@@ -56,11 +56,26 @@ otherwise complete)
       create-node → register → poll → list-peers → export-config →
       revoke smoke test against a live containerized coordinator.
 - [ ] **Final end-to-end verification**: the coordinator+admin half of
-      this is now done (see M6) against a real container. Still open:
-      a real two-agent WireGuard mesh test (needs `CAP_NET_ADMIN` +
-      either network namespaces or two privileged containers — see the
-      original plan's verification section for the approach; not run in
-      this session).
+      this is now done (see M6) against a real container. Still open: a
+      real two-agent WireGuard mesh test. **Confirmed blocked in this
+      development sandbox specifically** (checked directly, not assumed):
+      the WireGuard kernel module is present
+      (`/lib/modules/.../wireguard.ko`), but the session's shell has an
+      empty effective capability set (`capsh --print` → `Current: =`)
+      despite `CAP_NET_ADMIN` sitting in the bounding set, and `sudo`
+      requires interactive terminal auth this session can't provide —
+      `ip link add ... type wireguard` fails with "Operation not
+      permitted" as expected. Needs either a privileged environment (a
+      real machine/VM, or `!sudo ...` run by the user directly in their
+      own terminal) or `unshare --net --map-root-user` / two containers
+      run with `--cap-add=NET_ADMIN --device /dev/net/tun` as the
+      original plan's verification section describes. Runbook once that
+      access exists: `wireserve-admin create-node` twice → `wireserve-agent
+      join` on each → confirm each sees the other in `wireserve list` →
+      `wireserve serve` a service on one → confirm the other's
+      `/etc/hosts` gets `<name>.wg` and `wg show`/nftables reflect it →
+      `wireserve-admin revoke` one → confirm the other drops it within
+      one poll interval.
 
 Security-sensitive paths (tokens, auth, firewall default-deny, file
 permissions) get test coverage inline with each milestone that introduces
