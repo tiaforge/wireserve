@@ -8,16 +8,16 @@ this checklist lives in the session that created it — this file is the
 source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
-**Currently working on:** Milestone 1 — `wireserve-types`
+**Currently working on:** Milestone 2 — `wireserve-coordinator`
 
 ## Milestones
 
 - [x] **M0 — Workspace scaffolding**: Cargo workspace, per-crate stub
       crates, `.gitignore`, `rust-toolchain.toml`, empty `deploy/` tree,
       this file.
-- [ ] **M1 — `wireserve-types`**: shared wire structs (§4), the single
+- [x] **M1 — `wireserve-types`**: shared wire structs (§4), the single
       `is_valid_dns_label` validator (§3), `FirewallBackend`/`ServiceRule`
-      (§5), token hashing helper.
+      (§5), token hashing helper. 24 unit tests, `cargo clippy` clean.
 - [ ] **M2 — `wireserve-coordinator`**: SQLite schema + migrations, IP
       allocation, `/register`, `/poll`, `/admin/*` routes, two separate
       listeners (node-facing vs admin), rate limiting, audit logging.
