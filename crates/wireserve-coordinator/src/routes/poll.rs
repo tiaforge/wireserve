@@ -23,6 +23,17 @@ pub async fn poll(
             )));
         }
     }
+    // S2 (security review): endpoint_addr is redistributed verbatim to
+    // every other node's /poll response and into rendered .conf files —
+    // same validation as /register, applied here too since a node can
+    // change its reported endpoint_addr on every poll (spec §4.3).
+    if let Some(endpoint) = &req.endpoint_addr {
+        if !wireserve_types::is_valid_endpoint_addr(endpoint) {
+            return Err(AppError::BadRequest(
+                "endpoint_addr must be a valid host:port".into(),
+            ));
+        }
+    }
 
     let mut conn = state.db.conn.lock().await;
 

@@ -35,6 +35,17 @@ pub struct InterfaceParams {
 /// block would make this device act as a router for other peers' traffic,
 /// and WireGuard requires non-overlapping `AllowedIPs` across peers on one
 /// interface regardless.
+///
+/// Defense in depth (security review S2): the coordinator now validates
+/// `pubkey`/`endpoint_addr` strictly at `/register` and `/poll` (rejecting
+/// anything containing control characters, among other checks), so a
+/// value reaching this function *should* already be safe — but this
+/// renderer refuses to emit any peer whose `pubkey` or `endpoint_addr`
+/// contains a newline regardless, rather than trusting the coordinator's
+/// validation as the only line of defense against a value that would
+/// otherwise let one field smuggle an entire extra `.conf` directive
+/// (e.g. an `endpoint_addr` of `"1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0"`
+/// hijacking this exported device's routing).
 #[must_use]
 pub fn render_conf(iface: &InterfaceParams, peers: &[PeerInfo]) -> String {
     let mut out = String::new();
@@ -44,6 +55,20 @@ pub fn render_conf(iface: &InterfaceParams, peers: &[PeerInfo]) -> String {
 
     for peer in peers {
         if peer.pubkey == iface.own_pubkey {
+            continue;
+        }
+        if contains_newline(&peer.pubkey)
+            || peer
+                .endpoint_addr
+                .as_deref()
+                .is_some_and(contains_newline)
+        {
+            eprintln!(
+                "warning: skipping peer '{}' — its pubkey or endpoint_addr contains a newline, \
+                 which could otherwise inject extra .conf directives; this indicates either a \
+                 coordinator bug or a compromised/malicious node and should be investigated",
+                peer.name
+            );
             continue;
         }
         out.push('\n');
@@ -59,6 +84,10 @@ pub fn render_conf(iface: &InterfaceParams, peers: &[PeerInfo]) -> String {
     }
 
     out
+}
+
+fn contains_newline(s: &str) -> bool {
+    s.contains('\n') || s.contains('\r')
 }
 
 /// Runs the full `export-config` flow end to end against a live
@@ -187,6 +216,56 @@ mod tests {
         let conf = render_conf(&i, &peers);
         assert_eq!(conf.matches("[Peer]").count(), 1);
         assert!(conf.contains("someone-else"));
+    }
+
+    // ---- S2 defense-in-depth: renderer refuses newline-smuggling peers ----
+
+    #[test]
+    fn skips_peer_with_newline_in_endpoint_addr_instead_of_rendering_it() {
+        let peers = vec![peer(
+            "otherpubkey",
+            "100.90.0.3",
+            "fd00:90::3",
+            Some("1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0"),
+        )];
+        let conf = render_conf(&iface(), &peers);
+        assert!(
+            !conf.contains("[Peer]"),
+            "a peer carrying a config-injection payload must be skipped entirely, not rendered"
+        );
+        assert!(!conf.contains("0.0.0.0/0"));
+    }
+
+    #[test]
+    fn skips_peer_with_newline_in_pubkey_instead_of_rendering_it() {
+        let peers = vec![peer(
+            "legit-looking-key\nEndpoint = evil.example:1",
+            "100.90.0.3",
+            "fd00:90::3",
+            None,
+        )];
+        let conf = render_conf(&iface(), &peers);
+        assert!(!conf.contains("[Peer]"));
+        assert!(!conf.contains("evil.example"));
+    }
+
+    #[test]
+    fn other_valid_peers_are_unaffected_by_a_skipped_one() {
+        let peers = vec![
+            peer("good1", "100.90.0.3", "fd00:90::3", None),
+            peer(
+                "bad\nEndpoint = evil.example:1",
+                "100.90.0.4",
+                "fd00:90::4",
+                None,
+            ),
+            peer("good2", "100.90.0.5", "fd00:90::5", None),
+        ];
+        let conf = render_conf(&iface(), &peers);
+        assert_eq!(conf.matches("[Peer]").count(), 2);
+        assert!(conf.contains("good1"));
+        assert!(conf.contains("good2"));
+        assert!(!conf.contains("evil.example"));
     }
 
     #[test]

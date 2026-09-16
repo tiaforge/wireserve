@@ -79,6 +79,7 @@ fn build_list_view(state: &AgentState) -> ListView {
     ListView {
         peers: directory.peers,
         services,
+        rejected_services: state.rejected_services.clone(),
     }
 }
 
@@ -95,6 +96,10 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
             }
             let mut state = ctx.state.lock().await;
             state.declared_services.retain(|d| d.name != name);
+            // A fresh `serve` for a previously-rejected name deserves a
+            // clean retry, not a stale "rejected" annotation hanging
+            // around until the next poll cycle re-evaluates it.
+            state.rejected_services.retain(|r| r.name != name);
             state.declared_services.push(ServiceDecl { name, port, proto });
             match state.save(&ctx.state_path) {
                 Ok(()) => (IpcResponse::Ok, false),

@@ -196,6 +196,18 @@ pub fn reissue_join_token(
     Ok(())
 }
 
+/// Clears a node's current bearer token without touching `revoked` (see
+/// `reissue_join_token`'s doc comment / PLAN.md decisions log — security
+/// review S8). The node simply can't `/poll` until it redeems a new join
+/// token via `/register`.
+pub fn clear_bearer_token(conn: &Connection, node_id: i64) -> Result<(), DbError> {
+    conn.execute(
+        "UPDATE nodes SET bearer_token_hash = NULL WHERE id = ?1",
+        [node_id],
+    )?;
+    Ok(())
+}
+
 /// All addresses currently allocated (any node, regardless of registration
 /// state) — used by the IP allocator to avoid handing out a duplicate.
 pub fn all_allocated_ip4(conn: &Connection) -> Result<Vec<Ipv4Addr>, DbError> {

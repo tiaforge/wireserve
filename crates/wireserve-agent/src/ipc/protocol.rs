@@ -34,6 +34,12 @@ pub struct LocalServiceView {
 pub struct ListView {
     pub peers: Vec<PeerInfo>,
     pub services: Vec<LocalServiceView>,
+    /// Declarations the coordinator rejected (name collision, spec §4.3)
+    /// — surfaced here rather than silently vanishing (security review
+    /// F3) so `wireserve list` tells the operator *why* a `serve` call
+    /// didn't take effect.
+    #[serde(default)]
+    pub rejected_services: Vec<crate::state::RejectedService>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -67,6 +67,24 @@ impl FirewallBackend for NftablesBackend {
     /// exists) deletes it and recreates the table/chain/rules from
     /// scratch — never a window where the old and new rulesets are both
     /// partially applied.
+    ///
+    /// **Real bug found and fixed by an actual end-to-end deployment test**
+    /// (two agent containers + a coordinator, see PLAN.md decisions log):
+    /// this chain is a *base* chain hooked into netfilter's global INPUT
+    /// path (`HookClass::In`) — a base chain's own default policy applies
+    /// to packets on *every* interface, not just the ones its individual
+    /// rules happen to `iiface()`-match. The original version set
+    /// `ChainPolicy::Drop` as that default, which silently firewalled off
+    /// **all** inbound traffic on every interface (including the node's
+    /// own outbound HTTP poll requests' return traffic on its regular
+    /// network interface) the moment the agent started — every poll
+    /// request hung in `SYN_SENT` forever, caught only by watching real
+    /// TCP state during a live test, since no unit test exercises a real
+    /// kernel netfilter hook. Fixed by keeping the chain's own policy at
+    /// `Accept` (safe for every non-WireGuard interface) and instead
+    /// scoping the actual deny behavior to an explicit final `iiface`
+    /// catch-all rule, so *only* traffic arriving on the WireGuard
+    /// interface is default-denied, per spec §5's actual intent.
     fn apply(&mut self, rules: &[ServiceRule]) -> Result<(), Self::Error> {
         let mut batch = Batch::new();
         Self::queue_delete_existing(&mut batch)?;
@@ -77,7 +95,19 @@ impl FirewallBackend for NftablesBackend {
         let chain = Chain::new(&table)
             .with_name(CHAIN_NAME)
             .with_hook(Hook::new(HookClass::In, 0))
-            .with_policy(ChainPolicy::Drop)
+            .with_policy(ChainPolicy::Accept)
+            .add_to_batch(&mut batch);
+
+        // Allow return traffic for connections this node itself initiated
+        // over the WireGuard interface (e.g. this node acting as a client
+        // of another peer's declared service) — without this, a
+        // WG-interface-scoped default-deny would break outbound
+        // connectivity through the tunnel just as badly as the bug above
+        // broke it on every other interface.
+        Rule::new(&chain)?
+            .iiface(&self.ifname)?
+            .established()?
+            .accept()
             .add_to_batch(&mut batch);
 
         for rule in rules {
@@ -87,6 +117,13 @@ impl FirewallBackend for NftablesBackend {
                 .accept()
                 .add_to_batch(&mut batch);
         }
+
+        // Default-deny, but ONLY for the WireGuard interface — everything
+        // else stays governed by the chain's own Accept policy above.
+        Rule::new(&chain)?
+            .iiface(&self.ifname)?
+            .drop()
+            .add_to_batch(&mut batch);
 
         batch.send()?;
         Ok(())

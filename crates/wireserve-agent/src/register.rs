@@ -59,6 +59,7 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
         endpoint_addr: params.endpoint_addr,
         declared_services: Vec::new(),
         last_directory: None,
+        rejected_services: Vec::new(),
     };
     state.save(&crate::paths::state_path())?;
     Ok(state)

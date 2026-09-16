@@ -65,7 +65,45 @@ fn replace_managed_block(contents: &str, services: &[ServiceInfo]) -> String {
 pub fn sync(path: &Path, services: &[ServiceInfo]) -> std::io::Result<()> {
     let existing = std::fs::read_to_string(path).unwrap_or_default();
     let updated = replace_managed_block(&existing, services);
+    write_preserving_mode(path, &updated)
+}
 
+/// Strips the managed block (markers included) entirely, rather than
+/// leaving an empty-but-present block behind. Used by `wireserve leave`
+/// (spec §4.6: "tears down interface, firewall, hosts block" — security
+/// review F2 flagged that this project's `leave` implementation was only
+/// doing the first two). A no-op if the markers aren't present.
+pub fn remove_block(path: &Path) -> std::io::Result<()> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let Some(stripped) = strip_managed_block(&existing) else {
+        return Ok(());
+    };
+    write_preserving_mode(path, &stripped)
+}
+
+/// Removes the marked span (and one adjoining blank separator line, if
+/// `replace_managed_block` added one) from `contents`. Returns `None` if
+/// the markers aren't present, so callers can treat that as a no-op
+/// rather than rewriting a file that doesn't need it.
+fn strip_managed_block(contents: &str) -> Option<String> {
+    let (start, end) = (contents.find(BEGIN_MARKER)?, contents.find(END_MARKER)?);
+    if end < start {
+        return None;
+    }
+    let before = contents[..start].trim_end_matches('\n');
+    let after = &contents[end + END_MARKER.len()..];
+    let after = after.strip_prefix('\n').unwrap_or(after);
+
+    let mut out = String::new();
+    out.push_str(before);
+    if !before.is_empty() && !after.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(after);
+    Some(out)
+}
+
+fn write_preserving_mode(path: &Path, contents: &str) -> std::io::Result<()> {
     let mode = std::fs::metadata(path)
         .map(|m| {
             use std::os::unix::fs::PermissionsExt;
@@ -73,7 +111,7 @@ pub fn sync(path: &Path, services: &[ServiceInfo]) -> std::io::Result<()> {
         })
         .unwrap_or(0o644);
 
-    atomic_write(path, updated.as_bytes(), mode)
+    atomic_write(path, contents.as_bytes(), mode)
 }
 
 #[cfg(test)]
@@ -171,6 +209,44 @@ mod tests {
 
         assert_eq!(
             std::fs::read_to_string(&real_hosts).unwrap(),
+            "127.0.0.1 localhost\n"
+        );
+    }
+
+    // ---- F2: `leave` must remove the managed block, not just empty it ----
+
+    #[test]
+    fn remove_block_strips_markers_and_body_preserving_surrounding_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts");
+        std::fs::write(
+            &path,
+            format!(
+                "127.0.0.1 localhost\n\n{BEGIN_MARKER}\n100.90.0.3 plex.wg\n{END_MARKER}\n192.168.1.1 router\n"
+            ),
+        )
+        .unwrap();
+
+        remove_block(&path).unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(!contents.contains(BEGIN_MARKER));
+        assert!(!contents.contains(END_MARKER));
+        assert!(!contents.contains("plex.wg"));
+        assert!(contents.contains("127.0.0.1 localhost"));
+        assert!(contents.contains("192.168.1.1 router"));
+    }
+
+    #[test]
+    fn remove_block_is_a_no_op_when_markers_are_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts");
+        std::fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+
+        remove_block(&path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
             "127.0.0.1 localhost\n"
         );
     }

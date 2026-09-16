@@ -29,6 +29,7 @@ fn test_config(db_path: &str) -> Config {
         online_threshold_secs: 180,
         rate_limit_max: 1000,
         rate_limit_window_secs: 60,
+        trust_proxy_headers: false,
     }
 }
 
@@ -91,6 +92,19 @@ async fn body_json(response: axum::response::Response) -> Value {
 
 const ADMIN: &str = "test-admin-token";
 
+/// Deterministically derives a syntactically valid WireGuard pubkey (32
+/// bytes, standard base64) from a short human-readable seed, so test call
+/// sites can keep writing readable identifiers like `"pk1"` while
+/// actually sending something that passes the coordinator's real pubkey
+/// validation (security review S2) rather than an arbitrary placeholder
+/// string.
+fn pubkey_for(seed: &str) -> String {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(seed.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(digest)
+}
+
 async fn admin_create_node(router: &Router, name: &str) -> String {
     let req = json_request(
         "POST",
@@ -99,7 +113,11 @@ async fn admin_create_node(router: &Router, name: &str) -> String {
         json!({ "name": name }),
     );
     let resp = router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "create-node should succeed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "create-node should succeed"
+    );
     let body = body_json(resp).await;
     body["join_token"].as_str().unwrap().to_string()
 }
@@ -107,7 +125,7 @@ async fn admin_create_node(router: &Router, name: &str) -> String {
 async fn register_node(
     router: &Router,
     join_token: &str,
-    pubkey: &str,
+    pubkey_seed: &str,
     listen_port: u16,
 ) -> Value {
     let req = json_request(
@@ -116,7 +134,7 @@ async fn register_node(
         None,
         json!({
             "join_token": join_token,
-            "pubkey": pubkey,
+            "pubkey": pubkey_for(pubkey_seed),
             "listen_port": listen_port,
         }),
     );
@@ -244,7 +262,7 @@ async fn rejoin_issues_new_token_and_old_bearer_stays_dead_until_reregister() {
 
     let req = json_request("POST", "/admin/nodes/n1/rejoin", Some(ADMIN), json!({}));
     let resp = app.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::CREATED);
     let body = body_json(resp).await;
     let new_join_token = body["join_token"].as_str().unwrap().to_string();
 
@@ -273,7 +291,7 @@ async fn join_token_reuse_fails_same_as_unknown_token() {
         "POST",
         "/register",
         None,
-        json!({ "join_token": t1, "pubkey": "pk-second-try", "listen_port": 51820 }),
+        json!({ "join_token": t1, "pubkey": pubkey_for("pk-second-try"), "listen_port": 51820 }),
     );
     let resp_reuse = app.router.clone().oneshot(req).await.unwrap();
     let status_reuse = resp_reuse.status();
@@ -283,7 +301,7 @@ async fn join_token_reuse_fails_same_as_unknown_token() {
         "POST",
         "/register",
         None,
-        json!({ "join_token": "jtk_never_existed", "pubkey": "pk-x", "listen_port": 51820 }),
+        json!({ "join_token": "jtk_never_existed", "pubkey": pubkey_for("pk-x"), "listen_port": 51820 }),
     );
     let resp_unknown = app.router.clone().oneshot(req).await.unwrap();
     let status_unknown = resp_unknown.status();
@@ -416,7 +434,7 @@ async fn static_node_endpoint_addr_stays_null() {
         None,
         json!({
             "join_token": join_token,
-            "pubkey": "pk-phone",
+            "pubkey": pubkey_for("pk-phone"),
             "kind": "static",
             "endpoint_addr": "should-be-ignored:51820",
         }),
@@ -502,4 +520,194 @@ async fn online_threshold_reflects_last_seen_staleness() {
     let body = body_json(resp).await;
     let peer = &body["peers"][0];
     assert!(peer["last_handshake"].is_null());
+}
+
+// ---- Security review regression coverage ----
+
+// S2: a "pubkey" or "endpoint_addr" that isn't validated gets redistributed
+// verbatim to every other node's /poll response and into rendered .conf
+// files — an attacker holding any valid bearer token could otherwise
+// smuggle extra config-file syntax into every downstream consumer.
+
+#[tokio::test]
+async fn register_rejects_malformed_pubkey() {
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({ "join_token": t1, "pubkey": "not-a-real-pubkey", "listen_port": 51820 }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert!(resp.status().is_client_error());
+
+    // The join token must NOT have been consumed by the rejected attempt.
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({ "join_token": t1, "pubkey": pubkey_for("valid"), "listen_port": 51820 }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn register_rejects_endpoint_addr_config_injection_attempt() {
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({
+            "join_token": t1,
+            "pubkey": pubkey_for("n1"),
+            "listen_port": 51820,
+            "endpoint_addr": "1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0",
+        }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert!(resp.status().is_client_error());
+}
+
+#[tokio::test]
+async fn poll_rejects_endpoint_addr_config_injection_attempt() {
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap();
+
+    let req = json_request(
+        "POST",
+        "/poll",
+        Some(bearer1),
+        json!({
+            "services": [],
+            "endpoint_addr": "1.2.3.4:51820\r\nEndpoint = evil.example:1",
+        }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert!(resp.status().is_client_error());
+}
+
+// F3: a service-name collision must be machine-readable, not just a string
+// the agent has to parse.
+
+#[tokio::test]
+async fn service_collision_409_includes_conflicting_service_field() {
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let t2 = admin_create_node(&app.router, "n2").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let r2 = register_node(&app.router, &t2, "n2", 51821).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap();
+    let bearer2 = r2["bearer_token"].as_str().unwrap();
+
+    let req = json_request(
+        "POST",
+        "/poll",
+        Some(bearer1),
+        json!({ "services": [{"name": "plex", "port": 32400, "proto": "tcp"}] }),
+    );
+    app.router.clone().oneshot(req).await.unwrap();
+
+    let req = json_request(
+        "POST",
+        "/poll",
+        Some(bearer2),
+        json!({ "services": [{"name": "plex", "port": 1, "proto": "tcp"}] }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    assert_eq!(body["conflicting_service"].as_str(), Some("plex"));
+}
+
+// S8: rejoin must invalidate the OLD bearer token immediately, even when
+// the node was never separately revoked first — spec §4.5 explicitly
+// covers calling rejoin directly on a node whose key is merely "suspected
+// compromised."
+
+#[tokio::test]
+async fn rejoin_on_non_revoked_node_invalidates_old_bearer_immediately() {
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let old_bearer = r1["bearer_token"].as_str().unwrap().to_string();
+
+    // No revoke call here — going straight to rejoin.
+    let req = json_request("POST", "/admin/nodes/n1/rejoin", Some(ADMIN), json!({}));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let req = json_request("POST", "/poll", Some(&old_bearer), json!({ "services": [] }));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "the old bearer token must stop working the moment rejoin is called, not just on revoke"
+    );
+}
+
+// F4: rejoin must not reallocate the node's address — every static peer's
+// exported .conf pointing at it would otherwise go stale.
+
+#[tokio::test]
+async fn rejoin_then_reregister_keeps_the_same_address() {
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let original_ip4 = r1["ip4"].as_str().unwrap().to_string();
+    let original_ip6 = r1["ip6"].as_str().unwrap().to_string();
+
+    let req = json_request("POST", "/admin/nodes/n1/revoke", Some(ADMIN), json!({}));
+    app.router.clone().oneshot(req).await.unwrap();
+    let req = json_request("POST", "/admin/nodes/n1/rejoin", Some(ADMIN), json!({}));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let body = body_json(resp).await;
+    let new_join_token = body["join_token"].as_str().unwrap().to_string();
+
+    let r2 = register_node(&app.router, &new_join_token, "n1-new-key", 51820).await;
+    assert_eq!(r2["ip4"].as_str().unwrap(), original_ip4);
+    assert_eq!(r2["ip6"].as_str().unwrap(), original_ip6);
+}
+
+// F7: spec §4.1/§4.5 both specify 201 for create-node and rejoin.
+
+#[tokio::test]
+async fn create_node_and_rejoin_return_201() {
+    let app = test_app();
+    let req = json_request("POST", "/admin/nodes", Some(ADMIN), json!({ "name": "n1" }));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let req = json_request("POST", "/admin/nodes/n1/rejoin", Some(ADMIN), json!({}));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+// S3: rate limiting must not consume budget on successful requests — only
+// actual failures should count against it.
+
+#[tokio::test]
+async fn successful_admin_auth_never_consumes_rate_limit_budget() {
+    let mut config = test_config("");
+    config.rate_limit_max = 3;
+    let app = app_with_config(config);
+
+    // Far more successful admin requests than the failure budget would
+    // allow, back to back — none of them should ever trip the limiter,
+    // since success is never recorded as a "hit."
+    for i in 0..10 {
+        let req = json_request(
+            "POST",
+            "/admin/nodes",
+            Some(ADMIN),
+            json!({ "name": format!("node{i}") }),
+        );
+        let resp = app.router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
 }

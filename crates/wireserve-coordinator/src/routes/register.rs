@@ -17,10 +17,28 @@ use crate::{ipam, tokengen};
 pub async fn register(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> Result<Json<RegisterResponse>, AppError> {
-    if req.pubkey.trim().is_empty() {
-        return Err(AppError::BadRequest("pubkey must not be empty".into()));
+    // S2 (security review): a pubkey/endpoint_addr that isn't validated
+    // here gets stored and later redistributed verbatim — to every other
+    // node's /poll response, to wireserve-admin's list-peers output, and
+    // (for endpoint_addr especially) into a rendered .conf file via
+    // export-config. An attacker holding any valid bearer token could
+    // otherwise smuggle extra config-file syntax (e.g. an embedded
+    // newline + "AllowedIPs = 0.0.0.0/0") into every downstream consumer
+    // of the peer directory. Reject anything malformed at the door.
+    if !wireserve_types::is_valid_wg_pubkey(&req.pubkey) {
+        return Err(AppError::BadRequest(
+            "pubkey must be a standard-base64-encoded 32-byte WireGuard public key".into(),
+        ));
+    }
+    if let Some(endpoint) = &req.endpoint_addr {
+        if !wireserve_types::is_valid_endpoint_addr(endpoint) {
+            return Err(AppError::BadRequest(
+                "endpoint_addr must be a valid host:port".into(),
+            ));
+        }
     }
 
     let hash = wireserve_types::hash_token(&req.join_token);
@@ -59,18 +77,49 @@ pub async fn register(
         ));
     }
 
-    let ip4 = ipam::allocate_v4(&state.config.net_v4_cidr, &nodes::all_allocated_ip4(&conn)?)
-        .map_err(DbError::from)?;
-    let ip6 = ipam::allocate_v6(&state.config.net_v6_prefix, &nodes::all_allocated_ip6(&conn)?)
-        .map_err(DbError::from)?;
+    // F4 (spec §4.5: rejoin works "without freeing its name or IP"):
+    // reuse the node's existing addresses if it has any — i.e. this is a
+    // re-registration after rejoin/revoke, not a brand-new node — rather
+    // than always allocating fresh ones. Every static peer's exported
+    // .conf pointing at this node's IP would otherwise silently go stale
+    // on every rejoin.
+    let ip4 = match node.ip4.as_deref().and_then(|s| s.parse().ok()) {
+        Some(existing) => existing,
+        None => ipam::allocate_v4(&state.config.net_v4_cidr, &nodes::all_allocated_ip4(&conn)?)
+            .map_err(DbError::from)?,
+    };
+    let ip6 = match node.ip6.as_deref().and_then(|s| s.parse().ok()) {
+        Some(existing) => existing,
+        None => ipam::allocate_v6(&state.config.net_v6_prefix, &nodes::all_allocated_ip6(&conn)?)
+            .map_err(DbError::from)?,
+    };
 
     // endpoint_addr fallback (spec §4.2) only ever applies to kind=agent —
     // a kind=static node's endpoint_addr stays NULL forever, since it's
-    // never dialed into.
+    // never dialed into. S4 (security review): the fallback also never
+    // fires when the observed source is loopback/private — spec §7 puts a
+    // reverse proxy in front of the coordinator, so an unqualified
+    // fallback would hand out the proxy's own useless local address to
+    // every other node as this node's "reachable" endpoint.
     let (endpoint_addr, listen_port) = if node.kind == NodeKind::Agent {
+        let observed_ip =
+            crate::client_ip::resolve(&headers, peer_addr.ip(), state.config.trust_proxy_headers);
+        // Loopback is unconditionally useless to any other peer, in any
+        // topology. A private-range address is only suspect when we've
+        // been told to expect a proxy (trust_proxy_headers) yet still
+        // ended up with a raw, unresolved observed address — see
+        // client_ip::is_loopback's doc comment for why a direct,
+        // proxy-less private-network deployment must NOT have this
+        // fallback disabled.
+        let observed_is_unusable = crate::client_ip::is_loopback(observed_ip)
+            || (state.config.trust_proxy_headers
+                && crate::client_ip::is_loopback_or_private(observed_ip));
         let endpoint = req.endpoint_addr.clone().or_else(|| {
-            req.listen_port
-                .map(|port| format!("{}:{port}", peer_addr.ip()))
+            if observed_is_unusable {
+                None
+            } else {
+                req.listen_port.map(|port| format!("{observed_ip}:{port}"))
+            }
         });
         (endpoint, req.listen_port)
     } else {

@@ -25,17 +25,42 @@ impl RateLimiter {
         }
     }
 
-    /// Records a hit for `ip` and returns whether the caller should be
-    /// allowed to proceed (`true`) or is over the limit (`false`).
-    pub fn check(&self, ip: IpAddr) -> bool {
+    /// Whether `ip` has already exhausted its failed-attempt budget for the
+    /// current window — a pure check, records nothing. Callers check this
+    /// *before* doing any auth-comparison work, so a blocked IP is turned
+    /// away without spending a hash/DB-lookup on a request that was never
+    /// going to be allowed anyway (a real, if minor, resource-exhaustion
+    /// consideration security review flagged: checking only after the
+    /// comparison already happened meant the limiter changed the response
+    /// code but not the per-request cost).
+    pub fn is_blocked(&self, ip: IpAddr) -> bool {
         let now = Instant::now();
         let mut hits = self.hits.lock().unwrap();
         let entry = hits.entry(ip).or_default();
         entry.retain(|t| now.duration_since(*t) < self.window);
-        if entry.len() as u32 >= self.max {
+        entry.len() as u32 >= self.max
+    }
+
+    /// Records one failed attempt from `ip` — call only on an actual auth
+    /// failure (never on success), so legitimate traffic never eats into
+    /// the budget.
+    pub fn record_failure(&self, ip: IpAddr) {
+        let now = Instant::now();
+        let mut hits = self.hits.lock().unwrap();
+        let entry = hits.entry(ip).or_default();
+        entry.retain(|t| now.duration_since(*t) < self.window);
+        entry.push(now);
+    }
+
+    /// Convenience used by call sites that just want the old
+    /// check-and-record-if-allowed behavior in one step, e.g. `/register`'s
+    /// own failure path. Equivalent to checking `is_blocked` then, if not
+    /// blocked, calling `record_failure` and returning `true`.
+    pub fn check(&self, ip: IpAddr) -> bool {
+        if self.is_blocked(ip) {
             false
         } else {
-            entry.push(now);
+            self.record_failure(ip);
             true
         }
     }

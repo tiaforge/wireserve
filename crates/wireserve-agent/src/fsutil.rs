@@ -9,6 +9,11 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
+/// `EBUSY` — see the fallback note on `atomic_write` below.
+const EBUSY: i32 = 16;
+/// `EXDEV` — likewise.
+const EXDEV: i32 = 18;
+
 /// Writes `contents` to `path` atomically, creating the file at exactly
 /// `mode` from the moment it's created (not a post-hoc `chmod`, which would
 /// leave a window where the file exists with default permissions).
@@ -17,6 +22,20 @@ use std::path::Path;
 /// `rename` is guaranteed to be on the same filesystem (required for
 /// atomicity — a cross-filesystem "rename" silently falls back to
 /// copy+delete on some platforms, which is not atomic).
+///
+/// **Falls back to a non-atomic in-place write if `rename()` fails with
+/// `EBUSY`/`EXDEV`.** Found by an actual containerized end-to-end test:
+/// `/etc/hosts` inside *every* container runtime (Podman, Docker,
+/// Kubernetes) is a bind-mounted file — including a container's own
+/// hosts file with no explicit `-v` flag at all, not just the
+/// `-v /etc/hosts:/etc/hosts` pattern this project's own Dockerfile
+/// documents — and `rename()` onto a bind-mounted path fails with EBUSY,
+/// since the mount point's inode can't be replaced. On a normal
+/// filesystem (the primary systemd/bare-metal/VM deployment this project
+/// targets) this fallback path is never exercised. Inside a container, it
+/// trades the crash-atomicity guarantee for the hosts-file sync actually
+/// working at all — an accepted, documented tradeoff, not a silent
+/// downgrade: see PLAN.md decisions log.
 pub fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
@@ -40,13 +59,56 @@ pub fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<
     f.sync_all()?;
     drop(f);
 
-    std::fs::rename(&tmp_path, path)
+    match std::fs::rename(&tmp_path, path) {
+        Ok(()) => Ok(()),
+        Err(e) if matches!(e.raw_os_error(), Some(EBUSY) | Some(EXDEV)) => {
+            let result = write_in_place(path, contents);
+            let _ = std::fs::remove_file(&tmp_path);
+            result
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(e)
+        }
+    }
+}
+
+/// Non-atomic fallback: truncate-and-write the target file directly,
+/// preserving whatever permissions it already has (no `O_CREAT` needed
+/// for a path that already exists, so `OpenOptions::mode` — only applied
+/// on creation — never comes into play here).
+fn write_in_place(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut f = OpenOptions::new().write(true).truncate(true).open(path)?;
+    f.write_all(contents)?;
+    f.sync_all()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    // The EBUSY/EXDEV-triggering condition itself (a real bind mount) needs
+    // privileges this test suite can't assume — it's exercised for real by
+    // an actual containerized deployment test instead (see PLAN.md decisions
+    // log). This test covers `write_in_place`'s own contract directly: it
+    // writes contents in place and leaves the target's existing permission
+    // bits untouched, since a container's already-bind-mounted /etc/hosts
+    // typically isn't mode 600 the way atomic_write's happy path creates
+    // new files.
+    #[test]
+    fn write_in_place_writes_contents_and_preserves_existing_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts");
+        std::fs::write(&path, "old content").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_in_place(&path, b"new content").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new content");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "write_in_place must not alter existing permissions");
+    }
 
     #[test]
     fn writes_contents_and_exact_mode() {

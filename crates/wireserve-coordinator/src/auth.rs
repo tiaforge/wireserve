@@ -4,7 +4,7 @@
 //! share a "check either token type" helper, even though the header
 //! parsing looks superficially similar.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use axum::extract::connect_info::ConnectInfo;
 use axum::extract::FromRequestParts;
@@ -27,16 +27,12 @@ impl IntoResponse for AuthError {
         match self {
             AuthError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
-                Json(wireserve_types::ErrorBody {
-                    error: "unauthorized".to_string(),
-                }),
+                Json(wireserve_types::ErrorBody::new("unauthorized")),
             )
                 .into_response(),
             AuthError::RateLimited => (
                 StatusCode::TOO_MANY_REQUESTS,
-                Json(wireserve_types::ErrorBody {
-                    error: "too many requests".to_string(),
-                }),
+                Json(wireserve_types::ErrorBody::new("too many requests")),
             )
                 .into_response(),
         }
@@ -49,20 +45,44 @@ fn extract_bearer(parts: &Parts) -> Option<&str> {
     value.strip_prefix("Bearer ").filter(|t| !t.is_empty())
 }
 
-/// Consulted only on the failed-auth path (spec §7: "basic rate limiting
-/// on /register and on failed-auth responses from any endpoint") —
-/// successful auth never touches the limiter. Once a source IP has
-/// exhausted its failed-attempt budget, further failures from it get 429
-/// instead of 401, until the window rolls over.
-fn record_failed_auth(state: &AppState, parts: &Parts) -> AuthError {
-    let ip = parts
+/// The IP to key rate limiting on — the raw TCP peer by default, or (if
+/// `state.config.trust_proxy_headers` is set) the reverse proxy's own
+/// `X-Forwarded-For` value, since spec §7 puts a proxy in front of the
+/// coordinator and `ConnectInfo` would otherwise always just be that
+/// proxy's own address for every request from every node (S4).
+fn source_ip(state: &AppState, parts: &Parts) -> Option<IpAddr> {
+    let connect_ip = parts
         .extensions
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0.ip());
-    match ip {
-        Some(ip) if !state.rate_limiter.check(ip) => AuthError::RateLimited,
-        _ => AuthError::Unauthorized,
+        .map(|ci| ci.0.ip())?;
+    Some(crate::client_ip::resolve(
+        &parts.headers,
+        connect_ip,
+        state.config.trust_proxy_headers,
+    ))
+}
+
+/// Checked BEFORE any comparison work — an IP that has already exhausted
+/// its failed-attempt budget is turned away immediately, without spending
+/// a hash/DB-lookup on a request that was never going to be allowed
+/// anyway (spec §7's rate limiting is meant to make guessing costly, which
+/// only holds if a blocked request is actually cheap to reject).
+fn check_budget(state: &AppState, parts: &Parts) -> Result<(), AuthError> {
+    match source_ip(state, parts) {
+        Some(ip) if state.rate_limiter.is_blocked(ip) => Err(AuthError::RateLimited),
+        _ => Ok(()),
     }
+}
+
+/// Records a failed attempt (spec §7: "basic rate limiting on /register
+/// and on failed-auth responses from any endpoint") — call only once an
+/// attempt has actually failed; successful auth never touches the
+/// limiter.
+fn record_failed_auth(state: &AppState, parts: &Parts) -> AuthError {
+    if let Some(ip) = source_ip(state, parts) {
+        state.rate_limiter.record_failure(ip);
+    }
+    AuthError::Unauthorized
 }
 
 /// Authenticates a request against the single static admin token. Compared
@@ -80,6 +100,7 @@ impl FromRequestParts<AppState> for AdminAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        check_budget(state, parts)?;
         let Some(candidate) = extract_bearer(parts) else {
             return Err(record_failed_auth(state, parts));
         };
@@ -112,6 +133,7 @@ impl FromRequestParts<AppState> for BearerNode {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        check_budget(state, parts)?;
         let Some(candidate) = extract_bearer(parts) else {
             return Err(record_failed_auth(state, parts));
         };

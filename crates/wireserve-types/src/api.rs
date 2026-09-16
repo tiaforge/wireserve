@@ -9,6 +9,32 @@ use crate::node::{NodeKind, Proto};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorBody {
     pub error: String,
+    /// Set only for a `409` from `/poll` caused by a service-name
+    /// collision (spec §4.3) — the specific declared name that collided,
+    /// as a machine-readable field rather than something the agent has to
+    /// string-parse out of `error`. Lets the agent quarantine exactly the
+    /// offending declaration instead of the whole poll cycle wedging on
+    /// it forever (see PLAN.md decisions log).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub conflicting_service: Option<String>,
+}
+
+impl ErrorBody {
+    #[must_use]
+    pub fn new(error: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+            conflicting_service: None,
+        }
+    }
+
+    #[must_use]
+    pub fn service_collision(error: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+            conflicting_service: Some(name.into()),
+        }
+    }
 }
 
 // ---- §4.1 Admin: create node ----

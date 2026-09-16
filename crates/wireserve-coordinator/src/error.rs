@@ -20,6 +20,19 @@ pub enum AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
+        // The service-collision case carries an extra machine-readable
+        // field (spec §4.3 / security review F3) so the agent can
+        // quarantine exactly the offending declaration instead of the
+        // whole poll cycle wedging on it forever — everything else is a
+        // plain `{error}` body.
+        if let AppError::Internal(DbError::ServiceNameCollision(name)) = &self {
+            let body = ErrorBody::service_collision(
+                format!("service name '{name}' is already in use"),
+                name.clone(),
+            );
+            return (StatusCode::CONFLICT, Json(body)).into_response();
+        }
+
         let (status, message) = match &self {
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
@@ -33,10 +46,7 @@ impl IntoResponse for AppError {
             AppError::Internal(DbError::NameTaken) => {
                 (StatusCode::CONFLICT, "name already in use".to_string())
             }
-            AppError::Internal(DbError::ServiceNameCollision(name)) => (
-                StatusCode::CONFLICT,
-                format!("service name '{name}' is already in use"),
-            ),
+            AppError::Internal(DbError::ServiceNameCollision(_)) => unreachable!("handled above"),
             AppError::Internal(DbError::NodeNotFound) => {
                 (StatusCode::NOT_FOUND, "not found".to_string())
             }
@@ -48,6 +58,6 @@ impl IntoResponse for AppError {
                 )
             }
         };
-        (status, Json(ErrorBody { error: message })).into_response()
+        (status, Json(ErrorBody::new(message))).into_response()
     }
 }

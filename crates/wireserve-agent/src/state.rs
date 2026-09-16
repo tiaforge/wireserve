@@ -34,6 +34,19 @@ pub struct AgentState {
     /// The full mesh + service directory from the last successful poll,
     /// used to answer `wireserve list` without a network round trip.
     pub last_directory: Option<PollResponse>,
+    /// Service declarations the coordinator rejected (name collision with
+    /// another node, spec §4.3) — removed from `declared_services` so
+    /// they're not resent forever (security review F3), but kept here so
+    /// `wireserve list` can show *why* a `serve` call didn't take effect
+    /// instead of it just silently vanishing.
+    #[serde(default)]
+    pub rejected_services: Vec<RejectedService>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RejectedService {
+    pub name: String,
+    pub reason: String,
 }
 
 #[derive(Debug, thiserror::Error)]

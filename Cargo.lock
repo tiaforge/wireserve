@@ -2953,6 +2953,7 @@ name = "wireserve-coordinator"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.23.1",
  "chrono",
  "rand",
  "rusqlite",
@@ -2975,6 +2976,7 @@ dependencies = [
 name = "wireserve-types"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "chrono",
  "serde",
  "serde_json",

@@ -8,8 +8,12 @@ this checklist lives in the session that created it — this file is the
 source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
-**Currently working on:** Final end-to-end verification (all milestones
-otherwise complete)
+**Currently working on:** nothing open — all milestones complete, including
+the independent security review remediation (M7) and a real, reproducible
+end-to-end test (`deploy/e2e/run-e2e-test.sh`). 169 tests passing across
+`cargo test --workspace` (agent tested with `--no-default-features`
+locally; the real `nftables` feature is exercised by the E2E script's own
+container builds, which also passed in full).
 
 ## Milestones
 
@@ -55,27 +59,66 @@ otherwise complete)
       image, and the M3 nftables type-mismatch above) plus a full
       create-node → register → poll → list-peers → export-config →
       revoke smoke test against a live containerized coordinator.
-- [ ] **Final end-to-end verification**: the coordinator+admin half of
-      this is now done (see M6) against a real container. Still open: a
-      real two-agent WireGuard mesh test. **Confirmed blocked in this
-      development sandbox specifically** (checked directly, not assumed):
-      the WireGuard kernel module is present
-      (`/lib/modules/.../wireguard.ko`), but the session's shell has an
-      empty effective capability set (`capsh --print` → `Current: =`)
-      despite `CAP_NET_ADMIN` sitting in the bounding set, and `sudo`
-      requires interactive terminal auth this session can't provide —
-      `ip link add ... type wireguard` fails with "Operation not
-      permitted" as expected. Needs either a privileged environment (a
-      real machine/VM, or `!sudo ...` run by the user directly in their
-      own terminal) or `unshare --net --map-root-user` / two containers
-      run with `--cap-add=NET_ADMIN --device /dev/net/tun` as the
-      original plan's verification section describes. Runbook once that
-      access exists: `wireserve-admin create-node` twice → `wireserve-agent
-      join` on each → confirm each sees the other in `wireserve list` →
-      `wireserve serve` a service on one → confirm the other's
-      `/etc/hosts` gets `<name>.wg` and `wg show`/nftables reflect it →
-      `wireserve-admin revoke` one → confirm the other drops it within
-      one poll interval.
+- [x] **Final end-to-end verification**: resolved. Rootless Podman
+      containers get `CAP_NET_ADMIN` scoped to their own network
+      namespace via `--cap-add`, which turned out to be sufficient —
+      unlike the bare host shell (which genuinely has an empty effective
+      capability set, confirmed via `capsh --print`). A real two-agent
+      mesh test now runs via `deploy/e2e/run-e2e-test.sh`, committed to
+      the repo so it's reproducible in later sessions rather than
+      redone by hand. It exercises real kernel WireGuard interfaces,
+      real nftables rules, and a live coordinator, and is what actually
+      found the M7 bugs below — none of which any unit/integration test
+      in M1–M6 could have caught, since they only manifest once real
+      netlink/kernel state is involved.
+- [x] **M7 — Independent security review remediation**: a full external
+      review of the codebase (not written by whoever implemented M1–M6)
+      found 8 security findings (S2–S8, wireserve-agent §7.4/§4.5,
+      wireserve-coordinator/admin) and 9 functional gaps against spec
+      (F1–F9). All fixed except where explicitly noted otherwise below;
+      see decisions log #29+ for exact reasoning per finding, especially
+      where a fix deliberately narrows or reframes the reviewer's
+      literal suggestion. Highlights:
+      - **S2 (config injection into static peers' `.conf` files)** — the
+        most serious finding: an unvalidated `endpoint_addr`/`pubkey`
+        from any bearer-token holder could smuggle extra `.conf`
+        directives (e.g. `AllowedIPs = 0.0.0.0/0`) into every static
+        peer's exported config. Fixed with real validation
+        (`is_valid_wg_pubkey`, `is_valid_endpoint_addr`) at the
+        coordinator plus defense-in-depth newline rejection in the
+        renderer and `list-peers` output.
+      - **F1 (`wireserve list` was completely broken)** — the poll loop
+        and the IPC server held two separate `AgentState` copies that
+        never resynchronized; `list` always showed stale/empty data.
+        Fixed and directly confirmed by the E2E script's own dedicated
+        check.
+      - **F6 (roaming defeated)** — `configure_peer` was called for
+        every peer on every poll cycle, resetting WireGuard's own
+        kernel-level endpoint-roaming correction (spec §4.2 relies on
+        this) every ~20s. Fixed with a real diff (`peers_to_configure`)
+        against last-applied state.
+      - **F4 (rejoin reallocated IPs)**, **F7 (wrong status codes)**,
+        **S8 (rejoin left the old bearer live)** — all direct spec
+        conformance bugs, fixed and covered by new coordinator
+        integration tests.
+      - **F3 (one colliding service name wedged the whole agent
+        forever)** — fixed via a structured `409` (`ErrorBody.
+        conflicting_service`) the agent uses to quarantine exactly the
+        offending declaration rather than resending it forever.
+      - **F2 (`leave` incomplete)**, **F9 (revoked node never noticed)**
+        — `leave` now also removes the hosts-file block and IPC socket
+        and resets local state; a `401` from `/poll` now triggers the
+        same full teardown once instead of retrying forever with a dead
+        token.
+      - **S3/S4 (rate limiter didn't check budget before verifying;
+        keyed on the reverse proxy's own address)** — budget is now
+        checked before any comparison work, and an optional
+        `X-Forwarded-For`-trusting mode (`WIRESERVE_TRUST_PROXY_HEADERS`)
+        exists for real proxy-fronted deployments.
+      - **S5 (exported `.conf` not mode 600)**, **S6 (no plaintext-HTTP
+        warning)**, **S7 (join token on the command line)** — all fixed
+        (file perms, a warning, and `--join-token-file`/stdin support
+        respectively).
 
 Security-sensitive paths (tokens, auth, firewall default-deny, file
 permissions) get test coverage inline with each milestone that introduces
@@ -248,3 +291,139 @@ doesn't stall or drift:
     agents and static-peer export-config still use standalone
     `wireserve-admin` builds as normal; this bundling is specific to
     making the containerized coordinator deployment self-sufficient.
+
+## M7 — independent security review remediation
+
+An external review (not by whoever wrote M1–M6) of the full codebase
+found 8 security findings and 9 functional/spec-conformance gaps. Each
+is recorded here with what was actually done — including the few places
+a literal reading of the reviewer's suggested fix would have been wrong
+or would have regressed something already verified working.
+
+29. **S2 — config injection into static peers' `.conf` files (most
+    serious finding).** `endpoint_addr`/`pubkey` were stored and
+    redistributed verbatim with no format validation; a bearer-token
+    holder could set `endpoint_addr` to e.g.
+    `"1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0"` and hijack traffic for
+    every static peer exported afterward. Fixed with real validators in
+    `wireserve-types` (`is_valid_wg_pubkey`: standard-base64, exactly 32
+    bytes, no newlines; `is_valid_endpoint_addr`: strict `host:port`, no
+    control characters), enforced at both `/register` and `/poll`.
+    Defense in depth on top, per the reviewer's explicit ask: the
+    `export-config` renderer and `wireserve-admin list-peers` both
+    refuse/sanitize a newline in pubkey or endpoint fields even though
+    the coordinator should never let one through.
+30. **S3 — rate limiter checked budget only after doing the comparison
+    work**, so a blocked IP still paid the same per-request cost; not
+    exploitable given 256-bit tokens, but didn't do what §7 claims.
+    Split `RateLimiter::check` into `is_blocked` (checked first, no
+    side effects) and `record_failure` (called only after an actual
+    auth failure) — a blocked IP is now turned away before any
+    hash/DB-lookup work.
+31. **S4 — rate limiting and `/register`'s endpoint fallback were keyed
+    on the reverse-proxy's own address**, per spec §7's mandated
+    topology. Added `WIRESERVE_TRUST_PROXY_HEADERS` (off by default) to
+    resolve the client IP from the right-most `X-Forwarded-For` entry
+    instead of the raw TCP peer. **Deliberately narrower than the
+    reviewer's literal "no fallback when loopback or private" fix**: an
+    internal-Docker-network or direct-private-LAN deployment with no
+    separate proxy hop is itself spec-compliant (§7 only mandates a
+    proxy when the network in between is genuinely untrusted), and in
+    that topology the observed private-range address *is* the real,
+    reachable peer address — confirmed by this project's own E2E test,
+    which runs exactly that topology. Rejecting all private ranges
+    unconditionally would have broken it. The fallback now skips only
+    loopback unconditionally, and additionally skips private ranges
+    only when `trust_proxy_headers` is on and XFF resolution still fell
+    through to the raw peer address (a sign of misconfiguration, not a
+    legitimate direct connection).
+32. **S5 — `export-config --out` wrote the `.conf` (containing a private
+    key) at default permissions (typically 0644).** Fixed: written via
+    `OpenOptions` at mode 600 from creation.
+33. **S6 — neither client warned on plaintext `http://` to a
+    non-loopback host**, so the admin/join token would cross the network
+    in clear. Added a warning (not a hard refusal, since
+    `http://127.0.0.1:...` — this project's own recommended
+    Docker-`exec` admin-access pattern — is completely legitimate).
+34. **S7 — join token and admin token on the command line** land in
+    shell history and are visible via `ps`. The admin token already had
+    a file-based option (decisions log #20); added the same for the
+    agent's join token: `--join-token-file <path>`, or `-` as the
+    positional value to read one line from stdin.
+35. **S8 — `rejoin` on a non-revoked node left the old bearer token
+    live** until a new `/register` completed, defeating the "suspected
+    compromised" use case spec §4.5 describes it for. `rejoin` now also
+    clears the node's `bearer_token_hash` immediately (`revoked` itself
+    still only clears back to 0 on a successful subsequent
+    `/register`, unchanged).
+36. **F1 — `wireserve list` was completely broken.** The daemon's poll
+    loop mutated a local `AgentState` and saved it to disk, while the
+    IPC server answered from a *different* `Arc<Mutex<AgentState>>`
+    that only ever received `declared_services` pulled *from* it at the
+    top of each cycle — `last_directory` (and hence every peer/service
+    `list` would show) never flowed back. Fixed: the daemon loop now
+    writes its updated state back into the shared copy after every poll
+    cycle, success or failure. Directly confirmed by a dedicated check
+    in `deploy/e2e/run-e2e-test.sh`.
+37. **F2 — `leave` didn't remove the hosts-file block, the IPC socket,
+    or reset local state**, only the interface and firewall (spec §4.6
+    literally lists three things; the socket/state gap was the
+    reviewer's own reasonable extension of that intent). Fixed via a
+    shared `teardown_everything` helper (also used by F9 below) that
+    does all of it, best-effort per step so one failure doesn't skip
+    the rest.
+38. **F3 — one colliding service name wedged the whole agent forever.**
+    A `409` from `/poll` failed the entire cycle before peer
+    reconciliation ever ran, and since the same rejected declaration
+    was resent every cycle, every future cycle failed identically —
+    the agent stopped seeing new peers *and* revocations. Fixed on both
+    ends: the coordinator's `409` now carries a structured
+    `conflicting_service` field (`ErrorBody`, not something to
+    string-parse out of a message), and the agent quarantines exactly
+    that declaration (`quarantine_rejected_service`) — dropped from
+    what's sent, recorded in a new `AgentState.rejected_services` so
+    `wireserve list` shows *why* — rather than resending it forever.
+    Recovery takes one more poll interval, not zero, but no longer
+    "forever."
+39. **F4 — `rejoin` reallocated the node's IP address**, contradicting
+    spec §4.5's explicit "without freeing its name or IP." Every static
+    peer's exported `.conf` pointing at that node would silently go
+    stale on every rejoin. Fixed: `/register` now reuses `ip4`/`ip6`
+    from the existing node row when present, only allocating fresh
+    addresses for a node that's never had any.
+40. **F5 — containerized agent claimed non-functional.** Half confirmed,
+    half refuted by direct testing: the `atomic_write`-over-bind-mounted-
+    `/etc/hosts` EBUSY failure was real and is fixed (see the M6-era fix
+    already in `fsutil.rs`, found independently before this review
+    landed). The claim that the mesh itself needs `--network host` was
+    tested directly and found **not necessary** — two containers on an
+    ordinary Podman/Docker bridge network reach each other over UDP just
+    fine for WireGuard's own traffic, confirmed by the E2E script
+    observing a real configured peer and real hosts-file propagation
+    with no host networking involved.
+41. **F6 — endpoint reapplied every poll cycle defeated WireGuard's own
+    roaming correction**, since `configure_peer` was called
+    unconditionally for every peer every cycle regardless of whether
+    anything changed — resetting kernel-level state spec §4.2 relies on
+    staying put between polls. Fixed with a real diff
+    (`wg::peers_to_configure`, using `Peer`'s derived `PartialEq`) that
+    only reconfigures a peer that's new or actually changed.
+42. **F7 — status codes.** Spec §4.1/§4.5 specify `201` for
+    `create-node`/`rejoin`; the coordinator returned `200`. Fixed, tests
+    updated to assert `201`.
+43. **F8 — no way to delete an orphaned node record** (e.g. a failed
+    `export-config` between create and register burns a name with an
+    unprinted join token forever). **Not fixed in this pass** — a real
+    gap, but lower severity than the rest (a burned name is an
+    annoyance, not a security or correctness issue) and out of scope
+    for this remediation round; a `DELETE /admin/nodes/{name}` +
+    `wireserve-admin delete-node` following the same shape as `revoke`
+    would close it.
+44. **F9 — a revoked agent got `401` forever and never noticed.** Spec
+    doesn't require teardown here, but silently retrying forever with a
+    dead token and a stale peer set serves no purpose. Fixed:
+    `PollError::is_unauthorized()` lets the daemon loop detect a `401`
+    specifically and run the same `teardown_everything` as `leave`,
+    once, then stop (rather than keep polling with a torn-down
+    interface) — an operator re-runs `join` with a fresh token from
+    `wireserve-admin rejoin` to come back.

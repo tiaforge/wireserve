@@ -16,8 +16,15 @@ use crate::wg::WgInterface;
 pub enum PollError {
     #[error("HTTP error talking to coordinator: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("coordinator rejected poll: {0}")]
-    Rejected(String),
+    /// Carries the status code — not just the body text — so callers can
+    /// tell a revoked-node 401 (F9: the daemon should notice and react,
+    /// not silently retry forever with a dead bearer token) apart from
+    /// any other rejection.
+    #[error("coordinator rejected poll ({status}): {message}")]
+    Rejected {
+        status: reqwest::StatusCode,
+        message: String,
+    },
     #[error("WireGuard reconciliation failed: {0}")]
     Wg(#[from] defguard_wireguard_rs::error::WireguardInterfaceError),
     #[error("firewall reconciliation failed: {0}")]
@@ -28,6 +35,23 @@ pub enum PollError {
     State(#[from] crate::state::StateError),
     #[error("agent is not registered yet — run `wireserve-agent join` first")]
     NotRegistered,
+}
+
+impl PollError {
+    /// F9 (security review): a 401 specifically means this node's bearer
+    /// token no longer works — almost always because an admin revoked it
+    /// — as opposed to a transient network/server error that's worth
+    /// blindly retrying.
+    #[must_use]
+    pub fn is_unauthorized(&self) -> bool {
+        matches!(
+            self,
+            PollError::Rejected {
+                status,
+                ..
+            } if *status == reqwest::StatusCode::UNAUTHORIZED
+        )
+    }
 }
 
 /// Builds the request body from currently-declared services — this is the
@@ -51,6 +75,28 @@ pub fn service_rules(declared: &[ServiceDecl]) -> Vec<ServiceRule> {
             port: d.port,
         })
         .collect()
+}
+
+/// Parses a `/poll` error body for a `conflicting_service` name (spec
+/// §4.3's 409, coordinator side) and, if present, removes it from
+/// `declared_services` and records why in `rejected_services` (security
+/// review F3). Kept pure/testable separately from the network call.
+/// Returns whether it actually quarantined anything, so the caller knows
+/// whether `state` needs saving.
+pub fn quarantine_rejected_service(state: &mut AgentState, error_body: &str) -> bool {
+    let Some(name) = serde_json::from_str::<wireserve_types::ErrorBody>(error_body)
+        .ok()
+        .and_then(|b| b.conflicting_service)
+    else {
+        return false;
+    };
+    state.declared_services.retain(|d| d.name != name);
+    state.rejected_services.retain(|r| r.name != name);
+    state.rejected_services.push(crate::state::RejectedService {
+        name,
+        reason: error_body.to_string(),
+    });
+    true
 }
 
 pub struct PollContext<'a, F: FirewallBackend> {
@@ -85,8 +131,27 @@ where
         .send()
         .await?;
     if !resp.status().is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(PollError::Rejected(body));
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+
+        // F3 (security review): a single colliding service name used to
+        // wedge the whole agent forever — this cycle's poll failed before
+        // ever reaching peer reconciliation, and since the same
+        // declaration was resent every cycle, EVERY future cycle failed
+        // the same way, so the agent stopped seeing new peers or
+        // revocations too. Quarantine exactly the offending declaration
+        // (drop it from what gets sent, record why) so the *next* cycle
+        // succeeds normally instead of repeating this forever. This
+        // cycle still reports failure — reconciliation resumes on the
+        // next poll interval, not this one.
+        if quarantine_rejected_service(state, &body_text) {
+            state.save(&crate::paths::state_path())?;
+        }
+
+        return Err(PollError::Rejected {
+            status,
+            message: body_text,
+        });
     }
     let directory: PollResponse = resp.json().await?;
 
@@ -147,5 +212,92 @@ mod tests {
         let declared = vec![ServiceDecl { name: "anything-goes-here".into(), port: 1, proto: Proto::Tcp }];
         let rules = service_rules(&declared);
         assert_eq!(rules, vec![ServiceRule { proto: Proto::Tcp, port: 1 }]);
+    }
+
+    // ---- F3: quarantine_rejected_service ----
+
+    fn state_with_declared(names: &[&str]) -> AgentState {
+        AgentState {
+            declared_services: names
+                .iter()
+                .map(|n| ServiceDecl {
+                    name: (*n).to_string(),
+                    port: 1,
+                    proto: Proto::Tcp,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn quarantine_removes_the_named_service_and_records_why() {
+        let mut state = state_with_declared(&["plex", "homeassistant"]);
+        let body = serde_json::to_string(&wireserve_types::ErrorBody::service_collision(
+            "service name 'plex' is already in use",
+            "plex",
+        ))
+        .unwrap();
+
+        let quarantined = quarantine_rejected_service(&mut state, &body);
+
+        assert!(quarantined);
+        assert_eq!(state.declared_services.len(), 1);
+        assert_eq!(state.declared_services[0].name, "homeassistant");
+        assert_eq!(state.rejected_services.len(), 1);
+        assert_eq!(state.rejected_services[0].name, "plex");
+    }
+
+    #[test]
+    fn quarantine_is_a_no_op_for_a_body_without_conflicting_service() {
+        let mut state = state_with_declared(&["plex"]);
+        let quarantined = quarantine_rejected_service(&mut state, r#"{"error":"invalid join token"}"#);
+
+        assert!(!quarantined);
+        assert_eq!(state.declared_services.len(), 1);
+        assert!(state.rejected_services.is_empty());
+    }
+
+    #[test]
+    fn quarantine_is_a_no_op_for_unparseable_body() {
+        let mut state = state_with_declared(&["plex"]);
+        let quarantined = quarantine_rejected_service(&mut state, "not json at all");
+
+        assert!(!quarantined);
+        assert_eq!(state.declared_services.len(), 1);
+    }
+
+    #[test]
+    fn requarantining_the_same_name_does_not_duplicate_the_record() {
+        let mut state = state_with_declared(&["plex"]);
+        let body = serde_json::to_string(&wireserve_types::ErrorBody::service_collision(
+            "service name 'plex' is already in use",
+            "plex",
+        ))
+        .unwrap();
+
+        quarantine_rejected_service(&mut state, &body);
+        quarantine_rejected_service(&mut state, &body);
+
+        assert_eq!(state.rejected_services.len(), 1);
+    }
+
+    // ---- F9: PollError::is_unauthorized ----
+
+    #[test]
+    fn is_unauthorized_true_only_for_401() {
+        let unauthorized = PollError::Rejected {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            message: "unauthorized".into(),
+        };
+        assert!(unauthorized.is_unauthorized());
+
+        let conflict = PollError::Rejected {
+            status: reqwest::StatusCode::CONFLICT,
+            message: "conflict".into(),
+        };
+        assert!(!conflict.is_unauthorized());
+
+        assert!(!PollError::NotRegistered.is_unauthorized());
     }
 }

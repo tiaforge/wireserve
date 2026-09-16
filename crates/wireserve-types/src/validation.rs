@@ -21,6 +21,66 @@ pub fn is_valid_dns_label(s: &str) -> bool {
     bytes.iter().all(|&b| is_alnum(b) || b == b'-')
 }
 
+/// Validates a WireGuard public key: standard base64 (with padding) encoding
+/// of exactly 32 bytes, per the WireGuard key format. Rejects anything else
+/// outright — including embedded newlines — so a malicious or buggy peer
+/// can never get a value containing config-file syntax (e.g. a fake
+/// `\nAllowedIPs = 0.0.0.0/0` line) treated as "a pubkey" anywhere
+/// downstream, such as a rendered `.conf` (spec §9) or admin CLI output.
+#[must_use]
+pub fn is_valid_wg_pubkey(s: &str) -> bool {
+    use base64::Engine;
+    if s.contains('\n') || s.contains('\r') {
+        return false;
+    }
+    match base64::engine::general_purpose::STANDARD.decode(s) {
+        Ok(bytes) => bytes.len() == 32,
+        Err(_) => false,
+    }
+}
+
+/// Validates an `endpoint_addr` value: `host:port`, where `host` is either
+/// a bracketed IPv6 literal, a bare IPv4 literal, or a DNS hostname, and
+/// `port` is 1-65535. Rejects embedded newlines/control characters
+/// outright — the same config-injection concern as `is_valid_wg_pubkey`
+/// above, since this value is echoed verbatim into `PeerInfo.endpoint_addr`
+/// and from there into rendered `.conf` files and admin CLI output. This is
+/// deliberately permissive about hostname syntax (real-world dynamic-DNS
+/// hostnames vary) but strict about structure and character set.
+#[must_use]
+pub fn is_valid_endpoint_addr(s: &str) -> bool {
+    if s.is_empty() || s.len() > 255 {
+        return false;
+    }
+    if !s.is_ascii() || s.chars().any(|c| c.is_ascii_control() || c.is_whitespace()) {
+        return false;
+    }
+
+    let (host, port) = match s.rsplit_once(':') {
+        Some((h, p)) => (h, p),
+        None => return false,
+    };
+    let Ok(port_num) = port.parse::<u32>() else {
+        return false;
+    };
+    if port_num == 0 || port_num > 65535 {
+        return false;
+    }
+
+    if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        // Bracketed IPv6 literal, e.g. "[::1]:51820".
+        return inner.parse::<std::net::Ipv6Addr>().is_ok();
+    }
+
+    // Bare IPv4 literal or DNS hostname: alphanumeric, hyphens, and dots
+    // only, matching what's actually valid in a hostname/A-label, and
+    // ruling out anything that could be interpreted as config-file syntax.
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,5 +155,76 @@ mod tests {
     #[test]
     fn hyphen_in_middle_is_valid() {
         assert!(is_valid_dns_label("home-assistant"));
+    }
+
+    // ---- is_valid_wg_pubkey ----
+
+    #[test]
+    fn valid_pubkey_is_32_bytes_base64() {
+        // 32 arbitrary bytes, standard base64 with padding.
+        assert!(is_valid_wg_pubkey("AAECAwQFBgcICQoLDA0OD/Dh0sO0pZaHeGlaSzwtHg8="));
+    }
+
+    #[test]
+    fn rejects_wrong_length_pubkey() {
+        assert!(!is_valid_wg_pubkey("QQ==")); // 1 byte
+        assert!(!is_valid_wg_pubkey(""));
+    }
+
+    #[test]
+    fn rejects_pubkey_with_embedded_newline() {
+        // The exact attack shape from the security review: a "pubkey" that
+        // is actually trying to smuggle extra .conf lines.
+        assert!(!is_valid_wg_pubkey(
+            "AAECAwQFBgcICQoLDA0OD/Dh0sO0pZaHeGlaSzwtHg8=\nAllowedIPs = 0.0.0.0/0"
+        ));
+    }
+
+    #[test]
+    fn rejects_non_base64_pubkey() {
+        assert!(!is_valid_wg_pubkey("not valid base64!!"));
+    }
+
+    // ---- is_valid_endpoint_addr ----
+
+    #[test]
+    fn valid_endpoint_addrs() {
+        for s in [
+            "1.2.3.4:51820",
+            "duckdns.example.com:51820",
+            "[::1]:51820",
+            "[2001:db8::1]:51820",
+        ] {
+            assert!(is_valid_endpoint_addr(s), "expected {s:?} to be valid");
+        }
+    }
+
+    #[test]
+    fn rejects_endpoint_without_port() {
+        assert!(!is_valid_endpoint_addr("1.2.3.4"));
+        assert!(!is_valid_endpoint_addr("example.com"));
+    }
+
+    #[test]
+    fn rejects_endpoint_with_out_of_range_or_non_numeric_port() {
+        assert!(!is_valid_endpoint_addr("1.2.3.4:0"));
+        assert!(!is_valid_endpoint_addr("1.2.3.4:70000"));
+        assert!(!is_valid_endpoint_addr("1.2.3.4:notaport"));
+    }
+
+    #[test]
+    fn rejects_endpoint_addr_with_embedded_newline_or_config_injection() {
+        // The exact attack shape from the security review: a bearer-token
+        // holder trying to smuggle an extra .conf directive via
+        // endpoint_addr, e.g. to redirect a static peer's whole-mesh
+        // traffic to an attacker-controlled host.
+        assert!(!is_valid_endpoint_addr("1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0"));
+        assert!(!is_valid_endpoint_addr("1.2.3.4:51820\r\nEndpoint = evil.example:1"));
+    }
+
+    #[test]
+    fn rejects_endpoint_addr_with_invalid_host_characters() {
+        assert!(!is_valid_endpoint_addr("host with spaces:51820"));
+        assert!(!is_valid_endpoint_addr("host/slash:51820"));
     }
 }

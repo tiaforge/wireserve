@@ -1,4 +1,5 @@
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::Json;
 use wireserve_types::{
     AdminPeersResponse, CreateNodeRequest, CreateNodeResponse, RejoinResponse, JOIN_TOKEN_PREFIX,
@@ -15,7 +16,7 @@ pub async fn create_node(
     State(state): State<AppState>,
     _admin: AdminAuth,
     Json(req): Json<CreateNodeRequest>,
-) -> Result<Json<CreateNodeResponse>, AppError> {
+) -> Result<(StatusCode, Json<CreateNodeResponse>), AppError> {
     if !wireserve_types::is_valid_dns_label(&req.name) {
         return Err(AppError::BadRequest(format!(
             "invalid node name: {}",
@@ -31,10 +32,13 @@ pub async fn create_node(
 
     tracing::info!(event = "node_created", node_name = %req.name, kind = req.kind.as_str());
 
-    Ok(Json(CreateNodeResponse {
-        name: req.name,
-        join_token,
-    }))
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateNodeResponse {
+            name: req.name,
+            join_token,
+        }),
+    ))
 }
 
 /// `POST /admin/nodes/{name}/revoke` (spec §4.4).
@@ -51,24 +55,35 @@ pub async fn revoke_node(
 }
 
 /// `POST /admin/nodes/{name}/rejoin` (spec §4.5).
+///
+/// Also clears the node's current bearer token immediately (security
+/// review S8): spec §4.5 explicitly covers calling this on a node whose
+/// key is "suspected compromised" while the node itself isn't yet
+/// revoked — leaving the OLD bearer token live until a new `/register`
+/// completes would mean a compromised credential keeps working for the
+/// entire window between "we suspect this" and "the physical operator
+/// gets around to re-registering it," which defeats the point of having
+/// this path at all. `revoked` itself still only clears back to `0` on a
+/// *successful* subsequent `/register` (unchanged).
 pub async fn rejoin_node(
     State(state): State<AppState>,
     _admin: AdminAuth,
     Path(name): Path<String>,
-) -> Result<Json<RejoinResponse>, AppError> {
+) -> Result<(StatusCode, Json<RejoinResponse>), AppError> {
     let conn = state.db.conn.lock().await;
     let node = nodes::find_by_name(&conn, &name)?.ok_or(AppError::NotFound)?;
 
     let join_token = tokengen::generate(JOIN_TOKEN_PREFIX);
     let hash = wireserve_types::hash_token(&join_token);
     nodes::reissue_join_token(&conn, node.id, &hash)?;
+    nodes::clear_bearer_token(&conn, node.id)?;
 
     tracing::info!(event = "node_rejoined", node_name = %name);
 
-    Ok(Json(RejoinResponse {
-        name,
-        join_token,
-    }))
+    Ok((
+        StatusCode::CREATED,
+        Json(RejoinResponse { name, join_token }),
+    ))
 }
 
 /// `GET /admin/peers` (spec §4.5.1).

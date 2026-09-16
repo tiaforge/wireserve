@@ -11,6 +11,13 @@ pub struct Config {
     pub online_threshold_secs: i64,
     pub rate_limit_max: u32,
     pub rate_limit_window_secs: u64,
+    /// Security review finding S4: trust the right-most `X-Forwarded-For`
+    /// entry as the client IP instead of the raw TCP peer address (which,
+    /// per spec §7, is always the reverse proxy itself). Off by default —
+    /// only safe to enable when the coordinator is actually reachable
+    /// exclusively through a proxy that sets this header, since otherwise
+    /// a client could forge it to evade rate limiting entirely.
+    pub trust_proxy_headers: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +58,7 @@ impl Config {
         let online_threshold_secs = env_parse_or("WIRESERVE_ONLINE_THRESHOLD_SECS", 180)?;
         let rate_limit_max = env_parse_or("WIRESERVE_RATE_LIMIT_MAX", 10)?;
         let rate_limit_window_secs = env_parse_or("WIRESERVE_RATE_LIMIT_WINDOW_SECS", 60)?;
+        let trust_proxy_headers = env_parse_or("WIRESERVE_TRUST_PROXY_HEADERS", false)?;
 
         Ok(Self {
             listen_addr,
@@ -62,6 +70,7 @@ impl Config {
             online_threshold_secs,
             rate_limit_max,
             rate_limit_window_secs,
+            trust_proxy_headers,
         })
     }
 }

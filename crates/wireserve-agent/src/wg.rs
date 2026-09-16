@@ -70,6 +70,23 @@ pub fn peers_to_remove<'a>(
         .collect()
 }
 
+/// Computes which desired peers actually need a `configure_peer` call:
+/// new peers, or ones whose configuration changed since last applied.
+/// Security review F6 — kept pure/testable separately from the netlink
+/// calls, same reasoning as `peers_to_remove`. See `WgInterface::reconcile`
+/// for why re-sending an unchanged peer defeats WireGuard's own roaming
+/// correction.
+pub fn peers_to_configure<'a>(
+    applied: &HashMap<Key, Peer>,
+    desired: &'a HashMap<Key, Peer>,
+) -> Vec<&'a Peer> {
+    desired
+        .iter()
+        .filter(|(key, peer)| applied.get(*key) != Some(*peer))
+        .map(|(_, peer)| peer)
+        .collect()
+}
+
 pub struct WgInterface {
     api: WGApi<Kernel>,
     ifname: String,
@@ -113,6 +130,21 @@ impl WgInterface {
     }
 
     /// Reconciles the kernel peer set to exactly `peers` (minus `self`).
+    ///
+    /// **Only calls `configure_peer` for peers that are new or actually
+    /// changed** (security review F6): re-sending an unchanged peer's
+    /// config on every cycle — including its `Endpoint` — resets
+    /// WireGuard's own kernel-level roaming correction every cycle
+    /// (`persistent_keepalive`/normal traffic updates the kernel's live
+    /// endpoint when a peer's source address changes, e.g. after a NAT
+    /// rebind; spec §4.2 explicitly relies on this), defeating the exact
+    /// mechanism spec §4.2 relies on to correct a stale `endpoint_addr`.
+    /// `Peer` derives `PartialEq` over all its fields, and neither side
+    /// of this comparison is ever populated with real kernel stats
+    /// (`last_handshake`/`tx_bytes`/`rx_bytes` stay at their `Peer::new`
+    /// defaults on both the freshly-built `desired` value and whatever
+    /// was stored in `self.applied` on a previous cycle), so the
+    /// comparison only ever reflects the fields this code actually sets.
     pub fn reconcile(
         &mut self,
         peers: &[PeerInfo],
@@ -123,7 +155,7 @@ impl WgInterface {
         for key in peers_to_remove(self.applied.keys(), &desired) {
             self.api.remove_peer(&key)?;
         }
-        for peer in desired.values() {
+        for peer in peers_to_configure(&self.applied, &desired) {
             self.api.configure_peer(peer)?;
         }
 
@@ -203,5 +235,77 @@ mod tests {
 
         let to_remove = peers_to_remove(applied.iter(), &desired);
         assert_eq!(to_remove, vec![b]);
+    }
+
+    // ---- F6: peers_to_configure must skip unchanged peers ----
+
+    #[test]
+    fn peers_to_configure_includes_brand_new_peers() {
+        let a = defguard_wireguard_rs::key::Key::new([1; 32]);
+        let applied = HashMap::new();
+        let mut desired = HashMap::new();
+        desired.insert(a.clone(), Peer::new(a.clone()));
+
+        let to_configure = peers_to_configure(&applied, &desired);
+        assert_eq!(to_configure.len(), 1);
+    }
+
+    #[test]
+    fn peers_to_configure_skips_a_peer_that_is_byte_for_byte_unchanged() {
+        let a = defguard_wireguard_rs::key::Key::new([1; 32]);
+        let mut peer = Peer::new(a.clone());
+        peer.persistent_keepalive_interval = Some(25);
+        peer.set_endpoint("10.0.0.1:51820").unwrap();
+
+        let mut applied = HashMap::new();
+        applied.insert(a.clone(), peer.clone());
+        let mut desired = HashMap::new();
+        desired.insert(a.clone(), peer);
+
+        // This is the exact regression: re-sending an identical peer
+        // config every poll cycle resets WireGuard's own kernel-level
+        // roaming correction (spec §4.2) every cycle.
+        assert!(
+            peers_to_configure(&applied, &desired).is_empty(),
+            "an unchanged peer must not be re-sent to configure_peer"
+        );
+    }
+
+    #[test]
+    fn peers_to_configure_includes_a_peer_whose_endpoint_changed() {
+        let a = defguard_wireguard_rs::key::Key::new([1; 32]);
+        let mut old_peer = Peer::new(a.clone());
+        old_peer.set_endpoint("10.0.0.1:51820").unwrap();
+        let mut new_peer = Peer::new(a.clone());
+        new_peer.set_endpoint("10.0.0.2:51820").unwrap();
+
+        let mut applied = HashMap::new();
+        applied.insert(a.clone(), old_peer);
+        let mut desired = HashMap::new();
+        desired.insert(a.clone(), new_peer);
+
+        assert_eq!(peers_to_configure(&applied, &desired).len(), 1);
+    }
+
+    #[test]
+    fn peers_to_configure_only_returns_the_changed_peer_not_every_peer() {
+        let a = defguard_wireguard_rs::key::Key::new([1; 32]);
+        let b = defguard_wireguard_rs::key::Key::new([2; 32]);
+        let unchanged = Peer::new(a.clone());
+        let mut old_b = Peer::new(b.clone());
+        old_b.set_endpoint("10.0.0.1:51820").unwrap();
+        let mut new_b = Peer::new(b.clone());
+        new_b.set_endpoint("10.0.0.2:51820").unwrap();
+
+        let mut applied = HashMap::new();
+        applied.insert(a.clone(), unchanged.clone());
+        applied.insert(b.clone(), old_b);
+        let mut desired = HashMap::new();
+        desired.insert(a.clone(), unchanged);
+        desired.insert(b.clone(), new_b);
+
+        let to_configure = peers_to_configure(&applied, &desired);
+        assert_eq!(to_configure.len(), 1);
+        assert_eq!(to_configure[0].public_key, b);
     }
 }
