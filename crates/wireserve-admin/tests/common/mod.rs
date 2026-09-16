@@ -161,6 +161,18 @@ async fn revoke_node(
     Ok(StatusCode::OK)
 }
 
+async fn delete_node(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(_name): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    record(&state, "DELETE", "/admin/nodes/:name", b"");
+    if !admin_auth_ok(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(StatusCode::OK)
+}
+
 async fn rejoin_node(
     State(state): State<MockState>,
     headers: HeaderMap,
@@ -208,6 +220,7 @@ fn admin_only_routes() -> Router<MockState> {
         .route("/admin/nodes", post(create_node))
         .route("/admin/nodes/{name}/revoke", post(revoke_node))
         .route("/admin/nodes/{name}/rejoin", post(rejoin_node))
+        .route("/admin/nodes/{name}", axum::routing::delete(delete_node))
         .route("/admin/peers", get(list_peers))
 }
 

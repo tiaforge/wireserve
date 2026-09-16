@@ -2,7 +2,7 @@ pub mod admin;
 pub mod poll;
 pub mod register;
 
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 
 use crate::state::AppState;
@@ -26,6 +26,7 @@ pub fn admin_router(state: AppState) -> Router {
         .route("/admin/nodes", post(admin::create_node))
         .route("/admin/nodes/{name}/revoke", post(admin::revoke_node))
         .route("/admin/nodes/{name}/rejoin", post(admin::rejoin_node))
+        .route("/admin/nodes/{name}", delete(admin::delete_node))
         .route("/admin/peers", get(admin::list_peers))
         .with_state(state)
 }

@@ -208,6 +208,17 @@ pub fn clear_bearer_token(conn: &Connection, node_id: i64) -> Result<(), DbError
     Ok(())
 }
 
+/// Hard-deletes a node record (security review F8: there was no way to
+/// free a name burned by e.g. a failed `export-config` between create and
+/// register). `services` rows go with it via the schema's
+/// `ON DELETE CASCADE` — this is the one path where that cascade
+/// actually fires, unlike `revoke` (see its doc comment). The caller is
+/// responsible for refusing to delete a node that is still active.
+pub fn delete_node(conn: &Connection, node_id: i64) -> Result<(), DbError> {
+    conn.execute("DELETE FROM nodes WHERE id = ?1", [node_id])?;
+    Ok(())
+}
+
 /// All addresses currently allocated (any node, regardless of registration
 /// state) — used by the IP allocator to avoid handing out a duplicate.
 pub fn all_allocated_ip4(conn: &Connection) -> Result<Vec<Ipv4Addr>, DbError> {

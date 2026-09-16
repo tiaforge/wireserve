@@ -89,6 +89,18 @@ impl AdminClient {
         Ok(())
     }
 
+    /// `DELETE /admin/nodes/{name}` (security review F8). The coordinator
+    /// refuses with 409 while the node is still active.
+    pub fn delete_node(&self, name: &str) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/admin/nodes/{name}")))
+            .bearer_auth(&self.admin_token)
+            .send()?;
+        Self::check_status(resp)?;
+        Ok(())
+    }
+
     /// `POST /admin/nodes/{name}/rejoin` (spec §4.5).
     pub fn rejoin(&self, name: &str) -> Result<RejoinResponse, ClientError> {
         let resp = self

@@ -136,3 +136,20 @@ fn list_peers_reflects_mock_directory() {
     assert_eq!(resp.peers.len(), 1);
     assert_eq!(resp.peers[0].name, "homeserver");
 }
+
+// ---- F8: delete-node ----
+
+#[test]
+fn delete_node_sends_delete_with_admin_token_and_validates_name_first() {
+    let mock = MockCoordinator::start(TOKEN);
+    let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
+
+    assert!(wireserve_admin::cmd_delete_node(&client, "Bad_Name").is_err());
+    assert_eq!(mock.request_count(), 0);
+
+    wireserve_admin::cmd_delete_node(&client, "orphan").unwrap();
+    assert_eq!(mock.request_count(), 1);
+
+    let wrong = AdminClient::new(mock.base_url.as_str(), "wrong-token");
+    assert!(wireserve_admin::cmd_delete_node(&wrong, "orphan").is_err());
+}

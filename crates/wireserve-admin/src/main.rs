@@ -32,6 +32,9 @@ enum Command {
     Revoke { name: String },
     /// Issue a fresh join token for an existing node record (spec §4.5).
     Rejoin { name: String },
+    /// Permanently delete a node record and free its name. Refused while
+    /// the node is still active — revoke it first.
+    DeleteNode { name: String },
     /// List the full peer directory (spec §4.5.1).
     ListPeers,
     /// Generate a WireGuard .conf for an agent-less consumer-only device
@@ -86,6 +89,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 "node '{}' rejoined — new join token: {}",
                 resp.name, resp.join_token
             );
+        }
+        Command::DeleteNode { name } => {
+            check_name(&name)?;
+            let client = build_client(&coordinator_url, &admin_token)?;
+            wireserve_admin::cmd_delete_node(&client, &name)?;
+            println!("node '{name}' deleted");
         }
         Command::ListPeers => {
             let client = build_client(&coordinator_url, &admin_token)?;
@@ -189,19 +198,7 @@ fn build_client(
 /// legitimate and must keep working without a flag to silence a false
 /// alarm.
 fn warn_if_plaintext_to_remote_host(url: &str) {
-    let Some(rest) = url.strip_prefix("http://") else {
-        return;
-    };
-    let host = rest
-        .split(['/', ':'])
-        .next()
-        .unwrap_or(rest);
-    let is_loopback = host == "localhost"
-        || host
-            .parse::<std::net::IpAddr>()
-            .map(|ip| ip.is_loopback())
-            .unwrap_or(false);
-    if !is_loopback {
+    if wireserve_types::is_plaintext_http_to_remote_host(url) {
         eprintln!(
             "warning: sending requests to {url} over plain HTTP — the admin token (and any \
              join token) will be sent in clear over the network. Spec §7 assumes a \

@@ -41,6 +41,20 @@ pub async fn register(
         }
     }
 
+    // S3/S4 (security review, round 2): the same before/after split the
+    // auth extractors use. The budget is checked BEFORE the token lookup
+    // — so a source that has exhausted its failed-attempt budget is
+    // turned away even if its next guess would have been correct, which
+    // is what makes the limiter an actual brute-force bound rather than a
+    // response-code cosmetic — and it is keyed on the proxy-resolved
+    // client IP, not the raw TCP peer (which behind spec §7's mandated
+    // reverse proxy is always the proxy itself).
+    let observed_ip =
+        crate::client_ip::resolve(&headers, peer_addr.ip(), state.config.trust_proxy_headers);
+    if state.rate_limiter.is_blocked(observed_ip) {
+        return Err(AppError::TooManyRequests);
+    }
+
     let hash = wireserve_types::hash_token(&req.join_token);
     let conn = state.db.conn.lock().await;
 
@@ -51,9 +65,7 @@ pub async fn register(
             // purpose (spec: "reject if token already used or unknown" —
             // with the same shape, so a caller learns nothing about
             // whether a guessed token was ever valid).
-            if !state.rate_limiter.check(peer_addr.ip()) {
-                return Err(AppError::TooManyRequests);
-            }
+            state.rate_limiter.record_failure(observed_ip);
             return Err(AppError::Internal(DbError::JoinTokenInvalid));
         }
     };
@@ -102,8 +114,6 @@ pub async fn register(
     // fallback would hand out the proxy's own useless local address to
     // every other node as this node's "reachable" endpoint.
     let (endpoint_addr, listen_port) = if node.kind == NodeKind::Agent {
-        let observed_ip =
-            crate::client_ip::resolve(&headers, peer_addr.ip(), state.config.trust_proxy_headers);
         // Loopback is unconditionally useless to any other peer, in any
         // topology. A private-range address is only suspect when we've
         // been told to expect a proxy (trust_proxy_headers) yet still

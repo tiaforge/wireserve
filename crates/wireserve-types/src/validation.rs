@@ -81,9 +81,62 @@ pub fn is_valid_endpoint_addr(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
 }
 
+/// Whether `url` is plain `http://` to a host that is not loopback — i.e.
+/// a bearer/join/admin token sent to it would cross a network in clear
+/// (security review S6; spec §7 assumes TLS termination in front of the
+/// coordinator for every non-local path). Shared by both `wireserve-agent`
+/// and `wireserve-admin` so the two clients can't drift on what counts as
+/// "local". Anything that isn't `http://` (including `https://` and
+/// malformed input) is reported as not-plaintext-remote — this is a
+/// warning aid, not a URL validator.
+#[must_use]
+pub fn is_plaintext_http_to_remote_host(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    // Strip any path, then any port. A bracketed IPv6 literal is handled
+    // by stripping the brackets before parsing.
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = if let Some(inner) = authority.strip_prefix('[') {
+        inner.split(']').next().unwrap_or(inner)
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    };
+    if host.is_empty() || host == "localhost" {
+        return false;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => !ip.is_loopback(),
+        Err(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- is_plaintext_http_to_remote_host ----
+
+    #[test]
+    fn plaintext_remote_detection() {
+        for local in [
+            "http://127.0.0.1:8081",
+            "http://localhost:8080/",
+            "http://[::1]:8080",
+            "https://coordinator.example.com",
+            "http://",
+            "not-a-url",
+        ] {
+            assert!(!is_plaintext_http_to_remote_host(local), "{local:?} must not warn");
+        }
+        for remote in [
+            "http://coordinator.example.com",
+            "http://10.0.0.5:8080/",
+            "http://[fd00::5]:8080",
+        ] {
+            assert!(is_plaintext_http_to_remote_host(remote), "{remote:?} must warn");
+        }
+    }
 
     #[test]
     fn valid_labels() {

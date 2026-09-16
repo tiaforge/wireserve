@@ -1,0 +1,4 @@
+# Linux-targeted project: keep every text file LF in the working tree
+# regardless of the contributor's global core.autocrlf setting, so diffs
+# never fill with line-ending churn.
+* text=auto eol=lf

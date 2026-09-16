@@ -9,11 +9,13 @@ source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
 **Currently working on:** nothing open — all milestones complete, including
-the independent security review remediation (M7) and a real, reproducible
-end-to-end test (`deploy/e2e/run-e2e-test.sh`). 169 tests passing across
-`cargo test --workspace` (agent tested with `--no-default-features`
-locally; the real `nftables` feature is exercised by the E2E script's own
-container builds, which also passed in full).
+the independent security review remediation (M7), its second-round
+follow-up (M8, closing every S/F item M7 had left partial), and a real,
+reproducible end-to-end test (`deploy/e2e/run-e2e-test.sh`). 176 tests
+passing across `cargo test --workspace` (agent tested with
+`--no-default-features` locally; the real `nftables` feature is exercised
+by the E2E script's own container builds). M8's changes are covered by
+unit/integration tests only — the E2E script was not re-run for M8.
 
 ## Milestones
 
@@ -119,6 +121,37 @@ container builds, which also passed in full).
         warning)**, **S7 (join token on the command line)** — all fixed
         (file perms, a warning, and `--join-token-file`/stdin support
         respectively).
+- [x] **M8 — Security review, round 2**: the reviewer re-verified M7
+      against the code and found five S/F items only partially closed.
+      All closed here, unit/integration-tested (176 total), clippy clean;
+      the E2E script was deliberately not re-run for this milestone.
+      - **S3/S4 on `/register`** — the extractors had been fixed in M7
+        but `/register` itself still recorded the failure *after* the
+        token lookup (a correct guess was never throttled) and keyed on
+        the raw TCP peer. Now checks `is_blocked` on the proxy-resolved
+        client IP before the lookup and `record_failure` after. Two new
+        integration tests: a correct token is refused with `429` once
+        the failed-attempt budget is spent, and with
+        `WIRESERVE_TRUST_PROXY_HEADERS` two clients behind one proxy get
+        separate budgets.
+      - **S6** — the plaintext-`http://` warning existed only in
+        `wireserve-admin`. The check now lives in `wireserve-types`
+        (`is_plaintext_http_to_remote_host`, unit-tested) and the agent
+        warns on `join` too.
+      - **F1** — M7's copy-back sync between the poll loop's private
+        state and the IPC server's shared state still lost any
+        `serve`/`unserve` issued while a poll request was in flight. The
+        daemon now holds exactly one `Arc<Mutex<AgentState>>`;
+        `poll_loop::run_once` snapshots what it sends, releases the lock
+        across the network round trip, and writes back only the fields
+        the cycle produced. The agent's HTTP client also gained a 30s
+        timeout so a hung coordinator can't pin `leave` behind it.
+      - **F5** — `Network=host` (see decisions log #40, corrected).
+      - **F8** — `delete-node` (see decisions log #43).
+      - Housekeeping: `.gitattributes` pins LF so a contributor's global
+        `core.autocrlf` no longer rewrites every touched file;
+        `WIRESERVE_TRUST_PROXY_HEADERS` documented in the coordinator
+        unit's env comment.
 
 Security-sensitive paths (tokens, auth, firewall default-deny, file
 permissions) get test coverage inline with each milestone that introduces
@@ -391,16 +424,18 @@ or would have regressed something already verified working.
     stale on every rejoin. Fixed: `/register` now reuses `ip4`/`ip6`
     from the existing node row when present, only allocating fresh
     addresses for a node that's never had any.
-40. **F5 — containerized agent claimed non-functional.** Half confirmed,
-    half refuted by direct testing: the `atomic_write`-over-bind-mounted-
-    `/etc/hosts` EBUSY failure was real and is fixed (see the M6-era fix
-    already in `fsutil.rs`, found independently before this review
-    landed). The claim that the mesh itself needs `--network host` was
-    tested directly and found **not necessary** — two containers on an
-    ordinary Podman/Docker bridge network reach each other over UDP just
-    fine for WireGuard's own traffic, confirmed by the E2E script
-    observing a real configured peer and real hosts-file propagation
-    with no host networking involved.
+40. **F5 — containerized agent claimed non-functional.** The
+    `atomic_write`-over-bind-mounted-`/etc/hosts` EBUSY failure was real
+    and is fixed in `fsutil.rs`. The `--network host` half was initially
+    marked "not necessary" here because the E2E script's two agents
+    reach each other over a bridge network — but that reasoning was
+    wrong, and M8 corrected it: in the E2E harness each *container* is
+    the node, so a private namespace is exactly right there, whereas in
+    the shipped deployment the *host* is the node and `wg0` plus the
+    nftables table must live in the host's namespace or nothing on the
+    host can use or serve over the mesh. `Network=host` is now set in
+    the Quadlet and documented as required in the Dockerfile's run
+    example; the E2E harness intentionally keeps isolated namespaces.
 41. **F6 — endpoint reapplied every poll cycle defeated WireGuard's own
     roaming correction**, since `configure_peer` was called
     unconditionally for every peer every cycle regardless of whether
@@ -413,12 +448,12 @@ or would have regressed something already verified working.
     updated to assert `201`.
 43. **F8 — no way to delete an orphaned node record** (e.g. a failed
     `export-config` between create and register burns a name with an
-    unprinted join token forever). **Not fixed in this pass** — a real
-    gap, but lower severity than the rest (a burned name is an
-    annoyance, not a security or correctness issue) and out of scope
-    for this remediation round; a `DELETE /admin/nodes/{name}` +
-    `wireserve-admin delete-node` following the same shape as `revoke`
-    would close it.
+    unprinted join token forever). Deferred in M7, closed in M8:
+    `DELETE /admin/nodes/{name}` + `wireserve-admin delete-node`. The
+    route refuses (`409`) while the node is registered and not revoked,
+    so removing a live mesh member is always a deliberate revoke-then-
+    delete, never a single slip. `services` rows go via the schema's
+    `ON DELETE CASCADE` — the one path where that cascade fires.
 44. **F9 — a revoked agent got `401` forever and never noticed.** Spec
     doesn't require teardown here, but silently retrying forever with a
     dead token and a stale peer set serves no purpose. Fixed:

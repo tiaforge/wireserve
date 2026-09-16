@@ -31,7 +31,23 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
     let private_key = Key::generate();
     let public_key = private_key.public_key();
 
-    let client = reqwest::Client::new();
+    // Security review S6: the join token (and the bearer token coming
+    // back) would cross the network in clear over plain http:// to a
+    // non-loopback host. A warning, not a refusal — a loopback or
+    // internal-network coordinator without TLS is a legitimate topology.
+    if wireserve_types::is_plaintext_http_to_remote_host(params.coordinator_url) {
+        eprintln!(
+            "warning: registering with {} over plain HTTP — the join token and the returned \
+             bearer token will cross the network in clear. Spec §7 assumes a TLS-terminating \
+             reverse proxy in front of the coordinator; use an https:// URL unless this really \
+             is a loopback/trusted-local connection.",
+            params.coordinator_url
+        );
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
     let url = format!("{}/register", params.coordinator_url.trim_end_matches('/'));
     let req = RegisterRequest {
         join_token: params.join_token.to_string(),

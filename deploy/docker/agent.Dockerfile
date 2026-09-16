@@ -6,6 +6,7 @@
 # Run with:
 #
 #   docker run -d --name wireserve-agent \
+#     --network host \
 #     --cap-add=NET_ADMIN --device /dev/net/tun \
 #     -v /etc/hosts:/etc/hosts \
 #     -v wireserve-agent-state:/var/lib/wireserve \
@@ -16,6 +17,15 @@
 # Never --privileged (spec §8) — CAP_NET_ADMIN + /dev/net/tun is the
 # whole capability set this needs for WireGuard and nftables netlink
 # operations.
+#
+# --network host is REQUIRED for a real node (security review F5): the
+# agent creates wg0 and installs its nftables table in whatever network
+# namespace it runs in. In a private container namespace nothing on the
+# host can reach the mesh, and no service running on the host is
+# reachable through it — the container would be a node all by itself.
+# Host networking puts wg0 and the firewall rules on the host, which is
+# the point. (deploy/e2e deliberately runs agents in isolated namespaces
+# because there each container IS the node under test.)
 #
 # IMPORTANT caveat, not a Dockerfile-solvable problem: the managed
 # /etc/hosts block (spec §6) is only useful to processes that share the

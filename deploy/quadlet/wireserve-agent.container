@@ -8,6 +8,16 @@
 # by hand against both, not generated, so any future change to either
 # must be applied here too.
 #
+# Network=host is REQUIRED for this container to be useful as a node
+# (security review F5): the agent creates the WireGuard interface and
+# installs nftables rules in whatever network namespace it runs in. In a
+# private container namespace, nothing on the host could reach the mesh
+# and no service running on the host would be reachable through it. With
+# host networking, wg0 and the `wireserve` nftables table land on the
+# host itself, which is the whole point. (An isolated namespace is only
+# appropriate for a test harness like deploy/e2e, where the "node" is
+# the container.)
+#
 # Same caveat as the Dockerfile: the bind-mounted /etc/hosts below is
 # what makes spec §6's <name>.wg entries resolve for processes on the
 # HOST rather than just inside this container — omit it if nothing
@@ -21,6 +31,7 @@ Wants=network-online.target
 [Container]
 Image=localhost/wireserve-agent:latest
 EnvironmentFile=/etc/wireserve/agent.env
+Network=host
 AddCapability=CAP_NET_ADMIN
 AddDevice=/dev/net/tun
 Volume=/etc/hosts:/etc/hosts

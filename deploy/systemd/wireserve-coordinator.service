@@ -13,6 +13,13 @@ Group=wireserve
 # WIRESERVE_LISTEN_ADDR, WIRESERVE_ADMIN_LISTEN_ADDR, WIRESERVE_DB_PATH,
 # WIRESERVE_NET_V4_CIDR, WIRESERVE_NET_V6_PREFIX, ...) live outside the
 # unit file, mode 600, owned by the wireserve user.
+#
+# Set WIRESERVE_TRUST_PROXY_HEADERS=true there when (and only when) the
+# node-facing listener is reachable exclusively through a reverse proxy
+# that sets X-Forwarded-For: it makes rate limiting and /register's
+# endpoint fallback use the real client address instead of the proxy's.
+# Leaving it on with a directly reachable listener lets clients forge
+# their own source address.
 EnvironmentFile=/etc/wireserve/coordinator.env
 Environment=WIRESERVE_DB_PATH=/var/lib/wireserve/coordinator.db
 

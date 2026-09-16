@@ -7,6 +7,7 @@
 
 use std::path::Path;
 
+use tokio::sync::Mutex;
 use wireserve_types::{FirewallBackend, PollRequest, PollResponse, ServiceDecl, ServiceRule};
 
 use crate::state::AgentState;
@@ -102,31 +103,47 @@ pub fn quarantine_rejected_service(state: &mut AgentState, error_body: &str) -> 
 pub struct PollContext<'a, F: FirewallBackend> {
     pub client: &'a reqwest::Client,
     pub coordinator_url: &'a str,
-    pub bearer_token: &'a str,
     pub hosts_path: &'a Path,
     pub wg: &'a mut WgInterface,
     pub firewall: &'a mut F,
 }
 
-/// Runs exactly one poll cycle against `state`, performing all five steps
-/// in order. Returns the fresh directory on success.
+/// Runs exactly one poll cycle against the daemon's single shared `state`,
+/// performing all five steps in order. Returns the fresh directory on
+/// success.
+///
+/// F1 (security review, round 2): `state` is the same `Mutex` the IPC
+/// server mutates, and the lock is held only for the moments this
+/// function reads or writes it — never across the network round trip —
+/// so a `serve`/`unserve`/`list` issued while a poll is in flight is
+/// neither blocked nor lost. Only the fields this cycle actually
+/// produces (`last_directory`, a quarantined declaration) are written
+/// back; `declared_services` is never overwritten wholesale.
 pub async fn run_once<F: FirewallBackend>(
     ctx: &mut PollContext<'_, F>,
-    state: &mut AgentState,
+    state: &Mutex<AgentState>,
 ) -> Result<PollResponse, PollError>
 where
     F::Error: std::fmt::Display,
 {
-    let bearer = state.bearer_token.as_deref().ok_or(PollError::NotRegistered)?;
-    let self_pubkey = state.public_key.clone().unwrap_or_default();
+    // Snapshot exactly what this cycle sends, then release the lock.
+    let (bearer, self_pubkey, declared, endpoint_addr) = {
+        let s = state.lock().await;
+        (
+            s.bearer_token.clone().ok_or(PollError::NotRegistered)?,
+            s.public_key.clone().unwrap_or_default(),
+            s.declared_services.clone(),
+            s.endpoint_addr.clone(),
+        )
+    };
 
     // 1. send
-    let req = build_poll_request(&state.declared_services, state.endpoint_addr.clone());
+    let req = build_poll_request(&declared, endpoint_addr);
     let url = format!("{}/poll", ctx.coordinator_url.trim_end_matches('/'));
     let resp = ctx
         .client
         .post(&url)
-        .bearer_auth(bearer)
+        .bearer_auth(&bearer)
         .json(&req)
         .send()
         .await?;
@@ -144,8 +161,11 @@ where
         // succeeds normally instead of repeating this forever. This
         // cycle still reports failure — reconciliation resumes on the
         // next poll interval, not this one.
-        if quarantine_rejected_service(state, &body_text) {
-            state.save(&crate::paths::state_path())?;
+        {
+            let mut s = state.lock().await;
+            if quarantine_rejected_service(&mut s, &body_text) {
+                s.save(&crate::paths::state_path())?;
+            }
         }
 
         return Err(PollError::Rejected {
@@ -158,9 +178,10 @@ where
     // 2. reconcile WireGuard peers
     ctx.wg.reconcile(&directory.peers, &self_pubkey)?;
 
-    // 3. reconcile this node's own firewall rules (from what we declared,
-    //    not from the coordinator's response).
-    let rules = service_rules(&state.declared_services);
+    // 3. reconcile this node's own firewall rules — from the snapshot
+    //    this cycle actually sent (spec §5), not from the coordinator's
+    //    response and not from whatever `serve` may have queued since.
+    let rules = service_rules(&declared);
     ctx.firewall
         .apply(&rules)
         .map_err(|e| PollError::Firewall(e.to_string()))?;
@@ -169,8 +190,11 @@ where
     crate::hosts::sync(ctx.hosts_path, &directory.services)?;
 
     // 5. persist merged state.
-    state.last_directory = Some(directory.clone());
-    state.save(&crate::paths::state_path())?;
+    {
+        let mut s = state.lock().await;
+        s.last_directory = Some(directory.clone());
+        s.save(&crate::paths::state_path())?;
+    }
 
     Ok(directory)
 }

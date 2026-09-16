@@ -137,7 +137,7 @@ fn resolve_join_token(
 
 async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<dyn std::error::Error>> {
     let state_path = paths::state_path();
-    let mut state = AgentState::load(&state_path)?;
+    let state = AgentState::load(&state_path)?;
     if state.bearer_token.is_none() {
         return Err("not registered — run `wireserve-agent join` first".into());
     }
@@ -160,7 +160,14 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
     firewall::startup_sequence(&mut fw).map_err(|e| e.to_string())?;
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
-    let shared_state = Arc::new(Mutex::new(state.clone()));
+    // F1 (security review, round 2): exactly ONE in-memory copy of the
+    // agent state, shared by the poll loop and the IPC server. The
+    // previous design kept two copies and re-synced them at cycle
+    // boundaries, which still silently dropped any `serve`/`unserve`
+    // issued while a poll request was in flight (the copy-back after the
+    // poll overwrote it).
+    let coordinator_url = state.coordinator_url.clone().unwrap_or_default();
+    let shared_state = Arc::new(Mutex::new(state));
     let ipc_ctx = AgentContext {
         state: shared_state.clone(),
         state_path: state_path.clone(),
@@ -174,37 +181,26 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
         }
     });
 
-    let client = reqwest::Client::new();
-    let coordinator_url = state.coordinator_url.clone().unwrap_or_default();
+    // A bounded timeout so a hung coordinator connection can never pin the
+    // poll loop (and with it `leave`, which is handled by the same
+    // `select!`) indefinitely.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
     let hosts_path = paths::hosts_path();
     let mut interval = tokio::time::interval(Duration::from_secs(poll_interval_secs));
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                // Pull in any serve/unserve queued via IPC since the last cycle.
-                {
-                    let shared = shared_state.lock().await;
-                    state.declared_services = shared.declared_services.clone();
-                }
-                let bearer_token = state.bearer_token.clone().unwrap_or_default();
                 let mut ctx = poll_loop::PollContext {
                     client: &client,
                     coordinator_url: &coordinator_url,
-                    bearer_token: &bearer_token,
                     hosts_path: &hosts_path,
                     wg: &mut wg,
                     firewall: &mut fw,
                 };
-                let result = poll_loop::run_once(&mut ctx, &mut state).await;
-
-                // F1 (security review): this cycle's outcome — including
-                // any F3 quarantine of a rejected declaration — must reach
-                // the copy `wireserve list` actually reads from over IPC.
-                // The two used to be separate clones that never
-                // resynchronized, so `list` always reported stale/empty
-                // data regardless of what polling actually did.
-                *shared_state.lock().await = state.clone();
+                let result = poll_loop::run_once(&mut ctx, &shared_state).await;
 
                 match result {
                     Ok(_) => tracing::info!("poll cycle succeeded"),
@@ -222,7 +218,7 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
                              tearing down and stopping (run `wireserve-agent join` again with a \
                              fresh token from `wireserve-admin rejoin` to rejoin)"
                         );
-                        teardown_everything(&mut fw, &mut wg, &hosts_path, &socket_path, &mut state, &state_path).await;
+                        teardown_everything(&mut fw, &mut wg, &hosts_path, &socket_path, &shared_state, &state_path).await;
                         break;
                     }
                     Err(e) => tracing::error!(error = %e, "poll cycle failed, will retry next interval"),
@@ -230,7 +226,7 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
             }
             _ = shutdown_rx.recv() => {
                 tracing::info!("leave requested, tearing down");
-                teardown_everything(&mut fw, &mut wg, &hosts_path, &socket_path, &mut state, &state_path).await;
+                teardown_everything(&mut fw, &mut wg, &hosts_path, &socket_path, &shared_state, &state_path).await;
                 break;
             }
         }
@@ -252,7 +248,7 @@ async fn teardown_everything<F: FirewallBackend>(
     wg: &mut WgInterface,
     hosts_path: &std::path::Path,
     socket_path: &std::path::Path,
-    state: &mut AgentState,
+    state: &Mutex<AgentState>,
     state_path: &std::path::Path,
 ) where
     F::Error: std::fmt::Display,
@@ -274,6 +270,7 @@ async fn teardown_everything<F: FirewallBackend>(
     // Reset local state (bearer token, keys, declared services) rather
     // than leaving secrets for a node that no longer considers itself
     // part of the mesh sitting on disk indefinitely.
+    let mut state = state.lock().await;
     *state = AgentState::default();
     if let Err(e) = state.save(state_path) {
         tracing::warn!(error = %e, "failed to reset local state during teardown");

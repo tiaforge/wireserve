@@ -711,3 +711,164 @@ async fn successful_admin_auth_never_consumes_rate_limit_budget() {
         assert_eq!(resp.status(), StatusCode::CREATED);
     }
 }
+
+// ---- Security review, round 2 ----
+
+// S3 on /register: the budget must be checked BEFORE the token lookup, so
+// a source that has exhausted its failed attempts is turned away even when
+// its next guess is the correct token. Anything else makes the limiter a
+// response-code cosmetic rather than a brute-force bound.
+
+#[tokio::test]
+async fn register_blocks_a_correct_token_once_failed_attempt_budget_is_exhausted() {
+    let mut config = test_config("");
+    config.rate_limit_max = 2;
+    let app = app_with_config(config);
+    let real_token = admin_create_node(&app.router, "n1").await;
+
+    for _ in 0..2 {
+        let req = json_request(
+            "POST",
+            "/register",
+            None,
+            json!({ "join_token": "jtk_wrong", "pubkey": pubkey_for("x"), "listen_port": 51820 }),
+        );
+        let resp = app.router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // Budget spent: the genuine token from the same source must now be
+    // refused with 429, and must NOT have been consumed.
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({ "join_token": real_token, "pubkey": pubkey_for("n1"), "listen_port": 51820 }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // A different source IP is unaffected and can still redeem it.
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/register")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "join_token": real_token, "pubkey": pubkey_for("n1"), "listen_port": 51820 })
+                .to_string(),
+        ))
+        .unwrap();
+    let other: SocketAddr = "198.51.100.7:9999".parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(other));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// S4 on /register: with trust_proxy_headers on, the rate-limit key is the
+// X-Forwarded-For client, so two clients behind one proxy get separate
+// budgets instead of sharing (and exhausting) the proxy's.
+
+#[tokio::test]
+async fn register_rate_limit_is_keyed_on_forwarded_client_when_proxy_trusted() {
+    let mut config = test_config("");
+    config.rate_limit_max = 1;
+    config.trust_proxy_headers = true;
+    let app = app_with_config(config);
+
+    let bad = |xff: &str| {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/register")
+            .header("content-type", "application/json")
+            .header("x-forwarded-for", xff)
+            .body(Body::from(
+                json!({ "join_token": "jtk_wrong", "pubkey": pubkey_for("x"), "listen_port": 1 })
+                    .to_string(),
+            ))
+            .unwrap();
+        // Same proxy address for every request.
+        let proxy: SocketAddr = "10.0.0.2:4444".parse().unwrap();
+        req.extensions_mut().insert(ConnectInfo(proxy));
+        req
+    };
+
+    let resp = app.router.clone().oneshot(bad("203.0.113.5")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp = app.router.clone().oneshot(bad("203.0.113.5")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "same client, budget spent");
+    let resp = app.router.clone().oneshot(bad("203.0.113.6")).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a different client behind the same proxy must have its own budget"
+    );
+}
+
+// F8: DELETE /admin/nodes/{name} frees the name, refuses active nodes.
+
+#[tokio::test]
+async fn delete_node_frees_name_for_unregistered_and_revoked_nodes() {
+    let app = test_app();
+
+    // Never registered (the export-config-failed-halfway case).
+    admin_create_node(&app.router, "orphan").await;
+    let req = json_request("DELETE", "/admin/nodes/orphan", Some(ADMIN), json!({}));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Name is free again.
+    admin_create_node(&app.router, "orphan").await;
+
+    // Registered, revoked, with a service: delete cascades the service.
+    let t = admin_create_node(&app.router, "old").await;
+    let r = register_node(&app.router, &t, "old", 51820).await;
+    let bearer = r["bearer_token"].as_str().unwrap();
+    let req = json_request(
+        "POST",
+        "/poll",
+        Some(bearer),
+        json!({ "services": [{"name": "svc", "port": 1, "proto": "tcp"}] }),
+    );
+    app.router.clone().oneshot(req).await.unwrap();
+    let req = json_request("POST", "/admin/nodes/old/revoke", Some(ADMIN), json!({}));
+    app.router.clone().oneshot(req).await.unwrap();
+    let req = json_request("DELETE", "/admin/nodes/old", Some(ADMIN), json!({}));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let count: i64 = {
+        let conn = app.state.db.conn.lock().await;
+        conn.query_row("SELECT COUNT(*) FROM nodes WHERE name = 'old'", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(count, 0);
+
+    // Unknown name.
+    let req = json_request("DELETE", "/admin/nodes/nope", Some(ADMIN), json!({}));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_node_refuses_an_active_node_until_revoked() {
+    let app = test_app();
+    let t = admin_create_node(&app.router, "live").await;
+    register_node(&app.router, &t, "live", 51820).await;
+
+    let req = json_request("DELETE", "/admin/nodes/live", Some(ADMIN), json!({}));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // Still there.
+    let req = json_request("GET", "/admin/peers", Some(ADMIN), json!({}));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["peers"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn delete_node_requires_admin_auth() {
+    let app = test_app();
+    admin_create_node(&app.router, "n1").await;
+    let req = raw_request("DELETE", "/admin/nodes/n1", Some("Bearer wrong"));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}

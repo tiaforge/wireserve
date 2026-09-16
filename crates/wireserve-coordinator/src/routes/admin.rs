@@ -54,6 +54,29 @@ pub async fn revoke_node(
     Ok(())
 }
 
+/// `DELETE /admin/nodes/{name}` (security review F8 — not in the spec's
+/// route list, added so an orphaned or mistyped node record can be
+/// removed and its name freed). Refuses with `409` while the node is
+/// still active (registered and not revoked): an active node must be
+/// revoked first, so that removing a live member of the mesh is always a
+/// deliberate two-step action rather than a single slip.
+pub async fn delete_node(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path(name): Path<String>,
+) -> Result<(), AppError> {
+    let conn = state.db.conn.lock().await;
+    let node = nodes::find_by_name(&conn, &name)?.ok_or(AppError::NotFound)?;
+    if node.pubkey.is_some() && !node.revoked {
+        return Err(AppError::Conflict(
+            "node is still active — revoke it first, then delete".into(),
+        ));
+    }
+    nodes::delete_node(&conn, node.id)?;
+    tracing::info!(event = "node_deleted", node_name = %name);
+    Ok(())
+}
+
 /// `POST /admin/nodes/{name}/rejoin` (spec §4.5).
 ///
 /// Also clears the node's current bearer token immediately (security
