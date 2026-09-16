@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wireserve-types",
+    "crates/wireserve-coordinator",
+    "crates/wireserve-agent",
+    "crates/wireserve-admin",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.91"
+license = "MIT"
+
+[workspace.dependencies]
+wireserve-types = { path = "crates/wireserve-types" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.11"
+rand = "0.10"
+subtle = "2"
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "signal", "sync", "fs"] }
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["trace", "catch-panic"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite_migration = "2"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "rustls-native-certs", "blocking"] }
+defguard_wireguard_rs = "0.12"
+rustables = "0.8"
+base64 = "0.23"
