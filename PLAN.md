@@ -8,7 +8,7 @@ this checklist lives in the session that created it — this file is the
 source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
-**Currently working on:** Milestone 3 — `wireserve-agent`
+**Currently working on:** Milestone 4 — `wireserve-admin`
 
 ## Milestones
 
@@ -22,10 +22,16 @@ source of truth for *current status*, the spec is the source of truth for
       allocation, `/register`, `/poll`, `/admin/*` routes, two separate
       listeners (node-facing vs admin), rate limiting, audit logging.
       43 tests (31 unit + 12 integration), `cargo clippy -D warnings` clean.
-- [ ] **M3 — `wireserve-agent`**: poll loop, WireGuard reconciliation
-      (`defguard_wireguard_rs`), nftables firewall backend (`rustables`),
+- [x] **M3 — `wireserve-agent`**: poll loop, WireGuard reconciliation
+      (`defguard_wireguard_rs`), nftables firewall backend (`rustables`,
+      behind a default-on `nftables` feature — see decisions log #15),
       `/etc/hosts` managed block, Unix-socket IPC for
-      `serve`/`unserve`/`list`/`leave`, join/bootstrap command.
+      `serve`/`unserve`/`list`/`leave`, join/bootstrap command. 36 unit
+      tests, clippy clean. `firewall/nftables.rs`'s real `rustables` calls
+      are verified against the crate's own source/examples but NOT by a
+      compile in this sandbox (missing system `libclang`) — worth a real
+      build/test on a dev machine with `clang` installed before trusting
+      it in production.
 - [ ] **M4 — `wireserve-admin`**: `create-node`, `revoke`, `rejoin`,
       `list-peers`, `export-config` (§9).
 - [ ] **M5 — Security hardening review pass**: checklist pass over M2–M4
@@ -101,3 +107,32 @@ doesn't stall or drift:
     `subtle::ConstantTimeEq` on the digests) rather than comparing raw
     token bytes directly, to avoid a length-based timing signal when
     candidate and real token lengths differ.
+15. **`rustables` is an optional Cargo feature (`nftables`), default-on.**
+    Purely so `wireserve-agent`'s non-firewall logic (poll loop, hosts
+    writer, IPC, state, WireGuard peer diffing) can be built/tested in an
+    environment lacking `rustables`' build-time `libclang` dependency. A
+    normal `cargo build -p wireserve-agent` still pulls in the real
+    backend by default — `--no-default-features` is a dev/CI-only escape
+    hatch, never a supported production configuration, and falls back to
+    a `NoopFirewall` that logs a loud warning rather than silently
+    skipping firewall enforcement.
+16. **Agent-local IPC JSON shape**: internally-tagged enums —
+    `{"op": "...", ...fields}` for requests, `{"status": "...", ...fields}`
+    for responses (serde's `#[serde(tag = "...")]`) — a concrete schema
+    the spec doesn't specify beyond "newline-delimited JSON."
+17. **`wireserve list`'s local/remote distinction**: a service queued via
+    `serve` but not yet confirmed by a poll still shows up immediately
+    (marked not-yet-online), rather than being invisible until the next
+    successful poll — so a just-issued `serve` doesn't look like it
+    silently failed.
+18. **`leave` over IPC acknowledges immediately and signals the daemon's
+    main loop to tear down asynchronously** afterwards, rather than
+    blocking the IPC response on WireGuard/firewall teardown completing
+    (which depends on netlink/kernel timing the IPC handler shouldn't be
+    stuck waiting on).
+19. **A node's own `endpoint_addr`, set at `join` time, is persisted in
+    local agent state and resent on every `/poll`** (not just the initial
+    `/register`) — spec §4.3 explicitly models this field as something
+    that "may change (dynamic DNS etc.)" and resendable per cycle; without
+    persisting it, the agent would have no way to report anything but
+    `None` after the first registration.

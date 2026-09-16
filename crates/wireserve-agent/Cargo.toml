@@ -5,6 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Real nftables backend is on by default — this matches the spec's Linux v1
+# requirement. It's off-able only so this crate's non-firewall logic (poll
+# loop, hosts-file writer, IPC, state, wg reconciliation diffing) can be
+# built/tested in an environment missing `rustables`' build-time dependency
+# on clang/libclang (bindgen against kernel netfilter headers) — NOT a
+# supported production configuration. See PLAN.md decisions log.
+default = ["nftables"]
+nftables = ["dep:rustables"]
+
 [dependencies]
 wireserve-types.workspace = true
 serde.workspace = true
@@ -19,4 +29,7 @@ reqwest.workspace = true
 defguard_wireguard_rs.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustables.workspace = true
+rustables = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
