@@ -8,7 +8,7 @@ this checklist lives in the session that created it — this file is the
 source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
-**Currently working on:** Milestone 2 — `wireserve-coordinator`
+**Currently working on:** Milestone 3 — `wireserve-agent`
 
 ## Milestones
 
@@ -18,9 +18,10 @@ source of truth for *current status*, the spec is the source of truth for
 - [x] **M1 — `wireserve-types`**: shared wire structs (§4), the single
       `is_valid_dns_label` validator (§3), `FirewallBackend`/`ServiceRule`
       (§5), token hashing helper. 24 unit tests, `cargo clippy` clean.
-- [ ] **M2 — `wireserve-coordinator`**: SQLite schema + migrations, IP
+- [x] **M2 — `wireserve-coordinator`**: SQLite schema + migrations, IP
       allocation, `/register`, `/poll`, `/admin/*` routes, two separate
       listeners (node-facing vs admin), rate limiting, audit logging.
+      43 tests (31 unit + 12 integration), `cargo clippy -D warnings` clean.
 - [ ] **M3 — `wireserve-agent`**: poll loop, WireGuard reconciliation
       (`defguard_wireguard_rs`), nftables firewall backend (`rustables`),
       `/etc/hosts` managed block, Unix-socket IPC for
@@ -85,3 +86,18 @@ doesn't stall or drift:
     build time (but no `libnftnl`/`libmnl` runtime linking — it talks to
     netlink directly). Document this as a build prerequisite for anyone
     building `wireserve-agent` from source.
+11. **`RegisterRequest.kind` vs. the node's kind at creation time**: the
+    node's `kind` is fixed at `POST /admin/nodes` and treated as
+    authoritative; `/register` 400s if the request's `kind` doesn't match
+    it, rather than letting a register call silently change a node's kind.
+12. **`/poll`'s `peers` array includes the polling node's own entry** —
+    spec's example doesn't clarify either way; including self is simpler
+    and harmless.
+13. **Rate limiting is consulted only on failure paths**: bad/unknown join
+    token on `/register`, bad admin token, bad/revoked bearer token —
+    never on successful requests, so legitimate high-frequency polling is
+    never throttled by it.
+14. **Admin token comparison hashes both sides first** (`SHA256` then
+    `subtle::ConstantTimeEq` on the digests) rather than comparing raw
+    token bytes directly, to avoid a length-based timing signal when
+    candidate and real token lengths differ.
