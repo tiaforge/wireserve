@@ -24,7 +24,11 @@ fn export_config_end_to_end_and_private_key_never_leaves_process() {
     }]);
 
     let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
-    let conf = wireserve_admin::export_config::run(&client, "phone").unwrap();
+    // The mock coordinator serves both the admin routes and /register from
+    // the same router (unlike the real coordinator, which binds them on
+    // two separate listeners — see PLAN.md decisions log), so the same
+    // base URL is valid for both parameters here.
+    let conf = wireserve_admin::export_config::run(&client, mock.base_url.as_str(), "phone").unwrap();
 
     assert!(conf.contains("[Interface]"));
     assert!(conf.contains("[Peer]"));
@@ -58,7 +62,7 @@ fn invalid_name_makes_zero_network_calls_for_every_name_taking_command() {
     assert!(wireserve_admin::cmd_create_node(&client, "Bad_Name", NodeKind::Agent).is_err());
     assert!(wireserve_admin::cmd_revoke(&client, "Bad_Name").is_err());
     assert!(wireserve_admin::cmd_rejoin(&client, "Bad_Name").is_err());
-    assert!(wireserve_admin::cmd_export_config(&client, "Bad_Name").is_err());
+    assert!(wireserve_admin::cmd_export_config(&client, mock.base_url.as_str(), "Bad_Name").is_err());
 
     assert_eq!(
         mock.request_count(),
@@ -84,6 +88,36 @@ fn wrong_admin_token_is_rejected_by_server() {
 
     let err = wireserve_admin::cmd_create_node(&client, "homeserver", NodeKind::Agent);
     assert!(err.is_err());
+}
+
+// ---- Regression coverage: admin and node-facing listeners are separate ----
+//
+// The real coordinator binds /admin/* and /register on two independently
+// configured listeners (spec §4.0). export_config::run must use its
+// register_url parameter for /register and never fall back to the admin
+// client's base URL for it — these two tests pin that down against mock
+// servers that only serve one half each, the way the real deployment does.
+
+#[test]
+fn export_config_succeeds_against_two_genuinely_separate_listeners() {
+    let admin_mock = MockCoordinator::start_admin_only(TOKEN);
+    let register_mock = MockCoordinator::start_register_only(TOKEN);
+    let client = AdminClient::new(admin_mock.base_url.as_str(), TOKEN);
+
+    let conf = wireserve_admin::export_config::run(&client, register_mock.base_url.as_str(), "phone")
+        .expect("export-config must work when admin and register URLs point at different listeners");
+    assert!(conf.contains("[Interface]"));
+}
+
+#[test]
+fn export_config_fails_cleanly_if_register_url_points_at_the_admin_only_listener() {
+    let admin_mock = MockCoordinator::start_admin_only(TOKEN);
+    let client = AdminClient::new(admin_mock.base_url.as_str(), TOKEN);
+
+    // Pointing register_url at a listener with no /register route must be
+    // a clean error, not a panic and not a silently-wrong success.
+    let result = wireserve_admin::export_config::run(&client, admin_mock.base_url.as_str(), "phone");
+    assert!(result.is_err());
 }
 
 #[test]

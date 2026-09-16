@@ -17,6 +17,13 @@ pub enum ConfigError {
     MissingAdminToken(String),
     #[error("no coordinator URL found — pass --coordinator-url or set WIRESERVE_COORDINATOR_URL")]
     MissingCoordinatorUrl,
+    #[error(
+        "no node-facing URL found for the /register call — pass --register-url or set \
+         WIRESERVE_REGISTER_URL. This is the coordinator's OTHER listener: spec §4.0 requires \
+         the admin and node-facing listeners to be bound separately (e.g. different ports), so \
+         --coordinator-url alone isn't enough for export-config"
+    )]
+    MissingRegisterUrl,
 }
 
 fn default_token_file_path() -> String {
@@ -65,6 +72,25 @@ pub fn resolve_coordinator_url(cli_flag: Option<&str>) -> Result<String, ConfigE
         }
     }
     Err(ConfigError::MissingCoordinatorUrl)
+}
+
+/// Resolves the node-facing base URL used only by `export-config`'s
+/// `/register` call (spec §4.2) — deliberately separate from
+/// `resolve_coordinator_url`, which resolves the *admin* listener's URL.
+/// See `ConfigError::MissingRegisterUrl` for why these can't default to
+/// the same value.
+pub fn resolve_register_url(cli_flag: Option<&str>) -> Result<String, ConfigError> {
+    if let Some(u) = cli_flag {
+        if !u.is_empty() {
+            return Ok(u.trim_end_matches('/').to_string());
+        }
+    }
+    if let Ok(u) = std::env::var("WIRESERVE_REGISTER_URL") {
+        if !u.is_empty() {
+            return Ok(u.trim_end_matches('/').to_string());
+        }
+    }
+    Err(ConfigError::MissingRegisterUrl)
 }
 
 #[cfg(test)]
@@ -130,5 +156,22 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::remove_var("WIRESERVE_COORDINATOR_URL");
         assert!(resolve_coordinator_url(None).is_err());
+    }
+
+    #[test]
+    fn register_url_is_resolved_independently_of_coordinator_url() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("WIRESERVE_REGISTER_URL");
+        std::env::set_var("WIRESERVE_COORDINATOR_URL", "http://127.0.0.1:8081");
+        // Coordinator (admin) URL being set must not satisfy the
+        // register-URL lookup — they are two different listeners.
+        assert!(resolve_register_url(None).is_err());
+        std::env::set_var("WIRESERVE_REGISTER_URL", "http://127.0.0.1:8080");
+        assert_eq!(
+            resolve_register_url(None).unwrap(),
+            "http://127.0.0.1:8080"
+        );
+        std::env::remove_var("WIRESERVE_COORDINATOR_URL");
+        std::env::remove_var("WIRESERVE_REGISTER_URL");
     }
 }

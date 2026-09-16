@@ -1,0 +1,36 @@
+# Podman Quadlet unit. Install at
+# /etc/containers/systemd/wireserve-agent.container, then
+# `systemctl daemon-reload && systemctl start wireserve-agent`.
+#
+# Mirrors deploy/docker/agent.Dockerfile's image and capability set
+# exactly (CAP_NET_ADMIN + /dev/net/tun, never --privileged — spec §8)
+# and deploy/systemd/wireserve-agent.service's env/volume shape. Written
+# by hand against both, not generated, so any future change to either
+# must be applied here too.
+#
+# Same caveat as the Dockerfile: the bind-mounted /etc/hosts below is
+# what makes spec §6's <name>.wg entries resolve for processes on the
+# HOST rather than just inside this container — omit it if nothing
+# outside the container needs that resolution.
+
+[Unit]
+Description=WireServe agent (Podman Quadlet)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/wireserve-agent:latest
+EnvironmentFile=/etc/wireserve/agent.env
+AddCapability=CAP_NET_ADMIN
+AddDevice=/dev/net/tun
+Volume=/etc/hosts:/etc/hosts
+Volume=wireserve-agent-state:/var/lib/wireserve
+Volume=wireserve-agent-run:/run/wireserve
+Exec=daemon
+
+[Service]
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target default.target

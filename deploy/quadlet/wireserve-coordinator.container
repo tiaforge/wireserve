@@ -1,0 +1,36 @@
+# Podman Quadlet unit. Install at
+# /etc/containers/systemd/wireserve-coordinator.container (root) or
+# ~/.config/containers/systemd/ (rootless), then `systemctl daemon-reload`
+# and `systemctl start wireserve-coordinator`.
+#
+# Mirrors deploy/docker/coordinator.Dockerfile's image and capability set
+# exactly (none — the coordinator never touches WireGuard or the host
+# firewall, spec §8) and deploy/systemd/wireserve-coordinator.service's
+# env/volume shape. Written by hand against both, not generated, so any
+# future change to either must be applied here too.
+
+[Unit]
+Description=WireServe coordinator (Podman Quadlet)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/wireserve-coordinator:latest
+EnvironmentFile=/etc/wireserve/coordinator.env
+# Node-facing port: publish per your reverse-proxy topology (often not
+# published to the host at all — see the Dockerfile's own comments and
+# PLAN.md decisions log #24 — a private Docker/Podman network reaching it
+# by container name is the common case).
+PublishPort=127.0.0.1:8080:8080
+# Admin port is intentionally NOT published beyond loopback (spec §4.0:
+# never 0.0.0.0). Reach it with `podman exec` for wireserve-admin, or
+# publish to 127.0.0.1 only if a host-side admin CLI needs it directly:
+PublishPort=127.0.0.1:8081:8081
+Volume=wireserve-coordinator-data:/var/lib/wireserve
+
+[Service]
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target default.target

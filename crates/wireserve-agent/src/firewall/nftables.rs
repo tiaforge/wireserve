@@ -38,7 +38,7 @@ impl NftablesBackend {
         let tables = rustables::list_tables()?;
         Ok(tables
             .into_iter()
-            .find(|t| t.get_name() == Some(TABLE_NAME)))
+            .find(|t| t.get_name().is_some_and(|n| n == TABLE_NAME)))
     }
 
     /// Queues "delete the existing table, if any" onto `batch` — the same

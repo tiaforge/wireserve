@@ -109,11 +109,22 @@ impl AdminClient {
         Ok(Self::check_status(resp)?.json()?)
     }
 
-    /// `POST /register` (spec §4.2). Deliberately unauthenticated — no
-    /// admin-token header — since the join token in the body is itself the
-    /// credential for this endpoint.
-    pub fn register(&self, req: &RegisterRequest) -> Result<RegisterResponse, ClientError> {
-        let resp = self.http.post(self.url("/register")).json(req).send()?;
-        Ok(Self::check_status(resp)?.json()?)
-    }
+}
+
+/// `POST /register` (spec §4.2), sent to the coordinator's **node-facing**
+/// listener — a different address/port from every other call in this
+/// module, which talk to the admin listener (spec §4.0 mandates the two
+/// be bound separately, e.g. different ports, so they can't be reached
+/// the same way). Deliberately not an `AdminClient` method for that
+/// reason: bundling it in would make "one base URL" look like it's
+/// enough for every call this crate makes, which it isn't. Also
+/// deliberately unauthenticated — no admin-token header — since the join
+/// token in the body is itself the credential for this endpoint.
+pub fn register(
+    node_facing_base_url: &str,
+    req: &RegisterRequest,
+) -> Result<RegisterResponse, ClientError> {
+    let url = format!("{}/register", node_facing_base_url.trim_end_matches('/'));
+    let resp = Client::new().post(url).json(req).send()?;
+    Ok(AdminClient::check_status(resp)?.json()?)
 }

@@ -41,11 +41,34 @@ pub struct MockCoordinator {
 }
 
 impl MockCoordinator {
-    /// Starts the mock server on an OS-assigned loopback port and returns
-    /// once it's ready to accept connections. Runs for the lifetime of the
-    /// test process — there's no explicit shutdown, matching how short-lived
-    /// test binaries commonly handle background test servers.
+    /// Starts a mock server serving every route (admin + /register) from
+    /// one router — convenient for most tests, but NOT how the real
+    /// coordinator is deployed (spec §4.0 requires the admin and
+    /// node-facing surfaces on two separately-bound listeners). Tests that
+    /// need to catch a regression in that split use `start_admin_only`/
+    /// `start_register_only` instead.
     pub fn start(admin_token: &str) -> Self {
+        Self::start_with_router(admin_token, build_router)
+    }
+
+    /// Admin routes only — no `/register` — modeling the real coordinator's
+    /// admin listener in isolation.
+    pub fn start_admin_only(admin_token: &str) -> Self {
+        Self::start_with_router(admin_token, build_admin_only_router)
+    }
+
+    /// `/register` only — no admin routes — modeling the real
+    /// coordinator's node-facing listener in isolation.
+    pub fn start_register_only(admin_token: &str) -> Self {
+        Self::start_with_router(admin_token, build_register_only_router)
+    }
+
+    /// Starts `router_fn`'s router on an OS-assigned loopback port and
+    /// returns once it's ready to accept connections. Runs for the
+    /// lifetime of the test process — there's no explicit shutdown,
+    /// matching how short-lived test binaries commonly handle background
+    /// test servers.
+    fn start_with_router(admin_token: &str, router_fn: fn(MockState) -> Router) -> Self {
         let state = MockState {
             admin_token: admin_token.to_string(),
             requests: Arc::new(Mutex::new(Vec::new())),
@@ -57,7 +80,7 @@ impl MockCoordinator {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                let app = build_router(thread_state);
+                let app = router_fn(thread_state);
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let addr = listener.local_addr().unwrap();
                 addr_tx.send(addr).unwrap();
@@ -180,12 +203,26 @@ async fn register(
     }))
 }
 
-fn build_router(state: MockState) -> Router {
+fn admin_only_routes() -> Router<MockState> {
     Router::new()
         .route("/admin/nodes", post(create_node))
         .route("/admin/nodes/{name}/revoke", post(revoke_node))
         .route("/admin/nodes/{name}/rejoin", post(rejoin_node))
         .route("/admin/peers", get(list_peers))
+}
+
+fn build_router(state: MockState) -> Router {
+    admin_only_routes()
+        .route("/register", post(register))
+        .with_state(state)
+}
+
+fn build_admin_only_router(state: MockState) -> Router {
+    admin_only_routes().with_state(state)
+}
+
+fn build_register_only_router(state: MockState) -> Router {
+    Router::new()
         .route("/register", post(register))
         .with_state(state)
 }

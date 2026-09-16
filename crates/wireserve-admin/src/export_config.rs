@@ -6,7 +6,7 @@
 use defguard_wireguard_rs::key::Key;
 use wireserve_types::{NodeKind, PeerInfo, RegisterRequest};
 
-use crate::client::{AdminClient, ClientError};
+use crate::client::{self, AdminClient, ClientError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExportConfigError {
@@ -64,21 +64,33 @@ pub fn render_conf(iface: &InterfaceParams, peers: &[PeerInfo]) -> String {
 /// Runs the full `export-config` flow end to end against a live
 /// coordinator: keygen (local only), create+redeem a `kind: "static"` node,
 /// fetch the peer directory, render the `.conf`.
-pub fn run(client: &AdminClient, name: &str) -> Result<String, ExportConfigError> {
+///
+/// Takes two base URLs, not one: `admin_client` talks to the coordinator's
+/// admin listener (`create_node`, `list_peers`), while `node_facing_url`
+/// is where `/register` actually lives — a separate listener by spec
+/// §4.0's design, not just a separate path on the same one.
+pub fn run(
+    admin_client: &AdminClient,
+    node_facing_url: &str,
+    name: &str,
+) -> Result<String, ExportConfigError> {
     let private_key = Key::generate();
     let public_key = private_key.public_key();
 
-    let created = client.create_node(name, NodeKind::Static)?;
+    let created = admin_client.create_node(name, NodeKind::Static)?;
 
-    let reg = client.register(&RegisterRequest {
-        join_token: created.join_token,
-        pubkey: public_key.to_string(),
-        kind: NodeKind::Static,
-        listen_port: None,
-        endpoint_addr: None,
-    })?;
+    let reg = client::register(
+        node_facing_url,
+        &RegisterRequest {
+            join_token: created.join_token,
+            pubkey: public_key.to_string(),
+            kind: NodeKind::Static,
+            listen_port: None,
+            endpoint_addr: None,
+        },
+    )?;
 
-    let directory = client.list_peers()?;
+    let directory = admin_client.list_peers()?;
 
     let iface = InterfaceParams {
         private_key: private_key.to_string(),

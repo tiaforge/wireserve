@@ -8,7 +8,8 @@ this checklist lives in the session that created it — this file is the
 source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
-**Currently working on:** Milestone 6 — deployment artifacts
+**Currently working on:** Final end-to-end verification (all milestones
+otherwise complete)
 
 ## Milestones
 
@@ -27,11 +28,12 @@ source of truth for *current status*, the spec is the source of truth for
       behind a default-on `nftables` feature — see decisions log #15),
       `/etc/hosts` managed block, Unix-socket IPC for
       `serve`/`unserve`/`list`/`leave`, join/bootstrap command. 36 unit
-      tests, clippy clean. `firewall/nftables.rs`'s real `rustables` calls
-      are verified against the crate's own source/examples but NOT by a
-      compile in this sandbox (missing system `libclang`) — worth a real
-      build/test on a dev machine with `clang` installed before trusting
-      it in production.
+      tests, clippy clean. **Update from M6**: the real `rustables`
+      backend has since been compiled and tested for real (via a Podman
+      build container with `clang` installed — see M6) and a genuine
+      type-mismatch bug in `firewall/nftables.rs` (`Table::get_name()`
+      returns `Option<&String>`, not `Option<&str>`) was found and fixed
+      there. No longer an open caveat.
 - [x] **M4 — `wireserve-admin`**: `create-node`, `revoke`, `rejoin`,
       `list-peers`, `export-config` (§9). 19 tests (14 unit + 5 integration
       against a real mock-HTTP-server coordinator), clippy clean.
@@ -43,10 +45,22 @@ source of truth for *current status*, the spec is the source of truth for
       DB file now hardened to mode 600 on open, and a startup warning logs
       when the node-facing listener isn't loopback/private (see decisions
       log #23-24 for why it's a warning, not a hard restriction, here).
-- [ ] **M6 — Deployment artifacts**: systemd units, Dockerfiles, Quadlet
-      files.
-- [ ] **Final end-to-end verification**: manual/scripted smoke test across
-      two agents + one coordinator (see spec verification notes).
+- [x] **M6 — Deployment artifacts**: systemd units (verified with
+      `systemd-analyze verify`), Dockerfiles, Quadlet files (verified by
+      actually running Podman's quadlet generator, confirming the exact
+      `podman run` invocation each produces matches the intended
+      capability set). Both Dockerfiles were **actually built and run**
+      with Podman, not just written — see decisions log #25-27 for two
+      real bugs this caught (missing `ca-certificates` in the coordinator
+      image, and the M3 nftables type-mismatch above) plus a full
+      create-node → register → poll → list-peers → export-config →
+      revoke smoke test against a live containerized coordinator.
+- [ ] **Final end-to-end verification**: the coordinator+admin half of
+      this is now done (see M6) against a real container. Still open:
+      a real two-agent WireGuard mesh test (needs `CAP_NET_ADMIN` +
+      either network namespaces or two privileged containers — see the
+      original plan's verification section for the approach; not run in
+      this session).
 
 Security-sensitive paths (tokens, auth, firewall default-deny, file
 permissions) get test coverage inline with each milestone that introduces
@@ -178,3 +192,44 @@ doesn't stall or drift:
     address, naming the §7 requirement explicitly, so the unsafe case is
     loud rather than silent — without breaking the safe containerized
     default.
+25. **Real bug caught by actually building the images with Podman**:
+    `crates/wireserve-agent/src/firewall/nftables.rs`'s `existing_table()`
+    compared `Table::get_name()` (which returns `Option<&String>`) against
+    `Some(&str)` — a type mismatch that could never surface in this
+    sandbox before M6, since `rustables` couldn't compile here without
+    system `libclang` (M3's known limitation). Building the agent's Docker
+    image in a Podman container that *does* have `clang` installed
+    finally compiled the real feature and caught it immediately. Fixed
+    with `.is_some_and(|n| n == TABLE_NAME)`. All 36 agent tests and
+    clippy pass with the real `rustables` backend compiled in.
+26. **A second, more consequential real bug caught the same way**:
+    `wireserve-admin`'s `AdminClient` used a single base URL for every
+    coordinator call, including `/register` — but the coordinator (by
+    hard design, spec §4.0) serves `/register` from its **node-facing**
+    listener and `/admin/*` from a **separately-bound admin listener**.
+    `export-config`'s own M4 tests never caught this because its mock
+    coordinator served every route from one router, masking the real
+    split. Actually running the built coordinator image and exercising
+    `create-node` → `register` → `poll` → `export-config` end to end
+    surfaced it. Fixed by giving `export_config::run` two URL parameters
+    (`admin_client`'s base URL, plus a separate `node_facing_url` used
+    only for the `/register` call via a new free function
+    `client::register` rather than an `AdminClient` method), with a new
+    `--register-url`/`WIRESERVE_REGISTER_URL` CLI flag/env var. Two new
+    regression tests spin up genuinely separate mock listeners (one
+    admin-only, one register-only) to pin this down going forward.
+27. **Coordinator Docker image needed `ca-certificates` too, not just the
+    agent's image** — `wireserve-admin` is bundled into the coordinator
+    image (decisions log entry below) and its `reqwest` client (rustls
+    backend) fails to even construct without a system trust store present,
+    regardless of whether the call is plain HTTP to localhost. Caught by
+    running `wireserve-admin create-node` inside the built container,
+    which panicked until this was added.
+28. **`wireserve-admin` is bundled into the coordinator's own Docker
+    image**, since spec §4.0's hard "admin listener never binds 0.0.0.0"
+    rule rules out the usual Docker pattern of publishing it via
+    `-p host:port` — the supported access pattern for the containerized
+    coordinator is `docker exec <container> wireserve-admin ...`. Node
+    agents and static-peer export-config still use standalone
+    `wireserve-admin` builds as normal; this bundling is specific to
+    making the containerized coordinator deployment self-sufficient.

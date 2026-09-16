@@ -1,0 +1,55 @@
+[Unit]
+Description=WireServe agent
+Documentation=file:///usr/share/doc/wireserve/wireserve-design-spec.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Secrets and per-deployment config (WIRESERVE_STATE_PATH override, poll
+# interval, etc. — the bearer token and WireGuard private key themselves
+# are never put here, they live in the mode-600 state file the agent
+# manages itself, see PLAN.md decisions log).
+EnvironmentFile=-/etc/wireserve/agent.env
+
+ExecStartPre=/usr/bin/install -d -m 0700 /run/wireserve
+ExecStart=/usr/local/bin/wireserve-agent daemon
+Restart=on-failure
+RestartSec=2s
+# A dead agent leaves the last-applied nftables state exactly as
+# restricted as it was (spec §5) — restarting quickly is the mitigation
+# for stale-but-safe state, not a defense against it. It's still safe to
+# restart aggressively, since teardown()-then-deny-all runs again before
+# the first real apply() on every startup (spec §5's ordering
+# requirement), so a crash loop never leaves the interface permissive.
+
+RuntimeDirectory=wireserve
+RuntimeDirectoryMode=0700
+StateDirectory=wireserve
+StateDirectoryMode=0700
+
+# Runs as root, not a hardened non-root user — deliberately, and unlike
+# the coordinator's unit. Spec §8 asks for CAP_NET_ADMIN + /dev/net/tun
+# "not full root where avoidable," but avoiding full root here would
+# still require CAP_DAC_OVERRIDE (or an /etc/hosts ACL) to let the agent
+# write the managed hosts-file block as a non-root user (spec §6: "no new
+# privilege required — the agent already runs with the elevation needed
+# to manage the WireGuard interface," which in practice means running as
+# root, since CAP_NET_ADMIN alone doesn't grant /etc/hosts write access).
+# CAP_DAC_OVERRIDE is broad enough that pretending it's meaningfully
+# safer than root would be dishonest, so the bounding set below is
+# informational (documents exactly which capabilities the workload
+# needs) rather than a real privilege reduction.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+DeviceAllow=/dev/net/tun rw
+NoNewPrivileges=true
+ProtectHome=true
+# /etc/hosts must remain writable — this is the one path this unit can't
+# lock down the way the coordinator's unit locks down /etc, precisely
+# because of spec §6's hosts-file sync.
+ReadWritePaths=/var/lib/wireserve /run/wireserve /etc
+
+[Install]
+WantedBy=multi-user.target

@@ -56,9 +56,13 @@ pub fn cmd_list_peers(client: &AdminClient) -> Result<AdminPeersResponse, CliErr
     Ok(client.list_peers()?)
 }
 
-pub fn cmd_export_config(client: &AdminClient, name: &str) -> Result<String, CliError> {
+pub fn cmd_export_config(
+    admin_client: &AdminClient,
+    node_facing_url: &str,
+    name: &str,
+) -> Result<String, CliError> {
     validate_name(name)?;
-    Ok(export_config::run(client, name)?)
+    Ok(export_config::run(admin_client, node_facing_url, name)?)
 }
 
 #[cfg(test)]

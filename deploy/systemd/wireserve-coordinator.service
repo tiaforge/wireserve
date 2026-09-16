@@ -1,0 +1,41 @@
+[Unit]
+Description=WireServe coordinator
+Documentation=file:///usr/share/doc/wireserve/wireserve-design-spec.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wireserve
+Group=wireserve
+
+# Secrets and per-deployment config (WIRESERVE_ADMIN_TOKEN,
+# WIRESERVE_LISTEN_ADDR, WIRESERVE_ADMIN_LISTEN_ADDR, WIRESERVE_DB_PATH,
+# WIRESERVE_NET_V4_CIDR, WIRESERVE_NET_V6_PREFIX, ...) live outside the
+# unit file, mode 600, owned by the wireserve user.
+EnvironmentFile=/etc/wireserve/coordinator.env
+Environment=WIRESERVE_DB_PATH=/var/lib/wireserve/coordinator.db
+
+ExecStart=/usr/local/bin/wireserve-coordinator
+Restart=on-failure
+RestartSec=2s
+
+# The coordinator never touches WireGuard or the host firewall — it is a
+# plain HTTP API and needs no special capabilities (spec §8).
+StateDirectory=wireserve
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/wireserve
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryDenyWriteExecute=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

@@ -40,6 +40,13 @@ enum Command {
         name: String,
         #[arg(long)]
         out: Option<std::path::PathBuf>,
+        /// Base URL of the coordinator's NODE-FACING listener (where
+        /// /register lives) — a different address/port from
+        /// --coordinator-url, which talks to the admin listener. Spec
+        /// §4.0 requires the two to be bound separately. Or set
+        /// WIRESERVE_REGISTER_URL.
+        #[arg(long)]
+        register_url: Option<String>,
     },
 }
 
@@ -94,10 +101,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        Command::ExportConfig { name, out } => {
+        Command::ExportConfig {
+            name,
+            out,
+            register_url,
+        } => {
             check_name(&name)?;
             let client = build_client(&coordinator_url, &admin_token)?;
-            let conf = wireserve_admin::cmd_export_config(&client, &name)?;
+            let register_url = config::resolve_register_url(register_url.as_deref())?;
+            let conf = wireserve_admin::cmd_export_config(&client, &register_url, &name)?;
             match out {
                 Some(path) => std::fs::write(path, conf)?,
                 None => print!("{conf}"),
