@@ -2917,12 +2917,15 @@ dependencies = [
 name = "wireserve-admin"
 version = "0.1.0"
 dependencies = [
- "base64 0.23.1",
+ "axum",
  "clap",
  "defguard_wireguard_rs",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
  "wireserve-types",
 ]
 

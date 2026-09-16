@@ -8,7 +8,7 @@ this checklist lives in the session that created it — this file is the
 source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
-**Currently working on:** Milestone 4 — `wireserve-admin`
+**Currently working on:** Milestone 5 — security hardening review pass
 
 ## Milestones
 
@@ -32,8 +32,9 @@ source of truth for *current status*, the spec is the source of truth for
       compile in this sandbox (missing system `libclang`) — worth a real
       build/test on a dev machine with `clang` installed before trusting
       it in production.
-- [ ] **M4 — `wireserve-admin`**: `create-node`, `revoke`, `rejoin`,
-      `list-peers`, `export-config` (§9).
+- [x] **M4 — `wireserve-admin`**: `create-node`, `revoke`, `rejoin`,
+      `list-peers`, `export-config` (§9). 19 tests (14 unit + 5 integration
+      against a real mock-HTTP-server coordinator), clippy clean.
 - [ ] **M5 — Security hardening review pass**: checklist pass over M2–M4
       against §7, once they're functionally complete.
 - [ ] **M6 — Deployment artifacts**: systemd units, Dockerfiles, Quadlet
@@ -136,3 +137,17 @@ doesn't stall or drift:
     that "may change (dynamic DNS etc.)" and resendable per cycle; without
     persisting it, the agent would have no way to report anything but
     `None` after the first registration.
+20. **`wireserve-admin`'s admin-token/config resolution precedence**:
+    `--admin-token` CLI flag > `WIRESERVE_ADMIN_TOKEN` env > a plain
+    trimmed-text token file (`WIRESERVE_ADMIN_TOKEN_FILE` env, default
+    `~/.config/wireserve-admin/admin_token`) — no structured TOML/YAML
+    config, since there's exactly one secret to store. Same precedence
+    shape for `--coordinator-url` / `WIRESERVE_COORDINATOR_URL`.
+21. **`export-config`'s self-exclusion from its own peer list** is done by
+    comparing pubkeys (skip any `/admin/peers` entry matching the
+    just-generated key), defensively handling either timing outcome of
+    whether the newly-registered static node already appears in that
+    directory by the time it's fetched.
+22. **`wireserve-admin list-peers` output format**: one tab-separated line
+    per peer (`name  pubkey  ip4  ip6  endpoint=...`) — spec only says
+    "render," no format specified.
