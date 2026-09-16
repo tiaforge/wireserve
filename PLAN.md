@@ -8,7 +8,7 @@ this checklist lives in the session that created it — this file is the
 source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
-**Currently working on:** Milestone 5 — security hardening review pass
+**Currently working on:** Milestone 6 — deployment artifacts
 
 ## Milestones
 
@@ -35,8 +35,14 @@ source of truth for *current status*, the spec is the source of truth for
 - [x] **M4 — `wireserve-admin`**: `create-node`, `revoke`, `rejoin`,
       `list-peers`, `export-config` (§9). 19 tests (14 unit + 5 integration
       against a real mock-HTTP-server coordinator), clippy clean.
-- [ ] **M5 — Security hardening review pass**: checklist pass over M2–M4
-      against §7, once they're functionally complete.
+- [x] **M5 — Security hardening review pass**: verified constant-time
+      admin-token comparison, admin-listener bind enforcement, mode-600
+      file handling (agent state/socket + newly added coordinator DB),
+      rate limiting on all failed-auth paths, and all six audit events —
+      all confirmed already in place from M2–M4. Two additions: coordinator
+      DB file now hardened to mode 600 on open, and a startup warning logs
+      when the node-facing listener isn't loopback/private (see decisions
+      log #23-24 for why it's a warning, not a hard restriction, here).
 - [ ] **M6 — Deployment artifacts**: systemd units, Dockerfiles, Quadlet
       files.
 - [ ] **Final end-to-end verification**: manual/scripted smoke test across
@@ -151,3 +157,24 @@ doesn't stall or drift:
 22. **`wireserve-admin list-peers` output format**: one tab-separated line
     per peer (`name  pubkey  ip4  ip6  endpoint=...`) — spec only says
     "render," no format specified.
+23. **Coordinator SQLite file hardened to mode 600 on every `open()`**
+    (added during the M5 review pass). Not spec-mandated — §7's mode-600
+    requirement is explicitly scoped to "the node's own disk" (the
+    agent), and the DB only ever holds *hashed* tokens by design — but a
+    cheap second layer for pubkeys/IPs/hashed-credential metadata against
+    other local users on a shared host.
+24. **Node-facing listener bind address is intentionally NOT
+    hard-restricted to loopback/private the way the admin listener is.**
+    Spec frames the admin listener's restriction as a hard, code-level
+    invariant regardless of deployment topology (§4.0), but frames the
+    node-facing listener's safety as depending on deployment topology
+    (§7: "an address only the proxy can reach... loopback, or an internal
+    Docker network") — a `0.0.0.0` bind is the *correct* choice inside an
+    isolated Docker network where the reverse-proxy container reaches it
+    over the bridge network rather than loopback, so hard-coding a
+    loopback-only check here would break that legitimate topology.
+    Instead (M5 addition): the coordinator logs a `tracing::warn!` at
+    startup whenever this listener isn't bound to a loopback/private
+    address, naming the §7 requirement explicitly, so the unsafe case is
+    loud rather than silent — without breaking the safe containerized
+    default.

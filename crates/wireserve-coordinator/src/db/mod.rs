@@ -23,6 +23,8 @@ pub enum DbError {
     ServiceNameCollision(String),
     #[error(transparent)]
     Ipam(#[from] crate::ipam::IpamError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 pub struct Db {
@@ -36,6 +38,7 @@ pub struct Db {
 
 impl Db {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
+        let path = path.as_ref();
         let mut conn = Connection::open(path)?;
         // Must be set per-connection, not inside a migration (SQLite does
         // not enforce foreign keys by default, and rusqlite_migration's own
@@ -43,6 +46,16 @@ impl Db {
         // consistently).
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         run_migrations(&mut conn)?;
+        // Milestone 5 hardening pass: the DB holds hashed (not plaintext)
+        // tokens by design (§3), but it's still node metadata — pubkeys,
+        // IPs, hashed credentials — worth keeping off-limits to other
+        // local users as a second layer, the same instinct as §7's
+        // mode-600 requirement for the agent's own local state files
+        // (which the spec states explicitly; this one is this project's
+        // own added precaution, not spec-mandated, since §7's file-mode
+        // bullet is scoped to "the node's own disk," i.e. the agent side).
+        #[cfg(unix)]
+        harden_file_permissions(path)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -72,4 +85,34 @@ fn migrations() -> Migrations<'static> {
 fn run_migrations(conn: &mut Connection) -> Result<(), DbError> {
     migrations().to_latest(conn)?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn harden_file_permissions(path: &Path) -> Result<(), DbError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn open_hardens_db_file_to_mode_600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wireserve.db");
+        // Start deliberately permissive, so the assertion proves `open`
+        // actively tightens permissions rather than merely inheriting a
+        // strict umask by accident.
+        std::fs::write(&path, []).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let _db = Db::open(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "coordinator DB file must be hardened to mode 600 on open");
+    }
 }

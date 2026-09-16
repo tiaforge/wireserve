@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use wireserve_coordinator::{build_state, db::Db, routes, Config};
+use wireserve_coordinator::{build_state, config, db::Db, routes, Config};
 
 #[tokio::main]
 async fn main() {
@@ -36,6 +36,16 @@ async fn main() {
             eprintln!("failed to bind admin listener on {admin_listen_addr}: {err}");
             std::process::exit(1);
         });
+
+    if !config::is_loopback_or_private(listen_addr.ip()) {
+        tracing::warn!(
+            %listen_addr,
+            "node-facing listener is bound to a non-loopback, non-private address — spec §7 \
+             requires this to sit behind a TLS-terminating reverse proxy and never be directly \
+             reachable from an untrusted network; confirm nothing routes to this port except \
+             that proxy"
+        );
+    }
 
     tracing::info!(%listen_addr, %admin_listen_addr, "wireserve-coordinator starting");
 

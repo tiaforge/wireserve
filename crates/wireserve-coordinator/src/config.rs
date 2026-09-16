@@ -92,7 +92,7 @@ pub fn validate_admin_listener(addr: SocketAddr) -> Result<(), ConfigError> {
     }
 }
 
-fn is_loopback_or_private(ip: IpAddr) -> bool {
+pub fn is_loopback_or_private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
         IpAddr::V6(v6) => {
