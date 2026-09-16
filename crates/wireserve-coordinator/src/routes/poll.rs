@@ -8,6 +8,13 @@ use crate::directory;
 use crate::error::AppError;
 use crate::state::AppState;
 
+/// Upper bound on services one node may declare. Every declared service is
+/// fanned out to every other node's `/poll` response and hosts file on
+/// every cycle, so without a cap a single node could bloat the whole
+/// mesh's directory at will. Generous for the "a few services per box"
+/// shape this project is for.
+pub const MAX_SERVICES_PER_NODE: usize = 64;
+
 /// `POST /poll` (spec §4.3): the agent's single call that both reports its
 /// own state and pulls the current mesh + service directory.
 pub async fn poll(
@@ -15,10 +22,22 @@ pub async fn poll(
     BearerNode { node }: BearerNode,
     Json(req): Json<PollRequest>,
 ) -> Result<Json<PollResponse>, AppError> {
+    if req.services.len() > MAX_SERVICES_PER_NODE {
+        return Err(AppError::BadRequest(format!(
+            "too many services declared ({}); the limit is {MAX_SERVICES_PER_NODE} per node",
+            req.services.len()
+        )));
+    }
     for decl in &req.services {
         if !wireserve_types::is_valid_dns_label(&decl.name) {
             return Err(AppError::BadRequest(format!(
                 "invalid service name: {}",
+                decl.name
+            )));
+        }
+        if decl.port == 0 {
+            return Err(AppError::BadRequest(format!(
+                "invalid port 0 for service '{}'",
                 decl.name
             )));
         }

@@ -19,10 +19,31 @@ const END_MARKER: &str = "# END WIRESERVE";
 fn render_block(services: &[ServiceInfo]) -> String {
     let mut lines: Vec<String> = services
         .iter()
+        .filter(|s| is_safe_entry(s))
         .map(|s| format!("{} {}.wg", s.ip4, s.name))
         .collect();
     lines.sort();
     lines.join("\n")
+}
+
+/// Defense in depth: the coordinator validates service names and
+/// allocates the addresses itself, so a bad entry here means either a
+/// coordinator bug or a compromised coordinator. Either way this writer
+/// is the last thing standing between that and a line of attacker-chosen
+/// text in every node's `/etc/hosts`, so it re-checks both fields (a
+/// strict DNS label, a literal IPv4 address) and drops anything else with
+/// a loud warning rather than trusting the wire.
+fn is_safe_entry(s: &ServiceInfo) -> bool {
+    let ok = wireserve_types::is_valid_dns_label(&s.name)
+        && s.ip4.parse::<std::net::Ipv4Addr>().is_ok();
+    if !ok {
+        tracing::warn!(
+            service = %s.name.escape_debug(),
+            ip4 = %s.ip4.escape_debug(),
+            "refusing to write malformed directory entry to the hosts file"
+        );
+    }
+    ok
 }
 
 /// Replaces the managed block in `contents`, creating the markers
@@ -226,6 +247,39 @@ mod tests {
             std::fs::read_to_string(&real_hosts).unwrap(),
             "127.0.0.1 localhost\n"
         );
+    }
+
+    // ---- defense in depth: never trust the wire for what lands in /etc/hosts ----
+
+    #[test]
+    fn malformed_directory_entries_are_dropped_not_written() {
+        let evil = vec![
+            svc("plex", "100.90.0.3"),
+            // Name carrying extra hosts-file syntax.
+            svc("evil.wg 10.0.0.1 bank.example", "100.90.0.4"),
+            // Name with a newline: a second, attacker-chosen line.
+            svc("x\n10.0.0.2 mail.example", "100.90.0.5"),
+            // Not an IP at all.
+            svc("ok-name", "not-an-ip"),
+            // IPv6 where the writer expects v4 (would still be a valid
+            // hosts line, but not what this block is defined to carry).
+            svc("six", "fd00::1"),
+        ];
+        let out = replace_managed_block("127.0.0.1 localhost\n", &evil);
+        assert!(out.contains("100.90.0.3 plex.wg"));
+        assert!(!out.contains("bank.example"));
+        assert!(!out.contains("mail.example"));
+        assert!(!out.contains("not-an-ip"));
+        assert!(!out.contains("fd00::1"));
+        // Exactly one entry line between the markers.
+        let body = out
+            .split(BEGIN_MARKER)
+            .nth(1)
+            .unwrap()
+            .split(END_MARKER)
+            .next()
+            .unwrap();
+        assert_eq!(body.trim().lines().count(), 1);
     }
 
     // ---- G1: an unreadable hosts file must abort, never be replaced ----

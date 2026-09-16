@@ -48,11 +48,17 @@ pub fn now_str() -> String {
     Utc::now().to_rfc3339()
 }
 
-/// Maps a UNIQUE-constraint SQLite error into `DbError::NameTaken`; any
-/// other error passes through unchanged.
+/// Maps a UNIQUE-constraint SQLite error into the matching `DbError`
+/// (`PubkeyTaken` for the `nodes.pubkey` column, `NameTaken` otherwise);
+/// any other error passes through unchanged. SQLite names the violated
+/// column in its message (`UNIQUE constraint failed: nodes.pubkey`),
+/// which is the only way to tell the two apart without a pre-query.
 fn map_unique_violation(err: rusqlite::Error) -> DbError {
-    if let rusqlite::Error::SqliteFailure(ref e, _) = err {
+    if let rusqlite::Error::SqliteFailure(ref e, ref msg) = err {
         if e.code == rusqlite::ErrorCode::ConstraintViolation {
+            if msg.as_deref().is_some_and(|m| m.contains("nodes.pubkey")) {
+                return DbError::PubkeyTaken;
+            }
             return DbError::NameTaken;
         }
     }
@@ -172,12 +178,16 @@ pub fn update_poll_state(
 /// name is now slightly misleading but is left as-is since it documents
 /// exactly this gotcha for the next reader.)
 pub fn revoke(conn: &Connection, node_id: i64) -> Result<(), DbError> {
-    conn.execute(
+    // One transaction: a crash between the two statements must not leave
+    // a node revoked but its services still in the directory.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "UPDATE nodes SET revoked = 1, revoked_at = ?1, bearer_token_hash = NULL \
          WHERE id = ?2",
         rusqlite::params![now_str(), node_id],
     )?;
-    conn.execute("DELETE FROM services WHERE node_id = ?1", [node_id])?;
+    tx.execute("DELETE FROM services WHERE node_id = ?1", [node_id])?;
+    tx.commit()?;
     Ok(())
 }
 

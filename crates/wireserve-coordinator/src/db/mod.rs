@@ -19,6 +19,8 @@ pub enum DbError {
     NodeNotFound,
     #[error("name already in use")]
     NameTaken,
+    #[error("pubkey already registered to another node")]
+    PubkeyTaken,
     #[error("service name '{0}' is already in use")]
     ServiceNameCollision(String),
     #[error(transparent)]

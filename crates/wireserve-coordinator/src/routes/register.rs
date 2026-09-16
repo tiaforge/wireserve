@@ -88,6 +88,9 @@ pub async fn register(
             "listen_port is required for kind=agent".into(),
         ));
     }
+    if req.listen_port == Some(0) {
+        return Err(AppError::BadRequest("listen_port must not be 0".into()));
+    }
 
     // F4 (spec §4.5: rejoin works "without freeing its name or IP"):
     // reuse the node's existing addresses if it has any — i.e. this is a

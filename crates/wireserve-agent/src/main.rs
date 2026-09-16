@@ -200,8 +200,24 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
     const UNAUTHORIZED_STREAK_TO_TEARDOWN: u32 = 3;
     let mut unauthorized_streak: u32 = 0;
 
+    // SIGTERM (systemd stop) / SIGINT: exit cleanly. Deliberately NOT a
+    // teardown — spec §5 wants a stopped agent to leave the node exactly
+    // as restricted as it last was, and `bring_up` tolerates an existing
+    // interface, so a restart resumes where it left off. The only thing
+    // removed is the IPC socket file, which would otherwise linger.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
     loop {
         tokio::select! {
+            _ = async { tokio::select! { _ = sigterm.recv() => {}, _ = tokio::signal::ctrl_c() => {} } } => {
+                tracing::info!("termination signal received — exiting without teardown (spec §5)");
+                if socket_path.exists() {
+                    if let Err(e) = std::fs::remove_file(&socket_path) {
+                        tracing::warn!(error = %e, "failed to remove IPC socket on exit");
+                    }
+                }
+                break;
+            }
             _ = interval.tick() => {
                 let mut ctx = poll_loop::PollContext {
                     client: &client,

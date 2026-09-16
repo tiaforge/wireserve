@@ -175,19 +175,27 @@ where
     }
     let directory: PollResponse = resp.json().await?;
 
-    // 2. reconcile WireGuard peers
-    ctx.wg.reconcile(&directory.peers, &self_pubkey)?;
-
-    // 3. reconcile this node's own firewall rules — from the snapshot
-    //    this cycle actually sent (spec §5), not from the coordinator's
-    //    response and not from whatever `serve` may have queued since.
+    // Steps 2-4 are all synchronous and can block: netlink round trips,
+    // DNS resolution of peer endpoints inside `reconcile`, and file I/O.
+    // `block_in_place` moves this worker off the async scheduler for the
+    // duration so the IPC server (`list`/`serve`/`leave`) stays
+    // responsive on the other workers.
     let rules = service_rules(&declared);
-    ctx.firewall
-        .apply(&rules)
-        .map_err(|e| PollError::Firewall(e.to_string()))?;
+    tokio::task::block_in_place(|| -> Result<(), PollError> {
+        // 2. reconcile WireGuard peers
+        ctx.wg.reconcile(&directory.peers, &self_pubkey)?;
 
-    // 4. rewrite the hosts-file managed block from the full directory.
-    crate::hosts::sync(ctx.hosts_path, &directory.services)?;
+        // 3. reconcile this node's own firewall rules — from the snapshot
+        //    this cycle actually sent (spec §5), not from the coordinator's
+        //    response and not from whatever `serve` may have queued since.
+        ctx.firewall
+            .apply(&rules)
+            .map_err(|e| PollError::Firewall(e.to_string()))?;
+
+        // 4. rewrite the hosts-file managed block from the full directory.
+        crate::hosts::sync(ctx.hosts_path, &directory.services)?;
+        Ok(())
+    })?;
 
     // 5. persist merged state.
     {

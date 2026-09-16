@@ -10,15 +10,16 @@ source of truth for *current status*, the spec is the source of truth for
 
 **Currently working on:** nothing open — all milestones complete, including
 the independent security review remediation (M7), its follow-ups (M8
-closing every partial S/F item, M9 the remaining "fix now" items), and a
-real, reproducible end-to-end test (`deploy/e2e/run-e2e-test.sh`). 180
-tests passing across `cargo test --workspace` (agent tested with
-`--no-default-features` locally; the real `nftables` feature is exercised
-by the E2E script's own container builds). M8 and M9 are covered by
-unit/integration tests plus a containerized type-check of the `nftables`
-backend — the E2E script was not re-run for them, so the next E2E run is
-the first live exercise of the F1 shared-state refactor, `Network=host`,
-and the RELATED conntrack rule.
+closing every partial S/F item, M9 the remaining "fix now" items, M10 the
+rest of the review's list), and a real, reproducible end-to-end test
+(`deploy/e2e/run-e2e-test.sh`). 187 tests passing across
+`cargo test --workspace` (agent tested with `--no-default-features`
+locally; the real `nftables` feature is exercised by the E2E script's own
+container builds). M8–M10 are covered by unit/integration tests plus a
+containerized type-check of the `nftables` backend — the E2E script was
+not re-run for them, so the next E2E run is the first live exercise of
+the F1 shared-state refactor, `Network=host`, the RELATED conntrack rule,
+`block_in_place` around reconciliation, and the SIGTERM handler.
 
 ## Milestones
 
@@ -188,6 +189,34 @@ and the RELATED conntrack rule.
         the default interval) and, unlike `leave`, keeps the state file
         so the operator can inspect what the node last saw; `join` with
         a fresh token overwrites it anyway.
+- [x] **M10 — Defense in depth, remaining functional items, cosmetics.**
+      187 tests, clippy clean, both systemd units pass
+      `systemd-analyze verify`. E2E not re-run.
+      - **Defense in depth**: the agent's hosts-file writer re-validates
+        every directory entry (strict DNS label + literal IPv4) and drops
+        anything else with a warning, so a compromised or buggy
+        coordinator cannot put attacker-chosen text into every node's
+        `/etc/hosts`. Tested with name-injection, newline, and non-IP
+        entries.
+      - **Functional**: port `0` rejected for services (`/poll` and the
+        agent's own `serve`) and for `listen_port`; `/poll` caps a node
+        at 64 services (`MAX_SERVICES_PER_NODE`); IPAM no longer hands
+        out the v4 broadcast address (decisions log #2 corrected); a
+        duplicate pubkey on `/register` is a `409` that names the pubkey
+        (`DbError::PubkeyTaken`, distinguished via SQLite's constraint
+        message) instead of "name already in use"; `revoke` runs in one
+        transaction; the coordinator Quadlet no longer publishes the
+        admin port to nothing; the admin CLI's HTTP client has a 30s
+        timeout; the agent handles SIGTERM/SIGINT by removing its socket
+        and exiting *without* teardown (spec §5: a stopped agent leaves
+        the node as restricted as it was).
+      - **Cosmetic**: `tower` moved to the coordinator's dev-dependencies
+        and `tower-http` dropped (neither was used by the binary); the
+        agent unit gained `ProtectSystem=strict` + `PrivateTmp` (the
+        existing `ReadWritePaths` was a no-op without it); the Windows
+        hosts-path branch is gone (dead code on a platform the crate
+        cannot build for); the poll loop's netlink/DNS/file steps run
+        under `block_in_place` so the IPC server stays responsive.
 
 Security-sensitive paths (tokens, auth, firewall default-deny, file
 permissions) get test coverage inline with each milestone that introduces
@@ -205,7 +234,11 @@ doesn't stall or drift:
 2. **Mesh addressing**: default `100.90.0.0/24` (v4) / `fd00:90::/64`
    (v6), both configurable via coordinator env
    (`WIRESERVE_NET_V4_CIDR` / `WIRESERVE_NET_V6_PREFIX`); first-free-slot
-   allocation, `.0`/`.1` network address reserved.
+   allocation starting at host `1`. Reserved: the network address (`.0`)
+   and, for v4 prefixes shorter than /31, the broadcast address (`.255`
+   on a /24) — the latter added in M10; earlier text here claimed `.1`
+   was reserved, which was never true (the coordinator is not a peer, so
+   nothing needs it).
 3. **`online` / `last_handshake` derivation**: the coordinator is
    explicitly never a WireGuard peer and never touches WG state, so it
    cannot observe real handshake times without a wire-schema change the

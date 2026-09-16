@@ -16,14 +16,11 @@ pub fn state_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/var/lib/wireserve/agent-state.json"))
 }
 
-#[cfg(target_os = "windows")]
-pub fn hosts_path() -> PathBuf {
-    std::env::var("WIRESERVE_HOSTS_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows\System32\drivers\etc\hosts"))
-}
-
-#[cfg(not(target_os = "windows"))]
+/// Linux/macOS/BSD hosts file. Spec §6 names the Windows path too
+/// (`C:\Windows\System32\drivers\etc\hosts`), but Windows support is
+/// explicitly deferred (spec "open items"), and this crate's atomic file
+/// writer is Unix-only, so no Windows branch is kept here — it would be
+/// dead code that cannot compile on the platform it claims to support.
 pub fn hosts_path() -> PathBuf {
     std::env::var("WIRESERVE_HOSTS_PATH")
         .map(PathBuf::from)

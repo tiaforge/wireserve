@@ -13,7 +13,10 @@ pub enum IpamError {
 }
 
 /// Smallest unused IPv4 host address in `cidr`, skipping the network
-/// address (`.0`). `used` need not be sorted.
+/// address (`.0`) and — for any prefix shorter than /31 — the broadcast
+/// address (the all-ones host, `.255` on a /24). A /31 has no broadcast
+/// (RFC 3021), so both its host values are usable. `used` need not be
+/// sorted.
 pub fn allocate_v4(cidr: &str, used: &[Ipv4Addr]) -> Result<Ipv4Addr, IpamError> {
     let (network, prefix_len) = parse_v4_cidr(cidr)?;
     let host_bits = 32 - prefix_len;
@@ -22,6 +25,8 @@ pub fn allocate_v4(cidr: &str, used: &[Ipv4Addr]) -> Result<Ipv4Addr, IpamError>
     }
     let network_u32 = u32::from(network);
     let max_hosts = 1u32 << host_bits;
+    // Exclusive upper bound: the broadcast host is excluded unless /31.
+    let max_hosts = if host_bits >= 2 { max_hosts - 1 } else { max_hosts };
 
     for host in 1..max_hosts {
         let candidate = Ipv4Addr::from(network_u32 | host);
@@ -110,17 +115,27 @@ mod tests {
 
     #[test]
     fn v4_exhausted_returns_error() {
-        // /30 has 2 usable host addresses (.1, .2); network .0 and
-        // broadcast-ish .3 both fall in our scanned range's edges, but our
-        // algorithm scans host numbers 1..max_hosts (max_hosts = 4 for a
-        // /30), i.e. host values 1..3 -> .1, .2, .3. Fill them all.
-        let used = vec![
-            Ipv4Addr::new(10, 0, 0, 1),
-            Ipv4Addr::new(10, 0, 0, 2),
-            Ipv4Addr::new(10, 0, 0, 3),
-        ];
+        // /30 has exactly 2 usable host addresses (.1, .2): .0 is the
+        // network and .3 the broadcast, and neither is ever handed out.
+        let used = vec![Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2)];
         let result = allocate_v4("10.0.0.0/30", &used);
         assert_eq!(result, Err(IpamError::Exhausted));
+    }
+
+    #[test]
+    fn v4_never_allocates_the_broadcast_address() {
+        let used: Vec<Ipv4Addr> = (1..=254).map(|h| Ipv4Addr::new(100, 90, 0, h)).collect();
+        assert_eq!(allocate_v4("100.90.0.0/24", &used), Err(IpamError::Exhausted));
+    }
+
+    #[test]
+    fn v4_slash_31_has_no_broadcast() {
+        // RFC 3021: both hosts of a /31 are usable. .0 is still skipped
+        // by the network-address rule, so exactly one address results.
+        assert_eq!(
+            allocate_v4("10.0.0.0/31", &[]).unwrap(),
+            Ipv4Addr::new(10, 0, 0, 1)
+        );
     }
 
     #[test]

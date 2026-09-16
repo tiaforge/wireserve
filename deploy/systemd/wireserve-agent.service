@@ -46,9 +46,12 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 DeviceAllow=/dev/net/tun rw
 NoNewPrivileges=true
 ProtectHome=true
-# /etc/hosts must remain writable — this is the one path this unit can't
-# lock down the way the coordinator's unit locks down /etc, precisely
-# because of spec §6's hosts-file sync.
+PrivateTmp=true
+# Everything read-only except the three paths the agent actually writes.
+# /etc as a whole (not just /etc/hosts) has to be writable because the
+# hosts-file sync creates a temp file beside it and renames over it —
+# this is the one place this unit is looser than the coordinator's.
+ProtectSystem=strict
 ReadWritePaths=/var/lib/wireserve /run/wireserve /etc
 
 [Install]

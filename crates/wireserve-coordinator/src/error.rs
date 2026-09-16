@@ -46,6 +46,10 @@ impl IntoResponse for AppError {
             AppError::Internal(DbError::NameTaken) => {
                 (StatusCode::CONFLICT, "name already in use".to_string())
             }
+            AppError::Internal(DbError::PubkeyTaken) => (
+                StatusCode::CONFLICT,
+                "pubkey already registered to another node".to_string(),
+            ),
             AppError::Internal(DbError::ServiceNameCollision(_)) => unreachable!("handled above"),
             AppError::Internal(DbError::NodeNotFound) => {
                 (StatusCode::NOT_FOUND, "not found".to_string())

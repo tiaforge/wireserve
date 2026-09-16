@@ -94,6 +94,9 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
                     false,
                 );
             }
+            if port == 0 {
+                return (IpcResponse::error("port must be 1-65535"), false);
+            }
             let mut state = ctx.state.lock().await;
             state.declared_services.retain(|d| d.name != name);
             // A fresh `serve` for a previously-rejected name deserves a
@@ -320,6 +323,24 @@ mod tests {
         assert!(matches!(resp, IpcResponse::Ok));
 
         rx.recv().await.expect("shutdown signal must be sent");
+    }
+
+    #[tokio::test]
+    async fn serve_rejects_port_zero_without_mutating_state() {
+        let (ctx, _dir, _rx) = test_ctx();
+        let (mut client, server) = tokio::io::duplex(8192);
+        let ctx2 = ctx.clone();
+        tokio::spawn(async move { handle_connection(&ctx2, server).await });
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        client
+            .write_all(b"{\"op\":\"serve\",\"name\":\"zero\",\"port\":0,\"proto\":\"tcp\"}\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = client.read(&mut buf).await.unwrap();
+        let resp: IpcResponse = serde_json::from_slice(&buf[..n]).unwrap();
+        assert!(matches!(resp, IpcResponse::Error { .. }));
+        assert!(ctx.state.lock().await.declared_services.is_empty());
     }
 
     #[tokio::test]

@@ -872,3 +872,73 @@ async fn delete_node_requires_admin_auth() {
     let resp = app.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ---- Review round 3: functional fixes ----
+
+#[tokio::test]
+async fn poll_rejects_port_zero_and_too_many_services() {
+    let app = test_app();
+    let t = admin_create_node(&app.router, "n1").await;
+    let r = register_node(&app.router, &t, "n1", 51820).await;
+    let bearer = r["bearer_token"].as_str().unwrap();
+
+    let req = json_request(
+        "POST",
+        "/poll",
+        Some(bearer),
+        json!({ "services": [{"name": "zero", "port": 0, "proto": "tcp"}] }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let too_many: Vec<Value> = (0..65)
+        .map(|i| json!({"name": format!("svc{i}"), "port": 1000 + i, "proto": "tcp"}))
+        .collect();
+    let req = json_request("POST", "/poll", Some(bearer), json!({ "services": too_many }));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Nothing from either rejected batch was applied.
+    let req = json_request("POST", "/poll", Some(bearer), json!({ "services": [] }));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let body = body_json(resp).await;
+    assert!(body["services"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn register_rejects_listen_port_zero() {
+    let app = test_app();
+    let t = admin_create_node(&app.router, "n1").await;
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({ "join_token": t, "pubkey": pubkey_for("n1"), "listen_port": 0 }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn duplicate_pubkey_gets_a_pubkey_specific_409() {
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let t2 = admin_create_node(&app.router, "n2").await;
+    register_node(&app.router, &t1, "same-key", 51820).await;
+
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({ "join_token": t2, "pubkey": pubkey_for("same-key"), "listen_port": 51821 }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    let msg = body["error"].as_str().unwrap();
+    assert!(msg.contains("pubkey"), "error must name the pubkey, got {msg:?}");
+    assert!(!msg.contains("name already in use"));
+
+    // The join token was not consumed by the failed attempt.
+    register_node(&app.router, &t2, "other-key", 51821).await;
+}

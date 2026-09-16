@@ -22,10 +22,11 @@ EnvironmentFile=/etc/wireserve/coordinator.env
 # PLAN.md decisions log #24 — a private Docker/Podman network reaching it
 # by container name is the common case).
 PublishPort=127.0.0.1:8080:8080
-# Admin port is intentionally NOT published beyond loopback (spec §4.0:
-# never 0.0.0.0). Reach it with `podman exec` for wireserve-admin, or
-# publish to 127.0.0.1 only if a host-side admin CLI needs it directly:
-PublishPort=127.0.0.1:8081:8081
+# The admin port is deliberately not published at all. It binds loopback
+# INSIDE the container (spec §4.0: never 0.0.0.0), so a PublishPort for
+# it would forward to a port nothing listens on. Reach it with
+# `podman exec <container> wireserve-admin ...`, which runs inside the
+# container's own network namespace.
 Volume=wireserve-coordinator-data:/var/lib/wireserve
 
 [Service]

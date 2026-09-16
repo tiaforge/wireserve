@@ -33,11 +33,23 @@ pub struct AdminClient {
     admin_token: String,
 }
 
+/// Builds the blocking client with a bounded timeout, so a hung coordinator
+/// fails the command instead of leaving the operator's terminal stuck.
+/// Panics only where `Client::new()` would have (reqwest cannot construct
+/// a client without a system trust store — see the coordinator Dockerfile
+/// note on `ca-certificates`).
+fn http_client() -> Client {
+    Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to build HTTP client (is a system CA trust store installed?)")
+}
+
 impl AdminClient {
     #[must_use]
     pub fn new(base_url: impl Into<String>, admin_token: impl Into<String>) -> Self {
         Self {
-            http: Client::new(),
+            http: http_client(),
             base_url: base_url.into(),
             admin_token: admin_token.into(),
         }
@@ -137,6 +149,6 @@ pub fn register(
     req: &RegisterRequest,
 ) -> Result<RegisterResponse, ClientError> {
     let url = format!("{}/register", node_facing_base_url.trim_end_matches('/'));
-    let resp = Client::new().post(url).json(req).send()?;
+    let resp = http_client().post(url).json(req).send()?;
     Ok(AdminClient::check_status(resp)?.json()?)
 }
