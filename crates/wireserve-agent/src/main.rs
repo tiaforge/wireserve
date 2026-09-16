@@ -190,6 +190,16 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
     let hosts_path = paths::hosts_path();
     let mut interval = tokio::time::interval(Duration::from_secs(poll_interval_secs));
 
+    // F9 follow-up: how many 401s in a row it takes before the daemon
+    // concludes it has really been revoked. A single 401 could also be a
+    // coordinator momentarily running against the wrong database (a
+    // restore from backup, a wiped volume) — tearing the whole mesh down
+    // on the first one would turn that operator mistake into every node
+    // dropping off at once. Three consecutive 401s (about a minute at the
+    // default interval) is still a tight bound for a genuine revoke.
+    const UNAUTHORIZED_STREAK_TO_TEARDOWN: u32 = 3;
+    let mut unauthorized_streak: u32 = 0;
+
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -203,22 +213,38 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
                 let result = poll_loop::run_once(&mut ctx, &shared_state).await;
 
                 match result {
-                    Ok(_) => tracing::info!("poll cycle succeeded"),
+                    Ok(_) => {
+                        unauthorized_streak = 0;
+                        tracing::info!("poll cycle succeeded");
+                    }
                     Err(e) if e.is_unauthorized() => {
-                        // F9: a 401 means this node's bearer token no
-                        // longer works — almost always a revoke. Retrying
+                        unauthorized_streak += 1;
+                        if unauthorized_streak < UNAUTHORIZED_STREAK_TO_TEARDOWN {
+                            tracing::warn!(
+                                streak = unauthorized_streak,
+                                "poll rejected with 401 — will tear down after {} consecutive",
+                                UNAUTHORIZED_STREAK_TO_TEARDOWN
+                            );
+                            continue;
+                        }
+                        // F9: a sustained 401 means this node's bearer
+                        // token no longer works — a revoke. Retrying
                         // forever with a dead token and a stale peer set
-                        // serves no purpose; tear down the same way
-                        // `leave` does and stop, rather than silently
-                        // spinning. An operator can `join` again (with a
-                        // fresh token from `wireserve-admin rejoin`) to
-                        // come back.
+                        // serves no purpose; tear down the interface,
+                        // firewall, hosts block and socket the same way
+                        // `leave` does, and stop. Unlike `leave`, the
+                        // state file (keys, last directory) is kept, so an
+                        // operator can inspect what the node last saw and
+                        // nothing irreversible happens from the daemon's
+                        // side; `join` with a fresh token from
+                        // `wireserve-admin rejoin` overwrites it anyway.
                         tracing::error!(
-                            "poll rejected with 401 — this node appears to have been revoked; \
-                             tearing down and stopping (run `wireserve-agent join` again with a \
-                             fresh token from `wireserve-admin rejoin` to rejoin)"
+                            "poll rejected with 401 {} times in a row — this node has been \
+                             revoked; tearing down and stopping (run `wireserve-agent join` \
+                             again with a fresh token from `wireserve-admin rejoin` to rejoin)",
+                            UNAUTHORIZED_STREAK_TO_TEARDOWN
                         );
-                        teardown_everything(&mut fw, &mut wg, &hosts_path, &socket_path, &shared_state, &state_path).await;
+                        teardown_everything(&mut fw, &mut wg, &hosts_path, &socket_path, &shared_state, &state_path, false).await;
                         break;
                     }
                     Err(e) => tracing::error!(error = %e, "poll cycle failed, will retry next interval"),
@@ -226,7 +252,7 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
             }
             _ = shutdown_rx.recv() => {
                 tracing::info!("leave requested, tearing down");
-                teardown_everything(&mut fw, &mut wg, &hosts_path, &socket_path, &shared_state, &state_path).await;
+                teardown_everything(&mut fw, &mut wg, &hosts_path, &socket_path, &shared_state, &state_path, true).await;
                 break;
             }
         }
@@ -250,6 +276,7 @@ async fn teardown_everything<F: FirewallBackend>(
     socket_path: &std::path::Path,
     state: &Mutex<AgentState>,
     state_path: &std::path::Path,
+    reset_state: bool,
 ) where
     F::Error: std::fmt::Display,
 {
@@ -267,9 +294,13 @@ async fn teardown_everything<F: FirewallBackend>(
             tracing::warn!(error = %e, "failed to remove IPC socket during teardown");
         }
     }
-    // Reset local state (bearer token, keys, declared services) rather
-    // than leaving secrets for a node that no longer considers itself
-    // part of the mesh sitting on disk indefinitely.
+    // On an explicit `leave`, reset local state (bearer token, keys,
+    // declared services) rather than leaving secrets for a node that no
+    // longer considers itself part of the mesh sitting on disk
+    // indefinitely. The revoked-node path deliberately keeps it.
+    if !reset_state {
+        return;
+    }
     let mut state = state.lock().await;
     *state = AgentState::default();
     if let Err(e) = state.save(state_path) {

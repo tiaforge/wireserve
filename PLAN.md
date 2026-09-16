@@ -9,13 +9,16 @@ source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
 **Currently working on:** nothing open — all milestones complete, including
-the independent security review remediation (M7), its second-round
-follow-up (M8, closing every S/F item M7 had left partial), and a real,
-reproducible end-to-end test (`deploy/e2e/run-e2e-test.sh`). 176 tests
-passing across `cargo test --workspace` (agent tested with
+the independent security review remediation (M7), its follow-ups (M8
+closing every partial S/F item, M9 the remaining "fix now" items), and a
+real, reproducible end-to-end test (`deploy/e2e/run-e2e-test.sh`). 180
+tests passing across `cargo test --workspace` (agent tested with
 `--no-default-features` locally; the real `nftables` feature is exercised
-by the E2E script's own container builds). M8's changes are covered by
-unit/integration tests only — the E2E script was not re-run for M8.
+by the E2E script's own container builds). M8 and M9 are covered by
+unit/integration tests plus a containerized type-check of the `nftables`
+backend — the E2E script was not re-run for them, so the next E2E run is
+the first live exercise of the F1 shared-state refactor, `Network=host`,
+and the RELATED conntrack rule.
 
 ## Milestones
 
@@ -152,6 +155,39 @@ unit/integration tests only — the E2E script was not re-run for M8.
         `core.autocrlf` no longer rewrites every touched file;
         `WIRESERVE_TRUST_PROXY_HEADERS` documented in the coordinator
         unit's env comment.
+- [x] **M9 — Remaining "worth fixing now" items** from the reviewer's
+      post-M8 list. 180 tests, clippy clean. The `nftables` change was
+      type-checked with the real feature (`cargo clippy -D warnings` in
+      a `rust:1-slim-bookworm` + `clang` container); the E2E script was
+      not re-run.
+      - **G1 — hosts sync could destroy `/etc/hosts`.** Any read error
+        (non-UTF-8 content, a transient permission failure) was treated
+        as an empty file and the whole file rewritten as just the
+        managed block. Now only `NotFound` is treated as empty; any
+        other error aborts the cycle with the file untouched (tested
+        with a non-UTF-8 hosts file, for both `sync` and `remove_block`).
+      - **Firewall matched ESTABLISHED but not RELATED.** rustables'
+        `established()` helper checks the ESTABLISHED bit alone, so ICMP
+        errors tied to a tunnel flow — packet-too-big for path MTU
+        discovery, routine at WireGuard's 1420 MTU — were dropped on
+        `wg0`. Replaced with a hand-built `ct state established,related`
+        rule mirroring the helper's expression shape.
+      - **G5 — rate limiter memory growth.** `is_blocked` runs on every
+        request and inserted an entry per source address, never evicted.
+        Now strictly read-only; `record_failure` prunes expired
+        timestamps and empty sources, bounding the table by sources with
+        a live failure. The unused `check()` is gone. Tests pin both.
+      - **G11 — no `.dockerignore`.** `target/` and `.git/` were copied
+        into every image build context; this was a large part of the E2E
+        script's build time.
+      - **F9 follow-up — 401 self-destruct was too eager.** One 401 tore
+        the node down and wiped its state, so a coordinator briefly
+        running against the wrong database (backup restore, wiped
+        volume) would have made every agent drop off the mesh at once.
+        Teardown now requires three consecutive 401s (about a minute at
+        the default interval) and, unlike `leave`, keeps the state file
+        so the operator can inspect what the node last saw; `join` with
+        a fresh token overwrites it anyway.
 
 Security-sensitive paths (tokens, auth, firewall default-deny, file
 permissions) get test coverage inline with each milestone that introduces

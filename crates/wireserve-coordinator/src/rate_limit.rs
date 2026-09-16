@@ -33,36 +33,43 @@ impl RateLimiter {
     /// consideration security review flagged: checking only after the
     /// comparison already happened meant the limiter changed the response
     /// code but not the per-request cost).
+    ///
+    /// Read-only in the strict sense (security review G5): this runs on
+    /// *every* request, successful ones included, so it must never insert
+    /// a map entry — otherwise every distinct source address ever seen
+    /// would occupy memory forever.
     pub fn is_blocked(&self, ip: IpAddr) -> bool {
         let now = Instant::now();
-        let mut hits = self.hits.lock().unwrap();
-        let entry = hits.entry(ip).or_default();
-        entry.retain(|t| now.duration_since(*t) < self.window);
-        entry.len() as u32 >= self.max
+        let hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
+        hits.get(&ip).is_some_and(|entry| {
+            let live = entry
+                .iter()
+                .filter(|t| now.duration_since(**t) < self.window)
+                .count();
+            live as u32 >= self.max
+        })
     }
 
     /// Records one failed attempt from `ip` — call only on an actual auth
     /// failure (never on success), so legitimate traffic never eats into
-    /// the budget.
+    /// the budget. This is also where the table is pruned: every expired
+    /// timestamp and every address left with none is dropped, so the map
+    /// is bounded by (sources with a live failure in the window × `max`).
+    /// Failures are rare relative to requests, so the sweep is cheap.
     pub fn record_failure(&self, ip: IpAddr) {
         let now = Instant::now();
-        let mut hits = self.hits.lock().unwrap();
-        let entry = hits.entry(ip).or_default();
-        entry.retain(|t| now.duration_since(*t) < self.window);
-        entry.push(now);
+        let mut hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
+        hits.retain(|_, entry| {
+            entry.retain(|t| now.duration_since(*t) < self.window);
+            !entry.is_empty()
+        });
+        hits.entry(ip).or_default().push(now);
     }
 
-    /// Convenience used by call sites that just want the old
-    /// check-and-record-if-allowed behavior in one step, e.g. `/register`'s
-    /// own failure path. Equivalent to checking `is_blocked` then, if not
-    /// blocked, calling `record_failure` and returning `true`.
-    pub fn check(&self, ip: IpAddr) -> bool {
-        if self.is_blocked(ip) {
-            false
-        } else {
-            self.record_failure(ip);
-            true
-        }
+    /// Number of source addresses currently tracked — exposed for tests
+    /// that pin down the no-growth guarantee above.
+    pub fn tracked_sources(&self) -> usize {
+        self.hits.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
@@ -70,32 +77,56 @@ impl RateLimiter {
 mod tests {
     use super::*;
 
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
     #[test]
-    fn allows_up_to_max_then_blocks() {
+    fn allows_up_to_max_failures_then_blocks() {
         let rl = RateLimiter::new(3, 60);
-        let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        assert!(rl.check(ip));
-        assert!(rl.check(ip));
-        assert!(rl.check(ip));
-        assert!(!rl.check(ip), "4th request within window must be blocked");
+        let a = ip("10.0.0.1");
+        for _ in 0..3 {
+            assert!(!rl.is_blocked(a));
+            rl.record_failure(a);
+        }
+        assert!(rl.is_blocked(a), "4th attempt within window must be blocked");
     }
 
     #[test]
     fn is_keyed_per_ip() {
         let rl = RateLimiter::new(1, 60);
-        let a: IpAddr = "10.0.0.1".parse().unwrap();
-        let b: IpAddr = "10.0.0.2".parse().unwrap();
-        assert!(rl.check(a));
-        assert!(!rl.check(a));
-        assert!(rl.check(b), "a different source IP must not be affected");
+        let (a, b) = (ip("10.0.0.1"), ip("10.0.0.2"));
+        rl.record_failure(a);
+        assert!(rl.is_blocked(a));
+        assert!(!rl.is_blocked(b), "a different source IP must not be affected");
     }
 
     #[test]
     fn resets_after_window_elapses() {
-        let rl = RateLimiter::new(1, 0); // window of 0s: every check is "expired" immediately
-        let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        assert!(rl.check(ip));
-        // With a 0-length window the previous hit is immediately stale.
-        assert!(rl.check(ip));
+        // window of 0s: every recorded failure is immediately stale.
+        let rl = RateLimiter::new(1, 0);
+        let a = ip("10.0.0.1");
+        rl.record_failure(a);
+        assert!(!rl.is_blocked(a));
+    }
+
+    #[test]
+    fn is_blocked_never_inserts_an_entry() {
+        let rl = RateLimiter::new(1, 60);
+        for n in 0..100u8 {
+            assert!(!rl.is_blocked(ip(&format!("203.0.113.{n}"))));
+        }
+        assert_eq!(rl.tracked_sources(), 0, "checking must not allocate per source");
+    }
+
+    #[test]
+    fn record_failure_prunes_expired_sources() {
+        let rl = RateLimiter::new(5, 0);
+        rl.record_failure(ip("10.0.0.1"));
+        rl.record_failure(ip("10.0.0.2"));
+        // With a 0s window both earlier entries are expired by the time
+        // the next failure sweeps the table; only the newest survives.
+        rl.record_failure(ip("10.0.0.3"));
+        assert_eq!(rl.tracked_sources(), 1);
     }
 }

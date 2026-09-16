@@ -3,6 +3,7 @@
 //! (default-on) because `rustables` needs `clang`/`libclang` at build time;
 //! see Cargo.toml and PLAN.md decisions log.
 
+use rustables::expr::{Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey};
 use rustables::{
     Batch, Chain, ChainPolicy, Hook, HookClass, MsgType, Protocol, ProtocolFamily, Rule, Table,
 };
@@ -50,6 +51,19 @@ impl NftablesBackend {
             batch.add(&existing, MsgType::Del);
         }
         Ok(())
+    }
+
+    /// `ct state established,related` — built by hand because rustables'
+    /// `Rule::established()` matches ESTABLISHED alone. Mirrors that
+    /// helper's expression shape exactly (conntrack state load, bitwise
+    /// AND against the wanted-states mask, compare-not-equal to zero),
+    /// with RELATED added to the mask.
+    fn established_or_related(rule: Rule) -> Result<Rule, NftablesError> {
+        let states = (ConnTrackState::ESTABLISHED | ConnTrackState::RELATED).bits();
+        Ok(rule
+            .with_expr(Conntrack::new(ConntrackKey::State))
+            .with_expr(Bitwise::new(states.to_le_bytes(), 0u32.to_be_bytes())?)
+            .with_expr(Cmp::new(CmpOp::Neq, 0u32.to_be_bytes())))
     }
 
     fn to_protocol(proto: Proto) -> Protocol {
@@ -103,10 +117,12 @@ impl FirewallBackend for NftablesBackend {
         // of another peer's declared service) — without this, a
         // WG-interface-scoped default-deny would break outbound
         // connectivity through the tunnel just as badly as the bug above
-        // broke it on every other interface.
-        Rule::new(&chain)?
-            .iiface(&self.ifname)?
-            .established()?
+        // broke it on every other interface. RELATED is included alongside
+        // ESTABLISHED (rustables' own `established()` helper matches only
+        // the latter): ICMP errors tied to a tracked flow — packet-too-big
+        // for path MTU discovery in particular, which WireGuard's 1420 MTU
+        // makes routine — are RELATED and would otherwise be dropped.
+        Self::established_or_related(Rule::new(&chain)?.iiface(&self.ifname)?)?
             .accept()
             .add_to_batch(&mut batch);
 

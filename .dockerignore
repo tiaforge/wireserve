@@ -1,0 +1,8 @@
+# Keep the build context small: the Dockerfiles COPY the whole repo, and
+# target/ alone can be gigabytes. Build stages produce their own target/.
+target/
+.git/
+*.db
+*.sqlite
+*.sqlite3
+.env

@@ -63,9 +63,24 @@ fn replace_managed_block(contents: &str, services: &[ServiceInfo]) -> String {
 /// `/etc/hosts` on a real system is typically world-readable, 644, and
 /// this writer has no business changing that).
 pub fn sync(path: &Path, services: &[ServiceInfo]) -> std::io::Result<()> {
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let existing = read_existing(path)?;
     let updated = replace_managed_block(&existing, services);
     write_preserving_mode(path, &updated)
+}
+
+/// Reads the current hosts file. A missing file is treated as empty (the
+/// block gets created from scratch); **any other failure is an error**,
+/// never silently treated as empty — a transient permission error or a
+/// non-UTF-8 byte somewhere in the file must abort this cycle, not cause
+/// the whole file to be rewritten as nothing but the managed block
+/// (security review G1: that would drop `localhost` and everything else
+/// the operator had in there).
+fn read_existing(path: &Path) -> std::io::Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Strips the managed block (markers included) entirely, rather than
@@ -74,7 +89,7 @@ pub fn sync(path: &Path, services: &[ServiceInfo]) -> std::io::Result<()> {
 /// review F2 flagged that this project's `leave` implementation was only
 /// doing the first two). A no-op if the markers aren't present.
 pub fn remove_block(path: &Path) -> std::io::Result<()> {
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let existing = read_existing(path)?;
     let Some(stripped) = strip_managed_block(&existing) else {
         return Ok(());
     };
@@ -211,6 +226,35 @@ mod tests {
             std::fs::read_to_string(&real_hosts).unwrap(),
             "127.0.0.1 localhost\n"
         );
+    }
+
+    // ---- G1: an unreadable hosts file must abort, never be replaced ----
+
+    #[test]
+    fn sync_refuses_to_rewrite_a_file_it_could_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts");
+        // Invalid UTF-8 makes read_to_string fail; the old code treated
+        // that as an empty file and would have written back ONLY the
+        // managed block, dropping every other entry.
+        let original: &[u8] = b"127.0.0.1 localhost\n\xff\xfe not utf8\n";
+        std::fs::write(&path, original).unwrap();
+
+        let err = sync(&path, &[svc("plex", "100.90.0.3")]);
+        assert!(err.is_err(), "sync must fail rather than guess");
+        assert_eq!(std::fs::read(&path).unwrap(), original, "file must be untouched");
+
+        let err = remove_block(&path);
+        assert!(err.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn sync_creates_a_missing_hosts_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts");
+        sync(&path, &[svc("plex", "100.90.0.3")]).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("plex.wg"));
     }
 
     // ---- F2: `leave` must remove the managed block, not just empty it ----
