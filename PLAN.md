@@ -1142,3 +1142,21 @@ what the library does and does not do on your behalf.
     by ANSI escapes in tracing output. Bounded by `MAX_DENY_REASON_LEN`,
     enforced both in `wireserve-admin` (fail fast, no round trip) and at
     the coordinator.
+68. **The e2e harness encoded the pre-approval expectation and had to be
+    updated — which turned out to be the best coverage in the change.**
+    `run-e2e-test.sh` declared a service and asserted it reached the other
+    node's `/etc/hosts`; with approval defaulting on, that assertion was
+    simply false. Rather than switch the flag off for the test, the step
+    now checks the gate *holds* (the name must NOT appear before
+    approval), that the declaring node reports its own service as pending,
+    then approves and checks propagation. That is the only place the
+    approval path is exercised against a real mesh, real nftables and a
+    real `/etc/hosts`. `run-nat-test.sh` approves its two services and
+    moves on, since it is about NAT traversal rather than approval.
+    `run-proxy-test.sh` needed no change: it asserts on
+    `service_declared` log events, which are emitted for a newly declared
+    name regardless of approval state — confirmed by running it, not by
+    reasoning about it.
+
+    All three suites were run against real kernel WireGuard and nftables
+    in Podman after the change, not just the unit suite.

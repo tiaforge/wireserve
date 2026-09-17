@@ -150,12 +150,31 @@ podman exec "$DEBUG_CONTAINER" ping -c2 -W3 "$AGENT2_MESH_IP" >/dev/null 2>&1 \
             "default-deny on wg0 drops inbound echo requests (they are neither" \
             "ESTABLISHED/RELATED nor a declared service port)."
 
-log "declaring a service on agent1 and checking hosts-file sync on agent2"
+log "declaring a service on agent1 — it must NOT propagate before approval"
 podman exec "$AGENT1" wireserve-agent serve testsvc 12345 tcp
 sleep 8
+# Service approval is on by default: a declaration is stored but withheld
+# from every other node's directory until an admin approves it, so that
+# one compromised node cannot claim an unclaimed name and have every
+# other node's /etc/hosts point at it. Check the gate actually holds
+# against a real mesh before approving, or the approval step below would
+# prove nothing.
+if podman exec "$AGENT2" grep -q "testsvc.wg" /etc/hosts; then
+    fail "testsvc.wg reached agent2 WITHOUT approval — the approval gate is not holding"
+fi
+pass "an unapproved service is withheld from the mesh directory"
+
+podman exec "$AGENT1" wireserve-agent list | grep -q '"pending": true' \
+    || fail "the declaring node does not show its own service as pending"
+pass "the declaring node reports its service as pending approval"
+
+log "approving the service and checking hosts-file sync on agent2"
+podman exec "$COORD" wireserve-admin approve-service node1 testsvc \
+    || fail "could not approve testsvc for node1"
+sleep 8
 podman exec "$AGENT2" grep -q "testsvc.wg" /etc/hosts \
-    || fail "agent2's /etc/hosts never picked up testsvc.wg"
-pass "agent2's /etc/hosts synced testsvc.wg from the mesh directory"
+    || fail "agent2's /etc/hosts never picked up testsvc.wg after approval"
+pass "agent2's /etc/hosts synced testsvc.wg once approved"
 
 log "checking the firewall allows the declared port and denies everything else"
 # agent1 declared testsvc on tcp/12345 above. Both listeners below run in

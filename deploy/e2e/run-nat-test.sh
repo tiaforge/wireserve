@@ -226,6 +226,14 @@ echo "node2 mesh address: $AGENT2_MESH"
 log "declaring a service on each of agent1 and agent2"
 podman exec "$AGENT1" wireserve-agent serve svc-one 12345 tcp
 podman exec "$AGENT2" wireserve-agent serve svc-two 12345 tcp
+sleep 8
+# Service approval is on by default. This harness is about NAT traversal,
+# not about the approval gate (run-e2e-test.sh covers that), so approve
+# both and get on with the actual question.
+podman exec "$COORD" wireserve-admin approve-service node1 svc-one \
+    || fail "could not approve svc-one"
+podman exec "$COORD" wireserve-admin approve-service node2 svc-two \
+    || fail "could not approve svc-two"
 sleep 12
 in_netns_bg "$AGENT1" nc -l -k -p 12345
 in_netns_bg "$AGENT2" nc -l -k -p 12345
