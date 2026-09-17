@@ -41,14 +41,18 @@ pub async fn register(
         }
     }
 
-    // S3/S4 (security review, round 2): the same before/after split the
-    // auth extractors use. The budget is checked BEFORE the token lookup
-    // — so a source that has exhausted its failed-attempt budget is
-    // turned away even if its next guess would have been correct, which
-    // is what makes the limiter an actual brute-force bound rather than a
-    // response-code cosmetic — and it is keyed on the proxy-resolved
-    // client IP, not the raw TCP peer (which behind spec §7's mandated
-    // reverse proxy is always the proxy itself).
+    // The budget is read before the lookup and keyed on the
+    // proxy-resolved client IP, not the raw TCP peer (which behind spec
+    // §7's mandated reverse proxy is always the proxy itself, S4).
+    //
+    // What that budget does and does not do: it selects the status code
+    // for a request that goes on to fail, and nothing more. It does NOT
+    // turn away a request carrying a valid join token — see the comment
+    // on the lookup below, and `rate_limit`'s module doc. An earlier
+    // version of this comment claimed the opposite ("an actual
+    // brute-force bound rather than a response-code cosmetic") while the
+    // code ten lines down did the reverse; the bound is the global
+    // failed-auth delay applied on the failure path, not this.
     let client =
         crate::client_ip::resolve_client(&headers, peer_addr.ip(), state.config.trust_proxy_headers);
     let observed_ip = client.ip;
@@ -63,14 +67,33 @@ pub async fn register(
     // reverse proxy, or behind any shared NAT, every node registers from
     // one address, so rejecting on the budget alone let a stranger's bad
     // guesses block a legitimate node from ever joining.
-    let node = match nodes::find_by_unused_join_token_hash(&conn, &hash)? {
+    let found = nodes::find_by_unused_join_token_hash(&conn, &hash)?;
+    let node = match found {
         Some(node) => node,
         None => {
-            // Unknown and already-used tokens are indistinguishable on
-            // purpose (spec: "reject if token already used or unknown" —
-            // with the same shape, so a caller learns nothing about
-            // whether a guessed token was ever valid).
+            // Unknown, already-used and expired tokens are
+            // indistinguishable on purpose (spec: "reject if token
+            // already used or unknown" — with the same shape, so a caller
+            // learns nothing about whether a guessed token was ever
+            // valid).
+            //
+            // Release the database lock BEFORE the delay below. `conn` is
+            // the process's single `Mutex<Connection>`: sleeping while
+            // holding it would queue every other request in the mesh
+            // behind whoever is guessing, which is a far worse outcome
+            // than the guessing itself. The success path deliberately
+            // keeps the lock instead — dropping and re-acquiring it there
+            // would open a window for two callers to redeem the same
+            // one-time token concurrently.
+            drop(conn);
             state.rate_limiter.record_failure(observed_ip);
+            tracing::warn!(
+                event = "auth_failure",
+                client_ip = %observed_ip,
+                endpoint = "/register",
+                reason = "unknown_token",
+            );
+            state.rate_limiter.apply_failure_delay().await;
             return Err(if blocked {
                 AppError::TooManyRequests
             } else {

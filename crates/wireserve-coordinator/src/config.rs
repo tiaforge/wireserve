@@ -31,6 +31,12 @@ pub struct Config {
     /// default is one extra command, and the cost of no expiry at all is
     /// a live credential nobody remembers issuing.
     pub join_token_ttl_secs: u64,
+    /// Failed authentications across *all* sources, per
+    /// `global_auth_failure_window_secs`, before failure responses start
+    /// being delayed. See `rate_limit`'s module doc for why this, and not
+    /// the per-source window, is the actual bound on guess rate.
+    pub global_auth_failure_max: u32,
+    pub global_auth_failure_window_secs: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -78,6 +84,9 @@ impl Config {
         let rate_limit_window_secs = env_parse_or("WIRESERVE_RATE_LIMIT_WINDOW_SECS", 60)?;
         let trust_proxy_headers = env_parse_or("WIRESERVE_TRUST_PROXY_HEADERS", false)?;
         let join_token_ttl_secs = env_parse_or("WIRESERVE_JOIN_TOKEN_TTL_SECS", 1800u64)?;
+        let global_auth_failure_max = env_parse_or("WIRESERVE_GLOBAL_AUTH_FAILURE_MAX", 20u32)?;
+        let global_auth_failure_window_secs =
+            env_parse_or("WIRESERVE_GLOBAL_AUTH_FAILURE_WINDOW_SECS", 60u64)?;
 
         Ok(Self {
             listen_addr,
@@ -91,6 +100,8 @@ impl Config {
             rate_limit_window_secs,
             trust_proxy_headers,
             join_token_ttl_secs,
+            global_auth_failure_max,
+            global_auth_failure_window_secs,
         })
     }
 }

@@ -31,6 +31,12 @@ fn test_config(db_path: &str) -> Config {
         rate_limit_window_secs: 60,
         trust_proxy_headers: false,
         join_token_ttl_secs: 1800,
+        // Effectively disabled for most tests: the delay is real wall
+        // time, and every existing test that exercises a failure path
+        // would otherwise pay for it. The tests that care about the
+        // delay lower this deliberately.
+        global_auth_failure_max: u32::MAX,
+        global_auth_failure_window_secs: 60,
     }
 }
 
@@ -1193,6 +1199,126 @@ async fn proxy_misconfiguration_still_suppresses_a_useless_endpoint() {
     assert!(
         row.endpoint_addr.is_none(),
         "the proxy's own address must never be recorded as a node's endpoint"
+    );
+}
+
+// ---- failed-auth delay ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delayed_failure_never_holds_the_database_lock() {
+    // The regression test for the way this mitigation could have been
+    // worse than the problem. `state.db.conn` is the process's single
+    // Mutex<Connection>; awaiting the failure delay while holding it
+    // would queue every other request in the mesh behind whoever is
+    // guessing join tokens. `/register` in particular used to hold that
+    // lock across its whole failure branch.
+    let mut config = test_config("");
+    config.global_auth_failure_max = 0; // every failure is delayed
+    let app = app_with_config(config);
+
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let bearer = r1["bearer_token"].as_str().unwrap().to_string();
+
+    // Put a pile of bad registrations into their delay.
+    let mut handles = Vec::new();
+    for i in 0..8 {
+        let router = app.router.clone();
+        handles.push(tokio::spawn(async move {
+            let req = json_request(
+                "POST",
+                "/register",
+                None,
+                json!({
+                    "join_token": format!("jtk_bogus{i}"),
+                    "pubkey": pubkey_for("z"),
+                    "listen_port": 51830
+                }),
+            );
+            router.oneshot(req).await.unwrap()
+        }));
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let start = std::time::Instant::now();
+    let req = json_request("POST", "/poll", Some(&bearer), json!({ "services": [] }));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        elapsed < std::time::Duration::from_millis(150),
+        "a valid poll must not queue behind delayed failures (took {elapsed:?})"
+    );
+
+    for h in handles {
+        let _ = h.await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_valid_credential_is_never_delayed_even_with_the_budget_drained() {
+    // What makes the global budget free of collateral damage, unlike the
+    // per-source window: the population slowed is exactly the population
+    // failing. A legitimate node sharing the proxy's address with an
+    // attacker is unaffected, because its credential is good.
+    let mut config = test_config("");
+    config.global_auth_failure_max = 0;
+    let app = app_with_config(config);
+
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let bearer = r1["bearer_token"].as_str().unwrap().to_string();
+
+    // Drain the budget with failures, sequentially, so they are finished
+    // rather than merely in flight.
+    for i in 0..5 {
+        let req = json_request(
+            "POST",
+            "/poll",
+            Some(&format!("brt_bogus{i}")),
+            json!({ "services": [] }),
+        );
+        let resp = app.router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let start = std::time::Instant::now();
+    let req = json_request("POST", "/poll", Some(&bearer), json!({ "services": [] }));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        elapsed < std::time::Duration::from_millis(150),
+        "a good credential must answer at full speed (took {elapsed:?})"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failure_past_the_budget_is_actually_slowed() {
+    // The other half — the delay has to exist, or the two tests above
+    // would pass against a function that does nothing.
+    let mut config = test_config("");
+    config.global_auth_failure_max = 0;
+    let app = app_with_config(config);
+
+    // First failure: budget already exceeded by the time the delay is
+    // consulted, since record_failure runs before it.
+    let start = std::time::Instant::now();
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({ "join_token": "jtk_bogus", "pubkey": pubkey_for("z"), "listen_port": 51830 }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        elapsed >= std::time::Duration::from_millis(200),
+        "a failure past the budget must be held back (took {elapsed:?})"
     );
 }
 

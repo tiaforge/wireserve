@@ -990,3 +990,57 @@ what the library does and does not do on your behalf.
     `Option<Json<RejoinRequest>>` so a bodiless POST — which is what every
     admin CLI built before this change sends — keeps working instead of
     failing on a missing Content-Type.
+58. **The rate limiter's comments claimed a bound it did not provide, and
+    now it provides one.** `routes/register.rs` asserted that an
+    over-budget source "is turned away even if its next guess would have
+    been correct, which is what makes the limiter an actual brute-force
+    bound rather than a response-code cosmetic" — ten lines above code
+    doing exactly the reverse, and directly contradicting the comment
+    immediately below it. `rate_limit`'s module doc claimed failed
+    attempts "trip it" as though that stopped something. Both rewritten to
+    describe what the per-source window actually does, which is select a
+    status code.
+
+    The decision that produced the gap was right and is unchanged:
+    rejecting on the per-source budget cannot work when spec §7 mandates
+    a proxy in front, because then every node shares one key and ten
+    guesses from a stranger take the mesh offline. What was missing is
+    that no bound replaced it. Added: a **global** failed-auth budget
+    that delays *failure responses only* (250ms, capped at 1s, at most 64
+    concurrently). A valid credential is never delayed, which is what
+    makes this free of the collateral damage the per-source version had —
+    the population slowed is exactly the population failing.
+
+    **The delay must never be awaited while holding `state.db.conn`**,
+    which is the process's single `Mutex<Connection>`. `/register` held
+    that lock across its whole failure branch, so the naive placement
+    would have queued every request in the mesh behind whoever was
+    guessing — a far worse outcome than the guessing. The failure branch
+    now drops the lock explicitly first; the success path deliberately
+    keeps it, because dropping and re-acquiring there would open a window
+    for two callers to redeem the same one-time join token. Pinned by
+    `a_delayed_failure_never_holds_the_database_lock`, which was checked
+    against a deliberately reintroduced bug.
+
+59. **Blocking an abusive source is the proxy's job, and the coordinator's
+    contribution is a log line.** The tempting alternative — since this
+    project already manages nftables — does not survive contact with the
+    architecture: the nftables code is in the *agent*, on a different
+    machine. The coordinator runs unprivileged with an empty
+    `CapabilityBoundingSet=` and never touches the host firewall (spec
+    §8), and behind the mandated proxy the only address it can see is the
+    proxy's own, so a block it applied would drop every node at once and
+    stay dropped. Granting it CAP_NET_ADMIN to do that would trade the
+    strongest privilege separation in the design for a mesh-wide outage
+    button. Instead every failed auth emits
+    `event="auth_failure"` with the resolved client address and a coarse
+    reason (never any part of the credential), and `deploy/fail2ban/`
+    ships a filter and jail for the proxy host.
+
+    **Not covered by a test: the log line's exact format**, which the
+    fail2ban filter depends on. Capturing tracing output needs a global
+    subscriber and is flaky under parallel tests, and decisions log #51 is
+    the record of this project already shipping a grep that matched
+    nothing because of ANSI escapes. The filter's README says to run
+    `fail2ban-regex` against real output rather than trusting it, which is
+    the honest version of a check this suite cannot make.

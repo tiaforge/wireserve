@@ -21,9 +21,11 @@ pub use state::AppState;
 pub fn build_state(config: Config, db: db::Db) -> AppState {
     AppState {
         db: Arc::new(db),
-        rate_limiter: Arc::new(rate_limit::RateLimiter::new(
+        rate_limiter: Arc::new(rate_limit::RateLimiter::with_global_budget(
             config.rate_limit_max,
             config.rate_limit_window_secs,
+            config.global_auth_failure_max,
+            config.global_auth_failure_window_secs,
         )),
         config: Arc::new(config),
     }

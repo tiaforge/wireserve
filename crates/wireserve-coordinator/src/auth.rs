@@ -110,10 +110,30 @@ fn over_budget(state: &AppState, parts: &Parts) -> bool {
 /// and on failed-auth responses from any endpoint") — call only once an
 /// attempt has actually failed; successful auth never touches the
 /// limiter.
-fn record_failed_auth(state: &AppState, parts: &Parts) -> AuthError {
-    if let Some(ip) = source_ip(state, parts) {
+///
+/// Also emits the `auth_failure` audit event. That event is the
+/// coordinator's entire contribution to blocking an abusive source: it
+/// runs unprivileged with an empty `CapabilityBoundingSet=` and never
+/// touches the host firewall (spec §8), and behind spec §7's mandated
+/// proxy the only address it can see is the proxy's own — so a block
+/// applied here would take the whole mesh off at once. The proxy host
+/// sees the real client and already holds the privilege to drop it; this
+/// log line is what tells it to. See `deploy/fail2ban/`.
+///
+/// `reason` is deliberately coarse and never contains any part of the
+/// presented credential — this line goes to a log that gets shipped,
+/// grepped and pasted into support threads.
+fn record_failed_auth(state: &AppState, parts: &Parts, endpoint: &str, reason: &str) -> AuthError {
+    let ip = source_ip(state, parts);
+    if let Some(ip) = ip {
         state.rate_limiter.record_failure(ip);
     }
+    tracing::warn!(
+        event = "auth_failure",
+        client_ip = %ip.map_or_else(|| "unknown".to_string(), |i| i.to_string()),
+        endpoint = endpoint,
+        reason = reason,
+    );
     AuthError::Unauthorized
 }
 
@@ -141,7 +161,9 @@ impl FromRequestParts<AppState> for AdminAuth {
             return Err(AuthError::RateLimited);
         }
         let Some(candidate) = extract_bearer(parts) else {
-            return Err(record_failed_auth(state, parts));
+            let err = record_failed_auth(state, parts, "admin", "missing_header");
+            state.rate_limiter.apply_failure_delay().await;
+            return Err(err);
         };
         let candidate_digest = Sha256::digest(candidate.as_bytes());
         let expected_digest = Sha256::digest(state.config.admin_token.as_bytes());
@@ -149,7 +171,9 @@ impl FromRequestParts<AppState> for AdminAuth {
         if matches {
             Ok(AdminAuth)
         } else {
-            Err(record_failed_auth(state, parts))
+            let err = record_failed_auth(state, parts, "admin", "bad_admin_token");
+            state.rate_limiter.apply_failure_delay().await;
+            Err(err)
         }
     }
 }
@@ -174,7 +198,8 @@ impl FromRequestParts<AppState> for BearerNode {
     ) -> Result<Self, Self::Rejection> {
         let blocked = over_budget(state, parts);
         let Some(candidate) = extract_bearer(parts) else {
-            record_failed_auth(state, parts);
+            record_failed_auth(state, parts, "/poll", "missing_header");
+            state.rate_limiter.apply_failure_delay().await;
             return Err(if blocked {
                 AuthError::RateLimited
             } else {
@@ -191,7 +216,11 @@ impl FromRequestParts<AppState> for BearerNode {
             // likely sharing a key with whoever did.
             Ok(Some(node)) => Ok(BearerNode { node }),
             Ok(None) => {
-                record_failed_auth(state, parts);
+                // The database lock was released above, before this
+                // point, which is what makes the delay safe to await
+                // here — see `RateLimiter::failure_delay`.
+                record_failed_auth(state, parts, "/poll", "unknown_token");
+                state.rate_limiter.apply_failure_delay().await;
                 Err(if blocked {
                     AuthError::RateLimited
                 } else {
