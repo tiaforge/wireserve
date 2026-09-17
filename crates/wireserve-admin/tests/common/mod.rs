@@ -109,6 +109,21 @@ impl MockCoordinator {
             .collect()
     }
 
+    /// The route patterns the mock matched, in order. Mirrors `bodies()`.
+    /// Handlers record the pattern (`/admin/nodes/:name/endpoint`) rather
+    /// than the concrete path, which is what makes an assertion here about
+    /// *which endpoint* was called rather than about the name substituted
+    /// into it.
+    pub fn paths(&self) -> Vec<String> {
+        self.state
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.path.clone())
+            .collect()
+    }
+
     pub fn set_peers(&self, peers: Vec<PeerInfo>) {
         *self.state.peers.lock().unwrap() = peers;
     }
@@ -155,6 +170,18 @@ async fn revoke_node(
     body: Bytes,
 ) -> Result<StatusCode, StatusCode> {
     record(&state, "POST", "/admin/nodes/:name/revoke", &body);
+    if !admin_auth_ok(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(StatusCode::OK)
+}
+
+async fn clear_endpoint(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(_name): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    record(&state, "DELETE", "/admin/nodes/:name/endpoint", b"");
     if !admin_auth_ok(&state, &headers) {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -221,6 +248,10 @@ fn admin_only_routes() -> Router<MockState> {
         .route("/admin/nodes/{name}/revoke", post(revoke_node))
         .route("/admin/nodes/{name}/rejoin", post(rejoin_node))
         .route("/admin/nodes/{name}", axum::routing::delete(delete_node))
+        .route(
+            "/admin/nodes/{name}/endpoint",
+            axum::routing::delete(clear_endpoint),
+        )
         .route("/admin/peers", get(list_peers))
 }
 

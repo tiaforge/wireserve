@@ -142,6 +142,7 @@ On the coordinator host, against the loopback-only admin port:
 | `wireserve-admin revoke <name>` | cut a node off, keep its name reserved |
 | `wireserve-admin rejoin <name>` | fresh join token, same name and address |
 | `wireserve-admin delete-node <name>` | remove the record, free the name |
+| `wireserve-admin clear-endpoint <name>` | drop a stale advertised endpoint |
 
 ## Workspace layout
 

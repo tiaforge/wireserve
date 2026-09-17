@@ -233,6 +233,37 @@ pub fn clear_bearer_token(conn: &Connection, node_id: i64) -> Result<(), DbError
     Ok(())
 }
 
+/// Clears a node's advertised `endpoint_addr`, leaving everything else
+/// about the node untouched.
+///
+/// Exists because `update_poll_state` writes the column with
+/// `COALESCE(?2, endpoint_addr)`, so a node can set an endpoint but never
+/// unset one: a `/poll` that omits `endpoint_addr` means "no opinion,
+/// keep what you have", not "clear it". That COALESCE is load-bearing and
+/// is deliberately left alone — a node that registered without
+/// `--endpoint-addr` had one inferred from its observed source address
+/// (spec §4.2) and never learned the value, so it sends no
+/// `endpoint_addr` on its very first poll. Dropping the COALESCE would
+/// wipe that inferred endpoint immediately and break exactly the NAT-ed
+/// deployment the register-time fallback exists to serve.
+///
+/// So clearing is an operator action instead, which is the right shape
+/// anyway: a stale endpoint (a lost port forward, a move behind CGNAT)
+/// is noticed by the person watching the mesh, not by the node that no
+/// longer knows how it is reached.
+///
+/// **This clears a stale value; it does not stop a node re-asserting
+/// one.** If the node still has an endpoint set locally it will report
+/// it again on its next poll and the column comes back. To stop that,
+/// change it at the node.
+pub fn clear_endpoint(conn: &Connection, node_id: i64) -> Result<(), DbError> {
+    conn.execute(
+        "UPDATE nodes SET endpoint_addr = NULL WHERE id = ?1",
+        [node_id],
+    )?;
+    Ok(())
+}
+
 /// Hard-deletes a node record (security review F8: there was no way to
 /// free a name burned by e.g. a failed `export-config` between create and
 /// register). `services` rows go with it via the schema's
@@ -456,6 +487,70 @@ mod tests {
         .unwrap();
         let row = find_by_name(&conn, "n1").unwrap().unwrap();
         assert!(!row.revoked, "rejoin + register is still the way back in");
+    }
+
+    #[tokio::test]
+    async fn clear_endpoint_removes_only_the_endpoint() {
+        let db = test_db();
+        let conn = db.conn.lock().await;
+        let id = create_node(&conn, "n1", NodeKind::Agent, "hash1").unwrap();
+        apply_redemption(
+            &conn,
+            id,
+            &Redemption {
+                pubkey: "pk1",
+                ip4: "100.90.0.1".parse().unwrap(),
+                ip6: "fd00:90::1".parse().unwrap(),
+                listen_port: Some(51820),
+                endpoint_addr: Some("1.2.3.4:51820"),
+                bearer_token_hash: "bearerhash1",
+            },
+        )
+        .unwrap();
+
+        clear_endpoint(&conn, id).unwrap();
+
+        let row = find_by_name(&conn, "n1").unwrap().unwrap();
+        assert!(row.endpoint_addr.is_none());
+        // Everything else about the node survives — this is not a revoke.
+        assert_eq!(row.listen_port, Some(51820));
+        assert!(!row.revoked);
+        assert!(find_by_bearer_hash(&conn, "bearerhash1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_poll_that_omits_an_endpoint_does_not_resurrect_a_cleared_one() {
+        // The COALESCE in `update_poll_state` means "no opinion", so a
+        // cleared endpoint must stay cleared until the node actually
+        // reports one. (The node re-asserting a locally-configured
+        // endpoint is the documented limitation, covered separately.)
+        let db = test_db();
+        let conn = db.conn.lock().await;
+        let id = create_node(&conn, "n1", NodeKind::Agent, "hash1").unwrap();
+        apply_redemption(
+            &conn,
+            id,
+            &Redemption {
+                pubkey: "pk1",
+                ip4: "100.90.0.1".parse().unwrap(),
+                ip6: "fd00:90::1".parse().unwrap(),
+                listen_port: Some(51820),
+                endpoint_addr: Some("1.2.3.4:51820"),
+                bearer_token_hash: "bearerhash1",
+            },
+        )
+        .unwrap();
+        clear_endpoint(&conn, id).unwrap();
+
+        update_poll_state(&conn, id, None).unwrap();
+        assert!(find_by_name(&conn, "n1").unwrap().unwrap().endpoint_addr.is_none());
+
+        update_poll_state(&conn, id, Some("5.6.7.8:51820")).unwrap();
+        assert_eq!(
+            find_by_name(&conn, "n1").unwrap().unwrap().endpoint_addr.as_deref(),
+            Some("5.6.7.8:51820"),
+            "a node that does report an endpoint still sets it"
+        );
     }
 
     #[tokio::test]

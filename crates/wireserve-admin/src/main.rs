@@ -35,6 +35,12 @@ enum Command {
     /// Permanently delete a node record and free its name. Refused while
     /// the node is still active — revoke it first.
     DeleteNode { name: String },
+    /// Clear a node's advertised endpoint address. Use when a node has
+    /// lost the public address other peers were dialing (a dropped port
+    /// forward, a move behind CGNAT) and is still advertising it. The
+    /// node reports a new one on its next poll if it still has one set
+    /// locally.
+    ClearEndpoint { name: String },
     /// List the full peer directory (spec §4.5.1).
     ListPeers,
     /// Generate a WireGuard .conf for an agent-less consumer-only device
@@ -95,6 +101,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let client = build_client(&coordinator_url, &admin_token)?;
             wireserve_admin::cmd_delete_node(&client, &name)?;
             println!("node '{name}' deleted");
+        }
+        Command::ClearEndpoint { name } => {
+            check_name(&name)?;
+            let client = build_client(&coordinator_url, &admin_token)?;
+            wireserve_admin::cmd_clear_endpoint(&client, &name)?;
+            println!("node '{name}' endpoint cleared");
         }
         Command::ListPeers => {
             let client = build_client(&coordinator_url, &admin_token)?;

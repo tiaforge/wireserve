@@ -1195,6 +1195,159 @@ async fn proxy_misconfiguration_still_suppresses_a_useless_endpoint() {
     );
 }
 
+// ---- clear-endpoint ----
+
+#[tokio::test]
+async fn clear_endpoint_removes_a_stale_endpoint_from_the_directory() {
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+
+    // n1 reports an endpoint, and a second node sees it in the directory.
+    let req = json_request(
+        "POST",
+        "/poll",
+        Some(&bearer1),
+        json!({ "endpoint_addr": "1.2.3.4:51820", "services": [] }),
+    );
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let t2 = admin_create_node(&app.router, "n2").await;
+    let r2 = register_node(&app.router, &t2, "n2", 51821).await;
+    let bearer2 = r2["bearer_token"].as_str().unwrap().to_string();
+    let req = json_request("POST", "/poll", Some(&bearer2), json!({ "services": [] }));
+    let body = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
+    let n1 = body["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "n1")
+        .unwrap()
+        .clone();
+    assert_eq!(n1["endpoint_addr"], "1.2.3.4:51820");
+
+    // Clear it.
+    let req = raw_request("DELETE", "/admin/nodes/n1/endpoint", Some(&format!("Bearer {ADMIN}")));
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let req = json_request("POST", "/poll", Some(&bearer2), json!({ "services": [] }));
+    let body = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
+    let n1 = body["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "n1")
+        .unwrap()
+        .clone();
+    assert!(
+        n1.get("endpoint_addr").is_none(),
+        "a cleared endpoint must stop being advertised: {n1}"
+    );
+}
+
+#[tokio::test]
+async fn a_poll_without_an_endpoint_does_not_resurrect_a_cleared_one() {
+    // `/poll`'s COALESCE means an omitted endpoint_addr is "no opinion",
+    // which is what lets a node registered behind NAT keep the endpoint
+    // inferred at register time. It must not also mean "put the old one
+    // back" after an admin cleared it.
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+
+    let req = json_request(
+        "POST",
+        "/poll",
+        Some(&bearer1),
+        json!({ "endpoint_addr": "1.2.3.4:51820", "services": [] }),
+    );
+    app.router.clone().oneshot(req).await.unwrap();
+
+    let req = raw_request("DELETE", "/admin/nodes/n1/endpoint", Some(&format!("Bearer {ADMIN}")));
+    app.router.clone().oneshot(req).await.unwrap();
+
+    // A poll that says nothing about its endpoint.
+    let req = json_request("POST", "/poll", Some(&bearer1), json!({ "services": [] }));
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let conn = app.state.db.conn.lock().await;
+    let row = wireserve_coordinator::db::nodes::find_by_name(&conn, "n1")
+        .unwrap()
+        .unwrap();
+    assert!(row.endpoint_addr.is_none());
+}
+
+#[tokio::test]
+async fn a_node_that_still_has_an_endpoint_re_reports_it_after_clearing() {
+    // The documented limitation: clearing removes a stale value, it does
+    // not stop a node re-asserting one it still has configured locally.
+    // Pinned so the limitation is a decision rather than a surprise.
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+
+    let req = json_request(
+        "POST",
+        "/poll",
+        Some(&bearer1),
+        json!({ "endpoint_addr": "1.2.3.4:51820", "services": [] }),
+    );
+    app.router.clone().oneshot(req).await.unwrap();
+
+    let req = raw_request("DELETE", "/admin/nodes/n1/endpoint", Some(&format!("Bearer {ADMIN}")));
+    app.router.clone().oneshot(req).await.unwrap();
+
+    let req = json_request(
+        "POST",
+        "/poll",
+        Some(&bearer1),
+        json!({ "endpoint_addr": "1.2.3.4:51820", "services": [] }),
+    );
+    app.router.clone().oneshot(req).await.unwrap();
+
+    let conn = app.state.db.conn.lock().await;
+    let row = wireserve_coordinator::db::nodes::find_by_name(&conn, "n1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.endpoint_addr.as_deref(), Some("1.2.3.4:51820"));
+}
+
+#[tokio::test]
+async fn clear_endpoint_is_404_for_an_unknown_node_and_401_without_admin_auth() {
+    let app = test_app();
+    admin_create_node(&app.router, "n1").await;
+
+    let req = raw_request("DELETE", "/admin/nodes/nope/endpoint", Some(&format!("Bearer {ADMIN}")));
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let req = raw_request("DELETE", "/admin/nodes/n1/endpoint", Some("Bearer wrong-token"));
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let req = raw_request("DELETE", "/admin/nodes/n1/endpoint", None);
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
 // ---- Request body cap ----
 
 #[tokio::test]

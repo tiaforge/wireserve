@@ -935,3 +935,23 @@ what the library does and does not do on your behalf.
     would bury it. New code matches the surrounding house style instead,
     and the verification gate is `cargo clippy -D warnings` plus the test
     suite — not `cargo fmt --check`.
+56. **`clear-endpoint` is an admin action, not a wire change.** A node can
+    set `endpoint_addr` but never unset one, because `update_poll_state`
+    writes it with `COALESCE(?2, endpoint_addr)` — an omitted field means
+    "no opinion, keep what you have". So a node that loses its port
+    forward keeps advertising an address no peer can reach. The obvious
+    fix, dropping the COALESCE, is actively harmful: `PollRequest`'s
+    `endpoint_addr` carries `skip_serializing_if`, and a node that
+    registered without `--endpoint-addr` had one inferred from its
+    observed source address and never learned the value, so it sends no
+    `endpoint_addr` on its first poll — dropping the COALESCE would wipe
+    the inferred endpoint immediately and break exactly the NAT-ed
+    deployment the register-time fallback exists for. The wire-level
+    alternative (a genuine tri-state: absent = keep, null = clear, value
+    = set) would work but needs `Option<Option<String>>` with a custom
+    deserializer, a wire-format change, and a new agent CLI affordance to
+    trigger a clear, for a case the operator is better placed to notice
+    anyway. `DELETE /admin/nodes/{name}/endpoint` instead.
+    **Documented limitation, tested rather than hidden**: this clears a
+    stale value, it does not stop a node re-asserting one it still has
+    configured locally.

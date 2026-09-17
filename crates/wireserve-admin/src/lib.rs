@@ -52,6 +52,11 @@ pub fn cmd_delete_node(client: &AdminClient, name: &str) -> Result<(), CliError>
     Ok(client.delete_node(name)?)
 }
 
+pub fn cmd_clear_endpoint(client: &AdminClient, name: &str) -> Result<(), CliError> {
+    validate_name(name)?;
+    Ok(client.clear_endpoint(name)?)
+}
+
 pub fn cmd_rejoin(client: &AdminClient, name: &str) -> Result<RejoinResponse, CliError> {
     validate_name(name)?;
     Ok(client.rejoin(name)?)

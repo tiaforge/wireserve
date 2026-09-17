@@ -42,6 +42,10 @@ pub fn admin_router(state: AppState) -> Router {
         .route("/admin/nodes/{name}/revoke", post(admin::revoke_node))
         .route("/admin/nodes/{name}/rejoin", post(admin::rejoin_node))
         .route("/admin/nodes/{name}", delete(admin::delete_node))
+        .route(
+            "/admin/nodes/{name}/endpoint",
+            delete(admin::clear_node_endpoint),
+        )
         .route("/admin/peers", get(admin::list_peers))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)

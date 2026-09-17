@@ -62,6 +62,8 @@ fn invalid_name_makes_zero_network_calls_for_every_name_taking_command() {
     assert!(wireserve_admin::cmd_create_node(&client, "Bad_Name", NodeKind::Agent).is_err());
     assert!(wireserve_admin::cmd_revoke(&client, "Bad_Name").is_err());
     assert!(wireserve_admin::cmd_rejoin(&client, "Bad_Name").is_err());
+    assert!(wireserve_admin::cmd_delete_node(&client, "Bad_Name").is_err());
+    assert!(wireserve_admin::cmd_clear_endpoint(&client, "Bad_Name").is_err());
     assert!(wireserve_admin::cmd_export_config(&client, mock.base_url.as_str(), "Bad_Name").is_err());
 
     assert_eq!(
@@ -69,6 +71,22 @@ fn invalid_name_makes_zero_network_calls_for_every_name_taking_command() {
         0,
         "an invalid name must never reach the network"
     );
+}
+
+#[test]
+fn clear_endpoint_hits_the_endpoint_subpath_not_the_node_path() {
+    // The two DELETEs differ by one path segment and mean very different
+    // things: /admin/nodes/{name} destroys the node record,
+    // /admin/nodes/{name}/endpoint only drops a routing hint. Pin which
+    // one the client actually calls.
+    let mock = MockCoordinator::start(TOKEN);
+    let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
+
+    wireserve_admin::cmd_clear_endpoint(&client, "homeserver").unwrap();
+
+    assert_eq!(mock.request_count(), 1);
+    let paths = mock.paths();
+    assert_eq!(paths, vec!["/admin/nodes/:name/endpoint".to_string()]);
 }
 
 #[test]

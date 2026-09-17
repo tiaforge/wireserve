@@ -77,6 +77,30 @@ pub async fn delete_node(
     Ok(())
 }
 
+/// `DELETE /admin/nodes/{name}/endpoint`.
+///
+/// Clears a stale advertised endpoint. Not in the spec's route list —
+/// added because `/poll`'s `COALESCE` means a node can set an
+/// `endpoint_addr` but never unset one, so a node that loses its port
+/// forward keeps advertising an address no peer can reach. See
+/// `nodes::clear_endpoint` for why the COALESCE stays.
+///
+/// Unlike `revoke`, this is not a security action and needs no
+/// two-step guard: it removes a routing hint, nothing more, and the
+/// worst case is one poll interval of peers falling back on
+/// WireGuard's own roaming correction.
+pub async fn clear_node_endpoint(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path(name): Path<String>,
+) -> Result<(), AppError> {
+    let conn = state.db.conn.lock().await;
+    let node = nodes::find_by_name(&conn, &name)?.ok_or(AppError::NotFound)?;
+    nodes::clear_endpoint(&conn, node.id)?;
+    tracing::info!(event = "node_endpoint_cleared", node_name = %name);
+    Ok(())
+}
+
 /// `POST /admin/nodes/{name}/rejoin` (spec §4.5).
 ///
 /// Also clears the node's current bearer token immediately (security
