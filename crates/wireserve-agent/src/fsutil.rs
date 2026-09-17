@@ -9,10 +9,26 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-/// `EBUSY` — see the fallback note on `atomic_write` below.
-const EBUSY: i32 = 16;
-/// `EXDEV` — likewise.
-const EXDEV: i32 = 18;
+/// Errno values that mean "this directory will not let me do the
+/// rename-based dance, but the target file itself may still be writable"
+/// — see the fallback note on `atomic_write` below.
+///
+/// `EBUSY`/`EXDEV` come from a bind-mounted target (every container
+/// runtime's `/etc/hosts`). `EROFS`/`EACCES`/`EPERM` come from the
+/// opposite direction: a read-only or non-writable *directory* with a
+/// writable file bind-mounted into it, which is exactly what
+/// `ProtectSystem=strict` plus `ReadWritePaths=/etc/hosts` produces.
+const FALLBACK_ERRNOS: [i32; 5] = [
+    1,  // EPERM
+    13, // EACCES
+    16, // EBUSY
+    18, // EXDEV
+    30, // EROFS
+];
+
+fn is_fallback_errno(e: &std::io::Error) -> bool {
+    e.raw_os_error().is_some_and(|n| FALLBACK_ERRNOS.contains(&n))
+}
 
 /// Writes `contents` to `path` atomically, creating the file at exactly
 /// `mode` from the moment it's created (not a post-hoc `chmod`, which would
@@ -23,8 +39,17 @@ const EXDEV: i32 = 18;
 /// atomicity — a cross-filesystem "rename" silently falls back to
 /// copy+delete on some platforms, which is not atomic).
 ///
-/// **Falls back to a non-atomic in-place write if `rename()` fails with
-/// `EBUSY`/`EXDEV`.** Found by an actual containerized end-to-end test:
+/// **Falls back to a non-atomic in-place write when the directory will not
+/// support the temp-file dance** — see `FALLBACK_ERRNOS`. The fallback is
+/// tried at *both* steps, because the two deployments that need it fail at
+/// different points: a bind-mounted target file fails at `rename()`
+/// (`EBUSY`), while a read-only directory holding a writable bind-mounted
+/// file fails earlier still, at the temp-file `open()` (`EROFS`), before
+/// any rename is attempted. Checking only the rename error left the
+/// second case with no fallback at all, which is what kept the agent unit
+/// needing `ReadWritePaths=/etc` instead of just `/etc/hosts`.
+///
+/// The `EBUSY` case was found by an actual containerized end-to-end test:
 /// `/etc/hosts` inside *every* container runtime (Podman, Docker,
 /// Kubernetes) is a bind-mounted file — including a container's own
 /// hosts file with no explicit `-v` flag at all, not just the
@@ -59,18 +84,28 @@ pub fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<
     // The directories these files live in are root-only in every shipped
     // deployment, so this is a second layer rather than the only one.
     let _ = std::fs::remove_file(&tmp_path);
-    let mut f = OpenOptions::new()
+    let opened = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(mode)
-        .open(&tmp_path)?;
+        .open(&tmp_path);
+
+    let mut f = match opened {
+        Ok(f) => f,
+        // The directory itself refused us. Nothing was created, so there
+        // is no temp file to clean up — go straight to the in-place path
+        // and let it report its own failure if the target is unwritable
+        // too.
+        Err(e) if is_fallback_errno(&e) => return write_in_place(path, contents),
+        Err(e) => return Err(e),
+    };
     f.write_all(contents)?;
     f.sync_all()?;
     drop(f);
 
     match std::fs::rename(&tmp_path, path) {
         Ok(()) => Ok(()),
-        Err(e) if matches!(e.raw_os_error(), Some(EBUSY) | Some(EXDEV)) => {
+        Err(e) if is_fallback_errno(&e) => {
             let result = write_in_place(path, contents);
             let _ = std::fs::remove_file(&tmp_path);
             result
@@ -117,6 +152,44 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"new content");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644, "write_in_place must not alter existing permissions");
+    }
+
+    #[test]
+    fn falls_back_to_in_place_when_the_directory_refuses_a_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts");
+        std::fs::write(&path, "old content").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // A read-only directory makes the temp-file create fail with
+        // EACCES — the same shape as the EROFS that `ProtectSystem=strict`
+        // plus `ReadWritePaths=/etc/hosts` produces, and reachable without
+        // privileges. The already-existing target stays writable, because
+        // opening an existing file for writing needs permission on the
+        // file, not on its directory. Before the create-step fallback this
+        // returned an error and the hosts block simply never synced.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let probe = dir.path().join(".probe");
+        let dir_is_enforcing = std::fs::File::create(&probe).is_err();
+        let _ = std::fs::remove_file(&probe);
+
+        let result = atomic_write(&path, b"new content", 0o600);
+
+        // Restore before asserting, so the tempdir can always clean up.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        if !dir_is_enforcing {
+            // Running as root: the mode bits do not actually bite, so
+            // there is no fallback to observe.
+            return;
+        }
+        result.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new content");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "the fallback must not alter the target's existing mode"
+        );
     }
 
     #[test]

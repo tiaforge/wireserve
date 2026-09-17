@@ -72,13 +72,42 @@ pub fn is_valid_endpoint_addr(s: &str) -> bool {
         return inner.parse::<std::net::Ipv6Addr>().is_ok();
     }
 
-    // Bare IPv4 literal or DNS hostname: alphanumeric, hyphens, and dots
-    // only, matching what's actually valid in a hostname/A-label, and
-    // ruling out anything that could be interpreted as config-file syntax.
-    !host.is_empty()
-        && host
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    // Bare IPv4 literal or DNS hostname. Checked per label, not merely
+    // per character: a charset-only check accepted `-x-.example.com` and
+    // `...`, which are not hostnames in any sense and passed only because
+    // every byte in them happened to be in the allowed set.
+    //
+    // One trailing dot is tolerated (the fully-qualified form,
+    // `example.com.`), since real dynamic-DNS configuration does get
+    // written that way. It is stripped before the per-label checks rather
+    // than being left to produce an empty final label.
+    let host = host.strip_suffix('.').unwrap_or(host);
+    !host.is_empty() && host.split('.').all(is_valid_hostname_label)
+}
+
+/// One label of a DNS hostname, for [`is_valid_endpoint_addr`]: ASCII
+/// alphanumerics and hyphens, 1-63 bytes, not starting or ending with a
+/// hyphen.
+///
+/// Deliberately **not** [`is_valid_dns_label`], despite the nearly
+/// identical rule. That one additionally requires lowercase, because it
+/// governs names *this project* assigns and then writes into
+/// `/etc/hosts` (node and service names, spec §3). A hostname somebody
+/// else operates may legitimately be written in mixed case — DNS
+/// comparison is case-insensitive — so rejecting
+/// `Duckdns.Example.com:51820` would be this validator inventing a rule
+/// the protocol does not have, on a value it does not own.
+fn is_valid_hostname_label(label: &str) -> bool {
+    let bytes = label.as_bytes();
+    if bytes.is_empty() || bytes.len() > 63 {
+        return false;
+    }
+    if bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 /// Whether `url` is plain `http://` to a host that is not loopback — i.e.
@@ -256,6 +285,41 @@ mod tests {
     fn rejects_endpoint_without_port() {
         assert!(!is_valid_endpoint_addr("1.2.3.4"));
         assert!(!is_valid_endpoint_addr("example.com"));
+    }
+
+    #[test]
+    fn rejects_structurally_invalid_hostname_labels() {
+        // All of these passed the old charset-only check.
+        for s in [
+            "-x-.example.com:51820",
+            "..:51820",
+            "a..b:51820",
+            "example-.com:51820",
+            "-example.com:51820",
+            ".example.com:51820",
+        ] {
+            assert!(!is_valid_endpoint_addr(s), "expected {s:?} to be rejected");
+        }
+        let too_long = format!("{}.com:51820", "a".repeat(64));
+        assert!(!is_valid_endpoint_addr(&too_long));
+    }
+
+    #[test]
+    fn accepts_hostname_forms_that_really_occur() {
+        for s in [
+            // Mixed case: DNS is case-insensitive and this value names
+            // somebody else's host, so case is not ours to police.
+            "Duckdns.Example.com:51820",
+            // Fully-qualified trailing dot.
+            "duckdns.example.com.:51820",
+            "a.b.c.d.example.com:51820",
+            "host-with-hyphens.example.com:51820",
+            "1.2.3.4:51820",
+        ] {
+            assert!(is_valid_endpoint_addr(s), "expected {s:?} to be accepted");
+        }
+        let max_label = format!("{}.com:51820", "a".repeat(63));
+        assert!(is_valid_endpoint_addr(&max_label));
     }
 
     #[test]

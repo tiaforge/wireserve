@@ -890,3 +890,48 @@ what the library does and does not do on your behalf.
     result seemed too good, which is the only reason to distrust a passing
     test. Worth remembering that a new assertion is itself unverified code
     until it has been seen to fail for the right reason.
+
+## M17 — review follow-ups
+
+52. **The coordinator unit's `Environment=WIRESERVE_DB_PATH=` line was the
+    trap its own comment warned about.** Two lines above it, the unit
+    explains that an `Environment=` after `EnvironmentFile=` silently wins
+    over the operator's env file — then set `WIRESERVE_DB_PATH` exactly
+    that way, while `coordinator.env.example` documented it as settable.
+    Removing the line alone would have regressed the bare-metal path,
+    because the binary's compiled-in default is the *relative*
+    `wireserve.db`, not the absolute path the unit was supplying; the
+    example file listed the absolute path under "optional, shown with
+    their defaults", which was simply untrue. Fixed by promoting
+    `WIRESERVE_DB_PATH` to an explicit, uncommented setting in the env
+    file. The container images were never affected — they set the same
+    value as an image `ENV`.
+53. **`fsutil::atomic_write` now falls back at the temp-file *create*
+    step, not only at `rename`.** The original fallback existed for
+    bind-mounted `/etc/hosts` (`EBUSY` at rename). The opposite
+    arrangement — a read-only directory holding a writable bind-mounted
+    file, which is what `ProtectSystem=strict` plus
+    `ReadWritePaths=/etc/hosts` produces — fails earlier, at the
+    `create_new` open with `EROFS`, before any rename is attempted, so
+    checking only the rename error left it with no fallback at all. That
+    is why the agent unit had to grant `ReadWritePaths=/etc` wholesale;
+    it now grants the single file. Tested without privileges by making
+    the *directory* mode 0500, which produces `EACCES` at the same step
+    (and the test no-ops under root, where the mode bits do not bite).
+54. **`is_valid_endpoint_addr` checked characters but not structure**, so
+    `-x-.example.com:51820` and `...:51820` passed — every byte was in
+    the allowed set. Now checked per label. Deliberately *not* reusing
+    `is_valid_dns_label`: that function additionally requires lowercase
+    because it governs names this project assigns and writes into
+    `/etc/hosts`, whereas an endpoint hostname belongs to somebody else
+    and DNS comparison is case-insensitive. One trailing dot is tolerated
+    (`example.com.`), since dynamic-DNS configuration does get written
+    that way.
+55. **This repo is not `cargo fmt`-clean and that is not being "fixed".**
+    26 of its source files deviate, consistently, in the direction of
+    keeping short constructs on one line where rustfmt would split them
+    (`assert_eq!(mode, 0o644, "…")` and similar). Running `cargo fmt`
+    would produce a large diff unrelated to any change in flight and
+    would bury it. New code matches the surrounding house style instead,
+    and the verification gate is `cargo clippy -D warnings` plus the test
+    suite — not `cargo fmt --check`.

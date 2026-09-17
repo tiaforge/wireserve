@@ -47,12 +47,16 @@ DeviceAllow=/dev/net/tun rw
 NoNewPrivileges=true
 ProtectHome=true
 PrivateTmp=true
-# Everything read-only except the three paths the agent actually writes.
-# /etc as a whole (not just /etc/hosts) has to be writable because the
-# hosts-file sync creates a temp file beside it and renames over it —
-# this is the one place this unit is looser than the coordinator's.
+# Everything read-only except the three paths the agent actually writes,
+# and the hosts file is granted as a single file rather than the whole of
+# /etc. That is only possible because `fsutil::atomic_write` falls back to
+# an in-place write when the *directory* refuses the temp file: with /etc
+# read-only the temp-file create fails with EROFS before any rename is
+# attempted, and the bind-mounted /etc/hosts stays writable on its own.
+# Before that fallback existed this line had to read `/etc`, which made
+# this unit meaningfully looser than the coordinator's for no benefit.
 ProtectSystem=strict
-ReadWritePaths=/var/lib/wireserve /run/wireserve /etc
+ReadWritePaths=/var/lib/wireserve /run/wireserve /etc/hosts
 
 [Install]
 WantedBy=multi-user.target
