@@ -49,8 +49,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Also up front, not only on exit: a previous run that was killed rather
+# than allowed to finish (Ctrl-C, a timeout, a crashed shell) leaves its
+# containers behind, and `podman run` then fails on the name collision
+# instead of doing anything useful.
+cleanup
+
 log "checking prerequisites"
 command -v podman >/dev/null || fail "podman not found on PATH"
+command -v python3 >/dev/null || fail "python3 not found on PATH (used to parse \`wireserve-agent list\`)"
 modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available (modinfo wireguard failed)"
 pass "podman and the WireGuard kernel module are present"
 
@@ -111,9 +118,23 @@ pass "agent1's wg0 has $PEER_COUNT configured peer(s)"
 # /etc/hosts had the name, `wireserve list` looked right, and not one byte
 # could travel between the two nodes, because WireGuard's AllowedIPs is a
 # crypto-routing table and does not put anything in the kernel's.
+
+# Reads a peer's mesh IPv4 out of `wireserve-agent list`. Parsed as JSON
+# rather than grepped: field order is not something a test should depend
+# on, and the mesh range is configurable, so matching on a literal prefix
+# would silently stop finding anything the moment someone changes it.
+mesh_ip_of() {
+    local from=$1 peer=$2
+    podman exec "$from" wireserve-agent list | python3 -c "
+import json, sys
+peers = json.load(sys.stdin).get('peers', [])
+match = [p['ip4'] for p in peers if p.get('name') == '$peer']
+print(match[0] if match else '')
+"
+}
+
 log "checking the mesh actually passes traffic (agent1 -> agent2 over wg0)"
-AGENT2_MESH_IP=$(podman exec "$AGENT2" wireserve-agent list \
-    | grep -B4 '"name": "node2"' | grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+AGENT2_MESH_IP=$(mesh_ip_of "$AGENT2" node2)
 [ -n "$AGENT2_MESH_IP" ] || fail "could not determine agent2's mesh address"
 echo "agent2 mesh address: $AGENT2_MESH_IP"
 podman exec "$DEBUG_CONTAINER" ip route get "$AGENT2_MESH_IP" \
@@ -121,6 +142,12 @@ podman exec "$DEBUG_CONTAINER" ip route get "$AGENT2_MESH_IP" \
 podman exec "$DEBUG_CONTAINER" ip route get "$AGENT2_MESH_IP" | grep -q "dev wg0" \
     || fail "route to agent2's mesh address does not go via wg0"
 pass "agent1 has a kernel route to agent2 via wg0"
+
+podman exec "$DEBUG_CONTAINER" ping -c2 -W3 "$AGENT2_MESH_IP" >/dev/null 2>&1 \
+    && echo "NOTE: agent2 answers ICMP on the mesh" \
+    || echo "NOTE: agent2 does not answer ICMP on the mesh, which is expected —" \
+            "default-deny on wg0 drops inbound echo requests (they are neither" \
+            "ESTABLISHED/RELATED nor a declared service port)."
 
 log "declaring a service on agent1 and checking hosts-file sync on agent2"
 podman exec "$AGENT1" wireserve-agent serve testsvc 12345 tcp
@@ -130,25 +157,39 @@ podman exec "$AGENT2" grep -q "testsvc.wg" /etc/hosts \
 pass "agent2's /etc/hosts synced testsvc.wg from the mesh directory"
 
 log "checking the firewall allows the declared port and denies everything else"
-# agent1 declared testsvc on tcp/12345, so that port must be reachable
-# across the tunnel and an undeclared one must not be. This is spec §5's
-# default-deny actually being exercised end to end rather than inferred
-# from the rules that were installed.
-AGENT1_MESH_IP=$(podman exec "$AGENT1" wireserve-agent list \
-    | grep -B4 '"name": "node1"' | grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+# agent1 declared testsvc on tcp/12345 above. Both listeners below run in
+# the debug container, which shares agent1's network namespace, so they
+# listen on agent1's wg0 and are governed by agent1's nftables rules.
+# Listening on BOTH ports is what makes this a real test: with nothing
+# bound to the undeclared port, an unreachable result would prove nothing,
+# since "refused because nothing is listening" and "dropped by the
+# firewall" look identical from the far end.
+#
+# Connections are made with `bash`, not `sh`: /dev/tcp is a bash builtin
+# and the image's /bin/sh is dash, where it silently fails and would make
+# every one of these checks pass regardless of the firewall.
+AGENT1_MESH_IP=$(mesh_ip_of "$AGENT1" node1)
 [ -n "$AGENT1_MESH_IP" ] || fail "could not determine agent1's mesh address"
-podman exec -d "$AGENT1" sh -c "nc -l -p 12345 >/dev/null 2>&1 || true"
+echo "agent1 mesh address: $AGENT1_MESH_IP"
+
+podman exec -d "$DEBUG_CONTAINER" nc -l -k -p 12345
+podman exec -d "$DEBUG_CONTAINER" nc -l -k -p 12346
 sleep 1
-if podman exec "$AGENT2" timeout 5 sh -c "</dev/tcp/$AGENT1_MESH_IP/12345" 2>/dev/null; then
-    pass "declared service port 12345 is reachable across the mesh"
-else
-    echo "NOTE: could not confirm the declared port is reachable (no listener in the"
-    echo "      runtime image is a likely cause, not necessarily a mesh failure)."
-fi
-if podman exec "$AGENT2" timeout 5 sh -c "</dev/tcp/$AGENT1_MESH_IP/12346" 2>/dev/null; then
+
+# Sanity: both listeners must be reachable from INSIDE agent1's own
+# namespace, or the checks below would be testing a broken listener rather
+# than the firewall. Loopback is not subject to the wg0-scoped rules.
+podman exec "$DEBUG_CONTAINER" timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/12346" \
+    || fail "the undeclared-port listener is not actually listening — the firewall check below would be meaningless"
+
+podman exec "$AGENT2" timeout 5 bash -c "exec 3<>/dev/tcp/$AGENT1_MESH_IP/12345" \
+    || fail "declared service port 12345 is NOT reachable across the mesh"
+pass "the declared service port is reachable across the mesh"
+
+if podman exec "$AGENT2" timeout 5 bash -c "exec 3<>/dev/tcp/$AGENT1_MESH_IP/12346" 2>/dev/null; then
     fail "an UNDECLARED port was reachable across the mesh — default-deny is not working"
 fi
-pass "an undeclared port is not reachable across the mesh (default-deny holds)"
+pass "an undeclared port is refused across the mesh (default-deny holds)"
 
 log "checking wireserve list reflects real data on agent1 (regression: F1)"
 podman exec "$AGENT1" wireserve-agent list | grep -q '"local": true' \
