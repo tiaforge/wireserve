@@ -106,7 +106,12 @@ pub fn run(
     let private_key = Key::generate();
     let public_key = private_key.public_key();
 
-    let created = admin_client.create_node(name, NodeKind::Static)?;
+    // A short-lived token is right here for the same reason it is
+    // elsewhere, and cheaper still: this token is minted and redeemed
+    // within the same function, microseconds apart, and never leaves the
+    // process. `None` takes the coordinator's configured default rather
+    // than asking for special treatment.
+    let created = admin_client.create_node(name, NodeKind::Static, None)?;
 
     let reg = client::register(
         node_facing_url,

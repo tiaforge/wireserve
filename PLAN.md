@@ -955,3 +955,38 @@ what the library does and does not do on your behalf.
     **Documented limitation, tested rather than hidden**: this clears a
     stale value, it does not stop a node re-asserting one it still has
     configured locally.
+57. **Join tokens expire after 30 minutes by default.** They were
+    redeemable forever, which is the wrong property for a credential that
+    is deliberately carried out of band — chat, a password manager,
+    terminal scrollback — and so tends to outlive its purpose by months.
+    A join token covers the gap between creating a node record and running
+    `join` on the machine, which is a minutes-long errand, and `rejoin`
+    mints a fresh one whenever the window is missed. So the cost of a
+    short default is one extra command; the cost of no expiry is a live
+    credential nobody remembers issuing. `WIRESERVE_JOIN_TOKEN_TTL_SECS`
+    (0 disables), `--ttl` per token.
+
+    Three details that are load-bearing rather than incidental:
+
+    - **NULL means "never expires", and every pre-existing row gets NULL
+      from `ADD COLUMN`.** Upgrading must not invalidate a token an
+      operator sent out five minutes ago, and
+      `migrating_an_existing_database_leaves_outstanding_join_tokens_redeemable`
+      pins that.
+    - **The expiry check is in Rust, not in the SQL predicate.**
+      Lexicographic comparison of RFC3339 strings is correct only while
+      every writer emits an identical format, including fractional-second
+      width — not a property worth betting a credential check on. The row
+      is fetched and the timestamps compared as parsed values.
+    - **Expired returns `Ok(None)`, the same value as unknown and as
+      already-redeemed.** That is what keeps all three indistinguishable
+      in the response, so a caller cannot probe which of its guesses were
+      ever real tokens. Asserted on whole response bodies, not just status
+      codes. An *unparseable* expiry also returns `Ok(None)`: a timestamp
+      this code cannot read is a corrupt or hand-edited row, and the safe
+      reading of "I don't know when this expires" is "it has".
+
+    `rejoin` gained an optional JSON body for `--ttl`, taken as
+    `Option<Json<RejoinRequest>>` so a bodiless POST — which is what every
+    admin CLI built before this change sends — keeps working instead of
+    failing on a missing Content-Type.

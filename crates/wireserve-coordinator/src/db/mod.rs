@@ -84,9 +84,13 @@ impl Db {
 }
 
 fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(include_str!(
-        "../../migrations/0001_init.sql"
-    ))])
+    // Order is the schema version: `rusqlite_migration` derives it from
+    // the index in this vector, so entries are only ever appended and an
+    // existing file is never edited once shipped.
+    Migrations::new(vec![
+        M::up(include_str!("../../migrations/0001_init.sql")),
+        M::up(include_str!("../../migrations/0002_join_token_expiry.sql")),
+    ])
 }
 
 fn run_migrations(conn: &mut Connection) -> Result<(), DbError> {
@@ -188,7 +192,7 @@ mod tests {
         // Force a write so the sidecars definitely exist.
         {
             let conn = db.conn.blocking_lock();
-            crate::db::nodes::create_node(&conn, "n1", NodeKind::Agent, "h1").unwrap();
+            crate::db::nodes::create_node(&conn, "n1", NodeKind::Agent, "h1", None).unwrap();
         }
 
         let wal = dir.path().join("wireserve.db-wal");
@@ -201,6 +205,42 @@ mod tests {
             let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{f} must not be readable by other local users");
         }
+    }
+
+    #[test]
+    fn migrating_an_existing_database_leaves_outstanding_join_tokens_redeemable() {
+        // Upgrading must not invalidate a token an operator sent out five
+        // minutes ago and is still waiting on. ADD COLUMN gives every
+        // existing row NULL, which reads as "never expires".
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // A database at the pre-expiry schema version, with a node that
+        // holds a live join token.
+        migrations().to_version(&mut conn, 1).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (name, kind, join_token_hash, join_token_used) \
+             VALUES ('n1', 'agent', 'joinhash1', 0)",
+            [],
+        )
+        .unwrap();
+
+        migrations().to_latest(&mut conn).unwrap();
+
+        let expiry: Option<String> = conn
+            .query_row(
+                "SELECT join_token_expires_at FROM nodes WHERE name = 'n1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(expiry.is_none(), "an existing row must not acquire an expiry");
+        assert!(
+            crate::db::nodes::find_by_unused_join_token_hash(&conn, "joinhash1")
+                .unwrap()
+                .is_some(),
+            "a token outstanding across the upgrade must still redeem"
+        );
     }
 
     #[test]

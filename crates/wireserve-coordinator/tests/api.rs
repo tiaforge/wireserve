@@ -30,6 +30,7 @@ fn test_config(db_path: &str) -> Config {
         rate_limit_max: 1000,
         rate_limit_window_secs: 60,
         trust_proxy_headers: false,
+        join_token_ttl_secs: 1800,
     }
 }
 
@@ -1192,6 +1193,153 @@ async fn proxy_misconfiguration_still_suppresses_a_useless_endpoint() {
     assert!(
         row.endpoint_addr.is_none(),
         "the proxy's own address must never be recorded as a node's endpoint"
+    );
+}
+
+// ---- join-token expiry ----
+
+#[tokio::test]
+async fn an_expired_join_token_is_refused_with_the_same_response_as_an_unknown_one() {
+    // The whole point of the expiry check returning Ok(None) rather than
+    // its own error: a caller must not be able to probe which of its
+    // guesses were ever real tokens. Compared as whole response bodies,
+    // not just status codes.
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+
+    // Push this token's window into the past.
+    {
+        let conn = app.state.db.conn.lock().await;
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE nodes SET join_token_expires_at = ?1 WHERE name = 'n1'",
+            [past],
+        )
+        .unwrap();
+    }
+
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({ "join_token": t1, "pubkey": pubkey_for("n1"), "listen_port": 51820 }),
+    );
+    let expired_resp = app.router.clone().oneshot(req).await.unwrap();
+    let expired_status = expired_resp.status();
+    let expired_body = body_json(expired_resp).await;
+
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({ "join_token": "jtk_never-existed", "pubkey": pubkey_for("x"), "listen_port": 51820 }),
+    );
+    let unknown_resp = app.router.clone().oneshot(req).await.unwrap();
+    let unknown_status = unknown_resp.status();
+    let unknown_body = body_json(unknown_resp).await;
+
+    assert_eq!(expired_status, unknown_status);
+    assert_eq!(
+        expired_body, unknown_body,
+        "an expired token must be indistinguishable from one that never existed"
+    );
+}
+
+#[tokio::test]
+async fn a_join_token_inside_its_window_still_registers() {
+    // The other half: the default 30-minute TTL must not break the
+    // ordinary create-then-join flow.
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({ "join_token": t1, "pubkey": pubkey_for("n1"), "listen_port": 51820 }),
+    );
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn create_node_reports_the_expiry_and_honours_a_ttl_override() {
+    let app = test_app();
+
+    let req = json_request("POST", "/admin/nodes", Some(ADMIN), json!({ "name": "n1" }));
+    let body = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
+    let default_expiry = body["join_token_expires_at"]
+        .as_str()
+        .expect("the default TTL must report an expiry");
+    let parsed = chrono::DateTime::parse_from_rfc3339(default_expiry).unwrap();
+    let delta = (parsed.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds();
+    assert!((1700..=1800).contains(&delta), "expected ~30min, got {delta}s");
+
+    // 0 disables expiry, and is reported by the field being absent rather
+    // than by some sentinel date.
+    let req = json_request(
+        "POST",
+        "/admin/nodes",
+        Some(ADMIN),
+        json!({ "name": "n2", "ttl_secs": 0 }),
+    );
+    let body = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
+    assert!(
+        body.get("join_token_expires_at").is_none(),
+        "ttl_secs=0 must mean no expiry: {body}"
+    );
+
+    // And a node created that way still registers.
+    let token = body["join_token"].as_str().unwrap().to_string();
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({ "join_token": token, "pubkey": pubkey_for("n2"), "listen_port": 51821 }),
+    );
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn rejoin_mints_a_fresh_window_after_the_old_one_lapsed() {
+    // Missing the window has to be recoverable, or a short default TTL
+    // would just be a way to brick a node record.
+    let app = test_app();
+    let _t1 = admin_create_node(&app.router, "n1").await;
+    {
+        let conn = app.state.db.conn.lock().await;
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE nodes SET join_token_expires_at = ?1 WHERE name = 'n1'",
+            [past],
+        )
+        .unwrap();
+    }
+
+    let req = raw_request("POST", "/admin/nodes/n1/rejoin", Some(&format!("Bearer {ADMIN}")));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "a bodiless rejoin must still work — the ttl body is optional"
+    );
+    let body = body_json(resp).await;
+    assert!(body["join_token_expires_at"].as_str().is_some());
+
+    let fresh = body["join_token"].as_str().unwrap().to_string();
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({ "join_token": fresh, "pubkey": pubkey_for("n1"), "listen_port": 51820 }),
+    );
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
     );
 }
 

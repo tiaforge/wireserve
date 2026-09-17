@@ -37,9 +37,10 @@ pub fn cmd_create_node(
     client: &AdminClient,
     name: &str,
     kind: NodeKind,
+    ttl_secs: Option<u64>,
 ) -> Result<CreateNodeResponse, CliError> {
     validate_name(name)?;
-    Ok(client.create_node(name, kind)?)
+    Ok(client.create_node(name, kind, ttl_secs)?)
 }
 
 pub fn cmd_revoke(client: &AdminClient, name: &str) -> Result<(), CliError> {
@@ -57,9 +58,13 @@ pub fn cmd_clear_endpoint(client: &AdminClient, name: &str) -> Result<(), CliErr
     Ok(client.clear_endpoint(name)?)
 }
 
-pub fn cmd_rejoin(client: &AdminClient, name: &str) -> Result<RejoinResponse, CliError> {
+pub fn cmd_rejoin(
+    client: &AdminClient,
+    name: &str,
+    ttl_secs: Option<u64>,
+) -> Result<RejoinResponse, CliError> {
     validate_name(name)?;
-    Ok(client.rejoin(name)?)
+    Ok(client.rejoin(name, ttl_secs)?)
 }
 
 pub fn cmd_list_peers(client: &AdminClient) -> Result<AdminPeersResponse, CliError> {

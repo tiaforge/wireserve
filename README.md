@@ -58,7 +58,12 @@ podman exec wireserve-coordinator wireserve-admin list-peers
 ### 2. Add a node
 
 Creating a node prints a one-time join token. Hand it to the machine out of
-band.
+band. **The token is redeemable for 30 minutes** — long enough to walk over
+to the machine, short enough that a token left in a chat log or a password
+manager is not a live way into the mesh months later. If the window lapses,
+`wireserve-admin rejoin <name>` mints a fresh one for the same node, name
+and address. Override with `--ttl <secs>` per token, or coordinator-wide
+with `WIRESERVE_JOIN_TOKEN_TTL_SECS`; `0` disables expiry.
 
 ```sh
 # on the coordinator

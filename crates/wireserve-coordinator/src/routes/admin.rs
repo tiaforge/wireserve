@@ -2,7 +2,8 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use wireserve_types::{
-    AdminPeersResponse, CreateNodeRequest, CreateNodeResponse, RejoinResponse, JOIN_TOKEN_PREFIX,
+    AdminPeersResponse, CreateNodeRequest, CreateNodeResponse, RejoinRequest, RejoinResponse,
+    JOIN_TOKEN_PREFIX,
 };
 
 use crate::auth::AdminAuth;
@@ -26,19 +27,35 @@ pub async fn create_node(
 
     let join_token = tokengen::generate(JOIN_TOKEN_PREFIX);
     let hash = wireserve_types::hash_token(&join_token);
+    let ttl = req.ttl_secs.unwrap_or(state.config.join_token_ttl_secs);
+    let expires_at = nodes::join_token_expiry(ttl);
 
     let conn = state.db.conn.lock().await;
-    nodes::create_node(&conn, &req.name, req.kind, &hash)?;
+    nodes::create_node(&conn, &req.name, req.kind, &hash, expires_at.as_deref())?;
 
-    tracing::info!(event = "node_created", node_name = %req.name, kind = req.kind.as_str());
+    tracing::info!(
+        event = "node_created",
+        node_name = %req.name,
+        kind = req.kind.as_str(),
+        join_token_ttl_secs = ttl,
+    );
 
     Ok((
         StatusCode::CREATED,
         Json(CreateNodeResponse {
             name: req.name,
             join_token,
+            join_token_expires_at: parse_expiry(expires_at.as_deref()),
         }),
     ))
+}
+
+/// Re-parses the expiry string that was just written to the database, so
+/// the response reports exactly what was stored rather than a separately
+/// computed value that could drift from it.
+fn parse_expiry(raw: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    raw.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
 /// `POST /admin/nodes/{name}/revoke` (spec §4.4).
@@ -116,20 +133,34 @@ pub async fn rejoin_node(
     State(state): State<AppState>,
     _admin: AdminAuth,
     Path(name): Path<String>,
+    // Optional body: a rejoin has never needed one, and an admin CLI
+    // built before `--ttl` existed sends none at all. `Option<Json<_>>`
+    // keeps that request working rather than turning a missing
+    // Content-Type into a 400 on a route that used to accept it.
+    body: Option<Json<RejoinRequest>>,
 ) -> Result<(StatusCode, Json<RejoinResponse>), AppError> {
+    let ttl = body
+        .and_then(|Json(b)| b.ttl_secs)
+        .unwrap_or(state.config.join_token_ttl_secs);
+    let expires_at = nodes::join_token_expiry(ttl);
+
     let conn = state.db.conn.lock().await;
     let node = nodes::find_by_name(&conn, &name)?.ok_or(AppError::NotFound)?;
 
     let join_token = tokengen::generate(JOIN_TOKEN_PREFIX);
     let hash = wireserve_types::hash_token(&join_token);
-    nodes::reissue_join_token(&conn, node.id, &hash)?;
+    nodes::reissue_join_token(&conn, node.id, &hash, expires_at.as_deref())?;
     nodes::clear_bearer_token(&conn, node.id)?;
 
-    tracing::info!(event = "node_rejoined", node_name = %name);
+    tracing::info!(event = "node_rejoined", node_name = %name, join_token_ttl_secs = ttl);
 
     Ok((
         StatusCode::CREATED,
-        Json(RejoinResponse { name, join_token }),
+        Json(RejoinResponse {
+            name,
+            join_token,
+            join_token_expires_at: parse_expiry(expires_at.as_deref()),
+        }),
     ))
 }
 

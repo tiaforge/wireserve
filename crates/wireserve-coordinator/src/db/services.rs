@@ -109,7 +109,7 @@ mod tests {
 
     async fn node_with_id(db: &Db, name: &str, hash: &str) -> i64 {
         let conn = db.conn.lock().await;
-        let id = create_node(&conn, name, NodeKind::Agent, hash).unwrap();
+        let id = create_node(&conn, name, NodeKind::Agent, hash, None).unwrap();
         // Every UNIQUE column (pubkey, ip4, ip6, bearer_token_hash) must be
         // distinct per node, or apply_redemption fails with a constraint
         // violation — derive them from `id` so callers with different

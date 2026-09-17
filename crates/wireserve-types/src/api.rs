@@ -44,12 +44,24 @@ pub struct CreateNodeRequest {
     pub name: String,
     #[serde(default)]
     pub kind: NodeKind,
+    /// Override the coordinator's configured join-token lifetime for this
+    /// one token, in seconds; `0` means no expiry. Omitted means "use the
+    /// coordinator's default" — which is not the same as `Some(0)`, and is
+    /// why this is an `Option` rather than a plain `u64` defaulting to 0.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateNodeResponse {
     pub name: String,
     pub join_token: String,
+    /// When this token stops being redeemable, or `None` if expiry is
+    /// disabled. Returned so the operator learns the deadline at the
+    /// moment they copy the token, rather than discovering it by having a
+    /// `join` fail half an hour later.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub join_token_expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 // ---- §4.2 Node: register ----
@@ -143,9 +155,18 @@ pub struct PollResponse {
 // ---- §4.5 Admin: rejoin ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RejoinRequest {
+    /// Same meaning as `CreateNodeRequest::ttl_secs`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ttl_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RejoinResponse {
     pub name: String,
     pub join_token: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub join_token_expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 // ---- §4.5.1 Admin: list peers ----

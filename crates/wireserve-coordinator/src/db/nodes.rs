@@ -48,6 +48,22 @@ pub fn now_str() -> String {
     Utc::now().to_rfc3339()
 }
 
+/// The `join_token_expires_at` value for a token minted now with `ttl_secs`
+/// of life, or `None` when `ttl_secs` is 0 (expiry disabled).
+///
+/// Returns `None` rather than a far-future timestamp for the disabled
+/// case, so "no expiry" is one representation everywhere — the column, the
+/// wire, and the check in `find_by_unused_join_token_hash` — instead of a
+/// sentinel date that some future comparison forgets to special-case.
+#[must_use]
+pub fn join_token_expiry(ttl_secs: u64) -> Option<String> {
+    if ttl_secs == 0 {
+        return None;
+    }
+    let ttl = chrono::Duration::try_seconds(i64::try_from(ttl_secs).ok()?)?;
+    Some((Utc::now() + ttl).to_rfc3339())
+}
+
 /// Maps a UNIQUE-constraint SQLite error into the matching `DbError`
 /// (`PubkeyTaken` for the `nodes.pubkey` column, `NameTaken` otherwise);
 /// any other error passes through unchanged. SQLite names the violated
@@ -72,11 +88,12 @@ pub fn create_node(
     name: &str,
     kind: NodeKind,
     join_token_hash: &str,
+    join_token_expires_at: Option<&str>,
 ) -> Result<i64, DbError> {
     conn.execute(
-        "INSERT INTO nodes (name, kind, join_token_hash, join_token_used) \
-         VALUES (?1, ?2, ?3, 0)",
-        rusqlite::params![name, kind.as_str(), join_token_hash],
+        "INSERT INTO nodes (name, kind, join_token_hash, join_token_used, join_token_expires_at) \
+         VALUES (?1, ?2, ?3, 0, ?4)",
+        rusqlite::params![name, kind.as_str(), join_token_hash, join_token_expires_at],
     )
     .map_err(map_unique_violation)?;
     Ok(conn.last_insert_rowid())
@@ -95,13 +112,38 @@ pub fn find_by_unused_join_token_hash(
     conn: &Connection,
     hash: &str,
 ) -> Result<Option<NodeRow>, DbError> {
-    conn.query_row(
-        "SELECT * FROM nodes WHERE join_token_hash = ?1 AND join_token_used = 0",
-        [hash],
-        map_row,
-    )
-    .optional()
-    .map_err(DbError::from)
+    let found: Option<(NodeRow, Option<String>)> = conn
+        .query_row(
+            "SELECT * FROM nodes WHERE join_token_hash = ?1 AND join_token_used = 0",
+            [hash],
+            |row| Ok((map_row(row)?, row.get("join_token_expires_at")?)),
+        )
+        .optional()?;
+
+    let Some((node, expires_at)) = found else {
+        return Ok(None);
+    };
+
+    // The expiry check lives here, in Rust, rather than as a predicate in
+    // the SQL above, so the comparison is between two parsed timestamps
+    // instead of two strings. Lexicographic comparison of RFC3339 happens
+    // to be correct only while every writer emits an identical format,
+    // which is not a property worth betting a credential check on.
+    //
+    // Returning `Ok(None)` for an expired token — the same value an
+    // unknown or already-redeemed one produces — is what keeps all three
+    // indistinguishable to the caller, and therefore in the response.
+    if let Some(raw) = expires_at {
+        match parse_dt(&raw) {
+            Some(expiry) if Utc::now() >= expiry => return Ok(None),
+            // Unparseable: fail closed. A timestamp this code cannot read
+            // is a corrupt or hand-edited row, and the safe reading of
+            // "I don't know when this expires" is "it has".
+            None => return Ok(None),
+            Some(_) => {}
+        }
+    }
+    Ok(Some(node))
 }
 
 pub struct Redemption<'a> {
@@ -212,10 +254,12 @@ pub fn reissue_join_token(
     conn: &Connection,
     node_id: i64,
     join_token_hash: &str,
+    join_token_expires_at: Option<&str>,
 ) -> Result<(), DbError> {
     conn.execute(
-        "UPDATE nodes SET join_token_hash = ?1, join_token_used = 0 WHERE id = ?2",
-        rusqlite::params![join_token_hash, node_id],
+        "UPDATE nodes SET join_token_hash = ?1, join_token_used = 0, \
+         join_token_expires_at = ?2 WHERE id = ?3",
+        rusqlite::params![join_token_hash, join_token_expires_at, node_id],
     )
     .map_err(map_unique_violation)?;
     Ok(())
@@ -324,7 +368,7 @@ mod tests {
     async fn create_and_find_by_name() {
         let db = test_db();
         let conn = db.conn.lock().await;
-        create_node(&conn, "homeserver", NodeKind::Agent, "hash1").unwrap();
+        create_node(&conn, "homeserver", NodeKind::Agent, "hash1", None).unwrap();
         let row = find_by_name(&conn, "homeserver").unwrap().unwrap();
         assert_eq!(row.name, "homeserver");
         assert!(!row.revoked);
@@ -335,8 +379,8 @@ mod tests {
     async fn duplicate_name_is_rejected() {
         let db = test_db();
         let conn = db.conn.lock().await;
-        create_node(&conn, "dup", NodeKind::Agent, "hash1").unwrap();
-        let err = create_node(&conn, "dup", NodeKind::Agent, "hash2").unwrap_err();
+        create_node(&conn, "dup", NodeKind::Agent, "hash1", None).unwrap();
+        let err = create_node(&conn, "dup", NodeKind::Agent, "hash2", None).unwrap_err();
         assert!(matches!(err, DbError::NameTaken));
     }
 
@@ -344,7 +388,7 @@ mod tests {
     async fn join_token_is_single_use() {
         let db = test_db();
         let conn = db.conn.lock().await;
-        let id = create_node(&conn, "n1", NodeKind::Agent, "hash1").unwrap();
+        let id = create_node(&conn, "n1", NodeKind::Agent, "hash1", None).unwrap();
         assert!(find_by_unused_join_token_hash(&conn, "hash1")
             .unwrap()
             .is_some());
@@ -368,10 +412,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_expired_join_token_is_indistinguishable_from_an_unknown_one() {
+        let db = test_db();
+        let conn = db.conn.lock().await;
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        create_node(&conn, "n1", NodeKind::Agent, "joinhash1", Some(&past)).unwrap();
+
+        // Both return Ok(None) — the same value, so the caller cannot
+        // tell "this token was real but you were too slow" from "this
+        // token never existed", and neither can the response.
+        assert!(find_by_unused_join_token_hash(&conn, "joinhash1")
+            .unwrap()
+            .is_none());
+        assert!(find_by_unused_join_token_hash(&conn, "never-existed")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_join_token_inside_its_window_still_redeems() {
+        let db = test_db();
+        let conn = db.conn.lock().await;
+        let future = (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        create_node(&conn, "n1", NodeKind::Agent, "joinhash1", Some(&future)).unwrap();
+        assert!(find_by_unused_join_token_hash(&conn, "joinhash1")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn a_null_expiry_never_expires() {
+        // What every row created before this feature has, and what
+        // ttl_secs = 0 produces.
+        let db = test_db();
+        let conn = db.conn.lock().await;
+        create_node(&conn, "n1", NodeKind::Agent, "joinhash1", None).unwrap();
+        assert!(find_by_unused_join_token_hash(&conn, "joinhash1")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_expiry_fails_closed() {
+        // A corrupt or hand-edited row. "I cannot tell when this expires"
+        // must read as "it has", not as "it hasn't".
+        let db = test_db();
+        let conn = db.conn.lock().await;
+        create_node(&conn, "n1", NodeKind::Agent, "joinhash1", Some("not-a-timestamp")).unwrap();
+        assert!(find_by_unused_join_token_hash(&conn, "joinhash1")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn rejoin_issues_a_token_with_a_fresh_expiry() {
+        let db = test_db();
+        let conn = db.conn.lock().await;
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let id = create_node(&conn, "n1", NodeKind::Agent, "joinhash1", Some(&past)).unwrap();
+        assert!(find_by_unused_join_token_hash(&conn, "joinhash1")
+            .unwrap()
+            .is_none());
+
+        let future = (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        reissue_join_token(&conn, id, "joinhash2", Some(&future)).unwrap();
+        assert!(
+            find_by_unused_join_token_hash(&conn, "joinhash2")
+                .unwrap()
+                .is_some(),
+            "missing the window must be recoverable with a fresh token"
+        );
+    }
+
+    #[test]
+    fn join_token_expiry_treats_zero_as_disabled() {
+        assert!(join_token_expiry(0).is_none());
+        let some = join_token_expiry(1800).expect("a non-zero ttl yields an expiry");
+        let parsed = parse_dt(&some).expect("and it must be parseable by our own reader");
+        let delta = (parsed - Utc::now()).num_seconds();
+        assert!((1700..=1800).contains(&delta), "expiry ~30min out, got {delta}s");
+    }
+
+    #[tokio::test]
     async fn revoke_clears_bearer_token_and_sets_flag() {
         let db = test_db();
         let conn = db.conn.lock().await;
-        let id = create_node(&conn, "n1", NodeKind::Agent, "hash1").unwrap();
+        let id = create_node(&conn, "n1", NodeKind::Agent, "hash1", None).unwrap();
         apply_redemption(
             &conn,
             id,
@@ -396,7 +522,7 @@ mod tests {
     async fn rejoin_does_not_clear_revoked_but_redemption_does() {
         let db = test_db();
         let conn = db.conn.lock().await;
-        let id = create_node(&conn, "n1", NodeKind::Agent, "hash1").unwrap();
+        let id = create_node(&conn, "n1", NodeKind::Agent, "hash1", None).unwrap();
         apply_redemption(
             &conn,
             id,
@@ -412,7 +538,7 @@ mod tests {
         .unwrap();
         revoke(&conn, id).unwrap();
 
-        reissue_join_token(&conn, id, "hash2").unwrap();
+        reissue_join_token(&conn, id, "hash2", None).unwrap();
         let row = find_by_name(&conn, "n1").unwrap().unwrap();
         assert!(row.revoked, "rejoin alone must not clear revoked");
 
@@ -442,7 +568,7 @@ mod tests {
         // `revoked` back to 0 in the process.
         let db = test_db();
         let conn = db.conn.lock().await;
-        let id = create_node(&conn, "n1", NodeKind::Agent, "joinhash1").unwrap();
+        let id = create_node(&conn, "n1", NodeKind::Agent, "joinhash1", None).unwrap();
         assert!(find_by_unused_join_token_hash(&conn, "joinhash1")
             .unwrap()
             .is_some());
@@ -464,10 +590,10 @@ mod tests {
         // redeemable even though revoke killed the previous one.
         let db = test_db();
         let conn = db.conn.lock().await;
-        let id = create_node(&conn, "n1", NodeKind::Agent, "joinhash1").unwrap();
+        let id = create_node(&conn, "n1", NodeKind::Agent, "joinhash1", None).unwrap();
         revoke(&conn, id).unwrap();
 
-        reissue_join_token(&conn, id, "joinhash2").unwrap();
+        reissue_join_token(&conn, id, "joinhash2", None).unwrap();
         assert!(find_by_unused_join_token_hash(&conn, "joinhash2")
             .unwrap()
             .is_some());
@@ -493,7 +619,7 @@ mod tests {
     async fn clear_endpoint_removes_only_the_endpoint() {
         let db = test_db();
         let conn = db.conn.lock().await;
-        let id = create_node(&conn, "n1", NodeKind::Agent, "hash1").unwrap();
+        let id = create_node(&conn, "n1", NodeKind::Agent, "hash1", None).unwrap();
         apply_redemption(
             &conn,
             id,
@@ -526,7 +652,7 @@ mod tests {
         // endpoint is the documented limitation, covered separately.)
         let db = test_db();
         let conn = db.conn.lock().await;
-        let id = create_node(&conn, "n1", NodeKind::Agent, "hash1").unwrap();
+        let id = create_node(&conn, "n1", NodeKind::Agent, "hash1", None).unwrap();
         apply_redemption(
             &conn,
             id,
@@ -557,7 +683,7 @@ mod tests {
     async fn cascade_delete_removes_services_on_revoke() {
         let db = test_db();
         let conn = db.conn.lock().await;
-        let id = create_node(&conn, "n1", NodeKind::Agent, "hash1").unwrap();
+        let id = create_node(&conn, "n1", NodeKind::Agent, "hash1", None).unwrap();
         apply_redemption(
             &conn,
             id,

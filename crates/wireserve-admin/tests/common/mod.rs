@@ -158,6 +158,7 @@ async fn create_node(
         serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
     let name = req["name"].as_str().unwrap_or_default().to_string();
     Ok(Json(CreateNodeResponse {
+        join_token_expires_at: None,
         name,
         join_token: "jtk_mock".to_string(),
     }))
@@ -211,6 +212,7 @@ async fn rejoin_node(
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(Json(RejoinResponse {
+        join_token_expires_at: None,
         name,
         join_token: "jtk_mock2".to_string(),
     }))

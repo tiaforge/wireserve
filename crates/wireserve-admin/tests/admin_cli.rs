@@ -59,9 +59,9 @@ fn invalid_name_makes_zero_network_calls_for_every_name_taking_command() {
     let mock = MockCoordinator::start(TOKEN);
     let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
 
-    assert!(wireserve_admin::cmd_create_node(&client, "Bad_Name", NodeKind::Agent).is_err());
+    assert!(wireserve_admin::cmd_create_node(&client, "Bad_Name", NodeKind::Agent, None).is_err());
     assert!(wireserve_admin::cmd_revoke(&client, "Bad_Name").is_err());
-    assert!(wireserve_admin::cmd_rejoin(&client, "Bad_Name").is_err());
+    assert!(wireserve_admin::cmd_rejoin(&client, "Bad_Name", None).is_err());
     assert!(wireserve_admin::cmd_delete_node(&client, "Bad_Name").is_err());
     assert!(wireserve_admin::cmd_clear_endpoint(&client, "Bad_Name").is_err());
     assert!(wireserve_admin::cmd_export_config(&client, mock.base_url.as_str(), "Bad_Name").is_err());
@@ -94,7 +94,7 @@ fn create_node_sends_admin_bearer_token_and_reaches_server() {
     let mock = MockCoordinator::start(TOKEN);
     let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
 
-    let resp = wireserve_admin::cmd_create_node(&client, "homeserver", NodeKind::Agent).unwrap();
+    let resp = wireserve_admin::cmd_create_node(&client, "homeserver", NodeKind::Agent, None).unwrap();
     assert_eq!(resp.name, "homeserver");
     assert_eq!(mock.request_count(), 1);
 }
@@ -104,7 +104,7 @@ fn wrong_admin_token_is_rejected_by_server() {
     let mock = MockCoordinator::start(TOKEN);
     let client = AdminClient::new(mock.base_url.as_str(), "wrong-token");
 
-    let err = wireserve_admin::cmd_create_node(&client, "homeserver", NodeKind::Agent);
+    let err = wireserve_admin::cmd_create_node(&client, "homeserver", NodeKind::Agent, None);
     assert!(err.is_err());
 }
 

@@ -2899,6 +2899,7 @@ name = "wireserve-admin"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chrono",
  "clap",
  "defguard_wireguard_rs",
  "reqwest",

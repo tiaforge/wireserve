@@ -13,7 +13,7 @@ use reqwest::blocking::{Client, Response};
 use reqwest::StatusCode;
 use wireserve_types::{
     AdminPeersResponse, CreateNodeRequest, CreateNodeResponse, ErrorBody, NodeKind,
-    RegisterRequest, RegisterResponse, RejoinResponse,
+    RegisterRequest, RegisterResponse, RejoinRequest, RejoinResponse,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -77,6 +77,7 @@ impl AdminClient {
         &self,
         name: &str,
         kind: NodeKind,
+        ttl_secs: Option<u64>,
     ) -> Result<CreateNodeResponse, ClientError> {
         let resp = self
             .http
@@ -85,6 +86,7 @@ impl AdminClient {
             .json(&CreateNodeRequest {
                 name: name.to_string(),
                 kind,
+                ttl_secs,
             })
             .send()?;
         Ok(Self::check_status(resp)?.json()?)
@@ -127,11 +129,16 @@ impl AdminClient {
     }
 
     /// `POST /admin/nodes/{name}/rejoin` (spec §4.5).
-    pub fn rejoin(&self, name: &str) -> Result<RejoinResponse, ClientError> {
+    pub fn rejoin(
+        &self,
+        name: &str,
+        ttl_secs: Option<u64>,
+    ) -> Result<RejoinResponse, ClientError> {
         let resp = self
             .http
             .post(self.url(&format!("/admin/nodes/{name}/rejoin")))
             .bearer_auth(&self.admin_token)
+            .json(&RejoinRequest { ttl_secs })
             .send()?;
         Ok(Self::check_status(resp)?.json()?)
     }

@@ -26,12 +26,22 @@ enum Command {
         name: String,
         #[arg(long, default_value = "agent")]
         kind: String,
+        /// Seconds the join token stays redeemable, overriding the
+        /// coordinator's default (30 minutes). Use 0 for no expiry.
+        #[arg(long)]
+        ttl: Option<u64>,
     },
     /// Revoke a node — its bearer token stops working on its very next
     /// poll, and its services are removed (spec §4.4).
     Revoke { name: String },
     /// Issue a fresh join token for an existing node record (spec §4.5).
-    Rejoin { name: String },
+    Rejoin {
+        name: String,
+        /// Seconds the join token stays redeemable, overriding the
+        /// coordinator's default (30 minutes). Use 0 for no expiry.
+        #[arg(long)]
+        ttl: Option<u64>,
+    },
     /// Permanently delete a node record and free its name. Refused while
     /// the node is still active — revoke it first.
     DeleteNode { name: String },
@@ -59,6 +69,19 @@ enum Command {
     },
 }
 
+/// Prints the join token's deadline immediately under the token itself.
+///
+/// The operator is about to copy that token into a chat window and walk
+/// to another machine; the one moment the expiry is useful is this one.
+/// Discovering it instead from a `join` that fails half an hour later
+/// tells them only that something is wrong, not what.
+fn print_expiry(expires_at: Option<chrono::DateTime<chrono::Utc>>) {
+    match expires_at {
+        Some(t) => println!("  redeemable until: {}", t.to_rfc3339()),
+        None => println!("  redeemable until: no expiry (token never becomes invalid on its own)"),
+    }
+}
+
 fn main() {
     if let Err(e) = run(Cli::parse()) {
         eprintln!("error: {e}");
@@ -74,12 +97,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     } = cli;
 
     match command {
-        Command::CreateNode { name, kind } => {
+        Command::CreateNode { name, kind, ttl } => {
             check_name(&name)?;
             let kind: NodeKind = kind.parse()?;
             let client = build_client(&coordinator_url, &admin_token)?;
-            let resp = wireserve_admin::cmd_create_node(&client, &name, kind)?;
+            let resp = wireserve_admin::cmd_create_node(&client, &name, kind, ttl)?;
             println!("node '{}' created — join token: {}", resp.name, resp.join_token);
+            print_expiry(resp.join_token_expires_at);
         }
         Command::Revoke { name } => {
             check_name(&name)?;
@@ -87,14 +111,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             wireserve_admin::cmd_revoke(&client, &name)?;
             println!("node '{name}' revoked");
         }
-        Command::Rejoin { name } => {
+        Command::Rejoin { name, ttl } => {
             check_name(&name)?;
             let client = build_client(&coordinator_url, &admin_token)?;
-            let resp = wireserve_admin::cmd_rejoin(&client, &name)?;
+            let resp = wireserve_admin::cmd_rejoin(&client, &name, ttl)?;
             println!(
                 "node '{}' rejoined — new join token: {}",
                 resp.name, resp.join_token
             );
+            print_expiry(resp.join_token_expires_at);
         }
         Command::DeleteNode { name } => {
             check_name(&name)?;

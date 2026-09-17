@@ -1,0 +1,14 @@
+-- Join-token expiry.
+--
+-- A join token is handed to a human and carried out of band -- a chat
+-- message, a password manager, a terminal scrollback -- which is exactly
+-- the kind of place a credential lingers long after it was needed. Until
+-- now a token stayed redeemable forever, so a leak discovered months
+-- later was still a live way into the mesh unless someone had thought to
+-- revoke the node.
+--
+-- NULL means "never expires", and every row that already exists gets NULL
+-- from ADD COLUMN. That is deliberate: upgrading must not invalidate a
+-- token an operator sent out five minutes ago and is waiting on. New
+-- tokens get an expiry from WIRESERVE_JOIN_TOKEN_TTL_SECS (default 1800).
+ALTER TABLE nodes ADD COLUMN join_token_expires_at TIMESTAMP;

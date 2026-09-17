@@ -18,6 +18,19 @@ pub struct Config {
     /// exclusively through a proxy that sets this header, since otherwise
     /// a client could forge it to evade rate limiting entirely.
     pub trust_proxy_headers: bool,
+    /// How long a freshly-issued join token stays redeemable, in seconds.
+    /// `0` disables expiry entirely.
+    ///
+    /// Default 1800 (30 minutes). A join token exists to cover the gap
+    /// between an operator creating a node record and walking over to the
+    /// machine to run `wireserve-agent join`; that is a minutes-long
+    /// errand, not an open-ended one. The token travels out of band
+    /// through chat, a password manager, terminal scrollback — places a
+    /// credential outlives its usefulness by months. `rejoin` mints a
+    /// fresh one whenever the window is missed, so the cost of a short
+    /// default is one extra command, and the cost of no expiry at all is
+    /// a live credential nobody remembers issuing.
+    pub join_token_ttl_secs: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +77,7 @@ impl Config {
         let rate_limit_max = env_parse_or("WIRESERVE_RATE_LIMIT_MAX", 10)?;
         let rate_limit_window_secs = env_parse_or("WIRESERVE_RATE_LIMIT_WINDOW_SECS", 60)?;
         let trust_proxy_headers = env_parse_or("WIRESERVE_TRUST_PROXY_HEADERS", false)?;
+        let join_token_ttl_secs = env_parse_or("WIRESERVE_JOIN_TOKEN_TTL_SECS", 1800u64)?;
 
         Ok(Self {
             listen_addr,
@@ -76,6 +90,7 @@ impl Config {
             rate_limit_max,
             rate_limit_window_secs,
             trust_proxy_headers,
+            join_token_ttl_secs,
         })
     }
 }
