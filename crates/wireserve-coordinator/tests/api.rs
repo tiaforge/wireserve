@@ -720,7 +720,21 @@ async fn successful_admin_auth_never_consumes_rate_limit_budget() {
 // response-code cosmetic rather than a brute-force bound.
 
 #[tokio::test]
-async fn register_blocks_a_correct_token_once_failed_attempt_budget_is_exhausted() {
+async fn register_still_honours_a_correct_token_when_the_source_is_over_budget() {
+    // This deliberately reverses what an earlier round asserted here.
+    //
+    // The limiter is keyed on a source address, and spec §7 puts a
+    // reverse proxy in front of this coordinator, so in the topology the
+    // spec describes every node shares one key. Refusing a *valid*
+    // credential because that shared key is over budget meant any
+    // stranger who could reach /register could stop every legitimate node
+    // from joining, for the length of the window, by guessing wrong a few
+    // times. Nodes behind one NAT share a key the same way. The guard was
+    // a better denial of service than the thing it guarded against, which
+    // is guessing a 256-bit token.
+    //
+    // What an over-budget source still cannot do is keep failing, which
+    // is asserted below.
     let mut config = test_config("");
     config.rate_limit_max = 2;
     let app = app_with_config(config);
@@ -737,8 +751,24 @@ async fn register_blocks_a_correct_token_once_failed_attempt_budget_is_exhausted
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
-    // Budget spent: the genuine token from the same source must now be
-    // refused with 429, and must NOT have been consumed.
+    // Budget spent. A further WRONG guess from this source is now turned
+    // away as rate-limited rather than merely rejected.
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({ "join_token": "jtk_wrong_again", "pubkey": pubkey_for("x"), "listen_port": 51820 }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "an over-budget source must not be able to keep guessing"
+    );
+
+    // But the genuine token from that same source still works: this node
+    // did nothing wrong and is very likely sharing an address with
+    // whoever did.
     let req = json_request(
         "POST",
         "/register",
@@ -746,22 +776,43 @@ async fn register_blocks_a_correct_token_once_failed_attempt_budget_is_exhausted
         json!({ "join_token": real_token, "pubkey": pubkey_for("n1"), "listen_port": 51820 }),
     );
     let resp = app.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a valid join token must not be collateral damage of a shared rate-limit key"
+    );
+}
 
-    // A different source IP is unaffected and can still redeem it.
-    let mut req = Request::builder()
-        .method("POST")
-        .uri("/register")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({ "join_token": real_token, "pubkey": pubkey_for("n1"), "listen_port": 51820 })
-                .to_string(),
-        ))
-        .unwrap();
-    let other: SocketAddr = "198.51.100.7:9999".parse().unwrap();
-    req.extensions_mut().insert(ConnectInfo(other));
+#[tokio::test]
+async fn poll_still_works_for_a_valid_node_when_its_shared_source_is_over_budget() {
+    // The mesh-wide version of the same failure: one bad actor behind the
+    // proxy, and every node's next poll gets a 429 until the window
+    // clears. Peer reconciliation, revocation propagation and hosts-file
+    // sync all stop for the whole mesh.
+    let mut config = test_config("");
+    config.rate_limit_max = 2;
+    let app = app_with_config(config);
+    let join = admin_create_node(&app.router, "innocent").await;
+    let reg = register_node(&app.router, &join, "pk-innocent", 51820).await;
+    let bearer = reg["bearer_token"].as_str().unwrap();
+
+    for _ in 0..3 {
+        let req = json_request("POST", "/poll", Some("brt_garbage"), json!({ "services": [] }));
+        app.router.clone().oneshot(req).await.unwrap();
+    }
+
+    let req = json_request("POST", "/poll", Some(bearer), json!({ "services": [] }));
     let resp = app.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a node with a valid bearer token must keep polling even when its source address is over budget"
+    );
+
+    // And the bad credential from that same source is still refused.
+    let req = json_request("POST", "/poll", Some("brt_garbage"), json!({ "services": [] }));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
 // S4 on /register: with trust_proxy_headers on, the rate-limit key is the
@@ -1064,5 +1115,82 @@ async fn static_node_is_refused_at_poll() {
     assert!(
         row.endpoint_addr.is_none(),
         "a refused poll must not have written an endpoint onto a static node"
+    );
+}
+
+// ---- Round-4: the endpoint fallback in the topology spec §7 mandates ----
+
+#[tokio::test]
+async fn proxied_node_gets_an_endpoint_from_its_forwarded_address() {
+    // Found by actually standing up nginx in front of the coordinator.
+    // With trust_proxy_headers on, a node's real address arrives via
+    // X-Forwarded-For and is private, because an internal network is
+    // private by definition. Treating "private" alone as unusable meant
+    // every node that omitted --endpoint-addr got no endpoint at all, and
+    // a peer with no endpoint cannot be dialled — so a mesh where nobody
+    // supplied one could never form.
+    let mut config = test_config("");
+    config.trust_proxy_headers = true;
+    let app = app_with_config(config);
+
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/register")
+        .header("content-type", "application/json")
+        .header("x-forwarded-for", "192.168.20.5")
+        .body(Body::from(
+            json!({ "join_token": t1, "pubkey": pubkey_for("n1"), "listen_port": 51820 })
+                .to_string(),
+        ))
+        .unwrap();
+    let proxy: SocketAddr = "10.0.0.9:443".parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(proxy));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let conn = app.state.db.conn.lock().await;
+    let row = wireserve_coordinator::db::nodes::find_by_name(&conn, "n1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.endpoint_addr.as_deref(),
+        Some("192.168.20.5:51820"),
+        "the forwarded client address is the node's real one and must be used"
+    );
+}
+
+#[tokio::test]
+async fn proxy_misconfiguration_still_suppresses_a_useless_endpoint() {
+    // The other half, and the case the private-range check exists for:
+    // trust_proxy_headers is on but no usable header arrived, so the
+    // address in hand is the proxy's own. Handing that to every other
+    // node as this node's reachable endpoint would be actively wrong.
+    let mut config = test_config("");
+    config.trust_proxy_headers = true;
+    let app = app_with_config(config);
+
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/register")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "join_token": t1, "pubkey": pubkey_for("n1"), "listen_port": 51820 })
+                .to_string(),
+        ))
+        .unwrap();
+    let proxy: SocketAddr = "10.0.0.9:443".parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(proxy));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let conn = app.state.db.conn.lock().await;
+    let row = wireserve_coordinator::db::nodes::find_by_name(&conn, "n1")
+        .unwrap()
+        .unwrap();
+    assert!(
+        row.endpoint_addr.is_none(),
+        "the proxy's own address must never be recorded as a node's endpoint"
     );
 }

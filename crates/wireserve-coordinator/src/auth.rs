@@ -75,16 +75,35 @@ fn source_ip(state: &AppState, parts: &Parts) -> Option<IpAddr> {
     ))
 }
 
-/// Checked BEFORE any comparison work — an IP that has already exhausted
-/// its failed-attempt budget is turned away immediately, without spending
-/// a hash/DB-lookup on a request that was never going to be allowed
-/// anyway (spec §7's rate limiting is meant to make guessing costly, which
-/// only holds if a blocked request is actually cheap to reject).
-fn check_budget(state: &AppState, parts: &Parts) -> Result<(), AuthError> {
-    match source_ip(state, parts) {
-        Some(ip) if state.rate_limiter.is_blocked(ip) => Err(AuthError::RateLimited),
-        _ => Ok(()),
-    }
+/// Whether this request's source has already spent its failed-attempt
+/// budget.
+///
+/// Consulted before any comparison work, so a source that is over budget
+/// and presents a *bad* credential is rejected without the caller having
+/// paid for a full verification (security review S3).
+///
+/// **It does not by itself reject the request**, and that is the
+/// correction to S3. The limiter is keyed on a source address, and spec
+/// §7 mandates a TLS-terminating reverse proxy in front of this
+/// coordinator, so in the deployment the spec actually describes every
+/// node shares one key: the proxy's own address. Rejecting purely on the
+/// budget therefore meant that ten bad guesses from anyone who could
+/// reach the coordinator took *every* node off the mesh until the window
+/// expired, because the check ran ahead of authentication and did not
+/// care that the credential was perfectly good. Nodes behind one NAT
+/// share a key the same way. A brute-force guard that can be turned into
+/// a mesh-wide outage by an unauthenticated stranger is worse than the
+/// thing it guards against, particularly when the thing it guards against
+/// is guessing a 256-bit token.
+///
+/// So a request that is over budget still gets its credential checked,
+/// and is allowed through if the credential is genuinely valid. What an
+/// over-budget source cannot do is keep *failing*. The cost of that check
+/// is one SHA-256 and one indexed lookup, which is bounded and small; the
+/// cost of the alternative is an availability failure in the default
+/// topology.
+fn over_budget(state: &AppState, parts: &Parts) -> bool {
+    source_ip(state, parts).is_some_and(|ip| state.rate_limiter.is_blocked(ip))
 }
 
 /// Records a failed attempt (spec §7: "basic rate limiting on /register
@@ -113,7 +132,14 @@ impl FromRequestParts<AppState> for AdminAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        check_budget(state, parts)?;
+        // The admin surface keeps the strict early rejection, because the
+        // reasoning in `over_budget` does not apply to it: it binds to
+        // loopback or an internal address (§4.0), there is exactly one
+        // credential and normally one operator, so there is no population
+        // of innocent callers sharing the key to be collateral damage.
+        if over_budget(state, parts) {
+            return Err(AuthError::RateLimited);
+        }
         let Some(candidate) = extract_bearer(parts) else {
             return Err(record_failed_auth(state, parts));
         };
@@ -146,17 +172,32 @@ impl FromRequestParts<AppState> for BearerNode {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        check_budget(state, parts)?;
+        let blocked = over_budget(state, parts);
         let Some(candidate) = extract_bearer(parts) else {
-            return Err(record_failed_auth(state, parts));
+            record_failed_auth(state, parts);
+            return Err(if blocked {
+                AuthError::RateLimited
+            } else {
+                AuthError::Unauthorized
+            });
         };
         let hash = hash_token(candidate);
         let conn = state.db.conn.lock().await;
         let looked_up = crate::db::nodes::find_by_bearer_hash(&conn, &hash);
         drop(conn);
         match looked_up {
+            // A valid token is honoured even when the source is over
+            // budget: this node has done nothing wrong, and it is very
+            // likely sharing a key with whoever did.
             Ok(Some(node)) => Ok(BearerNode { node }),
-            Ok(None) => Err(record_failed_auth(state, parts)),
+            Ok(None) => {
+                record_failed_auth(state, parts);
+                Err(if blocked {
+                    AuthError::RateLimited
+                } else {
+                    AuthError::Unauthorized
+                })
+            }
             Err(err) => {
                 // Distinguish "checked, and wrong" from "could not
                 // check" — see `AuthError::Internal`.

@@ -27,15 +27,53 @@ use axum::http::HeaderMap;
 /// its own `X-Forwarded-For` to evade rate limiting entirely.
 #[must_use]
 pub fn resolve(headers: &HeaderMap, connect_ip: IpAddr, trust_proxy_headers: bool) -> IpAddr {
+    resolve_client(headers, connect_ip, trust_proxy_headers).ip
+}
+
+/// The client address, plus where it came from.
+pub struct ResolvedClient {
+    pub ip: IpAddr,
+    /// Whether `ip` was read from a trusted `X-Forwarded-For` entry, as
+    /// opposed to falling back to the raw TCP peer address.
+    ///
+    /// Callers that only need a rate-limiting key can ignore this, but
+    /// `/register`'s endpoint fallback cannot: "we were told to expect a
+    /// proxy and got a private address from it" and "we were told to
+    /// expect a proxy, found no usable header, and are looking at the
+    /// proxy's own private address" are the same address with opposite
+    /// meanings. The first is the ordinary internal-network deployment
+    /// and the address is the node's real one; the second is a
+    /// misconfiguration and the address is useless to every other peer.
+    pub from_forwarded_header: bool,
+}
+
+#[must_use]
+pub fn resolve_client(
+    headers: &HeaderMap,
+    connect_ip: IpAddr,
+    trust_proxy_headers: bool,
+) -> ResolvedClient {
     if !trust_proxy_headers {
-        return connect_ip;
+        return ResolvedClient {
+            ip: connect_ip,
+            from_forwarded_header: false,
+        };
     }
-    headers
+    match headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.rsplit(',').next())
         .and_then(|s| s.trim().parse::<IpAddr>().ok())
-        .unwrap_or(connect_ip)
+    {
+        Some(ip) => ResolvedClient {
+            ip,
+            from_forwarded_header: true,
+        },
+        None => ResolvedClient {
+            ip: connect_ip,
+            from_forwarded_header: false,
+        },
+    }
 }
 
 /// Whether `ip` is loopback or in a private/ULA range — used to decide
@@ -110,6 +148,33 @@ mod tests {
 
         let h = headers_with_xff("not-an-ip");
         assert_eq!(resolve(&h, connect, true), connect);
+    }
+
+    #[test]
+    fn reports_whether_the_address_came_from_the_forwarded_header() {
+        let connect: IpAddr = "10.0.0.1".parse().unwrap();
+
+        let h = headers_with_xff("192.168.20.5");
+        let r = resolve_client(&h, connect, true);
+        assert_eq!(r.ip, "192.168.20.5".parse::<IpAddr>().unwrap());
+        assert!(
+            r.from_forwarded_header,
+            "a private address from a trusted proxy is still the client's real address"
+        );
+
+        // Trusting the header but finding none usable is the
+        // misconfiguration case, and must be distinguishable from the
+        // one above even though both yield a private address.
+        let r = resolve_client(&HeaderMap::new(), connect, true);
+        assert_eq!(r.ip, connect);
+        assert!(!r.from_forwarded_header);
+
+        let r = resolve_client(&headers_with_xff("not-an-ip"), connect, true);
+        assert!(!r.from_forwarded_header);
+
+        let r = resolve_client(&headers_with_xff("192.168.20.5"), connect, false);
+        assert_eq!(r.ip, connect);
+        assert!(!r.from_forwarded_header);
     }
 
     #[test]

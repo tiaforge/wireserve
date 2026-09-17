@@ -9,9 +9,15 @@ source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
 **Currently working on:** nothing open — all milestones complete through
-M12. 200 tests passing across `cargo test --workspace` (agent tested with
-`--no-default-features` locally; the real `nftables` feature is
-type-checked in a container, and both images are built and smoke-tested).
+M15. 204 tests passing across `cargo test --workspace`, plus three
+container harnesses in `deploy/e2e/` that all pass on a real kernel:
+`run-e2e-test.sh` (mesh, firewall, interface guard), `run-nat-test.sh`
+(two NAT-ed sites) and `run-proxy-test.sh` (TLS-terminating reverse proxy,
+the topology spec §7 actually mandates).
+
+Everything that can be verified here now is. What remains unverified is
+scale (three nodes, not thirty), real WAN paths, and long-running
+behaviour.
 
 **The next E2E run matters more than usual.** M11 fixed a bug that meant
 the mesh never carried traffic at all (R1 below), and the reason it
@@ -350,6 +356,70 @@ firewall ordering.
         how it fits together, then create coordinator → add node →
         publish service → add a phone → revoke, a command reference for
         both CLIs, and the ports and conflicts sections from M11.
+
+- [x] **M13 — Fixed the E2E data-plane checks, then ran the mesh.** The
+      checks added in M11 could not have worked and two would have passed
+      unconditionally. See the commit; the short version is `sh -c` with
+      `/dev/tcp` (a bash builtin, and /bin/sh is dash), `nc` absent from
+      the runtime image so nothing was ever listening on the port being
+      probed, and a mesh IP grepped for a range M12 had changed. First
+      confirmation in the project's history that the mesh carries traffic.
+- [x] **M14 — Simulated the two-NAT topology** (`run-nat-test.sh`). Two
+      sites behind their own nftables routers, one port-forwarded and one
+      not, plus a third node sharing the second router. Required marking
+      every segment `--internal`: netavark masquerades traffic whose
+      source is one of its non-internal subnets, so our routers' NAT was
+      being NAT-ed a second time and handshakes half-completed. Findings:
+      the NAT-ed to port-forwarded path works in both directions;
+      **two nodes behind one router cannot reach each other** (needs NAT
+      hairpinning, spec defers STUN); and the `/register` endpoint
+      fallback records the node's self-reported `listen_port`, not the
+      port the NAT mapped, so two nodes behind one router are recorded
+      identically. It self-heals via WireGuard endpoint correction.
+- [x] **M15 — Closed the three fixable items left open after M14.**
+      204 tests, clippy clean, all three harnesses pass.
+      - **R10 (high, availability) — the rate limiter could take the whole
+        mesh offline, and this had been left as advice rather than fixed.**
+        The budget check ran ahead of authentication and rejected on the
+        budget alone. Keyed on a source address, with spec §7's mandated
+        proxy in front, every node shares one key — so ten bad guesses
+        from any stranger who could reach the coordinator took every node
+        off the mesh until the window expired. Nodes behind one NAT share
+        a key the same way. Corrected: being over budget no longer rejects
+        a request that carries a genuinely valid credential, it only stops
+        one from continuing to fail. This deliberately reverses part of
+        S3; the cost is one SHA-256 and an indexed lookup for an
+        over-budget source, against an availability failure in the default
+        topology. The admin surface keeps strict early rejection, since it
+        is loopback-bound with one credential and one operator, so it has
+        no population of innocent callers to damage.
+      - **R11 (high, functional) — found by the new proxy harness: a
+        proxied node got no endpoint at all.** `/register`'s fallback
+        skipped the observed address whenever `trust_proxy_headers` was on
+        and the address was private — without checking whether the
+        forwarded header had actually been used. On an internal network
+        behind a proxy, which is the recommended deployment, the node's
+        real forwarded address *is* private, so every node that omitted
+        `--endpoint-addr` was recorded with no endpoint. A peer with no
+        endpoint cannot be dialled, and a node only learns a peer's real
+        address from traffic that peer sent first, so a mesh where nobody
+        supplied one could never form. `client_ip::resolve_client` now
+        reports whether the address came from the header, and the
+        private-range skip applies only to the misconfiguration case it
+        was always documented (decisions log #31) as being for.
+      - **The interface-adoption guard now actually runs.** R3 was
+        reasoned from library source and covered by nothing executable.
+        `run-e2e-test.sh` now stands up a foreign `wg0` with its own key,
+        confirms the agent refuses to start, confirms that interface kept
+        its key and address, and confirms the same agent starts normally
+        on `--ifname wg1`.
+      - **The proxy path is no longer untested** (`run-proxy-test.sh`):
+        real nginx, a private CA installed into each agent's trust store
+        so certificate validation is genuine, the coordinator on an
+        internal-only segment so "unreachable except through the proxy" is
+        a property of the topology rather than a claim, and checks that
+        `X-Forwarded-For` gives each node its own address and its own
+        rate-limit budget.
 
 Security-sensitive paths (tokens, auth, firewall default-deny, file
 permissions) get test coverage inline with each milestone that introduces
@@ -758,3 +828,27 @@ what the library does and does not do on your behalf.
     unchanged dependencies, not the container. A host-built binary would
     only be viable against a musl target or a runtime base matched to the
     host, both of which trade away more than they gain.
+
+## M15 — what three rounds of review did not find
+
+50. **Both bugs in M15 were found by running the code in a topology it had
+    never been run in, not by reading it.** R10 had been *reported* a
+    round earlier and consciously left as deployment advice; R11 was
+    invisible until nginx was actually put in front of the coordinator,
+    at which point it took about ninety seconds to spot, because the
+    symptom was two nodes with `endpoint=-` in a table that should never
+    have had any. Both are in code that had been read closely several
+    times. The pattern across M11-M15 is consistent enough to write down:
+    every serious defect in this project was found by executing something
+    or by reading a dependency's source, and none was found by re-reading
+    this project's own code.
+
+51. **Three separate test-harness bugs were written during M11-M15**, each
+    of which would have made a check pass without testing anything: `sh`
+    versus `bash` for `/dev/tcp`, a listener that was never running
+    because `nc` is absent from debian-slim, and a `grep` for
+    `event="..."` against tracing output that puts ANSI escapes between
+    the field name and the `=`. All three were caught by looking at why a
+    result seemed too good, which is the only reason to distrust a passing
+    test. Worth remembering that a new assertion is itself unverified code
+    until it has been seen to fail for the right reason.

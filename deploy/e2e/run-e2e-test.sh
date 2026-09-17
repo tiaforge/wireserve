@@ -44,7 +44,8 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 cleanup() {
     log "cleaning up containers and network"
-    podman rm -f "$COORD" "$AGENT1" "$AGENT2" "$DEBUG_CONTAINER" >/dev/null 2>&1 || true
+    podman rm -f "$COORD" "$AGENT1" "$AGENT2" "$DEBUG_CONTAINER" \
+        wireserve-guard-e2e-test >/dev/null 2>&1 || true
     podman network rm "$NET" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -203,6 +204,55 @@ if podman exec "$AGENT2" wireserve-agent list | grep -q '"name": "node1"'; then
     fail "node1 is still listed as a peer on agent2 after revoke"
 fi
 pass "node1 dropped out of agent2's peer list after revoke"
+
+log "the agent must refuse to take over an interface it did not create"
+# The library underneath is idempotent to a fault: creating an interface
+# that already exists returns success, and configuring it then flushes its
+# addresses, overwrites its private key and listen port, and sends
+# WireGuard's ReplacePeers flag, dropping every peer on it. On a host that
+# already runs a wg-quick tunnel called wg0 — the default name, and a very
+# common way to reach a machine remotely — starting this daemon used to
+# quietly destroy it. Everything below is set up to look exactly like that
+# situation.
+GUARD=wireserve-guard-e2e-test
+podman rm -f "$GUARD" >/dev/null 2>&1 || true
+podman run -d --name "$GUARD" --network "$NET" \
+    --cap-add=NET_ADMIN --device /dev/net/tun \
+    --entrypoint sleep wireserve-agent:e2e-test infinity >/dev/null
+JT_GUARD=$(create_node node3)
+podman exec "$GUARD" wireserve-agent join "http://$COORD_IP:8080" "$JT_GUARD" --listen-port 51820
+
+# Stand up somebody else's wg0 first, with its own key and address.
+FOREIGN_KEY=$(podman run --rm "$DEBUG_IMG" wg genkey)
+podman run --rm --network "container:$GUARD" --cap-add=NET_ADMIN "$DEBUG_IMG" sh -c "
+    ip link add wg0 type wireguard &&
+    echo '$FOREIGN_KEY' > /tmp/k && wg set wg0 private-key /tmp/k listen-port 51821 &&
+    ip addr add 192.0.2.77/32 dev wg0 && ip link set wg0 up"
+FOREIGN_PUB=$(echo "$FOREIGN_KEY" | podman run --rm -i "$DEBUG_IMG" wg pubkey)
+echo "pre-existing wg0 public key: $FOREIGN_PUB"
+
+if podman exec "$GUARD" wireserve-agent daemon --poll-interval-secs 5 2>&1 | tee /tmp/guard-out.txt; then
+    fail "the agent started on an interface it did not create — it should have refused"
+fi
+grep -qi "refusing to take over" /tmp/guard-out.txt \
+    || fail "the agent failed, but not with the interface-conflict error: $(cat /tmp/guard-out.txt)"
+pass "the agent refused to start on a pre-existing wg0"
+
+STILL_PUB=$(podman run --rm --network "container:$GUARD" --cap-add=NET_ADMIN "$DEBUG_IMG" wg show wg0 public-key)
+[ "$STILL_PUB" = "$FOREIGN_PUB" ] \
+    || fail "the pre-existing interface's private key was overwritten ($STILL_PUB != $FOREIGN_PUB)"
+podman run --rm --network "container:$GUARD" --cap-add=NET_ADMIN "$DEBUG_IMG" ip addr show wg0 \
+    | grep -q "192.0.2.77" || fail "the pre-existing interface's address was flushed"
+pass "the pre-existing interface kept its key and its address"
+
+# And with a free name it starts normally, so the guard is not just
+# refusing everything.
+podman exec -d "$GUARD" wireserve-agent daemon --poll-interval-secs 5 --ifname wg1
+sleep 8
+podman exec "$GUARD" test -d /sys/class/net/wg1 \
+    || fail "the agent did not come up on the alternative interface name"
+pass "the same agent starts normally on a free interface name (--ifname wg1)"
+podman rm -f "$GUARD" >/dev/null 2>&1 || true
 
 log "testing leave removes the managed hosts-file block (regression: F2)"
 podman exec "$AGENT2" wireserve-agent leave

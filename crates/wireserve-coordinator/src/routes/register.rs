@@ -49,15 +49,20 @@ pub async fn register(
     // response-code cosmetic — and it is keyed on the proxy-resolved
     // client IP, not the raw TCP peer (which behind spec §7's mandated
     // reverse proxy is always the proxy itself).
-    let observed_ip =
-        crate::client_ip::resolve(&headers, peer_addr.ip(), state.config.trust_proxy_headers);
-    if state.rate_limiter.is_blocked(observed_ip) {
-        return Err(AppError::TooManyRequests);
-    }
+    let client =
+        crate::client_ip::resolve_client(&headers, peer_addr.ip(), state.config.trust_proxy_headers);
+    let observed_ip = client.ip;
+    let blocked = state.rate_limiter.is_blocked(observed_ip);
 
     let hash = wireserve_types::hash_token(&req.join_token);
     let conn = state.db.conn.lock().await;
 
+    // Same correction as the auth extractors: being over budget does not
+    // reject a request carrying a genuinely valid credential, it only
+    // stops one from continuing to fail. Behind spec §7's mandated
+    // reverse proxy, or behind any shared NAT, every node registers from
+    // one address, so rejecting on the budget alone let a stranger's bad
+    // guesses block a legitimate node from ever joining.
     let node = match nodes::find_by_unused_join_token_hash(&conn, &hash)? {
         Some(node) => node,
         None => {
@@ -66,7 +71,11 @@ pub async fn register(
             // with the same shape, so a caller learns nothing about
             // whether a guessed token was ever valid).
             state.rate_limiter.record_failure(observed_ip);
-            return Err(AppError::Internal(DbError::JoinTokenInvalid));
+            return Err(if blocked {
+                AppError::TooManyRequests
+            } else {
+                AppError::Internal(DbError::JoinTokenInvalid)
+            });
         }
     };
 
@@ -124,8 +133,19 @@ pub async fn register(
         // client_ip::is_loopback's doc comment for why a direct,
         // proxy-less private-network deployment must NOT have this
         // fallback disabled.
+        // The private-range half of this check applies ONLY when we were
+        // told to expect a proxy and did not actually get an address from
+        // it. Without that qualification it fired on the recommended
+        // topology itself: a proxy on an internal network forwards the
+        // node's real address, that address is private because the whole
+        // network is, and suppressing the fallback there left every node
+        // that omitted --endpoint-addr with no endpoint at all. Since a
+        // peer with no endpoint cannot be dialled, and a node only learns
+        // a peer's real address from traffic that peer sent first, a mesh
+        // where nobody has an endpoint never forms at all.
         let observed_is_unusable = crate::client_ip::is_loopback(observed_ip)
             || (state.config.trust_proxy_headers
+                && !client.from_forwarded_header
                 && crate::client_ip::is_loopback_or_private(observed_ip));
         let endpoint = req.endpoint_addr.clone().or_else(|| {
             if observed_is_unusable {
