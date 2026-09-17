@@ -152,6 +152,43 @@ pub fn v4_cidr_overlaps_cgnat(cidr: &str) -> bool {
     (u32::from(addr) & mask) == (cgnat_net & mask)
 }
 
+/// Whether a configured IPv6 mesh prefix uses a Unique Local Address
+/// block whose Global ID was obviously not generated the way RFC 4193
+/// requires.
+///
+/// A ULA is `fd` followed by a **40-bit pseudo-randomly generated** Global
+/// ID. The randomness is not decoration: it is the entire mechanism by
+/// which two networks built independently, by people who never spoke to
+/// each other, can later be bridged or merged without renumbering. A
+/// prefix inside `fd00::/16` has a Global ID whose top 16 bits are zero,
+/// which in practice means somebody picked a round number by hand —
+/// `fd00::`, `fd00:1::`, and this project's own default `fd00:90::` are
+/// among the most commonly hand-picked prefixes in existence, so they
+/// collide with precisely the neighbours ULAs were designed to coexist
+/// with: a Docker bridge given an `fd00::` pool, another VPN, a home
+/// router handing out something memorable.
+///
+/// Warned about rather than refused, for the same reason as
+/// [`v4_cidr_overlaps_cgnat`]: the default is what the spec's own
+/// examples use throughout, and a deployment already addressed out of it
+/// is working fine until the day something else turns up on the same
+/// host.
+///
+/// Note this has nothing to do with Tailscale, whose IPv6 range is
+/// `fd7a:115c:a1e0::/48` and collides with neither the default nor a
+/// randomly generated prefix.
+#[must_use]
+pub fn v6_prefix_has_nonrandom_global_id(prefix: &str) -> bool {
+    let Some((addr_str, _)) = prefix.split_once('/') else {
+        return false;
+    };
+    let Ok(addr) = addr_str.parse::<std::net::Ipv6Addr>() else {
+        return false;
+    };
+    // fd00::/16 — a ULA whose Global ID starts with 16 zero bits.
+    addr.segments()[0] == 0xfd00
+}
+
 pub fn is_loopback_or_private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
@@ -222,6 +259,23 @@ mod tests {
         // 100.63.255.0 is the last address below it.
         assert!(!v4_cidr_overlaps_cgnat("100.63.255.0/24"));
         assert!(!v4_cidr_overlaps_cgnat("garbage"));
+    }
+
+    #[test]
+    fn flags_a_hand_picked_ula_global_id() {
+        // The compiled-in default, and its equally round neighbours.
+        assert!(v6_prefix_has_nonrandom_global_id("fd00:90::/64"));
+        assert!(v6_prefix_has_nonrandom_global_id("fd00::/64"));
+        assert!(v6_prefix_has_nonrandom_global_id("fd00:1::/48"));
+    }
+
+    #[test]
+    fn accepts_a_properly_generated_ula_global_id() {
+        assert!(!v6_prefix_has_nonrandom_global_id("fdb4:d481:7c21::/64"));
+        // Tailscale's own range is a correctly generated ULA and must not
+        // be flagged either.
+        assert!(!v6_prefix_has_nonrandom_global_id("fd7a:115c:a1e0::/48"));
+        assert!(!v6_prefix_has_nonrandom_global_id("garbage"));
     }
 
     #[test]

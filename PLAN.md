@@ -9,9 +9,9 @@ source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
 **Currently working on:** nothing open — all milestones complete through
-M11 (security review round 3). 198 tests passing across
-`cargo test --workspace` (agent tested with `--no-default-features`
-locally; the real `nftables` feature is type-checked in a container).
+M12. 200 tests passing across `cargo test --workspace` (agent tested with
+`--no-default-features` locally; the real `nftables` feature is
+type-checked in a container, and both images are built and smoke-tested).
 
 **The next E2E run matters more than usual.** M11 fixed a bug that meant
 the mesh never carried traffic at all (R1 below), and the reason it
@@ -304,6 +304,52 @@ firewall ordering.
         resolution is serial and blocking on every cycle (decisions log
         #46), and a quarantined service is never retried automatically
         (#47).
+
+- [x] **M12 — Deployment configuration, usable docs, and a logging gap.**
+      200 tests, clippy clean, both images built and smoke-tested.
+      - **R9 (medium, security/spec) — the audit log produced nothing.**
+        Found while smoke-testing the rebuilt image: with `RUST_LOG`
+        unset the coordinator emitted zero lines. `fmt::init()` derives
+        its filter from `RUST_LOG`, and an unset `RUST_LOG` passes
+        `ERROR` only — so all six of spec §7's required audit events
+        (node creation, registration, revoke, rejoin, service
+        declare/withdraw), which are emitted at `INFO`, were filtered out
+        on every real deployment, along with every startup warning. The
+        audit log existed in the source and nowhere else. Both binaries
+        now floor the filter at `info`; `RUST_LOG` still overrides. The
+        agent had the same defect, where it also hid "firewall rules are
+        NOT being applied" and every failing poll cycle.
+      - **Mesh ranges set in the deploy configs.** `WIRESERVE_NET_V4_CIDR`
+        is `10.90.0.0/24` and `WIRESERVE_NET_V6_PREFIX` a randomly
+        generated `fdb4:d481:7c21::/64`. The compiled-in defaults are
+        unchanged, since they are what the spec's examples use throughout
+        and a deployment already addressed out of them still works. The
+        v6 change is for a different reason than the v4 one and nothing
+        to do with Tailscale (whose own range, `fd7a:115c:a1e0::/48`,
+        collides with neither): `fd00:90::` discards the 40 pseudo-random
+        bits RFC 4193 requires, which is the entire mechanism by which
+        independently-built ULA networks avoid collision. A startup
+        warning now covers this case, symmetric with M11's CGNAT warning.
+      - **`deploy/env/` added.** All three unit files referenced
+        `/etc/wireserve/{coordinator,agent}.env` and nothing in the repo
+        said what belonged in them — and the coordinator unit's
+        `EnvironmentFile=` has no `-` prefix, so it is mandatory.
+        Documented examples now exist, and are where the mesh ranges live
+        for the systemd and Quadlet paths (deliberately not duplicated as
+        `Environment=` lines, which would override the operator's own
+        file rather than default it).
+      - **Image builds are incremental.** Both Dockerfiles now use cache
+        mounts for the cargo registry and target directory, shared
+        between the two images, which previously compiled the common
+        dependency graph twice and recompiled everything on any source
+        change. Measured: coordinator 92s cold and 19s after a source
+        edit, agent 37s and 20s. Building inside the container is kept
+        deliberately — see decisions log #49.
+      - **README rewritten around using the thing.** It opened with the
+        crate layout and never said how to run a mesh. Now: what it is,
+        how it fits together, then create coordinator → add node →
+        publish service → add a phone → revoke, a command reference for
+        both CLIs, and the ports and conflicts sections from M11.
 
 Security-sensitive paths (tokens, auth, firewall default-deny, file
 permissions) get test coverage inline with each milestone that introduces
@@ -693,3 +739,22 @@ what the library does and does not do on your behalf.
     it without printing or storing it anywhere — but an invariant that
     holds only because a value happens to be unreachable is not enforced,
     it is lucky.
+
+## M12 — deployment configuration
+
+49. **Container images are still built inside the container, on purpose.**
+    The obvious speedup is to `cargo build --release` on the host and
+    `COPY` the binary into a slim image, and it does not work here: the
+    runtime images are `debian:bookworm-slim` (glibc 2.36) and this
+    development host is Ubuntu with glibc 2.43. A binary linked against
+    the newer glibc does not start in the image at all, and the failure is
+    a `GLIBC_2.xx not found` at exec time rather than anything the build
+    catches. Building in the same Debian release the binary will run on is
+    what keeps that honest, and it is also the only thing that verifies
+    the shipped Dockerfiles themselves still work — the property M6 was
+    about, which found both the missing `ca-certificates` and the
+    `rustables` type mismatch. Cache mounts get the speed back without
+    giving either of those up: the cost being avoided was recompiling
+    unchanged dependencies, not the container. A host-built binary would
+    only be viable against a musl target or a runtime base matched to the
+    host, both of which trade away more than they gain.

@@ -16,6 +16,10 @@ Wants=network-online.target
 
 [Container]
 Image=localhost/wireserve-coordinator:latest
+# Start from deploy/env/coordinator.env.example — it documents every
+# setting, including the mesh ranges (WIRESERVE_NET_V4_CIDR /
+# WIRESERVE_NET_V6_PREFIX) that must be right before the first node
+# registers.
 EnvironmentFile=/etc/wireserve/coordinator.env
 # Node-facing port: publish per your reverse-proxy topology (often not
 # published to the host at all — see the Dockerfile's own comments and

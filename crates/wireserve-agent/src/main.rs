@@ -58,9 +58,27 @@ enum Command {
     Leave,
 }
 
+/// Initialises logging with `info` as the floor rather than tracing's own
+/// default.
+///
+/// `tracing_subscriber::fmt::init()` builds an `EnvFilter` from `RUST_LOG`,
+/// and an unset `RUST_LOG` yields a filter that passes `ERROR` only. That
+/// is a reasonable default for a library and the wrong one here: this is a
+/// daemon whose whole job is to notice things, and its warnings are how
+/// an operator learns that the firewall backend was compiled out, that a
+/// directory entry was refused, or that poll cycles have been failing for
+/// an hour. Filtered out by default, a silent agent and a working one look
+/// identical. `RUST_LOG`
+/// still overrides this in either direction.
+fn init_logging() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    init_logging();
     let cli = Cli::parse();
 
     let result = match cli.command {

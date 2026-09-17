@@ -1,8 +1,147 @@
 # WireServe
 
-Minimal, self-hosted WireGuard mesh with a declared-service directory. See
-`wireserve-design-spec.md` for the full design and `PLAN.md` for current
-implementation status.
+A small, self-hosted WireGuard mesh with a service directory. You run one
+coordinator. Every machine that joins gets a stable mesh address, an
+automatically maintained set of WireGuard peers, a default-deny firewall on
+the tunnel, and a `<service>.wg` hostname for anything it chooses to
+publish. Phones and laptops that only want to *reach* things join as
+ordinary WireGuard clients with a generated `.conf`, no agent required.
+
+It deliberately does not become your DNS server, does not relay traffic,
+and has no web UI. See `wireserve-design-spec.md` for the full design and
+the reasoning, and `PLAN.md` for implementation status.
+
+## How it fits together
+
+```
+  admin CLI ──▶ coordinator ◀── agents poll every ~20s over HTTPS
+                (axum + SQLite)     │
+                                    ├─ configure WireGuard peers
+                                    ├─ open only declared ports on wg0
+                                    └─ write <service>.wg into /etc/hosts
+```
+
+The coordinator holds no private keys and is never itself a WireGuard peer.
+Each node generates its own keypair locally and sends only the public half.
+Nodes talk to each other directly; the coordinator only tells them who
+exists.
+
+## Getting started
+
+### 1. Run the coordinator
+
+Somewhere reachable by every node, behind a reverse proxy that terminates
+TLS. Copy `deploy/env/coordinator.env.example` to
+`/etc/wireserve/coordinator.env`, set `WIRESERVE_ADMIN_TOKEN` to a fresh
+secret, and check the two mesh ranges before anything registers.
+
+```sh
+openssl rand -hex 32                      # the admin token
+podman build -f deploy/docker/coordinator.Dockerfile -t wireserve-coordinator .
+podman run -d --name wireserve-coordinator \
+    --env-file /etc/wireserve/coordinator.env \
+    -p 127.0.0.1:8080:8080 \
+    -v wireserve-coordinator-data:/var/lib/wireserve \
+    wireserve-coordinator
+```
+
+Point your proxy at `127.0.0.1:8080`. There is a systemd unit and a Quadlet
+unit in `deploy/` if you would rather not use a container.
+
+The admin port never leaves the host by design, so admin commands run
+inside it:
+
+```sh
+podman exec wireserve-coordinator wireserve-admin list-peers
+```
+
+### 2. Add a node
+
+Creating a node prints a one-time join token. Hand it to the machine out of
+band.
+
+```sh
+# on the coordinator
+podman exec wireserve-coordinator wireserve-admin create-node homeserver
+
+# on the node itself
+wireserve-agent join https://wireserve.example.com --join-token-file ./token
+systemctl enable --now wireserve-agent
+```
+
+`join` generates the keypair locally, redeems the token, and stores
+everything mode-600. Pass `--ifname wg1` if the machine already has a
+`wg0`. Prefer `--join-token-file` or `-` over typing the token as an
+argument, where it lands in shell history and is visible via `ps`.
+
+### 3. Publish a service
+
+On the node hosting it. The declaration takes effect on the next poll:
+the port opens on the tunnel and the name appears in every other node's
+hosts file.
+
+```sh
+wireserve-agent serve plex 32400 tcp
+wireserve-agent list                    # what this node sees right now
+wireserve-agent unserve plex
+```
+
+Any other node can then reach `plex.wg:32400`. Names are unique across the
+whole mesh, first come first served. Note that the hostname carries the
+address only, not the port, which is what `list` is for.
+
+### 4. Add a phone or laptop
+
+A device that only consumes services does not run the agent. This creates
+the node and prints a ready-to-import WireGuard config:
+
+```sh
+podman exec wireserve-coordinator wireserve-admin export-config myphone \
+    --out myphone.conf
+```
+
+Import it into the official WireGuard app, by file or by feeding the
+contents to any QR-code generator. The file contains a private key, so it
+is written mode 600; move it, do not copy it. Such a peer gets a mesh
+address and reaches every service by IP and port, but has no `.wg` name
+resolution, and it is a snapshot: re-export and reimport after new nodes
+join.
+
+### 5. When a machine is lost or compromised
+
+```sh
+podman exec wireserve-coordinator wireserve-admin revoke homeserver
+```
+
+The node's token stops working immediately, and every other node drops it
+as a peer on its own next poll, so removal across the mesh is bounded by
+the poll interval rather than instant. `rejoin` issues a fresh join token
+for the same name and address when the machine itself is still trusted;
+`delete-node` frees the name entirely, and refuses until the node is
+revoked.
+
+## Command reference
+
+On a node, talking to the local daemon over a Unix socket:
+
+| Command | What it does |
+| --- | --- |
+| `wireserve-agent join <url>` | one-time bootstrap, generates the keypair |
+| `wireserve-agent serve <name> <port> [tcp\|udp]` | publish a service |
+| `wireserve-agent unserve <name>` | withdraw one |
+| `wireserve-agent list` | peers, services and rejected declarations |
+| `wireserve-agent leave` | tear down interface, firewall, hosts block |
+
+On the coordinator host, against the loopback-only admin port:
+
+| Command | What it does |
+| --- | --- |
+| `wireserve-admin create-node <name>` | create a node, print a join token |
+| `wireserve-admin export-config <name>` | create a static peer, print a `.conf` |
+| `wireserve-admin list-peers` | the full directory |
+| `wireserve-admin revoke <name>` | cut a node off, keep its name reserved |
+| `wireserve-admin rejoin <name>` | fresh join token, same name and address |
+| `wireserve-admin delete-node <name>` | remove the record, free the name |
 
 ## Workspace layout
 
@@ -10,7 +149,7 @@ implementation status.
 - `crates/wireserve-coordinator` — axum + SQLite coordinator binary.
 - `crates/wireserve-agent` — WireGuard/firewall/hosts-file daemon + CLI.
 - `crates/wireserve-admin` — separate admin CLI (distinct trust surface).
-- `deploy/` — systemd units, Dockerfiles, Quadlet files.
+- `deploy/` — systemd units, Dockerfiles, Quadlet files, env examples.
 
 ## Build prerequisites
 
@@ -71,13 +210,49 @@ needs host networking, or the mesh exists only inside that container.
 refuses to start instead — so an existing tunnel is safe, but you will need
 `--ifname wg1` (or another free name) on a host that already has one.
 
-**The mesh address range.** The default is `100.90.0.0/24`, which sits
-inside `100.64.0.0/10`, the carrier-grade-NAT block that Tailscale
-allocates all of its addresses from and that some ISPs use on WAN links. If
-any node also runs such an overlay, that overlay routes the whole `/10` to
-its own interface and mesh traffic can leave the wrong way. Set
-`WIRESERVE_NET_V4_CIDR` to something you control, for example
-`10.90.0.0/24`, before the first node registers; the coordinator logs a
-warning at startup when the configured range overlaps. Addresses are
-allocated once and kept, so changing this later affects only nodes that
-have not registered yet.
+**The mesh address ranges.** Both of the binary's compiled-in defaults are
+poor choices, for unrelated reasons, and `deploy/env/coordinator.env.example`
+sets better ones. Fix these before the first node registers: addresses are
+allocated once and kept for the life of the node record, so a later change
+leaves the mesh addressed out of two ranges.
+
+The IPv4 default `100.90.0.0/24` sits inside `100.64.0.0/10`, the
+carrier-grade-NAT block Tailscale allocates all of its addresses from and
+some ISPs use on WAN links. A host running such an overlay routes that
+whole `/10` to the overlay's interface, covering these mesh addresses too.
+
+The IPv6 default `fd00:90::/64` is not a Tailscale problem at all, since
+Tailscale uses `fd7a:115c:a1e0::/48`. It is an RFC 4193 problem: a unique
+local address is `fd` followed by 40 **pseudo-randomly generated** bits,
+and that randomness is the entire mechanism that lets two networks built
+by strangers be merged without renumbering. `fd00:90::` throws it away,
+and round-numbered `fd00::` prefixes are the most commonly hand-picked
+there are, so it collides with exactly the neighbours it should coexist
+with. Generate your own:
+
+```sh
+python3 -c "import secrets; h=secrets.token_bytes(5).hex(); print(f'fd{h[0:2]}:{h[2:6]}:{h[6:10]}::/64')"
+```
+
+The coordinator warns at startup about either default.
+
+## Building the container images
+
+Both Dockerfiles use build cache mounts for the cargo registry and the
+target directory, shared between the two images. The first build is a cold
+compile of the whole dependency graph, including bindgen against the
+kernel netfilter headers for the agent; every build after that is
+incremental, even though `COPY . .` invalidates its layer on any source
+change.
+
+Builds run inside the container rather than on the host on purpose, and
+this is not just about having a toolchain available. The runtime images
+are `debian:bookworm-slim` (glibc 2.36), and a binary compiled against a
+newer host glibc will not start in them at all. Building in the same
+Debian release the binary will run on is what keeps that honest.
+
+```sh
+podman build -f deploy/docker/coordinator.Dockerfile -t wireserve-coordinator .
+podman build -f deploy/docker/agent.Dockerfile -t wireserve-agent .
+podman builder prune --all   # if a build ever looks like it reused something stale
+```

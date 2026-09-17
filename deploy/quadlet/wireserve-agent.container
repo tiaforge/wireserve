@@ -30,6 +30,8 @@ Wants=network-online.target
 
 [Container]
 Image=localhost/wireserve-agent:latest
+# See deploy/env/agent.env.example. The mesh address range is a
+# coordinator-side setting; nothing about addressing belongs here.
 EnvironmentFile=/etc/wireserve/agent.env
 Network=host
 AddCapability=CAP_NET_ADMIN

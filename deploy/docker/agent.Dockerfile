@@ -49,14 +49,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY . .
-RUN cargo build --release -p wireserve-agent
+# The two cache mounts below are what keep a rebuild from recompiling the
+# whole dependency graph every time. `COPY . .` is invalidated by any
+# source change, so without them each build starts cargo from nothing —
+# several minutes of rustls, tokio, rusqlite's bundled SQLite and (for the
+# agent) bindgen against the kernel headers, every single time, for a
+# one-line edit. The caches persist across builds AND are shared between
+# the two images, which otherwise compile the common dependencies twice.
+#
+# A cache mount is not part of the image layer, so /build/target does not
+# survive into the next stage — hence copying the binaries to /out inside
+# the same RUN, which is where the runtime stage picks them up.
+#
+# Clear them with `podman builder prune --all` if a build ever looks like
+# it is reusing something it should not.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    cargo build --release -p wireserve-agent \
+    && mkdir -p /out \
+    && cp target/release/wireserve-agent /out/
 
 # ---- runtime stage ----
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /build/target/release/wireserve-agent /usr/local/bin/wireserve-agent
+COPY --from=builder /out/wireserve-agent /usr/local/bin/wireserve-agent
 
 # Runs as the image's default root user, deliberately — same reasoning as
 # deploy/systemd/wireserve-agent.service: writing the bind-mounted host
