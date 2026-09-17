@@ -195,10 +195,30 @@ the admin port is deliberately unreachable from anywhere else.
 Inbound UDP 51820 has to reach the node for other peers to open a tunnel to
 it, which usually means a port-forward on the router plus an
 `--endpoint-addr` the other nodes can resolve. A node behind NAT with no
-port-forward can still reach nodes that do have one, because
-`PersistentKeepalive` keeps its side of the mapping alive; two such nodes
-cannot reach each other at all. There is no relay or NAT-traversal
-assistance in v1, which the spec lists as deliberately deferred.
+port-forward can still reach nodes that do have one, and they can reach
+back into it, because `PersistentKeepalive` holds its side of the mapping
+open. Two nodes that both lack a forward cannot reach each other at all.
+There is no relay, STUN or NAT traversal in v1, which the spec lists as
+deliberately deferred. `deploy/e2e/run-nat-test.sh` builds this topology
+and checks all of it.
+
+**Two machines behind the same router is the case to watch.** They learn
+each other's address as their shared router's external one, so reaching it
+from inside means sending a packet out to your own NAT and expecting it
+back, which is NAT hairpinning. Many routers do not do it, and where it
+fails those two nodes cannot reach each other even though both reach
+everything else on the mesh normally. Giving at least one of them a
+port-forward avoids it.
+
+A related wrinkle if you skip `--endpoint-addr`: the coordinator falls back
+to the source address it observed plus the port the node reported for
+itself, and behind NAT the port a router maps for WireGuard's UDP is not
+that one. The recorded endpoint is then wrong, and two nodes behind one
+router get recorded identically. It self-corrects, because WireGuard
+replaces a peer's endpoint with the real source of the first packet it
+receives, so any node that speaks within the 25-second keepalive is found.
+Set `--endpoint-addr` on nodes that have a stable reachable address rather
+than relying on the guess.
 
 The agent needs `CAP_NET_ADMIN` and `/dev/net/tun`, and in a container it
 needs host networking, or the mesh exists only inside that container.
