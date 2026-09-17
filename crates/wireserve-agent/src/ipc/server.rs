@@ -31,6 +31,8 @@ fn build_list_view(state: &AgentState) -> ListView {
         .unwrap_or(PollResponse {
             peers: vec![],
             services: vec![],
+            pending_services: vec![],
+            denied_services: vec![],
         });
 
     let self_name = state.public_key.as_ref().and_then(|pk| {
@@ -46,6 +48,11 @@ fn build_list_view(state: &AgentState) -> ListView {
         .iter()
         .map(|d| d.name.as_str())
         .collect();
+    let pending_names: HashSet<&str> = state
+        .pending_services
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
 
     let mut services: Vec<LocalServiceView> = directory
         .services
@@ -58,6 +65,11 @@ fn build_list_view(state: &AgentState) -> ListView {
             proto: s.proto,
             online: s.online,
             local: declared_names.contains(s.name.as_str()),
+            // Always false in practice for a directory-derived entry,
+            // since `list_approved` filters pending rows out before they
+            // reach any node — set from the same source as the local
+            // branch below so the two cannot drift.
+            pending: pending_names.contains(s.name.as_str()),
         })
         .collect();
 
@@ -72,6 +84,7 @@ fn build_list_view(state: &AgentState) -> ListView {
                 proto: d.proto,
                 online: false,
                 local: true,
+                pending: pending_names.contains(d.name.as_str()),
             });
         }
     }
@@ -125,8 +138,10 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
             state.declared_services.retain(|d| d.name != name);
             // A fresh `serve` for a previously-rejected name deserves a
             // clean retry, not a stale "rejected" annotation hanging
-            // around until the next poll cycle re-evaluates it.
+            // around until the next poll cycle re-evaluates it. The same
+            // goes for a stale "waiting on approval" marker.
             state.rejected_services.retain(|r| r.name != name);
+            state.pending_services.retain(|n| n != &name);
             state.declared_services.push(ServiceDecl { name, port, proto });
             match state.save(&ctx.state_path) {
                 Ok(()) => (IpcResponse::Ok, false),
@@ -267,6 +282,71 @@ mod tests {
         let n = client.read(&mut buf).await.unwrap();
         let resp: IpcResponse = serde_json::from_slice(&buf[..n]).unwrap();
         assert!(matches!(resp, IpcResponse::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn list_marks_a_declaration_waiting_on_approval_as_pending() {
+        // Before this flag a pending service looked exactly like one from
+        // a node that had not polled yet: declared locally, absent from
+        // the directory. This is what tells the operator which it is.
+        let (ctx, _dir, _rx) = test_ctx();
+        {
+            let mut state = ctx.state.lock().await;
+            state.declared_services.push(ServiceDecl {
+                name: "plex".into(),
+                port: 32400,
+                proto: wireserve_types::Proto::Tcp,
+            });
+            state.pending_services.push("plex".into());
+        }
+
+        let view = build_list_view(&*ctx.state.lock().await);
+        assert_eq!(view.services.len(), 1);
+        assert_eq!(view.services[0].name, "plex");
+        assert!(view.services[0].local);
+        assert!(view.services[0].pending, "must be distinguishable from not-yet-polled");
+    }
+
+    #[tokio::test]
+    async fn list_does_not_mark_an_approved_service_as_pending() {
+        let (ctx, _dir, _rx) = test_ctx();
+        {
+            let mut state = ctx.state.lock().await;
+            state.declared_services.push(ServiceDecl {
+                name: "plex".into(),
+                port: 32400,
+                proto: wireserve_types::Proto::Tcp,
+            });
+            // Approval is observed as the name leaving pending_services.
+        }
+
+        let view = build_list_view(&*ctx.state.lock().await);
+        assert_eq!(view.services.len(), 1);
+        assert!(!view.services[0].pending);
+    }
+
+    #[tokio::test]
+    async fn serve_clears_a_stale_pending_marker_for_the_same_name() {
+        // Same reasoning as the existing rejected_services clear: a fresh
+        // `serve` deserves a clean retry, not a marker from the previous
+        // declaration hanging around until the next cycle re-evaluates it.
+        let (ctx, _dir, _rx) = test_ctx();
+        {
+            let mut state = ctx.state.lock().await;
+            state.pending_services.push("plex".into());
+        }
+
+        let (resp, _) = dispatch(
+            &ctx,
+            IpcRequest::Serve {
+                name: "plex".into(),
+                port: 32400,
+                proto: wireserve_types::Proto::Tcp,
+            },
+        )
+        .await;
+        assert!(matches!(resp, IpcResponse::Ok));
+        assert!(ctx.state.lock().await.pending_services.is_empty());
     }
 
     #[tokio::test]

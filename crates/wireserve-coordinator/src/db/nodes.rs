@@ -99,6 +99,14 @@ pub fn create_node(
     Ok(conn.last_insert_rowid())
 }
 
+/// Looks up a node by its row id — used to turn an `OwnedByAnotherNode`
+/// outcome into a name the operator recognises.
+pub fn find_by_id(conn: &Connection, id: i64) -> Result<Option<NodeRow>, DbError> {
+    conn.query_row("SELECT * FROM nodes WHERE id = ?1", [id], map_row)
+        .optional()
+        .map_err(DbError::from)
+}
+
 pub fn find_by_name(conn: &Connection, name: &str) -> Result<Option<NodeRow>, DbError> {
     conn.query_row("SELECT * FROM nodes WHERE name = ?1", [name], map_row)
         .optional()

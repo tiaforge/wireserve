@@ -177,6 +177,55 @@ async fn revoke_node(
     Ok(StatusCode::OK)
 }
 
+async fn list_services(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+) -> Result<Json<wireserve_types::AdminServicesResponse>, StatusCode> {
+    record(&state, "GET", "/admin/services", b"");
+    if !admin_auth_ok(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(Json(wireserve_types::AdminServicesResponse { services: vec![] }))
+}
+
+async fn approve_service(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path((node, service)): Path<(String, String)>,
+) -> Result<StatusCode, StatusCode> {
+    // The concrete names, not the route pattern: these two path segments
+    // are what carry the bind-to-the-declaring-node rule over the wire,
+    // so a test needs to see which ones actually went out.
+    record(
+        &state,
+        "POST",
+        &format!("/admin/nodes/{node}/services/{service}/approve"),
+        b"",
+    );
+    if !admin_auth_ok(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(StatusCode::OK)
+}
+
+async fn deny_service(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path((node, service)): Path<(String, String)>,
+    body: String,
+) -> Result<StatusCode, StatusCode> {
+    record(
+        &state,
+        "POST",
+        &format!("/admin/nodes/{node}/services/{service}/deny"),
+        body.as_bytes(),
+    );
+    if !admin_auth_ok(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(StatusCode::OK)
+}
+
 async fn clear_endpoint(
     State(state): State<MockState>,
     headers: HeaderMap,
@@ -255,6 +304,15 @@ fn admin_only_routes() -> Router<MockState> {
             axum::routing::delete(clear_endpoint),
         )
         .route("/admin/peers", get(list_peers))
+        .route("/admin/services", get(list_services))
+        .route(
+            "/admin/nodes/{name}/services/{service}/approve",
+            post(approve_service),
+        )
+        .route(
+            "/admin/nodes/{name}/services/{service}/deny",
+            post(deny_service),
+        )
 }
 
 fn build_router(state: MockState) -> Router {

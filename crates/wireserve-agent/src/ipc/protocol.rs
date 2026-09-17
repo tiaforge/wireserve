@@ -28,6 +28,16 @@ pub struct LocalServiceView {
     pub proto: Proto,
     pub online: bool,
     pub local: bool,
+    /// Declared by this node and accepted by the coordinator, but waiting
+    /// on an admin's approval before any other node's hosts file gets it.
+    /// Only ever true for a local declaration.
+    ///
+    /// A pending service already showed up in `list` before this flag
+    /// existed — as a declared name absent from the directory — but was
+    /// indistinguishable from "not polled yet". This is what tells the
+    /// operator which of the two they are looking at.
+    #[serde(default)]
+    pub pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

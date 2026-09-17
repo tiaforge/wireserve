@@ -90,6 +90,7 @@ fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(include_str!("../../migrations/0001_init.sql")),
         M::up(include_str!("../../migrations/0002_join_token_expiry.sql")),
+        M::up(include_str!("../../migrations/0003_service_approval.sql")),
     ])
 }
 
@@ -240,6 +241,77 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "a token outstanding across the upgrade must still redeem"
+        );
+    }
+
+    #[test]
+    fn migration_grandfathers_existing_services_as_approved() {
+        // The most dangerous line in the approval change. Service
+        // approval defaults ON, so without the backfill in migration
+        // 0003 every service in every existing mesh would drop out of the
+        // directory -- and out of every node's managed /etc/hosts block
+        // -- on the first poll after the upgrade.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // A database at the pre-approval schema version, carrying a
+        // registered node with a declared service, written the old way
+        // (including declared_at's SQLite-format column DEFAULT).
+        migrations().to_version(&mut conn, 2).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (name, kind, pubkey, ip4, ip6, join_token_used) \
+             VALUES ('n1', 'agent', 'pk1', '100.90.0.1', 'fd00:90::1', 1)",
+            [],
+        )
+        .unwrap();
+        let node_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO services (node_id, name, port, proto) VALUES (?1, 'plex', 32400, 'tcp')",
+            [node_id],
+        )
+        .unwrap();
+
+        migrations().to_latest(&mut conn).unwrap();
+
+        let approved = crate::db::services::list_approved(&conn).unwrap();
+        assert_eq!(
+            approved.len(),
+            1,
+            "a service declared before the upgrade must keep propagating"
+        );
+        assert_eq!(approved[0].name, "plex");
+        assert!(approved[0].approved_at.is_some());
+        assert!(approved[0].denied_at.is_none());
+    }
+
+    #[test]
+    fn migration_normalises_a_legacy_sqlite_timestamp() {
+        // SQLite's CURRENT_TIMESTAMP default writes "YYYY-MM-DD HH:MM:SS",
+        // which parse_from_rfc3339 rejects by returning None -- silently.
+        // Dormant until ServiceRow started reading declared_at.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        migrations().to_version(&mut conn, 2).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (name, kind, pubkey, ip4, ip6, join_token_used) \
+             VALUES ('n1', 'agent', 'pk1', '100.90.0.1', 'fd00:90::1', 1)",
+            [],
+        )
+        .unwrap();
+        let node_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO services (node_id, name, port, proto, declared_at) \
+             VALUES (?1, 'plex', 32400, 'tcp', '2026-01-01 00:00:00')",
+            [node_id],
+        )
+        .unwrap();
+
+        migrations().to_latest(&mut conn).unwrap();
+
+        let rows = crate::db::services::list_all_for_admin(&conn).unwrap();
+        assert!(
+            rows[0].declared_at.is_some(),
+            "a legacy timestamp must survive as a parsed value, not silently become None"
         );
     }
 

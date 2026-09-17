@@ -65,6 +65,7 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
     let reg: RegisterResponse = resp.json().await?;
 
     let state = AgentState {
+        pending_services: Vec::new(),
         coordinator_url: Some(params.coordinator_url.to_string()),
         bearer_token: Some(reg.bearer_token),
         private_key: Some(private_key.to_string()),

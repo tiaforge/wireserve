@@ -2,12 +2,12 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use wireserve_types::{
-    AdminPeersResponse, CreateNodeRequest, CreateNodeResponse, RejoinRequest, RejoinResponse,
-    JOIN_TOKEN_PREFIX,
+    AdminPeersResponse, AdminServicesResponse, CreateNodeRequest, CreateNodeResponse,
+    DenyServiceRequest, RejoinRequest, RejoinResponse, JOIN_TOKEN_PREFIX, MAX_DENY_REASON_LEN,
 };
 
 use crate::auth::AdminAuth;
-use crate::db::nodes;
+use crate::db::{nodes, services};
 use crate::error::AppError;
 use crate::state::AppState;
 use crate::tokengen;
@@ -162,6 +162,130 @@ pub async fn rejoin_node(
             join_token_expires_at: parse_expiry(expires_at.as_deref()),
         }),
     ))
+}
+
+/// `GET /admin/services` — every declared service in every approval
+/// state.
+///
+/// The admin has no other view of the service directory: `/admin/peers`
+/// lists nodes only, and the directory is otherwise visible solely to
+/// nodes via `/poll`.
+pub async fn list_services(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+) -> Result<Json<AdminServicesResponse>, AppError> {
+    let conn = state.db.conn.lock().await;
+    let rows = services::list_all_for_admin(&conn)?;
+    let owners: std::collections::HashMap<i64, nodes::NodeRow> = nodes::list_all_peers(&conn)?
+        .into_iter()
+        .map(|n| (n.id, n))
+        .collect();
+    let out = rows
+        .iter()
+        .filter_map(|s| {
+            owners
+                .get(&s.node_id)
+                .map(|owner| crate::directory::admin_service_info(s, owner))
+        })
+        .collect();
+    Ok(Json(AdminServicesResponse { services: out }))
+}
+
+/// Shared shape for the two approval endpoints: validate the service
+/// label, resolve the node, then act. Kept together so approve and deny
+/// cannot drift on validation or on what a missing node means.
+async fn resolve_node_for_service(
+    state: &AppState,
+    node_name: &str,
+    service: &str,
+) -> Result<i64, AppError> {
+    if !wireserve_types::is_valid_dns_label(service) {
+        return Err(AppError::BadRequest(format!(
+            "invalid service name: {service}"
+        )));
+    }
+    let conn = state.db.conn.lock().await;
+    let node = nodes::find_by_name(&conn, node_name)?.ok_or(AppError::NotFound)?;
+    Ok(node.id)
+}
+
+/// `POST /admin/nodes/{name}/services/{service}/approve`.
+///
+/// **The node name is in the path on purpose.** There is deliberately no
+/// `/admin/services/{name}/approve` form at any layer of this codebase
+/// that would approve "whoever currently holds this name" — approval
+/// binds to the pair, so an operator acting on a stale view of the
+/// directory gets a 409 naming the real owner instead of silently
+/// blessing a squatter's claim.
+pub async fn approve_service(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path((name, service)): Path<(String, String)>,
+) -> Result<(), AppError> {
+    let node_id = resolve_node_for_service(&state, &name, &service).await?;
+    let conn = state.db.conn.lock().await;
+    match services::approve(&conn, node_id, &service)? {
+        services::ApproveOutcome::Approved => {
+            tracing::info!(event = "service_approved", node_name = %name, service = %service);
+            Ok(())
+        }
+        services::ApproveOutcome::AlreadyApproved => Ok(()),
+        services::ApproveOutcome::OwnedByAnotherNode { owner_node_id } => {
+            let owner = nodes::find_by_id(&conn, owner_node_id)?
+                .map_or_else(|| "another node".to_string(), |n| n.name);
+            Err(AppError::Conflict(format!(
+                "service '{service}' is declared by node '{owner}', not '{name}' — \
+                 approval binds to the declaring node"
+            )))
+        }
+        services::ApproveOutcome::NotDeclared => Err(AppError::NotFound),
+    }
+}
+
+/// `POST /admin/nodes/{name}/services/{service}/deny`.
+pub async fn deny_service(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path((name, service)): Path<(String, String)>,
+    body: Option<Json<DenyServiceRequest>>,
+) -> Result<(), AppError> {
+    let reason = body.and_then(|Json(b)| b.reason);
+    if let Some(r) = &reason {
+        if r.len() > MAX_DENY_REASON_LEN {
+            return Err(AppError::BadRequest(format!(
+                "denial reason is {} bytes; the limit is {MAX_DENY_REASON_LEN}",
+                r.len()
+            )));
+        }
+    }
+    let node_id = resolve_node_for_service(&state, &name, &service).await?;
+    let conn = state.db.conn.lock().await;
+    match services::deny(&conn, node_id, &service, reason.as_deref())? {
+        services::DenyOutcome::Denied => {
+            // `?` (Debug), not `%` (Display): this is operator-supplied
+            // free text entering an audit log, and Debug for &str quotes
+            // and escapes control characters, so a reason containing
+            // newlines or ANSI escapes cannot forge extra log lines.
+            // PLAN.md #51 records this project already being bitten by
+            // ANSI escapes in tracing output.
+            tracing::info!(
+                event = "service_denied",
+                node_name = %name,
+                service = %service,
+                reason = ?reason,
+            );
+            Ok(())
+        }
+        services::DenyOutcome::AlreadyDenied => Ok(()),
+        services::DenyOutcome::OwnedByAnotherNode { owner_node_id } => {
+            let owner = nodes::find_by_id(&conn, owner_node_id)?
+                .map_or_else(|| "another node".to_string(), |n| n.name);
+            Err(AppError::Conflict(format!(
+                "service '{service}' is declared by node '{owner}', not '{name}'"
+            )))
+        }
+        services::DenyOutcome::NotDeclared => Err(AppError::NotFound),
+    }
 }
 
 /// `GET /admin/peers` (spec §4.5.1).

@@ -91,13 +91,84 @@ pub fn quarantine_rejected_service(state: &mut AgentState, error_body: &str) -> 
     else {
         return false;
     };
+    quarantine(state, name, error_body.to_string());
+    true
+}
+
+/// Drops a declaration and records why, so it stops being resent every
+/// cycle but does not silently vanish from `wireserve list` (security
+/// review F3).
+///
+/// Shared by the name-collision path and the admin-denial path so the two
+/// cannot drift — in particular so both get the de-duplication that stops
+/// a repeatedly-quarantined name accumulating records.
+fn quarantine(state: &mut AgentState, name: String, reason: String) {
     state.declared_services.retain(|d| d.name != name);
     state.rejected_services.retain(|r| r.name != name);
-    state.rejected_services.push(crate::state::RejectedService {
-        name,
-        reason: error_body.to_string(),
-    });
-    true
+    state.pending_services.retain(|n| n != &name);
+    state
+        .rejected_services
+        .push(crate::state::RejectedService { name, reason });
+}
+
+/// Folds the approval verdicts from a SUCCESSFUL poll into local state.
+///
+/// The asymmetry between the two verdicts is the important part:
+///
+/// * **pending** stays in `declared_services`. The node keeps declaring
+///   it so an admin can still approve it, keeps its own firewall hole
+///   open (spec §5 — a node only ever firewalls itself, and nothing
+///   resolves `<name>.wg` for it yet anyway), and is simply absent from
+///   every other node's directory. It is recorded so `wireserve list` can
+///   say "waiting on approval" instead of looking identical to "not
+///   polled yet".
+///
+/// * **denied** is quarantined exactly as a name collision is: dropped
+///   from `declared_services` so it stops being resent forever, with the
+///   admin's reason kept so the operator can see why. Because
+///   `service_rules` derives from `declared_services`, that drop is also
+///   what closes the local firewall hole.
+///
+/// Returns whether anything changed, so the caller knows whether to save.
+pub fn apply_approval_verdicts(state: &mut AgentState, directory: &PollResponse) -> bool {
+    let mut changed = false;
+
+    for denied in &directory.denied_services {
+        if state.declared_services.iter().any(|d| d.name == denied.name) {
+            let reason = denied
+                .reason
+                .clone()
+                .unwrap_or_else(|| "denied by an administrator".to_string());
+            tracing::error!(
+                service = %denied.name,
+                reason = ?denied.reason,
+                "declared service was denied by an admin — withdrawing it locally"
+            );
+            quarantine(state, denied.name.clone(), reason);
+            changed = true;
+        }
+    }
+
+    let pending: Vec<String> = directory
+        .pending_services
+        .iter()
+        .map(|p| p.name.clone())
+        .collect();
+    for name in &pending {
+        if !state.pending_services.contains(name) {
+            tracing::warn!(
+                service = %name,
+                "declared service is waiting on admin approval — no other node can \
+                 resolve <name>.wg for it yet"
+            );
+        }
+    }
+    if pending != state.pending_services {
+        state.pending_services = pending;
+        changed = true;
+    }
+
+    changed
 }
 
 pub struct PollContext<'a, F: FirewallBackend> {
@@ -175,6 +246,32 @@ where
     }
     let directory: PollResponse = resp.json().await?;
 
+    // Approval verdicts are folded in BEFORE the firewall rules are
+    // computed, and that ordering is the whole point.
+    //
+    // `declared` is the snapshot taken before the request was sent. A
+    // denial arriving in this response drops the name from
+    // `declared_services`, and since `service_rules` derives from that
+    // list, recomputing it here is what closes the local firewall hole on
+    // *this* cycle rather than the next one. Applying the verdict to
+    // persisted state alone and leaving `rules` built from the stale
+    // snapshot would leave a denied service reachable for another poll
+    // interval — twenty seconds by default, which reads as a bug rather
+    // than as a design.
+    //
+    // This is the one place the coordinator's response influences a
+    // node's own firewall, amending the rule stated on step 3 below. It
+    // is safe in exactly one direction and must stay that way: a verdict
+    // can only ever remove a rule, never add one, so a compromised or
+    // buggy coordinator can close ports on a node but can never open one.
+    let declared = {
+        let mut s = state.lock().await;
+        if apply_approval_verdicts(&mut s, &directory) {
+            s.save(&crate::paths::state_path())?;
+        }
+        s.declared_services.clone()
+    };
+
     // Steps 2-4 are all synchronous and can block: netlink round trips,
     // DNS resolution of peer endpoints inside `reconcile`, and file I/O.
     // `block_in_place` moves this worker off the async scheduler for the
@@ -185,9 +282,11 @@ where
         // 2. reconcile WireGuard peers
         ctx.wg.reconcile(&directory.peers, &self_pubkey)?;
 
-        // 3. reconcile this node's own firewall rules — from the snapshot
-        //    this cycle actually sent (spec §5), not from the coordinator's
-        //    response and not from whatever `serve` may have queued since.
+        // 3. reconcile this node's own firewall rules — from what this
+        //    node declared (spec §5), not from the coordinator's
+        //    directory and not from whatever `serve` may have queued
+        //    since. The one exception is an admin denial, already folded
+        //    in above, which can only ever close a hole; see there.
         ctx.firewall
             .apply(&rules)
             .map_err(|e| PollError::Firewall(e.to_string()))?;
@@ -244,6 +343,126 @@ mod tests {
         let declared = vec![ServiceDecl { name: "anything-goes-here".into(), port: 1, proto: Proto::Tcp }];
         let rules = service_rules(&declared);
         assert_eq!(rules, vec![ServiceRule { proto: Proto::Tcp, port: 1 }]);
+    }
+
+    // ---- service approval verdicts ----
+
+    fn directory_with(
+        pending: &[&str],
+        denied: &[(&str, Option<&str>)],
+    ) -> PollResponse {
+        PollResponse {
+            peers: vec![],
+            services: vec![],
+            pending_services: pending
+                .iter()
+                .map(|n| wireserve_types::PendingService {
+                    name: (*n).to_string(),
+                    port: 1,
+                    proto: Proto::Tcp,
+                    declared_at: None,
+                })
+                .collect(),
+            denied_services: denied
+                .iter()
+                .map(|(n, r)| wireserve_types::DeniedService {
+                    name: (*n).to_string(),
+                    reason: r.map(str::to_string),
+                    denied_at: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_denied_service_is_quarantined_from_a_successful_poll() {
+        let mut state = state_with_declared(&["plex", "git"]);
+        let changed = apply_approval_verdicts(
+            &mut state,
+            &directory_with(&[], &[("plex", Some("reserved for the build box"))]),
+        );
+
+        assert!(changed);
+        assert_eq!(state.declared_services.len(), 1);
+        assert_eq!(state.declared_services[0].name, "git");
+        assert_eq!(state.rejected_services.len(), 1);
+        assert_eq!(state.rejected_services[0].name, "plex");
+        assert!(state.rejected_services[0].reason.contains("reserved for the build box"));
+    }
+
+    #[test]
+    fn a_denied_service_loses_its_firewall_hole_because_it_leaves_declared_services() {
+        // The mechanism behind same-cycle closure: firewall rules derive
+        // from `declared_services`, so quarantining the name is what shuts
+        // the port. `run_once` recomputes `rules` after this call for
+        // exactly that reason.
+        let mut state = state_with_declared(&["plex", "git"]);
+        state.declared_services[0].port = 32400;
+        assert!(service_rules(&state.declared_services)
+            .iter()
+            .any(|r| r.port == 32400));
+
+        apply_approval_verdicts(&mut state, &directory_with(&[], &[("plex", None)]));
+
+        assert!(
+            !service_rules(&state.declared_services)
+                .iter()
+                .any(|r| r.port == 32400),
+            "a denied service's port must not survive in the rule set"
+        );
+    }
+
+    #[test]
+    fn a_pending_service_is_recorded_but_never_quarantined() {
+        // Pending keeps being declared (so an admin can still approve it)
+        // and keeps its own firewall hole — the node is only firewalling
+        // itself, and nothing resolves <name>.wg for it yet anyway.
+        let mut state = state_with_declared(&["plex"]);
+        state.declared_services[0].port = 32400;
+
+        let changed = apply_approval_verdicts(&mut state, &directory_with(&["plex"], &[]));
+
+        assert!(changed);
+        assert_eq!(state.declared_services.len(), 1, "still declared");
+        assert!(state.rejected_services.is_empty(), "pending is not a rejection");
+        assert_eq!(state.pending_services, vec!["plex".to_string()]);
+        assert!(service_rules(&state.declared_services)
+            .iter()
+            .any(|r| r.port == 32400));
+    }
+
+    #[test]
+    fn pending_services_are_replaced_not_merged() {
+        // An approval is observed as a name *disappearing* from the
+        // coordinator's pending list, so merging would mean a service
+        // stayed flagged "waiting" forever after it was approved.
+        let mut state = state_with_declared(&["plex", "git"]);
+        apply_approval_verdicts(&mut state, &directory_with(&["plex", "git"], &[]));
+        assert_eq!(state.pending_services.len(), 2);
+
+        apply_approval_verdicts(&mut state, &directory_with(&["git"], &[]));
+        assert_eq!(state.pending_services, vec!["git".to_string()]);
+    }
+
+    #[test]
+    fn a_response_without_the_approval_fields_changes_nothing() {
+        // What an older coordinator, or one with approval disabled,
+        // returns. Must be a no-op, not an implicit "everything denied".
+        let mut state = state_with_declared(&["plex"]);
+        let changed = apply_approval_verdicts(&mut state, &directory_with(&[], &[]));
+
+        assert!(!changed);
+        assert_eq!(state.declared_services.len(), 1);
+        assert!(state.rejected_services.is_empty());
+        assert!(state.pending_services.is_empty());
+    }
+
+    #[test]
+    fn denying_a_name_this_node_no_longer_declares_is_a_no_op() {
+        let mut state = state_with_declared(&["git"]);
+        let changed = apply_approval_verdicts(&mut state, &directory_with(&[], &[("plex", None)]));
+        assert!(!changed);
+        assert!(state.rejected_services.is_empty());
     }
 
     // ---- F3: quarantine_rejected_service ----

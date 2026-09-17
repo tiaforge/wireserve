@@ -86,7 +86,12 @@ pub async fn poll(
     let previous_names: std::collections::HashSet<&str> =
         previous.iter().map(|s| s.name.as_str()).collect();
 
-    services::upsert_for_node(&mut conn, node.id, &desired)?;
+    let mode = if state.config.require_service_approval {
+        services::ApprovalMode::RequireApproval
+    } else {
+        services::ApprovalMode::AutoApprove
+    };
+    let outcome = services::upsert_for_node(&mut conn, node.id, &desired, mode)?;
 
     for name in desired_names.difference(&previous_names) {
         tracing::info!(event = "service_declared", node_name = %node.name, service = %name);
@@ -94,9 +99,23 @@ pub async fn poll(
     for name in previous_names.difference(&desired_names) {
         tracing::info!(event = "service_withdrawn", node_name = %node.name, service = %name);
     }
+    // Gated on *newly* declared names: a service can sit pending for days,
+    // and logging it on every 20-second cycle would bury the audit trail
+    // it belongs to.
+    for row in &outcome.pending {
+        if desired_names.difference(&previous_names).any(|n| *n == row.name) {
+            tracing::info!(
+                event = "service_pending_approval",
+                node_name = %node.name,
+                service = %row.name,
+                port = row.port,
+                proto = row.proto.as_str(),
+            );
+        }
+    }
 
     let all_peers = nodes::list_all_peers(&conn)?;
-    let all_services = services::list_all(&conn)?;
+    let all_services = services::list_approved(&conn)?;
 
     let peers = all_peers
         .iter()
@@ -114,5 +133,10 @@ pub async fn poll(
         })
         .collect();
 
-    Ok(Json(PollResponse { peers, services }))
+    Ok(Json(PollResponse {
+        peers,
+        services,
+        pending_services: outcome.pending.iter().map(directory::pending_service).collect(),
+        denied_services: outcome.denied.iter().map(directory::denied_service).collect(),
+    }))
 }

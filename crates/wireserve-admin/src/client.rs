@@ -12,8 +12,9 @@
 use reqwest::blocking::{Client, Response};
 use reqwest::StatusCode;
 use wireserve_types::{
-    AdminPeersResponse, CreateNodeRequest, CreateNodeResponse, ErrorBody, NodeKind,
-    RegisterRequest, RegisterResponse, RejoinRequest, RejoinResponse,
+    AdminPeersResponse, AdminServicesResponse, CreateNodeRequest, CreateNodeResponse,
+    DenyServiceRequest, ErrorBody, NodeKind, RegisterRequest, RegisterResponse, RejoinRequest,
+    RejoinResponse,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -141,6 +142,50 @@ impl AdminClient {
             .json(&RejoinRequest { ttl_secs })
             .send()?;
         Ok(Self::check_status(resp)?.json()?)
+    }
+
+    /// `GET /admin/services` — every declared service and its approval
+    /// state.
+    pub fn list_services(&self) -> Result<AdminServicesResponse, ClientError> {
+        let resp = self
+            .http
+            .get(self.url("/admin/services"))
+            .bearer_auth(&self.admin_token)
+            .send()?;
+        Ok(Self::check_status(resp)?.json()?)
+    }
+
+    /// `POST /admin/nodes/{node}/services/{service}/approve`.
+    ///
+    /// Both names are in the path because approval binds to the pair —
+    /// there is no "approve whoever holds this name" call.
+    pub fn approve_service(&self, node: &str, service: &str) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/admin/nodes/{node}/services/{service}/approve")))
+            .bearer_auth(&self.admin_token)
+            .send()?;
+        Self::check_status(resp)?;
+        Ok(())
+    }
+
+    /// `POST /admin/nodes/{node}/services/{service}/deny`.
+    pub fn deny_service(
+        &self,
+        node: &str,
+        service: &str,
+        reason: Option<&str>,
+    ) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/admin/nodes/{node}/services/{service}/deny")))
+            .bearer_auth(&self.admin_token)
+            .json(&DenyServiceRequest {
+                reason: reason.map(str::to_string),
+            })
+            .send()?;
+        Self::check_status(resp)?;
+        Ok(())
     }
 
     /// `GET /admin/peers` (spec §4.5.1).

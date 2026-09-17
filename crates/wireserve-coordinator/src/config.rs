@@ -37,6 +37,24 @@ pub struct Config {
     /// the per-source window, is the actual bound on guess rate.
     pub global_auth_failure_max: u32,
     pub global_auth_failure_window_secs: u64,
+    /// Require an admin to approve a service declaration before it is
+    /// propagated to any other node.
+    ///
+    /// **On by default.** Service names are globally unique and
+    /// first-come-first-served, so without this any node holding a valid
+    /// bearer token can claim an unclaimed name — or re-claim one freed a
+    /// moment earlier when its owner was revoked — and every other node's
+    /// `/etc/hosts` will point `<name>.wg` at it. That is a credible way
+    /// to intercept traffic a user believes is going somewhere else, and
+    /// it needs only one compromised node.
+    ///
+    /// Turn it off (`false`) for a single-operator mesh where every node
+    /// is already trusted and the round trip to approve is pure
+    /// ceremony. With it off, a declaration is written approved on
+    /// arrival and nothing downstream can tell the feature exists: the
+    /// two extra `PollResponse` fields are provably empty and omitted
+    /// from the JSON entirely.
+    pub require_service_approval: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -87,6 +105,8 @@ impl Config {
         let global_auth_failure_max = env_parse_or("WIRESERVE_GLOBAL_AUTH_FAILURE_MAX", 20u32)?;
         let global_auth_failure_window_secs =
             env_parse_or("WIRESERVE_GLOBAL_AUTH_FAILURE_WINDOW_SECS", 60u64)?;
+        let require_service_approval =
+            env_parse_or("WIRESERVE_REQUIRE_SERVICE_APPROVAL", true)?;
 
         Ok(Self {
             listen_addr,
@@ -102,6 +122,7 @@ impl Config {
             join_token_ttl_secs,
             global_auth_failure_max,
             global_auth_failure_window_secs,
+            require_service_approval,
         })
     }
 }

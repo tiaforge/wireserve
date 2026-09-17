@@ -81,7 +81,48 @@ argument, where it lands in shell history and is visible via `ps`.
 
 ### 3. Publish a service
 
-On the node hosting it. The declaration takes effect on the next poll:
+On the node hosting it.
+
+**By default a declaration needs an admin to approve it** before any other
+node sees it. Service names are globally unique and first-come-first-served,
+so without that gate any node holding a valid bearer token could claim an
+unclaimed name — or re-claim one freed a moment earlier when its owner was
+revoked — and every other node's `/etc/hosts` would point `<name>.wg` at it.
+One compromised node is enough. Set
+`WIRESERVE_REQUIRE_SERVICE_APPROVAL=false` on the coordinator for a
+single-operator mesh where every node is already trusted and the round trip
+is pure ceremony.
+
+So the flow is two steps:
+
+```sh
+# on the node
+wireserve-agent serve plex 32400 tcp
+
+# on the coordinator — see what is waiting, then approve it
+wireserve-admin list-services --pending
+wireserve-admin approve-service homeserver plex
+```
+
+Until it is approved, `wireserve-agent list` shows the service with
+`"pending": true`, which is how you tell "waiting on an admin" from "this
+node has not polled yet". The node's own firewall hole opens immediately
+either way — it is only firewalling itself, and nothing resolves
+`<name>.wg` for it yet.
+
+`wireserve-admin deny-service <node> <service> --reason '...'` refuses one,
+and the declaring node withdraws it and closes the hole on its next poll.
+Denying an already-approved service pulls it back out of the directory,
+which is the way to re-review a name on a mesh where approval was switched
+on after the fact — enabling it grandfathers everything already declared,
+rather than blanking every hosts file at upgrade time.
+
+**Deny is for mistakes; `revoke` is for compromise.** A denied service still
+holds its globally-unique name until the declaring node withdraws it, and a
+node you do not trust will not withdraw anything. `revoke` deletes all of
+its declarations and kills its token.
+
+Once approved, the declaration takes effect on the next poll:
 the port opens on the tunnel and the name appears in every other node's
 hosts file.
 
@@ -148,6 +189,9 @@ On the coordinator host, against the loopback-only admin port:
 | `wireserve-admin rejoin <name>` | fresh join token, same name and address |
 | `wireserve-admin delete-node <name>` | remove the record, free the name |
 | `wireserve-admin clear-endpoint <name>` | drop a stale advertised endpoint |
+| `wireserve-admin list-services [--pending]` | declared services and their approval state |
+| `wireserve-admin approve-service <node> <svc>` | let a declaration reach the mesh |
+| `wireserve-admin deny-service <node> <svc>` | refuse one, or withdraw an approval |
 
 ## Workspace layout
 

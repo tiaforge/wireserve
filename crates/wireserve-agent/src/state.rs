@@ -41,6 +41,16 @@ pub struct AgentState {
     /// instead of it just silently vanishing.
     #[serde(default)]
     pub rejected_services: Vec<RejectedService>,
+    /// Names this node declared that the coordinator is holding for admin
+    /// approval, as of the last successful poll.
+    ///
+    /// Coordinator-derived and replaced wholesale every cycle, never
+    /// merged — an approval shows up here as a name *disappearing*, which
+    /// is also how `wireserve list` learns to stop flagging it. Denials
+    /// are not kept here; they go through `rejected_services`, which
+    /// already exists for declarations that will not take effect.
+    #[serde(default)]
+    pub pending_services: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

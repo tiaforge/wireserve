@@ -3,7 +3,9 @@
 //! `online`/`last_handshake` approximation from PLAN.md decisions log #3.
 
 use chrono::Utc;
-use wireserve_types::{PeerInfo, ServiceInfo};
+use wireserve_types::{
+    AdminServiceInfo, DeniedService, PeerInfo, PendingService, ServiceApprovalState, ServiceInfo,
+};
 
 use crate::db::nodes::NodeRow;
 use crate::db::services::ServiceRow;
@@ -35,6 +37,57 @@ pub fn service_info(service: &ServiceRow, node: &NodeRow, online_threshold_secs:
         port: service.port,
         proto: service.proto,
         online: is_recent(node.last_seen, online_threshold_secs),
+    }
+}
+
+/// Derived, never stored: `denied_at` is only meaningful while
+/// `approved_at` is NULL, so approval wins if a row somehow carries both.
+/// No writer produces that state, but `ALTER TABLE` cannot add the
+/// table-level CHECK that would forbid it, so the reader resolves it
+/// rather than assuming.
+#[must_use]
+pub fn approval_state(service: &ServiceRow) -> ServiceApprovalState {
+    if service.approved_at.is_some() {
+        ServiceApprovalState::Approved
+    } else if service.denied_at.is_some() {
+        ServiceApprovalState::Denied
+    } else {
+        ServiceApprovalState::Pending
+    }
+}
+
+#[must_use]
+pub fn pending_service(service: &ServiceRow) -> PendingService {
+    PendingService {
+        name: service.name.clone(),
+        port: service.port,
+        proto: service.proto,
+        declared_at: service.declared_at,
+    }
+}
+
+#[must_use]
+pub fn denied_service(service: &ServiceRow) -> DeniedService {
+    DeniedService {
+        name: service.name.clone(),
+        reason: service.denied_reason.clone(),
+        denied_at: service.denied_at,
+    }
+}
+
+#[must_use]
+pub fn admin_service_info(service: &ServiceRow, owner: &NodeRow) -> AdminServiceInfo {
+    AdminServiceInfo {
+        name: service.name.clone(),
+        node: owner.name.clone(),
+        ip4: owner.ip4.clone().unwrap_or_default(),
+        port: service.port,
+        proto: service.proto,
+        state: approval_state(service),
+        declared_at: service.declared_at,
+        approved_at: service.approved_at,
+        denied_at: service.denied_at,
+        denied_reason: service.denied_reason.clone(),
     }
 }
 
@@ -88,6 +141,10 @@ mod tests {
             name: "plex".into(),
             port: 32400,
             proto: wireserve_types::Proto::Tcp,
+            declared_at: None,
+            approved_at: Some(Utc::now()),
+            denied_at: None,
+            denied_reason: None,
         };
         let info = service_info(&svc, &n, 180);
         assert!(info.online);

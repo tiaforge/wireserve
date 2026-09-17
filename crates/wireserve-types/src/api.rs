@@ -146,10 +146,102 @@ pub struct ServiceInfo {
     pub online: bool,
 }
 
+/// A declaration the coordinator accepted and stored but has NOT put in
+/// the directory, because service approval is required and no admin has
+/// approved it for this node yet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingService {
+    pub name: String,
+    pub port: u16,
+    pub proto: Proto,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub declared_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// A declaration an admin explicitly refused. The agent drops it from
+/// `declared_services` on receipt — exactly as it does for a name
+/// collision — which both withdraws the advertisement and closes the
+/// local firewall hole, since firewall rules derive from that list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeniedService {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub denied_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Cap on an admin-supplied denial reason.
+///
+/// It rides back to the declaring node on every poll until that node
+/// quarantines the declaration, and then sits in `wireserve list` output.
+/// Lives here, not in the coordinator, so `wireserve-admin` can refuse an
+/// over-long one before spending a round trip — the same reasoning as
+/// [`MAX_SERVICES_PER_NODE`].
+pub const MAX_DENY_REASON_LEN: usize = 256;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PollResponse {
     pub peers: Vec<PeerInfo>,
     pub services: Vec<ServiceInfo>,
+    /// THIS node's own declarations awaiting approval — never anyone
+    /// else's.
+    ///
+    /// Reported on a **successful** response, not as an error, and that
+    /// is load-bearing. Any `/poll` error aborts the whole cycle: peer
+    /// reconciliation, firewall and hosts sync are all skipped, and since
+    /// the agent resends the same declaration every cycle, an error for a
+    /// pending declaration would fail identically forever — the node
+    /// would stop seeing new peers and would never see its own
+    /// revocation. Pending is a normal, possibly long-lived state.
+    ///
+    /// `skip_serializing_if` also means these bytes are absent whenever
+    /// nothing is pending, so "approval disabled behaves exactly as
+    /// before" holds at the wire level for free.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_services: Vec<PendingService>,
+    /// THIS node's own declarations an admin refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_services: Vec<DeniedService>,
+}
+
+/// Approval state of a service, as reported to the admin. Derived from
+/// the stored timestamps rather than stored itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceApprovalState {
+    Pending,
+    Approved,
+    Denied,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminServiceInfo {
+    pub name: String,
+    pub node: String,
+    pub ip4: String,
+    pub port: u16,
+    pub proto: Proto,
+    pub state: ServiceApprovalState,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub declared_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub approved_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub denied_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub denied_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminServicesResponse {
+    pub services: Vec<AdminServiceInfo>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DenyServiceRequest {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reason: Option<String>,
 }
 
 // ---- §4.5 Admin: rejoin ----
@@ -198,6 +290,30 @@ mod tests {
     }
 
     #[test]
+    fn poll_response_omits_the_approval_fields_when_empty() {
+        // The wire half of "approval disabled behaves exactly as before":
+        // the keys must be absent from the JSON, not merely empty arrays.
+        let resp = PollResponse {
+            peers: vec![],
+            services: vec![],
+            pending_services: vec![],
+            denied_services: vec![],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("pending_services"), "{json}");
+        assert!(!json.contains("denied_services"), "{json}");
+    }
+
+    #[test]
+    fn poll_response_without_the_approval_fields_still_deserializes() {
+        // An older coordinator's response reaching a newer agent, and a
+        // state file written before the fields existed.
+        let resp: PollResponse = serde_json::from_str(r#"{"peers":[],"services":[]}"#).unwrap();
+        assert!(resp.pending_services.is_empty());
+        assert!(resp.denied_services.is_empty());
+    }
+
+    #[test]
     fn poll_response_roundtrips() {
         let resp = PollResponse {
             peers: vec![PeerInfo {
@@ -216,6 +332,8 @@ mod tests {
                 proto: Proto::Tcp,
                 online: true,
             }],
+            pending_services: vec![],
+            denied_services: vec![],
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: PollResponse = serde_json::from_str(&json).unwrap();

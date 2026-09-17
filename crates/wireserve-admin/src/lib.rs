@@ -4,7 +4,8 @@ pub mod export_config;
 
 use client::{AdminClient, ClientError};
 use wireserve_types::{
-    is_valid_dns_label, AdminPeersResponse, CreateNodeResponse, NodeKind, RejoinResponse,
+    is_valid_dns_label, AdminPeersResponse, AdminServicesResponse, CreateNodeResponse, NodeKind,
+    RejoinResponse, MAX_DENY_REASON_LEN,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -20,6 +21,8 @@ pub enum CliError {
     Config(#[from] config::ConfigError),
     #[error(transparent)]
     ExportConfig(#[from] export_config::ExportConfigError),
+    #[error("denial reason is {0} bytes; the limit is {MAX_DENY_REASON_LEN}")]
+    DenyReasonTooLong(usize),
 }
 
 /// Spec §3: "fail fast, don't round trip to the server for an obvious
@@ -69,6 +72,40 @@ pub fn cmd_rejoin(
 
 pub fn cmd_list_peers(client: &AdminClient) -> Result<AdminPeersResponse, CliError> {
     Ok(client.list_peers()?)
+}
+
+pub fn cmd_list_services(client: &AdminClient) -> Result<AdminServicesResponse, CliError> {
+    Ok(client.list_services()?)
+}
+
+/// Both names are validated before any network call — spec §3's fail-fast
+/// rule, and a second reason here: these are the first two path segments
+/// this crate interpolates from two separate user inputs, and a valid DNS
+/// label cannot contain `/` or `..`.
+pub fn cmd_approve_service(
+    client: &AdminClient,
+    node: &str,
+    service: &str,
+) -> Result<(), CliError> {
+    validate_name(node)?;
+    validate_name(service)?;
+    Ok(client.approve_service(node, service)?)
+}
+
+pub fn cmd_deny_service(
+    client: &AdminClient,
+    node: &str,
+    service: &str,
+    reason: Option<&str>,
+) -> Result<(), CliError> {
+    validate_name(node)?;
+    validate_name(service)?;
+    if let Some(r) = reason {
+        if r.len() > MAX_DENY_REASON_LEN {
+            return Err(CliError::DenyReasonTooLong(r.len()));
+        }
+    }
+    Ok(client.deny_service(node, service, reason)?)
 }
 
 pub fn cmd_export_config(

@@ -53,6 +53,27 @@ enum Command {
     ClearEndpoint { name: String },
     /// List the full peer directory (spec §4.5.1).
     ListPeers,
+    /// List every declared service and its approval state.
+    ListServices {
+        /// Show only declarations waiting on approval.
+        #[arg(long)]
+        pending: bool,
+    },
+    /// Approve a pending service declaration for a specific node.
+    /// Approval binds to this node — it does not reserve the name for
+    /// anyone else.
+    ApproveService { node: String, service: String },
+    /// Deny a declaration, or withdraw an approval already granted.
+    ///
+    /// For mistakes. For a node you no longer trust use `revoke`: a
+    /// denied service still holds its globally-unique name until the
+    /// declaring node withdraws it, and a compromised node will not.
+    DenyService {
+        node: String,
+        service: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Generate a WireGuard .conf for an agent-less consumer-only device
     /// (spec §9).
     ExportConfig {
@@ -132,6 +153,54 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let client = build_client(&coordinator_url, &admin_token)?;
             wireserve_admin::cmd_clear_endpoint(&client, &name)?;
             println!("node '{name}' endpoint cleared");
+        }
+        Command::ListServices { pending } => {
+            let client = build_client(&coordinator_url, &admin_token)?;
+            let resp = wireserve_admin::cmd_list_services(&client)?;
+            for s in resp.services {
+                if pending && s.state != wireserve_types::ServiceApprovalState::Pending {
+                    continue;
+                }
+                let state = match s.state {
+                    wireserve_types::ServiceApprovalState::Pending => "pending",
+                    wireserve_types::ServiceApprovalState::Approved => "approved",
+                    wireserve_types::ServiceApprovalState::Denied => "denied",
+                };
+                // Same S2 defense in depth as list-peers: every field is
+                // sanitized, and denied_reason especially — it is the one
+                // field here an operator typed and a database round-tripped.
+                println!(
+                    "{}\t{}\t{}\t{}\t{}/{}\t{}",
+                    sanitize_for_terminal(&s.name),
+                    sanitize_for_terminal(&s.node),
+                    state,
+                    sanitize_for_terminal(&s.ip4),
+                    s.port,
+                    s.proto.as_str(),
+                    s.denied_reason
+                        .as_deref()
+                        .map(sanitize_for_terminal)
+                        .unwrap_or_else(|| "-".to_string())
+                );
+            }
+        }
+        Command::ApproveService { node, service } => {
+            let client = build_client(&coordinator_url, &admin_token)?;
+            wireserve_admin::cmd_approve_service(&client, &node, &service)?;
+            println!("service '{service}' approved for node '{node}'");
+        }
+        Command::DenyService {
+            node,
+            service,
+            reason,
+        } => {
+            let client = build_client(&coordinator_url, &admin_token)?;
+            wireserve_admin::cmd_deny_service(&client, &node, &service, reason.as_deref())?;
+            println!("service '{service}' denied for node '{node}'");
+            println!(
+                "  the node withdraws it and closes its firewall hole on its next poll \
+                 (up to one poll interval from now)"
+            );
         }
         Command::ListPeers => {
             let client = build_client(&coordinator_url, &admin_token)?;

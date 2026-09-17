@@ -357,6 +357,19 @@ async fn teardown_everything<F: FirewallBackend>(
 async fn cmd_serve(name: String, port: u16, proto: String) -> Result<(), Box<dyn std::error::Error>> {
     let proto: Proto = proto.parse().map_err(|e: String| e)?;
     let resp = client::call(&paths::socket_path(), &IpcRequest::Serve { name, port, proto }).await?;
+    // "ok" alone overstates what just happened: the declaration is queued
+    // locally and only reaches the coordinator on the next poll, and if
+    // that coordinator requires approval it will sit pending until an
+    // admin acts. The agent cannot know which until it polls, so say what
+    // is actually true and point at where the answer shows up.
+    if matches!(resp, wireserve_agent::ipc::IpcResponse::Ok) {
+        println!("ok — queued; takes effect on the next poll");
+        println!(
+            "  if this coordinator requires admin approval, `wireserve-agent list` will show \
+             it as pending until an admin approves it"
+        );
+        return Ok(());
+    }
     print_response(resp);
     Ok(())
 }

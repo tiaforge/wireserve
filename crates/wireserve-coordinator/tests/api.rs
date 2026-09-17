@@ -37,6 +37,10 @@ fn test_config(db_path: &str) -> Config {
         // delay lower this deliberately.
         global_auth_failure_max: u32::MAX,
         global_auth_failure_window_secs: 60,
+        // Most existing tests predate approval and assert the immediate
+        // propagation that was the only behaviour then. They run with it
+        // off; the approval tests set it explicitly.
+        require_service_approval: false,
     }
 }
 
@@ -1200,6 +1204,415 @@ async fn proxy_misconfiguration_still_suppresses_a_useless_endpoint() {
         row.endpoint_addr.is_none(),
         "the proxy's own address must never be recorded as a node's endpoint"
     );
+}
+
+// ---- service approval ----
+
+fn approval_app() -> TestApp {
+    let mut config = test_config("");
+    config.require_service_approval = true;
+    app_with_config(config)
+}
+
+async fn declare(router: &Router, bearer: &str, name: &str) -> Value {
+    let req = json_request(
+        "POST",
+        "/poll",
+        Some(bearer),
+        json!({ "services": [{ "name": name, "port": 32400, "proto": "tcp" }] }),
+    );
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "a declaration must never fail the cycle");
+    body_json(resp).await
+}
+
+async fn admin_post(router: &Router, uri: &str) -> StatusCode {
+    let req = raw_request("POST", uri, Some(&format!("Bearer {ADMIN}")));
+    router.clone().oneshot(req).await.unwrap().status()
+}
+
+#[tokio::test]
+async fn approval_disabled_behaves_exactly_as_before() {
+    // test_config leaves approval off, matching every test written before
+    // the feature. Asserted on the raw JSON keys rather than deserialized
+    // empty vectors: the claim is about the bytes on the wire.
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+
+    let body = declare(&app.router, &bearer1, "plex").await;
+    assert_eq!(body["services"].as_array().unwrap().len(), 1);
+    assert!(body.get("pending_services").is_none(), "{body}");
+    assert!(body.get("denied_services").is_none(), "{body}");
+
+    let t2 = admin_create_node(&app.router, "n2").await;
+    let r2 = register_node(&app.router, &t2, "n2", 51821).await;
+    let bearer2 = r2["bearer_token"].as_str().unwrap().to_string();
+    let req = json_request("POST", "/poll", Some(&bearer2), json!({ "services": [] }));
+    let body = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
+    assert_eq!(body["services"].as_array().unwrap().len(), 1, "propagates immediately");
+}
+
+#[tokio::test]
+async fn a_pending_declaration_succeeds_and_is_invisible_to_other_nodes() {
+    let app = approval_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+
+    let body = declare(&app.router, &bearer1, "plex").await;
+    assert!(body["services"].as_array().unwrap().is_empty(), "not in its own directory yet");
+    assert_eq!(body["pending_services"][0]["name"], "plex");
+
+    let t2 = admin_create_node(&app.router, "n2").await;
+    let r2 = register_node(&app.router, &t2, "n2", 51821).await;
+    let bearer2 = r2["bearer_token"].as_str().unwrap().to_string();
+    let req = json_request("POST", "/poll", Some(&bearer2), json!({ "services": [] }));
+    let body = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
+    assert!(
+        body["services"].as_array().unwrap().is_empty(),
+        "an unapproved name must not reach another node's hosts file"
+    );
+    assert!(body.get("pending_services").is_none(), "and not another node's verdict list");
+}
+
+#[tokio::test]
+async fn a_pending_declaration_never_wedges_the_poll_cycle() {
+    // The failure shape this project has hit twice: a /poll error skips
+    // peer reconciliation, firewall and hosts sync, and since the agent
+    // resends the same declaration every cycle, every future cycle fails
+    // identically -- so the node stops seeing new peers and never sees
+    // its own revocation. Pending can last days; it must stay a 200.
+    let app = approval_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+    let t2 = admin_create_node(&app.router, "n2").await;
+    register_node(&app.router, &t2, "n2", 51821).await;
+
+    for cycle in 0..5 {
+        let body = declare(&app.router, &bearer1, "plex").await;
+        assert_eq!(
+            body["peers"].as_array().unwrap().len(),
+            2,
+            "cycle {cycle} must still carry the peer list"
+        );
+        assert_eq!(body["pending_services"][0]["name"], "plex");
+    }
+}
+
+#[tokio::test]
+async fn approving_propagates_the_service_and_clears_the_pending_report() {
+    let app = approval_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+    declare(&app.router, &bearer1, "plex").await;
+
+    assert_eq!(
+        admin_post(&app.router, "/admin/nodes/n1/services/plex/approve").await,
+        StatusCode::OK
+    );
+
+    let body = declare(&app.router, &bearer1, "plex").await;
+    assert_eq!(body["services"][0]["name"], "plex");
+    assert!(body.get("pending_services").is_none(), "no longer pending: {body}");
+
+    let t2 = admin_create_node(&app.router, "n2").await;
+    let r2 = register_node(&app.router, &t2, "n2", 51821).await;
+    let bearer2 = r2["bearer_token"].as_str().unwrap().to_string();
+    let req = json_request("POST", "/poll", Some(&bearer2), json!({ "services": [] }));
+    let body = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
+    assert_eq!(body["services"][0]["name"], "plex");
+}
+
+#[tokio::test]
+async fn approving_for_the_wrong_node_is_refused_and_changes_nothing() {
+    // Approval binds to (name, node). An operator acting on a stale view
+    // of who owns what must get a 409 naming the real owner, never a
+    // silent blessing of a squatter's claim.
+    let app = approval_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+    let t2 = admin_create_node(&app.router, "n2").await;
+    let r2 = register_node(&app.router, &t2, "n2", 51821).await;
+    let bearer2 = r2["bearer_token"].as_str().unwrap().to_string();
+
+    declare(&app.router, &bearer1, "plex").await;
+
+    let req = raw_request(
+        "POST",
+        "/admin/nodes/n2/services/plex/approve",
+        Some(&format!("Bearer {ADMIN}")),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    assert!(
+        body["error"].as_str().unwrap().contains("n1"),
+        "the refusal must name the real owner: {body}"
+    );
+
+    let body = declare(&app.router, &bearer2, "other").await;
+    assert!(
+        body["services"].as_array().unwrap().is_empty(),
+        "nothing was approved for anyone"
+    );
+}
+
+#[tokio::test]
+async fn a_denied_service_is_reported_to_its_owner_and_to_nobody_else() {
+    let app = approval_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+    let t2 = admin_create_node(&app.router, "n2").await;
+    let r2 = register_node(&app.router, &t2, "n2", 51821).await;
+    let bearer2 = r2["bearer_token"].as_str().unwrap().to_string();
+    declare(&app.router, &bearer1, "plex").await;
+
+    let req = json_request(
+        "POST",
+        "/admin/nodes/n1/services/plex/deny",
+        Some(ADMIN),
+        json!({ "reason": "reserved for the build box" }),
+    );
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let body = declare(&app.router, &bearer1, "plex").await;
+    assert_eq!(body["denied_services"][0]["name"], "plex");
+    assert_eq!(body["denied_services"][0]["reason"], "reserved for the build box");
+
+    let req = json_request("POST", "/poll", Some(&bearer2), json!({ "services": [] }));
+    let body = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
+    assert!(body.get("denied_services").is_none(), "another node's verdicts are not its business");
+    assert!(body["services"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn denying_an_approved_service_removes_it_from_the_directory() {
+    // The per-name re-review lever for a mesh where enabling approval
+    // grandfathered everything already declared.
+    let app = approval_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+    declare(&app.router, &bearer1, "plex").await;
+    admin_post(&app.router, "/admin/nodes/n1/services/plex/approve").await;
+    let body = declare(&app.router, &bearer1, "plex").await;
+    assert_eq!(body["services"].as_array().unwrap().len(), 1);
+
+    assert_eq!(
+        admin_post(&app.router, "/admin/nodes/n1/services/plex/deny").await,
+        StatusCode::OK
+    );
+
+    let body = declare(&app.router, &bearer1, "plex").await;
+    assert!(body["services"].as_array().unwrap().is_empty());
+    assert_eq!(body["denied_services"][0]["name"], "plex");
+}
+
+#[tokio::test]
+async fn a_revoked_node_must_have_its_services_reapproved_after_rejoin() {
+    // revoke() deletes the node's services rows, so its approvals die
+    // with it -- which is the point, since revoke is what you reach for
+    // when you no longer trust the node's claims.
+    let app = approval_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+    declare(&app.router, &bearer1, "plex").await;
+    admin_post(&app.router, "/admin/nodes/n1/services/plex/approve").await;
+    assert_eq!(
+        declare(&app.router, &bearer1, "plex").await["services"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    admin_post(&app.router, "/admin/nodes/n1/revoke").await;
+    let req = raw_request("POST", "/admin/nodes/n1/rejoin", Some(&format!("Bearer {ADMIN}")));
+    let rejoin = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
+    let fresh = rejoin["join_token"].as_str().unwrap().to_string();
+    let r1 = register_node(&app.router, &fresh, "n1", 51820).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+
+    let body = declare(&app.router, &bearer1, "plex").await;
+    assert!(
+        body["services"].as_array().unwrap().is_empty(),
+        "a revoked node's approval must not survive its return"
+    );
+    assert_eq!(body["pending_services"][0]["name"], "plex");
+}
+
+#[tokio::test]
+async fn a_bare_rejoin_keeps_an_existing_approval() {
+    // The documented asymmetry: a bare rejoin is a credential rotation,
+    // not a statement of distrust in what the node claims. Blowing away
+    // its directory entries would flap every other node's hosts file for
+    // a routine operation.
+    let app = approval_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+    declare(&app.router, &bearer1, "plex").await;
+    admin_post(&app.router, "/admin/nodes/n1/services/plex/approve").await;
+
+    let req = raw_request("POST", "/admin/nodes/n1/rejoin", Some(&format!("Bearer {ADMIN}")));
+    let rejoin = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
+    let fresh = rejoin["join_token"].as_str().unwrap().to_string();
+    let r1 = register_node(&app.router, &fresh, "n1", 51820).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+
+    let body = declare(&app.router, &bearer1, "plex").await;
+    assert_eq!(body["services"].as_array().unwrap().len(), 1);
+    assert!(body.get("pending_services").is_none());
+}
+
+#[tokio::test]
+async fn pending_declarations_count_against_the_per_node_limit() {
+    // Otherwise an authenticated node could create unbounded pending rows
+    // for an admin to wade through.
+    let app = approval_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+
+    let max: Vec<Value> = (0..64)
+        .map(|i| json!({ "name": format!("svc{i}"), "port": 1000 + i, "proto": "tcp" }))
+        .collect();
+    let req = json_request("POST", "/poll", Some(&bearer1), json!({ "services": max }));
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+    {
+        let conn = app.state.db.conn.lock().await;
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM services", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 64, "pending rows are real rows and are bounded");
+    }
+
+    let too_many: Vec<Value> = (0..65)
+        .map(|i| json!({ "name": format!("svc{i}"), "port": 1000 + i, "proto": "tcp" }))
+        .collect();
+    let req = json_request("POST", "/poll", Some(&bearer1), json!({ "services": too_many }));
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn admin_service_listing_reports_every_state() {
+    let app = approval_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+
+    let req = json_request(
+        "POST",
+        "/poll",
+        Some(&bearer1),
+        json!({ "services": [
+            { "name": "approved-one", "port": 1, "proto": "tcp" },
+            { "name": "pending-one", "port": 2, "proto": "tcp" },
+            { "name": "denied-one", "port": 3, "proto": "tcp" }
+        ] }),
+    );
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+    admin_post(&app.router, "/admin/nodes/n1/services/approved-one/approve").await;
+    admin_post(&app.router, "/admin/nodes/n1/services/denied-one/deny").await;
+
+    let req = raw_request("GET", "/admin/services", Some(&format!("Bearer {ADMIN}")));
+    let body = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
+    let by_name: std::collections::HashMap<String, String> = body["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["name"].as_str().unwrap().to_string(),
+                s["state"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(by_name["approved-one"], "approved");
+    assert_eq!(by_name["pending-one"], "pending");
+    assert_eq!(by_name["denied-one"], "denied");
+}
+
+#[tokio::test]
+async fn approval_endpoints_require_admin_auth_and_report_missing_things() {
+    let app = approval_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+    declare(&app.router, &bearer1, "plex").await;
+
+    for uri in [
+        "/admin/nodes/n1/services/plex/approve",
+        "/admin/nodes/n1/services/plex/deny",
+    ] {
+        let req = raw_request("POST", uri, Some("Bearer wrong-token"));
+        assert_eq!(
+            app.router.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "{uri}"
+        );
+    }
+
+    assert_eq!(
+        admin_post(&app.router, "/admin/nodes/n1/services/nothing/approve").await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        admin_post(&app.router, "/admin/nodes/nope/services/plex/approve").await,
+        StatusCode::NOT_FOUND
+    );
+
+    let req = raw_request("GET", "/admin/services", Some("Bearer wrong-token"));
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn an_over_long_denial_reason_is_refused_and_nothing_is_half_applied() {
+    let app = approval_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+    declare(&app.router, &bearer1, "plex").await;
+
+    let req = json_request(
+        "POST",
+        "/admin/nodes/n1/services/plex/deny",
+        Some(ADMIN),
+        json!({ "reason": "x".repeat(wireserve_types::MAX_DENY_REASON_LEN + 1) }),
+    );
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let body = declare(&app.router, &bearer1, "plex").await;
+    assert_eq!(
+        body["pending_services"][0]["name"], "plex",
+        "the service must still be merely pending, not denied"
+    );
+    assert!(body.get("denied_services").is_none());
 }
 
 // ---- failed-auth delay ----

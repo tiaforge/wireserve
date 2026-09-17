@@ -1044,3 +1044,101 @@ what the library does and does not do on your behalf.
     nothing because of ANSI escapes. The filter's README says to run
     `fail2ban-regex` against real output rather than trusting it, which is
     the honest version of a check this suite cannot make.
+
+## M18 — service approval
+
+60. **Service declarations need admin approval before they propagate, and
+    that is ON by default.** Service names are globally unique and
+    first-come-first-served, so any node holding a valid bearer token
+    could claim an unclaimed name — or re-claim one freed a moment earlier
+    when its owner was revoked — and every other node's `/etc/hosts` would
+    point `<name>.wg` at it. That is a credible way to intercept traffic a
+    user believes is going somewhere else, and it needs exactly one
+    compromised node. `WIRESERVE_REQUIRE_SERVICE_APPROVAL=false` turns it
+    off for a single-operator mesh where the round trip is pure ceremony.
+
+61. **The approval lives on the `services` row, as two nullable
+    timestamps.** A row *is* the pair `(node_id, name)`, so binding
+    approval to that pair is structural rather than a check that could be
+    forgotten: there is no representable state "the name `plex` is
+    approved" independent of who holds it. It also means approval dies
+    with the node for free — `revoke()` already deletes a node's rows and
+    `delete_node` gets them via the FK cascade — where a side table keyed
+    on the name would have needed explicit cleanup in three places, one of
+    them the security-critical one.
+
+    `approved_at IS NULL` means pending, and that direction is the point:
+    **fail-closed**. A future insert that forgets the column yields a row
+    invisible to the mesh, never an approved one. A `status TEXT NOT NULL
+    DEFAULT 'approved'` column would have given the migration backfill for
+    free and auto-approved on that same mistake, silently, forever.
+
+62. **The migration's backfill is the most dangerous line in the change.**
+    Because approval defaults ON, upgrading an existing deployment without
+    it would empty the directory — and every node's managed `/etc/hosts`
+    block — on the first poll. `migration_grandfathers_existing_services_as_approved`
+    was checked against a build with the backfill removed, and fails.
+    Consequence worth stating: an operator enabling approval over a
+    running mesh reviews nothing already there. `deny-service` on an
+    approved name is the deliberate per-name re-review lever.
+
+63. **A pending declaration is reported on a `200`, never as an error.**
+    Any `/poll` error aborts the whole cycle — peer reconciliation,
+    firewall and hosts sync all skipped — and since the agent resends the
+    same declaration every cycle, an error for a pending declaration would
+    fail identically forever, so the node would stop seeing new peers and
+    would never see its own revocation. This project has hit that shape
+    twice already (decisions log #47, and `MAX_SERVICES_PER_NODE`).
+    Pending is a normal, possibly long-lived state. The two new
+    `PollResponse` fields carry `skip_serializing_if`, so with approval
+    disabled they are absent from the JSON entirely and "behaves exactly
+    as before" holds at the byte level rather than by assertion.
+
+64. **Approval gates the directory; a denial also closes the firewall
+    hole, in the same cycle.** A *pending* service keeps its local hole
+    open — the node is only firewalling itself (spec §5), and nothing
+    resolves `<name>.wg` for it yet anyway. An explicit *denial* is
+    different: the agent quarantines the name out of `declared_services`,
+    and because `service_rules` derives from that list, the hole shuts.
+
+    The ordering matters and is easy to get wrong. `run_once` used to
+    compute `rules` from the pre-request snapshot; folding the verdict
+    into persisted state alone would have left a denied service reachable
+    for another poll interval — twenty seconds by default, which reads as
+    a bug rather than a design. Verdicts are now applied *before* `rules`
+    is computed, and `rules` is built from the post-denial list.
+
+    This is the one place the coordinator's response influences a node's
+    own firewall, amending the invariant documented on step 3 of the poll
+    loop. It is safe in exactly one direction and must stay that way: a
+    verdict can only ever remove a rule, never add one, so a compromised
+    or buggy coordinator can close ports on a node but can never open one.
+
+65. **Deny is for mistakes; revoke is for compromise.** A denied row still
+    occupies its globally-unique name until the *declaring node*
+    withdraws it — and a hostile node will not. Deleting the row outright
+    instead would be worse: the node recreates it as pending on its very
+    next poll and never learns it was denied, because the denial and the
+    recreation race and the recreation always wins. So deny does not, and
+    cannot, stop a compromised node parking a name; `revoke` deletes every
+    one of its rows and kills its token, which is the actual answer. Said
+    plainly in `deny`'s doc comment, the CLI help and the README rather
+    than left for someone to discover. Real name-squatting resistance
+    would be admin-side *reservation* — a separate design.
+
+66. **`MAX_SERVICES_PER_NODE` needed no change, and denied rows are
+    self-cleaning.** The limit counts `req.services.len()`, and after the
+    withdraw-diff a node's row set is exactly what it declared, whatever
+    state those rows are in. A denied name is quarantined out of the
+    agent's `declared_services`, so the node stops declaring it, so the
+    withdraw-diff deletes the row — no lockout from denials eating a
+    node's quota, and no unbounded denied rows, without a second cap.
+
+67. **The denial reason is logged with `?` (Debug), not `%` (Display).**
+    It is operator-supplied free text entering an audit log, and `Debug`
+    for `&str` quotes and escapes control characters, so a reason
+    containing newlines or ANSI escapes cannot forge extra log lines —
+    decisions log #51 is the record of this project already being bitten
+    by ANSI escapes in tracing output. Bounded by `MAX_DENY_REASON_LEN`,
+    enforced both in `wireserve-admin` (fail fast, no round trip) and at
+    the coordinator.

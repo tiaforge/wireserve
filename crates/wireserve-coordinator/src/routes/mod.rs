@@ -47,6 +47,15 @@ pub fn admin_router(state: AppState) -> Router {
             delete(admin::clear_node_endpoint),
         )
         .route("/admin/peers", get(admin::list_peers))
+        .route("/admin/services", get(admin::list_services))
+        .route(
+            "/admin/nodes/{name}/services/{service}/approve",
+            post(admin::approve_service),
+        )
+        .route(
+            "/admin/nodes/{name}/services/{service}/deny",
+            post(admin::deny_service),
+        )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }

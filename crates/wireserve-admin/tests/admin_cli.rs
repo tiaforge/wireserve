@@ -64,6 +64,14 @@ fn invalid_name_makes_zero_network_calls_for_every_name_taking_command() {
     assert!(wireserve_admin::cmd_rejoin(&client, "Bad_Name", None).is_err());
     assert!(wireserve_admin::cmd_delete_node(&client, "Bad_Name").is_err());
     assert!(wireserve_admin::cmd_clear_endpoint(&client, "Bad_Name").is_err());
+    // Both path segments are user input here, and a valid DNS label
+    // cannot contain `/` or `..` — so both are validated, and a bad one
+    // in either position must stop before the network.
+    assert!(wireserve_admin::cmd_approve_service(&client, "Bad_Name", "plex").is_err());
+    assert!(wireserve_admin::cmd_approve_service(&client, "homeserver", "Bad_Service").is_err());
+    assert!(wireserve_admin::cmd_deny_service(&client, "Bad_Name", "plex", None).is_err());
+    assert!(wireserve_admin::cmd_deny_service(&client, "homeserver", "Bad_Service", None).is_err());
+    assert!(wireserve_admin::cmd_approve_service(&client, "homeserver", "../../etc/passwd").is_err());
     assert!(wireserve_admin::cmd_export_config(&client, mock.base_url.as_str(), "Bad_Name").is_err());
 
     assert_eq!(
@@ -87,6 +95,65 @@ fn clear_endpoint_hits_the_endpoint_subpath_not_the_node_path() {
     assert_eq!(mock.request_count(), 1);
     let paths = mock.paths();
     assert_eq!(paths, vec!["/admin/nodes/:name/endpoint".to_string()]);
+}
+
+#[test]
+fn approve_service_puts_both_names_in_the_path() {
+    // Approval binds to (name, node). If the node name were dropped from
+    // the path the server would be approving "whoever holds this name",
+    // which is the exact thing the design refuses to offer.
+    let mock = MockCoordinator::start(TOKEN);
+    let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
+
+    wireserve_admin::cmd_approve_service(&client, "homeserver", "plex").unwrap();
+
+    assert_eq!(
+        mock.paths(),
+        vec!["/admin/nodes/homeserver/services/plex/approve".to_string()]
+    );
+}
+
+#[test]
+fn deny_service_sends_the_reason_in_the_body() {
+    let mock = MockCoordinator::start(TOKEN);
+    let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
+
+    wireserve_admin::cmd_deny_service(&client, "homeserver", "plex", Some("build box owns this"))
+        .unwrap();
+
+    assert_eq!(
+        mock.paths(),
+        vec!["/admin/nodes/homeserver/services/plex/deny".to_string()]
+    );
+    assert!(
+        mock.bodies()[0].contains("build box owns this"),
+        "got {:?}",
+        mock.bodies()
+    );
+}
+
+#[test]
+fn deny_service_without_a_reason_still_sends_a_json_object() {
+    // The handler takes an optional Json body; an empty body with no
+    // content-type would be a different code path on the server.
+    let mock = MockCoordinator::start(TOKEN);
+    let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
+
+    wireserve_admin::cmd_deny_service(&client, "homeserver", "plex", None).unwrap();
+
+    assert_eq!(mock.bodies(), vec!["{}".to_string()]);
+}
+
+#[test]
+fn an_over_long_denial_reason_makes_zero_network_calls() {
+    let mock = MockCoordinator::start(TOKEN);
+    let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
+    let too_long = "x".repeat(wireserve_types::MAX_DENY_REASON_LEN + 1);
+
+    assert!(
+        wireserve_admin::cmd_deny_service(&client, "homeserver", "plex", Some(&too_long)).is_err()
+    );
+    assert_eq!(mock.request_count(), 0);
 }
 
 #[test]
