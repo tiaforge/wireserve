@@ -49,6 +49,17 @@ pub struct RejectedService {
     pub reason: String,
 }
 
+#[cfg(unix)]
+fn set_dir_mode_700(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn set_dir_mode_700(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
     #[error("I/O error: {0}")]
@@ -70,6 +81,15 @@ impl AgentState {
     pub fn save(&self, path: &Path) -> Result<(), StateError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            // The file itself is 0600 (§7), but the directory holding it
+            // was left at whatever the umask produced — typically 0755.
+            // Under systemd or the shipped container images the directory
+            // is root-owned so that is not exploitable, but this code
+            // should not be the part that depends on it: a
+            // world-writable-by-default parent is what makes temp-file
+            // games against `atomic_write` worth attempting in the first
+            // place.
+            set_dir_mode_700(parent)?;
         }
         let json = serde_json::to_vec_pretty(self)?;
         atomic_write(path, &json, 0o600)?;
@@ -128,12 +148,19 @@ mod tests {
     }
 
     #[test]
-    fn save_creates_parent_directory() {
+    fn save_creates_parent_directory_root_only() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("agent-state.json");
         let state = AgentState::default();
         state.save(&path).unwrap();
         assert!(path.exists());
+
+        let mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "the directory holding key material must not be world-readable");
     }
 
     #[test]

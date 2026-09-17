@@ -49,10 +49,19 @@ pub fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<
     };
     let tmp_path = dir.join(tmp_name);
 
+    // `create_new` (O_CREAT|O_EXCL), not `create`: O_EXCL refuses to
+    // follow a symlink and refuses an existing file, so a leftover temp
+    // path — whether from a crashed earlier run or planted deliberately —
+    // can neither redirect this write somewhere else nor leave the file
+    // at permissions from before, since `mode` is only honoured when the
+    // file is actually created. Any stale temp file is removed first, so
+    // the stricter open does not turn a crash into a permanent failure.
+    // The directories these files live in are root-only in every shipped
+    // deployment, so this is a second layer rather than the only one.
+    let _ = std::fs::remove_file(&tmp_path);
     let mut f = OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(mode)
         .open(&tmp_path)?;
     f.write_all(contents)?;
@@ -121,6 +130,33 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "file must be created at exactly the requested mode");
+    }
+
+    #[test]
+    fn does_not_follow_a_symlink_planted_at_the_temp_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("attacker-controlled");
+        std::fs::write(&target, "untouched").unwrap();
+        let path = dir.path().join("state.json");
+        std::os::unix::fs::symlink(&target, dir.path().join(".state.json.tmp")).unwrap();
+
+        atomic_write(&path, b"secret", 0o600).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+        assert_eq!(std::fs::read(&path).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn recovers_from_a_leftover_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(dir.path().join(".state.json.tmp"), "stale junk").unwrap();
+
+        atomic_write(&path, b"fresh", 0o600).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"fresh");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

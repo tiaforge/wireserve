@@ -942,3 +942,127 @@ async fn duplicate_pubkey_gets_a_pubkey_specific_409() {
     // The join token was not consumed by the failed attempt.
     register_node(&app.router, &t2, "other-key", 51821).await;
 }
+
+// ---- Round-3 security review: revoke must kill an outstanding join token ----
+
+#[tokio::test]
+async fn revoke_kills_a_join_token_that_was_never_redeemed() {
+    // The scenario this protects against: a node is created, its join
+    // token goes out of band, and the token is found to have leaked
+    // before the machine ever registered. Revoking is the operator's
+    // only lever, and it has to actually close the door — redeeming the
+    // leaked token afterwards would otherwise hand out a bearer token
+    // AND clear `revoked` back to 0, putting the attacker on the mesh as
+    // a fully legitimate member.
+    let app = test_app();
+    let join_token = admin_create_node(&app.router, "neverjoined").await;
+
+    let req = raw_request("POST", "/admin/nodes/neverjoined/revoke", Some(&format!("Bearer {ADMIN}")));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({
+            "join_token": join_token,
+            "pubkey": pubkey_for("attacker"),
+            "listen_port": 51820,
+        }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a join token outstanding at revoke time must be dead afterwards"
+    );
+
+    // And the node must still be revoked, not resurrected.
+    let conn = app.state.db.conn.lock().await;
+    let row = wireserve_coordinator::db::nodes::find_by_name(&conn, "neverjoined")
+        .unwrap()
+        .unwrap();
+    assert!(row.revoked, "node must remain revoked");
+    assert!(row.pubkey.is_none(), "no pubkey may have been recorded");
+}
+
+#[tokio::test]
+async fn revoke_then_rejoin_still_lets_the_node_come_back() {
+    // The other half of the contract above: killing the outstanding
+    // token must not break spec §4.5's supported way back in.
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "comeback").await;
+    register_node(&app.router, &t1, "pk-comeback", 51820).await;
+
+    let req = raw_request("POST", "/admin/nodes/comeback/revoke", Some(&format!("Bearer {ADMIN}")));
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let req = raw_request("POST", "/admin/nodes/comeback/rejoin", Some(&format!("Bearer {ADMIN}")));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let new_token = body_json(resp).await["join_token"].as_str().unwrap().to_string();
+
+    let reg = register_node(&app.router, &new_token, "pk-comeback-2", 51820).await;
+    let bearer = reg["bearer_token"].as_str().unwrap();
+    let req = json_request("POST", "/poll", Some(bearer), json!({ "services": [] }));
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK,
+        "a rejoined node must be able to poll again"
+    );
+}
+
+// ---- Round-3: a kind=static node must never poll (spec §9) ----
+
+#[tokio::test]
+async fn static_node_is_refused_at_poll() {
+    let app = test_app();
+    let req = json_request(
+        "POST",
+        "/admin/nodes",
+        Some(ADMIN),
+        json!({ "name": "phone", "kind": "static" }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let join_token = body_json(resp).await["join_token"].as_str().unwrap().to_string();
+
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({
+            "join_token": join_token,
+            "pubkey": pubkey_for("pk-phone"),
+            "kind": "static",
+        }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bearer = body_json(resp).await["bearer_token"].as_str().unwrap().to_string();
+
+    // Spec §9: a static peer never polls. Nothing legitimately holds this
+    // token (export-config discards it), but the endpoint must not depend
+    // on that for the invariant "a static node's endpoint_addr is NULL".
+    let req = json_request(
+        "POST",
+        "/poll",
+        Some(&bearer),
+        json!({ "endpoint_addr": "1.2.3.4:51820", "services": [] }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let conn = app.state.db.conn.lock().await;
+    let row = wireserve_coordinator::db::nodes::find_by_name(&conn, "phone")
+        .unwrap()
+        .unwrap();
+    assert!(
+        row.endpoint_addr.is_none(),
+        "a refused poll must not have written an endpoint onto a static node"
+    );
+}

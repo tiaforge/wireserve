@@ -166,7 +166,8 @@ pub fn update_poll_state(
 }
 
 /// Revokes a node: clears its bearer token (so its very next `/poll` gets
-/// 401), marks it revoked, and removes its `services` rows.
+/// 401), invalidates any join token still outstanding, marks it revoked,
+/// and removes its `services` rows.
 ///
 /// The `services.node_id` foreign key is declared `ON DELETE CASCADE`
 /// (spec §3's DDL, kept verbatim), but that only fires when the *node row
@@ -177,12 +178,26 @@ pub fn update_poll_state(
 /// `db::nodes::tests::cascade_delete_removes_services_on_revoke`, whose
 /// name is now slightly misleading but is left as-is since it documents
 /// exactly this gotcha for the next reader.)
+///
+/// **`join_token_hash` is cleared too, and that is load-bearing, not
+/// tidiness.** Spec §4.4 lists only `bearer_token_hash` because it
+/// describes revoking a node that has already registered. But a node that
+/// was created and never registered still holds a live, unredeemed join
+/// token, and `apply_redemption` sets `revoked = 0` — so without this,
+/// revoking such a node would not actually cut it off: whoever holds that
+/// join token could redeem it afterwards and come back as a fully
+/// un-revoked member of the mesh. That is precisely the case revoke
+/// exists for (a credential issued out of band and then found to have
+/// leaked). Rejoin (§4.5) remains the supported way back in, and it
+/// issues a *fresh* token rather than reviving this one.
 pub fn revoke(conn: &Connection, node_id: i64) -> Result<(), DbError> {
-    // One transaction: a crash between the two statements must not leave
-    // a node revoked but its services still in the directory.
+    // One transaction: a crash between the statements must not leave a
+    // node revoked but its services still in the directory, or its join
+    // token still redeemable.
     let tx = conn.unchecked_transaction()?;
     tx.execute(
-        "UPDATE nodes SET revoked = 1, revoked_at = ?1, bearer_token_hash = NULL \
+        "UPDATE nodes SET revoked = 1, revoked_at = ?1, bearer_token_hash = NULL, \
+         join_token_hash = NULL, join_token_used = 1 \
          WHERE id = ?2",
         rusqlite::params![now_str(), node_id],
     )?;
@@ -385,6 +400,62 @@ mod tests {
         .unwrap();
         let row = find_by_name(&conn, "n1").unwrap().unwrap();
         assert!(!row.revoked, "successful re-registration clears revoked");
+    }
+
+    #[tokio::test]
+    async fn revoke_invalidates_an_outstanding_unredeemed_join_token() {
+        // The node was created but never registered, so it still holds a
+        // live join token. Revoking it must make that token dead — an
+        // un-redeemed token that survives revoke would let whoever holds
+        // it join afterwards, and `apply_redemption` would clear
+        // `revoked` back to 0 in the process.
+        let db = test_db();
+        let conn = db.conn.lock().await;
+        let id = create_node(&conn, "n1", NodeKind::Agent, "joinhash1").unwrap();
+        assert!(find_by_unused_join_token_hash(&conn, "joinhash1")
+            .unwrap()
+            .is_some());
+
+        revoke(&conn, id).unwrap();
+
+        assert!(
+            find_by_unused_join_token_hash(&conn, "joinhash1")
+                .unwrap()
+                .is_none(),
+            "a join token outstanding at revoke time must not stay redeemable"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejoin_after_revoke_still_issues_a_working_token() {
+        // The flip side of the test above: revoke must not break the
+        // supported way back in (spec §4.5). A fresh rejoin token is
+        // redeemable even though revoke killed the previous one.
+        let db = test_db();
+        let conn = db.conn.lock().await;
+        let id = create_node(&conn, "n1", NodeKind::Agent, "joinhash1").unwrap();
+        revoke(&conn, id).unwrap();
+
+        reissue_join_token(&conn, id, "joinhash2").unwrap();
+        assert!(find_by_unused_join_token_hash(&conn, "joinhash2")
+            .unwrap()
+            .is_some());
+
+        apply_redemption(
+            &conn,
+            id,
+            &Redemption {
+                pubkey: "pk1",
+                ip4: "100.90.0.1".parse().unwrap(),
+                ip6: "fd00:90::1".parse().unwrap(),
+                listen_port: Some(51820),
+                endpoint_addr: None,
+                bearer_token_hash: "bearerhash1",
+            },
+        )
+        .unwrap();
+        let row = find_by_name(&conn, "n1").unwrap().unwrap();
+        assert!(!row.revoked, "rejoin + register is still the way back in");
     }
 
     #[tokio::test]

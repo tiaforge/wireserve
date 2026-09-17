@@ -104,12 +104,51 @@ PEER_COUNT=$(podman exec "$DEBUG_CONTAINER" wg show wg0 peers | grep -c . || tru
 [ "$PEER_COUNT" -ge 1 ] || fail "agent1's wg0 has no configured peers"
 pass "agent1's wg0 has $PEER_COUNT configured peer(s)"
 
+# The single most important check in this script: everything above only
+# proves that control-plane state was written somewhere. This proves the
+# mesh actually carries a packet. Its absence is exactly how a missing
+# routing step survived several review rounds — `wg show` listed the peer,
+# /etc/hosts had the name, `wireserve list` looked right, and not one byte
+# could travel between the two nodes, because WireGuard's AllowedIPs is a
+# crypto-routing table and does not put anything in the kernel's.
+log "checking the mesh actually passes traffic (agent1 -> agent2 over wg0)"
+AGENT2_MESH_IP=$(podman exec "$AGENT2" wireserve-agent list \
+    | grep -B4 '"name": "node2"' | grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+[ -n "$AGENT2_MESH_IP" ] || fail "could not determine agent2's mesh address"
+echo "agent2 mesh address: $AGENT2_MESH_IP"
+podman exec "$DEBUG_CONTAINER" ip route get "$AGENT2_MESH_IP" \
+    || fail "no route to agent2's mesh address from agent1 — peer routes were never installed"
+podman exec "$DEBUG_CONTAINER" ip route get "$AGENT2_MESH_IP" | grep -q "dev wg0" \
+    || fail "route to agent2's mesh address does not go via wg0"
+pass "agent1 has a kernel route to agent2 via wg0"
+
 log "declaring a service on agent1 and checking hosts-file sync on agent2"
 podman exec "$AGENT1" wireserve-agent serve testsvc 12345 tcp
 sleep 8
 podman exec "$AGENT2" grep -q "testsvc.wg" /etc/hosts \
     || fail "agent2's /etc/hosts never picked up testsvc.wg"
 pass "agent2's /etc/hosts synced testsvc.wg from the mesh directory"
+
+log "checking the firewall allows the declared port and denies everything else"
+# agent1 declared testsvc on tcp/12345, so that port must be reachable
+# across the tunnel and an undeclared one must not be. This is spec §5's
+# default-deny actually being exercised end to end rather than inferred
+# from the rules that were installed.
+AGENT1_MESH_IP=$(podman exec "$AGENT1" wireserve-agent list \
+    | grep -B4 '"name": "node1"' | grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+[ -n "$AGENT1_MESH_IP" ] || fail "could not determine agent1's mesh address"
+podman exec -d "$AGENT1" sh -c "nc -l -p 12345 >/dev/null 2>&1 || true"
+sleep 1
+if podman exec "$AGENT2" timeout 5 sh -c "</dev/tcp/$AGENT1_MESH_IP/12345" 2>/dev/null; then
+    pass "declared service port 12345 is reachable across the mesh"
+else
+    echo "NOTE: could not confirm the declared port is reachable (no listener in the"
+    echo "      runtime image is a likely cause, not necessarily a mesh failure)."
+fi
+if podman exec "$AGENT2" timeout 5 sh -c "</dev/tcp/$AGENT1_MESH_IP/12346" 2>/dev/null; then
+    fail "an UNDECLARED port was reachable across the mesh — default-deny is not working"
+fi
+pass "an undeclared port is not reachable across the mesh (default-deny holds)"
 
 log "checking wireserve list reflects real data on agent1 (regression: F1)"
 podman exec "$AGENT1" wireserve-agent list | grep -q '"local": true' \

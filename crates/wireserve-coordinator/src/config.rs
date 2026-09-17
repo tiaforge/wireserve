@@ -28,7 +28,12 @@ pub enum ConfigError {
     Invalid(&'static str, String),
     #[error(
         "WIRESERVE_ADMIN_LISTEN_ADDR ({0}) is not loopback or a private-range address — the \
-         admin surface must never be reachable from an untrusted network (spec §4.0)"
+         admin surface must never be reachable from an untrusted network (spec §4.0). Note \
+         that 100.64.0.0/10 addresses (the carrier-grade-NAT range Tailscale and similar \
+         overlays hand out) are deliberately not accepted as private here: that range is \
+         also used by ISPs on real WAN links, so it cannot be treated as inherently \
+         internal. Bind this listener to loopback and reach it from inside the host \
+         instead."
     )]
     AdminListenerNotPrivate(SocketAddr),
 }
@@ -101,6 +106,52 @@ pub fn validate_admin_listener(addr: SocketAddr) -> Result<(), ConfigError> {
     }
 }
 
+/// The IPv4 carrier-grade-NAT range, RFC 6598. Tailscale allocates every
+/// node address it hands out from inside this block, and so do some ISPs
+/// on WAN links.
+const CGNAT_V4: (u32, u32) = (0x6440_0000, 10); // 100.64.0.0/10
+
+/// Whether a configured mesh CIDR overlaps `100.64.0.0/10`.
+///
+/// This is not a correctness problem for WireServe by itself — the mesh
+/// works fine on any range the operator picks — but it collides with
+/// whatever else on the host already claims that space. Tailscale is the
+/// common case: it routes all of `100.64.0.0/10` to its own interface, so
+/// a mesh address inside that block can end up resolving to a route
+/// pointing at `tailscale0` rather than `wg0`, and traffic meant for a
+/// WireServe peer leaves over the tailnet instead (or goes nowhere).
+///
+/// The project's default (`100.90.0.0/24`, which is what the spec's own
+/// examples use throughout) sits squarely inside it, so this warns rather
+/// than refuses: an operator who does not run any CGNAT-range overlay is
+/// perfectly fine on the default, and silently moving the default would
+/// break any deployment already addressed from it.
+#[must_use]
+pub fn v4_cidr_overlaps_cgnat(cidr: &str) -> bool {
+    let Some((addr_str, len_str)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(addr) = addr_str.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let Ok(len) = len_str.parse::<u32>() else {
+        return false;
+    };
+    if len > 32 {
+        return false;
+    }
+    let (cgnat_net, cgnat_len) = CGNAT_V4;
+    // Two prefixes overlap when either contains the other's network
+    // address, i.e. when they agree on the shorter of the two masks.
+    let shorter = len.min(cgnat_len);
+    let mask = if shorter == 0 {
+        0
+    } else {
+        u32::MAX << (32 - shorter)
+    };
+    (u32::from(addr) & mask) == (cgnat_net & mask)
+}
+
 pub fn is_loopback_or_private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
@@ -148,6 +199,29 @@ mod tests {
         assert!(validate_admin_listener(addr).is_ok());
         let addr: SocketAddr = "[fd00::1]:8081".parse().unwrap();
         assert!(validate_admin_listener(addr).is_ok());
+    }
+
+    #[test]
+    fn detects_overlap_with_the_tailscale_cgnat_range() {
+        // The project default is inside 100.64.0.0/10 — this is exactly
+        // the case the startup warning exists for.
+        assert!(v4_cidr_overlaps_cgnat("100.90.0.0/24"));
+        assert!(v4_cidr_overlaps_cgnat("100.64.0.0/10"));
+        assert!(v4_cidr_overlaps_cgnat("100.127.255.0/24"));
+        // A prefix shorter than /10 that contains it still overlaps.
+        assert!(v4_cidr_overlaps_cgnat("100.0.0.0/8"));
+    }
+
+    #[test]
+    fn does_not_flag_ranges_outside_cgnat() {
+        assert!(!v4_cidr_overlaps_cgnat("10.90.0.0/24"));
+        assert!(!v4_cidr_overlaps_cgnat("192.168.90.0/24"));
+        assert!(!v4_cidr_overlaps_cgnat("172.20.0.0/16"));
+        // 100.128.0.0 is the first address past the top of the range.
+        assert!(!v4_cidr_overlaps_cgnat("100.128.0.0/24"));
+        // 100.63.255.0 is the last address below it.
+        assert!(!v4_cidr_overlaps_cgnat("100.63.255.0/24"));
+        assert!(!v4_cidr_overlaps_cgnat("garbage"));
     }
 
     #[test]

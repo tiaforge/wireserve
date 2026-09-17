@@ -8,18 +8,22 @@ this checklist lives in the session that created it — this file is the
 source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
-**Currently working on:** nothing open — all milestones complete, including
-the independent security review remediation (M7), its follow-ups (M8
-closing every partial S/F item, M9 the remaining "fix now" items, M10 the
-rest of the review's list), and a real, reproducible end-to-end test
-(`deploy/e2e/run-e2e-test.sh`). 187 tests passing across
+**Currently working on:** nothing open — all milestones complete through
+M11 (security review round 3). 198 tests passing across
 `cargo test --workspace` (agent tested with `--no-default-features`
-locally; the real `nftables` feature is exercised by the E2E script's own
-container builds). M8–M10 are covered by unit/integration tests plus a
-containerized type-check of the `nftables` backend — the E2E script was
-not re-run for them, so the next E2E run is the first live exercise of
-the F1 shared-state refactor, `Network=host`, the RELATED conntrack rule,
-`block_in_place` around reconciliation, and the SIGTERM handler.
+locally; the real `nftables` feature is type-checked in a container).
+
+**The next E2E run matters more than usual.** M11 fixed a bug that meant
+the mesh never carried traffic at all (R1 below), and the reason it
+survived three review rounds is that `deploy/e2e/run-e2e-test.sh` only
+ever checked control-plane state — `wg show` output, `/etc/hosts`
+contents, `wireserve list` — and never once sent a packet between the two
+agents. The script now has a data-plane check and a default-deny check,
+but neither has been run yet. Everything from M8 onward is still awaiting
+its first live exercise: the F1 shared-state refactor, `Network=host`,
+the RELATED conntrack rule, `block_in_place` around reconciliation, the
+SIGTERM handler, and now M11's peer routing, interface-adoption guard and
+firewall ordering.
 
 ## Milestones
 
@@ -217,6 +221,89 @@ the F1 shared-state refactor, `Network=host`, the RELATED conntrack rule,
         hosts-path branch is gone (dead code on a platform the crate
         cannot build for); the poll loop's netlink/DNS/file steps run
         under `block_in_place` so the IPC server stays responsive.
+
+- [x] **M11 — Security review, round 3.** A fresh full-codebase review,
+      reading the actual dependency sources rather than trusting their
+      names. 198 tests, clippy clean. Found one critical functional bug,
+      two high-severity items, and a handful of smaller ones. The E2E
+      script was not re-run (it gained new checks that need it).
+      - **R1 (critical, functional) — the mesh never carried traffic.**
+        The agent configured WireGuard peers and never installed a single
+        kernel route. `AllowedIPs` is WireGuard's *cryptographic*
+        routing table: it decides which peer an inbound packet belongs
+        to, and puts nothing in the host's routing table. The interface's
+        own address is assigned as a `/32` + `/128`, which creates a
+        local route for this node alone, so there was no route toward any
+        other member of the mesh — `plex.wg` resolved fine and then
+        failed to connect. `wg-quick` does this step from `AllowedIPs`;
+        this agent has to too. Fixed by calling
+        `configure_peer_routing` when the peer set changes, which adds
+        exactly one host route per peer (never a default route, since
+        every peer's `AllowedIPs` is its own `/32` + `/128`). See
+        decisions log #45.
+      - **R2 (high, security) — `revoke` did not invalidate an
+        outstanding join token.** `revoke` cleared `bearer_token_hash`
+        but left `join_token_hash` redeemable, and `apply_redemption`
+        sets `revoked = 0`. So revoking a node that had been created but
+        not yet registered did not cut it off: whoever held the join
+        token could redeem it afterwards and land on the mesh as a fully
+        un-revoked member. That is exactly the case revoke exists for —
+        a credential issued out of band and then found to have leaked.
+        Now cleared in the same transaction; rejoin (§4.5) remains the
+        way back in and issues a fresh token.
+      - **R3 (high, operational) — the agent silently destroyed a
+        pre-existing `wg0`.** `create_interface` treats `EEXIST` as
+        success, and `configure_interface` then flushes every address
+        from the interface, overwrites its private key and listen port,
+        and sends WireGuard's `ReplacePeers` flag. On a host already
+        running a `wg-quick`-managed `wg0` — a common way to reach a
+        machine remotely — starting the daemon tore that tunnel down
+        without a word, and `leave` deleted the interface outright. The
+        agent now refuses to adopt an interface whose private key is not
+        its own, naming `--ifname` in the error.
+      - **R4 (medium, functional) — more than 64 `serve` calls wedged the
+        agent permanently.** `MAX_SERVICES_PER_NODE` was enforced only at
+        the coordinator, which returns a plain `400` with no
+        `conflicting_service` field, so the agent could not quarantine
+        anything: the oversized list was persisted, resent verbatim every
+        cycle, and every future poll failed with it — no peer
+        reconciliation, no firewall updates, no hosts sync. The same
+        wedge shape F3 was reworked to eliminate. The constant moved to
+        `wireserve-types` and `serve` now enforces it locally.
+      - **R5 (medium, deployment) — the default mesh range overlaps
+        Tailscale.** `100.90.0.0/24` sits inside `100.64.0.0/10`, the
+        CGNAT block Tailscale allocates every address from. A host
+        running both has an overlay route covering the whole `/10`, so
+        mesh traffic can leave over the wrong interface. The default is
+        unchanged (it is what the spec's own examples use throughout, and
+        moving it would strand any deployment already addressed from it),
+        but the coordinator now warns at startup when the configured
+        range overlaps, and the README says what to set instead.
+      - **R6 (low) — a database error during bearer auth was billed as a
+        failed credential guess.** `find_by_bearer_hash(..).ok().flatten()`
+        turned any DB error into `401` + `record_failure`, so a transient
+        storage fault would rate-limit legitimately-polling nodes off the
+        mesh while the real error stayed out of the logs. Now a distinct
+        `500`, logged, and never charged to the caller's budget.
+      - **R7 (low) — default-deny was installed after the interface came
+        up.** Reordered to strictly before `bring_up`. The old order was
+        not exploitable (a freshly configured interface has no peers, so
+        the kernel drops everything inbound anyway), but that is a
+        property of WireGuard rather than the guarantee §5 asks for.
+      - **R8 (low) — `atomic_write` followed a symlink at the temp
+        path** (`create` rather than `create_new`), and `AgentState::save`
+        left the directory holding the key material at the umask default.
+        Both now hardened; not exploitable under the shipped deployments,
+        where the directories are root-owned, but this code should not be
+        the part relying on that.
+      - **Test coverage**: `deploy/e2e/run-e2e-test.sh` gained the two
+        checks whose absence let R1 survive — a real route/connectivity
+        check between the two agents, and a default-deny check that an
+        undeclared port is refused across the tunnel.
+      - **Reported, deliberately not fixed**: peer endpoint DNS
+        resolution is serial and blocking on every cycle (decisions log
+        #46), and a quarantined service is never retried automatically
+        (#47).
 
 Security-sensitive paths (tokens, auth, firewall default-deny, file
 permissions) get test coverage inline with each milestone that introduces
@@ -531,3 +618,78 @@ or would have regressed something already verified working.
     once, then stop (rather than keep polling with a torn-down
     interface) — an operator re-runs `join` with a fresh token from
     `wireserve-admin rejoin` to come back.
+
+## M11 — security review round 3
+
+A third review, this time reading the actual source of `defguard_wireguard_rs`
+and `rustables` rather than reasoning from their API names. That is what
+turned up #45 — a bug that no amount of reading this project's own code
+would have revealed, because the code looks correct right up until you know
+what the library does and does not do on your behalf.
+
+45. **Peer routing was missing entirely — the mesh carried no traffic.**
+    The agent called `configure_peer` for each peer and stopped there.
+    WireGuard's `AllowedIPs` is a *cryptographic* routing table: it decides
+    which peer an inbound packet is allowed to have come from, and which
+    peer an outbound packet gets encrypted to, once the packet has already
+    been handed to the interface. It does not create a single entry in the
+    kernel's routing table. The interface's own address is assigned via
+    `IpAddrMask::host`, i.e. a `/32` and a `/128`, which gives a local
+    route for this node and nothing pointing at any other node. So every
+    piece of visible state was correct — `wg show wg0 peers` listed the
+    peers, `/etc/hosts` had `plex.wg`, `wireserve list` showed the
+    directory — and a connection to `plex.wg` got `ENETUNREACH`, or worse,
+    on a host running an overlay that claims the surrounding range, was
+    handed to that overlay's interface instead. Fixed by calling
+    `configure_peer_routing` whenever the peer set changes. Deliberately
+    not on every cycle: adding an existing route just logs a warning
+    inside the library, and keeping it off the steady-state path preserves
+    what F6 was about. The library's `add_peer_routing` has a special
+    branch for a peer carrying `0.0.0.0/0` that rewrites the default route
+    and installs policy-routing rules — it cannot trigger here, because
+    every peer's `AllowedIPs` is its own `/32` + `/128` by construction
+    (`peer_allowed_ips`), which is the same property spec §9 requires of
+    exported static-peer configs for its own reasons.
+
+    **Why three review rounds missed it**: `deploy/e2e/run-e2e-test.sh`
+    asserted on control-plane state only and never sent a packet between
+    the two agents. A test that checks `wg show` lists a peer is testing
+    that configuration was accepted, not that anything works. The script
+    now checks for a route via `wg0` and that an undeclared port is
+    refused across the tunnel.
+
+46. **Peer endpoint DNS resolution is serial and blocking on every cycle —
+    reported, not fixed.** `desired_peers` calls `Peer::set_endpoint` for
+    every peer on every poll, which resolves the hostname synchronously.
+    A directory full of slow-resolving names makes a poll cycle take
+    proportionally longer; it runs inside `block_in_place`, so the IPC
+    server stays responsive and the runtime is never starved, but the
+    cycle itself stalls. The obvious fix — only re-resolve when the
+    endpoint *string* changed — is wrong for this design: spec §4.2
+    explicitly wants a dynamic-DNS endpoint to be re-resolved so a peer
+    that moved is found again, and caching by string defeats exactly that.
+    A proper fix is an async resolver with a TTL-aware cache, which is
+    more machinery than the problem currently justifies. Left as a known
+    characteristic rather than papered over.
+
+47. **A quarantined service is never retried — reported, not fixed.** F3's
+    quarantine drops a colliding declaration and records why, and the only
+    way out is the operator running `serve` for that name again (which
+    clears the record). If the other node withdraws the colliding name,
+    this node does not notice and does not reclaim it. Automatic retry
+    would mean re-sending a declaration the coordinator already rejected,
+    on some backoff, which reintroduces a weaker version of the wedge F3
+    removed. `wireserve list` showing the rejection with its reason is the
+    intended recovery path, and that is a documented limitation rather
+    than an oversight.
+
+48. **`kind=static` nodes are now refused at `/poll`.** Spec §9 says a
+    static peer never polls, and §4.2 that its `endpoint_addr` stays NULL
+    forever. Neither was enforced: `update_poll_state` would have written
+    an endpoint onto a static node, and every exported `.conf` afterwards
+    would carry an `Endpoint =` line for a device that is only ever meant
+    to initiate. In practice nothing could reach that code — `export-config`
+    generates the static node's bearer token during registration and drops
+    it without printing or storing it anywhere — but an invariant that
+    holds only because a value happens to be unreachable is not enforced,
+    it is lucky.

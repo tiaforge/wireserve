@@ -8,12 +8,12 @@ use crate::directory;
 use crate::error::AppError;
 use crate::state::AppState;
 
-/// Upper bound on services one node may declare. Every declared service is
-/// fanned out to every other node's `/poll` response and hosts file on
-/// every cycle, so without a cap a single node could bloat the whole
-/// mesh's directory at will. Generous for the "a few services per box"
-/// shape this project is for.
-pub const MAX_SERVICES_PER_NODE: usize = 64;
+/// Re-exported from `wireserve-types`, which is where the number now
+/// lives so the agent can enforce the identical limit locally before it
+/// ever queues a declaration the coordinator would reject. See that
+/// constant's own doc comment for why a coordinator-only limit was a
+/// wedge waiting to happen.
+pub use wireserve_types::MAX_SERVICES_PER_NODE;
 
 /// `POST /poll` (spec §4.3): the agent's single call that both reports its
 /// own state and pulls the current mesh + service directory.
@@ -22,6 +22,23 @@ pub async fn poll(
     BearerNode { node }: BearerNode,
     Json(req): Json<PollRequest>,
 ) -> Result<Json<PollResponse>, AppError> {
+    // Spec §9: a `kind=static` node "never polls" and its `endpoint_addr`
+    // "stays NULL forever" — it is a consumer-only device running an
+    // official WireGuard client, with no agent to do the polling. Nothing
+    // legitimately reaches this line with a static node's bearer token:
+    // `export-config` generates that token during registration and drops
+    // it on the floor without ever printing or storing it. Enforce the
+    // invariant anyway rather than leave it resting on that accident,
+    // since `update_poll_state` below would otherwise happily write an
+    // `endpoint_addr` onto a static node and every exported `.conf`
+    // afterwards would carry an `Endpoint =` line for a peer that is
+    // never meant to be dialed into.
+    if node.kind == wireserve_types::NodeKind::Static {
+        return Err(AppError::Forbidden(
+            "this node is registered as kind=static, which never polls (spec §9)".into(),
+        ));
+    }
+
     if req.services.len() > MAX_SERVICES_PER_NODE {
         return Err(AppError::BadRequest(format!(
             "too many services declared ({}); the limit is {MAX_SERVICES_PER_NODE} per node",

@@ -12,6 +12,23 @@ use defguard_wireguard_rs::peer::Peer;
 use defguard_wireguard_rs::{InterfaceConfiguration, Kernel, WGApi, WireguardInterfaceApi};
 use wireserve_types::PeerInfo;
 
+/// Why `bring_up` can fail before it has touched anything.
+#[derive(Debug, thiserror::Error)]
+pub enum BringUpError {
+    #[error(transparent)]
+    Wg(#[from] WireguardInterfaceError),
+    #[error(
+        "refusing to take over the existing network interface '{ifname}': {reason}. \
+         Bringing up the agent on an interface it did not create would flush that \
+         interface's addresses, overwrite its private key and listen port, and remove \
+         every peer configured on it — silently destroying whatever tunnel is currently \
+         using that name, which may well be how this machine is reached. Start the agent \
+         with `--ifname <name>` pointing at an unused name, or remove the existing \
+         interface first if it really is disposable"
+    )]
+    InterfaceConflict { ifname: String, reason: String },
+}
+
 /// A WireGuard peer's own `/32` + `/128` `AllowedIPs` — never a shared
 /// subnet block, so every peer only ever routes to itself on this
 /// interface (same non-overlapping-`AllowedIPs` reasoning as spec §9's
@@ -104,15 +121,71 @@ impl WgInterface {
         })
     }
 
+    /// Whether a network interface with this name already exists on the
+    /// host, WireGuard or otherwise. Read straight from sysfs rather than
+    /// inferred from a netlink error, because the distinction that
+    /// matters here ("something already owns this name") is not one the
+    /// WireGuard API reports cleanly: `create_interface` deliberately
+    /// treats `EEXIST` as success so that restarts are idempotent.
+    fn interface_exists(ifname: &str) -> bool {
+        std::path::Path::new("/sys/class/net").join(ifname).exists()
+    }
+
     /// Creates the interface and applies this node's own identity. Must be
     /// called once at daemon startup before any peer reconciliation.
+    ///
+    /// **Refuses to adopt an interface this agent did not create.** The
+    /// underlying library is idempotent to a fault: `create_interface`
+    /// swallows `EEXIST`, and `configure_interface` then flushes every
+    /// address from the interface, overwrites its private key and listen
+    /// port, and sends the WireGuard `ReplacePeers` flag, which removes
+    /// all of its existing peers. On a host that already has a `wg0` —
+    /// the default name `wg-quick` uses, and a common way to reach a
+    /// machine remotely — starting this daemon would therefore tear down
+    /// that tunnel without a word. So: if the name is already taken, it
+    /// is only reused when the interface is a readable WireGuard device
+    /// whose private key is the one in this node's own state, i.e. it is
+    /// this agent's own interface from a previous run.
     pub fn bring_up(
         &mut self,
         private_key_b64: &str,
         ip4: Ipv4Addr,
         ip6: Ipv6Addr,
         listen_port: u16,
-    ) -> Result<(), WireguardInterfaceError> {
+    ) -> Result<(), BringUpError> {
+        if Self::interface_exists(&self.ifname) {
+            match self.api.read_interface_data() {
+                Ok(host) => {
+                    let ours = Key::try_from(private_key_b64).ok();
+                    let matches = match (&host.private_key, &ours) {
+                        (Some(existing), Some(ours)) => existing == ours,
+                        _ => false,
+                    };
+                    if !matches {
+                        return Err(BringUpError::InterfaceConflict {
+                            ifname: self.ifname.clone(),
+                            reason: "it is a WireGuard interface configured with a different \
+                                     private key, so it belongs to another tunnel"
+                                .to_string(),
+                        });
+                    }
+                    tracing::info!(
+                        ifname = %self.ifname,
+                        "reusing this agent's own existing WireGuard interface"
+                    );
+                }
+                Err(err) => {
+                    return Err(BringUpError::InterfaceConflict {
+                        ifname: self.ifname.clone(),
+                        reason: format!(
+                            "an interface with that name exists but its WireGuard \
+                             configuration could not be read ({err})"
+                        ),
+                    });
+                }
+            }
+        }
+
         self.api.create_interface()?;
         let config = InterfaceConfiguration {
             name: self.ifname.clone(),
@@ -126,7 +199,8 @@ impl WgInterface {
             mtu: None,
             fwmark: None,
         };
-        self.api.configure_interface(&config)
+        self.api.configure_interface(&config)?;
+        Ok(())
     }
 
     /// Reconciles the kernel peer set to exactly `peers` (minus `self`).
@@ -152,11 +226,43 @@ impl WgInterface {
     ) -> Result<(), WireguardInterfaceError> {
         let desired = desired_peers(peers, self_pubkey);
 
-        for key in peers_to_remove(self.applied.keys(), &desired) {
-            self.api.remove_peer(&key)?;
+        let to_remove = peers_to_remove(self.applied.keys(), &desired);
+        for key in &to_remove {
+            self.api.remove_peer(key)?;
         }
-        for peer in peers_to_configure(&self.applied, &desired) {
+        let to_configure: Vec<Peer> = peers_to_configure(&self.applied, &desired)
+            .into_iter()
+            .cloned()
+            .collect();
+        for peer in &to_configure {
             self.api.configure_peer(peer)?;
+        }
+
+        // Install a route for every peer's address.
+        //
+        // WireGuard's `AllowedIPs` is a cryptographic routing table, not a
+        // kernel one: it decides which peer a packet belongs to once the
+        // packet has already been handed to the interface. It does not put
+        // anything in the host's routing table, so without this step
+        // nothing ever sends a packet to `wg0` in the first place. The
+        // interface's own address is assigned as a `/32` (plus a `/128`),
+        // which creates a local route for this node alone and no route at
+        // all towards the other members of the mesh — so `plex.wg`
+        // resolving to a peer's address would still fail to connect, and
+        // on a host running an overlay that claims the surrounding range
+        // (Tailscale and `100.64.0.0/10`, say) the packet would be handed
+        // to *that* interface instead. `wg-quick` does this same step from
+        // `AllowedIPs` and it has to happen here too.
+        //
+        // Only run when the peer set actually changed, to keep it off the
+        // steady-state path: every peer's `AllowedIPs` here is its own
+        // `/32` + `/128`, never a default route, so this adds exactly one
+        // host route per peer and never touches the default route or the
+        // policy-routing rules that `configure_peer_routing` would set up
+        // for a `0.0.0.0/0` peer.
+        if !to_remove.is_empty() || !to_configure.is_empty() {
+            let all: Vec<Peer> = desired.values().cloned().collect();
+            self.api.configure_peer_routing(&all)?;
         }
 
         self.applied = desired;

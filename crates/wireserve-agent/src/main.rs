@@ -147,7 +147,6 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
     let ip6: std::net::Ipv6Addr = state.ip6.clone().unwrap_or_default().parse()?;
     let listen_port = state.listen_port.unwrap_or(51820);
     let private_key = state.private_key.clone().unwrap_or_default();
-    wg.bring_up(&private_key, ip4, ip6, listen_port)?;
 
     #[cfg(all(feature = "nftables", target_os = "linux"))]
     let mut fw = firewall::nftables::NftablesBackend::new(ifname.clone());
@@ -157,7 +156,20 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
     // Spec §5: teardown-then-deny-all must run before the first successful
     // apply() from a poll response — the interface must never come up
     // permissive-by-default.
+    //
+    // Ordered strictly before `bring_up`, not merely before the first
+    // poll. The rules are matched on the interface *name*
+    // (`meta iifname`), which nftables is happy to accept for a name that
+    // does not exist yet, so there is no reason to let the interface
+    // exist for even an instant without its default-deny in place. The
+    // previous order happened to be safe — a freshly configured
+    // interface has no peers, so the kernel drops everything inbound
+    // anyway — but that is a property of WireGuard's own behaviour rather
+    // than of the guarantee spec §5 asks for, and it would quietly stop
+    // holding if bring-up ever restored a peer set.
     firewall::startup_sequence(&mut fw).map_err(|e| e.to_string())?;
+
+    wg.bring_up(&private_key, ip4, ip6, listen_port)?;
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
     // F1 (security review, round 2): exactly ONE in-memory copy of the

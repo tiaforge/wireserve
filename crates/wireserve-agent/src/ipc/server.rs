@@ -98,6 +98,30 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
                 return (IpcResponse::error("port must be 1-65535"), false);
             }
             let mut state = ctx.state.lock().await;
+            // Enforce the coordinator's own per-node limit here too, on
+            // the count this declaration would produce. A limit checked
+            // only at the coordinator is not a limit, it is a trap: the
+            // over-long list is persisted locally and resent verbatim on
+            // every cycle, so every future poll fails with the same 400
+            // and the agent stops reconciling peers, firewall rules and
+            // hosts entries entirely — the exact wedge the 409
+            // service-collision path was reworked to avoid, but with no
+            // way for the agent to tell which declaration to drop.
+            // Refusing the 65th `serve` locally costs the operator one
+            // clear error message instead.
+            let would_be_new = !state.declared_services.iter().any(|d| d.name == name);
+            if would_be_new && state.declared_services.len() >= wireserve_types::MAX_SERVICES_PER_NODE
+            {
+                return (
+                    IpcResponse::error(format!(
+                        "this node already declares {} services, which is the limit \
+                         ({}); withdraw one with `wireserve-agent unserve <name>` first",
+                        state.declared_services.len(),
+                        wireserve_types::MAX_SERVICES_PER_NODE
+                    )),
+                    false,
+                );
+            }
             state.declared_services.retain(|d| d.name != name);
             // A fresh `serve` for a previously-rejected name deserves a
             // clean retry, not a stale "rejected" annotation hanging
@@ -341,6 +365,91 @@ mod tests {
         let resp: IpcResponse = serde_json::from_slice(&buf[..n]).unwrap();
         assert!(matches!(resp, IpcResponse::Error { .. }));
         assert!(ctx.state.lock().await.declared_services.is_empty());
+    }
+
+    #[tokio::test]
+    async fn serve_refuses_to_exceed_the_coordinators_per_node_service_limit() {
+        // Going over the limit locally would be persisted and resent on
+        // every poll, and the coordinator's 400 carries no
+        // `conflicting_service` field for the agent to quarantine — so
+        // every subsequent cycle would fail identically and the agent
+        // would stop reconciling anything at all.
+        let (ctx, _dir, _rx) = test_ctx();
+        {
+            let mut state = ctx.state.lock().await;
+            for i in 0..wireserve_types::MAX_SERVICES_PER_NODE {
+                state.declared_services.push(ServiceDecl {
+                    name: format!("svc-{i}"),
+                    port: 1000,
+                    proto: wireserve_types::Proto::Tcp,
+                });
+            }
+        }
+
+        let (mut client, server) = tokio::io::duplex(8192);
+        let ctx2 = ctx.clone();
+        tokio::spawn(async move { handle_connection(&ctx2, server).await });
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        client
+            .write_all(b"{\"op\":\"serve\",\"name\":\"one-too-many\",\"port\":1,\"proto\":\"tcp\"}\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = client.read(&mut buf).await.unwrap();
+        let resp: IpcResponse = serde_json::from_slice(&buf[..n]).unwrap();
+        assert!(matches!(resp, IpcResponse::Error { .. }));
+
+        let state = ctx.state.lock().await;
+        assert_eq!(
+            state.declared_services.len(),
+            wireserve_types::MAX_SERVICES_PER_NODE
+        );
+        assert!(!state.declared_services.iter().any(|d| d.name == "one-too-many"));
+    }
+
+    #[tokio::test]
+    async fn serve_can_still_update_an_existing_service_when_at_the_limit() {
+        // Re-declaring a name already present replaces it rather than
+        // growing the list, so it must not be refused at the limit.
+        let (ctx, _dir, _rx) = test_ctx();
+        {
+            let mut state = ctx.state.lock().await;
+            for i in 0..wireserve_types::MAX_SERVICES_PER_NODE {
+                state.declared_services.push(ServiceDecl {
+                    name: format!("svc-{i}"),
+                    port: 1000,
+                    proto: wireserve_types::Proto::Tcp,
+                });
+            }
+        }
+
+        let (mut client, server) = tokio::io::duplex(8192);
+        let ctx2 = ctx.clone();
+        tokio::spawn(async move { handle_connection(&ctx2, server).await });
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        client
+            .write_all(b"{\"op\":\"serve\",\"name\":\"svc-0\",\"port\":2000,\"proto\":\"tcp\"}\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = client.read(&mut buf).await.unwrap();
+        let resp: IpcResponse = serde_json::from_slice(&buf[..n]).unwrap();
+        assert!(matches!(resp, IpcResponse::Ok));
+
+        let state = ctx.state.lock().await;
+        assert_eq!(
+            state.declared_services.len(),
+            wireserve_types::MAX_SERVICES_PER_NODE
+        );
+        assert_eq!(
+            state
+                .declared_services
+                .iter()
+                .find(|d| d.name == "svc-0")
+                .unwrap()
+                .port,
+            2000
+        );
     }
 
     #[tokio::test]

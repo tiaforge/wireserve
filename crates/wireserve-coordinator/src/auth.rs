@@ -20,6 +20,14 @@ use crate::state::AppState;
 pub enum AuthError {
     Unauthorized,
     RateLimited,
+    /// The token could not be checked at all (the database errored), as
+    /// opposed to being checked and found wrong. Kept distinct so a
+    /// transient storage failure is not laundered into "your credential
+    /// is bad": reporting 401 there would burn the caller's
+    /// failed-attempt budget for something it did not do, and a handful
+    /// of such cycles would rate-limit every legitimately-polling node
+    /// off the mesh while the real fault stayed invisible in the logs.
+    Internal,
 }
 
 impl IntoResponse for AuthError {
@@ -33,6 +41,11 @@ impl IntoResponse for AuthError {
             AuthError::RateLimited => (
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(wireserve_types::ErrorBody::new("too many requests")),
+            )
+                .into_response(),
+            AuthError::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(wireserve_types::ErrorBody::new("internal error")),
             )
                 .into_response(),
         }
@@ -139,11 +152,17 @@ impl FromRequestParts<AppState> for BearerNode {
         };
         let hash = hash_token(candidate);
         let conn = state.db.conn.lock().await;
-        let node = crate::db::nodes::find_by_bearer_hash(&conn, &hash).ok().flatten();
+        let looked_up = crate::db::nodes::find_by_bearer_hash(&conn, &hash);
         drop(conn);
-        match node {
-            Some(node) => Ok(BearerNode { node }),
-            None => Err(record_failed_auth(state, parts)),
+        match looked_up {
+            Ok(Some(node)) => Ok(BearerNode { node }),
+            Ok(None) => Err(record_failed_auth(state, parts)),
+            Err(err) => {
+                // Distinguish "checked, and wrong" from "could not
+                // check" — see `AuthError::Internal`.
+                tracing::error!(error = %err, "bearer token lookup failed");
+                Err(AuthError::Internal)
+            }
         }
     }
 }

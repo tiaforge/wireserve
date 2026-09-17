@@ -75,6 +75,25 @@ pub struct RegisterResponse {
 
 // ---- §4.3 Node: poll ----
 
+/// Upper bound on the services a single node may declare (spec §4.3 puts
+/// no limit on the array; this is this project's own cap). Every declared
+/// service is fanned out to every other node's `/poll` response and hosts
+/// file on every cycle, so without a cap one node could bloat the whole
+/// mesh's directory at will.
+///
+/// **Lives here, not in the coordinator**, for the same reason
+/// `is_valid_dns_label` does (spec §3: one definition, called from every
+/// place that needs it). The agent enforces the identical limit locally
+/// when `serve` queues a declaration: a limit enforced *only* at the
+/// coordinator turns an over-eager operator into a permanently wedged
+/// agent, because the rejected batch is resent verbatim every cycle and
+/// the whole poll — peer reconciliation included — fails with it. That is
+/// the same failure shape as the service-name collision handled by
+/// `ErrorBody::conflicting_service`, and the cheapest fix is for both
+/// sides to agree on the number up front.
+pub const MAX_SERVICES_PER_NODE: usize = 64;
+
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceDecl {
     pub name: String,
