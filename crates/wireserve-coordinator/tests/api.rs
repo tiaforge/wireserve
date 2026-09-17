@@ -1194,3 +1194,48 @@ async fn proxy_misconfiguration_still_suppresses_a_useless_endpoint() {
         "the proxy's own address must never be recorded as a node's endpoint"
     );
 }
+
+// ---- Request body cap ----
+
+#[tokio::test]
+async fn an_oversized_request_body_is_refused_before_it_is_parsed() {
+    // /register is unauthenticated, so the cheapest request an anonymous
+    // caller can send should not be the most expensive one to serve.
+    let app = test_app();
+    let huge = "a".repeat(wireserve_coordinator::routes::MAX_REQUEST_BODY_BYTES + 1);
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/register")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "join_token": huge, "pubkey": pubkey_for("x"), "listen_port": 51820 })
+                .to_string(),
+        ))
+        .unwrap();
+    let peer: SocketAddr = format!("{PEER_IP}:12345").parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(peer));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn a_full_size_legitimate_poll_is_still_accepted() {
+    // The cap has to sit comfortably above the largest real body, which
+    // is a poll declaring the maximum number of services.
+    let app = test_app();
+    let join = admin_create_node(&app.router, "busy").await;
+    let reg = register_node(&app.router, &join, "pk-busy", 51820).await;
+    let bearer = reg["bearer_token"].as_str().unwrap();
+
+    let services: Vec<Value> = (0..wireserve_types::MAX_SERVICES_PER_NODE)
+        .map(|i| json!({ "name": format!("service-number-{i}"), "port": 1000 + i, "proto": "tcp" }))
+        .collect();
+    let req = json_request(
+        "POST",
+        "/poll",
+        Some(bearer),
+        json!({ "endpoint_addr": "192.0.2.1:51820", "services": services }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

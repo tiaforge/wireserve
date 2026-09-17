@@ -42,22 +42,27 @@ impl Db {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
         let path = path.as_ref();
         let mut conn = Connection::open(path)?;
+        // Hardened here, BEFORE anything writes, rather than at the end.
+        // SQLite creates the `-wal` and `-shm` sidecars with whatever
+        // permissions the main database file has at the moment it makes
+        // them, and those sidecars hold the same rows the database does.
+        // Tightening the main file afterwards would leave them at the
+        // umask default.
+        #[cfg(unix)]
+        harden_file_permissions(path)?;
         // Must be set per-connection, not inside a migration (SQLite does
         // not enforce foreign keys by default, and rusqlite_migration's own
         // docs warn PRAGMA statements inside migrations aren't applied
         // consistently).
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        set_write_mode(&conn)?;
         run_migrations(&mut conn)?;
-        // Milestone 5 hardening pass: the DB holds hashed (not plaintext)
-        // tokens by design (§3), but it's still node metadata — pubkeys,
-        // IPs, hashed credentials — worth keeping off-limits to other
-        // local users as a second layer, the same instinct as §7's
-        // mode-600 requirement for the agent's own local state files
-        // (which the spec states explicitly; this one is this project's
-        // own added precaution, not spec-mandated, since §7's file-mode
-        // bullet is scoped to "the node's own disk," i.e. the agent side).
+        // The sidecars are created during the migration above, so they
+        // are swept once more here for the case where the main file
+        // already existed at looser permissions before this process
+        // opened it.
         #[cfg(unix)]
-        harden_file_permissions(path)?;
+        harden_sidecars(path)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -89,6 +94,38 @@ fn run_migrations(conn: &mut Connection) -> Result<(), DbError> {
     Ok(())
 }
 
+/// Write-ahead logging, plus the `synchronous` setting that normally
+/// accompanies it.
+///
+/// Every `/poll` writes (`last_seen` at minimum), and in SQLite's default
+/// rollback journal at `synchronous=FULL` each of those transactions
+/// costs several fsyncs. That work happens while holding the single
+/// connection's mutex, so it is also exactly the window during which no
+/// other request can be served. WAL turns it into an append and lets a
+/// reader proceed against the last committed snapshot while a write is in
+/// flight.
+///
+/// `synchronous=NORMAL` is the standard pairing and the reason it is safe
+/// here: in WAL mode it still guarantees consistency across an
+/// application crash, and gives up only durability of the most recent
+/// transactions in a power loss or kernel panic. The most recent
+/// transaction on this database is a node's `last_seen` timestamp, which
+/// the next poll rewrites within seconds anyway.
+///
+/// Neither pragma is load-bearing for correctness, and neither is a fix
+/// for a bottleneck anyone reaches legitimately — a poll-shaped
+/// transaction measured about 0.05ms before this change. It shortens the
+/// critical section on hardware where fsync is honest, which is where the
+/// default would actually hurt.
+fn set_write_mode(conn: &Connection) -> Result<(), DbError> {
+    // `PRAGMA journal_mode` returns a row, so it cannot go through
+    // `execute_batch`. An in-memory database cannot use WAL and answers
+    // "memory" instead; that is expected and not an error.
+    let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+    conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn harden_file_permissions(path: &Path) -> Result<(), DbError> {
     use std::os::unix::fs::PermissionsExt;
@@ -96,9 +133,25 @@ fn harden_file_permissions(path: &Path) -> Result<(), DbError> {
     Ok(())
 }
 
+/// The `-wal` and `-shm` files hold the same data the database does and
+/// must not be left readable by other local users.
+#[cfg(unix)]
+fn harden_sidecars(path: &Path) -> Result<(), DbError> {
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = std::path::PathBuf::from(sidecar);
+        if sidecar.exists() {
+            harden_file_permissions(&sidecar)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wireserve_types::NodeKind;
 
     #[cfg(unix)]
     #[test]
@@ -116,5 +169,49 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "coordinator DB file must be hardened to mode 600 on open");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_sidecar_files_are_also_mode_600() {
+        // The -wal file holds the same rows the database does, so it is
+        // exactly as sensitive. It inherits the main file's permissions
+        // at the moment SQLite creates it, which is why the main file is
+        // hardened before WAL is switched on rather than after.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wireserve.db");
+        std::fs::write(&path, []).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let db = Db::open(&path).unwrap();
+        // Force a write so the sidecars definitely exist.
+        {
+            let conn = db.conn.blocking_lock();
+            crate::db::nodes::create_node(&conn, "n1", NodeKind::Agent, "h1").unwrap();
+        }
+
+        let wal = dir.path().join("wireserve.db-wal");
+        assert!(wal.exists(), "WAL mode should have produced a -wal file");
+        for f in ["wireserve.db", "wireserve.db-wal", "wireserve.db-shm"] {
+            let p = dir.path().join(f);
+            if !p.exists() {
+                continue;
+            }
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{f} must not be readable by other local users");
+        }
+    }
+
+    #[test]
+    fn open_actually_enables_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wireserve.db");
+        let db = Db::open(&path).unwrap();
+        let conn = db.conn.blocking_lock();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
     }
 }

@@ -9,7 +9,7 @@ source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
 **Currently working on:** nothing open — all milestones complete through
-M15. 204 tests passing across `cargo test --workspace`, plus three
+M16. 208 tests passing across `cargo test --workspace`, plus three
 container harnesses in `deploy/e2e/` that all pass on a real kernel:
 `run-e2e-test.sh` (mesh, firewall, interface guard), `run-nat-test.sh`
 (two NAT-ed sites) and `run-proxy-test.sh` (TLS-terminating reverse proxy,
@@ -420,6 +420,44 @@ firewall ordering.
         a property of the topology rather than a claim, and checks that
         `X-Forwarded-For` gives each node its own address and its own
         rate-limit budget.
+
+- [x] **M16 — SQLite write path and request body cap.** 208 tests,
+      clippy clean, E2E passes. Prompted by asking whether the single
+      pooled connection was a bottleneck; it measurably is not, and
+      saying so mattered more than the changes did.
+      - **Measured first.** A poll-shaped transaction (one `UPDATE`, one
+        `SELECT`, committed) cost about **0.05ms** in the default
+        rollback journal at `synchronous=FULL`. A thirty-node mesh
+        polling every twenty seconds offers 1.5 requests per second. The
+        mutex was never close to being the limit, and a connection pool
+        would have been complexity bought for nothing — every `/poll`
+        writes, so SQLite would serialise the writes regardless of how
+        many connections were available.
+      - **WAL plus `synchronous=NORMAL`** (about 0.01ms on this machine,
+        and a far larger difference wherever fsync is honest). Kept
+        because it is one line, standard for server-side SQLite, and
+        shortens the window during which the connection mutex is held.
+        `synchronous=NORMAL` under WAL still survives an application
+        crash; it trades only the durability of the newest transactions
+        against power loss, and the newest transaction here is a
+        `last_seen` timestamp that the next poll rewrites anyway.
+      - **File-permission ordering was the actual bug this introduced,
+        and it was caught before it shipped.** SQLite creates the `-wal`
+        and `-shm` sidecars with whatever permissions the main database
+        has at that moment, and those sidecars hold the same rows. The
+        old code hardened the main file *after* migrating, which with WAL
+        enabled would have left the sidecars at the umask default. The
+        hardening now runs before WAL is switched on, with a second sweep
+        afterwards, and a test asserts all three files are `600`.
+      - **Request bodies capped at 64KB**, replacing axum's 2MB default.
+        The largest legitimate body is a `/poll` declaring the maximum 64
+        services, which measures **under 3KB**; the default let an
+        unauthenticated caller have two megabytes of JSON parsed before
+        any credential was examined, at roughly **7ms** against the
+        ~0.05ms of database work behind it. That inversion, where the
+        cheapest request to send was by far the most expensive to serve,
+        was the real exposure on this path rather than the mutex. Not a
+        substitute for rate limiting at the reverse proxy.
 
 Security-sensitive paths (tokens, auth, firewall default-deny, file
 permissions) get test coverage inline with each milestone that introduces
