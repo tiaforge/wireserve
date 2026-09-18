@@ -103,27 +103,58 @@ podman exec wireserve-coordinator wireserve-admin list-peers
 
 ### 2. Add a node
 
-Creating a node prints a one-time join token. Hand it to the machine out of
-band. **The token is redeemable for 30 minutes** — long enough to walk over
+`wireserve-admin` doesn't have to run on the coordinator host — it's a
+plain HTTP client, so it works just as well from your own laptop, as long
+as it can reach the admin listener (loopback-only by default; bind it to
+a private address, or SSH-tunnel it, to reach it from elsewhere). Give it
+the coordinator's public URL once and it remembers it:
+
+```sh
+wireserve-admin create-node homeserver
+```
+
+If you haven't set `--coordinator-url`/`WIRESERVE_COORDINATOR_URL` or
+`--admin-token`/`WIRESERVE_ADMIN_TOKEN` (or the coordinator host's own
+generated `coordinator-secrets.env`, see above), it asks for each —
+masked for the token — and offers to save both to
+`~/.config/wireserve-admin/` so you're never asked again. Same for
+`--register-url`/`WIRESERVE_REGISTER_URL` (the coordinator's *other*
+listener, the one nodes actually register against): set it once and every
+`create-node`/`rejoin` prints the exact command to run on the new node:
+
+```
+node 'homeserver' created — join token: jtk_...
+  redeemable until: ...
+
+To add this node to the mesh:
+  wireserve-agent join https://wireserve.example.com
+  then paste the join token above when prompted
+```
+
+**The token is redeemable for 30 minutes** — long enough to walk over
 to the machine, short enough that a token left in a chat log or a password
 manager is not a live way into the mesh months later. If the window lapses,
 `wireserve-admin rejoin <name>` mints a fresh one for the same node, name
 and address. Override with `--ttl <secs>` per token, or coordinator-wide
 with `WIRESERVE_JOIN_TOKEN_TTL_SECS`; `0` disables expiry.
 
-```sh
-# on the coordinator
-podman exec wireserve-coordinator wireserve-admin create-node homeserver
+On the node itself:
 
-# on the node itself
-wireserve-agent join https://wireserve.example.com --join-token-file ./token
+```sh
+wireserve-agent join
 systemctl enable --now wireserve-agent
 ```
 
-`join` generates the keypair locally, redeems the token, and stores
-everything mode-600. Pass `--ifname wg1` if the machine already has a
-`wg0`. Prefer `--join-token-file` or `-` over typing the token as an
-argument, where it lands in shell history and is visible via `ps`.
+Run with no arguments like this, `join` prompts for the coordinator URL and
+then the join token (masked, not echoed) — nothing to paste into the
+command line at all, which is also the safer option: a token passed as an
+argument lands in shell history and is visible to any local user via `ps`
+for as long as the process is alive. Passing both explicitly still works
+the same as before (`wireserve-agent join <url> <token>`, or
+`--join-token-file <path>`/`-` for scripted joins) if you'd rather not be
+prompted. `join` generates the keypair locally, redeems the token, and
+stores everything mode-600. Pass `--ifname wg1` if the machine already has
+a `wg0`.
 
 ### 3. Publish a service
 
@@ -218,13 +249,15 @@ On a node, talking to the local daemon over a Unix socket:
 
 | Command | What it does |
 | --- | --- |
-| `wireserve-agent join <url>` | one-time bootstrap, generates the keypair |
+| `wireserve-agent join [url] [token]` | one-time bootstrap, generates the keypair — prompts for either if omitted |
 | `wireserve-agent serve <name> <port> [tcp\|udp]` | publish a service |
 | `wireserve-agent unserve <name>` | withdraw one |
 | `wireserve-agent list` | peers, services and rejected declarations |
 | `wireserve-agent leave` | tear down interface, firewall, hosts block |
 
-On the coordinator host, against the loopback-only admin port:
+Against the admin port (loopback-only by default; run from the coordinator
+host, or point `--coordinator-url`/`WIRESERVE_COORDINATOR_URL` at it from
+anywhere that can reach it):
 
 | Command | What it does |
 | --- | --- |

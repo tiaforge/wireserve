@@ -34,3 +34,4 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 defguard_wireguard_rs = "0.12"
 rustables = "0.8"
 base64 = "0.23"
+rpassword = "7"

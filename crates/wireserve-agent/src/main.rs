@@ -20,7 +20,8 @@ enum Command {
     /// One-time bootstrap: redeem a join token issued by `wireserve-admin
     /// create-node`, generating this node's keypair locally.
     Join {
-        coordinator_url: String,
+        /// Prompted for if omitted and running interactively.
+        coordinator_url: Option<String>,
         /// The join token, or `-` to read it from stdin. Security review
         /// S7: a token passed directly on the command line lands in shell
         /// history and is visible to any local user via `ps` for as long
@@ -106,12 +107,13 @@ async fn main() {
 }
 
 async fn cmd_join(
-    coordinator_url: String,
+    coordinator_url: Option<String>,
     join_token: Option<String>,
     join_token_file: Option<std::path::PathBuf>,
     listen_port: u16,
     endpoint_addr: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let coordinator_url = resolve_coordinator_url(coordinator_url)?;
     let join_token = resolve_join_token(join_token, join_token_file)?;
     let state = register::join(register::JoinParams {
         coordinator_url: &coordinator_url,
@@ -128,9 +130,41 @@ async fn cmd_join(
     Ok(())
 }
 
+/// Whether stdin is an interactive terminal — the gate for every prompt
+/// `join` can make. A script or CI invocation (stdin redirected from a
+/// file, closed, or piped) never blocks waiting for input: it hits the
+/// same error it always did.
+fn is_interactive() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
+}
+
+/// Resolves the coordinator URL: the positional argument if given,
+/// otherwise a prompt when running interactively, otherwise a clear error.
+fn resolve_coordinator_url(
+    positional: Option<String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(url) = positional {
+        if !url.is_empty() {
+            return Ok(url);
+        }
+    }
+    if is_interactive() {
+        eprint!("Coordinator URL (e.g. https://wireserve.example.com): ");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        let url = line.trim().to_string();
+        if !url.is_empty() {
+            return Ok(url);
+        }
+    }
+    Err("no coordinator URL given — pass it as an argument".into())
+}
+
 /// Resolves the join token from (in order): `--join-token-file`, the
-/// positional argument being literally `-` (read one line from stdin), or
-/// the positional argument itself. Security review S7.
+/// positional argument being literally `-` (read one line from stdin), the
+/// positional argument itself, or — running interactively, with neither of
+/// those given — a masked prompt. Security review S7.
 fn resolve_join_token(
     positional: Option<String>,
     file: Option<std::path::PathBuf>,
@@ -147,9 +181,20 @@ fn resolve_join_token(
             Ok(line.trim().to_string())
         }
         Some(token) => Ok(token.to_string()),
-        None => Err("no join token given — pass it as an argument, '-' to read from stdin, \
-                      or --join-token-file <path>"
-            .into()),
+        None => {
+            if is_interactive() {
+                let token = rpassword::prompt_password(
+                    "Join token (from 'wireserve-admin create-node'): ",
+                )?;
+                let token = token.trim().to_string();
+                if !token.is_empty() {
+                    return Ok(token);
+                }
+            }
+            Err("no join token given — pass it as an argument, '-' to read from stdin, \
+                 or --join-token-file <path>"
+                .into())
+        }
     }
 }
 
@@ -456,5 +501,19 @@ mod tests {
     fn resolve_join_token_errors_on_unreadable_file() {
         let path = std::path::PathBuf::from("/nonexistent/path/for/test/token");
         assert!(resolve_join_token(None, Some(path)).is_err());
+    }
+
+    // ---- resolve_coordinator_url ----
+
+    #[test]
+    fn resolve_coordinator_url_uses_positional_when_given() {
+        let url = resolve_coordinator_url(Some("https://wireserve.example.com".into())).unwrap();
+        assert_eq!(url, "https://wireserve.example.com");
+    }
+
+    #[test]
+    fn resolve_coordinator_url_errors_when_nothing_given_and_not_interactive() {
+        assert!(!is_interactive(), "cargo test's stdin should never be a tty");
+        assert!(resolve_coordinator_url(None).is_err());
     }
 }

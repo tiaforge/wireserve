@@ -14,6 +14,16 @@ struct Cli {
     /// ~/.config/wireserve-admin/admin_token.
     #[arg(long, global = true)]
     admin_token: Option<String>,
+    /// Base URL of the coordinator's NODE-FACING listener (where
+    /// /register lives) — a different address/port from
+    /// --coordinator-url, which talks to the admin listener. Spec §4.0
+    /// requires the two to be bound separately. Used by `export-config`
+    /// (required) and by `create-node`/`rejoin` (optional — fills in the
+    /// exact `wireserve-agent join` command they print). Or set
+    /// WIRESERVE_REGISTER_URL, or write one to
+    /// ~/.config/wireserve-admin/register_url.
+    #[arg(long, global = true)]
+    register_url: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -80,13 +90,6 @@ enum Command {
         name: String,
         #[arg(long)]
         out: Option<std::path::PathBuf>,
-        /// Base URL of the coordinator's NODE-FACING listener (where
-        /// /register lives) — a different address/port from
-        /// --coordinator-url, which talks to the admin listener. Spec
-        /// §4.0 requires the two to be bound separately. Or set
-        /// WIRESERVE_REGISTER_URL.
-        #[arg(long)]
-        register_url: Option<String>,
     },
 }
 
@@ -114,6 +117,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let Cli {
         coordinator_url,
         admin_token,
+        register_url,
         command,
     } = cli;
 
@@ -125,6 +129,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let resp = wireserve_admin::cmd_create_node(&client, &name, kind, ttl)?;
             println!("node '{}' created — join token: {}", resp.name, resp.join_token);
             print_expiry(resp.join_token_expires_at);
+            if kind == NodeKind::Agent {
+                print_join_instructions(resolve_register_url_best_effort(register_url.as_deref()));
+            }
         }
         Command::Revoke { name } => {
             check_name(&name)?;
@@ -141,6 +148,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 resp.name, resp.join_token
             );
             print_expiry(resp.join_token_expires_at);
+            // `rejoin`'s response doesn't carry the node's kind (unlike
+            // `create-node`, which has it from the --kind flag), and a
+            // static peer's `export-config` covers its own re-registration
+            // anyway — an operator rejoining a static node manually is not
+            // a case this needs to guess at, so this always assumes agent.
+            print_join_instructions(resolve_register_url_best_effort(register_url.as_deref()));
         }
         Command::DeleteNode { name } => {
             check_name(&name)?;
@@ -224,14 +237,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        Command::ExportConfig {
-            name,
-            out,
-            register_url,
-        } => {
+        Command::ExportConfig { name, out } => {
             check_name(&name)?;
             let client = build_client(&coordinator_url, &admin_token)?;
-            let register_url = config::resolve_register_url(register_url.as_deref())?;
+            let register_url = config::resolve_register_url_interactive(register_url.as_deref())?;
             warn_if_plaintext_to_remote_host(&register_url);
             let conf = wireserve_admin::cmd_export_config(&client, &register_url, &name)?;
             match out {
@@ -287,10 +296,42 @@ fn build_client(
     coordinator_url: &Option<String>,
     admin_token: &Option<String>,
 ) -> Result<AdminClient, Box<dyn std::error::Error>> {
-    let url = config::resolve_coordinator_url(coordinator_url.as_deref())?;
+    let url = config::resolve_coordinator_url_interactive(coordinator_url.as_deref())?;
     warn_if_plaintext_to_remote_host(&url);
-    let token = config::resolve_admin_token(admin_token.as_deref())?;
+    let token = config::resolve_admin_token_interactive(admin_token.as_deref())?;
     Ok(AdminClient::new(url, token))
+}
+
+/// Resolves the register URL the same way `export-config` does (flag → env
+/// → saved file), but never prompts and never fails the caller — used by
+/// `create-node`/`rejoin`, where this is a bonus annotation on already
+/// successful output, not a requirement for the command itself.
+fn resolve_register_url_best_effort(cli_flag: Option<&str>) -> Option<String> {
+    config::resolve_register_url(cli_flag).ok()
+}
+
+/// Printed after a fresh join token, right where the operator is looking —
+/// the actual command to run on the new machine, not just the token it
+/// needs. Deliberately does not embed the token itself: a token as a
+/// command-line argument lands in shell history and `ps` output (S7,
+/// `wireserve-agent`'s own doc comment on its `join_token` argument), which
+/// `wireserve-agent join`'s interactive prompt exists to avoid — so the
+/// command printed here has no secret in it, and the token is pasted in
+/// response to that prompt instead.
+fn print_join_instructions(register_url: Option<String>) {
+    println!();
+    println!("To add this node to the mesh:");
+    match register_url {
+        Some(url) => println!("  wireserve-agent join {url}"),
+        None => {
+            println!("  wireserve-agent join <this coordinator's public URL>");
+            println!(
+                "  (pass --register-url, or set WIRESERVE_REGISTER_URL, so this command is \
+                 filled in for you)"
+            );
+        }
+    }
+    println!("  then paste the join token above when prompted");
 }
 
 /// Security review S6: neither client here refuses plain `http://` to a

@@ -27,6 +27,7 @@ clap.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
 defguard_wireguard_rs.workspace = true
+rpassword.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustables = { workspace = true, optional = true }
