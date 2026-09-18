@@ -28,7 +28,11 @@ pub struct JoinParams<'a> {
 /// Performs the join: keypair generation, `/register`, and persists the
 /// resulting state. Returns the saved state on success.
 pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
-    let private_key = Key::generate();
+    // Clamped so the persisted key already matches the form the kernel
+    // will report back on every future `bring_up` (see
+    // `wg::clamp_private_key`) — otherwise a freshly generated key would
+    // fail that check on the very first restart.
+    let private_key = crate::wg::clamp_private_key(&Key::generate());
     let public_key = private_key.public_key();
 
     // Security review S6: the join token (and the bearer token coming

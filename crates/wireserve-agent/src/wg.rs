@@ -29,6 +29,24 @@ pub enum BringUpError {
     InterfaceConflict { ifname: String, reason: String },
 }
 
+/// Applies Curve25519/X25519 "clamping" to a private key: clears the low 3
+/// bits of the first byte and fixes the top two bits of the last byte.
+/// `defguard_wireguard_rs::Key::generate()` returns `x25519_dalek`'s raw,
+/// unclamped scalar, but the Linux kernel's WireGuard implementation always
+/// clamps a private key before storing it — so a freshly generated key
+/// round-trips back from the kernel as a *different* value than the one
+/// that was sent in, even though both represent the same key for actual
+/// tunnel use. Persisting (and comparing against) the clamped form keeps
+/// this node's own state consistent with what the kernel will ever report
+/// back via `read_interface_data`.
+pub fn clamp_private_key(key: &Key) -> Key {
+    let mut bytes = key.as_array();
+    bytes[0] &= 248;
+    bytes[31] &= 127;
+    bytes[31] |= 64;
+    Key::new(bytes)
+}
+
 /// A WireGuard peer's own `/32` + `/128` `AllowedIPs` — never a shared
 /// subnet block, so every peer only ever routes to itself on this
 /// interface (same non-overlapping-`AllowedIPs` reasoning as spec §9's
@@ -156,7 +174,14 @@ impl WgInterface {
         if Self::interface_exists(&self.ifname) {
             match self.api.read_interface_data() {
                 Ok(host) => {
-                    let ours = Key::try_from(private_key_b64).ok();
+                    // The kernel always reports a clamped key back (see
+                    // `clamp_private_key`); clamp our own candidate too so
+                    // an unclamped persisted key (e.g. from a state file
+                    // written before this fix) still compares equal to the
+                    // same key's clamped, kernel-reported form.
+                    let ours = Key::try_from(private_key_b64)
+                        .ok()
+                        .map(|k| clamp_private_key(&k));
                     let matches = match (&host.private_key, &ours) {
                         (Some(existing), Some(ours)) => existing == ours,
                         _ => false,
@@ -295,6 +320,34 @@ mod tests {
             endpoint_addr: None,
             last_handshake: None,
         }
+    }
+
+    #[test]
+    fn clamp_private_key_matches_the_kernels_own_clamping() {
+        // Regression test for a real bug: a freshly generated key (via
+        // x25519_dalek's raw, unclamped StaticSecret::to_bytes()) came back
+        // from the kernel with different bytes after configure_interface,
+        // because the kernel clamps every private key it stores. Observed
+        // on real hardware: state.json held
+        // "AVAJTj9yprpuSrnk0YxwidG1TTnX4kniiJqLe/jsY2o=" (byte 0 = 0x01)
+        // while `wg show wg0 private-key` reported
+        // "AFAJTj9yprpuSrnk0YxwidG1TTnX4kniiJqLe/jsY2o=" (byte 0 = 0x00) —
+        // the same key, differing only by clamping.
+        let unclamped =
+            Key::try_from("AVAJTj9yprpuSrnk0YxwidG1TTnX4kniiJqLe/jsY2o=").unwrap();
+        let kernel_reported =
+            Key::try_from("AFAJTj9yprpuSrnk0YxwidG1TTnX4kniiJqLe/jsY2o=").unwrap();
+        assert_eq!(
+            clamp_private_key(&unclamped).as_array(),
+            kernel_reported.as_array()
+        );
+        // Clamping an already-clamped key must be a no-op (idempotent),
+        // since `bring_up` clamps its candidate unconditionally regardless
+        // of whether the persisted key predates this fix.
+        assert_eq!(
+            clamp_private_key(&kernel_reported).as_array(),
+            kernel_reported.as_array()
+        );
     }
 
     #[test]
