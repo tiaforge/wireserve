@@ -63,12 +63,37 @@ pub fn peer_allowed_ips(ip4: &str, ip6: &str) -> Vec<IpAddrMask> {
     out
 }
 
+/// Picks which of a peer's endpoint candidates to actually configure.
+/// The operator's/passive-fallback's explicit `endpoint_addr` always wins
+/// (unchanged behavior) over the actively-probed `endpoint_addr_v4`/`_v6`
+/// pair; between those two, `prefer_ipv6` — this node's own live "do I
+/// have real working IPv6 right now" self-test against the coordinator
+/// (see `probe::has_working_ipv6`, threaded in from `poll_loop::run_once`)
+/// — decides. A node with no real v6 of its own (the incident this
+/// feature exists to fix: a peer's auto-detected endpoint happened to be
+/// IPv6, which an IPv6-less node could never dial) always falls through
+/// to v4 here regardless of what the peer offers.
+pub fn choose_peer_endpoint(p: &PeerInfo, prefer_ipv6: bool) -> Option<String> {
+    if let Some(explicit) = &p.endpoint_addr {
+        return Some(explicit.clone());
+    }
+    match (&p.endpoint_addr_v4, &p.endpoint_addr_v6) {
+        (Some(v4), Some(v6)) => Some(if prefer_ipv6 { v6.clone() } else { v4.clone() }),
+        (Some(v4), None) => Some(v4.clone()),
+        (None, Some(v6)) => Some(v6.clone()),
+        (None, None) => None,
+    }
+}
+
 /// Builds the desired kernel peer set (keyed by pubkey) from a `/poll`
 /// response's `peers` array, skipping this node's own entry (peers
 /// includes self — PLAN.md decisions log #12) and any entry whose pubkey
 /// doesn't parse (defensive: a malformed directory entry must not crash
-/// reconciliation for every other peer).
-pub fn desired_peers(peers: &[PeerInfo], self_pubkey: &str) -> HashMap<Key, Peer> {
+/// reconciliation for every other peer). `prefer_ipv6` is this node's own
+/// live self-test result — see `choose_peer_endpoint`. Stays fully
+/// pure/network-free: the actual probe happens once per cycle in
+/// `poll_loop::run_once`, outside this module.
+pub fn desired_peers(peers: &[PeerInfo], self_pubkey: &str, prefer_ipv6: bool) -> HashMap<Key, Peer> {
     let mut desired = HashMap::new();
     for p in peers {
         if p.pubkey == self_pubkey {
@@ -80,8 +105,8 @@ pub fn desired_peers(peers: &[PeerInfo], self_pubkey: &str) -> HashMap<Key, Peer
         };
         let mut peer = Peer::new(key.clone());
         peer.allowed_ips = peer_allowed_ips(&p.ip4, &p.ip6);
-        if let Some(endpoint) = &p.endpoint_addr {
-            if let Err(e) = peer.set_endpoint(endpoint) {
+        if let Some(endpoint) = choose_peer_endpoint(p, prefer_ipv6) {
+            if let Err(e) = peer.set_endpoint(&endpoint) {
                 tracing::warn!(peer = %p.name, error = %e, "could not resolve peer endpoint");
             }
         }
@@ -248,8 +273,9 @@ impl WgInterface {
         &mut self,
         peers: &[PeerInfo],
         self_pubkey: &str,
+        prefer_ipv6: bool,
     ) -> Result<(), WireguardInterfaceError> {
-        let desired = desired_peers(peers, self_pubkey);
+        let desired = desired_peers(peers, self_pubkey, prefer_ipv6);
 
         let to_remove = peers_to_remove(self.applied.keys(), &desired);
         for key in &to_remove {
@@ -318,6 +344,8 @@ mod tests {
             ip4: "100.90.0.5".into(),
             ip6: "fd00:90::5".into(),
             endpoint_addr: None,
+            endpoint_addr_v4: None,
+            endpoint_addr_v6: None,
             last_handshake: None,
         }
     }
@@ -368,7 +396,7 @@ mod tests {
         let self_key = key_b64(1);
         let other_key = key_b64(2);
         let peers = vec![peer("me", &self_key), peer("other", &other_key)];
-        let desired = desired_peers(&peers, &self_key);
+        let desired = desired_peers(&peers, &self_key, false);
         assert_eq!(desired.len(), 1);
     }
 
@@ -380,8 +408,80 @@ mod tests {
             peer("bad", "not-a-real-base64-key"),
             peer("good", &good_key),
         ];
-        let desired = desired_peers(&peers, &self_key);
+        let desired = desired_peers(&peers, &self_key, false);
         assert_eq!(desired.len(), 1);
+    }
+
+    #[test]
+    fn choose_peer_endpoint_prefers_v4_by_default() {
+        let mut p = peer("n1", &key_b64(2));
+        p.endpoint_addr_v4 = Some("203.0.113.5:51820".into());
+        p.endpoint_addr_v6 = Some("[2001:db8::1]:51820".into());
+        assert_eq!(
+            choose_peer_endpoint(&p, false),
+            Some("203.0.113.5:51820".into())
+        );
+    }
+
+    #[test]
+    fn choose_peer_endpoint_prefers_v6_only_when_asked_and_both_exist() {
+        let mut p = peer("n1", &key_b64(2));
+        p.endpoint_addr_v4 = Some("203.0.113.5:51820".into());
+        p.endpoint_addr_v6 = Some("[2001:db8::1]:51820".into());
+        assert_eq!(
+            choose_peer_endpoint(&p, true),
+            Some("[2001:db8::1]:51820".into())
+        );
+    }
+
+    #[test]
+    fn choose_peer_endpoint_falls_back_to_whichever_single_candidate_exists() {
+        let mut p = peer("n1", &key_b64(2));
+        p.endpoint_addr_v6 = Some("[2001:db8::1]:51820".into());
+        assert_eq!(
+            choose_peer_endpoint(&p, false),
+            Some("[2001:db8::1]:51820".into()),
+            "no v4 candidate at all — v6 is used even though prefer_ipv6 is false"
+        );
+        assert_eq!(choose_peer_endpoint(&p, true), Some("[2001:db8::1]:51820".into()));
+    }
+
+    #[test]
+    fn choose_peer_endpoint_explicit_override_always_wins() {
+        let mut p = peer("n1", &key_b64(2));
+        p.endpoint_addr = Some("explicit.example.com:51820".into());
+        p.endpoint_addr_v4 = Some("203.0.113.5:51820".into());
+        p.endpoint_addr_v6 = Some("[2001:db8::1]:51820".into());
+        assert_eq!(
+            choose_peer_endpoint(&p, false),
+            Some("explicit.example.com:51820".into())
+        );
+        assert_eq!(
+            choose_peer_endpoint(&p, true),
+            Some("explicit.example.com:51820".into()),
+            "explicit wins regardless of prefer_ipv6"
+        );
+    }
+
+    #[test]
+    fn desired_peers_wires_prefer_ipv6_through_to_the_configured_endpoint() {
+        let self_key = key_b64(1);
+        let mut other = peer("other", &key_b64(2));
+        other.endpoint_addr_v4 = Some("203.0.113.5:51820".into());
+        other.endpoint_addr_v6 = Some("[2001:db8::1]:51820".into());
+
+        let desired_v4 = desired_peers(&[other.clone()], &self_key, false);
+        let key = defguard_wireguard_rs::key::Key::try_from(key_b64(2).as_str()).unwrap();
+        assert_eq!(
+            desired_v4[&key].endpoint,
+            Some("203.0.113.5:51820".parse().unwrap())
+        );
+
+        let desired_v6 = desired_peers(&[other], &self_key, true);
+        assert_eq!(
+            desired_v6[&key].endpoint,
+            Some("[2001:db8::1]:51820".parse::<std::net::SocketAddr>().unwrap())
+        );
     }
 
     #[test]

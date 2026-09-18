@@ -57,10 +57,19 @@ impl PollError {
 
 /// Builds the request body from currently-declared services — this is the
 /// node's own view of what it's serving, independent of anything the
-/// coordinator has told it.
-pub fn build_poll_request(declared: &[ServiceDecl], endpoint_addr: Option<String>) -> PollRequest {
+/// coordinator has told it. `dual` is this cycle's actively-probed
+/// endpoint candidates (see `probe::probe_both`) — always sent verbatim
+/// (including `None`s), same COALESCE-preserving contract the coordinator
+/// already applies to them.
+pub fn build_poll_request(
+    declared: &[ServiceDecl],
+    endpoint_addr: Option<String>,
+    dual: &crate::probe::DualProbeResult,
+) -> PollRequest {
     PollRequest {
         endpoint_addr,
+        endpoint_addr_v4: dual.v4.clone(),
+        endpoint_addr_v6: dual.v6.clone(),
         services: declared.to_vec(),
     }
 }
@@ -198,18 +207,27 @@ where
     F::Error: std::fmt::Display,
 {
     // Snapshot exactly what this cycle sends, then release the lock.
-    let (bearer, self_pubkey, declared, endpoint_addr) = {
+    let (bearer, self_pubkey, declared, endpoint_addr, listen_port) = {
         let s = state.lock().await;
         (
             s.bearer_token.clone().ok_or(PollError::NotRegistered)?,
             s.public_key.clone().unwrap_or_default(),
             s.declared_services.clone(),
             s.endpoint_addr.clone(),
+            s.listen_port.unwrap_or(51820),
         )
     };
 
+    // Actively probe both families against the coordinator this cycle —
+    // see `probe` module doc. Reused for two jobs below: the self-report
+    // in this poll's own request body, and (via `dual.v6.is_some()`) the
+    // "do I have real working IPv6 right now" signal for peer
+    // reconciliation's endpoint preference.
+    let dual = crate::probe::probe_both(ctx.coordinator_url, listen_port, crate::probe::PROBE_TIMEOUT).await;
+    let prefer_ipv6 = dual.v6.is_some();
+
     // 1. send
-    let req = build_poll_request(&declared, endpoint_addr);
+    let req = build_poll_request(&declared, endpoint_addr, &dual);
     let url = format!("{}/poll", ctx.coordinator_url.trim_end_matches('/'));
     let resp = ctx
         .client
@@ -280,7 +298,7 @@ where
     let rules = service_rules(&declared);
     tokio::task::block_in_place(|| -> Result<(), PollError> {
         // 2. reconcile WireGuard peers
-        ctx.wg.reconcile(&directory.peers, &self_pubkey)?;
+        ctx.wg.reconcile(&directory.peers, &self_pubkey, prefer_ipv6)?;
 
         // 3. reconcile this node's own firewall rules — from what this
         //    node declared (spec §5), not from the coordinator's
@@ -318,9 +336,15 @@ mod tests {
             port: 32400,
             proto: Proto::Tcp,
         }];
-        let req = build_poll_request(&declared, Some("host:51820".into()));
+        let dual = crate::probe::DualProbeResult {
+            v4: Some("203.0.113.5:51820".into()),
+            v6: None,
+        };
+        let req = build_poll_request(&declared, Some("host:51820".into()), &dual);
         assert_eq!(req.services.len(), 1);
         assert_eq!(req.endpoint_addr.as_deref(), Some("host:51820"));
+        assert_eq!(req.endpoint_addr_v4.as_deref(), Some("203.0.113.5:51820"));
+        assert!(req.endpoint_addr_v6.is_none());
     }
 
     #[test]

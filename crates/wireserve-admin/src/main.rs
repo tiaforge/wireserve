@@ -60,7 +60,15 @@ enum Command {
     /// forward, a move behind CGNAT) and is still advertising it. The
     /// node reports a new one on its next poll if it still has one set
     /// locally.
-    ClearEndpoint { name: String },
+    ClearEndpoint {
+        name: String,
+        /// Clear only one actively-probed candidate ("v4" or "v6"),
+        /// leaving the explicit override and the other family untouched.
+        /// Omit to clear everything (the explicit override plus both
+        /// candidates) — today's default behavior.
+        #[arg(long)]
+        family: Option<String>,
+    },
     /// List the full peer directory (spec §4.5.1).
     ListPeers,
     /// List every declared service and its approval state.
@@ -161,11 +169,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             wireserve_admin::cmd_delete_node(&client, &name)?;
             println!("node '{name}' deleted");
         }
-        Command::ClearEndpoint { name } => {
+        Command::ClearEndpoint { name, family } => {
             check_name(&name)?;
             let client = build_client(&coordinator_url, &admin_token)?;
-            wireserve_admin::cmd_clear_endpoint(&client, &name)?;
-            println!("node '{name}' endpoint cleared");
+            wireserve_admin::cmd_clear_endpoint(&client, &name, family.as_deref())?;
+            match &family {
+                Some(f) => println!("node '{name}' {f} endpoint cleared"),
+                None => println!("node '{name}' endpoint cleared"),
+            }
         }
         Command::ListServices { pending } => {
             let client = build_client(&coordinator_url, &admin_token)?;
@@ -225,12 +236,20 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // only line of defense" reasoning as export_config's
                 // renderer.
                 println!(
-                    "{}\t{}\t{}\t{}\tendpoint={}",
+                    "{}\t{}\t{}\t{}\tendpoint={}\tv4={}\tv6={}",
                     sanitize_for_terminal(&p.name),
                     sanitize_for_terminal(&p.pubkey),
                     sanitize_for_terminal(&p.ip4),
                     sanitize_for_terminal(&p.ip6),
                     p.endpoint_addr
+                        .as_deref()
+                        .map(sanitize_for_terminal)
+                        .unwrap_or_else(|| "-".to_string()),
+                    p.endpoint_addr_v4
+                        .as_deref()
+                        .map(sanitize_for_terminal)
+                        .unwrap_or_else(|| "-".to_string()),
+                    p.endpoint_addr_v6
                         .as_deref()
                         .map(sanitize_for_terminal)
                         .unwrap_or_else(|| "-".to_string())

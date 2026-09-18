@@ -113,8 +113,32 @@ pub async fn clear_node_endpoint(
 ) -> Result<(), AppError> {
     let conn = state.db.conn.lock().await;
     let node = nodes::find_by_name(&conn, &name)?.ok_or(AppError::NotFound)?;
-    nodes::clear_endpoint(&conn, node.id)?;
+    nodes::clear_endpoint(&conn, node.id, None)?;
     tracing::info!(event = "node_endpoint_cleared", node_name = %name);
+    Ok(())
+}
+
+/// `DELETE /admin/nodes/{name}/endpoint/{family}` (`family` = `v4`|`v6`).
+///
+/// The family-scoped sibling of [`clear_node_endpoint`], for when only
+/// one of a node's two actively-probed candidates has gone stale (the
+/// node lost its IPv6 route but its IPv4 one is still fine, say) —
+/// clearing both via the unqualified route would be needlessly
+/// destructive to the family that's still working.
+pub async fn clear_node_endpoint_family(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path((name, family_str)): Path<(String, String)>,
+) -> Result<(), AppError> {
+    let family = match family_str.as_str() {
+        "v4" => nodes::EndpointFamily::V4,
+        "v6" => nodes::EndpointFamily::V6,
+        _ => return Err(AppError::BadRequest("family must be v4 or v6".into())),
+    };
+    let conn = state.db.conn.lock().await;
+    let node = nodes::find_by_name(&conn, &name)?.ok_or(AppError::NotFound)?;
+    nodes::clear_endpoint(&conn, node.id, Some(family))?;
+    tracing::info!(event = "node_endpoint_cleared", node_name = %name, family = %family_str);
     Ok(())
 }
 

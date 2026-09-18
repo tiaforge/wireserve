@@ -1,0 +1,21 @@
+-- Splits the single observed/asserted endpoint into independent v4 and v6
+-- candidates, actively reported by an upgraded agent's dual-probe (see
+-- agent's probe.rs), rather than derived by the coordinator from a single
+-- passively observed connection. Motivating incident: a dual-stack node's
+-- auto-detected endpoint happened to be its IPv6 address, which an
+-- IPv6-less peer could never dial.
+--
+-- endpoint_addr/endpoint_cleared are deliberately untouched: they remain
+-- the operator's explicit --endpoint-addr override and the passive
+-- single-family fallback for old agents and static nodes, and still win
+-- over these columns on the receiving side (wg::choose_peer_endpoint).
+--
+-- No matching "_cleared" flag for these two columns: endpoint_cleared
+-- exists because the coordinator itself re-derives endpoint_addr from
+-- passive observation on every /poll even without the agent asserting
+-- anything, and the flag is what stops that self-healing from undoing an
+-- admin's clear. These two columns are never derived by the coordinator
+-- -- only ever set to whatever an agent explicitly asserts that cycle --
+-- so a plain NULL already is the complete "stop advertising it" action.
+ALTER TABLE nodes ADD COLUMN endpoint_addr_v4 TEXT;
+ALTER TABLE nodes ADD COLUMN endpoint_addr_v6 TEXT;

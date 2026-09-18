@@ -20,6 +20,8 @@ fn export_config_end_to_end_and_private_key_never_leaves_process() {
         ip4: "100.90.0.3".into(),
         ip6: "fd00:90::3".into(),
         endpoint_addr: Some("duckdns.example.com:51820".into()),
+        endpoint_addr_v4: None,
+        endpoint_addr_v6: None,
         last_handshake: None,
     }]);
 
@@ -63,7 +65,7 @@ fn invalid_name_makes_zero_network_calls_for_every_name_taking_command() {
     assert!(wireserve_admin::cmd_revoke(&client, "Bad_Name").is_err());
     assert!(wireserve_admin::cmd_rejoin(&client, "Bad_Name", None).is_err());
     assert!(wireserve_admin::cmd_delete_node(&client, "Bad_Name").is_err());
-    assert!(wireserve_admin::cmd_clear_endpoint(&client, "Bad_Name").is_err());
+    assert!(wireserve_admin::cmd_clear_endpoint(&client, "Bad_Name", None).is_err());
     // Both path segments are user input here, and a valid DNS label
     // cannot contain `/` or `..` — so both are validated, and a bad one
     // in either position must stop before the network.
@@ -90,7 +92,7 @@ fn clear_endpoint_hits_the_endpoint_subpath_not_the_node_path() {
     let mock = MockCoordinator::start(TOKEN);
     let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
 
-    wireserve_admin::cmd_clear_endpoint(&client, "homeserver").unwrap();
+    wireserve_admin::cmd_clear_endpoint(&client, "homeserver", None).unwrap();
 
     assert_eq!(mock.request_count(), 1);
     let paths = mock.paths();
@@ -214,6 +216,8 @@ fn list_peers_reflects_mock_directory() {
         ip4: "100.90.0.3".into(),
         ip6: "fd00:90::3".into(),
         endpoint_addr: None,
+        endpoint_addr_v4: None,
+        endpoint_addr_v6: None,
         last_handshake: None,
     }]);
     let client = AdminClient::new(mock.base_url.as_str(), TOKEN);

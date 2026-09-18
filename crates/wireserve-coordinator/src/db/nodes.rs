@@ -19,6 +19,12 @@ pub struct NodeRow {
     /// `clear_endpoint`'s doc comment. Gates whether `/poll` is allowed to
     /// re-derive `endpoint_addr` from the observed source address.
     pub endpoint_cleared: bool,
+    /// Actively self-reported by the agent's own dual-family probe (see
+    /// `update_poll_state`'s doc comment) — never derived by the
+    /// coordinator from a single observed connection, unlike
+    /// `endpoint_addr` above.
+    pub endpoint_addr_v4: Option<String>,
+    pub endpoint_addr_v6: Option<String>,
     pub listen_port: Option<i64>,
     pub revoked: bool,
     pub last_seen: Option<DateTime<Utc>>,
@@ -37,6 +43,8 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
         ip6: row.get("ip6")?,
         endpoint_addr: row.get("endpoint_addr")?,
         endpoint_cleared: row.get("endpoint_cleared")?,
+        endpoint_addr_v4: row.get("endpoint_addr_v4")?,
+        endpoint_addr_v6: row.get("endpoint_addr_v6")?,
         listen_port: row.get("listen_port")?,
         revoked: row.get("revoked")?,
         last_seen: last_seen_str.and_then(|s| parse_dt(&s)),
@@ -165,6 +173,13 @@ pub struct Redemption<'a> {
     pub ip6: Ipv6Addr,
     pub listen_port: Option<u16>,
     pub endpoint_addr: Option<&'a str>,
+    /// Actively self-reported dual-family candidates, straight from this
+    /// `/register` request — see `NodeRow::endpoint_addr_v4`'s doc
+    /// comment. Set directly, not COALESCEd, same as `endpoint_addr`: a
+    /// fresh register/rejoin fully re-derives from this request, not from
+    /// history.
+    pub endpoint_addr_v4: Option<&'a str>,
+    pub endpoint_addr_v6: Option<&'a str>,
     pub bearer_token_hash: &'a str,
 }
 
@@ -178,8 +193,9 @@ pub fn apply_redemption(conn: &Connection, node_id: i64, r: &Redemption<'_>) -> 
     conn.execute(
         "UPDATE nodes SET pubkey = ?1, ip4 = ?2, ip6 = ?3, listen_port = ?4, \
          endpoint_addr = ?5, bearer_token_hash = ?6, join_token_hash = NULL, \
-         join_token_used = 1, revoked = 0, revoked_at = NULL, endpoint_cleared = 0 \
-         WHERE id = ?7",
+         join_token_used = 1, revoked = 0, revoked_at = NULL, endpoint_cleared = 0, \
+         endpoint_addr_v4 = ?7, endpoint_addr_v6 = ?8 \
+         WHERE id = ?9",
         rusqlite::params![
             r.pubkey,
             r.ip4.to_string(),
@@ -187,6 +203,8 @@ pub fn apply_redemption(conn: &Connection, node_id: i64, r: &Redemption<'_>) -> 
             r.listen_port,
             r.endpoint_addr,
             r.bearer_token_hash,
+            r.endpoint_addr_v4,
+            r.endpoint_addr_v6,
             node_id,
         ],
     )
@@ -207,23 +225,46 @@ pub fn find_by_bearer_hash(conn: &Connection, hash: &str) -> Result<Option<NodeR
     .map_err(DbError::from)
 }
 
-/// `endpoint_addr` is the value to write (if any — `None` means "no
-/// opinion this poll," preserved via `COALESCE` exactly as before).
-/// `reset_cleared` is true exactly when the node itself reported an
-/// explicit `endpoint_addr` this poll: an explicit assertion always
-/// un-clears (see `clear_endpoint`'s doc comment), regardless of whether
-/// the auto-detected fallback was gated off by a previous clear.
+/// `explicit` is the singular-`endpoint_addr` value to write (if any —
+/// `None` means "no opinion this poll," preserved via `COALESCE` exactly
+/// as before). `reset_cleared` is true exactly when the node itself
+/// reported an explicit `endpoint_addr` this poll: an explicit assertion
+/// always un-clears (see `clear_endpoint`'s doc comment), regardless of
+/// whether the auto-detected fallback was gated off by a previous clear.
+///
+/// `v4`/`v6` are the agent's actively self-probed candidates (see
+/// `NodeRow::endpoint_addr_v4`'s doc comment) — also COALESCEd, so a
+/// node that couldn't reach a given family this cycle doesn't erase a
+/// candidate it successfully reported on some earlier cycle. Unlike
+/// `endpoint_addr`, these are never gated by `endpoint_cleared`: nothing
+/// coordinator-side ever derives them passively, so a plain write here
+/// already is the only kind of "self-heal" that exists for them.
+pub struct EndpointUpdate<'a> {
+    pub explicit: Option<&'a str>,
+    pub reset_cleared: bool,
+    pub v4: Option<&'a str>,
+    pub v6: Option<&'a str>,
+}
+
 pub fn update_poll_state(
     conn: &Connection,
     node_id: i64,
-    endpoint_addr: Option<&str>,
-    reset_cleared: bool,
+    update: &EndpointUpdate<'_>,
 ) -> Result<(), DbError> {
     conn.execute(
         "UPDATE nodes SET last_seen = ?1, endpoint_addr = COALESCE(?2, endpoint_addr), \
-         endpoint_cleared = CASE WHEN ?3 THEN 0 ELSE endpoint_cleared END \
-         WHERE id = ?4",
-        rusqlite::params![now_str(), endpoint_addr, reset_cleared, node_id],
+         endpoint_cleared = CASE WHEN ?3 THEN 0 ELSE endpoint_cleared END, \
+         endpoint_addr_v4 = COALESCE(?4, endpoint_addr_v4), \
+         endpoint_addr_v6 = COALESCE(?5, endpoint_addr_v6) \
+         WHERE id = ?6",
+        rusqlite::params![
+            now_str(),
+            update.explicit,
+            update.reset_cleared,
+            update.v4,
+            update.v6,
+            node_id
+        ],
     )?;
     Ok(())
 }
@@ -328,11 +369,45 @@ pub fn clear_bearer_token(conn: &Connection, node_id: i64) -> Result<(), DbError
 /// what actually makes the guarantee above true for the *auto-detected*
 /// case, not just the "node reports its own" case the doc comment above
 /// already covered before self-healing existed.
-pub fn clear_endpoint(conn: &Connection, node_id: i64) -> Result<(), DbError> {
-    conn.execute(
-        "UPDATE nodes SET endpoint_addr = NULL, endpoint_cleared = 1 WHERE id = ?1",
-        [node_id],
-    )?;
+/// `None` clears everything (the singular override plus both probed
+/// candidates) — today's default and the only behavior that existed
+/// before dual-stack tracking. `Some(family)` clears only that probed
+/// candidate, leaving the singular `endpoint_addr` and the other family
+/// untouched — for the narrower case where only one family's advertised
+/// address has gone stale (e.g. this node lost its IPv6 route but its
+/// IPv4 one is still fine).
+///
+/// No family-scoped `_cleared` flag: unlike `endpoint_addr`, nothing
+/// coordinator-side ever re-derives `endpoint_addr_v4`/`_v6` passively —
+/// they're only ever set to whatever the node's own probe asserted that
+/// cycle — so a plain `NULL` here already is the complete "stop
+/// advertising it" action, same documented limitation as below (the node
+/// re-probing successfully next cycle re-asserts it).
+pub enum EndpointFamily {
+    V4,
+    V6,
+}
+
+pub fn clear_endpoint(
+    conn: &Connection,
+    node_id: i64,
+    family: Option<EndpointFamily>,
+) -> Result<(), DbError> {
+    match family {
+        None => conn.execute(
+            "UPDATE nodes SET endpoint_addr = NULL, endpoint_cleared = 1, \
+             endpoint_addr_v4 = NULL, endpoint_addr_v6 = NULL WHERE id = ?1",
+            [node_id],
+        ),
+        Some(EndpointFamily::V4) => conn.execute(
+            "UPDATE nodes SET endpoint_addr_v4 = NULL WHERE id = ?1",
+            [node_id],
+        ),
+        Some(EndpointFamily::V6) => conn.execute(
+            "UPDATE nodes SET endpoint_addr_v6 = NULL WHERE id = ?1",
+            [node_id],
+        ),
+    }?;
     Ok(())
 }
 
@@ -430,6 +505,8 @@ mod tests {
                 listen_port: Some(51820),
                 endpoint_addr: Some("1.2.3.4:51820"),
                 bearer_token_hash: "bearerhash1",
+                endpoint_addr_v4: None,
+                endpoint_addr_v6: None,
             },
         )
         .unwrap();
@@ -536,6 +613,8 @@ mod tests {
                 listen_port: Some(51820),
                 endpoint_addr: None,
                 bearer_token_hash: "bearerhash1",
+                endpoint_addr_v4: None,
+                endpoint_addr_v6: None,
             },
         )
         .unwrap();
@@ -561,6 +640,8 @@ mod tests {
                 listen_port: Some(51820),
                 endpoint_addr: None,
                 bearer_token_hash: "bearerhash1",
+                endpoint_addr_v4: None,
+                endpoint_addr_v6: None,
             },
         )
         .unwrap();
@@ -580,6 +661,8 @@ mod tests {
                 listen_port: Some(51820),
                 endpoint_addr: None,
                 bearer_token_hash: "bearerhash2",
+                endpoint_addr_v4: None,
+                endpoint_addr_v6: None,
             },
         )
         .unwrap();
@@ -636,6 +719,8 @@ mod tests {
                 listen_port: Some(51820),
                 endpoint_addr: None,
                 bearer_token_hash: "bearerhash1",
+                endpoint_addr_v4: None,
+                endpoint_addr_v6: None,
             },
         )
         .unwrap();
@@ -658,11 +743,13 @@ mod tests {
                 listen_port: Some(51820),
                 endpoint_addr: Some("1.2.3.4:51820"),
                 bearer_token_hash: "bearerhash1",
+                endpoint_addr_v4: None,
+                endpoint_addr_v6: None,
             },
         )
         .unwrap();
 
-        clear_endpoint(&conn, id).unwrap();
+        clear_endpoint(&conn, id, None).unwrap();
 
         let row = find_by_name(&conn, "n1").unwrap().unwrap();
         assert!(row.endpoint_addr.is_none());
@@ -691,15 +778,37 @@ mod tests {
                 listen_port: Some(51820),
                 endpoint_addr: Some("1.2.3.4:51820"),
                 bearer_token_hash: "bearerhash1",
+                endpoint_addr_v4: None,
+                endpoint_addr_v6: None,
             },
         )
         .unwrap();
-        clear_endpoint(&conn, id).unwrap();
+        clear_endpoint(&conn, id, None).unwrap();
 
-        update_poll_state(&conn, id, None, false).unwrap();
+        update_poll_state(
+            &conn,
+            id,
+            &EndpointUpdate {
+                explicit: None,
+                reset_cleared: false,
+                v4: None,
+                v6: None,
+            },
+        )
+        .unwrap();
         assert!(find_by_name(&conn, "n1").unwrap().unwrap().endpoint_addr.is_none());
 
-        update_poll_state(&conn, id, Some("5.6.7.8:51820"), true).unwrap();
+        update_poll_state(
+            &conn,
+            id,
+            &EndpointUpdate {
+                explicit: Some("5.6.7.8:51820"),
+                reset_cleared: true,
+                v4: None,
+                v6: None,
+            },
+        )
+        .unwrap();
         let row = find_by_name(&conn, "n1").unwrap().unwrap();
         assert_eq!(
             row.endpoint_addr.as_deref(),
@@ -710,6 +819,87 @@ mod tests {
             !row.endpoint_cleared,
             "an explicit report resets the cleared flag too"
         );
+    }
+
+    #[tokio::test]
+    async fn clear_endpoint_can_target_a_single_family() {
+        // The direct regression test for the incident this feature
+        // exists to fix: an admin clearing a specific stale family (say,
+        // v6 stopped working) must not also wipe the still-good v4
+        // candidate or the unrelated singular override.
+        let db = test_db();
+        let conn = db.conn.lock().await;
+        let id = create_node(&conn, "n1", NodeKind::Agent, "hash1", None).unwrap();
+        apply_redemption(
+            &conn,
+            id,
+            &Redemption {
+                pubkey: "pk1",
+                ip4: "100.90.0.1".parse().unwrap(),
+                ip6: "fd00:90::1".parse().unwrap(),
+                listen_port: Some(51820),
+                endpoint_addr: Some("explicit.example.com:51820"),
+                bearer_token_hash: "bearerhash1",
+                endpoint_addr_v4: Some("203.0.113.5:51820"),
+                endpoint_addr_v6: Some("[2001:db8::1]:51820"),
+            },
+        )
+        .unwrap();
+
+        clear_endpoint(&conn, id, Some(EndpointFamily::V6)).unwrap();
+
+        let row = find_by_name(&conn, "n1").unwrap().unwrap();
+        assert_eq!(row.endpoint_addr_v4.as_deref(), Some("203.0.113.5:51820"));
+        assert!(row.endpoint_addr_v6.is_none());
+        assert_eq!(
+            row.endpoint_addr.as_deref(),
+            Some("explicit.example.com:51820"),
+            "a family-scoped clear leaves the singular override alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_poll_state_coalesces_v4_and_v6_independently() {
+        let db = test_db();
+        let conn = db.conn.lock().await;
+        let id = create_node(&conn, "n1", NodeKind::Agent, "hash1", None).unwrap();
+        apply_redemption(
+            &conn,
+            id,
+            &Redemption {
+                pubkey: "pk1",
+                ip4: "100.90.0.1".parse().unwrap(),
+                ip6: "fd00:90::1".parse().unwrap(),
+                listen_port: Some(51820),
+                endpoint_addr: None,
+                bearer_token_hash: "bearerhash1",
+                endpoint_addr_v4: Some("203.0.113.5:51820"),
+                endpoint_addr_v6: None,
+            },
+        )
+        .unwrap();
+
+        // A poll that only succeeded probing v6 this cycle must not erase
+        // the v4 candidate learned earlier.
+        update_poll_state(
+            &conn,
+            id,
+            &EndpointUpdate {
+                explicit: None,
+                reset_cleared: false,
+                v4: None,
+                v6: Some("[2001:db8::1]:51820"),
+            },
+        )
+        .unwrap();
+
+        let row = find_by_name(&conn, "n1").unwrap().unwrap();
+        assert_eq!(
+            row.endpoint_addr_v4.as_deref(),
+            Some("203.0.113.5:51820"),
+            "an omitted v4 this cycle preserves the earlier one"
+        );
+        assert_eq!(row.endpoint_addr_v6.as_deref(), Some("[2001:db8::1]:51820"));
     }
 
     #[tokio::test]
@@ -727,6 +917,8 @@ mod tests {
                 listen_port: Some(51820),
                 endpoint_addr: None,
                 bearer_token_hash: "bearerhash1",
+                endpoint_addr_v4: None,
+                endpoint_addr_v6: None,
             },
         )
         .unwrap();

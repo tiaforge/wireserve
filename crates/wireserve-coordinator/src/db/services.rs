@@ -399,6 +399,8 @@ mod tests {
                 ip6: format!("fd00:90::{id}").parse().unwrap(),
                 listen_port: Some(51820),
                 endpoint_addr: None,
+                endpoint_addr_v4: None,
+                endpoint_addr_v6: None,
                 bearer_token_hash: &format!("bearer-{name}"),
             },
         )

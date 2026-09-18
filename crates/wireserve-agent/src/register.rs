@@ -53,12 +53,25 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
     let url = format!("{}/register", params.coordinator_url.trim_end_matches('/'));
+    // Best-effort: a probe failure must not fail `join` — the mesh
+    // already tolerates a node with no reachable endpoint at all, and
+    // `--endpoint-addr` remains available as a manual override for a
+    // coordinator this node genuinely can't reach outbound over a
+    // required family at join time.
+    let dual = crate::probe::probe_both(
+        params.coordinator_url,
+        params.listen_port,
+        crate::probe::PROBE_TIMEOUT,
+    )
+    .await;
     let req = RegisterRequest {
         join_token: params.join_token.to_string(),
         pubkey: public_key.to_string(),
         kind: NodeKind::Agent,
         listen_port: Some(params.listen_port),
         endpoint_addr: params.endpoint_addr.clone(),
+        endpoint_addr_v4: dual.v4,
+        endpoint_addr_v6: dual.v6,
     };
 
     let resp = client.post(&url).json(&req).send().await?;
@@ -102,6 +115,8 @@ mod tests {
             kind: NodeKind::Agent,
             listen_port: Some(51820),
             endpoint_addr: None,
+            endpoint_addr_v4: None,
+            endpoint_addr_v6: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains(&private_key.to_string()));

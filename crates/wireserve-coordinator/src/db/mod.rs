@@ -92,6 +92,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0002_join_token_expiry.sql")),
         M::up(include_str!("../../migrations/0003_service_approval.sql")),
         M::up(include_str!("../../migrations/0004_endpoint_cleared.sql")),
+        M::up(include_str!("../../migrations/0005_dual_stack_endpoints.sql")),
     ])
 }
 
@@ -337,6 +338,28 @@ mod tests {
 
         let row = crate::db::nodes::find_by_name(&conn, "n1").unwrap().unwrap();
         assert!(!row.endpoint_cleared);
+    }
+
+    #[test]
+    fn migration_grandfathers_existing_nodes_with_no_v4_v6_endpoint() {
+        // An existing node acquires no v4/v6 candidate for free on
+        // upgrade -- None, not an empty string that downstream code might
+        // mistake for a real (if empty) address.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        migrations().to_version(&mut conn, 4).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (name, kind, pubkey, ip4, ip6, join_token_used) \
+             VALUES ('n1', 'agent', 'pk1', '100.90.0.1', 'fd00:90::1', 1)",
+            [],
+        )
+        .unwrap();
+
+        migrations().to_latest(&mut conn).unwrap();
+
+        let row = crate::db::nodes::find_by_name(&conn, "n1").unwrap().unwrap();
+        assert!(row.endpoint_addr_v4.is_none());
+        assert!(row.endpoint_addr_v6.is_none());
     }
 
     #[test]

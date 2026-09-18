@@ -584,6 +584,176 @@ async fn register_rejects_endpoint_addr_config_injection_attempt() {
 }
 
 #[tokio::test]
+async fn register_rejects_config_injection_via_v4_or_v6_endpoint() {
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({
+            "join_token": t1,
+            "pubkey": pubkey_for("n1"),
+            "listen_port": 51820,
+            "endpoint_addr_v4": "1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0",
+        }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert!(resp.status().is_client_error());
+}
+
+#[tokio::test]
+async fn register_and_poll_propagate_dual_stack_endpoint_candidates() {
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({
+            "join_token": t1,
+            "pubkey": pubkey_for("n1"),
+            "listen_port": 51820,
+            "endpoint_addr_v4": "203.0.113.5:51820",
+            "endpoint_addr_v6": "[2001:db8::1]:51820",
+        }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let r1 = body_json(resp).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+
+    // A second node polls and should see n1's dual candidates in its
+    // directory.
+    let t2 = admin_create_node(&app.router, "n2").await;
+    let r2 = register_node(&app.router, &t2, "n2", 51820).await;
+    let bearer2 = r2["bearer_token"].as_str().unwrap();
+    let req = json_request("POST", "/poll", Some(bearer2), json!({ "services": [] }));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let body = body_json(resp).await;
+    let n1_peer = body["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "n1")
+        .unwrap();
+    assert_eq!(n1_peer["endpoint_addr_v4"], "203.0.113.5:51820");
+    assert_eq!(n1_peer["endpoint_addr_v6"], "[2001:db8::1]:51820");
+
+    // n1 polls reporting only a fresh v6 candidate — its v4 one must
+    // survive (COALESCE), not get wiped.
+    let req = json_request(
+        "POST",
+        "/poll",
+        Some(&bearer1),
+        json!({ "services": [], "endpoint_addr_v6": "[2001:db8::2]:51820" }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let conn = app.state.db.conn.lock().await;
+    let row = wireserve_coordinator::db::nodes::find_by_name(&conn, "n1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.endpoint_addr_v4.as_deref(), Some("203.0.113.5:51820"));
+    assert_eq!(row.endpoint_addr_v6.as_deref(), Some("[2001:db8::2]:51820"));
+}
+
+#[tokio::test]
+async fn admin_can_clear_a_single_endpoint_family() {
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({
+            "join_token": t1,
+            "pubkey": pubkey_for("n1"),
+            "listen_port": 51820,
+            "endpoint_addr_v4": "203.0.113.5:51820",
+            "endpoint_addr_v6": "[2001:db8::1]:51820",
+        }),
+    );
+    app.router.clone().oneshot(req).await.unwrap();
+
+    let req = raw_request(
+        "DELETE",
+        "/admin/nodes/n1/endpoint/v6",
+        Some(&format!("Bearer {ADMIN}")),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let conn = app.state.db.conn.lock().await;
+    let row = wireserve_coordinator::db::nodes::find_by_name(&conn, "n1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.endpoint_addr_v4.as_deref(), Some("203.0.113.5:51820"));
+    assert!(row.endpoint_addr_v6.is_none());
+}
+
+#[tokio::test]
+async fn admin_clear_endpoint_rejects_an_unknown_family() {
+    let app = test_app();
+    admin_create_node(&app.router, "n1").await;
+    let req = raw_request(
+        "DELETE",
+        "/admin/nodes/n1/endpoint/v5",
+        Some(&format!("Bearer {ADMIN}")),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert!(resp.status().is_client_error());
+}
+
+#[tokio::test]
+async fn probe_echoes_the_observed_source_address_per_family() {
+    let app = test_app();
+
+    let mut req = Request::builder()
+        .method("GET")
+        .uri("/probe")
+        .body(Body::empty())
+        .unwrap();
+    let v4: SocketAddr = "203.0.113.10:12345".parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(v4));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["addr"], "203.0.113.10");
+
+    let mut req = Request::builder()
+        .method("GET")
+        .uri("/probe")
+        .body(Body::empty())
+        .unwrap();
+    let v6: SocketAddr = "[2001:db8::5]:12345".parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(v6));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["addr"], "2001:db8::5");
+}
+
+#[tokio::test]
+async fn probe_uses_the_forwarded_address_when_the_proxy_is_trusted() {
+    let mut config = test_config("");
+    config.trust_proxy_headers = true;
+    let app = app_with_config(config);
+
+    let mut req = Request::builder()
+        .method("GET")
+        .uri("/probe")
+        .header("x-forwarded-for", "192.168.20.5")
+        .body(Body::empty())
+        .unwrap();
+    let proxy: SocketAddr = "10.0.0.9:443".parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(proxy));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["addr"], "192.168.20.5");
+}
+
+#[tokio::test]
 async fn poll_rejects_endpoint_addr_config_injection_attempt() {
     let app = test_app();
     let t1 = admin_create_node(&app.router, "n1").await;

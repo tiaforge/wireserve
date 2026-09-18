@@ -67,7 +67,14 @@ pub async fn poll(
     // every other node's /poll response and into rendered .conf files —
     // same validation as /register, applied here too since a node can
     // change its reported endpoint_addr on every poll (spec §4.3).
-    if let Some(endpoint) = &req.endpoint_addr {
+    for endpoint in [
+        req.endpoint_addr.as_deref(),
+        req.endpoint_addr_v4.as_deref(),
+        req.endpoint_addr_v6.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
         if !wireserve_types::is_valid_endpoint_addr(endpoint) {
             return Err(AppError::BadRequest(
                 "endpoint_addr must be a valid host:port".into(),
@@ -108,7 +115,16 @@ pub async fn poll(
 
     let mut conn = state.db.conn.lock().await;
 
-    nodes::update_poll_state(&conn, node.id, endpoint_addr.as_deref(), explicit.is_some())?;
+    nodes::update_poll_state(
+        &conn,
+        node.id,
+        &nodes::EndpointUpdate {
+            explicit: endpoint_addr.as_deref(),
+            reset_cleared: explicit.is_some(),
+            v4: req.endpoint_addr_v4.as_deref(),
+            v6: req.endpoint_addr_v6.as_deref(),
+        },
+    )?;
 
     let desired: Vec<(String, u16, Proto)> = req
         .services

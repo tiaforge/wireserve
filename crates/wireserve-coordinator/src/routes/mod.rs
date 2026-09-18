@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod poll;
+pub mod probe;
 pub mod register;
 
 use axum::extract::DefaultBodyLimit;
@@ -28,6 +29,7 @@ pub fn node_router(state: AppState) -> Router {
     Router::new()
         .route("/register", post(register::register))
         .route("/poll", post(poll::poll))
+        .route("/probe", get(probe::probe))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
@@ -45,6 +47,10 @@ pub fn admin_router(state: AppState) -> Router {
         .route(
             "/admin/nodes/{name}/endpoint",
             delete(admin::clear_node_endpoint),
+        )
+        .route(
+            "/admin/nodes/{name}/endpoint/{family}",
+            delete(admin::clear_node_endpoint_family),
         )
         .route("/admin/peers", get(admin::list_peers))
         .route("/admin/services", get(admin::list_services))

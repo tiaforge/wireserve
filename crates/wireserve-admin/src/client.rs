@@ -116,13 +116,21 @@ impl AdminClient {
         Ok(())
     }
 
-    /// `DELETE /admin/nodes/{name}/endpoint`. Clears a stale advertised
-    /// endpoint; the node re-reports one on its next poll if it still has
-    /// one configured locally.
-    pub fn clear_endpoint(&self, name: &str) -> Result<(), ClientError> {
+    /// `DELETE /admin/nodes/{name}/endpoint` (unqualified) or
+    /// `.../endpoint/{family}` (`family` = `Some("v4")`/`Some("v6")`).
+    /// Unqualified clears the explicit override plus both actively-probed
+    /// candidates; a family clears only that one probed candidate,
+    /// leaving the explicit override and the other family untouched. The
+    /// node re-reports whatever it clears if it still has that value
+    /// configured/reachable on its next poll.
+    pub fn clear_endpoint(&self, name: &str, family: Option<&str>) -> Result<(), ClientError> {
+        let path = match family {
+            Some(family) => format!("/admin/nodes/{name}/endpoint/{family}"),
+            None => format!("/admin/nodes/{name}/endpoint"),
+        };
         let resp = self
             .http
-            .delete(self.url(&format!("/admin/nodes/{name}/endpoint")))
+            .delete(self.url(&path))
             .bearer_auth(&self.admin_token)
             .send()?;
         Self::check_status(resp)?;

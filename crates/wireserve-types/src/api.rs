@@ -64,6 +64,19 @@ pub struct CreateNodeResponse {
     pub join_token_expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+// ---- Node: address probe (dual-family endpoint self-discovery) ----
+
+/// `GET /probe` response: the bare source address the coordinator saw
+/// this request arrive from (via `client_ip::resolve_client`, same as
+/// `/register`'s endpoint fallback), no port. Unauthenticated,
+/// unrelated to any node's registration state — a node calls it twice,
+/// once over a connection forced to IPv4 and once forced to IPv6, purely
+/// to learn which families it can actually reach the coordinator over.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProbeResponse {
+    pub addr: String,
+}
+
 // ---- §4.2 Node: register ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +89,16 @@ pub struct RegisterRequest {
     pub listen_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint_addr: Option<String>,
+    /// Actively self-discovered via the agent's own dual-family probe
+    /// against `/probe` (never derived by the coordinator from a single
+    /// passively-observed connection, unlike `endpoint_addr`'s fallback) —
+    /// see `wireserve-agent`'s `probe` module. Absent for a node that
+    /// couldn't reach the coordinator over that family at all, or for an
+    /// older agent that predates this field.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub endpoint_addr_v4: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub endpoint_addr_v6: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +140,12 @@ pub struct ServiceDecl {
 pub struct PollRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint_addr: Option<String>,
+    /// See `RegisterRequest::endpoint_addr_v4`'s doc comment — same
+    /// active self-discovery, re-run every poll cycle.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub endpoint_addr_v4: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub endpoint_addr_v6: Option<String>,
     #[serde(default)]
     pub services: Vec<ServiceDecl>,
 }
@@ -129,6 +158,14 @@ pub struct PeerInfo {
     pub ip6: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint_addr: Option<String>,
+    /// This peer's actively self-discovered candidates — see
+    /// `RegisterRequest::endpoint_addr_v4`. `endpoint_addr` above (an
+    /// operator's explicit override, or the older passive fallback) still
+    /// wins over both when present; see `wg::choose_peer_endpoint`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub endpoint_addr_v4: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub endpoint_addr_v6: Option<String>,
     /// See PLAN.md decisions log #3: approximated from the coordinator's
     /// own `last_seen` bookkeeping, not a true WireGuard handshake
     /// observation (the coordinator is never itself a WireGuard peer).
@@ -279,6 +316,8 @@ mod tests {
         assert_eq!(req.kind, NodeKind::Agent);
         assert!(req.listen_port.is_none());
         assert!(req.endpoint_addr.is_none());
+        assert!(req.endpoint_addr_v4.is_none());
+        assert!(req.endpoint_addr_v6.is_none());
     }
 
     #[test]
@@ -287,6 +326,8 @@ mod tests {
         let req: PollRequest = serde_json::from_str(json).unwrap();
         assert!(req.services.is_empty());
         assert!(req.endpoint_addr.is_none());
+        assert!(req.endpoint_addr_v4.is_none());
+        assert!(req.endpoint_addr_v6.is_none());
     }
 
     #[test]
@@ -322,6 +363,8 @@ mod tests {
                 ip4: "100.90.0.3".into(),
                 ip6: "fd00:90::3".into(),
                 endpoint_addr: Some("duckdns.example.com:51820".into()),
+                endpoint_addr_v4: Some("203.0.113.5:51820".into()),
+                endpoint_addr_v6: None,
                 last_handshake: None,
             }],
             services: vec![ServiceInfo {
@@ -338,6 +381,11 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let back: PollResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(back.peers.len(), 1);
+        assert_eq!(
+            back.peers[0].endpoint_addr_v4.as_deref(),
+            Some("203.0.113.5:51820")
+        );
+        assert!(back.peers[0].endpoint_addr_v6.is_none());
         assert_eq!(back.services[0].name, "plex");
         assert_eq!(back.services[0].proto, Proto::Tcp);
     }

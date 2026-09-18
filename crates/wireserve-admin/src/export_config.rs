@@ -57,12 +57,18 @@ pub fn render_conf(iface: &InterfaceParams, peers: &[PeerInfo]) -> String {
         if peer.pubkey == iface.own_pubkey {
             continue;
         }
-        if contains_newline(&peer.pubkey)
-            || peer
-                .endpoint_addr
-                .as_deref()
-                .is_some_and(contains_newline)
-        {
+        // A static `.conf`'s `Endpoint =` line can only hold one address —
+        // the explicit override always wins (unchanged); failing that,
+        // prefer the actively-probed v4 candidate over v6, since an
+        // official WireGuard client with no real IPv6 (not unusual —
+        // this is the exact failure this whole feature exists to fix)
+        // could never dial a v6-only endpoint.
+        let endpoint = peer
+            .endpoint_addr
+            .clone()
+            .or_else(|| peer.endpoint_addr_v4.clone())
+            .or_else(|| peer.endpoint_addr_v6.clone());
+        if contains_newline(&peer.pubkey) || endpoint.as_deref().is_some_and(contains_newline) {
             eprintln!(
                 "warning: skipping peer '{}' — its pubkey or endpoint_addr contains a newline, \
                  which could otherwise inject extra .conf directives; this indicates either a \
@@ -75,7 +81,7 @@ pub fn render_conf(iface: &InterfaceParams, peers: &[PeerInfo]) -> String {
         out.push_str("[Peer]\n");
         out.push_str(&format!("PublicKey = {}\n", peer.pubkey));
         out.push_str(&format!("AllowedIPs = {}/32, {}/128\n", peer.ip4, peer.ip6));
-        if let Some(endpoint) = &peer.endpoint_addr {
+        if let Some(endpoint) = &endpoint {
             out.push_str(&format!("Endpoint = {endpoint}\n"));
         }
         // This device likely roams networks (wifi/cellular switching, laptop
@@ -121,6 +127,8 @@ pub fn run(
             kind: NodeKind::Static,
             listen_port: None,
             endpoint_addr: None,
+            endpoint_addr_v4: None,
+            endpoint_addr_v6: None,
         },
     )?;
 
@@ -147,6 +155,8 @@ mod tests {
             ip4: ip4.into(),
             ip6: ip6.into(),
             endpoint_addr: endpoint.map(String::from),
+            endpoint_addr_v4: None,
+            endpoint_addr_v6: None,
             last_handshake: None,
         }
     }
@@ -185,6 +195,23 @@ mod tests {
         )];
         let conf = render_conf(&iface(), &peers);
         assert!(conf.contains("Endpoint = duckdns.example.com:51820"));
+    }
+
+    #[test]
+    fn prefers_v4_over_v6_when_both_are_set_and_no_explicit_override() {
+        let mut p = peer("otherpubkey", "100.90.0.3", "fd00:90::3", None);
+        p.endpoint_addr_v4 = Some("203.0.113.5:51820".into());
+        p.endpoint_addr_v6 = Some("[2001:db8::1]:51820".into());
+        let conf = render_conf(&iface(), &[p]);
+        assert!(conf.contains("Endpoint = 203.0.113.5:51820"));
+    }
+
+    #[test]
+    fn falls_back_to_v6_when_only_v6_is_available() {
+        let mut p = peer("otherpubkey", "100.90.0.3", "fd00:90::3", None);
+        p.endpoint_addr_v6 = Some("[2001:db8::1]:51820".into());
+        let conf = render_conf(&iface(), &[p]);
+        assert!(conf.contains("Endpoint = [2001:db8::1]:51820"));
     }
 
     #[test]
@@ -283,6 +310,8 @@ mod tests {
             kind: NodeKind::Static,
             listen_port: None,
             endpoint_addr: None,
+            endpoint_addr_v4: None,
+            endpoint_addr_v6: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains(&private_key.to_string()));

@@ -25,6 +25,8 @@ pub fn peer_info(node: &NodeRow, online_threshold_secs: i64) -> PeerInfo {
         ip4: node.ip4.clone().unwrap_or_default(),
         ip6: node.ip6.clone().unwrap_or_default(),
         endpoint_addr: node.endpoint_addr.clone(),
+        endpoint_addr_v4: node.endpoint_addr_v4.clone(),
+        endpoint_addr_v6: node.endpoint_addr_v6.clone(),
         last_handshake: if recent { node.last_seen } else { None },
     }
 }
@@ -107,6 +109,8 @@ mod tests {
             ip6: Some("fd00:90::1".into()),
             endpoint_addr: None,
             endpoint_cleared: false,
+            endpoint_addr_v4: None,
+            endpoint_addr_v6: None,
             listen_port: Some(51820),
             revoked: false,
             last_seen,

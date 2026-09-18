@@ -4,6 +4,7 @@ pub mod hosts;
 pub mod ipc;
 pub mod paths;
 pub mod poll_loop;
+pub mod probe;
 pub mod register;
 pub mod state;
 pub mod wg;

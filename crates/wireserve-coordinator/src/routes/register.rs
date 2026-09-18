@@ -33,7 +33,14 @@ pub async fn register(
             "pubkey must be a standard-base64-encoded 32-byte WireGuard public key".into(),
         ));
     }
-    if let Some(endpoint) = &req.endpoint_addr {
+    for endpoint in [
+        req.endpoint_addr.as_deref(),
+        req.endpoint_addr_v4.as_deref(),
+        req.endpoint_addr_v6.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
         if !wireserve_types::is_valid_endpoint_addr(endpoint) {
             return Err(AppError::BadRequest(
                 "endpoint_addr must be a valid host:port".into(),
@@ -148,7 +155,7 @@ pub async fn register(
     // reverse proxy in front of the coordinator, so an unqualified
     // fallback would hand out the proxy's own useless local address to
     // every other node as this node's "reachable" endpoint.
-    let (endpoint_addr, listen_port) = if node.kind == NodeKind::Agent {
+    let (endpoint_addr, endpoint_addr_v4, endpoint_addr_v6, listen_port) = if node.kind == NodeKind::Agent {
         // Loopback is unconditionally useless to any other peer, in any
         // topology. A private-range address is only suspect when we've
         // been told to expect a proxy (trust_proxy_headers) yet still
@@ -172,9 +179,14 @@ pub async fn register(
             req.listen_port,
             state.config.trust_proxy_headers,
         );
-        (endpoint, req.listen_port)
+        (
+            endpoint,
+            req.endpoint_addr_v4.clone(),
+            req.endpoint_addr_v6.clone(),
+            req.listen_port,
+        )
     } else {
-        (None, None)
+        (None, None, None, None)
     };
 
     let bearer_token = tokengen::generate(BEARER_TOKEN_PREFIX);
@@ -189,6 +201,8 @@ pub async fn register(
             ip6,
             listen_port,
             endpoint_addr: endpoint_addr.as_deref(),
+            endpoint_addr_v4: endpoint_addr_v4.as_deref(),
+            endpoint_addr_v6: endpoint_addr_v6.as_deref(),
             bearer_token_hash: &bearer_hash,
         },
     )?;
