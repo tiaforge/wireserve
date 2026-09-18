@@ -147,7 +147,20 @@ impl FirewallBackend for NftablesBackend {
 
     /// Removes the `wireserve` table entirely, if present. No-op if it was
     /// never created (e.g. a fresh install where `apply` was never called).
+    ///
+    /// Skips the netlink round-trip entirely when there is nothing to
+    /// delete: sending a batch containing only `BATCH_BEGIN`/`BATCH_END`
+    /// (no actual operations) is a real hang on at least some kernels —
+    /// observed on a fresh node's first `daemon` startup, where
+    /// `startup_sequence` calls `teardown()` before any `wireserve` table
+    /// has ever been created, so `batch.send()` sat blocked in `recvfrom`
+    /// forever waiting for an ACK the kernel never sent for the no-op
+    /// batch. `apply()` is unaffected since it always queues real
+    /// operations (table/chain/rules), even when called with `&[]`.
     fn teardown(&mut self) -> Result<(), Self::Error> {
+        if Self::existing_table()?.is_none() {
+            return Ok(());
+        }
         let mut batch = Batch::new();
         Self::queue_delete_existing(&mut batch)?;
         batch.send()?;
