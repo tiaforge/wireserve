@@ -15,6 +15,10 @@ pub struct NodeRow {
     pub ip4: Option<String>,
     pub ip6: Option<String>,
     pub endpoint_addr: Option<String>,
+    /// Set by the `DELETE /admin/nodes/:name/endpoint` admin action; see
+    /// `clear_endpoint`'s doc comment. Gates whether `/poll` is allowed to
+    /// re-derive `endpoint_addr` from the observed source address.
+    pub endpoint_cleared: bool,
     pub listen_port: Option<i64>,
     pub revoked: bool,
     pub last_seen: Option<DateTime<Utc>>,
@@ -32,6 +36,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
         ip4: row.get("ip4")?,
         ip6: row.get("ip6")?,
         endpoint_addr: row.get("endpoint_addr")?,
+        endpoint_cleared: row.get("endpoint_cleared")?,
         listen_port: row.get("listen_port")?,
         revoked: row.get("revoked")?,
         last_seen: last_seen_str.and_then(|s| parse_dt(&s)),
@@ -173,7 +178,7 @@ pub fn apply_redemption(conn: &Connection, node_id: i64, r: &Redemption<'_>) -> 
     conn.execute(
         "UPDATE nodes SET pubkey = ?1, ip4 = ?2, ip6 = ?3, listen_port = ?4, \
          endpoint_addr = ?5, bearer_token_hash = ?6, join_token_hash = NULL, \
-         join_token_used = 1, revoked = 0, revoked_at = NULL \
+         join_token_used = 1, revoked = 0, revoked_at = NULL, endpoint_cleared = 0 \
          WHERE id = ?7",
         rusqlite::params![
             r.pubkey,
@@ -202,15 +207,23 @@ pub fn find_by_bearer_hash(conn: &Connection, hash: &str) -> Result<Option<NodeR
     .map_err(DbError::from)
 }
 
+/// `endpoint_addr` is the value to write (if any — `None` means "no
+/// opinion this poll," preserved via `COALESCE` exactly as before).
+/// `reset_cleared` is true exactly when the node itself reported an
+/// explicit `endpoint_addr` this poll: an explicit assertion always
+/// un-clears (see `clear_endpoint`'s doc comment), regardless of whether
+/// the auto-detected fallback was gated off by a previous clear.
 pub fn update_poll_state(
     conn: &Connection,
     node_id: i64,
     endpoint_addr: Option<&str>,
+    reset_cleared: bool,
 ) -> Result<(), DbError> {
     conn.execute(
-        "UPDATE nodes SET last_seen = ?1, endpoint_addr = COALESCE(?2, endpoint_addr) \
-         WHERE id = ?3",
-        rusqlite::params![now_str(), endpoint_addr, node_id],
+        "UPDATE nodes SET last_seen = ?1, endpoint_addr = COALESCE(?2, endpoint_addr), \
+         endpoint_cleared = CASE WHEN ?3 THEN 0 ELSE endpoint_cleared END \
+         WHERE id = ?4",
+        rusqlite::params![now_str(), endpoint_addr, reset_cleared, node_id],
     )?;
     Ok(())
 }
@@ -308,9 +321,16 @@ pub fn clear_bearer_token(conn: &Connection, node_id: i64) -> Result<(), DbError
 /// one.** If the node still has an endpoint set locally it will report
 /// it again on its next poll and the column comes back. To stop that,
 /// change it at the node.
+///
+/// Also sets `endpoint_cleared`, so `/poll`'s observed-source-address
+/// self-healing (`client_ip::endpoint_fallback`) does not immediately
+/// undo this by re-deriving a value on the very next poll — that flag is
+/// what actually makes the guarantee above true for the *auto-detected*
+/// case, not just the "node reports its own" case the doc comment above
+/// already covered before self-healing existed.
 pub fn clear_endpoint(conn: &Connection, node_id: i64) -> Result<(), DbError> {
     conn.execute(
-        "UPDATE nodes SET endpoint_addr = NULL WHERE id = ?1",
+        "UPDATE nodes SET endpoint_addr = NULL, endpoint_cleared = 1 WHERE id = ?1",
         [node_id],
     )?;
     Ok(())
@@ -676,14 +696,19 @@ mod tests {
         .unwrap();
         clear_endpoint(&conn, id).unwrap();
 
-        update_poll_state(&conn, id, None).unwrap();
+        update_poll_state(&conn, id, None, false).unwrap();
         assert!(find_by_name(&conn, "n1").unwrap().unwrap().endpoint_addr.is_none());
 
-        update_poll_state(&conn, id, Some("5.6.7.8:51820")).unwrap();
+        update_poll_state(&conn, id, Some("5.6.7.8:51820"), true).unwrap();
+        let row = find_by_name(&conn, "n1").unwrap().unwrap();
         assert_eq!(
-            find_by_name(&conn, "n1").unwrap().unwrap().endpoint_addr.as_deref(),
+            row.endpoint_addr.as_deref(),
             Some("5.6.7.8:51820"),
             "a node that does report an endpoint still sets it"
+        );
+        assert!(
+            !row.endpoint_cleared,
+            "an explicit report resets the cleared flag too"
         );
     }
 

@@ -1,4 +1,6 @@
-use axum::extract::State;
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, State};
 use axum::Json;
 use wireserve_types::{PollRequest, PollResponse, Proto};
 
@@ -19,6 +21,8 @@ pub use wireserve_types::MAX_SERVICES_PER_NODE;
 /// own state and pulls the current mesh + service directory.
 pub async fn poll(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     BearerNode { node }: BearerNode,
     Json(req): Json<PollRequest>,
 ) -> Result<Json<PollResponse>, AppError> {
@@ -71,9 +75,40 @@ pub async fn poll(
         }
     }
 
+    // Same observed-source-address fallback as `/register` (spec §4.2),
+    // re-applied on every poll rather than frozen at join time — see
+    // `client_ip::endpoint_fallback`'s doc comment for why (an operator's
+    // own explicit --endpoint-addr, sent every poll, still always wins).
+    //
+    // But never when an admin has explicitly cleared this node's endpoint
+    // (`node.endpoint_cleared`) — self-healing would otherwise undo that
+    // clear on the very next poll, which is the one guarantee
+    // `clear_endpoint` exists to make. An explicit report from the node
+    // itself is exempt from that gate (and resets it): the node asserting
+    // its own address is not the coordinator guessing again.
+    let explicit = req.endpoint_addr.as_deref();
+    let endpoint_addr = if explicit.is_some() {
+        explicit.map(str::to_string)
+    } else if node.endpoint_cleared {
+        None
+    } else {
+        let client = crate::client_ip::resolve_client(
+            &headers,
+            peer_addr.ip(),
+            state.config.trust_proxy_headers,
+        );
+        let listen_port = node.listen_port.and_then(|p| u16::try_from(p).ok());
+        crate::client_ip::endpoint_fallback(
+            None,
+            &client,
+            listen_port,
+            state.config.trust_proxy_headers,
+        )
+    };
+
     let mut conn = state.db.conn.lock().await;
 
-    nodes::update_poll_state(&conn, node.id, req.endpoint_addr.as_deref())?;
+    nodes::update_poll_state(&conn, node.id, endpoint_addr.as_deref(), explicit.is_some())?;
 
     let desired: Vec<(String, u16, Proto)> = req
         .services

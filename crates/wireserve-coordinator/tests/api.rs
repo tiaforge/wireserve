@@ -2012,6 +2012,52 @@ async fn a_node_that_still_has_an_endpoint_re_reports_it_after_clearing() {
 }
 
 #[tokio::test]
+async fn poll_self_heals_the_endpoint_as_the_observed_address_changes() {
+    // The point of re-deriving the fallback on every poll rather than
+    // only at registration: a node with no --endpoint-addr, whose real
+    // address changes over time (dynamic WAN IP, no dynamic-DNS name
+    // configured), stays reachable without an operator having to notice
+    // and force a rejoin.
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+
+    // register_node's requests carry the default PEER_IP.
+    let conn = app.state.db.conn.lock().await;
+    let row = wireserve_coordinator::db::nodes::find_by_name(&conn, "n1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.endpoint_addr.as_deref(), Some(format!("{PEER_IP}:51820").as_str()));
+    drop(conn);
+
+    // A later poll, with no explicit endpoint_addr, from a different
+    // source address.
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/poll")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {bearer1}"))
+        .body(Body::from(json!({ "services": [] }).to_string()))
+        .unwrap();
+    let new_peer: SocketAddr = "198.51.100.7:22000".parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(new_peer));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let conn = app.state.db.conn.lock().await;
+    let row = wireserve_coordinator::db::nodes::find_by_name(&conn, "n1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.endpoint_addr.as_deref(),
+        Some("198.51.100.7:51820"),
+        "a poll from a new address should update the auto-detected endpoint, \
+         not leave it frozen at whatever was observed during registration"
+    );
+}
+
+#[tokio::test]
 async fn clear_endpoint_is_404_for_an_unknown_node_and_401_without_admin_auth() {
     let app = test_app();
     admin_create_node(&app.router, "n1").await;

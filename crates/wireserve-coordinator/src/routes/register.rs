@@ -166,17 +166,12 @@ pub async fn register(
         // peer with no endpoint cannot be dialled, and a node only learns
         // a peer's real address from traffic that peer sent first, a mesh
         // where nobody has an endpoint never forms at all.
-        let observed_is_unusable = crate::client_ip::is_loopback(observed_ip)
-            || (state.config.trust_proxy_headers
-                && !client.from_forwarded_header
-                && crate::client_ip::is_loopback_or_private(observed_ip));
-        let endpoint = req.endpoint_addr.clone().or_else(|| {
-            if observed_is_unusable {
-                None
-            } else {
-                req.listen_port.map(|port| format!("{observed_ip}:{port}"))
-            }
-        });
+        let endpoint = crate::client_ip::endpoint_fallback(
+            req.endpoint_addr.as_deref(),
+            &client,
+            req.listen_port,
+            state.config.trust_proxy_headers,
+        );
         (endpoint, req.listen_port)
     } else {
         (None, None)

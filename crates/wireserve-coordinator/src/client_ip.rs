@@ -114,6 +114,36 @@ pub fn is_loopback(ip: IpAddr) -> bool {
     }
 }
 
+/// Computes the endpoint-address fallback shared by `/register` (spec
+/// §4.2) and `/poll`: an explicitly-reported address always wins (an
+/// operator who set one — e.g. a dynamic-DNS name for an IP that changes —
+/// knows better than an observed source address ever could); failing
+/// that, the observed source address paired with the node's own reported
+/// listen port, unless the observed address is unusable (see
+/// [`is_loopback`] / [`is_loopback_or_private`]'s doc comments for why).
+///
+/// Used on every `/poll`, not just at registration, so a node's endpoint
+/// keeps tracking its actual observed address as it changes (a roaming
+/// laptop, an ISP that rotates the WAN IP) rather than freezing whatever
+/// was observed once at `join` time forever.
+#[must_use]
+pub fn endpoint_fallback(
+    explicit: Option<&str>,
+    client: &ResolvedClient,
+    listen_port: Option<u16>,
+    trust_proxy_headers: bool,
+) -> Option<String> {
+    if let Some(explicit) = explicit {
+        return Some(explicit.to_string());
+    }
+    let observed_is_unusable = is_loopback(client.ip)
+        || (trust_proxy_headers && !client.from_forwarded_header && is_loopback_or_private(client.ip));
+    if observed_is_unusable {
+        return None;
+    }
+    listen_port.map(|port| format!("{}:{port}", client.ip))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

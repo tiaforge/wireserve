@@ -91,6 +91,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0001_init.sql")),
         M::up(include_str!("../../migrations/0002_join_token_expiry.sql")),
         M::up(include_str!("../../migrations/0003_service_approval.sql")),
+        M::up(include_str!("../../migrations/0004_endpoint_cleared.sql")),
     ])
 }
 
@@ -313,6 +314,29 @@ mod tests {
             rows[0].declared_at.is_some(),
             "a legacy timestamp must survive as a parsed value, not silently become None"
         );
+    }
+
+    #[test]
+    fn migration_grandfathers_existing_nodes_as_not_endpoint_cleared() {
+        // ADD COLUMN ... DEFAULT 0 already gives every existing row
+        // `false` for free, but pinned anyway: if that default were ever
+        // dropped or changed, every already-registered node would
+        // silently stop self-healing its endpoint on poll (see
+        // client_ip::endpoint_fallback), with no error anywhere.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        migrations().to_version(&mut conn, 3).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (name, kind, pubkey, ip4, ip6, join_token_used) \
+             VALUES ('n1', 'agent', 'pk1', '100.90.0.1', 'fd00:90::1', 1)",
+            [],
+        )
+        .unwrap();
+
+        migrations().to_latest(&mut conn).unwrap();
+
+        let row = crate::db::nodes::find_by_name(&conn, "n1").unwrap().unwrap();
+        assert!(!row.endpoint_cleared);
     }
 
     #[test]

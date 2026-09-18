@@ -106,6 +106,7 @@ mod tests {
             ip4: Some("100.90.0.1".into()),
             ip6: Some("fd00:90::1".into()),
             endpoint_addr: None,
+            endpoint_cleared: false,
             listen_port: Some(51820),
             revoked: false,
             last_seen,

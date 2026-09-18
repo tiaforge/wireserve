@@ -1,0 +1,16 @@
+-- Tracks whether an admin explicitly cleared a node's stale
+-- `endpoint_addr` (DELETE /admin/nodes/:name/endpoint), as distinct from
+-- the column simply never having been set.
+--
+-- /poll now re-applies the observed-source-address endpoint fallback on
+-- every poll, not just at registration (so a node's endpoint keeps
+-- tracking its real address as it changes, rather than freezing whatever
+-- was observed once at join time). That self-healing must not silently
+-- undo an admin's clear -- the whole point of clearing is telling the
+-- coordinator "stop advertising this address until you hear otherwise" --
+-- so a poll only re-derives the fallback when this flag is unset. An
+-- explicit endpoint_addr reported by the node itself always resets it:
+-- the node asserting its own address is not the coordinator guessing
+-- again. See client_ip::endpoint_fallback and nodes::clear_endpoint's
+-- doc comments.
+ALTER TABLE nodes ADD COLUMN endpoint_cleared BOOLEAN NOT NULL DEFAULT 0;
