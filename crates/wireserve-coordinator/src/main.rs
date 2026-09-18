@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use wireserve_coordinator::{build_state, config, db::Db, routes, Config};
 
@@ -123,6 +123,18 @@ async fn main() {
         );
     }
 
+    eprintln!("========================================================================");
+    eprintln!("wireserve-coordinator is up.");
+    eprintln!();
+    eprintln!(
+        "  Point your reverse proxy at:  http://{}",
+        proxy_target(listen_addr)
+    );
+    eprintln!("  (it must terminate TLS — the coordinator itself never speaks TLS, §7)");
+    eprintln!();
+    eprintln!("  Next: add a node —  wireserve-admin create-node <name>");
+    eprintln!("========================================================================");
+
     tracing::info!(%listen_addr, %admin_listen_addr, "wireserve-coordinator starting");
 
     let node_server = axum::serve(node_listener, node_app);
@@ -131,5 +143,47 @@ async fn main() {
     if let Err(err) = tokio::try_join!(node_server, admin_server) {
         eprintln!("server error: {err}");
         std::process::exit(1);
+    }
+}
+
+/// Resolves a listen address to the one a reverse proxy on the same host
+/// should actually be told to connect to. A wildcard bind (`0.0.0.0` or
+/// `::`) is not itself a connectable address — nothing dials `0.0.0.0` —
+/// but a proxy on the same host reaches it via loopback regardless of
+/// what it bound to, so that's what gets printed instead. An address the
+/// operator explicitly set to something else (a specific interface, a
+/// container-network address) is left as-is, since that's what actually
+/// matters for whatever topology led them to set it.
+fn proxy_target(addr: SocketAddr) -> SocketAddr {
+    if !addr.ip().is_unspecified() {
+        return addr;
+    }
+    let loopback = match addr {
+        SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+    };
+    SocketAddr::new(loopback, addr.port())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wildcard_v4_resolves_to_loopback() {
+        let addr: SocketAddr = "0.0.0.0:47820".parse().unwrap();
+        assert_eq!(proxy_target(addr), "127.0.0.1:47820".parse().unwrap());
+    }
+
+    #[test]
+    fn wildcard_v6_resolves_to_loopback() {
+        let addr: SocketAddr = "[::]:47820".parse().unwrap();
+        assert_eq!(proxy_target(addr), "[::1]:47820".parse().unwrap());
+    }
+
+    #[test]
+    fn explicit_address_is_left_alone() {
+        let addr: SocketAddr = "10.0.0.5:47820".parse().unwrap();
+        assert_eq!(proxy_target(addr), addr);
     }
 }
