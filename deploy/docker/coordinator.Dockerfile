@@ -18,8 +18,8 @@
 #   docker exec -it <container> wireserve-admin create-node homeserver
 #
 # which reaches the loopback-bound admin port from inside the same
-# network namespace. The node-facing port (8080) has no such restriction
-# and can be published normally, e.g. `-p 127.0.0.1:8080:8080` with a
+# network namespace. The node-facing port (47820) has no such restriction
+# and can be published normally, e.g. `-p 127.0.0.1:47820:47820` with a
 # reverse proxy terminating TLS in front of that, per spec §7.
 
 # ---- build stage ----
@@ -67,24 +67,21 @@ COPY --from=builder /out/wireserve-admin /usr/local/bin/wireserve-admin
 
 USER wireserve
 ENV WIRESERVE_DB_PATH=/var/lib/wireserve/coordinator.db
-ENV WIRESERVE_LISTEN_ADDR=0.0.0.0:8080
-ENV WIRESERVE_ADMIN_LISTEN_ADDR=127.0.0.1:8081
-# Mesh addressing. Both differ from the binary's own compiled-in defaults
-# (100.90.0.0/24 and fd00:90::/64), deliberately — see the commentary in
-# deploy/env/coordinator.env.example for why each one was moved. Set
-# these before the first node registers: addresses are allocated once and
-# kept, so a later change leaves the mesh addressed out of two ranges.
-# Override at run time with --env-file or -e as usual.
-ENV WIRESERVE_NET_V4_CIDR=10.90.0.0/24
-ENV WIRESERVE_NET_V6_PREFIX=fdb4:d481:7c21::/64
+ENV WIRESERVE_LISTEN_ADDR=0.0.0.0:47820
+ENV WIRESERVE_ADMIN_LISTEN_ADDR=127.0.0.1:47821
+# Mesh addressing and the admin token are NOT set here on purpose: leaving
+# them unset lets the coordinator generate and persist all three itself
+# on first start, into the /var/lib/wireserve volume declared below, so
+# they survive container recreation. Set any of
+# WIRESERVE_ADMIN_TOKEN/WIRESERVE_NET_V4_CIDR/WIRESERVE_NET_V6_PREFIX at
+# run time with --env-file or -e if you'd rather manage one yourself —
+# see deploy/env/coordinator.env.example.
 # Convenience defaults so a bare `wireserve-admin <subcommand>` works from
-# a `docker exec` shell without extra flags — WIRESERVE_ADMIN_TOKEN itself
-# must still come from the coordinator's own env (see coordinator.env),
-# never baked into the image. Two different URLs, matching the two
-# separately-bound listeners: WIRESERVE_COORDINATOR_URL for /admin/*,
-# WIRESERVE_REGISTER_URL for export-config's /register call.
-ENV WIRESERVE_COORDINATOR_URL=http://127.0.0.1:8081
-ENV WIRESERVE_REGISTER_URL=http://127.0.0.1:8080
+# a `docker exec` shell without extra flags. Two different URLs, matching
+# the two separately-bound listeners: WIRESERVE_COORDINATOR_URL for
+# /admin/*, WIRESERVE_REGISTER_URL for export-config's /register call.
+ENV WIRESERVE_COORDINATOR_URL=http://127.0.0.1:47821
+ENV WIRESERVE_REGISTER_URL=http://127.0.0.1:47820
 VOLUME ["/var/lib/wireserve"]
-EXPOSE 8080
+EXPOSE 47820
 ENTRYPOINT ["/usr/local/bin/wireserve-coordinator"]

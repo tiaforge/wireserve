@@ -1,0 +1,21 @@
+# Reverse proxy for wireserve-coordinator, using Caddy.
+#
+# Install at /etc/caddy/Caddyfile (or drop into /etc/caddy/conf.d/ with an
+# `import` line, depending on your distro's packaging), replace the
+# hostname below, and `systemctl reload caddy`. Caddy requests and renews
+# the certificate itself via ACME/Let's Encrypt — nothing else to set up
+# for TLS.
+#
+# This is the only piece of the reverse-proxy topology this project asks
+# you to run yourself (spec §7): the coordinator never terminates TLS or
+# holds a certificate.
+
+wireserve.example.com {
+	reverse_proxy 127.0.0.1:47820
+}
+
+# X-Forwarded-For / X-Forwarded-Proto are set by reverse_proxy
+# automatically. Set WIRESERVE_TRUST_PROXY_HEADERS=true in
+# coordinator.env once this proxy is the *only* way to reach the
+# node-facing listener — with a directly reachable listener, turning that
+# on lets a client forge its own source address and evade rate limiting.

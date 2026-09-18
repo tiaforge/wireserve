@@ -9,14 +9,20 @@
 //! plain trimmed-text file holding just the token, not a structured
 //! TOML/YAML config, since there's exactly one secret to store.
 
+/// The coordinator's own compiled-in default for `WIRESERVE_ADMIN_LISTEN_ADDR`
+/// (`crates/wireserve-coordinator/src/config.rs`). The admin listener is
+/// loopback-only by construction — the coordinator refuses to start
+/// otherwise — so defaulting to it here removes a setting that is
+/// effectively never anything else, while an operator with a nonstandard
+/// admin listen address can still override it exactly as before.
+const DEFAULT_COORDINATOR_URL: &str = "http://127.0.0.1:47821";
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error(
         "no admin token found — pass --admin-token, set WIRESERVE_ADMIN_TOKEN, or write one to {0}"
     )]
     MissingAdminToken(String),
-    #[error("no coordinator URL found — pass --coordinator-url or set WIRESERVE_COORDINATOR_URL")]
-    MissingCoordinatorUrl,
     #[error(
         "no node-facing URL found for the /register call — pass --register-url or set \
          WIRESERVE_REGISTER_URL. This is the coordinator's OTHER listener: spec §4.0 requires \
@@ -58,8 +64,9 @@ pub fn resolve_admin_token(cli_flag: Option<&str>) -> Result<String, ConfigError
 }
 
 /// Resolves the coordinator base URL from an explicit CLI flag or the
-/// `WIRESERVE_COORDINATOR_URL` env var; trailing slashes are stripped so
-/// every caller can safely append a path starting with `/`.
+/// `WIRESERVE_COORDINATOR_URL` env var, falling back to the admin
+/// listener's own compiled-in default address; trailing slashes are
+/// stripped so every caller can safely append a path starting with `/`.
 pub fn resolve_coordinator_url(cli_flag: Option<&str>) -> Result<String, ConfigError> {
     if let Some(u) = cli_flag {
         if !u.is_empty() {
@@ -71,7 +78,7 @@ pub fn resolve_coordinator_url(cli_flag: Option<&str>) -> Result<String, ConfigE
             return Ok(u.trim_end_matches('/').to_string());
         }
     }
-    Err(ConfigError::MissingCoordinatorUrl)
+    Ok(DEFAULT_COORDINATOR_URL.to_string())
 }
 
 /// Resolves the node-facing base URL used only by `export-config`'s
@@ -152,10 +159,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_coordinator_url_is_an_error() {
+    fn missing_coordinator_url_falls_back_to_the_admin_listener_default() {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::remove_var("WIRESERVE_COORDINATOR_URL");
-        assert!(resolve_coordinator_url(None).is_err());
+        assert_eq!(
+            resolve_coordinator_url(None).unwrap(),
+            DEFAULT_COORDINATOR_URL
+        );
     }
 
     #[test]

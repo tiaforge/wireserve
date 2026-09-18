@@ -174,7 +174,7 @@ pass "agent1 is reachable from the inet segment, the other two are not"
 
 log "checking the agents can reach the coordinator through NAT at all"
 for a in "$AGENT1" "$AGENT2" "$AGENT3"; do
-    podman exec "$a" timeout 10 bash -c "exec 3<>/dev/tcp/$COORD_IP/8080" \
+    podman exec "$a" timeout 10 bash -c "exec 3<>/dev/tcp/$COORD_IP/47820" \
         || fail "$a cannot reach the coordinator through its NAT"
 done
 pass "all three agents reach the coordinator through their NAT"
@@ -189,13 +189,13 @@ JT2=$(create_node node2)
 JT3=$(create_node node3)
 # agent1 knows its public endpoint, because somebody configured the
 # port-forward and told it so. This is the normal home-server case.
-podman exec "$AGENT1" wireserve-agent join "http://$COORD_IP:8080" "$JT1" \
+podman exec "$AGENT1" wireserve-agent join "http://$COORD_IP:47820" "$JT1" \
     --listen-port "$WG_PORT" --endpoint-addr "$ROUTER_A_WAN:$WG_PORT" 2>/dev/null
 # agent2 and agent3 do not: they are behind NAT with nothing forwarded, so
 # they leave it unset and the coordinator falls back to the source address
 # it observes (spec §4.2).
-podman exec "$AGENT2" wireserve-agent join "http://$COORD_IP:8080" "$JT2" --listen-port "$WG_PORT" 2>/dev/null
-podman exec "$AGENT3" wireserve-agent join "http://$COORD_IP:8080" "$JT3" --listen-port "$WG_PORT" 2>/dev/null
+podman exec "$AGENT2" wireserve-agent join "http://$COORD_IP:47820" "$JT2" --listen-port "$WG_PORT" 2>/dev/null
+podman exec "$AGENT3" wireserve-agent join "http://$COORD_IP:47820" "$JT3" --listen-port "$WG_PORT" 2>/dev/null
 pass "all three nodes registered from behind NAT"
 
 log "what endpoint did the coordinator record for each node?"

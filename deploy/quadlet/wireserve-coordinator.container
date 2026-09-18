@@ -16,16 +16,15 @@ Wants=network-online.target
 
 [Container]
 Image=localhost/wireserve-coordinator:latest
-# Start from deploy/env/coordinator.env.example — it documents every
-# setting, including the mesh ranges (WIRESERVE_NET_V4_CIDR /
-# WIRESERVE_NET_V6_PREFIX) that must be right before the first node
-# registers.
-EnvironmentFile=/etc/wireserve/coordinator.env
+# Entirely optional — see deploy/env/coordinator.env.example. The admin
+# token and both mesh ranges are auto-generated and persisted into the
+# volume below on first start if you don't set them here.
+EnvironmentFile=-/etc/wireserve/coordinator.env
 # Node-facing port: publish per your reverse-proxy topology (often not
 # published to the host at all — see the Dockerfile's own comments and
 # PLAN.md decisions log #24 — a private Docker/Podman network reaching it
 # by container name is the common case).
-PublishPort=127.0.0.1:8080:8080
+PublishPort=127.0.0.1:47820:47820
 # The admin port is deliberately not published at all. It binds loopback
 # INSIDE the container (spec §4.0: never 0.0.0.0), so a PublishPort for
 # it would forward to a port nothing listens on. Reach it with

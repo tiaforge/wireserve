@@ -24,10 +24,39 @@ fn init_logging() {
 async fn main() {
     init_logging();
 
-    let config = Config::from_env().unwrap_or_else(|err| {
+    let loaded = Config::load().unwrap_or_else(|err| {
         eprintln!("configuration error: {err}");
         std::process::exit(1);
     });
+    let config = loaded.config;
+
+    if !loaded.generated.is_empty() {
+        eprintln!("======================================================================");
+        eprintln!("wireserve-coordinator: first run — generated the following and saved");
+        eprintln!("them to {}:", loaded.secrets_path.display());
+        for key in &loaded.generated {
+            match *key {
+                "WIRESERVE_ADMIN_TOKEN" => {
+                    eprintln!("  WIRESERVE_ADMIN_TOKEN = {}", config.admin_token);
+                }
+                "WIRESERVE_NET_V4_CIDR" => {
+                    eprintln!("  WIRESERVE_NET_V4_CIDR = {}", config.net_v4_cidr);
+                }
+                "WIRESERVE_NET_V6_PREFIX" => {
+                    eprintln!("  WIRESERVE_NET_V6_PREFIX = {}", config.net_v6_prefix);
+                }
+                _ => {}
+            }
+        }
+        eprintln!(
+            "These are kept for the life of this mesh — nothing else needs to be done, and \
+             `sudo cat {}` retrieves them again any time. Set any of these as an environment \
+             variable yourself if you'd rather manage it your own way; an explicit value \
+             always overrides what's stored here.",
+            loaded.secrets_path.display()
+        );
+        eprintln!("======================================================================");
+    }
 
     let db = Db::open(&config.db_path).unwrap_or_else(|err| {
         eprintln!("failed to open database: {err}");

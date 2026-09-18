@@ -8,10 +8,10 @@
 # coordinator, so the topology the spec actually mandates was the one
 # thing never exercised.
 #
-#   [agent1]─┐                     ┌──────────────┐
-#            ├── https ──▶ [nginx] │ coordinator  │
-#   [agent2]─┘   (TLS)     plain──▶│ 8080 only    │
-#                                  └──────────────┘
+#   [agent1]─┐                     ┌───────────────┐
+#            ├── https ──▶ [nginx] │ coordinator   │
+#   [agent2]─┘   (TLS)     plain──▶│ 47820 only    │
+#                                  └───────────────┘
 #
 # The coordinator sits on an internal-only segment that agents cannot
 # reach at all; the proxy is the sole path in. That is checked, not
@@ -109,7 +109,7 @@ http {
         ssl_certificate     /etc/nginx/certs/server.crt;
         ssl_certificate_key /etc/nginx/certs/server.key;
         location / {
-            proxy_pass http://$COORD_IP:8080;
+            proxy_pass http://$COORD_IP:47820;
             proxy_set_header Host \$host;
             # The header the coordinator reads the real client address
             # from when WIRESERVE_TRUST_PROXY_HEADERS is set. nginx
@@ -151,13 +151,13 @@ start_agent "$AGENT2"
 pass "both agents have the test CA installed"
 
 log "the coordinator must NOT be reachable except through the proxy"
-if podman exec "$AGENT1" timeout 5 bash -c "exec 3<>/dev/tcp/$COORD_IP/8080" 2>/dev/null; then
+if podman exec "$AGENT1" timeout 5 bash -c "exec 3<>/dev/tcp/$COORD_IP/47820" 2>/dev/null; then
     fail "an agent reached the coordinator's plain-HTTP listener directly — spec §7 requires the proxy to be the only path in"
 fi
 pass "the coordinator's plain-HTTP port is unreachable from the agents' segment"
 
 log "the admin listener must not be reachable either"
-if podman exec "$AGENT1" timeout 5 bash -c "exec 3<>/dev/tcp/$PROXY_IP/8081" 2>/dev/null; then
+if podman exec "$AGENT1" timeout 5 bash -c "exec 3<>/dev/tcp/$PROXY_IP/47821" 2>/dev/null; then
     fail "the admin port was reachable through the proxy segment"
 fi
 pass "the admin port is not exposed"

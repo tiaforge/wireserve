@@ -145,12 +145,14 @@ between the two surfaces).
 ### 4.0 Admin authentication
 
 `/admin/*` requires `Authorization: Bearer <admin_token>`, where
-`admin_token` is a single static secret supplied out-of-band at coordinator
-startup (env var or config file, e.g. `WIRESERVE_ADMIN_TOKEN`) — not
-issued or stored per-request, and generated once by the operator (e.g.
-`openssl rand -hex 32`) rather than by the coordinator itself. This is a
-hard requirement for v1, not a later addition: the revoke endpoint (§4.4)
-is meaningless if the admin surface itself isn't gated.
+`admin_token` is a single static secret (`WIRESERVE_ADMIN_TOKEN`) — not
+issued or stored per-request. By default the coordinator generates it
+itself on first start (CSPRNG, same shape as `openssl rand -hex 32`) and
+persists it alongside the database; an operator who sets the environment
+variable explicitly overrides that unconditionally, for those who'd rather
+manage the secret themselves out of band. Either way this is a hard
+requirement for v1, not a later addition: the revoke endpoint (§4.4) is
+meaningless if the admin surface itself isn't gated.
 
 - Compared using a constant-time check (§7), same as every other token in
   this spec — no timing side-channel on the one credential that can revoke

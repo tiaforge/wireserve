@@ -31,25 +31,71 @@ exists.
 ### 1. Run the coordinator
 
 Somewhere reachable by every node, behind a reverse proxy that terminates
-TLS. Copy `deploy/env/coordinator.env.example` to
-`/etc/wireserve/coordinator.env`, set `WIRESERVE_ADMIN_TOKEN` to a fresh
-secret, and check the two mesh ranges before anything registers.
+TLS. You don't need to invent a secret or pick a mesh IP range up front —
+the coordinator generates and persists both for you on first start if you
+leave them unset.
+
+**Bare metal**, using the shipped systemd unit:
 
 ```sh
-openssl rand -hex 32                      # the admin token
+cargo build --release --workspace
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin wireserve
+sudo install -m 0755 target/release/wireserve-coordinator target/release/wireserve-admin /usr/local/bin/
+sudo cp deploy/systemd/wireserve-coordinator.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now wireserve-coordinator
+```
+
+No `/etc/wireserve/coordinator.env` is required for this — the unit's
+`StateDirectory=` gives the coordinator `/var/lib/wireserve` to work with,
+and it generates its own admin token and mesh ranges there on first start.
+Get the admin token it generated:
+
+```sh
+sudo grep WIRESERVE_ADMIN_TOKEN /var/lib/wireserve/coordinator-secrets.env
+```
+
+and save it once so `wireserve-admin` never needs a flag or env var again:
+
+```sh
+mkdir -p ~/.config/wireserve-admin
+sudo grep WIRESERVE_ADMIN_TOKEN /var/lib/wireserve/coordinator-secrets.env \
+    | cut -d= -f2 > ~/.config/wireserve-admin/admin_token
+chmod 600 ~/.config/wireserve-admin/admin_token
+```
+
+```sh
+wireserve-admin list-peers   # just works — no --coordinator-url, no --admin-token
+```
+
+If you'd rather manage the admin token or mesh ranges yourself, copy
+`deploy/env/coordinator.env.example` to `/etc/wireserve/coordinator.env`
+and set whichever of `WIRESERVE_ADMIN_TOKEN`, `WIRESERVE_NET_V4_CIDR`,
+`WIRESERVE_NET_V6_PREFIX` you want — an explicit value there always wins
+over the generated one.
+
+**Point a reverse proxy at `127.0.0.1:47820`.** `deploy/proxy/` has a
+ready-to-use `Caddyfile.example` (auto-TLS via Let's Encrypt, about five
+lines) and `nginx.conf.example`. This is the one piece the coordinator
+deliberately never does itself — see spec §7 for why.
+
+**Containers**, if you'd rather not use systemd directly:
+
+```sh
 podman build -f deploy/docker/coordinator.Dockerfile -t wireserve-coordinator .
 podman run -d --name wireserve-coordinator \
-    --env-file /etc/wireserve/coordinator.env \
-    -p 127.0.0.1:8080:8080 \
+    -p 127.0.0.1:47820:47820 \
     -v wireserve-coordinator-data:/var/lib/wireserve \
     wireserve-coordinator
 ```
 
-Point your proxy at `127.0.0.1:8080`. There is a systemd unit and a Quadlet
-unit in `deploy/` if you would rather not use a container.
+Same zero-config behavior applies: the admin token and mesh ranges are
+generated into the named volume on first start unless you pass
+`--env-file /etc/wireserve/coordinator.env` with your own values. There is
+also a Quadlet unit in `deploy/` for Podman-under-systemd.
 
 The admin port never leaves the host by design, so admin commands run
-inside it:
+inside the container:
 
 ```sh
 podman exec wireserve-coordinator wireserve-admin list-peers
@@ -227,8 +273,8 @@ dependencies beyond a C toolchain (for `rusqlite`'s bundled SQLite).
 | Port | Direction | Who connects | Notes |
 | --- | --- | --- | --- |
 | 443/tcp | inbound | every agent | your reverse proxy, terminating TLS |
-| 8080/tcp | none | the proxy only | plain HTTP, must not be reachable from an untrusted network (§7) |
-| 8081/tcp | none | nobody | admin listener, loopback only; the coordinator refuses to start if it is not (§4.0) |
+| 47820/tcp | none | the proxy only | plain HTTP, must not be reachable from an untrusted network (§7) |
+| 47821/tcp | none | nobody | admin listener, loopback only; the coordinator refuses to start if it is not (§4.0) |
 
 The coordinator is not a WireGuard peer and needs no UDP port, no
 `NET_ADMIN`, and no access to `/dev/net/tun`. Admin commands run inside the
@@ -280,31 +326,37 @@ needs host networking, or the mesh exists only inside that container.
 refuses to start instead — so an existing tunnel is safe, but you will need
 `--ifname wg1` (or another free name) on a host that already has one.
 
-**The mesh address ranges.** Both of the binary's compiled-in defaults are
-poor choices, for unrelated reasons, and `deploy/env/coordinator.env.example`
-sets better ones. Fix these before the first node registers: addresses are
+**The mesh address ranges.** If you left `WIRESERVE_NET_V4_CIDR` and
+`WIRESERVE_NET_V6_PREFIX` unset, the coordinator already generated a safe
+pair for you on first start (see "Run the coordinator" above) and there is
+nothing to do here. This section is for anyone who set one or both
+explicitly, or who is running against an older deployment that still has
+the binary's compiled-in defaults — either way, both are poor choices, for
+unrelated reasons, and changing them requires care: addresses are
 allocated once and kept for the life of the node record, so a later change
 leaves the mesh addressed out of two ranges.
 
-The IPv4 default `100.90.0.0/24` sits inside `100.64.0.0/10`, the
-carrier-grade-NAT block Tailscale allocates all of its addresses from and
-some ISPs use on WAN links. A host running such an overlay routes that
+The compiled-in IPv4 default `100.90.0.0/24` sits inside `100.64.0.0/10`,
+the carrier-grade-NAT block Tailscale allocates all of its addresses from
+and some ISPs use on WAN links. A host running such an overlay routes that
 whole `/10` to the overlay's interface, covering these mesh addresses too.
 
-The IPv6 default `fd00:90::/64` is not a Tailscale problem at all, since
-Tailscale uses `fd7a:115c:a1e0::/48`. It is an RFC 4193 problem: a unique
-local address is `fd` followed by 40 **pseudo-randomly generated** bits,
-and that randomness is the entire mechanism that lets two networks built
-by strangers be merged without renumbering. `fd00:90::` throws it away,
-and round-numbered `fd00::` prefixes are the most commonly hand-picked
-there are, so it collides with exactly the neighbours it should coexist
-with. Generate your own:
+The compiled-in IPv6 default `fd00:90::/64` is not a Tailscale problem at
+all, since Tailscale uses `fd7a:115c:a1e0::/48`. It is an RFC 4193
+problem: a unique local address is `fd` followed by 40
+**pseudo-randomly generated** bits, and that randomness is the entire
+mechanism that lets two networks built by strangers be merged without
+renumbering. `fd00:90::` throws it away, and round-numbered `fd00::`
+prefixes are the most commonly hand-picked there are, so it collides with
+exactly the neighbours it should coexist with. Generate your own the same
+way the coordinator does internally:
 
 ```sh
 python3 -c "import secrets; h=secrets.token_bytes(5).hex(); print(f'fd{h[0:2]}:{h[2:6]}:{h[6:10]}::/64')"
 ```
 
-The coordinator warns at startup about either default.
+The coordinator warns at startup if either configured range still matches
+one of these compiled-in defaults.
 
 ## Building the container images
 

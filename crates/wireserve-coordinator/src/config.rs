@@ -59,8 +59,6 @@ pub struct Config {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("{0} must be set")]
-    Missing(&'static str),
     #[error("invalid value for {0}: {1}")]
     Invalid(&'static str, String),
     #[error(
@@ -76,26 +74,42 @@ pub enum ConfigError {
 }
 
 impl Config {
-    pub fn from_env() -> Result<Self, ConfigError> {
-        let listen_addr = env_or("WIRESERVE_LISTEN_ADDR", "0.0.0.0:8080")?;
-        let admin_listen_addr = env_or("WIRESERVE_ADMIN_LISTEN_ADDR", "127.0.0.1:8081")?;
+    /// Loads configuration from the environment, generating and persisting
+    /// a handful of first-run values (the admin token, both mesh ranges)
+    /// when the operator hasn't set them explicitly. See
+    /// [`crate::bootstrap`] for the resolution order and where those values
+    /// are written.
+    pub fn load() -> Result<Loaded, ConfigError> {
+        let listen_addr = env_or("WIRESERVE_LISTEN_ADDR", "0.0.0.0:47820")?;
+        let admin_listen_addr = env_or("WIRESERVE_ADMIN_LISTEN_ADDR", "127.0.0.1:47821")?;
         validate_admin_listener(admin_listen_addr)?;
 
-        let admin_token = std::env::var("WIRESERVE_ADMIN_TOKEN")
-            .map_err(|_| ConfigError::Missing("WIRESERVE_ADMIN_TOKEN"))?;
-        if admin_token.is_empty() {
-            return Err(ConfigError::Invalid(
-                "WIRESERVE_ADMIN_TOKEN",
-                "must not be empty".into(),
-            ));
+        let db_path = resolve_db_path();
+        let state_dir = std::path::Path::new(&db_path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        std::fs::create_dir_all(&state_dir).map_err(|e| {
+            ConfigError::Invalid(
+                "WIRESERVE_DB_PATH",
+                format!("could not create parent directory {}: {e}", state_dir.display()),
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700));
         }
 
-        let db_path =
-            std::env::var("WIRESERVE_DB_PATH").unwrap_or_else(|_| "wireserve.db".to_string());
-        let net_v4_cidr = std::env::var("WIRESERVE_NET_V4_CIDR")
-            .unwrap_or_else(|_| "100.90.0.0/24".to_string());
-        let net_v6_prefix = std::env::var("WIRESERVE_NET_V6_PREFIX")
-            .unwrap_or_else(|_| "fd00:90::/64".to_string());
+        let bootstrapped = crate::bootstrap::resolve(&state_dir).map_err(|e| {
+            ConfigError::Invalid("WIRESERVE_ADMIN_TOKEN", format!("bootstrap failed: {e}"))
+        })?;
+        let admin_token = bootstrapped.admin_token;
+        let net_v4_cidr = bootstrapped.net_v4_cidr;
+        let net_v6_prefix = bootstrapped.net_v6_prefix;
+        let generated = bootstrapped.generated;
+        let secrets_path = bootstrapped.path;
 
         let online_threshold_secs = env_parse_or("WIRESERVE_ONLINE_THRESHOLD_SECS", 180)?;
         let rate_limit_max = env_parse_or("WIRESERVE_RATE_LIMIT_MAX", 10)?;
@@ -108,23 +122,59 @@ impl Config {
         let require_service_approval =
             env_parse_or("WIRESERVE_REQUIRE_SERVICE_APPROVAL", true)?;
 
-        Ok(Self {
-            listen_addr,
-            admin_listen_addr,
-            admin_token,
-            db_path,
-            net_v4_cidr,
-            net_v6_prefix,
-            online_threshold_secs,
-            rate_limit_max,
-            rate_limit_window_secs,
-            trust_proxy_headers,
-            join_token_ttl_secs,
-            global_auth_failure_max,
-            global_auth_failure_window_secs,
-            require_service_approval,
+        Ok(Loaded {
+            config: Self {
+                listen_addr,
+                admin_listen_addr,
+                admin_token,
+                db_path,
+                net_v4_cidr,
+                net_v6_prefix,
+                online_threshold_secs,
+                rate_limit_max,
+                rate_limit_window_secs,
+                trust_proxy_headers,
+                join_token_ttl_secs,
+                global_auth_failure_max,
+                global_auth_failure_window_secs,
+                require_service_approval,
+            },
+            generated,
+            secrets_path,
         })
     }
+}
+
+/// The result of [`Config::load`]: the config itself, plus which first-run
+/// values (if any) were freshly generated this call and where they were
+/// persisted — `main` uses these two to print a one-time banner.
+pub struct Loaded {
+    pub config: Config,
+    pub generated: Vec<&'static str>,
+    pub secrets_path: std::path::PathBuf,
+}
+
+/// Resolves the database path: an explicit `WIRESERVE_DB_PATH` first, then
+/// systemd's own `$STATE_DIRECTORY` (set automatically for any unit using
+/// `StateDirectory=`, which the shipped coordinator unit does) joined with
+/// `coordinator.db`, then the historical relative default. The middle case
+/// is what lets the shipped systemd unit resolve a correct absolute path
+/// with zero configuration instead of relying on an operator setting
+/// `WIRESERVE_DB_PATH` in `coordinator.env` by convention.
+fn resolve_db_path() -> String {
+    if let Ok(path) = std::env::var("WIRESERVE_DB_PATH") {
+        return path;
+    }
+    if let Ok(state_dir) = std::env::var("STATE_DIRECTORY") {
+        // systemd may list multiple colon-separated directories; the first
+        // is the one this unit's own StateDirectory= entry created.
+        if let Some(first) = state_dir.split(':').next() {
+            if !first.is_empty() {
+                return format!("{first}/coordinator.db");
+            }
+        }
+    }
+    "wireserve.db".to_string()
 }
 
 fn env_or(key: &'static str, default: &str) -> Result<SocketAddr, ConfigError> {

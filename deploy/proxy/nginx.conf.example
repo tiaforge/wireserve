@@ -1,0 +1,36 @@
+# Reverse proxy for wireserve-coordinator, using nginx.
+#
+# Install as /etc/nginx/sites-available/wireserve.conf (symlink into
+# sites-enabled/, or drop straight into conf.d/ depending on your distro),
+# replace the hostname and certificate paths below, and
+# `systemctl reload nginx`. Unlike Caddy, nginx does not obtain the
+# certificate itself — get one first (certbot, or your own CA) and point
+# ssl_certificate/ssl_certificate_key at it.
+#
+# This is the only piece of the reverse-proxy topology this project asks
+# you to run yourself (spec §7): the coordinator never terminates TLS or
+# holds a certificate, and listens on plain HTTP on 127.0.0.1:47820 only.
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name wireserve.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/wireserve.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/wireserve.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:47820;
+        proxy_set_header Host $host;
+        # The header the coordinator reads the real client address from
+        # when WIRESERVE_TRUST_PROXY_HEADERS is set. nginx appends the
+        # connecting peer to any inbound value, so the right-most entry is
+        # always the one it observed itself — exactly the one the
+        # coordinator trusts. Turn WIRESERVE_TRUST_PROXY_HEADERS on in
+        # coordinator.env once this proxy is the *only* way to reach the
+        # node-facing listener; with a directly reachable listener it lets
+        # a client forge its own source address and evade rate limiting.
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}

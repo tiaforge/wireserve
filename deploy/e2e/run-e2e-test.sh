@@ -89,7 +89,7 @@ start_agent() {
     podman run -d --name "$name" --network "$NET" \
         --cap-add=NET_ADMIN --device /dev/net/tun \
         --entrypoint sleep wireserve-agent:e2e-test infinity >/dev/null
-    podman exec "$name" wireserve-agent join "http://$COORD_IP:8080" "$token" --listen-port 51820
+    podman exec "$name" wireserve-agent join "http://$COORD_IP:47820" "$token" --listen-port 51820
     podman exec -d "$name" wireserve-agent daemon --poll-interval-secs 5
 }
 start_agent "$AGENT1" "$JT1"
@@ -239,7 +239,7 @@ podman run -d --name "$GUARD" --network "$NET" \
     --cap-add=NET_ADMIN --device /dev/net/tun \
     --entrypoint sleep wireserve-agent:e2e-test infinity >/dev/null
 JT_GUARD=$(create_node node3)
-podman exec "$GUARD" wireserve-agent join "http://$COORD_IP:8080" "$JT_GUARD" --listen-port 51820
+podman exec "$GUARD" wireserve-agent join "http://$COORD_IP:47820" "$JT_GUARD" --listen-port 51820
 
 # Stand up somebody else's wg0 first, with its own key and address.
 FOREIGN_KEY=$(podman run --rm "$DEBUG_IMG" wg genkey)

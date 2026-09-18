@@ -12,10 +12,13 @@ Group=wireserve
 # Secrets and per-deployment config (WIRESERVE_ADMIN_TOKEN,
 # WIRESERVE_LISTEN_ADDR, WIRESERVE_ADMIN_LISTEN_ADDR, WIRESERVE_DB_PATH,
 # WIRESERVE_NET_V4_CIDR, WIRESERVE_NET_V6_PREFIX, ...) live outside the
-# unit file, mode 600, owned by the wireserve user. Start from
-# deploy/env/coordinator.env.example, which documents every setting and
-# carries the mesh ranges this project recommends over the binary's own
-# compiled-in defaults.
+# unit file, mode 600, owned by the wireserve user. This file is entirely
+# optional (note the leading `-`): the admin token and both mesh ranges
+# are auto-generated and persisted on first start if left unset, and
+# WIRESERVE_DB_PATH resolves against $STATE_DIRECTORY (which
+# StateDirectory= below causes systemd to set automatically) with no
+# configuration at all. Start from deploy/env/coordinator.env.example if
+# you want to override any of that.
 #
 # Deliberately NOT duplicated as Environment= lines here: systemd applies
 # these in file order, so an Environment= line placed after
@@ -32,7 +35,7 @@ Group=wireserve
 # endpoint fallback use the real client address instead of the proxy's.
 # Leaving it on with a directly reachable listener lets clients forge
 # their own source address.
-EnvironmentFile=/etc/wireserve/coordinator.env
+EnvironmentFile=-/etc/wireserve/coordinator.env
 
 ExecStart=/usr/local/bin/wireserve-coordinator
 Restart=on-failure
