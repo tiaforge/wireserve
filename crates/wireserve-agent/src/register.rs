@@ -30,6 +30,40 @@ pub struct JoinParams<'a> {
     pub ifname_pinned: bool,
 }
 
+/// The first WireGuard port tried, and how many after it.
+pub const DEFAULT_LISTEN_PORT: u16 = 51820;
+const PORT_RANGE: u16 = 100;
+
+/// Picks the UDP port this instance listens on when `join` isn't given
+/// one: its previous port if it had one and that is still free, otherwise
+/// the first free port from 51820 up. `reserved` are ports other instances
+/// on this host have stored, running or not — each keeps its own.
+pub fn choose_listen_port(
+    previous: Option<u16>,
+    reserved: &std::collections::BTreeSet<u16>,
+    is_free: impl Fn(u16) -> bool,
+) -> Option<u16> {
+    let range = DEFAULT_LISTEN_PORT..DEFAULT_LISTEN_PORT + PORT_RANGE;
+    previous
+        .into_iter()
+        .chain(range)
+        .find(|p| !reserved.contains(p) && is_free(*p))
+}
+
+/// Whether nothing on this host is bound to UDP `port`, over IPv4 and —
+/// where the host has IPv6 at all — IPv6. The kernel's WireGuard socket
+/// binds both, so a port taken on either would fail bring-up.
+#[must_use]
+pub fn udp_port_is_free(port: u16) -> bool {
+    use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
+    let v4 = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).is_ok();
+    let v6 = match UdpSocket::bind((Ipv6Addr::UNSPECIFIED, port)) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::AddrInUse,
+    };
+    v4 && v6
+}
+
 /// Performs the join: keypair generation, `/register`, and persists the
 /// resulting state. Returns the saved state on success.
 pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
@@ -128,5 +162,26 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains(&private_key.to_string()));
         assert!(json.contains(&public_key.to_string()));
+    }
+
+    #[test]
+    fn listen_port_keeps_the_previous_one_then_takes_the_first_free() {
+        let none = std::collections::BTreeSet::new();
+        assert_eq!(choose_listen_port(None, &none, |_| true), Some(51820));
+        assert_eq!(choose_listen_port(Some(51825), &none, |_| true), Some(51825));
+        // Taken by another instance (running or not), or bound by anything.
+        let reserved = std::collections::BTreeSet::from([51820, 51821]);
+        assert_eq!(choose_listen_port(None, &reserved, |p| p != 51822), Some(51823));
+        assert_eq!(choose_listen_port(Some(51820), &reserved, |_| true), Some(51822));
+        assert_eq!(choose_listen_port(None, &none, |_| false), None);
+    }
+
+    #[test]
+    fn a_bound_port_is_not_free() {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        assert!(!udp_port_is_free(port));
+        drop(socket);
+        assert!(udp_port_is_free(port));
     }
 }

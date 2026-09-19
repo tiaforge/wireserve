@@ -77,6 +77,44 @@ pub fn validate_ifname(name: &str) -> Result<(), InvalidIfname> {
     }
 }
 
+/// Every interface other than `except` that has `addr` assigned.
+pub fn interfaces_with_address(addr: IpAddr, except: &str) -> std::io::Result<Vec<String>> {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `head` with a list we free below.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut out = Vec::new();
+    let mut cursor = head;
+    while !cursor.is_null() {
+        // SAFETY: every node of the list is valid until freeifaddrs; the
+        // sockaddr is read as the type its family says it is.
+        let ifa = unsafe { &*cursor };
+        cursor = ifa.ifa_next;
+        if ifa.ifa_addr.is_null() {
+            continue;
+        }
+        let found = match i32::from(unsafe { (*ifa.ifa_addr).sa_family }) {
+            libc::AF_INET => {
+                let sin = unsafe { &*ifa.ifa_addr.cast::<libc::sockaddr_in>() };
+                IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)))
+            }
+            libc::AF_INET6 => {
+                let sin6 = unsafe { &*ifa.ifa_addr.cast::<libc::sockaddr_in6>() };
+                IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr))
+            }
+            _ => continue,
+        };
+        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_string_lossy().into_owned();
+        if found == addr && name != except && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    // SAFETY: `head` came from getifaddrs and is freed exactly once.
+    unsafe { libc::freeifaddrs(head) };
+    Ok(out)
+}
+
 /// A WireGuard peer's own `/32` + `/128` `AllowedIPs` — never a shared
 /// subnet block, so every peer only ever routes to itself on this
 /// interface (same non-overlapping-`AllowedIPs` reasoning as spec §9's
@@ -672,5 +710,23 @@ mod tests {
             assert!(validate_ifname(name).is_err(), "{name:?} should be rejected");
         }
     }
-}
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_finds_an_address_on_other_interfaces_only() {
+        if !crate::firewall::netns::reexec("wg::tests::kernel_finds_an_address_on_other_interfaces_only") {
+            return;
+        }
+        let out = std::process::Command::new("sh")
+            .args(["-euc", "ip link add other type dummy && ip addr add 10.77.0.1/32 dev other && ip addr add fd77::1/128 dev other nodad && ip link set other up"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let v4: IpAddr = "10.77.0.1".parse().unwrap();
+        let v6: IpAddr = "fd77::1".parse().unwrap();
+        assert_eq!(interfaces_with_address(v4, "wireserve0").unwrap(), ["other"]);
+        assert_eq!(interfaces_with_address(v6, "wireserve0").unwrap(), ["other"]);
+        assert!(interfaces_with_address(v4, "other").unwrap().is_empty());
+        assert!(interfaces_with_address("10.77.0.2".parse().unwrap(), "x").unwrap().is_empty());
+    }
+}

@@ -41,8 +41,11 @@ enum Command {
         /// or stdin (S7) — trailing whitespace/newline is trimmed.
         #[arg(long, conflicts_with = "join_token")]
         join_token_file: Option<std::path::PathBuf>,
-        #[arg(long, default_value_t = 51820)]
-        listen_port: u16,
+        /// The UDP port WireGuard listens on. Without it: this instance's
+        /// previous port on a re-join, otherwise the first free one from
+        /// 51820 up that no other instance on this host has.
+        #[arg(long)]
+        listen_port: Option<u16>,
         #[arg(long)]
         endpoint_addr: Option<String>,
     },
@@ -138,7 +141,7 @@ async fn cmd_join(
     coordinator_url: Option<String>,
     join_token: Option<String>,
     join_token_file: Option<std::path::PathBuf>,
-    listen_port: u16,
+    listen_port: Option<u16>,
     endpoint_addr: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Held across the whole join: a daemon running on this instance would
@@ -147,8 +150,19 @@ async fn cmd_join(
     let coordinator_url = resolve_coordinator_url(coordinator_url)?;
     let join_token = resolve_join_token(join_token, join_token_file)?;
     let state_path = instance.state_path();
-    // A re-join keeps the interface this instance already runs on.
+    // A re-join keeps the interface and port this instance already uses.
     let previous = AgentState::load(&state_path).unwrap_or_default();
+    let listen_port = match listen_port {
+        Some(port) => port,
+        None => {
+            let reserved: std::collections::BTreeSet<u16> = paths::other_instances(instance)
+                .into_iter()
+                .filter_map(|(_, s)| s.listen_port)
+                .collect();
+            register::choose_listen_port(previous.listen_port, &reserved, register::udp_port_is_free)
+                .ok_or("no free UDP port from 51820 up for WireGuard to listen on; pass --listen-port")?
+        }
+    };
     let state = register::join(register::JoinParams {
         coordinator_url: &coordinator_url,
         join_token: &join_token,
@@ -251,7 +265,7 @@ async fn cmd_daemon(
 
     let ip4: std::net::Ipv4Addr = state.ip4.clone().unwrap_or_default().parse()?;
     let ip6: std::net::Ipv6Addr = state.ip6.clone().unwrap_or_default().parse()?;
-    let listen_port = state.listen_port.unwrap_or(51820);
+    let listen_port = state.listen_port.unwrap_or(register::DEFAULT_LISTEN_PORT);
     let private_key = state.private_key.clone().unwrap_or_default();
 
     // Which interface. Claimed here and held for the life of the process,
@@ -274,6 +288,25 @@ async fn cmd_daemon(
     tracing::info!(instance = instance.name(), %ifname, source = ?choice.source, pinned = choice.pinned, "using interface");
     choice.claim.hold();
     remove_leftover_interfaces(&ifname, state.ifname.as_deref(), &private_key);
+    // Two meshes on one host with overlapping address ranges would fight
+    // over routes; this node's own address on another interface is the
+    // one clash that is certain, and cheap to see before anything changes.
+    for addr in [std::net::IpAddr::V4(ip4), std::net::IpAddr::V6(ip6)] {
+        match wireserve_agent::wg::interfaces_with_address(addr, &ifname) {
+            Ok(others) if !others.is_empty() => {
+                return Err(format!(
+                    "this node's mesh address {addr} is already assigned to {} — most likely \
+                     another mesh on this host uses the same address range. Give the meshes' \
+                     coordinators non-overlapping ranges (WIRESERVE_NET_V4_CIDR / \
+                     WIRESERVE_NET_V6_PREFIX)",
+                    others.join(", ")
+                )
+                .into());
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "could not check whether the mesh address is already in use"),
+        }
+    }
     if state.ifname.as_deref() != Some(ifname.as_str()) || state.ifname_pinned != choice.pinned {
         state.ifname = Some(ifname.clone());
         state.ifname_pinned = choice.pinned;
