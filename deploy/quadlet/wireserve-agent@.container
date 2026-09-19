@@ -1,0 +1,37 @@
+# Podman Quadlet template for a named agent instance. Install at
+# /etc/containers/systemd/wireserve-agent@.container, then e.g.
+# `systemctl daemon-reload && systemctl start wireserve-agent@work`.
+#
+# The same container as wireserve-agent.container (read its notes), running
+# `--instance %i`. It shares that unit's state volume on purpose: every
+# instance's state lives under /var/lib/wireserve (named ones in
+# instances/<name>), each instance locks only its own, and seeing the
+# others' is how an instance leaves their interface names and listen
+# ports alone. With Network=host they also see each other's interface
+# claims. Join the instance once before starting it:
+#
+#   podman run --rm -it --network host --cap-add NET_ADMIN --device /dev/net/tun \
+#     -v wireserve-agent-state:/var/lib/wireserve localhost/wireserve-agent:latest \
+#     --instance work join <coordinator-url>
+
+[Unit]
+Description=WireServe agent, instance %i (Podman Quadlet)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/wireserve-agent:latest
+EnvironmentFile=/etc/wireserve/agent.env
+Network=host
+AddCapability=CAP_NET_ADMIN
+AddDevice=/dev/net/tun
+Volume=/etc/hosts:/etc/hosts
+Volume=wireserve-agent-state:/var/lib/wireserve
+Exec=--instance %i daemon
+
+[Service]
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target default.target

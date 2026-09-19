@@ -1248,3 +1248,108 @@ what the library does and does not do on your behalf.
     runtime (monitor, debounce, tick, stop) restoring rules after external
     reloads — this last one re-execs the test binary inside the namespace,
     with firewalld disabled because its D-Bus is not namespace-scoped.
+
+## M19 — several agents on one host
+
+71. **Named instances.** `--instance <name>` (or `WIRESERVE_INSTANCE`)
+    selects everything that was a single fixed resource: state, socket,
+    interface, listen port, firewall tables, host-firewall tags,
+    hosts-file block. The default instance keeps every path and marker
+    it had, so upgrading moves nothing on disk. Named state lives in
+    `/var/lib/wireserve/instances/<n>/` (one directory and one container
+    volume hold all keys); sockets in sibling `/run/wireserve-<n>/`,
+    because systemd deletes a unit's `RuntimeDirectory` on stop and
+    nesting would let the default's stop delete the others' sockets.
+    `WIRESERVE_STATE_PATH`/`WIRESERVE_SOCKET_PATH` now apply to the
+    default instance only — the agent image sets them, and applying them
+    to every instance made all instances in a container share one state.
+    Instance names are the explicit key rather than the interface name,
+    because the interface is chosen automatically and the state path
+    can't depend on the outcome.
+
+72. **Two kinds of lock, scoped to what they protect.** An `flock` next to
+    the state file makes `daemon` and `join` exclusive per instance
+    (filesystem scope, like the state). Interface names are claimed with
+    a listening socket at `@wireserve/if/<ifname>` in the abstract
+    namespace: that is network-namespace scoped exactly like interface
+    names and nft tables (so host-network containers with separate
+    filesystems still see each other), atomic to take, and released by
+    the kernel when the holder dies — no stale locks. Abstract sockets
+    have no permissions, so a claim only counts when `SO_PEERCRED` says
+    the holder runs as our euid; a squatter can make an agent skip a name
+    but can't make a dead agent's rules look alive. The holder accepts
+    and drops connections on a thread (probes would otherwise fill its
+    backlog), and probes connect non-blocking so a squatter that never
+    accepts can't hang the prober.
+
+73. **Every firewall object is per interface, and cleanup is by
+    liveness.** Before this, a second agent replaced the first's
+    `inet wireserve` table on every poll, rebuilt the single guard, and —
+    worst — deleted every `wireserve:*` rule not tagged with its own
+    interface, which the first agent's monitor immediately restored: an
+    endless rewrite loop. Now the tables are `inet wireserve.<if>` and
+    `inet wireserve-interop.<if>`, every `wireserve*` table counts as ours
+    (never inserted into, changes never trigger a reconcile), and a
+    tagged rule for another interface is kept while a running agent holds
+    that interface's claim and removed once none does — so crash and
+    `--ifname`-change cleanup still work, done by whichever agent runs
+    next. Another instance's guard is never touched: it only drops, and
+    removing it could open forwarding while that interface is still
+    trusted. The default instance removes a pre-instances agent's
+    fixed-name table and guard (with the `wg0` firewalld trust the guard
+    implies, unless a live agent now claims `wg0`).
+
+74. **Interface names: `wireserve0` … `wireserve15`, sticky, pinnable.**
+    `wg0` was a poor default because it is wg-quick's, so any host with a
+    tunnel needed manual configuration. The chosen name is stored in the
+    instance's state and reused; otherwise our own interface under any
+    candidate wins (a run that died before saving must not be orphaned),
+    then the first free one — skipping names claimed by a running agent,
+    stored by another instance (even a stopped one), or held by any
+    interface that isn't ours. `--ifname <name>` pins a name, with the old
+    refuse-on-conflict behaviour; `--ifname auto` unpins. At start, this
+    node's own interfaces under other candidate names, `wg0` or the
+    previous name are removed with their firewall state. The choice is a
+    pure function over a probe, so its rules are unit-tested; the probe
+    itself is tested against real interfaces in a namespace.
+
+    That namespace test found a real bug: interface existence was read
+    from `/sys/class/net`, which shows the network namespace of whoever
+    *mounted* sysfs. Under `nsenter`/`unshare -n` a taken name looked
+    free and would have been configured over. Now `if_nametoindex`, with
+    anything but `ENODEV` treated as taken.
+
+75. **Listen ports and addresses.** `join` without `--listen-port` keeps
+    the instance's previous port, else the first from 51820 that no other
+    instance stored and nothing has bound (v4, and v6 where present). The
+    daemon refuses to start when its own mesh address is on another
+    interface — overlapping ranges between two meshes, the one clash that
+    is certain; peer-route overlaps are not detected.
+
+76. **Hosts file.** Each instance owns a labelled block
+    (`# BEGIN WIRESERVE <n>`; the default keeps the bare markers). Markers
+    now match whole lines only: the old substring search would have found
+    the bare marker inside a labelled block. Read-modify-write runs under
+    an `flock` on the file, re-validated against the path's inode after
+    locking, since `atomic_write` replaces the file by rename. A rewrite
+    that changes nothing is skipped.
+
+77. **`deploy/e2e/run-multi-instance-test.sh`** runs the real binaries in
+    an unprivileged user + network namespace — two coordinators, two
+    instances on the "host" behind a drop-by-default host firewall and a
+    foreign `wireserve0`, and a peer namespace over veth with one agent
+    per mesh. It checks interface and port selection, per-instance
+    tables and hosts blocks, real traffic reaching only what each
+    instance declared, rule stability across polls (no fighting), crash
+    cleanup by the surviving instance, sticky restart, clean stop, the
+    pre-instances upgrade, and `leave`. No root, no containers.
+
+    Found by it, not fixed here (a separate change, recorded in the README
+    as a known issue): defguard's `configure_peer_routing` always calls
+    `configure_endpoints`, which routes every peer endpoint via the
+    default gateway — and on a host with no default route installs a
+    *blackhole* route to it, cutting the mesh off. It is meant for
+    `0.0.0.0/0` peers only; ours never are. The test gives its namespaces
+    default routes. Also observed: defguard's `remove_interface` flushes
+    systemd-resolved over D-Bus, which times out after 25 s where the bus
+    is unreachable, so teardown is slow there.

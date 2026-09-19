@@ -13,8 +13,9 @@
 # installs nftables rules in whatever network namespace it runs in. In a
 # private container namespace, nothing on the host could reach the mesh
 # and no service running on the host would be reachable through it. With
-# host networking, wg0 and the `wireserve` nftables table land on the
-# host itself, which is the whole point. (An isolated namespace is only
+# host networking, the mesh interface (wireserve0, or the next free
+# name) and its nftables table land on the host itself, which is the
+# whole point. (An isolated namespace is only
 # appropriate for a test harness like deploy/e2e, where the "node" is
 # the container.)
 #
@@ -26,6 +27,8 @@
 # what makes spec §6's <name>.wg entries resolve for processes on the
 # HOST rather than just inside this container — omit it if nothing
 # outside the container needs that resolution.
+#
+# More agents on the same host (another mesh): wireserve-agent@.container.
 
 [Unit]
 Description=WireServe agent (Podman Quadlet)

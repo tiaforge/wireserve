@@ -264,7 +264,7 @@ else
 fi
 
 log "handshake state on agent1"
-in_netns "$AGENT1" wg show wg0 | sed 's/^/  /'
+in_netns "$AGENT1" wg show wireserve0 | sed 's/^/  /'
 
 log "comparing the endpoint the coordinator recorded against the real one"
 # The coordinator composes its fallback endpoint (spec §4.2) from the
@@ -275,7 +275,7 @@ log "comparing the endpoint the coordinator recorded against the real one"
 echo "  recorded by the coordinator:"
 podman exec "$COORD" wireserve-admin list-peers | awk '{printf "    %-8s %s\n", $1, $NF}'
 echo "  actually observed by agent1, learned from received packets:"
-in_netns "$AGENT1" wg show wg0 endpoints | awk '{printf "    %s\n", $0}'
+in_netns "$AGENT1" wg show wireserve0 endpoints | awk '{printf "    %s\n", $0}'
 
 DUPES=$(podman exec "$COORD" wireserve-admin list-peers | awk '{print $NF}' \
     | grep -v 'endpoint=-$' | sort | uniq -d)

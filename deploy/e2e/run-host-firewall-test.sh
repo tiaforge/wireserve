@@ -130,19 +130,19 @@ podman exec -d "$AGENT1" wireserve-agent daemon --poll-interval-secs 5
 podman exec -d "$AGENT2" wireserve-agent daemon --poll-interval-secs 5
 sleep 8
 
-log "checking the host firewalls now let wg0 through (and only wg0)"
+log "checking the host firewalls now let wireserve0 through (and only wireserve0)"
 IPT=$(in_dbg "iptables -S INPUT")
 echo "$IPT"
-echo "$IPT" | sed -n 2p | grep -qx -- '-A INPUT -i wg0 -m comment --comment "wireserve:wg0" -j ACCEPT' \
-    || fail "iptables INPUT does not start with our wg0 accept"
+echo "$IPT" | sed -n 2p | grep -qx -- '-A INPUT -i wireserve0 -m comment --comment "wireserve:wireserve0" -j ACCEPT' \
+    || fail "iptables INPUT does not start with our wireserve0 accept"
 NFT=$(in_dbg "nft list table inet filter")
 echo "$NFT"
-[ "$(echo "$NFT" | grep -c 'wireserve:wg0')" = 1 ] || fail "native input chain lacks exactly one wg0 accept"
-echo "$NFT" | grep 'wireserve:wg0' | grep -q 'iifname "wg0" counter' \
-    || fail "native accept is not scoped to iifname wg0"
+[ "$(echo "$NFT" | grep -c 'wireserve:wireserve0')" = 1 ] || fail "native input chain lacks exactly one wireserve0 accept"
+echo "$NFT" | grep 'wireserve:wireserve0' | grep -q 'iifname "wireserve0" counter' \
+    || fail "native accept is not scoped to iifname wireserve0"
 [ "$(native_tags)" = 1 ] \
     || fail "wireserve-tagged nft rules exist somewhere other than the one native input chain"
-pass "iptables and the native input chain each have exactly one wg0-scoped accept"
+pass "iptables and the native input chain each have exactly one wireserve0-scoped accept"
 
 log "declaring and approving a service on agent1"
 podman exec "$AGENT1" wireserve-agent serve testsvc 12345 tcp
@@ -169,7 +169,7 @@ if can_connect "$AGENT1_MESH_IP" 12346; then
 fi
 pass "undeclared port refused over the mesh"
 if can_connect "$AGENT1_BRIDGE_IP" 12345; then
-    fail "the service is reachable on eth0 — the host firewall was opened beyond wg0"
+    fail "the service is reachable on eth0 — the host firewall was opened beyond wireserve0"
 fi
 pass "the same service is still blocked on eth0 (nothing opened on another interface)"
 
@@ -177,17 +177,17 @@ log "E3: a native config reload is repaired within seconds"
 in_dbg "nft delete table inet filter"
 in_dbg "$(echo "$HOST_FIREWALL" | sed -n '/^nft -f/,/^EOF$/p')"
 for _ in $(seq 1 30); do
-    in_dbg "nft list table inet filter" | grep -q 'wireserve:wg0' && break
+    in_dbg "nft list table inet filter" | grep -q 'wireserve:wireserve0' && break
     sleep 0.1
 done
-in_dbg "nft list table inet filter" | grep -q 'wireserve:wg0' || fail "rule not restored within 3s after reload"
+in_dbg "nft list table inet filter" | grep -q 'wireserve:wireserve0' || fail "rule not restored within 3s after reload"
 can_connect "$AGENT1_MESH_IP" 12345 || fail "service unreachable after the reload was repaired"
 pass "native table reload repaired within 3s; service reachable again"
 
 log "E3: an iptables rule removed by hand comes back within one poll"
-in_dbg "iptables -D INPUT -i wg0 -m comment --comment wireserve:wg0 -j ACCEPT"
+in_dbg "iptables -D INPUT -i wireserve0 -m comment --comment wireserve:wireserve0 -j ACCEPT"
 sleep 6
-[ "$(in_dbg "iptables -S INPUT" | grep -c 'wireserve:wg0')" = 1 ] || fail "iptables rule not restored"
+[ "$(in_dbg "iptables -S INPUT" | grep -c 'wireserve:wireserve0')" = 1 ] || fail "iptables rule not restored"
 [ "$(native_tags)" = 1 ] || fail "native rule duplicated during repair"
 pass "iptables rule restored, no duplicates anywhere"
 
@@ -202,7 +202,7 @@ fi
 [ "$(in_dbg "nft list table inet filter")" = "$BEFORE_NFT" ] || fail "native table differs from before the agent ran"
 pass "host firewalls are exactly as they were before the agent started"
 
-log "E5: refusing a foreign wg0 touches no firewall at all"
+log "E5: refusing a foreign interface touches no firewall at all"
 node_container "$GUARD"
 debug_for "$DBG_GUARD" "$GUARD"
 podman exec "$DBG_GUARD" sh -c "$HOST_FIREWALL"
@@ -214,10 +214,13 @@ guard_rules() { podman exec "$DBG_GUARD" sh -c "nft -s list ruleset; iptables -S
 GUARD_BEFORE=$(guard_rules)
 JT3=$(create_node node3)
 podman exec "$GUARD" wireserve-agent join "http://$COORD_IP:47820" "$JT3" --listen-port 51820
-if podman exec "$GUARD" wireserve-agent daemon --poll-interval-secs 5 >/tmp/hostfw-guard.txt 2>&1; then
+# Pinned to that name (without --ifname it would simply pick another), so
+# the agent has to refuse — and must do so before any firewall change,
+# since every rule it would install is keyed on the name.
+if podman exec "$GUARD" wireserve-agent daemon --poll-interval-secs 5 --ifname wg0 >/tmp/hostfw-guard.txt 2>&1; then
     fail "the agent started on a foreign wg0"
 fi
-grep -qi "refusing to take over" /tmp/hostfw-guard.txt || fail "unexpected failure: $(cat /tmp/hostfw-guard.txt)"
+grep -qi "cannot use the interface name 'wg0'" /tmp/hostfw-guard.txt || fail "unexpected failure: $(cat /tmp/hostfw-guard.txt)"
 GUARD_AFTER=$(guard_rules)
 if [ "$GUARD_AFTER" != "$GUARD_BEFORE" ]; then
     diff <(echo "$GUARD_BEFORE") <(echo "$GUARD_AFTER") || true
@@ -238,14 +241,14 @@ if podman exec "$DBG_LEGACY" sh -c "iptables-legacy -A INPUT -i lo -j ACCEPT && 
     podman exec -d "$LEGACY" wireserve-agent daemon --poll-interval-secs 5
     sleep 6
     podman exec "$DBG_LEGACY" iptables-legacy -S INPUT | sed -n 2p \
-        | grep -qx -- '-A INPUT -i wg0 -m comment --comment "wireserve:wg0" -j ACCEPT' \
-        || fail "legacy iptables INPUT does not start with our wg0 accept"
+        | grep -qx -- '-A INPUT -i wireserve0 -m comment --comment "wireserve:wireserve0" -j ACCEPT' \
+        || fail "legacy iptables INPUT does not start with our wireserve0 accept"
     podman exec "$LEGACY" wireserve-agent leave
     sleep 2
     if podman exec "$DBG_LEGACY" iptables-legacy -S INPUT | grep -q wireserve; then
         fail "legacy iptables rule left behind after leave"
     fi
-    pass "legacy iptables opened for wg0 and cleaned up on leave"
+    pass "legacy iptables opened for wireserve0 and cleaned up on leave"
 else
     echo "SKIPPED: legacy iptables (ip_tables) not usable in this environment"
 fi

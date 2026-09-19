@@ -19,11 +19,12 @@
 # operations.
 #
 # --network host is REQUIRED for a real node (security review F5): the
-# agent creates wg0 and installs its nftables table in whatever network
+# agent creates its WireGuard interface (wireserve0, or the next free
+# name) and installs its nftables table in whatever network
 # namespace it runs in. In a private container namespace nothing on the
 # host can reach the mesh, and no service running on the host is
 # reachable through it — the container would be a node all by itself.
-# Host networking puts wg0 and the firewall rules on the host, which is
+# Host networking puts the interface and the firewall rules on the host, which is
 # the point. (deploy/e2e deliberately runs agents in isolated namespaces
 # because there each container IS the node under test.)
 #
@@ -85,6 +86,9 @@ COPY --from=builder /out/wireserve-agent /usr/local/bin/wireserve-agent
 # /etc/hosts needs DAC access this container's root has for free and a
 # non-root user would need CAP_DAC_OVERRIDE (nearly as broad as root) to
 # get another way.
+# The default instance's paths (the built-in defaults, spelled out). A
+# named instance (`--instance <n>`) keeps its state under
+# /var/lib/wireserve/instances/<n> — inside the same volume.
 ENV WIRESERVE_STATE_PATH=/var/lib/wireserve/agent-state.json
 ENV WIRESERVE_SOCKET_PATH=/run/wireserve/agent.sock
 VOLUME ["/var/lib/wireserve", "/run/wireserve"]

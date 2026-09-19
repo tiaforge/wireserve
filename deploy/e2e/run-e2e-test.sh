@@ -98,19 +98,19 @@ start_agent "$AGENT2" "$JT2"
 log "waiting for the first few poll cycles"
 sleep 8
 
-log "checking both agents have a real wg0 interface"
+log "checking both agents have a real wireserve0 interface"
 for agent in "$AGENT1" "$AGENT2"; do
-    podman exec "$agent" test -d /sys/class/net/wg0 || fail "$agent has no wg0 interface"
+    podman exec "$agent" test -d /sys/class/net/wireserve0 || fail "$agent has no wireserve0 interface"
 done
 pass "both agents created a real kernel WireGuard interface"
 
-log "checking agent1's wg0 has a configured peer"
+log "checking agent1's wireserve0 has a configured peer"
 podman run -d --name "$DEBUG_CONTAINER" --network "container:$AGENT1" \
     --cap-add=NET_ADMIN "$DEBUG_IMG" >/dev/null
 sleep 1
-PEER_COUNT=$(podman exec "$DEBUG_CONTAINER" wg show wg0 peers | grep -c . || true)
-[ "$PEER_COUNT" -ge 1 ] || fail "agent1's wg0 has no configured peers"
-pass "agent1's wg0 has $PEER_COUNT configured peer(s)"
+PEER_COUNT=$(podman exec "$DEBUG_CONTAINER" wg show wireserve0 peers | grep -c . || true)
+[ "$PEER_COUNT" -ge 1 ] || fail "agent1's wireserve0 has no configured peers"
+pass "agent1's wireserve0 has $PEER_COUNT configured peer(s)"
 
 # The single most important check in this script: everything above only
 # proves that control-plane state was written somewhere. This proves the
@@ -134,20 +134,20 @@ print(match[0] if match else '')
 "
 }
 
-log "checking the mesh actually passes traffic (agent1 -> agent2 over wg0)"
+log "checking the mesh actually passes traffic (agent1 -> agent2 over wireserve0)"
 AGENT2_MESH_IP=$(mesh_ip_of "$AGENT2" node2)
 [ -n "$AGENT2_MESH_IP" ] || fail "could not determine agent2's mesh address"
 echo "agent2 mesh address: $AGENT2_MESH_IP"
 podman exec "$DEBUG_CONTAINER" ip route get "$AGENT2_MESH_IP" \
     || fail "no route to agent2's mesh address from agent1 — peer routes were never installed"
-podman exec "$DEBUG_CONTAINER" ip route get "$AGENT2_MESH_IP" | grep -q "dev wg0" \
-    || fail "route to agent2's mesh address does not go via wg0"
-pass "agent1 has a kernel route to agent2 via wg0"
+podman exec "$DEBUG_CONTAINER" ip route get "$AGENT2_MESH_IP" | grep -q "dev wireserve0" \
+    || fail "route to agent2's mesh address does not go via wireserve0"
+pass "agent1 has a kernel route to agent2 via wireserve0"
 
 podman exec "$DEBUG_CONTAINER" ping -c2 -W3 "$AGENT2_MESH_IP" >/dev/null 2>&1 \
     && echo "NOTE: agent2 answers ICMP on the mesh" \
     || echo "NOTE: agent2 does not answer ICMP on the mesh, which is expected —" \
-            "default-deny on wg0 drops inbound echo requests (they are neither" \
+            "default-deny on wireserve0 drops inbound echo requests (they are neither" \
             "ESTABLISHED/RELATED nor a declared service port)."
 
 log "declaring a service on agent1 — it must NOT propagate before approval"
@@ -179,7 +179,7 @@ pass "agent2's /etc/hosts synced testsvc.wg once approved"
 log "checking the firewall allows the declared port and denies everything else"
 # agent1 declared testsvc on tcp/12345 above. Both listeners below run in
 # the debug container, which shares agent1's network namespace, so they
-# listen on agent1's wg0 and are governed by agent1's nftables rules.
+# listen on agent1's wireserve0 and are governed by agent1's nftables rules.
 # Listening on BOTH ports is what makes this a real test: with nothing
 # bound to the undeclared port, an unreachable result would prove nothing,
 # since "refused because nothing is listening" and "dropped by the
@@ -198,7 +198,7 @@ sleep 1
 
 # Sanity: both listeners must be reachable from INSIDE agent1's own
 # namespace, or the checks below would be testing a broken listener rather
-# than the firewall. Loopback is not subject to the wg0-scoped rules.
+# than the firewall. Loopback is not subject to the wireserve0-scoped rules.
 podman exec "$DEBUG_CONTAINER" timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/12346" \
     || fail "the undeclared-port listener is not actually listening — the firewall check below would be meaningless"
 
@@ -224,15 +224,14 @@ if podman exec "$AGENT2" wireserve-agent list | grep -q '"name": "node1"'; then
 fi
 pass "node1 dropped out of agent2's peer list after revoke"
 
-log "the agent must refuse to take over an interface it did not create"
+log "the agent must never take over an interface it did not create"
 # The library underneath is idempotent to a fault: creating an interface
 # that already exists returns success, and configuring it then flushes its
 # addresses, overwrites its private key and listen port, and sends
 # WireGuard's ReplacePeers flag, dropping every peer on it. On a host that
-# already runs a wg-quick tunnel called wg0 — the default name, and a very
-# common way to reach a machine remotely — starting this daemon used to
-# quietly destroy it. Everything below is set up to look exactly like that
-# situation.
+# already runs another tunnel under the agent's name, starting the daemon
+# used to quietly destroy it. Everything below is set up to look exactly
+# like that situation: somebody else's wireserve0.
 GUARD=wireserve-guard-e2e-test
 podman rm -f "$GUARD" >/dev/null 2>&1 || true
 podman run -d --name "$GUARD" --network "$NET" \
@@ -241,36 +240,37 @@ podman run -d --name "$GUARD" --network "$NET" \
 JT_GUARD=$(create_node node3)
 podman exec "$GUARD" wireserve-agent join "http://$COORD_IP:47820" "$JT_GUARD" --listen-port 51820
 
-# Stand up somebody else's wg0 first, with its own key and address.
 FOREIGN_KEY=$(podman run --rm "$DEBUG_IMG" wg genkey)
 podman run --rm --network "container:$GUARD" --cap-add=NET_ADMIN "$DEBUG_IMG" sh -c "
-    ip link add wg0 type wireguard &&
-    echo '$FOREIGN_KEY' > /tmp/k && wg set wg0 private-key /tmp/k listen-port 51821 &&
-    ip addr add 192.0.2.77/32 dev wg0 && ip link set wg0 up"
+    ip link add wireserve0 type wireguard &&
+    echo '$FOREIGN_KEY' > /tmp/k && wg set wireserve0 private-key /tmp/k listen-port 51821 &&
+    ip addr add 192.0.2.77/32 dev wireserve0 && ip link set wireserve0 up"
 FOREIGN_PUB=$(echo "$FOREIGN_KEY" | podman run --rm -i "$DEBUG_IMG" wg pubkey)
-echo "pre-existing wg0 public key: $FOREIGN_PUB"
+echo "pre-existing wireserve0 public key: $FOREIGN_PUB"
+foreign_intact() {
+    local pub
+    pub=$(podman run --rm --network "container:$GUARD" --cap-add=NET_ADMIN "$DEBUG_IMG" wg show wireserve0 public-key)
+    [ "$pub" = "$FOREIGN_PUB" ] || fail "the pre-existing interface's private key was overwritten ($pub != $FOREIGN_PUB)"
+    podman run --rm --network "container:$GUARD" --cap-add=NET_ADMIN "$DEBUG_IMG" ip addr show wireserve0 \
+        | grep -q "192.0.2.77" || fail "the pre-existing interface's address was flushed"
+}
 
-if podman exec "$GUARD" wireserve-agent daemon --poll-interval-secs 5 2>&1 | tee /tmp/guard-out.txt; then
+# Told to use exactly that name, it refuses.
+if podman exec "$GUARD" wireserve-agent daemon --poll-interval-secs 5 --ifname wireserve0 2>&1 | tee /tmp/guard-out.txt; then
     fail "the agent started on an interface it did not create — it should have refused"
 fi
-grep -qi "refusing to take over" /tmp/guard-out.txt \
+grep -qi "cannot use the interface name 'wireserve0'" /tmp/guard-out.txt \
     || fail "the agent failed, but not with the interface-conflict error: $(cat /tmp/guard-out.txt)"
-pass "the agent refused to start on a pre-existing wg0"
+foreign_intact
+pass "pinned to a foreign interface's name, the agent refused and left it alone"
 
-STILL_PUB=$(podman run --rm --network "container:$GUARD" --cap-add=NET_ADMIN "$DEBUG_IMG" wg show wg0 public-key)
-[ "$STILL_PUB" = "$FOREIGN_PUB" ] \
-    || fail "the pre-existing interface's private key was overwritten ($STILL_PUB != $FOREIGN_PUB)"
-podman run --rm --network "container:$GUARD" --cap-add=NET_ADMIN "$DEBUG_IMG" ip addr show wg0 \
-    | grep -q "192.0.2.77" || fail "the pre-existing interface's address was flushed"
-pass "the pre-existing interface kept its key and its address"
-
-# And with a free name it starts normally, so the guard is not just
-# refusing everything.
-podman exec -d "$GUARD" wireserve-agent daemon --poll-interval-secs 5 --ifname wg1
+# Left to choose, it goes around it.
+podman exec -d "$GUARD" wireserve-agent daemon --poll-interval-secs 5
 sleep 8
-podman exec "$GUARD" test -d /sys/class/net/wg1 \
-    || fail "the agent did not come up on the alternative interface name"
-pass "the same agent starts normally on a free interface name (--ifname wg1)"
+podman exec "$GUARD" test -d /sys/class/net/wireserve1 \
+    || fail "the agent did not come up on the next free name, wireserve1"
+foreign_intact
+pass "without --ifname the agent picked wireserve1 and left the foreign wireserve0 alone"
 podman rm -f "$GUARD" >/dev/null 2>&1 || true
 
 log "testing leave removes the managed hosts-file block (regression: F2)"

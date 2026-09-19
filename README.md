@@ -17,7 +17,7 @@ the reasoning, and `PLAN.md` for implementation status.
   admin CLI ──▶ coordinator ◀── agents poll every ~20s over HTTPS
                 (axum + SQLite)     │
                                     ├─ configure WireGuard peers
-                                    ├─ open only declared ports on wg0
+                                    ├─ open only declared ports on wireserve0
                                     └─ write <service>.wg into /etc/hosts
 ```
 
@@ -153,8 +153,9 @@ for as long as the process is alive. Passing both explicitly still works
 the same as before (`wireserve-agent join <url> <token>`, or
 `--join-token-file <path>`/`-` for scripted joins) if you'd rather not be
 prompted. `join` generates the keypair locally, redeems the token, and
-stores everything mode-600. Pass `--ifname wg1` if the machine already has
-a `wg0`.
+stores everything mode-600. The daemon brings the mesh up on `wireserve0`,
+or the next free name if that one is taken; `wireserve-agent list` shows
+which.
 
 ### 3. Publish a service
 
@@ -350,10 +351,15 @@ needs host networking, or the mesh exists only inside that container.
 
 ### Two conflicts worth checking before the first start
 
-**The interface name.** The agent defaults to `wg0`, which is also what
-`wg-quick` uses. It will not take over an interface it did not create — it
-refuses to start instead — so an existing tunnel is safe, but you will need
-`--ifname wg1` (or another free name) on a host that already has one.
+**The interface name.** The agent picks the first free name of
+`wireserve0` … `wireserve15` and keeps it across restarts (it's stored in
+the instance's state). It never takes over an interface it did not create:
+a name held by another tunnel is simply skipped. `--ifname <name>` pins an
+exact name instead — then a conflict makes the daemon refuse to start
+rather than pick another, since you presumably refer to that name
+elsewhere — and `--ifname auto` removes the pin. Agents from before this
+used `wg0`; on upgrade, the default instance moves to `wireserve0` and
+removes what the old one left behind.
 
 **The mesh address ranges.** If you left `WIRESERVE_NET_V4_CIDR` and
 `WIRESERVE_NET_V6_PREFIX` unset, the coordinator already generated a safe
@@ -398,14 +404,14 @@ mesh interface through, the same way NetBird does, and its own table then
 decides what is actually reachable:
 
 - **nftables tables** (native configs, crowdsec, geoip-shell, …): a rule
-  `iifname "wg0" counter accept comment "wireserve:wg0"` at the top of every
-  other table's input filter chain.
+  `iifname "wireserve0" counter accept comment "wireserve:wireserve0"` at the
+  top of every other table's input filter chain.
 - **iptables** (ufw, Docker hosts, scripts; both nft-backed and legacy):
-  `-A INPUT -i wg0 -m comment --comment "wireserve:wg0" -j ACCEPT` at the top
-  of `INPUT`.
+  `-A INPUT -i wireserve0 -m comment --comment "wireserve:wireserve0" -j ACCEPT`
+  at the top of `INPUT`.
 - **firewalld**: the interface goes into the `trusted` zone for the current
   boot only (never `--permanent`), plus a small table
-  `inet wireserve-interop` that drops traffic *forwarded* from the mesh
+  `inet wireserve-interop.wireserve0` that drops traffic *forwarded* from the mesh
   interface, because a trusted zone would otherwise let mesh peers route
   through this host. A zone you bound the interface to yourself is left
   alone (the agent logs that it did).
@@ -420,15 +426,64 @@ place when another tool reloads (`ufw reload`, `firewall-cmd --reload`,
 ```sh
 sudo nft list ruleset | grep wireserve:
 sudo iptables -S INPUT | grep wireserve:
-firewall-cmd --get-zone-of-interface=wg0
+firewall-cmd --get-zone-of-interface=wireserve0
 ```
 
-`sudo ufw allow in on wg0` or similar manual exceptions are not needed and
-can be removed.
+`sudo ufw allow in on wireserve0` or similar manual exceptions are not
+needed and can be removed.
 
 In a container (Docker/Podman with host networking) the same happens on
 the host, except for firewalld, which the container can't reach; the agent
 logs the command to run on the host instead.
+
+### Several agents on one host
+
+One host can be a node in several meshes (or hold several identities in
+one) by running one agent *instance* per mesh. The plain unit runs the
+default instance; name the others:
+
+```sh
+sudo wireserve-agent --instance work join          # prompts, as above
+sudo systemctl enable --now wireserve-agent@work   # deploy/systemd/wireserve-agent@.service
+sudo wireserve-agent --instance work serve git 3000
+sudo wireserve-agent --instance work list
+```
+
+(`WIRESERVE_INSTANCE=work` works in place of the flag.) Each instance is a
+separate node with its own:
+
+| | default instance | instance `work` |
+|---|---|---|
+| state and keys | `/var/lib/wireserve/` | `/var/lib/wireserve/instances/work/` |
+| socket | `/run/wireserve/agent.sock` | `/run/wireserve-work/agent.sock` |
+| interface | first free `wireserve<N>` | next free `wireserve<N>` |
+| listen port | first free from 51820 | next free from 51820 |
+| nftables | `inet wireserve.<if>`, `inet wireserve-interop.<if>` | same, for its interface |
+| hosts file | `# BEGIN WIRESERVE` block | `# BEGIN WIRESERVE work` block |
+
+Instances leave each other alone: each keeps, rewrites and removes only
+its own table, hosts block and host-firewall rules. Another instance's
+rules are left in place while it runs; if it dies without cleaning up,
+whichever instance runs next removes them. An instance can't be run twice,
+and `join` refuses while that instance's daemon is up. Interface names and
+listen ports stored by an instance stay reserved for it even while it's
+stopped.
+
+Give the meshes' coordinators non-overlapping address ranges; the daemon
+refuses to start if its own mesh address is already on another interface.
+
+Running `deploy/e2e/run-multi-instance-test.sh` (after
+`cargo build --workspace`) exercises all of this end to end in a throwaway
+unprivileged namespace — no root and no containers needed.
+
+### Known issue: hosts without a default route
+
+The WireGuard library the agent uses adds a host route for each peer's
+endpoint through the default gateway whenever it sets up peer routes. On a
+host with **no** default route it adds a *blackhole* route to each endpoint
+instead, which cuts the mesh (and a coordinator at a peer's address) off
+entirely. Hosts with a default route are unaffected apart from the extra
+routes.
 
 ## Building the container images
 
