@@ -36,3 +36,8 @@ nftables = { version = "0.6", default-features = false }
 base64 = "0.23"
 rpassword = "7"
 libc = "0.2"
+# The versions defguard_wireguard_rs uses, for our own route handling (see
+# wireserve-agent/src/routes.rs); keep in step with it.
+netlink-packet-core = "0.9"
+netlink-packet-route = "0.33"
+netlink-sys = "0.9"

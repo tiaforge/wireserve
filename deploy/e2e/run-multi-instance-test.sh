@@ -73,11 +73,8 @@ ip addr add 10.99.0.1/24 dev vh && ip link set vh up
 in_peer ip link set lo up
 in_peer ip addr add 10.99.0.2/24 dev vp
 in_peer ip link set vp up
-# Default routes, as real hosts have: without one, defguard's
-# `configure_peer_routing` blackholes every peer endpoint (see the
-# README's known issues).
-ip route add default via 10.99.0.2
-in_peer ip route add default via 10.99.0.1
+# Deliberately no default route on either side: the agent once let
+# defguard blackhole every peer endpoint on such hosts (PLAN.md #78).
 
 log "a host firewall that drops everything not explicitly allowed"
 iptables-nft -P INPUT DROP
@@ -294,6 +291,10 @@ ip link show wireserve2 >/dev/null 2>&1 && fail "wireserve2 still exists after l
 pass "leave removed only its own instance"
 [ "$(wg show wireserve0 public-key)" = "$FOREIGN_PUB" ] || fail "the foreign wireserve0 was modified"
 pass "the foreign wireserve0 survived all of it"
+if ip route show table all | grep -q blackhole || in_peer ip route show table all | grep -q blackhole; then
+    fail "a blackhole route appeared"
+fi
+pass "no endpoint or blackhole routes anywhere"
 
 echo
 echo "=== ALL CHECKS PASSED ==="

@@ -1344,12 +1344,27 @@ what the library does and does not do on your behalf.
     cleanup by the surviving instance, sticky restart, clean stop, the
     pre-instances upgrade, and `leave`. No root, no containers.
 
-    Found by it, not fixed here (a separate change, recorded in the README
-    as a known issue): defguard's `configure_peer_routing` always calls
-    `configure_endpoints`, which routes every peer endpoint via the
-    default gateway — and on a host with no default route installs a
-    *blackhole* route to it, cutting the mesh off. It is meant for
-    `0.0.0.0/0` peers only; ours never are. The test gives its namespaces
-    default routes. Also observed: defguard's `remove_interface` flushes
-    systemd-resolved over D-Bus, which times out after 25 s where the bus
-    is unreachable, so teardown is slow there.
+    Also observed: defguard's `remove_interface` flushes systemd-resolved
+    over D-Bus, which times out after 25 s where the bus is unreachable,
+    so teardown is slow there.
+
+78. **Peer routes are our own; endpoints get none.** Found by #77:
+    defguard's `configure_peer_routing` always calls `configure_endpoints`,
+    which routes every peer endpoint via the default gateway — and on a
+    host with no default route installs a *blackhole* route to it,
+    cutting the mesh (and a coordinator at a peer's address) off. That
+    step exists for `0.0.0.0/0` peers, whose endpoint must be kept out of
+    the tunnel; ours only ever carry their own `/32` + `/128`, so an
+    endpoint is reached over the host's normal routes. `routes.rs` now
+    adds the link-scoped host routes itself (netlink, same crates and
+    route shape defguard used), and removes a departed peer's route,
+    which defguard never did. Deletes carry the output interface so
+    another mesh's route to the same address is never removed; an add
+    that collides with such a route is a no-op (one route per prefix).
+    Route failures are logged, not fatal: failing `reconcile` would leave
+    `applied` stale and reconfigure every peer next cycle, resetting
+    WireGuard's endpoint roaming. Routes previous versions pinned to
+    endpoints are not removed — they can't be told apart from an
+    operator's — and vanish with the link or a reboot. A kernel test
+    reproduces the blackhole with the old call and passes with the new
+    one; the multi-instance e2e now runs without default routes.

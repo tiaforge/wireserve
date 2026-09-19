@@ -2,7 +2,7 @@
 //! interface: bring-up with this node's own keypair/addresses, and
 //! reconciling the kernel peer set against each poll's `peers` array.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use defguard_wireguard_rs::error::WireguardInterfaceError;
@@ -410,25 +410,33 @@ impl WgInterface {
         // kernel one: it decides which peer a packet belongs to once the
         // packet has already been handed to the interface. It does not put
         // anything in the host's routing table, so without this step
-        // nothing ever sends a packet to `wg0` in the first place. The
-        // interface's own address is assigned as a `/32` (plus a `/128`),
-        // which creates a local route for this node alone and no route at
-        // all towards the other members of the mesh — so `plex.wg`
-        // resolving to a peer's address would still fail to connect, and
-        // on a host running an overlay that claims the surrounding range
-        // (Tailscale and `100.64.0.0/10`, say) the packet would be handed
-        // to *that* interface instead. `wg-quick` does this same step from
-        // `AllowedIPs` and it has to happen here too.
+        // nothing ever sends a packet to the interface in the first place.
+        // The interface's own address is assigned as a `/32` (plus a
+        // `/128`), which creates a local route for this node alone and no
+        // route at all towards the other members of the mesh — so
+        // `plex.wg` resolving to a peer's address would still fail to
+        // connect, and on a host running an overlay that claims the
+        // surrounding range (Tailscale and `100.64.0.0/10`, say) the packet
+        // would be handed to *that* interface instead. `wg-quick` does this
+        // same step from `AllowedIPs` and it has to happen here too.
+        //
+        // Our own routes, not defguard's `configure_peer_routing`, which
+        // also routes every peer *endpoint* via the default gateway — and
+        // blackholes it on a host without one. See `crate::routes`.
         //
         // Only run when the peer set actually changed, to keep it off the
-        // steady-state path: every peer's `AllowedIPs` here is its own
-        // `/32` + `/128`, never a default route, so this adds exactly one
-        // host route per peer and never touches the default route or the
-        // policy-routing rules that `configure_peer_routing` would set up
-        // for a `0.0.0.0/0` peer.
+        // steady-state path.
         if !to_remove.is_empty() || !to_configure.is_empty() {
-            let all: Vec<Peer> = desired.values().cloned().collect();
-            self.api.configure_peer_routing(&all)?;
+            let addresses = |peers: &HashMap<Key, Peer>| -> BTreeSet<IpAddr> {
+                peers.values().flat_map(|p| &p.allowed_ips).map(|a| a.address).collect()
+            };
+            // A route that couldn't be set is logged (by `sync`) and retried
+            // on the next change, not fatal: failing here would leave
+            // `applied` stale and reconfigure every peer next cycle, which
+            // resets WireGuard's own endpoint roaming (see above).
+            if let Err(e) = crate::routes::sync(&self.ifname, &addresses(&self.applied), &addresses(&desired)) {
+                tracing::warn!(ifname = %self.ifname, error = %e, "peer routes are incomplete");
+            }
         }
 
         self.applied = desired;
@@ -728,5 +736,45 @@ mod tests {
         assert_eq!(interfaces_with_address(v6, "wireserve0").unwrap(), ["other"]);
         assert!(interfaces_with_address(v4, "other").unwrap().is_empty());
         assert!(interfaces_with_address("10.77.0.2".parse().unwrap(), "x").unwrap().is_empty());
+    }
+
+    /// Regression test for the endpoint blackhole: on a host with no
+    /// default route, defguard's `configure_peer_routing` added a
+    /// blackhole route to every peer's endpoint. Our routing adds a route
+    /// for each peer's mesh addresses on the interface and nothing else,
+    /// and removes it again when the peer goes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_reconcile_routes_peers_and_never_their_endpoints() {
+        if !crate::firewall::netns::reexec("wg::tests::kernel_reconcile_routes_peers_and_never_their_endpoints") {
+            return;
+        }
+        let sh = |script: &str| {
+            let out = std::process::Command::new("sh").args(["-euc", script]).output().unwrap();
+            assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap()
+        };
+        // A LAN and no default route — the case that broke.
+        sh("ip link set lo up && ip link add lan type dummy && ip addr add 10.99.0.2/24 dev lan && ip link set lan up");
+
+        let own = clamp_private_key(&Key::generate());
+        let mut wg = WgInterface::new("wgtest").unwrap();
+        wg.bring_up(&own.to_string(), "100.90.0.2".parse().unwrap(), "fd00:90::2".parse().unwrap(), 51820)
+            .unwrap();
+
+        let mut p = peer("peer", &key_b64(9));
+        p.endpoint_addr = Some("10.99.0.1:51820".into());
+        wg.reconcile(std::slice::from_ref(&p), &own.public_key().to_string(), false).unwrap();
+
+        let routes = sh("ip -4 route show table all; ip -6 route show table all");
+        assert!(!routes.contains("blackhole"), "{routes}");
+        assert!(!routes.contains("10.99.0.1"), "no route to the endpoint at all: {routes}");
+        assert!(routes.contains("100.90.0.5 dev wgtest"), "{routes}");
+        assert!(routes.contains("fd00:90::5 dev wgtest"), "{routes}");
+
+        wg.reconcile(&[], &own.public_key().to_string(), false).unwrap();
+        let routes = sh("ip -4 route show table all; ip -6 route show table all");
+        assert!(!routes.contains("100.90.0.5") && !routes.contains("fd00:90::5"), "departed peer's route removed: {routes}");
+        wg.teardown().unwrap();
     }
 }

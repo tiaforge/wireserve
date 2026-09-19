@@ -476,14 +476,12 @@ Running `deploy/e2e/run-multi-instance-test.sh` (after
 `cargo build --workspace`) exercises all of this end to end in a throwaway
 unprivileged namespace — no root and no containers needed.
 
-### Known issue: hosts without a default route
-
-The WireGuard library the agent uses adds a host route for each peer's
-endpoint through the default gateway whenever it sets up peer routes. On a
-host with **no** default route it adds a *blackhole* route to each endpoint
-instead, which cuts the mesh (and a coordinator at a peer's address) off
-entirely. Hosts with a default route are unaffected apart from the extra
-routes.
+The agent adds one route per peer address on its interface and nothing
+else — no routes to peers' endpoints, so hosts without a default route
+work too. Versions before this let the WireGuard library pin a route to
+every peer endpoint via the default gateway; those stay until the link
+goes down or the host reboots, and are harmless while the gateway doesn't
+change (`ip route` lists them as `<endpoint-ip> via <gateway>`).
 
 ## Building the container images
 
