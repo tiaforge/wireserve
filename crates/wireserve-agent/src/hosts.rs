@@ -121,7 +121,12 @@ pub fn sync(path: &Path, label: Option<&str>, services: &[ServiceInfo]) -> std::
         if updated == existing {
             return Ok(());
         }
-        write_preserving_mode(path, &updated)
+        write_preserving_mode(path, &updated)?;
+        // Once per actual change, never per cycle: enough to tell from the
+        // log alone what the block held at any moment.
+        let names: Vec<&str> = services.iter().map(|s| s.name.as_str()).collect();
+        tracing::info!(path = %path.display(), services = ?names, "hosts-file block rewritten");
+        Ok(())
     })
 }
 
@@ -203,7 +208,11 @@ fn strip_managed_block(contents: &str, label: Option<&str>) -> Option<String> {
 
     let mut out = String::new();
     out.push_str(before);
-    if !before.is_empty() && !after.is_empty() {
+    if !before.is_empty() {
+        // Separates `before` from `after`, or — with the block last in the
+        // file — restores the final newline the trim above took. Without
+        // it the file ends mid-line, and the next `echo ... >> /etc/hosts`
+        // glues its entry onto the last hostname.
         out.push('\n');
     }
     out.push_str(after);
@@ -441,7 +450,21 @@ mod tests {
         assert!(!only_work.contains("plex.wg") && only_work.contains("# BEGIN WIRESERVE work"), "{only_work}");
         let only_default = strip_managed_block(&ab, Some("work")).unwrap();
         assert!(only_default.contains("plex.wg") && !only_default.contains("work"), "{only_default}");
-        assert_eq!(strip_managed_block(&only_default, None).unwrap(), base.trim_end());
+        assert_eq!(strip_managed_block(&only_default, None).unwrap(), base);
+    }
+
+    #[test]
+    fn sync_then_remove_restores_the_file_byte_for_byte() {
+        // A block appended to the end of the file and removed again used
+        // to take the file's own final newline with it.
+        for original in ["127.0.0.1 localhost\n::1 localhost\n", "127.0.0.1 localhost\n\n# tail\n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("hosts");
+            std::fs::write(&path, original).unwrap();
+            sync(&path, None, &[svc("plex", "100.90.0.3")]).unwrap();
+            remove_block(&path, None).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
     }
 
     #[test]

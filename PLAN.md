@@ -1368,3 +1368,29 @@ what the library does and does not do on your behalf.
     operator's — and vanish with the link or a reboot. A kernel test
     reproduces the blackhole with the old call and passes with the new
     one; the multi-instance e2e now runs without default routes.
+
+79. **Poll steps no longer block each other; a lost `/etc/hosts` mount
+    restarts the agent.** Peers, firewall and hosts file (steps 2-4) were
+    chained with `?`, so any step failing on every cycle froze the ones
+    after it — the reported symptom was a hosts block written once,
+    empty, while peers and routes kept tracking the directory. Each step
+    now runs regardless, and a cycle reports every failed step together
+    (`PollError::Incomplete`); `last_directory` is still saved only after
+    a cycle applied in full.
+
+    One way to get there, reproduced: the units grant `/etc/hosts` with
+    `ReadWritePaths=` over a read-only `/etc`, which bind-mounts the file
+    into the unit's namespace. When anything on the host replaces the
+    file by rename (`sed -i`, an editor, cloud-init, the agent run by hand
+    outside the unit), the kernel detaches that mount in every other
+    namespace, leaving the read-only file underneath: every later write
+    fails with `EROFS` until the unit restarts. The daemon now treats
+    `EROFS` on the hosts file, *after* a write already succeeded in the
+    same run, as exactly that — tears down and exits non-zero, and
+    `Restart=on-failure` sets the mount up afresh. A hosts file that was
+    read-only from the start (a `:ro` container mount) only logs, never
+    loops. Checked with the real daemon in a namespace sandboxed like the
+    unit. Each actual rewrite of the block is now logged with the names
+    it holds.
+
+    Also: removing the block no longer eats the file's final newline.

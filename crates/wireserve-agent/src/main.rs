@@ -403,6 +403,14 @@ async fn cmd_daemon(
     const UNAUTHORIZED_STREAK_TO_TEARDOWN: u32 = 3;
     let mut unauthorized_streak: u32 = 0;
 
+    // Whether a cycle has written the hosts file (or found it current) in
+    // this run — what tells a hosts file that *became* read-only (a lost
+    // bind mount, see `PollError::hosts_read_only`) from one that always
+    // was, e.g. a container's `-v /etc/hosts:/etc/hosts:ro`. Only the
+    // first is worth restarting over; restarting for the second would
+    // just loop.
+    let mut hosts_synced = false;
+
     // SIGTERM (systemd stop) / SIGINT: tear down the interface, firewall
     // table and hosts block the same way `leave` does, but keep the state
     // file (bearer token, keys, last directory) intact — a stopped daemon
@@ -433,6 +441,27 @@ async fn cmd_daemon(
                 // Safety net for host-firewall changes the interop's own
                 // change monitor can't see (legacy iptables, firewalld).
                 interop.tick();
+
+                match &result {
+                    Ok(_) => hosts_synced = true,
+                    Err(e) if e.hosts_synced() => hosts_synced = true,
+                    Err(e) if hosts_synced && e.hosts_read_only() => {
+                        // Exiting non-zero is the recovery: the unit's
+                        // `Restart=on-failure` sets the sandbox — and with
+                        // it the hosts-file mount — up again from scratch.
+                        tracing::error!(
+                            error = %e,
+                            path = %hosts_path.display(),
+                            "the hosts file became read-only after it had been written in this \
+                             run — under the systemd unit that means something on the host \
+                             replaced it and this unit's mount of it was dropped; exiting so \
+                             the service manager restarts the agent with a fresh one"
+                        );
+                        teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, instance.hosts_label(), &socket_path, &shared_state, &state_path, false).await;
+                        return Err("hosts file became read-only; restart required".into());
+                    }
+                    Err(_) => {}
+                }
 
                 match result {
                     Ok(_) => {

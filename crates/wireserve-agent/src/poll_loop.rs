@@ -36,6 +36,14 @@ pub enum PollError {
     State(#[from] crate::state::StateError),
     #[error("agent is not registered yet — run `wireserve-agent join` first")]
     NotRegistered,
+    /// One or more of the local steps (peers, firewall, hosts file) failed
+    /// while the others were still applied — see `run_once`.
+    #[error("reconciliation incomplete: {}", join_failures(.0))]
+    Incomplete(Vec<PollError>),
+}
+
+fn join_failures(failures: &[PollError]) -> String {
+    failures.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
 }
 
 impl PollError {
@@ -52,6 +60,34 @@ impl PollError {
                 ..
             } if *status == reqwest::StatusCode::UNAUTHORIZED
         )
+    }
+
+    /// The hosts-file step failed with `EROFS`. Under the shipped systemd
+    /// unit that means the agent lost its bind mount of `/etc/hosts`:
+    /// `ReadWritePaths=/etc/hosts` mounts the file into the unit's
+    /// namespace over a read-only `/etc`, and when anything on the host
+    /// replaces the file by rename (`sed -i`, an editor, cloud-init, this
+    /// agent run by hand outside the unit) the kernel detaches that mount
+    /// in every other namespace. The read-only file underneath is all
+    /// that is left, and no write can succeed again until the unit is
+    /// restarted and the mount set up afresh.
+    #[must_use]
+    pub fn hosts_read_only(&self) -> bool {
+        match self {
+            PollError::Hosts(e) => e.raw_os_error() == Some(libc::EROFS),
+            PollError::Incomplete(failures) => failures.iter().any(Self::hosts_read_only),
+            _ => false,
+        }
+    }
+
+    /// The cycle got as far as the hosts file and wrote it (or found it
+    /// already current), even though another step failed.
+    #[must_use]
+    pub fn hosts_synced(&self) -> bool {
+        match self {
+            PollError::Incomplete(failures) => !failures.iter().any(|e| matches!(e, PollError::Hosts(_))),
+            _ => false,
+        }
     }
 }
 
@@ -299,24 +335,41 @@ where
     // `block_in_place` moves this worker off the async scheduler for the
     // duration so the IPC server (`list`/`serve`/`leave`) stays
     // responsive on the other workers.
+    //
+    // Steps 2-4 are independent of one another, so each one runs whatever
+    // happened to the one before it. Chaining them with `?` meant a step
+    // that failed on every cycle silently froze everything after it: a
+    // hosts block written once, empty, while peers and routes (step 2,
+    // which ran first) kept tracking the directory perfectly.
     let rules = service_rules(&declared);
-    tokio::task::block_in_place(|| -> Result<(), PollError> {
+    let failures = tokio::task::block_in_place(|| {
+        let mut failures = Vec::new();
+
         // 2. reconcile WireGuard peers
-        ctx.wg.reconcile(&directory.peers, &self_pubkey, prefer_ipv6)?;
+        if let Err(e) = ctx.wg.reconcile(&directory.peers, &self_pubkey, prefer_ipv6) {
+            failures.push(PollError::Wg(e));
+        }
 
         // 3. reconcile this node's own firewall rules — from what this
         //    node declared (spec §5), not from the coordinator's
         //    directory and not from whatever `serve` may have queued
         //    since. The one exception is an admin denial, already folded
         //    in above, which can only ever close a hole; see there.
-        ctx.firewall
-            .apply(&rules)
-            .map_err(|e| PollError::Firewall(e.to_string()))?;
+        if let Err(e) = ctx.firewall.apply(&rules) {
+            failures.push(PollError::Firewall(e.to_string()));
+        }
 
         // 4. rewrite the hosts-file managed block from the full directory.
-        crate::hosts::sync(ctx.hosts_path, ctx.hosts_label, &directory.services)?;
-        Ok(())
-    })?;
+        if let Err(e) = crate::hosts::sync(ctx.hosts_path, ctx.hosts_label, &directory.services) {
+            failures.push(PollError::Hosts(e));
+        }
+        failures
+    });
+    // `last_directory` stays what was last applied in full, so `list`
+    // never shows a directory this node only partly acted on.
+    if !failures.is_empty() {
+        return Err(PollError::Incomplete(failures));
+    }
 
     // 5. persist merged state.
     {
@@ -578,5 +631,36 @@ mod tests {
         assert!(!conflict.is_unauthorized());
 
         assert!(!PollError::NotRegistered.is_unauthorized());
+    }
+
+    // ---- a lost /etc/hosts mount, and steps failing independently ----
+
+    fn io(errno: i32) -> PollError {
+        PollError::Hosts(std::io::Error::from_raw_os_error(errno))
+    }
+
+    #[test]
+    fn hosts_read_only_only_for_a_hosts_step_erofs() {
+        assert!(io(libc::EROFS).hosts_read_only());
+        assert!(PollError::Incomplete(vec![PollError::Firewall("x".into()), io(libc::EROFS)]).hosts_read_only());
+
+        assert!(!io(libc::EACCES).hosts_read_only());
+        assert!(!PollError::Incomplete(vec![PollError::Firewall("x".into())]).hosts_read_only());
+        assert!(!PollError::NotRegistered.hosts_read_only());
+    }
+
+    #[test]
+    fn hosts_synced_when_only_another_step_failed() {
+        assert!(PollError::Incomplete(vec![PollError::Firewall("x".into())]).hosts_synced());
+        assert!(!PollError::Incomplete(vec![PollError::Firewall("x".into()), io(libc::EROFS)]).hosts_synced());
+        // Failures before the local steps never reached the hosts file.
+        assert!(!PollError::NotRegistered.hosts_synced());
+    }
+
+    #[test]
+    fn an_incomplete_cycle_names_every_failed_step() {
+        let msg = PollError::Incomplete(vec![PollError::Firewall("nft said no".into()), io(libc::EROFS)]).to_string();
+        assert!(msg.contains("firewall reconciliation failed: nft said no"), "{msg}");
+        assert!(msg.contains("hosts-file sync failed"), "{msg}");
     }
 }
