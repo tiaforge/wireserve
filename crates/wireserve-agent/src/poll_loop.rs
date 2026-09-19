@@ -184,6 +184,10 @@ pub struct PollContext<'a, F: FirewallBackend> {
     pub client: &'a reqwest::Client,
     pub coordinator_url: &'a str,
     pub hosts_path: &'a Path,
+    /// This instance's label on its hosts-file block (see
+    /// `hosts::sync`); `None` for the default instance.
+    pub hosts_label: Option<&'a str>,
+    pub state_path: &'a Path,
     pub wg: &'a mut WgInterface,
     pub firewall: &'a mut F,
 }
@@ -253,7 +257,7 @@ where
         {
             let mut s = state.lock().await;
             if quarantine_rejected_service(&mut s, &body_text) {
-                s.save(&crate::paths::state_path())?;
+                s.save(ctx.state_path)?;
             }
         }
 
@@ -285,7 +289,7 @@ where
     let declared = {
         let mut s = state.lock().await;
         if apply_approval_verdicts(&mut s, &directory) {
-            s.save(&crate::paths::state_path())?;
+            s.save(ctx.state_path)?;
         }
         s.declared_services.clone()
     };
@@ -310,7 +314,7 @@ where
             .map_err(|e| PollError::Firewall(e.to_string()))?;
 
         // 4. rewrite the hosts-file managed block from the full directory.
-        crate::hosts::sync(ctx.hosts_path, &directory.services)?;
+        crate::hosts::sync(ctx.hosts_path, ctx.hosts_label, &directory.services)?;
         Ok(())
     })?;
 
@@ -318,7 +322,7 @@ where
     {
         let mut s = state.lock().await;
         s.last_directory = Some(directory.clone());
-        s.save(&crate::paths::state_path())?;
+        s.save(ctx.state_path)?;
     }
 
     Ok(directory)

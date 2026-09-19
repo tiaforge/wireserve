@@ -2,6 +2,7 @@ pub mod firewall;
 pub mod fsutil;
 pub mod hosts;
 pub mod ipc;
+pub mod lock;
 pub mod paths;
 pub mod poll_loop;
 pub mod probe;

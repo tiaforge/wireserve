@@ -2871,6 +2871,7 @@ dependencies = [
  "chrono",
  "clap",
  "defguard_wireguard_rs",
+ "libc",
  "nftables",
  "reqwest",
  "rpassword",

@@ -6,12 +6,20 @@ use tokio::sync::{mpsc, Mutex};
 use wireserve_agent::ipc::{client, protocol::IpcRequest, AgentContext};
 use wireserve_agent::state::AgentState;
 use wireserve_agent::firewall::InteropHandle;
-use wireserve_agent::{firewall, paths, poll_loop, register, wg::WgInterface};
+use wireserve_agent::paths::{self, Instance};
+use wireserve_agent::{firewall, lock, poll_loop, register, wg::WgInterface};
 use wireserve_types::{FirewallBackend, Proto};
 
 #[derive(Parser)]
 #[command(name = "wireserve-agent")]
 struct Cli {
+    /// Which agent instance to act on. Each instance is a separate node
+    /// with its own state, interface, firewall rules and hosts-file block,
+    /// so one host can run several agents side by side (one per mesh, for
+    /// instance). The default instance uses the paths a single agent
+    /// always has.
+    #[arg(long, global = true, env = "WIRESERVE_INSTANCE", default_value = paths::DEFAULT_INSTANCE, value_parser = parse_instance)]
+    instance: Instance,
     #[command(subcommand)]
     command: Command,
 }
@@ -78,10 +86,15 @@ fn init_logging() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
+fn parse_instance(name: &str) -> Result<Instance, paths::InvalidInstance> {
+    Instance::new(name)
+}
+
 #[tokio::main]
 async fn main() {
     init_logging();
     let cli = Cli::parse();
+    let instance = cli.instance;
 
     let result = match cli.command {
         Command::Join {
@@ -90,15 +103,15 @@ async fn main() {
             join_token_file,
             listen_port,
             endpoint_addr,
-        } => cmd_join(coordinator_url, join_token, join_token_file, listen_port, endpoint_addr).await,
+        } => cmd_join(&instance, coordinator_url, join_token, join_token_file, listen_port, endpoint_addr).await,
         Command::Daemon {
             poll_interval_secs,
             ifname,
-        } => cmd_daemon(poll_interval_secs, ifname).await,
-        Command::Serve { name, port, proto } => cmd_serve(name, port, proto).await,
-        Command::Unserve { name } => cmd_unserve(name).await,
-        Command::List => cmd_list().await,
-        Command::Leave => cmd_leave().await,
+        } => cmd_daemon(&instance, poll_interval_secs, ifname).await,
+        Command::Serve { name, port, proto } => cmd_serve(&instance, name, port, proto).await,
+        Command::Unserve { name } => cmd_unserve(&instance, name).await,
+        Command::List => cmd_list(&instance).await,
+        Command::Leave => cmd_leave(&instance).await,
     };
 
     if let Err(e) = result {
@@ -108,19 +121,25 @@ async fn main() {
 }
 
 async fn cmd_join(
+    instance: &Instance,
     coordinator_url: Option<String>,
     join_token: Option<String>,
     join_token_file: Option<std::path::PathBuf>,
     listen_port: u16,
     endpoint_addr: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Held across the whole join: a daemon running on this instance would
+    // otherwise keep using (and saving) the identity this is replacing.
+    let _lock = lock::lock_instance(instance)?;
     let coordinator_url = resolve_coordinator_url(coordinator_url)?;
     let join_token = resolve_join_token(join_token, join_token_file)?;
+    let state_path = instance.state_path();
     let state = register::join(register::JoinParams {
         coordinator_url: &coordinator_url,
         join_token: &join_token,
         listen_port,
         endpoint_addr,
+        state_path: &state_path,
     })
     .await?;
     println!(
@@ -199,8 +218,15 @@ fn resolve_join_token(
     }
 }
 
-async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<dyn std::error::Error>> {
-    let state_path = paths::state_path();
+async fn cmd_daemon(
+    instance: &Instance,
+    poll_interval_secs: u64,
+    ifname: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // First, before anything is looked at or changed: one daemon per
+    // instance. Held until the process exits.
+    let _lock = lock::lock_instance(instance)?;
+    let state_path = instance.state_path();
     let state = AgentState::load(&state_path)?;
     if state.bearer_token.is_none() {
         return Err("not registered — run `wireserve-agent join` first".into());
@@ -263,7 +289,7 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
         state_path: state_path.clone(),
         shutdown: shutdown_tx,
     };
-    let socket_path = paths::socket_path();
+    let socket_path = instance.socket_path();
     let ipc_socket_path = socket_path.clone();
     tokio::spawn(async move {
         if let Err(e) = wireserve_agent::ipc::server::serve(ipc_ctx, &ipc_socket_path).await {
@@ -303,7 +329,7 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
         tokio::select! {
             _ = async { tokio::select! { _ = sigterm.recv() => {}, _ = tokio::signal::ctrl_c() => {} } } => {
                 tracing::info!("termination signal received — tearing down");
-                teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, &socket_path, &shared_state, &state_path, false).await;
+                teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, instance.hosts_label(), &socket_path, &shared_state, &state_path, false).await;
                 break;
             }
             _ = interval.tick() => {
@@ -311,6 +337,8 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
                     client: &client,
                     coordinator_url: &coordinator_url,
                     hosts_path: &hosts_path,
+                    hosts_label: instance.hosts_label(),
+                    state_path: &state_path,
                     wg: &mut wg,
                     firewall: &mut fw,
                 };
@@ -351,7 +379,7 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
                              again with a fresh token from `wireserve-admin rejoin` to rejoin)",
                             UNAUTHORIZED_STREAK_TO_TEARDOWN
                         );
-                        teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, &socket_path, &shared_state, &state_path, false).await;
+                        teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, instance.hosts_label(), &socket_path, &shared_state, &state_path, false).await;
                         break;
                     }
                     Err(e) => tracing::error!(error = %e, "poll cycle failed, will retry next interval"),
@@ -359,7 +387,7 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
             }
             _ = shutdown_rx.recv() => {
                 tracing::info!("leave requested, tearing down");
-                teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, &socket_path, &shared_state, &state_path, true).await;
+                teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, instance.hosts_label(), &socket_path, &shared_state, &state_path, true).await;
                 break;
             }
         }
@@ -383,6 +411,7 @@ async fn teardown_everything<F: FirewallBackend>(
     interop: &mut impl InteropHandle,
     wg: &mut WgInterface,
     hosts_path: &std::path::Path,
+    hosts_label: Option<&str>,
     socket_path: &std::path::Path,
     state: &Mutex<AgentState>,
     state_path: &std::path::Path,
@@ -390,7 +419,7 @@ async fn teardown_everything<F: FirewallBackend>(
 ) where
     F::Error: std::fmt::Display,
 {
-    if let Err(e) = wireserve_agent::hosts::remove_block(hosts_path) {
+    if let Err(e) = wireserve_agent::hosts::remove_block(hosts_path, hosts_label) {
         tracing::warn!(error = %e, "failed to remove managed hosts-file block during teardown");
     }
     // The host firewall closes back first, then our own table goes: the
@@ -422,9 +451,9 @@ async fn teardown_everything<F: FirewallBackend>(
     }
 }
 
-async fn cmd_serve(name: String, port: u16, proto: String) -> Result<(), Box<dyn std::error::Error>> {
+async fn cmd_serve(instance: &Instance, name: String, port: u16, proto: String) -> Result<(), Box<dyn std::error::Error>> {
     let proto: Proto = proto.parse().map_err(|e: String| e)?;
-    let resp = client::call(&paths::socket_path(), &IpcRequest::Serve { name, port, proto }).await?;
+    let resp = client::call(&instance.socket_path(), &IpcRequest::Serve { name, port, proto }).await?;
     // "ok" alone overstates what just happened: the declaration is queued
     // locally and only reaches the coordinator on the next poll, and if
     // that coordinator requires approval it will sit pending until an
@@ -442,14 +471,14 @@ async fn cmd_serve(name: String, port: u16, proto: String) -> Result<(), Box<dyn
     Ok(())
 }
 
-async fn cmd_unserve(name: String) -> Result<(), Box<dyn std::error::Error>> {
-    let resp = client::call(&paths::socket_path(), &IpcRequest::Unserve { name }).await?;
+async fn cmd_unserve(instance: &Instance, name: String) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = client::call(&instance.socket_path(), &IpcRequest::Unserve { name }).await?;
     print_response(resp);
     Ok(())
 }
 
-async fn cmd_list() -> Result<(), Box<dyn std::error::Error>> {
-    let resp = client::call(&paths::socket_path(), &IpcRequest::List).await?;
+async fn cmd_list(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = client::call(&instance.socket_path(), &IpcRequest::List).await?;
     match resp {
         wireserve_agent::ipc::IpcResponse::List(view) => {
             println!("{}", serde_json::to_string_pretty(&view)?);
@@ -459,8 +488,8 @@ async fn cmd_list() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn cmd_leave() -> Result<(), Box<dyn std::error::Error>> {
-    let resp = client::call(&paths::socket_path(), &IpcRequest::Leave).await?;
+async fn cmd_leave(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = client::call(&instance.socket_path(), &IpcRequest::Leave).await?;
     print_response(resp);
     Ok(())
 }

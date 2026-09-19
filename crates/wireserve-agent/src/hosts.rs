@@ -3,6 +3,13 @@
 //! IPv4 address. Entries live between fixed markers so each poll cycle can
 //! safely wipe-and-rewrite just that span without touching anything else
 //! already in the file.
+//!
+//! Each agent instance on a host owns its own block: the default instance
+//! keeps the bare `# BEGIN WIRESERVE` / `# END WIRESERVE` markers every
+//! earlier version wrote, a named instance `<n>` writes
+//! `# BEGIN WIRESERVE <n>` / `# END WIRESERVE <n>`. Markers only ever
+//! match a whole line, so `# BEGIN WIRESERVE` never finds the start of
+//! another instance's labelled block.
 
 use std::path::Path;
 
@@ -12,6 +19,13 @@ use crate::fsutil::atomic_write;
 
 const BEGIN_MARKER: &str = "# BEGIN WIRESERVE";
 const END_MARKER: &str = "# END WIRESERVE";
+
+fn markers(label: Option<&str>) -> (String, String) {
+    match label {
+        None => (BEGIN_MARKER.to_string(), END_MARKER.to_string()),
+        Some(l) => (format!("{BEGIN_MARKER} {l}"), format!("{END_MARKER} {l}")),
+    }
+}
 
 /// Renders the managed block's body (without markers) for the given
 /// services, one `<ip> <name>.wg` line per service, sorted for a stable
@@ -46,23 +60,40 @@ fn is_safe_entry(s: &ServiceInfo) -> bool {
     ok
 }
 
+/// The byte span of this label's block: from the start of its begin line
+/// to the end of its end-marker text (the newline after it is not part of
+/// the span). `None` unless both markers are present, each as a whole
+/// line, the end after the begin.
+fn find_block(contents: &str, label: Option<&str>) -> Option<(usize, usize)> {
+    let (begin, end) = markers(label);
+    let mut offset = 0;
+    let mut start = None;
+    for line in contents.split_inclusive('\n') {
+        let text = line.trim_end();
+        match start {
+            None if text == begin => start = Some(offset),
+            Some(s) if text == end => return Some((s, offset + line.trim_end_matches(['\n', '\r']).len())),
+            _ => {}
+        }
+        offset += line.len();
+    }
+    None
+}
+
 /// Replaces the managed block in `contents`, creating the markers
 /// (appended, with a leading blank line for separation) if they're not
 /// already present. Everything outside the markers is preserved verbatim.
-fn replace_managed_block(contents: &str, services: &[ServiceInfo]) -> String {
+fn replace_managed_block(contents: &str, label: Option<&str>, services: &[ServiceInfo]) -> String {
+    let (begin, end) = markers(label);
     let body = render_block(services);
-    let new_block = format!("{BEGIN_MARKER}\n{body}\n{END_MARKER}");
+    let new_block = format!("{begin}\n{body}\n{end}");
 
-    if let (Some(start), Some(end)) = (contents.find(BEGIN_MARKER), contents.find(END_MARKER)) {
-        if end >= start {
-            let before = &contents[..start];
-            let after = &contents[end + END_MARKER.len()..];
-            let mut out = String::new();
-            out.push_str(before);
-            out.push_str(&new_block);
-            out.push_str(after);
-            return out;
-        }
+    if let Some((start, stop)) = find_block(contents, label) {
+        let mut out = String::new();
+        out.push_str(&contents[..start]);
+        out.push_str(&new_block);
+        out.push_str(&contents[stop..]);
+        return out;
     }
 
     // Markers absent (or malformed/out of order — treat as absent rather
@@ -79,14 +110,54 @@ fn replace_managed_block(contents: &str, services: &[ServiceInfo]) -> String {
     out
 }
 
-/// Reads `path`, rewrites only the managed block, and writes the result
-/// back atomically. Preserves the original file's permission bits (an
-/// `/etc/hosts` on a real system is typically world-readable, 644, and
-/// this writer has no business changing that).
-pub fn sync(path: &Path, services: &[ServiceInfo]) -> std::io::Result<()> {
-    let existing = read_existing(path)?;
-    let updated = replace_managed_block(&existing, services);
-    write_preserving_mode(path, &updated)
+/// Reads `path`, rewrites only this instance's managed block, and writes
+/// the result back atomically. Preserves the original file's permission
+/// bits (an `/etc/hosts` on a real system is typically world-readable,
+/// 644, and this writer has no business changing that).
+pub fn sync(path: &Path, label: Option<&str>, services: &[ServiceInfo]) -> std::io::Result<()> {
+    with_lock(path, || {
+        let existing = read_existing(path)?;
+        let updated = replace_managed_block(&existing, label, services);
+        if updated == existing {
+            return Ok(());
+        }
+        write_preserving_mode(path, &updated)
+    })
+}
+
+/// Runs a read-modify-write of `path` under an exclusive `flock`, so two
+/// agent instances rewriting their own blocks at the same moment can't
+/// each write back a copy missing the other's change.
+///
+/// The lock is on the file itself, and `atomic_write` replaces the file by
+/// renaming a new one over it, so a lock taken while waiting may end up on
+/// the replaced file rather than the current one. Checked after locking,
+/// by comparing the locked descriptor's inode with the path's, and retried
+/// until the two agree — the usual protocol for locking a file that is
+/// updated by rename. A missing file has nothing to lock; the write that
+/// creates it goes ahead unlocked.
+fn with_lock<T>(path: &Path, f: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    loop {
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return f(),
+            Err(e) => return Err(e),
+        };
+        // SAFETY: a plain syscall on a descriptor that outlives the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let locked = file.metadata()?;
+        match std::fs::metadata(path) {
+            Ok(now) if now.dev() == locked.dev() && now.ino() == locked.ino() => return f(),
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return f(),
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Reads the current hosts file. A missing file is treated as empty (the
@@ -104,30 +175,30 @@ fn read_existing(path: &Path) -> std::io::Result<String> {
     }
 }
 
-/// Strips the managed block (markers included) entirely, rather than
-/// leaving an empty-but-present block behind. Used by `wireserve leave`
-/// (spec §4.6: "tears down interface, firewall, hosts block" — security
-/// review F2 flagged that this project's `leave` implementation was only
-/// doing the first two). A no-op if the markers aren't present.
-pub fn remove_block(path: &Path) -> std::io::Result<()> {
-    let existing = read_existing(path)?;
-    let Some(stripped) = strip_managed_block(&existing) else {
-        return Ok(());
-    };
-    write_preserving_mode(path, &stripped)
+/// Strips this instance's managed block (markers included) entirely,
+/// rather than leaving an empty-but-present block behind. Used by
+/// `wireserve leave` (spec §4.6: "tears down interface, firewall, hosts
+/// block" — security review F2 flagged that this project's `leave`
+/// implementation was only doing the first two). A no-op if the markers
+/// aren't present.
+pub fn remove_block(path: &Path, label: Option<&str>) -> std::io::Result<()> {
+    with_lock(path, || {
+        let existing = read_existing(path)?;
+        let Some(stripped) = strip_managed_block(&existing, label) else {
+            return Ok(());
+        };
+        write_preserving_mode(path, &stripped)
+    })
 }
 
 /// Removes the marked span (and one adjoining blank separator line, if
 /// `replace_managed_block` added one) from `contents`. Returns `None` if
 /// the markers aren't present, so callers can treat that as a no-op
 /// rather than rewriting a file that doesn't need it.
-fn strip_managed_block(contents: &str) -> Option<String> {
-    let (start, end) = (contents.find(BEGIN_MARKER)?, contents.find(END_MARKER)?);
-    if end < start {
-        return None;
-    }
+fn strip_managed_block(contents: &str, label: Option<&str>) -> Option<String> {
+    let (start, end) = find_block(contents, label)?;
     let before = contents[..start].trim_end_matches('\n');
-    let after = &contents[end + END_MARKER.len()..];
+    let after = &contents[end..];
     let after = after.strip_prefix('\n').unwrap_or(after);
 
     let mut out = String::new();
@@ -169,7 +240,7 @@ mod tests {
     #[test]
     fn creates_markers_when_absent_preserving_existing_content() {
         let original = "127.0.0.1 localhost\n::1 localhost\n";
-        let out = replace_managed_block(original, &[svc("plex", "100.90.0.3")]);
+        let out = replace_managed_block(original, None, &[svc("plex", "100.90.0.3")]);
         assert!(out.starts_with(original));
         assert!(out.contains(BEGIN_MARKER));
         assert!(out.contains("100.90.0.3 plex.wg"));
@@ -181,7 +252,7 @@ mod tests {
         let original = format!(
             "127.0.0.1 localhost\n{BEGIN_MARKER}\n100.90.0.3 old.wg\n{END_MARKER}\n192.168.1.1 router\n"
         );
-        let out = replace_managed_block(&original, &[svc("plex", "100.90.0.3")]);
+        let out = replace_managed_block(&original, None, &[svc("plex", "100.90.0.3")]);
         assert!(out.contains("127.0.0.1 localhost"));
         assert!(out.contains("192.168.1.1 router"));
         assert!(!out.contains("old.wg"));
@@ -191,14 +262,14 @@ mod tests {
     #[test]
     fn idempotent_when_services_unchanged() {
         let original = "127.0.0.1 localhost\n";
-        let first = replace_managed_block(original, &[svc("plex", "100.90.0.3")]);
-        let second = replace_managed_block(&first, &[svc("plex", "100.90.0.3")]);
+        let first = replace_managed_block(original, None, &[svc("plex", "100.90.0.3")]);
+        let second = replace_managed_block(&first, None, &[svc("plex", "100.90.0.3")]);
         assert_eq!(first, second);
     }
 
     #[test]
     fn empty_services_yields_empty_but_present_block() {
-        let out = replace_managed_block("", &[]);
+        let out = replace_managed_block("", None, &[]);
         assert!(out.contains(BEGIN_MARKER));
         assert!(out.contains(END_MARKER));
     }
@@ -209,12 +280,12 @@ mod tests {
         let path = dir.path().join("hosts");
         std::fs::write(&path, "127.0.0.1 localhost\n").unwrap();
 
-        sync(&path, &[svc("plex", "100.90.0.3")]).unwrap();
+        sync(&path, None, &[svc("plex", "100.90.0.3")]).unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("plex.wg"));
         assert!(contents.contains("127.0.0.1 localhost"));
 
-        sync(&path, &[svc("homeassistant", "100.90.0.5")]).unwrap();
+        sync(&path, None, &[svc("homeassistant", "100.90.0.5")]).unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(!contents.contains("plex.wg"), "old entry must be gone");
         assert!(contents.contains("homeassistant.wg"));
@@ -240,7 +311,7 @@ mod tests {
         std::fs::write(&real_hosts, "127.0.0.1 localhost\n").unwrap();
 
         let bad_path = dir.path().join("missing-dir").join("hosts");
-        let err = sync(&bad_path, &[svc("plex", "100.90.0.3")]);
+        let err = sync(&bad_path, None, &[svc("plex", "100.90.0.3")]);
         assert!(err.is_err());
 
         assert_eq!(
@@ -265,7 +336,7 @@ mod tests {
             // hosts line, but not what this block is defined to carry).
             svc("six", "fd00::1"),
         ];
-        let out = replace_managed_block("127.0.0.1 localhost\n", &evil);
+        let out = replace_managed_block("127.0.0.1 localhost\n", None, &evil);
         assert!(out.contains("100.90.0.3 plex.wg"));
         assert!(!out.contains("bank.example"));
         assert!(!out.contains("mail.example"));
@@ -294,11 +365,11 @@ mod tests {
         let original: &[u8] = b"127.0.0.1 localhost\n\xff\xfe not utf8\n";
         std::fs::write(&path, original).unwrap();
 
-        let err = sync(&path, &[svc("plex", "100.90.0.3")]);
+        let err = sync(&path, None, &[svc("plex", "100.90.0.3")]);
         assert!(err.is_err(), "sync must fail rather than guess");
         assert_eq!(std::fs::read(&path).unwrap(), original, "file must be untouched");
 
-        let err = remove_block(&path);
+        let err = remove_block(&path, None);
         assert!(err.is_err());
         assert_eq!(std::fs::read(&path).unwrap(), original);
     }
@@ -307,7 +378,7 @@ mod tests {
     fn sync_creates_a_missing_hosts_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hosts");
-        sync(&path, &[svc("plex", "100.90.0.3")]).unwrap();
+        sync(&path, None, &[svc("plex", "100.90.0.3")]).unwrap();
         assert!(std::fs::read_to_string(&path).unwrap().contains("plex.wg"));
     }
 
@@ -325,7 +396,7 @@ mod tests {
         )
         .unwrap();
 
-        remove_block(&path).unwrap();
+        remove_block(&path, None).unwrap();
 
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(!contents.contains(BEGIN_MARKER));
@@ -341,11 +412,72 @@ mod tests {
         let path = dir.path().join("hosts");
         std::fs::write(&path, "127.0.0.1 localhost\n").unwrap();
 
-        remove_block(&path).unwrap();
+        remove_block(&path, None).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "127.0.0.1 localhost\n"
         );
+    }
+
+    // ---- several instances, one hosts file ----
+
+    #[test]
+    fn instances_own_separate_blocks() {
+        let base = "127.0.0.1 localhost\n";
+        let a = replace_managed_block(base, None, &[svc("plex", "100.90.0.3")]);
+        let ab = replace_managed_block(&a, Some("work"), &[svc("git", "10.77.0.2")]);
+        assert!(ab.contains("# BEGIN WIRESERVE\n100.90.0.3 plex.wg\n# END WIRESERVE\n"), "{ab}");
+        assert!(ab.contains("# BEGIN WIRESERVE work\n10.77.0.2 git.wg\n# END WIRESERVE work\n"), "{ab}");
+
+        // Rewriting either leaves the other alone.
+        let ab2 = replace_managed_block(&ab, None, &[svc("jellyfin", "100.90.0.4")]);
+        assert!(ab2.contains("git.wg") && ab2.contains("jellyfin.wg") && !ab2.contains("plex.wg"), "{ab2}");
+        let ab3 = replace_managed_block(&ab2, Some("work"), &[]);
+        assert!(!ab3.contains("git.wg") && ab3.contains("jellyfin.wg"), "{ab3}");
+
+        // Removing one keeps the other intact.
+        let only_work = strip_managed_block(&ab, None).unwrap();
+        assert!(!only_work.contains("plex.wg") && only_work.contains("# BEGIN WIRESERVE work"), "{only_work}");
+        let only_default = strip_managed_block(&ab, Some("work")).unwrap();
+        assert!(only_default.contains("plex.wg") && !only_default.contains("work"), "{only_default}");
+        assert_eq!(strip_managed_block(&only_default, None).unwrap(), base.trim_end());
+    }
+
+    #[test]
+    fn the_default_markers_never_match_a_labelled_block() {
+        // The labelled block comes first, so a substring search for the
+        // bare markers would have matched inside it.
+        let text = "# BEGIN WIRESERVE work\n10.77.0.2 git.wg\n# END WIRESERVE work\n";
+        assert_eq!(find_block(text, None), None);
+        assert_eq!(strip_managed_block(text, None), None);
+        let out = replace_managed_block(text, None, &[svc("plex", "100.90.0.3")]);
+        assert!(out.starts_with(text), "labelled block untouched: {out}");
+        assert!(out.ends_with("# BEGIN WIRESERVE\n100.90.0.3 plex.wg\n# END WIRESERVE\n"), "{out}");
+    }
+
+    #[test]
+    fn concurrent_writers_never_lose_each_others_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts");
+        std::fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+        let labels = ["a", "b", "c", "d"];
+        std::thread::scope(|s| {
+            for (i, label) in labels.iter().enumerate() {
+                let path = &path;
+                s.spawn(move || {
+                    for round in 0..50 {
+                        let ip = format!("10.{i}.0.{}", round % 250 + 1);
+                        sync(path, Some(label), &[svc(label, &ip)]).unwrap();
+                    }
+                });
+            }
+        });
+        let out = std::fs::read_to_string(&path).unwrap();
+        for label in labels {
+            assert!(out.contains(&format!("# BEGIN WIRESERVE {label}\n10.")), "{label} missing:\n{out}");
+            assert_eq!(out.matches(&format!("# BEGIN WIRESERVE {label}\n")).count(), 1, "{out}");
+        }
+        assert!(out.starts_with("127.0.0.1 localhost\n"));
     }
 }

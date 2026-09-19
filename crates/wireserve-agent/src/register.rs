@@ -23,6 +23,7 @@ pub struct JoinParams<'a> {
     pub join_token: &'a str,
     pub listen_port: u16,
     pub endpoint_addr: Option<String>,
+    pub state_path: &'a std::path::Path,
 }
 
 /// Performs the join: keypair generation, `/register`, and persists the
@@ -95,7 +96,7 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
         last_directory: None,
         rejected_services: Vec::new(),
     };
-    state.save(&crate::paths::state_path())?;
+    state.save(params.state_path)?;
     Ok(state)
 }
 

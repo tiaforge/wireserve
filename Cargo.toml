@@ -35,3 +35,4 @@ defguard_wireguard_rs = "0.12"
 nftables = { version = "0.6", default-features = false }
 base64 = "0.23"
 rpassword = "7"
+libc = "0.2"
