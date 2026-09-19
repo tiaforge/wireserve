@@ -17,6 +17,8 @@ use crate::state::AgentState;
 pub struct AgentContext {
     pub state: Arc<Mutex<AgentState>>,
     pub state_path: PathBuf,
+    pub instance: String,
+    pub ifname: String,
     /// Signalled when `leave` is requested, so the daemon's main loop (which
     /// owns the live WireGuard interface / firewall backend) can perform
     /// the actual teardown — the IPC handler itself only queues the
@@ -24,7 +26,7 @@ pub struct AgentContext {
     pub shutdown: mpsc::Sender<()>,
 }
 
-fn build_list_view(state: &AgentState) -> ListView {
+fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
     let directory = state
         .last_directory
         .clone()
@@ -90,6 +92,8 @@ fn build_list_view(state: &AgentState) -> ListView {
     }
 
     ListView {
+        instance: ctx.instance.clone(),
+        ifname: ctx.ifname.clone(),
         peers: directory.peers,
         services,
         rejected_services: state.rejected_services.clone(),
@@ -158,7 +162,7 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
         }
         IpcRequest::List => {
             let state = ctx.state.lock().await;
-            (IpcResponse::List(build_list_view(&state)), false)
+            (IpcResponse::List(build_list_view(ctx, &state)), false)
         }
         IpcRequest::Leave => (IpcResponse::Ok, true),
     }
@@ -244,6 +248,8 @@ mod tests {
             AgentContext {
                 state: Arc::new(Mutex::new(AgentState::default())),
                 state_path,
+                instance: "default".into(),
+                ifname: "wireserve0".into(),
                 shutdown: tx,
             },
             dir,
@@ -300,7 +306,7 @@ mod tests {
             state.pending_services.push("plex".into());
         }
 
-        let view = build_list_view(&*ctx.state.lock().await);
+        let view = build_list_view(&ctx, &*ctx.state.lock().await);
         assert_eq!(view.services.len(), 1);
         assert_eq!(view.services[0].name, "plex");
         assert!(view.services[0].local);
@@ -320,7 +326,7 @@ mod tests {
             // Approval is observed as the name leaving pending_services.
         }
 
-        let view = build_list_view(&*ctx.state.lock().await);
+        let view = build_list_view(&ctx, &*ctx.state.lock().await);
         assert_eq!(view.services.len(), 1);
         assert!(!view.services[0].pending);
     }

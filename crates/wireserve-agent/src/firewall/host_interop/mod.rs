@@ -127,6 +127,15 @@ impl HostInterop {
     }
 }
 
+/// Removes everything the interop ever added for `ifname`: for an
+/// interface this instance used before and has now left behind.
+pub fn remove_for(ifname: &str) {
+    match Nft::locate() {
+        Ok(nft) => ops::remove(&mut RealOps::new(nft), ifname),
+        Err(e) => tracing::warn!(error = %e, ifname, "could not remove host firewall interop"),
+    }
+}
+
 /// Removes what an agent from before multi-instance support left behind:
 /// its fixed-name guard (with the firewalld trust it guarded) and its
 /// fixed-name `inet wireserve` table. Its tagged rules go with any
@@ -231,8 +240,6 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    const IN_NETNS: &str = "WIRESERVE_TEST_IN_NETNS";
-
     fn sh(script: &str) -> String {
         let out = Command::new("sh").args(["-euc", script]).output().unwrap();
         assert!(
@@ -261,23 +268,7 @@ mod tests {
     /// with firewalld disabled (its D-Bus is not namespace-scoped).
     #[test]
     fn kernel_runtime_opens_restores_and_removes() {
-        if std::env::var_os(IN_NETNS).is_none() {
-            if !crate::firewall::netns::available() {
-                eprintln!("SKIPPED: unprivileged network namespaces or nft unavailable");
-                return;
-            }
-            let status = Command::new("unshare")
-                .arg("-rn")
-                .arg(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "firewall::host_interop::tests::kernel_runtime_opens_restores_and_removes",
-                    "--nocapture",
-                ])
-                .env(IN_NETNS, "1")
-                .status()
-                .unwrap();
-            assert!(status.success(), "in-namespace run failed");
+        if !crate::firewall::netns::reexec("firewall::host_interop::tests::kernel_runtime_opens_restores_and_removes") {
             return;
         }
 
@@ -319,33 +310,12 @@ mod tests {
         assert!(after_stop.contains("-A INPUT -i lo -j ACCEPT"), "{after_stop}");
     }
 
-    /// Re-runs the named test inside a fresh network namespace. Returns
-    /// whether the caller is already inside it and should do the work.
-    fn in_netns(test: &str) -> bool {
-        if std::env::var_os(IN_NETNS).is_some() {
-            return true;
-        }
-        if !crate::firewall::netns::available() {
-            eprintln!("SKIPPED: unprivileged network namespaces or nft unavailable");
-            return false;
-        }
-        let status = Command::new("unshare")
-            .arg("-rn")
-            .arg(std::env::current_exe().unwrap())
-            .args(["--exact", test, "--nocapture"])
-            .env(IN_NETNS, "1")
-            .status()
-            .unwrap();
-        assert!(status.success(), "in-namespace run failed");
-        false
-    }
-
     /// Two agents' runtimes on one host, each holding its interface
     /// claim: both get their rules in, neither keeps rewriting the other's
     /// (rule handles stay put), and stopping one leaves the other intact.
     #[test]
     fn kernel_two_agents_coexist() {
-        if !in_netns("firewall::host_interop::tests::kernel_two_agents_coexist") {
+        if !crate::firewall::netns::reexec("firewall::host_interop::tests::kernel_two_agents_coexist") {
             return;
         }
         let native = "table inet filter {\n chain input {\n  type filter hook input priority 0; policy drop;\n  iif lo accept\n }\n}\n";

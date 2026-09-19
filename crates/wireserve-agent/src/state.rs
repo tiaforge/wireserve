@@ -51,6 +51,13 @@ pub struct AgentState {
     /// already exists for declarations that will not take effect.
     #[serde(default)]
     pub pending_services: Vec<String>,
+    /// The WireGuard interface this instance runs on, once the daemon has
+    /// chosen it (see `ifname`), so it keeps the same one across restarts.
+    #[serde(default)]
+    pub ifname: Option<String>,
+    /// Set by `--ifname <name>`: use exactly `ifname`, never pick another.
+    #[serde(default)]
+    pub ifname_pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

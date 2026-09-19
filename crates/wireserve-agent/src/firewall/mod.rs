@@ -269,6 +269,31 @@ pub mod netns {
                 .any(|p| std::path::Path::new(p).is_file())
     }
 
+    const IN_NETNS: &str = "WIRESERVE_TEST_IN_NETNS";
+
+    /// Re-runs the test at `path` (as `--exact` knows it) inside a fresh
+    /// network namespace. Returns whether the caller is already inside it
+    /// and should do the work; outside, it waits for the inner run and
+    /// fails if that did.
+    pub fn reexec(path: &str) -> bool {
+        if std::env::var_os(IN_NETNS).is_some() {
+            return true;
+        }
+        if !available() {
+            eprintln!("SKIPPED: unprivileged network namespaces or nft unavailable");
+            return false;
+        }
+        let status = Command::new("unshare")
+            .arg("-rn")
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", path, "--nocapture"])
+            .env(IN_NETNS, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "in-namespace run failed");
+        false
+    }
+
     /// Runs `script` with `sh -c` in a fresh namespace. Returns stdout, or
     /// `None` (after printing why) when namespaces or `nft` are
     /// unavailable. Panics with stderr if the script itself fails.

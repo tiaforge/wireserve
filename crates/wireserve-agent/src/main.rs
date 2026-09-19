@@ -7,7 +7,7 @@ use wireserve_agent::ipc::{client, protocol::IpcRequest, AgentContext};
 use wireserve_agent::state::AgentState;
 use wireserve_agent::firewall::InteropHandle;
 use wireserve_agent::paths::{self, Instance};
-use wireserve_agent::{firewall, lock, poll_loop, register, wg::WgInterface};
+use wireserve_agent::{firewall, ifname, lock, poll_loop, register, wg::WgInterface};
 use wireserve_types::{FirewallBackend, Proto};
 
 #[derive(Parser)]
@@ -50,8 +50,13 @@ enum Command {
     Daemon {
         #[arg(long, default_value_t = 20)]
         poll_interval_secs: u64,
-        #[arg(long, default_value = "wg0")]
-        ifname: String,
+        /// The WireGuard interface to run on. Without it, the instance
+        /// keeps the name it used last, or picks the first free one of
+        /// wireserve0..wireserve15. A name given here is pinned: used
+        /// exactly, on this and every later start, or the daemon refuses
+        /// to start. `auto` removes a pin.
+        #[arg(long, value_parser = parse_ifname_flag)]
+        ifname: Option<ifname::Flag>,
     },
     /// Queues a local service declaration, applied on the next poll.
     Serve {
@@ -84,6 +89,14 @@ fn init_logging() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+fn parse_ifname_flag(s: &str) -> Result<ifname::Flag, wireserve_agent::wg::InvalidIfname> {
+    let flag = ifname::Flag::parse(s);
+    if let ifname::Flag::Name(n) = &flag {
+        wireserve_agent::wg::validate_ifname(n)?;
+    }
+    Ok(flag)
 }
 
 fn parse_instance(name: &str) -> Result<Instance, paths::InvalidInstance> {
@@ -134,12 +147,16 @@ async fn cmd_join(
     let coordinator_url = resolve_coordinator_url(coordinator_url)?;
     let join_token = resolve_join_token(join_token, join_token_file)?;
     let state_path = instance.state_path();
+    // A re-join keeps the interface this instance already runs on.
+    let previous = AgentState::load(&state_path).unwrap_or_default();
     let state = register::join(register::JoinParams {
         coordinator_url: &coordinator_url,
         join_token: &join_token,
         listen_port,
         endpoint_addr,
         state_path: &state_path,
+        ifname: previous.ifname,
+        ifname_pinned: previous.ifname_pinned,
     })
     .await?;
     println!(
@@ -221,23 +238,49 @@ fn resolve_join_token(
 async fn cmd_daemon(
     instance: &Instance,
     poll_interval_secs: u64,
-    ifname: String,
+    ifname_flag: Option<ifname::Flag>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // First, before anything is looked at or changed: one daemon per
     // instance. Held until the process exits.
     let _lock = lock::lock_instance(instance)?;
     let state_path = instance.state_path();
-    let state = AgentState::load(&state_path)?;
+    let mut state = AgentState::load(&state_path)?;
     if state.bearer_token.is_none() {
         return Err("not registered — run `wireserve-agent join` first".into());
     }
 
-    wireserve_agent::wg::validate_ifname(&ifname)?;
-    let mut wg = WgInterface::new(&ifname)?;
     let ip4: std::net::Ipv4Addr = state.ip4.clone().unwrap_or_default().parse()?;
     let ip6: std::net::Ipv6Addr = state.ip6.clone().unwrap_or_default().parse()?;
     let listen_port = state.listen_port.unwrap_or(51820);
     let private_key = state.private_key.clone().unwrap_or_default();
+
+    // Which interface. Claimed here and held for the life of the process,
+    // before any firewall state keyed on the name is touched — see
+    // `ifname` for the rules.
+    let reserved: std::collections::BTreeMap<String, String> = paths::other_instances(instance)
+        .into_iter()
+        .filter_map(|(other, s)| s.ifname.map(|n| (n, other.name().to_string())))
+        .collect();
+    let choice = ifname::choose(
+        &ifname::Request {
+            flag: ifname_flag.as_ref(),
+            stored: state.ifname.as_deref(),
+            stored_pinned: state.ifname_pinned,
+            reserved: &reserved,
+        },
+        |name| ifname::probe_host(name, &private_key),
+    )?;
+    let ifname = choice.ifname.clone();
+    tracing::info!(instance = instance.name(), %ifname, source = ?choice.source, pinned = choice.pinned, "using interface");
+    choice.claim.hold();
+    remove_leftover_interfaces(&ifname, state.ifname.as_deref(), &private_key);
+    if state.ifname.as_deref() != Some(ifname.as_str()) || state.ifname_pinned != choice.pinned {
+        state.ifname = Some(ifname.clone());
+        state.ifname_pinned = choice.pinned;
+        state.save(&state_path)?;
+    }
+
+    let mut wg = WgInterface::new(&ifname)?;
 
     // An agent from before multi-instance support kept its firewall state
     // under fixed names. Nothing creates those any more, so whatever is
@@ -296,6 +339,8 @@ async fn cmd_daemon(
     let ipc_ctx = AgentContext {
         state: shared_state.clone(),
         state_path: state_path.clone(),
+        instance: instance.name().to_string(),
+        ifname: ifname.clone(),
         shutdown: shutdown_tx,
     };
     let socket_path = instance.socket_path();
@@ -329,7 +374,7 @@ async fn cmd_daemon(
     // table and hosts block the same way `leave` does, but keep the state
     // file (bearer token, keys, last directory) intact — a stopped daemon
     // isn't maintaining/reconciling/firewalling anything, so it shouldn't
-    // leave a live-looking `wg0` sitting on the host. The next `daemon`
+    // leave a live-looking interface sitting on the host. The next `daemon`
     // start rejoins the mesh with the same identity, without needing
     // `join` again.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -403,6 +448,38 @@ async fn cmd_daemon(
     }
 
     Ok(())
+}
+
+/// Tears down this node's own interfaces (by private key) under any name
+/// but `chosen` — left behind when a run died without tearing down, and
+/// the instance has since moved to another name (or come up on a
+/// `wireserve*` name for the first time, leaving a pre-instances `wg0`) —
+/// together with the firewall state kept for them. Each name is claimed
+/// first, so nothing a running agent uses is touched.
+fn remove_leftover_interfaces(chosen: &str, previous: Option<&str>, private_key: &str) {
+    for name in ifname::leftover_names(chosen, previous) {
+        let ifname::Probe::Usable { claim, ours: true } = ifname::probe_host(&name, private_key) else {
+            continue;
+        };
+        tracing::info!(ifname = %name, "removing this node's own interface left behind under another name");
+        #[cfg(target_os = "linux")]
+        {
+            firewall::host_interop::remove_for(&name);
+            match firewall::nftables::NftablesBackend::new(name.clone()) {
+                Ok(mut fw) => {
+                    if let Err(e) = fw.teardown() {
+                        tracing::warn!(ifname = %name, error = %e, "could not remove its firewall table");
+                    }
+                }
+                Err(e) => tracing::warn!(ifname = %name, error = %e, "could not remove its firewall table"),
+            }
+        }
+        match WgInterface::new(&name).map(|mut wg| wg.teardown()) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) | Err(e) => tracing::warn!(ifname = %name, error = %e, "could not remove it"),
+        }
+        drop(claim);
+    }
 }
 
 /// Shared by both the `leave` IPC path and F9's revoked-node auto-teardown:

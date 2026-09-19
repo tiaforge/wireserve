@@ -24,6 +24,10 @@ pub struct JoinParams<'a> {
     pub listen_port: u16,
     pub endpoint_addr: Option<String>,
     pub state_path: &'a std::path::Path,
+    /// Carried over from this instance's previous state, so a re-join
+    /// keeps its interface.
+    pub ifname: Option<String>,
+    pub ifname_pinned: bool,
 }
 
 /// Performs the join: keypair generation, `/register`, and persists the
@@ -95,6 +99,8 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
         declared_services: Vec::new(),
         last_directory: None,
         rejected_services: Vec::new(),
+        ifname: params.ifname,
+        ifname_pinned: params.ifname_pinned,
     };
     state.save(params.state_path)?;
     Ok(state)

@@ -42,6 +42,12 @@ pub struct LocalServiceView {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ListView {
+    /// Which agent instance answered, and the interface it runs on — with
+    /// several agents on one host, the first thing to know about a listing.
+    #[serde(default)]
+    pub instance: String,
+    #[serde(default)]
+    pub ifname: String,
     pub peers: Vec<PeerInfo>,
     pub services: Vec<LocalServiceView>,
     /// Declarations the coordinator rejected (name collision, spec §4.3)

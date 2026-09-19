@@ -23,8 +23,8 @@ pub enum BringUpError {
          interface's addresses, overwrite its private key and listen port, and remove \
          every peer configured on it — silently destroying whatever tunnel is currently \
          using that name, which may well be how this machine is reached. Start the agent \
-         with `--ifname <name>` pointing at an unused name, or remove the existing \
-         interface first if it really is disposable"
+         with `--ifname auto` to have it pick a free name, or `--ifname <name>` pointing \
+         at an unused one, or remove the existing interface first if it really is disposable"
     )]
     InterfaceConflict { ifname: String, reason: String },
 }
@@ -177,6 +177,14 @@ pub fn peers_to_configure<'a>(
         .collect()
 }
 
+/// See [`WgInterface::classify`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Slot {
+    Free,
+    Ours,
+    Foreign(String),
+}
+
 pub struct WgInterface {
     api: WGApi<Kernel>,
     ifname: String,
@@ -195,15 +203,63 @@ impl WgInterface {
     }
 
     /// Whether a network interface with this name already exists on the
-    /// host, WireGuard or otherwise. Read straight from sysfs rather than
-    /// inferred from a netlink error, because the distinction that
-    /// matters here ("something already owns this name") is not one the
-    /// WireGuard API reports cleanly: `create_interface` deliberately
-    /// treats `EEXIST` as success so that restarts are idempotent.
+    /// host, WireGuard or otherwise. Asked directly rather than inferred
+    /// from a netlink error, because the distinction that matters here
+    /// ("something already owns this name") is not one the WireGuard API
+    /// reports cleanly: `create_interface` deliberately treats `EEXIST` as
+    /// success so that restarts are idempotent.
+    ///
+    /// `if_nametoindex`, not `/sys/class/net`: sysfs shows the network
+    /// namespace of whoever mounted it, which is not ours when the agent is
+    /// started in a namespace without its own sysfs mount (`nsenter`,
+    /// `unshare -n`) — there it would call a name that is taken here free.
+    /// Anything but "no such device" counts as taken: when in doubt, the
+    /// name is not ours to configure.
     fn interface_exists(ifname: &str) -> bool {
-        std::path::Path::new("/sys/class/net").join(ifname).exists()
+        let Ok(name) = std::ffi::CString::new(ifname) else {
+            return true;
+        };
+        // SAFETY: `name` is a valid NUL-terminated string for the call.
+        if unsafe { libc::if_nametoindex(name.as_ptr()) } != 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ENODEV)
     }
 
+    /// Who has this interface name right now, as far as the host itself
+    /// can tell: nobody, this node (a WireGuard device carrying our own
+    /// private key — our interface from a previous run), or something
+    /// else. Claims by other agents are a separate question
+    /// (`crate::lock`).
+    pub fn classify(&self, private_key_b64: &str) -> Slot {
+        if !Self::interface_exists(&self.ifname) {
+            return Slot::Free;
+        }
+        match self.api.read_interface_data() {
+            Ok(host) => {
+                // The kernel always reports a clamped key back (see
+                // `clamp_private_key`); clamp our own candidate too so
+                // an unclamped persisted key (e.g. from a state file
+                // written before this fix) still compares equal to the
+                // same key's clamped, kernel-reported form.
+                let ours = Key::try_from(private_key_b64)
+                    .ok()
+                    .map(|k| clamp_private_key(&k));
+                match (&host.private_key, &ours) {
+                    (Some(existing), Some(ours)) if existing == ours => Slot::Ours,
+                    _ => Slot::Foreign(
+                        "it is a WireGuard interface configured with a different private key, \
+                         so it belongs to another tunnel"
+                            .to_string(),
+                    ),
+                }
+            }
+            Err(err) => Slot::Foreign(format!(
+                "an interface with that name exists but its WireGuard configuration could \
+                 not be read ({err})"
+            )),
+        }
+    }
 
     /// The ownership check `bring_up` depends on, runnable on its own —
     /// `cmd_daemon` calls it **before touching any firewall state**. The
@@ -215,48 +271,20 @@ impl WgInterface {
     /// got the chance to refuse. Passing this means the name is free or
     /// is this agent's own interface from a previous run.
     pub fn preflight(&self, private_key_b64: &str) -> Result<(), BringUpError> {
-        if !Self::interface_exists(&self.ifname) {
-            return Ok(());
-        }
-
-        match self.api.read_interface_data() {
-            Ok(host) => {
-                // The kernel always reports a clamped key back (see
-                // `clamp_private_key`); clamp our own candidate too so
-                // an unclamped persisted key (e.g. from a state file
-                // written before this fix) still compares equal to the
-                // same key's clamped, kernel-reported form.
-                let ours = Key::try_from(private_key_b64)
-                    .ok()
-                    .map(|k| clamp_private_key(&k));
-                let matches = match (&host.private_key, &ours) {
-                    (Some(existing), Some(ours)) => existing == ours,
-                    _ => false,
-                };
-                if !matches {
-                    return Err(BringUpError::InterfaceConflict {
-                        ifname: self.ifname.clone(),
-                        reason: "it is a WireGuard interface configured with a different \
-                                 private key, so it belongs to another tunnel"
-                            .to_string(),
-                    });
-                }
+        match self.classify(private_key_b64) {
+            Slot::Free => Ok(()),
+            Slot::Ours => {
                 tracing::info!(
                     ifname = %self.ifname,
                     "reusing this agent's own existing WireGuard interface"
                 );
+                Ok(())
             }
-            Err(err) => {
-                return Err(BringUpError::InterfaceConflict {
-                    ifname: self.ifname.clone(),
-                    reason: format!(
-                        "an interface with that name exists but its WireGuard \
-                         configuration could not be read ({err})"
-                    ),
-                });
-            }
+            Slot::Foreign(reason) => Err(BringUpError::InterfaceConflict {
+                ifname: self.ifname.clone(),
+                reason,
+            }),
         }
-        Ok(())
     }
 
     /// Creates the interface and applies this node's own identity. Must be

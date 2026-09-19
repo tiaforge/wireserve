@@ -1,6 +1,7 @@
 pub mod firewall;
 pub mod fsutil;
 pub mod hosts;
+pub mod ifname;
 pub mod ipc;
 pub mod lock;
 pub mod paths;
