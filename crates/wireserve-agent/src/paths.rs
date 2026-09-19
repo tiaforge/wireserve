@@ -3,31 +3,35 @@
 //! One host can run several agents side by side — one per mesh, or one
 //! per identity in the same mesh — each as a named *instance* with its
 //! own state, IPC socket, WireGuard interface, firewall tables and
-//! hosts-file block. The unnamed default instance keeps the paths every
-//! existing deployment already uses, so an upgrade moves nothing on disk:
+//! hosts-file block. The default instance keeps the paths every existing
+//! deployment already uses, so an upgrade moves nothing on disk:
 //!
-//! | instance  | state                                     | socket                        |
-//! |-----------|-------------------------------------------|-------------------------------|
-//! | `default` | `/var/lib/wireserve/agent-state.json`     | `/run/wireserve/agent.sock`   |
-//! | `<n>`     | `/var/lib/wireserve-<n>/agent-state.json` | `/run/wireserve-<n>/agent.sock` |
+//! | instance  | state                                               | socket                          |
+//! |-----------|-----------------------------------------------------|---------------------------------|
+//! | `default` | `/var/lib/wireserve/agent-state.json`               | `/run/wireserve/agent.sock`     |
+//! | `<n>`     | `/var/lib/wireserve/instances/<n>/agent-state.json` | `/run/wireserve-<n>/agent.sock` |
 //!
-//! Sibling directories rather than nesting named instances under the
-//! default's: systemd removes a unit's `RuntimeDirectory` when the unit
-//! stops, so nesting would have stopping the default instance delete the
-//! sockets of every other one while they are still running.
+//! State nests under the default's directory, so one directory (and the
+//! container image's one volume) holds every instance's keys. Sockets
+//! don't: systemd removes a unit's `RuntimeDirectory` when the unit stops,
+//! so nesting would have stopping the default instance delete the sockets
+//! of every other one while they are still running.
 //!
-//! The roots are overridable via env so tests (and anyone running the
-//! agent rootless for development) don't need to write to `/run` or
-//! `/var/lib`; `WIRESERVE_STATE_PATH`/`WIRESERVE_SOCKET_PATH` still
-//! override the full path for whichever instance is running.
+//! `WIRESERVE_STATE_ROOT` (default `/var/lib/wireserve`) and
+//! `WIRESERVE_RUN_ROOT` (default `/run`) move all of it, so tests — and
+//! anyone running the agent rootless for development — don't need to
+//! write to `/run` or `/var/lib`. The older `WIRESERVE_STATE_PATH` and
+//! `WIRESERVE_SOCKET_PATH` still set the default instance's exact paths;
+//! they never apply to a named instance, which would otherwise share the
+//! default's state.
 
 use std::path::PathBuf;
 
 use crate::state::AgentState;
 
 pub const DEFAULT_INSTANCE: &str = "default";
-const DIR_PREFIX: &str = "wireserve";
 const STATE_FILE: &str = "agent-state.json";
+const INSTANCES_DIR: &str = "instances";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error(
@@ -76,26 +80,36 @@ impl Instance {
         self.name == DEFAULT_INSTANCE
     }
 
-    fn dir_name(&self) -> String {
+    fn state_dir(&self) -> PathBuf {
         if self.is_default() {
-            DIR_PREFIX.to_string()
+            state_root()
         } else {
-            format!("{DIR_PREFIX}-{}", self.name)
+            state_root().join(INSTANCES_DIR).join(&self.name)
+        }
+    }
+
+    fn run_dir(&self) -> PathBuf {
+        if self.is_default() {
+            run_root().join("wireserve")
+        } else {
+            run_root().join(format!("wireserve-{}", self.name))
         }
     }
 
     #[must_use]
     pub fn state_path(&self) -> PathBuf {
-        std::env::var("WIRESERVE_STATE_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| state_root().join(self.dir_name()).join(STATE_FILE))
+        match std::env::var("WIRESERVE_STATE_PATH") {
+            Ok(path) if self.is_default() => PathBuf::from(path),
+            _ => self.state_dir().join(STATE_FILE),
+        }
     }
 
     #[must_use]
     pub fn socket_path(&self) -> PathBuf {
-        std::env::var("WIRESERVE_SOCKET_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| run_root().join(self.dir_name()).join("agent.sock"))
+        match std::env::var("WIRESERVE_SOCKET_PATH") {
+            Ok(path) if self.is_default() => PathBuf::from(path),
+            _ => self.run_dir().join("agent.sock"),
+        }
     }
 
     /// Next to the state file: the lock guards that file, so it has to
@@ -118,7 +132,7 @@ impl Instance {
 fn state_root() -> PathBuf {
     std::env::var("WIRESERVE_STATE_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/var/lib"))
+        .unwrap_or_else(|_| PathBuf::from("/var/lib/wireserve"))
 }
 
 fn run_root() -> PathBuf {
@@ -127,12 +141,18 @@ fn run_root() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/run"))
 }
 
-/// Which instance a directory under the state root belongs to, if any.
-fn instance_of_dir(dir_name: &str) -> Option<Instance> {
-    if dir_name == DIR_PREFIX {
-        return Some(Instance::default());
+/// Every instance that has a state directory, the default one included.
+fn all_instances() -> Vec<Instance> {
+    let mut out = vec![Instance::default()];
+    if let Ok(entries) = std::fs::read_dir(state_root().join(INSTANCES_DIR)) {
+        out.extend(
+            entries
+                .flatten()
+                .filter_map(|e| e.file_name().to_str().and_then(|n| Instance::new(n).ok()))
+                .filter(|i| !i.is_default()),
+        );
     }
-    Instance::new(dir_name.strip_prefix(DIR_PREFIX)?.strip_prefix('-')?).ok()
+    out
 }
 
 /// The saved state of every *other* instance on this host, running or
@@ -143,16 +163,10 @@ fn instance_of_dir(dir_name: &str) -> Option<Instance> {
 /// refusing to start over someone else's broken file would be worse.
 #[must_use]
 pub fn other_instances(own: &Instance) -> Vec<(Instance, AgentState)> {
-    let Ok(entries) = std::fs::read_dir(state_root()) else {
-        return Vec::new();
-    };
     let own_state = own.state_path();
     let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let Some(instance) = entry.file_name().to_str().and_then(instance_of_dir) else {
-            continue;
-        };
-        let path = entry.path().join(STATE_FILE);
+    for instance in all_instances() {
+        let path = instance.state_path();
         if instance == *own || path == own_state || !path.exists() {
             continue;
         }
@@ -191,24 +205,66 @@ mod tests {
         }
     }
 
+    /// One test for everything that reads the environment, so parallel
+    /// tests never see each other's variables.
     #[test]
-    fn default_instance_keeps_the_historic_directory_names() {
+    fn layout_overrides_and_discovery() {
+        let root = tempfile::tempdir().unwrap();
+        // SAFETY: the only test in this crate that sets these variables.
+        unsafe {
+            std::env::set_var("WIRESERVE_STATE_ROOT", root.path().join("lib"));
+            std::env::set_var("WIRESERVE_RUN_ROOT", root.path().join("run"));
+        }
+        let lib = root.path().join("lib");
+        let run = root.path().join("run");
         let d = Instance::default();
-        assert!(d.is_default());
-        assert_eq!(d.dir_name(), "wireserve");
-        assert_eq!(d.hosts_label(), None);
         let w = Instance::new("work").unwrap();
-        assert_eq!(w.dir_name(), "wireserve-work");
-        assert_eq!(w.hosts_label(), Some("work"));
-    }
 
-    #[test]
-    fn directories_map_back_to_their_instance() {
-        assert_eq!(instance_of_dir("wireserve"), Some(Instance::default()));
-        assert_eq!(instance_of_dir("wireserve-work"), Instance::new("work").ok());
-        assert_eq!(instance_of_dir("wireserve-"), None);
-        assert_eq!(instance_of_dir("wireservex"), None);
-        assert_eq!(instance_of_dir("wireserve-a.b"), None);
-        assert_eq!(instance_of_dir("other"), None);
+        assert_eq!(d.state_path(), lib.join("agent-state.json"));
+        assert_eq!(d.socket_path(), run.join("wireserve/agent.sock"));
+        assert_eq!(d.lock_path(), lib.join("agent.lock"));
+        assert_eq!(w.state_path(), lib.join("instances/work/agent-state.json"));
+        assert_eq!(w.socket_path(), run.join("wireserve-work/agent.sock"));
+        assert_eq!(w.lock_path(), lib.join("instances/work/agent.lock"));
+        assert_eq!((d.hosts_label(), w.hosts_label()), (None, Some("work")));
+
+        // Discovery: every other instance with a state file.
+        let save = |i: &Instance, port| {
+            AgentState {
+                listen_port: Some(port),
+                ..Default::default()
+            }
+            .save(&i.state_path())
+            .unwrap();
+        };
+        save(&d, 51820);
+        save(&w, 51821);
+        std::fs::create_dir_all(lib.join("instances/not.valid")).unwrap();
+        std::fs::create_dir_all(lib.join("instances/empty")).unwrap();
+        let ports = |own: &Instance| -> Vec<(String, Option<u16>)> {
+            other_instances(own)
+                .into_iter()
+                .map(|(i, s)| (i.name().to_string(), s.listen_port))
+                .collect()
+        };
+        assert_eq!(ports(&d), [("work".to_string(), Some(51821))]);
+        assert_eq!(ports(&w), [("default".to_string(), Some(51820))]);
+
+        // The old full-path variables move the default instance only.
+        unsafe {
+            std::env::set_var("WIRESERVE_STATE_PATH", root.path().join("legacy/state.json"));
+            std::env::set_var("WIRESERVE_SOCKET_PATH", root.path().join("legacy/agent.sock"));
+        }
+        assert_eq!(d.state_path(), root.path().join("legacy/state.json"));
+        assert_eq!(d.lock_path(), root.path().join("legacy/agent.lock"));
+        assert_eq!(d.socket_path(), root.path().join("legacy/agent.sock"));
+        assert_eq!(w.state_path(), lib.join("instances/work/agent-state.json"));
+        assert_eq!(w.socket_path(), run.join("wireserve-work/agent.sock"));
+
+        unsafe {
+            for v in ["WIRESERVE_STATE_ROOT", "WIRESERVE_RUN_ROOT", "WIRESERVE_STATE_PATH", "WIRESERVE_SOCKET_PATH"] {
+                std::env::remove_var(v);
+            }
+        }
     }
 }
