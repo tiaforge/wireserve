@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::model::{Family, OWN_TABLES};
+use super::model::{is_own_table, Family};
 use crate::firewall::nft::Nft;
 
 /// Should this `nft -j monitor` line trigger a reconcile?
@@ -44,7 +44,7 @@ pub fn is_relevant(line: &str) -> bool {
         .and_then(Family::parse)
         .is_some();
     let table = object.get(table_key).and_then(Value::as_str).unwrap_or_default();
-    family_ok && !OWN_TABLES.contains(&table)
+    family_ok && !is_own_table(table)
 }
 
 /// Collapses a burst of events into one action `delay` after the last.
@@ -139,18 +139,32 @@ mod tests {
     const OWN_TABLE_ADD: &str = r#"{"add": {"table": {"family": "inet", "name": "wireserve", "handle": 9}}}"#;
     const OWN_RULE_ADD: &str = r#"{"add": {"rule": {"family": "inet", "table": "wireserve", "chain": "wireserve-in", "handle": 3, "expr": []}}}"#;
     const GUARD_CHAIN_ADD: &str = r#"{"add": {"chain": {"family": "inet", "table": "wireserve-interop", "name": "forward-guard", "handle": 1}}}"#;
+    const OTHER_AGENT_RULE_ADD: &str = r#"{"add": {"rule": {"family": "inet", "table": "wireserve.wireserve1", "chain": "wireserve-in", "handle": 3, "expr": []}}}"#;
+    const OTHER_AGENT_GUARD_ADD: &str = r#"{"add": {"table": {"family": "inet", "name": "wireserve-interop.wireserve1", "handle": 4}}}"#;
+    const LOOKALIKE_TABLE_ADD: &str = r#"{"add": {"table": {"family": "inet", "name": "wireservex", "handle": 5}}}"#;
     const BRIDGE_RULE: &str = r#"{"add": {"rule": {"family": "bridge", "table": "br", "chain": "input", "handle": 2, "expr": []}}}"#;
 
     #[test]
     fn foreign_table_chain_and_rule_changes_are_relevant() {
-        for line in [FOREIGN_RULE_ADD, FOREIGN_RULE_DEL, FOREIGN_CHAIN_DEL, FOREIGN_TABLE_ADD] {
+        for line in [FOREIGN_RULE_ADD, FOREIGN_RULE_DEL, FOREIGN_CHAIN_DEL, FOREIGN_TABLE_ADD, LOOKALIKE_TABLE_ADD] {
             assert!(is_relevant(line), "{line}");
         }
     }
 
     #[test]
     fn set_churn_our_own_tables_and_other_families_are_ignored() {
-        for line in [SET_ADD, ELEMENT_ADD, OWN_TABLE_ADD, OWN_RULE_ADD, GUARD_CHAIN_ADD, BRIDGE_RULE] {
+        // Another agent's tables included: reacting to its every poll would
+        // have two agents reconciling in response to each other forever.
+        for line in [
+            SET_ADD,
+            ELEMENT_ADD,
+            OWN_TABLE_ADD,
+            OWN_RULE_ADD,
+            GUARD_CHAIN_ADD,
+            OTHER_AGENT_RULE_ADD,
+            OTHER_AGENT_GUARD_ADD,
+            BRIDGE_RULE,
+        ] {
             assert!(!is_relevant(line), "{line}");
         }
     }

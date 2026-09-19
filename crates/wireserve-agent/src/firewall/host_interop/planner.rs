@@ -11,14 +11,20 @@
 //! - the only forward-hook object we create is the guard, which only
 //!   drops, and only exists while firewalld trust is in place;
 //! - repeated planning on the resulting state yields no actions (it
-//!   settles instead of churning on its own writes).
+//!   settles instead of churning on its own writes);
+//! - another running agent's rules (tagged for an interface in
+//!   `Observed::live`) and tables are never touched, so several agents
+//!   on one host settle side by side instead of undoing each other.
 
 use serde_json::{json, Value};
 
+use std::collections::BTreeSet;
+
+use super::iptables::line_tag;
 use super::model::{
-    tag, Action, ChainInfo, Family, FirewalldState, IpVersion, IptablesObservation,
-    IptablesVariant, NftView, Observed, RuleInfo, FIREWALLD_TABLE, GUARD_CHAIN, GUARD_TABLE,
-    IPTABLES_TABLES, OWN_TABLES, TAG_PREFIX,
+    guard_table, is_own_table, tag, tag_owner, Action, ChainInfo, Family, FirewalldState,
+    IpVersion, IptablesObservation, IptablesVariant, NftView, Observed, RuleInfo,
+    FIREWALLD_TABLE, GUARD_CHAIN, IPTABLES_TABLES, LEGACY_GUARD_TABLE, TAG_PREFIX,
 };
 
 const TRUSTED: &str = "trusted";
@@ -51,6 +57,20 @@ fn is_ours(rule: &RuleInfo) -> bool {
     rule.comment.as_deref().is_some_and(|c| c.starts_with(TAG_PREFIX))
 }
 
+/// Whether a tagged rule, owned by the interface in its tag, is ours to
+/// clean up: our own, or one no running agent claims.
+fn removable(owner: Option<&str>, ifname: &str, live: &BTreeSet<String>) -> bool {
+    match owner {
+        Some(o) if o == ifname => true,
+        Some(o) => !live.contains(o),
+        None => true,
+    }
+}
+
+fn rule_removable(rule: &RuleInfo, ifname: &str, live: &BTreeSet<String>) -> bool {
+    removable(rule.comment.as_deref().and_then(tag_owner), ifname, live)
+}
+
 fn version_of(family: Family) -> Option<IpVersion> {
     match family {
         Family::Ip => Some(IpVersion::V4),
@@ -71,7 +91,7 @@ enum Route {
 
 fn route(view: &NftView, chain: &ChainInfo, iptables: &[IptablesObservation]) -> Route {
     let c = &chain.chain;
-    if OWN_TABLES.contains(&c.table.as_str()) || c.table == FIREWALLD_TABLE {
+    if is_own_table(&c.table) || c.table == FIREWALLD_TABLE {
         return Route::Skip;
     }
     let owner_flagged = view
@@ -113,37 +133,39 @@ fn route(view: &NftView, chain: &ChainInfo, iptables: &[IptablesObservation]) ->
 
 /// The reconcile plan: make every foreign INPUT-hook filter chain (and each
 /// iptables ruleset in use) hold exactly one correct accept for `ifname`,
-/// remove every other rule carrying our tag, and keep firewalld trust and
-/// the forward guard in step.
+/// remove every other rule carrying our tag except a running agent's, and
+/// keep firewalld trust and the forward guard in step.
 #[must_use]
 pub fn plan_reconcile(observed: &Observed, ifname: &str) -> Vec<Action> {
     let mut actions = Vec::new();
 
     if let Some(view) = &observed.nft {
         for chain in &view.chains {
-            let foreign = !OWN_TABLES.contains(&chain.chain.table.as_str());
+            let foreign = !is_own_table(&chain.chain.table);
             match route(view, chain, &observed.iptables) {
-                Route::Nft => plan_nft_chain(chain, ifname, &mut actions),
+                Route::Nft => plan_nft_chain(chain, ifname, &observed.live, &mut actions),
                 // Not ours to fill, but a tagged rule that ended up there
                 // (an older version, a changed chain type) still goes.
-                Route::Iptables | Route::Skip if foreign => delete_all_tagged(chain, &mut actions),
+                Route::Iptables | Route::Skip if foreign => {
+                    delete_removable(chain, ifname, &observed.live, &mut actions);
+                }
                 Route::Iptables | Route::Skip => {}
             }
         }
     }
 
     for obs in &observed.iptables {
-        plan_iptables(obs, ifname, observed.nft.as_ref(), &mut actions);
+        plan_iptables(obs, ifname, observed.nft.as_ref(), &observed.live, &mut actions);
     }
 
     plan_firewalld(observed, ifname, &mut actions);
     actions
 }
 
-fn plan_nft_chain(chain: &ChainInfo, ifname: &str, actions: &mut Vec<Action>) {
+fn plan_nft_chain(chain: &ChainInfo, ifname: &str, live: &BTreeSet<String>, actions: &mut Vec<Action>) {
     let wanted = tag(ifname);
     let mut kept = false;
-    for rule in chain.rules.iter().filter(|r| is_ours(r)) {
+    for rule in chain.rules.iter().filter(|r| is_ours(r) && rule_removable(r, ifname, live)) {
         let correct = rule.comment.as_deref() == Some(wanted.as_str()) && is_accept_shape(rule, ifname);
         if correct && !kept {
             kept = true;
@@ -162,8 +184,8 @@ fn plan_nft_chain(chain: &ChainInfo, ifname: &str, actions: &mut Vec<Action>) {
     }
 }
 
-fn delete_all_tagged(chain: &ChainInfo, actions: &mut Vec<Action>) {
-    for rule in chain.rules.iter().filter(|r| is_ours(r)) {
+fn delete_removable(chain: &ChainInfo, ifname: &str, live: &BTreeSet<String>, actions: &mut Vec<Action>) {
+    for rule in chain.rules.iter().filter(|r| is_ours(r) && rule_removable(r, ifname, live)) {
         actions.push(Action::NftDelete {
             chain: chain.chain.clone(),
             handle: rule.handle,
@@ -199,14 +221,20 @@ fn iptables_applies(obs: &IptablesObservation, nft: Option<&NftView>) -> bool {
     }
 }
 
-fn plan_iptables(obs: &IptablesObservation, ifname: &str, nft: Option<&NftView>, actions: &mut Vec<Action>) {
+fn plan_iptables(
+    obs: &IptablesObservation,
+    ifname: &str,
+    nft: Option<&NftView>,
+    live: &BTreeSet<String>,
+    actions: &mut Vec<Action>,
+) {
     let Some(lines) = &obs.tagged_lines else {
         return;
     };
     let applies = iptables_applies(obs, nft);
     let wanted = iptables_line(ifname);
     let mut kept = false;
-    for line in lines {
+    for line in lines.iter().filter(|l| iptables_line_removable(l, ifname, live)) {
         if applies && *line == wanted && !kept {
             kept = true;
         } else {
@@ -224,17 +252,23 @@ fn plan_iptables(obs: &IptablesObservation, ifname: &str, nft: Option<&NftView>,
     }
 }
 
+fn iptables_line_removable(line: &str, ifname: &str, live: &BTreeSet<String>) -> bool {
+    let tag = line_tag(line);
+    removable(tag.as_deref().and_then(tag_owner), ifname, live)
+}
+
 fn guard_state(nft: Option<&NftView>, ifname: &str) -> GuardState {
     let Some(view) = nft else {
         return GuardState::Unknown;
     };
+    let table = guard_table(ifname);
     let chain = view.chains.iter().find(|c| {
-        c.chain.family == Family::Inet && c.chain.table == GUARD_TABLE && c.chain.chain == GUARD_CHAIN
+        c.chain.family == Family::Inet && c.chain.table == table && c.chain.chain == GUARD_CHAIN
     });
     let table_exists = view
         .tables
         .iter()
-        .any(|t| t.family == Family::Inet && t.name == GUARD_TABLE);
+        .any(|t| t.family == Family::Inet && t.name == table);
     match chain {
         Some(c)
             if c.hook.as_deref() == Some("forward")
@@ -289,7 +323,9 @@ fn plan_firewalld(observed: &Observed, ifname: &str, actions: &mut Vec<Action>) 
         (true, GuardState::Absent | GuardState::Wrong) => actions.push(Action::GuardCreate {
             ifname: ifname.to_string(),
         }),
-        (false, GuardState::Correct | GuardState::Wrong) => actions.push(Action::GuardDelete),
+        (false, GuardState::Correct | GuardState::Wrong) => actions.push(Action::GuardDelete {
+            table: guard_table(ifname),
+        }),
         _ => {}
     }
     // Trust only after the guard: forwarding from the mesh must never be
@@ -340,8 +376,8 @@ pub fn notices(observed: &Observed, ifname: &str) -> Vec<String> {
     out
 }
 
-/// The removal plan for shutdown/`leave`: every tagged rule anywhere, our
-/// firewalld trust (runtime `trusted` with no operator binding — the only
+/// The removal plan for shutdown/`leave`: every tagged rule anywhere that
+/// isn't a running agent's (so leftovers go too), our firewalld trust (runtime `trusted` with no operator binding — the only
 /// state we ever create), then the guard. Ordered so the host closes back
 /// before the guard goes: the guard must never be missing while trust is
 /// still in place.
@@ -350,13 +386,18 @@ pub fn plan_removal(observed: &Observed, ifname: &str) -> Vec<Action> {
     let mut actions = Vec::new();
     if let Some(view) = &observed.nft {
         for chain in &view.chains {
-            if !OWN_TABLES.contains(&chain.chain.table.as_str()) {
-                delete_all_tagged(chain, &mut actions);
+            if !is_own_table(&chain.chain.table) {
+                delete_removable(chain, ifname, &observed.live, &mut actions);
             }
         }
     }
     for obs in &observed.iptables {
-        for line in obs.tagged_lines.iter().flatten() {
+        for line in obs
+            .tagged_lines
+            .iter()
+            .flatten()
+            .filter(|l| iptables_line_removable(l, ifname, &observed.live))
+        {
             actions.push(Action::IptablesDelete {
                 target: obs.target.clone(),
                 line: line.clone(),
@@ -374,14 +415,53 @@ pub fn plan_removal(observed: &Observed, ifname: &str) -> Vec<Action> {
             });
         }
     }
-    let guard_table_exists = observed.nft.as_ref().is_some_and(|v| {
+    let table = guard_table(ifname);
+    let guard_table_exists = observed
+        .nft
+        .as_ref()
+        .is_some_and(|v| v.tables.iter().any(|t| t.family == Family::Inet && t.name == table));
+    if guard_table_exists {
+        actions.push(Action::GuardDelete { table });
+    }
+    actions
+}
+
+/// The interface name every agent used before `--ifname` had another
+/// default.
+pub const LEGACY_IFNAME: &str = "wg0";
+
+/// What an agent from before multi-instance support leaves behind if it
+/// crashed or was upgraded mid-run, beyond tagged rules: its fixed-name
+/// guard table and, while that exists, the firewalld trust for `wg0` it
+/// guarded. Only planned when the legacy guard is there — the evidence
+/// that trust was ours — and the trust is left alone while a running
+/// agent claims `wg0` now (its trust, guarded by its own table). Same
+/// order as `plan_removal`: trust goes before its guard.
+#[must_use]
+pub fn plan_legacy_removal(observed: &Observed, wg0_live: bool) -> Vec<Action> {
+    let legacy_guard = observed.nft.as_ref().is_some_and(|v| {
         v.tables
             .iter()
-            .any(|t| t.family == Family::Inet && t.name == GUARD_TABLE)
+            .any(|t| t.family == Family::Inet && t.name == LEGACY_GUARD_TABLE)
     });
-    if guard_table_exists {
-        actions.push(Action::GuardDelete);
+    if !legacy_guard {
+        return Vec::new();
     }
+    let mut actions = Vec::new();
+    if let FirewalldState::Running {
+        runtime_zone: Some(zone),
+        permanent_zone: None,
+    } = &observed.firewalld
+    {
+        if zone == TRUSTED && !wg0_live {
+            actions.push(Action::FirewalldUntrust {
+                ifname: LEGACY_IFNAME.to_string(),
+            });
+        }
+    }
+    actions.push(Action::GuardDelete {
+        table: LEGACY_GUARD_TABLE.to_string(),
+    });
     actions
 }
 
@@ -392,7 +472,17 @@ pub(crate) fn simulate(observed: &Observed, actions: &[Action]) -> Observed {
     use super::model::{ChainRef, TableInfo};
 
     let mut out = observed.clone();
-    let mut next_handle = 10_000;
+    // Past every handle already there, as the kernel's would be — so rules
+    // from separate simulated passes never share one.
+    let mut next_handle = observed
+        .nft
+        .iter()
+        .flat_map(|v| &v.chains)
+        .flat_map(|c| &c.rules)
+        .map(|r| r.handle)
+        .max()
+        .unwrap_or(0)
+        .max(10_000);
     for action in actions {
         match action {
             Action::NftInsert { chain, ifname } => {
@@ -438,19 +528,20 @@ pub(crate) fn simulate(observed: &Observed, actions: &[Action]) -> Observed {
                 }
             }
             Action::GuardCreate { ifname } => {
+                let table = guard_table(ifname);
                 let view = out.nft.as_mut().unwrap();
-                view.tables.retain(|t| t.name != GUARD_TABLE);
-                view.chains.retain(|c| c.chain.table != GUARD_TABLE);
+                view.tables.retain(|t| t.name != table);
+                view.chains.retain(|c| c.chain.table != table);
                 view.tables.push(TableInfo {
                     family: Family::Inet,
-                    name: GUARD_TABLE.into(),
+                    name: table.clone(),
                     flags: vec![],
                 });
                 next_handle += 1;
                 view.chains.push(ChainInfo {
                     chain: ChainRef {
                         family: Family::Inet,
-                        table: GUARD_TABLE.into(),
+                        table,
                         chain: GUARD_CHAIN.into(),
                     },
                     hook: Some("forward".into()),
@@ -462,10 +553,10 @@ pub(crate) fn simulate(observed: &Observed, actions: &[Action]) -> Observed {
                     }],
                 });
             }
-            Action::GuardDelete => {
+            Action::GuardDelete { table } => {
                 let view = out.nft.as_mut().unwrap();
-                view.tables.retain(|t| t.name != GUARD_TABLE);
-                view.chains.retain(|c| c.chain.table != GUARD_TABLE);
+                view.tables.retain(|t| t.name != *table);
+                view.chains.retain(|c| c.chain.table != *table);
             }
         }
     }

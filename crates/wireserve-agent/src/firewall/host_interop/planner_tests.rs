@@ -45,6 +45,7 @@ fn observed(nft: NftView) -> Observed {
         nft: Some(nft),
         iptables: vec![],
         firewalld: FirewalldState::Unavailable,
+        live: Default::default(),
     }
 }
 
@@ -78,6 +79,7 @@ fn strato() -> Observed {
             ipt(IpVersion::V6, IptablesVariant::Nft, &[]),
         ],
         firewalld: FirewalldState::Unavailable,
+        live: Default::default(),
     }
 }
 
@@ -112,7 +114,7 @@ fn every_insert_is_for_exactly_the_configured_interface() {
                     Action::NftDelete { .. }
                     | Action::IptablesDelete { .. }
                     | Action::FirewalldUntrust { .. }
-                    | Action::GuardDelete => {}
+                    | Action::GuardDelete { .. } => {}
                 }
             }
         }
@@ -182,14 +184,16 @@ fn forward_guard_only_drops_and_only_exists_with_firewalld_trust() {
         .unwrap()
         .chains
         .iter()
-        .find(|c| c.chain.table == GUARD_TABLE)
+        .find(|c| c.chain.table == guard_table("wg0"))
         .unwrap();
     assert!(guard.rules.iter().all(|r| is_guard_shape(r, "wg0")));
 
     // Without firewalld there is no guard, and a leftover one is removed.
     let mut gone = after.clone();
     gone.firewalld = FirewalldState::Unavailable;
-    assert!(plan_reconcile(&gone, "wg0").contains(&Action::GuardDelete));
+    assert!(plan_reconcile(&gone, "wg0").contains(&Action::GuardDelete {
+        table: "wireserve-interop.wg0".into()
+    }));
     assert!(!plan_reconcile(&observed(view(NATIVE)), "wg0")
         .iter()
         .any(|a| matches!(a, Action::GuardCreate { .. })));
@@ -239,7 +243,7 @@ fn our_own_tables_and_firewalld_are_never_inserted_into() {
     let actions = plan_reconcile(&observed(view(FIREWALLD_LIKE)), "wg0");
     assert!(nft_inserts(&actions).is_empty(), "{actions:?}");
     let actions = plan_reconcile(&strato(), "wg0");
-    assert!(!nft_inserts(&actions).iter().any(|c| OWN_TABLES.contains(&c.table.as_str())));
+    assert!(!nft_inserts(&actions).iter().any(|c| is_own_table(&c.table)));
 }
 
 #[test]
@@ -501,6 +505,7 @@ fn no_firewalld_trust_when_the_ruleset_is_unreadable() {
             runtime_zone: None,
             permanent_zone: None,
         },
+        live: Default::default(),
     };
     assert_eq!(plan_reconcile(&obs, "wg0"), []);
 }
@@ -522,7 +527,7 @@ fn removal_takes_away_everything_we_added_and_nothing_else() {
 
     // Untrust comes before the guard goes: forwarding is never open.
     let untrust = removal.iter().position(|a| matches!(a, Action::FirewalldUntrust { .. }));
-    let guard = removal.iter().position(|a| *a == Action::GuardDelete);
+    let guard = removal.iter().position(|a| matches!(a, Action::GuardDelete { .. }));
     assert!(untrust.unwrap() < guard.unwrap(), "{removal:?}");
 
     let after = simulate(&installed, &removal);
@@ -617,4 +622,156 @@ fn notices_explain_what_is_deliberately_left_alone() {
     assert!(zone(Some("trusted"), Some("trusted")).is_empty());
     // No firewalld at all: nothing.
     assert!(notices(&observed(view(NATIVE)), "wg0").is_empty());
+}
+
+// ---------------------------------------------------------------------
+// Several agents on one host
+// ---------------------------------------------------------------------
+
+/// `obs` as the agent on `ifname` sees it, with `others` running.
+fn seen_by(obs: &Observed, others: &[&str]) -> Observed {
+    let mut o = obs.clone();
+    o.live = others.iter().map(|s| (*s).to_string()).collect();
+    o
+}
+
+fn tag_count(obs: &Observed, ifname: &str) -> usize {
+    let wanted = tag(ifname);
+    let nft = obs
+        .nft
+        .iter()
+        .flat_map(|v| &v.chains)
+        .flat_map(|c| &c.rules)
+        .filter(|r| r.comment.as_deref() == Some(wanted.as_str()))
+        .count();
+    let ipt = obs
+        .iptables
+        .iter()
+        .flat_map(|o| o.tagged_lines.iter().flatten())
+        .filter(|l| l.contains(&format!("\"{wanted}\"")))
+        .count();
+    nft + ipt
+}
+
+/// ufw via iptables-nft (v4 + v6), crowdsec natively, legacy iptables too.
+fn busy_host() -> Observed {
+    let mut obs = strato();
+    obs.iptables.push(ipt(IpVersion::V4, IptablesVariant::Legacy, &[]));
+    obs
+}
+
+#[test]
+fn two_running_agents_settle_side_by_side() {
+    let a = converge(&seen_by(&busy_host(), &["wireserve1"]), "wireserve0");
+    let both = converge(&seen_by(&a, &["wireserve0"]), "wireserve1");
+
+    let per_agent = tag_count(&a, "wireserve0");
+    assert!(per_agent >= 4, "one accept per chain and ruleset: {per_agent}");
+    assert_eq!(tag_count(&both, "wireserve0"), per_agent, "B left A's rules alone");
+    assert_eq!(tag_count(&both, "wireserve1"), per_agent);
+
+    // Neither has anything left to do: no ping-pong between the two.
+    assert_eq!(plan_reconcile(&seen_by(&both, &["wireserve1"]), "wireserve0"), vec![]);
+    assert_eq!(plan_reconcile(&seen_by(&both, &["wireserve0"]), "wireserve1"), vec![]);
+}
+
+#[test]
+fn a_stopping_agent_removes_only_its_own_rules() {
+    let a = converge(&seen_by(&busy_host(), &["wireserve1"]), "wireserve0");
+    let both = converge(&seen_by(&a, &["wireserve0"]), "wireserve1");
+
+    let after = simulate(&both, &plan_removal(&seen_by(&both, &["wireserve1"]), "wireserve0"));
+    assert_eq!(tag_count(&after, "wireserve0"), 0);
+    assert_eq!(tag_count(&after, "wireserve1"), tag_count(&both, "wireserve1"));
+}
+
+#[test]
+fn a_dead_agents_rules_are_cleaned_up_by_a_running_one() {
+    // B crashed: its claim is gone, so A no longer sees it as live.
+    let a = converge(&seen_by(&busy_host(), &["wireserve1"]), "wireserve0");
+    let both = converge(&seen_by(&a, &["wireserve0"]), "wireserve1");
+
+    let actions = plan_reconcile(&seen_by(&both, &[]), "wireserve0");
+    assert!(nft_inserts(&actions).is_empty(), "{actions:?}");
+    let after = simulate(&both, &actions);
+    assert_eq!(tag_count(&after, "wireserve1"), 0);
+    assert_eq!(tag_count(&after, "wireserve0"), tag_count(&a, "wireserve0"));
+}
+
+#[test]
+fn each_agent_keeps_its_own_forward_guard() {
+    let firewalld = |obs: &Observed| {
+        let mut o = obs.clone();
+        o.firewalld = FirewalldState::Running {
+            runtime_zone: None,
+            permanent_zone: None,
+        };
+        o
+    };
+    let a = converge(&firewalld(&seen_by(&observed(view(FIREWALLD_LIKE)), &["wireserve1"])), "wireserve0");
+    let has_guard = |obs: &Observed, ifname: &str| {
+        obs.nft.as_ref().unwrap().tables.iter().any(|t| t.name == guard_table(ifname))
+    };
+    assert!(has_guard(&a, "wireserve0"));
+
+    // B, with firewalld reporting its own interface as unassigned, creates
+    // its own guard and never deletes A's.
+    let b_actions = plan_reconcile(&firewalld(&seen_by(&a, &["wireserve0"])), "wireserve1");
+    assert!(b_actions.contains(&Action::GuardCreate {
+        ifname: "wireserve1".into()
+    }));
+    assert!(!b_actions.iter().any(|x| matches!(x, Action::GuardDelete { .. })), "{b_actions:?}");
+    let both = simulate(&a, &b_actions);
+    assert!(has_guard(&both, "wireserve0") && has_guard(&both, "wireserve1"));
+
+    // B's removal takes only B's guard.
+    let mut b_trusted = seen_by(&both, &["wireserve0"]);
+    b_trusted.firewalld = FirewalldState::Running {
+        runtime_zone: Some("trusted".into()),
+        permanent_zone: None,
+    };
+    let removal = plan_removal(&b_trusted, "wireserve1");
+    assert_eq!(
+        removal,
+        [
+            Action::FirewalldUntrust {
+                ifname: "wireserve1".into()
+            },
+            Action::GuardDelete {
+                table: "wireserve-interop.wireserve1".into()
+            }
+        ]
+    );
+}
+
+#[test]
+fn legacy_guard_and_its_trust_are_removed_once() {
+    let mut v = view(FIREWALLD_LIKE);
+    v.tables.push(TableInfo {
+        family: Family::Inet,
+        name: LEGACY_GUARD_TABLE.into(),
+        flags: vec![],
+    });
+    let mut obs = observed(v);
+    obs.firewalld = FirewalldState::Running {
+        runtime_zone: Some("trusted".into()),
+        permanent_zone: None,
+    };
+    let delete = Action::GuardDelete {
+        table: "wireserve-interop".into(),
+    };
+    assert_eq!(
+        plan_legacy_removal(&obs, false),
+        [Action::FirewalldUntrust { ifname: "wg0".into() }, delete.clone()]
+    );
+    // A running agent that claims `wg0` now owns that trust.
+    assert_eq!(plan_legacy_removal(&obs, true), std::slice::from_ref(&delete));
+    // An operator's permanent binding is theirs.
+    obs.firewalld = FirewalldState::Running {
+        runtime_zone: Some("trusted".into()),
+        permanent_zone: Some("trusted".into()),
+    };
+    assert_eq!(plan_legacy_removal(&obs, false), [delete]);
+    // Nothing legacy, nothing to do.
+    assert_eq!(plan_legacy_removal(&observed(view(FIREWALLD_LIKE)), false), []);
 }

@@ -2,9 +2,9 @@
 //! (ordering, failure handling) is tested against a recording fake, the
 //! same way `firewall::fake::FakeFirewallBackend` stands in for nftables.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
-use super::model::{Action, FirewalldState, Observed};
+use super::model::{tag_owner, Action, FirewalldState, IptablesObservation, NftView, Observed};
 use super::{firewalld, iptables, nft_ops, planner, ruleset};
 use crate::firewall::nft::Nft;
 
@@ -51,14 +51,19 @@ impl HostOps for RealOps {
                 None
             }
         };
+        let iptables = iptables::observe();
+        let live = live_owners(nft.as_ref(), &iptables, ifname, |o| {
+            crate::lock::holder(o).is_agent()
+        });
         Observed {
             nft,
-            iptables: iptables::observe(),
+            iptables,
             firewalld: if self.firewalld {
                 firewalld::observe(ifname)
             } else {
                 FirewalldState::Unavailable
             },
+            live,
         }
     }
 
@@ -68,7 +73,7 @@ impl HostOps for RealOps {
             Action::NftInsert { chain, ifname } => nft(nft_ops::insert_accept(chain, ifname)),
             Action::NftDelete { chain, handle } => nft(nft_ops::delete_rule(chain, *handle)),
             Action::GuardCreate { ifname } => nft(nft_ops::guard_create(ifname)),
-            Action::GuardDelete => nft(nft_ops::guard_delete()),
+            Action::GuardDelete { table } => nft(nft_ops::guard_delete(table)),
             Action::IptablesInsert { target, ifname } => {
                 iptables::run(target, &iptables::insert_args(ifname)).map(|_| ())
             }
@@ -82,6 +87,29 @@ impl HostOps for RealOps {
             Action::FirewalldUntrust { ifname } => firewalld::execute(&firewalld::untrust_args(ifname)),
         }
     }
+}
+
+/// Every interface name, other than `ifname`, that a tagged rule was seen
+/// for and that `is_live` says a running agent holds. Asked once per name,
+/// not per rule.
+pub fn live_owners(
+    nft: Option<&NftView>,
+    iptables: &[IptablesObservation],
+    ifname: &str,
+    is_live: impl Fn(&str) -> bool,
+) -> BTreeSet<String> {
+    let from_nft = nft
+        .into_iter()
+        .flat_map(|v| &v.chains)
+        .flat_map(|c| &c.rules)
+        .filter_map(|r| r.comment.as_deref().and_then(tag_owner).map(str::to_string));
+    let from_iptables = iptables
+        .iter()
+        .flat_map(|o| o.tagged_lines.iter().flatten())
+        .filter_map(|l| iptables::line_tag(l))
+        .filter_map(|t| tag_owner(&t).map(str::to_string));
+    let owners: BTreeSet<String> = from_nft.chain(from_iptables).filter(|o| o != ifname).collect();
+    owners.into_iter().filter(|o| is_live(o)).collect()
 }
 
 /// Runs `actions` in order, logging each. Every failure is logged and the
@@ -98,7 +126,7 @@ pub fn execute_all(ops: &mut impl HostOps, actions: &[Action]) -> usize {
     for action in actions {
         let skip = match action {
             Action::FirewalldTrust { .. } => guard_failed,
-            Action::GuardDelete => untrust_failed,
+            Action::GuardDelete { .. } => untrust_failed,
             _ => false,
         };
         if skip {
@@ -137,10 +165,20 @@ pub fn reconcile(ops: &mut impl HostOps, ifname: &str, told: &mut HashSet<String
     actions.len()
 }
 
-/// Removes everything this module ever added (any interface name).
+/// Removes everything this module added for `ifname`, plus any leftovers
+/// no running agent claims.
 pub fn remove(ops: &mut impl HostOps, ifname: &str) {
     let observed = ops.observe(ifname);
     execute_all(ops, &planner::plan_removal(&observed, ifname));
+}
+
+/// Removes what an agent from before multi-instance support left behind:
+/// its fixed-name forward guard, and the firewalld trust it guarded. Its
+/// tagged rules need nothing special — nobody claims `wg0` for them, so
+/// every reconcile treats them as leftovers already.
+pub fn remove_legacy(ops: &mut impl HostOps, wg0_live: bool) {
+    let observed = ops.observe(planner::LEGACY_IFNAME);
+    execute_all(ops, &planner::plan_legacy_removal(&observed, wg0_live));
 }
 
 #[cfg(test)]
@@ -190,6 +228,7 @@ mod tests {
                 nft: None,
                 iptables: vec![],
                 firewalld: FirewalldState::Unavailable,
+                live: BTreeSet::new(),
             },
             executed: vec![],
             fail,
@@ -223,8 +262,11 @@ mod tests {
     #[test]
     fn the_guard_stays_while_firewalld_trust_could_not_be_removed() {
         let untrust = Action::FirewalldUntrust { ifname: "wg0".into() };
+        let delete = Action::GuardDelete {
+            table: "wireserve-interop.wg0".into(),
+        };
         let mut ops = fake(vec![untrust.clone()]);
-        assert_eq!(execute_all(&mut ops, &[untrust.clone(), Action::GuardDelete]), 2);
+        assert_eq!(execute_all(&mut ops, &[untrust.clone(), delete]), 2);
         assert_eq!(ops.executed, [untrust], "guard must stay while the interface is still trusted");
     }
 
@@ -249,5 +291,41 @@ mod tests {
                 Action::FirewalldTrust { ifname: "wg0".into() }
             ]
         );
+    }
+
+    #[test]
+    fn only_other_interfaces_a_running_agent_holds_are_live() {
+        use crate::firewall::host_interop::model::{ChainInfo, IptablesTarget, IptablesVariant, IpVersion, RuleInfo};
+        let rule = |comment: &str| RuleInfo {
+            handle: 1,
+            comment: Some(comment.into()),
+            expr: vec![],
+        };
+        let nft = NftView {
+            tables: vec![],
+            chains: vec![ChainInfo {
+                chain: chain("input"),
+                hook: Some("input".into()),
+                chain_type: Some("filter".into()),
+                rules: vec![rule("wireserve:wg0"), rule("wireserve:alive"), rule("wireserve:dead"), rule("ssh")],
+            }],
+        };
+        let iptables = vec![IptablesObservation {
+            target: IptablesTarget {
+                version: IpVersion::V4,
+                variant: IptablesVariant::Nft,
+                binary: "/usr/sbin/iptables".into(),
+            },
+            tagged_lines: Some(vec![
+                "-A INPUT -i alive2 -m comment --comment \"wireserve:alive2\" -j ACCEPT".into(),
+            ]),
+        }];
+        let asked = std::cell::RefCell::new(Vec::new());
+        let live = live_owners(Some(&nft), &iptables, "wg0", |o| {
+            asked.borrow_mut().push(o.to_string());
+            o.starts_with("alive")
+        });
+        assert_eq!(live, BTreeSet::from(["alive".to_string(), "alive2".to_string()]));
+        assert_eq!(*asked.borrow(), ["alive", "alive2", "dead"], "never asks about our own name");
     }
 }

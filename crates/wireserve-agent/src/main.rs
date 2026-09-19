@@ -239,6 +239,15 @@ async fn cmd_daemon(
     let listen_port = state.listen_port.unwrap_or(51820);
     let private_key = state.private_key.clone().unwrap_or_default();
 
+    // An agent from before multi-instance support kept its firewall state
+    // under fixed names. Nothing creates those any more, so whatever is
+    // there was left by a crash or a mid-run upgrade — of what is now the
+    // default instance.
+    #[cfg(target_os = "linux")]
+    if instance.is_default() {
+        firewall::host_interop::remove_legacy();
+    }
+
     #[cfg(target_os = "linux")]
     let mut fw = firewall::nftables::NftablesBackend::new(ifname.clone())?;
     #[cfg(not(target_os = "linux"))]

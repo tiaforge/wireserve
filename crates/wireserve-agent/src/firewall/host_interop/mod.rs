@@ -1,6 +1,6 @@
 //! Host-firewall interop, NetBird-style: makes the *other* firewalls on the
-//! host let traffic on our interface through, so that our own `wireserve`
-//! table is the only thing deciding for it.
+//! host let traffic on our interface through, so that our own
+//! `wireserve.<ifname>` table is the only thing deciding for it.
 //!
 //! Why this is needed at all: every base chain on a netfilter hook sees
 //! the packet independently, and while a `drop` anywhere is final, an
@@ -18,8 +18,15 @@
 //! - `-I INPUT 1 -i <if> … -j ACCEPT` in each iptables ruleset in use
 //!   (ufw, docker hosts, hand-written scripts; nft-backed and legacy);
 //! - firewalld: the interface in the `trusted` zone (runtime), with a
-//!   forward guard (`inet wireserve-interop`) that drops forwarded traffic
-//!   from the interface, because a zone's target also covers forwarding.
+//!   forward guard (`inet wireserve-interop.<if>`) that drops forwarded
+//!   traffic from the interface, because a zone's target also covers
+//!   forwarding.
+//!
+//! Several agents can run on one host, each on its own interface. Each
+//! one only ever adds, keeps and removes what is tagged with its own
+//! interface name; a tagged rule for another name is left alone while a
+//! running agent claims that name (`crate::lock`), and cleaned up as a
+//! leftover once none does.
 //!
 //! What is never done: anything on another interface, anything on the
 //! forward or output path other than the guard's drop, anything to an
@@ -117,6 +124,25 @@ impl HostInterop {
                 }
             }
         }
+    }
+}
+
+/// Removes what an agent from before multi-instance support left behind:
+/// its fixed-name guard (with the firewalld trust it guarded) and its
+/// fixed-name `inet wireserve` table. Its tagged rules go with any
+/// agent's next reconcile, like every other leftover.
+pub fn remove_legacy() {
+    let nft = match Nft::locate() {
+        Ok(nft) => nft,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not look for a legacy agent's leftovers");
+            return;
+        }
+    };
+    let wg0_live = crate::lock::holder(planner::LEGACY_IFNAME).is_agent();
+    ops::remove_legacy(&mut RealOps::new(nft.clone()), wg0_live);
+    if let Err(e) = super::nftables::remove_legacy_table(&nft) {
+        tracing::warn!(error = %e, "could not remove a legacy agent's `inet wireserve` table");
     }
 }
 
@@ -291,5 +317,63 @@ mod tests {
         assert_eq!(tags(&after_stop), 0, "{after_stop}");
         assert!(after_stop.contains("policy drop"), "foreign config intact: {after_stop}");
         assert!(after_stop.contains("-A INPUT -i lo -j ACCEPT"), "{after_stop}");
+    }
+
+    /// Re-runs the named test inside a fresh network namespace. Returns
+    /// whether the caller is already inside it and should do the work.
+    fn in_netns(test: &str) -> bool {
+        if std::env::var_os(IN_NETNS).is_some() {
+            return true;
+        }
+        if !crate::firewall::netns::available() {
+            eprintln!("SKIPPED: unprivileged network namespaces or nft unavailable");
+            return false;
+        }
+        let status = Command::new("unshare")
+            .arg("-rn")
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(IN_NETNS, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "in-namespace run failed");
+        false
+    }
+
+    /// Two agents' runtimes on one host, each holding its interface
+    /// claim: both get their rules in, neither keeps rewriting the other's
+    /// (rule handles stay put), and stopping one leaves the other intact.
+    #[test]
+    fn kernel_two_agents_coexist() {
+        if !in_netns("firewall::host_interop::tests::kernel_two_agents_coexist") {
+            return;
+        }
+        let native = "table inet filter {\n chain input {\n  type filter hook input priority 0; policy drop;\n  iif lo accept\n }\n}\n";
+        sh(&format!("iptables-nft -P INPUT DROP; iptables-nft -A INPUT -i lo -j ACCEPT; printf '{native}' | nft -f -"));
+        let count = |ifname: &str| {
+            sh("nft list ruleset; iptables-nft -S INPUT").matches(&format!("wireserve:{ifname}\"")).count()
+        };
+
+        let nft = Nft::locate().unwrap();
+        crate::lock::IfnameClaim::take("wireserve0").unwrap().unwrap().hold();
+        crate::lock::IfnameClaim::take("wireserve1").unwrap().unwrap().hold();
+        let mut a = HostInterop::start_with("wireserve0", nft.clone(), RealOps::without_firewalld(nft.clone()));
+        let mut b = HostInterop::start_with("wireserve1", nft.clone(), RealOps::without_firewalld(nft));
+        assert_eq!((count("wireserve0"), count("wireserve1")), (2, 2));
+
+        // Each one's monitor sees the other's inserts; let that settle, then
+        // check nothing is being rewritten any more.
+        std::thread::sleep(Duration::from_millis(1500));
+        let settled = sh("nft -a list ruleset");
+        a.tick();
+        b.tick();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(sh("nft -a list ruleset"), settled, "rules were rewritten: the agents are fighting");
+        assert_eq!((count("wireserve0"), count("wireserve1")), (2, 2));
+
+        b.stop();
+        assert_eq!((count("wireserve0"), count("wireserve1")), (2, 0));
+        a.stop();
+        assert_eq!((count("wireserve0"), count("wireserve1")), (0, 0));
     }
 }

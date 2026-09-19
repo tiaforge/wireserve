@@ -1,6 +1,7 @@
 //! Pure data types shared by the observer, the planner and the executor.
 //! Nothing here touches the system.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use serde_json::Value;
@@ -18,13 +19,40 @@ pub fn tag(ifname: &str) -> String {
     format!("{TAG_PREFIX}{ifname}")
 }
 
-/// Our own tables. Never treated as "foreign", never written into by the
-/// planner's insert logic, and changes to them never trigger a reconcile
-/// (the backend replaces `wireserve` on every poll).
-pub const OWN_TABLES: &[&str] = &[super::super::nftables::TABLE_NAME, GUARD_TABLE];
+/// The interface name a tag belongs to (`wireserve:<ifname>`).
+#[must_use]
+pub fn tag_owner(comment: &str) -> Option<&str> {
+    comment.strip_prefix(TAG_PREFIX)
+}
 
-/// Holds the forward guard — see [`Action::GuardCreate`].
-pub const GUARD_TABLE: &str = "wireserve-interop";
+/// Before several agents could share a host, both of our tables had fixed
+/// names. Nothing creates them any more; see `remove_legacy`.
+pub const LEGACY_GUARD_TABLE: &str = "wireserve-interop";
+const GUARD_TABLE_PREFIX: &str = "wireserve-interop.";
+
+/// Holds `ifname`'s forward guard — see [`Action::GuardCreate`]. One per
+/// interface, so every agent on the host creates and removes its own
+/// without ever touching another's.
+#[must_use]
+pub fn guard_table(ifname: &str) -> String {
+    format!("{GUARD_TABLE_PREFIX}{ifname}")
+}
+
+/// Tables that belong to wireserve — any agent on this host, running or
+/// not, current or legacy naming. Never treated as "foreign", never
+/// written into by the planner's insert logic, and changes to them never
+/// trigger a reconcile (each backend replaces its own table on every
+/// poll; with several agents, reacting to each other's would have them
+/// reconciling in response to one another forever).
+#[must_use]
+pub fn is_own_table(name: &str) -> bool {
+    use crate::firewall::nftables::{LEGACY_TABLE_NAME, TABLE_PREFIX};
+    name == LEGACY_TABLE_NAME
+        || name == LEGACY_GUARD_TABLE
+        || name.starts_with(TABLE_PREFIX)
+        || name.starts_with(GUARD_TABLE_PREFIX)
+}
+
 pub const GUARD_CHAIN: &str = "forward-guard";
 
 /// firewalld's own table. firewalld (nftables backend) creates it with the
@@ -163,6 +191,12 @@ pub struct Observed {
     pub nft: Option<NftView>,
     pub iptables: Vec<IptablesObservation>,
     pub firewalld: FirewalldState,
+    /// Interface names, other than our own, that tagged rules were seen
+    /// for and whose claim a running agent holds (`lock::holder`). Their
+    /// rules belong to that agent and are left alone; tagged rules for
+    /// any other name are leftovers — a crashed agent, an older version,
+    /// a changed `--ifname` — and removed.
+    pub live: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -178,12 +212,14 @@ pub enum Action {
     FirewalldTrust { ifname: String },
     /// `firewall-cmd --zone=trusted --remove-interface=<ifname>` (runtime only).
     FirewalldUntrust { ifname: String },
-    /// (Re)create table `inet wireserve-interop` with a forward-hook chain
+    /// (Re)create table `inet wireserve-interop.<ifname>` with a forward-hook chain
     /// holding exactly `iifname "<ifname>" drop`. firewalld's zone target
     /// applies to forwarded traffic too, so trusting the interface would
     /// otherwise let mesh peers route through this host into its other
     /// networks. A drop is final across all chains, so this keeps
     /// forwarding from the mesh exactly as blocked as it was before.
     GuardCreate { ifname: String },
-    GuardDelete,
+    /// Delete a guard table, given by its full name (the legacy
+    /// fixed-name one included).
+    GuardDelete { table: String },
 }

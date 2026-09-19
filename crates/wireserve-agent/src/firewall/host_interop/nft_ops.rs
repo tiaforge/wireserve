@@ -10,7 +10,7 @@ use nftables::schema::{Chain, NfCmd, NfListObject, NfObject, Nftables, Rule, Tab
 use nftables::stmt::{Accept, Counter, Drop, Match, Operator, Statement};
 use nftables::types::{NfChainPolicy, NfChainType, NfFamily, NfHook};
 
-use super::model::{tag, ChainRef, Family, GUARD_CHAIN, GUARD_TABLE};
+use super::model::{guard_table, tag, ChainRef, Family, GUARD_CHAIN};
 
 fn nf_family(family: Family) -> NfFamily {
     match family {
@@ -73,33 +73,34 @@ pub fn delete_rule(chain: &ChainRef, handle: u64) -> Nftables<'static> {
     }
 }
 
-fn guard_table() -> Table<'static> {
+fn inet_table(name: &str) -> Table<'static> {
     Table {
         family: NfFamily::INet,
-        name: GUARD_TABLE.into(),
+        name: Cow::Owned(name.to_string()),
         handle: None,
     }
 }
 
-fn delete_guard_cmds() -> Vec<NfObject<'static>> {
+fn delete_table_cmds(name: &str) -> Vec<NfObject<'static>> {
     vec![
-        NfObject::CmdObject(NfCmd::Add(NfListObject::Table(guard_table()))),
-        NfObject::CmdObject(NfCmd::Delete(NfListObject::Table(guard_table()))),
+        NfObject::CmdObject(NfCmd::Add(NfListObject::Table(inet_table(name)))),
+        NfObject::CmdObject(NfCmd::Delete(NfListObject::Table(inet_table(name)))),
     ]
 }
 
-/// Atomically (re)creates `inet wireserve-interop` holding exactly one
+/// Atomically (re)creates `inet wireserve-interop.<ifname>` holding exactly one
 /// forward-hook rule: `iifname "<ifname>" drop`. A drop is final across
 /// every chain on the hook, so while this exists nothing — firewalld's
 /// `trusted` zone included — can let traffic from the mesh be forwarded
 /// to another interface.
 #[must_use]
 pub fn guard_create(ifname: &str) -> Nftables<'static> {
-    let mut objects = delete_guard_cmds();
-    objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Table(guard_table()))));
+    let table = guard_table(ifname);
+    let mut objects = delete_table_cmds(&table);
+    objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Table(inet_table(&table)))));
     objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Chain(Chain {
         family: NfFamily::INet,
-        table: GUARD_TABLE.into(),
+        table: Cow::Owned(table.clone()),
         name: GUARD_CHAIN.into(),
         _type: Some(NfChainType::Filter),
         hook: Some(NfHook::Forward),
@@ -109,7 +110,7 @@ pub fn guard_create(ifname: &str) -> Nftables<'static> {
     }))));
     objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(Rule {
         family: NfFamily::INet,
-        table: GUARD_TABLE.into(),
+        table: Cow::Owned(table),
         chain: GUARD_CHAIN.into(),
         expr: vec![iifname_is(ifname), Statement::Drop(None::<Drop>)].into(),
         handle: None,
@@ -121,10 +122,11 @@ pub fn guard_create(ifname: &str) -> Nftables<'static> {
     }
 }
 
+/// Deletes the guard table `table` (by full name) if it exists.
 #[must_use]
-pub fn guard_delete() -> Nftables<'static> {
+pub fn guard_delete(table: &str) -> Nftables<'static> {
     Nftables {
-        objects: delete_guard_cmds().into(),
+        objects: delete_table_cmds(table).into(),
     }
 }
 
@@ -171,17 +173,17 @@ mod tests {
 
     #[test]
     fn guard_json_is_exact_and_only_drops() {
-        let t = json!({"family": "inet", "name": "wireserve-interop"});
+        let t = json!({"family": "inet", "name": "wireserve-interop.wg0"});
         assert_eq!(
             serde_json::to_value(guard_create("wg0")).unwrap(),
             json!({"nftables": [
                 {"add": {"table": t}},
                 {"delete": {"table": t}},
                 {"add": {"table": t}},
-                {"add": {"chain": {"family": "inet", "table": "wireserve-interop",
+                {"add": {"chain": {"family": "inet", "table": "wireserve-interop.wg0",
                     "name": "forward-guard", "type": "filter", "hook": "forward",
                     "prio": 0, "policy": "accept"}}},
-                {"add": {"rule": {"family": "inet", "table": "wireserve-interop",
+                {"add": {"rule": {"family": "inet", "table": "wireserve-interop.wg0",
                     "chain": "forward-guard", "expr": [
                         {"match": {"op": "==", "left": {"meta": {"key": "iifname"}}, "right": "wg0"}},
                         {"drop": null}
@@ -189,7 +191,7 @@ mod tests {
             ]})
         );
         assert_eq!(
-            serde_json::to_value(guard_delete()).unwrap(),
+            serde_json::to_value(guard_delete("wireserve-interop.wg0")).unwrap(),
             json!({"nftables": [{"add": {"table": t}}, {"delete": {"table": t}}]})
         );
     }
@@ -228,6 +230,7 @@ mod tests {
                 runtime_zone: Some("trusted".into()),
                 permanent_zone: None,
             },
+            live: Default::default(),
         };
         assert_eq!(planner::plan_reconcile(&observed, "wg0"), vec![], "settled on real kernel output");
 
@@ -237,7 +240,7 @@ mod tests {
         for action in &removal {
             match action {
                 Action::NftDelete { chain, handle } => script += &apply_script(&delete_rule(chain, *handle)),
-                Action::GuardDelete => script += &apply_script(&guard_delete()),
+                Action::GuardDelete { table } => script += &apply_script(&guard_delete(table)),
                 Action::FirewalldUntrust { .. } => {}
                 other => panic!("unexpected removal action {other:?}"),
             }

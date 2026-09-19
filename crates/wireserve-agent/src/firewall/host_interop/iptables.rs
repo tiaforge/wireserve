@@ -171,6 +171,17 @@ pub fn split_words(line: &str) -> Result<Vec<String>, String> {
     }
 }
 
+/// The comment of a `-S` line if it carries our tag prefix — the whole
+/// tag, `wireserve:<ifname>`.
+#[must_use]
+pub fn line_tag(line: &str) -> Option<String> {
+    let words = split_words(line).ok()?;
+    words
+        .windows(2)
+        .find(|p| p[0] == "--comment" && p[1].starts_with(TAG_PREFIX))
+        .map(|p| p[1].clone())
+}
+
 /// Every `-A INPUT` line in `-S INPUT` output whose comment carries our
 /// tag prefix — nothing else, however similar.
 #[must_use]
@@ -178,12 +189,7 @@ pub fn tagged_lines(listing: &str) -> Vec<String> {
     listing
         .lines()
         .filter(|l| l.starts_with("-A INPUT "))
-        .filter(|l| {
-            split_words(l).is_ok_and(|w| {
-                w.windows(2)
-                    .any(|p| p[0] == "--comment" && p[1].starts_with(TAG_PREFIX))
-            })
-        })
+        .filter(|l| line_tag(l).is_some())
         .map(str::to_string)
         .collect()
 }
