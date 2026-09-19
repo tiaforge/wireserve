@@ -363,8 +363,10 @@ struct ServiceRule {
 - `rules` = this node's own currently-declared services (from the `services`
   array in the request the agent just sent, not the coordinator's response —
   a node only ever firewalls itself).
-- **Linux v1**: `NftablesBackend` via the `rustables` crate (netlink, no
-  shelling out to `nft`), scoped to the WireGuard interface, default `DROP`.
+- **Linux v1**: `NftablesBackend` via the `nft` binary's JSON API (one
+  atomic `nft -j -f -` transaction per `apply()`), scoped to the WireGuard
+  interface, default `DROP`. (Originally netlink via `rustables` with "no
+  shelling out to `nft`"; reversed — see PLAN.md decisions log #69.)
 - **Windows v1.1**: `WindowsFirewallBackend` implementing the same trait —
   backend swap only, no change to the sync logic that calls `apply()`.
 - **Startup ordering**: `teardown()`-then-deny-all must run *before* the

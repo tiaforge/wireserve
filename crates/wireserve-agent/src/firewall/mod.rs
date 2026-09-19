@@ -4,7 +4,9 @@
 //! sequencing that's a hard spec requirement regardless of which backend is
 //! in use.
 
-#[cfg(all(feature = "nftables", target_os = "linux"))]
+#[cfg(target_os = "linux")]
+pub mod nft;
+#[cfg(target_os = "linux")]
 pub mod nftables;
 
 use wireserve_types::FirewallBackend;
@@ -23,8 +25,7 @@ pub fn startup_sequence<B: FirewallBackend>(backend: &mut B) -> Result<(), B::Er
 pub mod fake {
     //! A `FirewallBackend` test double that records call order, so the
     //! startup-sequencing requirement can be verified without a real
-    //! nftables/netlink backend (which this sandbox can't build — see
-    //! Cargo.toml's `nftables` feature).
+    //! nftables backend (which needs root and a kernel netfilter hook).
 
     use wireserve_types::{FirewallBackend, ServiceRule};
 
@@ -93,5 +94,47 @@ mod tests {
                 }]),
             ]
         );
+    }
+}
+
+/// Real-kernel test support: runs a shell script inside a throwaway
+/// unprivileged user+network namespace (`unshare -rn`), where `nft` and
+/// `iptables` get `CAP_NET_ADMIN` over a private, empty netfilter state.
+/// Nothing touches the host's firewall and no root is needed — but not
+/// every environment allows unprivileged user namespaces (some CI
+/// containers don't), so callers get `None` there and skip, loudly.
+#[cfg(all(test, target_os = "linux"))]
+pub mod netns {
+    use std::process::Command;
+
+    pub fn available() -> bool {
+        Command::new("unshare")
+            .args(["-rn", "true"])
+            .status()
+            .is_ok_and(|s| s.success())
+            && super::nft::NFT_CANDIDATES
+                .iter()
+                .any(|p| std::path::Path::new(p).is_file())
+    }
+
+    /// Runs `script` with `sh -c` in a fresh namespace. Returns stdout, or
+    /// `None` (after printing why) when namespaces or `nft` are
+    /// unavailable. Panics with stderr if the script itself fails.
+    pub fn run(script: &str) -> Option<String> {
+        if !available() {
+            eprintln!("SKIPPED: unprivileged network namespaces or nft unavailable");
+            return None;
+        }
+        let out = Command::new("unshare")
+            .args(["-rn", "sh", "-euc", script])
+            .output()
+            .expect("spawn unshare");
+        assert!(
+            out.status.success(),
+            "netns script failed ({}):\n{}\n--- script ---\n{script}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some(String::from_utf8(out.stdout).unwrap())
     }
 }

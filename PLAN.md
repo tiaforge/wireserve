@@ -502,14 +502,14 @@ doesn't stall or drift:
    `.public_key()` (confirmed real API — wraps `x25519-dalek`
    internally) for WireGuard keypairs, rather than a separate keygen
    dependency, so the two sides can never disagree on key encoding.
-9. **`rustables` is GPLv3-licensed.** The spec names it explicitly (§5,
+9. **(Superseded by #69 — `rustables` removed.)** **`rustables` is GPLv3-licensed.** The spec names it explicitly (§5,
    "netlink, no shelling out to `nft`"), so this is a spec directive, not
    a choice made here — but it's worth flagging plainly: linking it into
    `wireserve-agent` means that binary's distribution terms are
    effectively governed by GPLv3, which may affect the license the
    `wireserve-agent` crate/binary ships under (this doesn't affect
    `wireserve-coordinator`/`wireserve-admin`, which don't depend on it).
-10. **Build-time system requirement**: `rustables` uses `bindgen` against
+10. **(Superseded by #69 — no clang/bindgen anymore.)** **Build-time system requirement**: `rustables` uses `bindgen` against
     Linux kernel netfilter headers, which requires `clang`/`libclang` at
     build time (but no `libnftnl`/`libmnl` runtime linking — it talks to
     netlink directly). Document this as a build prerequisite for anyone
@@ -529,7 +529,7 @@ doesn't stall or drift:
     `subtle::ConstantTimeEq` on the digests) rather than comparing raw
     token bytes directly, to avoid a length-based timing signal when
     candidate and real token lengths differ.
-15. **`rustables` is an optional Cargo feature (`nftables`), default-on.**
+15. **(Superseded by #69 — the feature is gone; the backend is gated on `target_os = "linux"` only.)** **`rustables` is an optional Cargo feature (`nftables`), default-on.**
     Purely so `wireserve-agent`'s non-firewall logic (poll loop, hosts
     writer, IPC, state, WireGuard peer diffing) can be built/tested in an
     environment lacking `rustables`' build-time `libclang` dependency. A
@@ -1160,3 +1160,29 @@ what the library does and does not do on your behalf.
 
     All three suites were run against real kernel WireGuard and nftables
     in Podman after the change, not just the unit suite.
+
+69. **The nftables backend moved from `rustables` (netlink) to the `nft`
+    binary's JSON API, reversing spec §5's "no shelling out to `nft`".**
+    Forced by host-firewall interop (ufw/firewalld/native nftables
+    coexistence, the NetBird-style approach): that needs inserting a rule
+    at the *head* of another tool's chain, and `rustables` 0.8.8 hard-codes
+    `NLM_F_APPEND` on every rule add with its message traits crate-private,
+    so there is no way to insert from outside the crate. It also only
+    partially decodes other tools' rulesets ("Ignoring unsupported
+    attribute" on iptables-nft's `xt` rules), cannot express
+    `ct original proto-dst`, cost a clang/bindgen build dependency and made
+    the agent binary GPLv3 (#9, #10, #15). Mullvad's `nftnl` was checked
+    and rejected: it also hard-codes APPEND, cannot list chains or rules,
+    and links C libraries. Commands are built with the `nftables` crate's
+    typed schema (MIT/Apache); anything read back from the kernel goes
+    through our own tolerant structs, because that crate rejects a whole
+    ruleset over one expression it doesn't model. `nft` is located at fixed
+    absolute paths, never via `PATH` (the agent runs as root), and the
+    daemon refuses to start without it — the firewall is not optional.
+    Each `apply()` is still one atomic transaction (`nft -j -f -`), and
+    "delete the table if present" is the `add table` + `delete table` pair,
+    which also retires the empty-netlink-batch hang (the old `teardown()`
+    special case). Kernel behavior is pinned by tests that feed the real
+    JSON to real `nft` inside an unprivileged `unshare -rn` namespace (no
+    root, nothing touches the host), skipped with a message where user
+    namespaces are unavailable.

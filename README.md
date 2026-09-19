@@ -282,22 +282,18 @@ anywhere that can reach it):
 
 ## Build prerequisites
 
-`wireserve-agent` depends on the `rustables` crate, which generates nftables
-netlink bindings at build time via `bindgen`. Building it requires:
-
-- `clang`/`libclang` (e.g. `apt install clang libclang-dev` on Debian/Ubuntu)
-- Linux kernel headers providing `linux/netfilter/nf_tables.h` (present by
-  default on most distros; `linux-libc-dev` on Debian/Ubuntu if missing)
-
-No `libnftnl`/`libmnl` runtime linking is required — `rustables` talks to
-netlink directly.
-
 ```sh
 cargo build --workspace
 ```
 
-`wireserve-coordinator` and `wireserve-admin` have no special system
-dependencies beyond a C toolchain (for `rusqlite`'s bundled SQLite).
+No special system dependencies beyond a C toolchain (for `rusqlite`'s
+bundled SQLite in the coordinator).
+
+At **runtime**, `wireserve-agent` needs the `nft` binary (the `nftables`
+package on Debian/Ubuntu/Fedora/Arch) at `/usr/sbin/nft`, `/sbin/nft`,
+`/usr/bin/nft` or `/bin/nft` — it manages its firewall through nft's JSON
+API and refuses to start without it. The container image already includes
+it.
 
 ## What each machine needs open and configured
 
@@ -395,8 +391,7 @@ one of these compiled-in defaults.
 
 Both Dockerfiles use build cache mounts for the cargo registry and the
 target directory, shared between the two images. The first build is a cold
-compile of the whole dependency graph, including bindgen against the
-kernel netfilter headers for the agent; every build after that is
+compile of the whole dependency graph; every build after that is
 incremental, even though `COPY . .` invalidates its layer on any source
 change.
 

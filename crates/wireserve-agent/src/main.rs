@@ -211,9 +211,9 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
     let listen_port = state.listen_port.unwrap_or(51820);
     let private_key = state.private_key.clone().unwrap_or_default();
 
-    #[cfg(all(feature = "nftables", target_os = "linux"))]
-    let mut fw = firewall::nftables::NftablesBackend::new(ifname.clone());
-    #[cfg(not(all(feature = "nftables", target_os = "linux")))]
+    #[cfg(target_os = "linux")]
+    let mut fw = firewall::nftables::NftablesBackend::new(ifname.clone())?;
+    #[cfg(not(target_os = "linux"))]
     let mut fw = NoopFirewall;
 
     // Spec §5: teardown-then-deny-all must run before the first successful
@@ -450,13 +450,13 @@ fn print_response(resp: wireserve_agent::ipc::IpcResponse) {
     }
 }
 
-/// Used only when the real nftables backend isn't compiled in (see
-/// Cargo.toml's `nftables` feature) — never a supported production
-/// configuration, just keeps `daemon` linkable in that configuration.
-#[cfg(not(all(feature = "nftables", target_os = "linux")))]
+/// Used only on non-Linux targets, where there is no nftables backend —
+/// never a supported production configuration, just keeps `daemon`
+/// linkable there.
+#[cfg(not(target_os = "linux"))]
 struct NoopFirewall;
 
-#[cfg(not(all(feature = "nftables", target_os = "linux")))]
+#[cfg(not(target_os = "linux"))]
 impl FirewallBackend for NoopFirewall {
     type Error = std::convert::Infallible;
     fn apply(&mut self, _rules: &[wireserve_types::ServiceRule]) -> Result<(), Self::Error> {

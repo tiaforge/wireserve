@@ -32,9 +32,8 @@ COPY . .
 # The two cache mounts below are what keep a rebuild from recompiling the
 # whole dependency graph every time. `COPY . .` is invalidated by any
 # source change, so without them each build starts cargo from nothing —
-# several minutes of rustls, tokio, rusqlite's bundled SQLite and (for the
-# agent) bindgen against the kernel headers, every single time, for a
-# one-line edit. The caches persist across builds AND are shared between
+# several minutes of rustls, tokio and rusqlite's bundled SQLite, every
+# single time, for a one-line edit. The caches persist across builds AND are shared between
 # the two images, which otherwise compile the common dependencies twice.
 #
 # A cache mount is not part of the image layer, so /build/target does not

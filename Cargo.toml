@@ -32,6 +32,6 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 rusqlite_migration = "2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "rustls-native-certs", "blocking"] }
 defguard_wireguard_rs = "0.12"
-rustables = "0.8"
+nftables = { version = "0.6", default-features = false }
 base64 = "0.23"
 rpassword = "7"

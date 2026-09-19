@@ -15,7 +15,7 @@
 #     wireserve-agent daemon
 #
 # Never --privileged (spec §8) — CAP_NET_ADMIN + /dev/net/tun is the
-# whole capability set this needs for WireGuard and nftables netlink
+# whole capability set this needs for WireGuard and nftables
 # operations.
 #
 # --network host is REQUIRED for a real node (security review F5): the
@@ -44,17 +44,13 @@
 
 # ---- build stage ----
 FROM rust:1-slim-bookworm AS builder
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    clang libclang-dev pkg-config \
-    && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY . .
 # The two cache mounts below are what keep a rebuild from recompiling the
 # whole dependency graph every time. `COPY . .` is invalidated by any
 # source change, so without them each build starts cargo from nothing —
-# several minutes of rustls, tokio, rusqlite's bundled SQLite and (for the
-# agent) bindgen against the kernel headers, every single time, for a
-# one-line edit. The caches persist across builds AND are shared between
+# several minutes of rustls, tokio and rusqlite's bundled SQLite, every
+# single time, for a one-line edit. The caches persist across builds AND are shared between
 # the two images, which otherwise compile the common dependencies twice.
 #
 # A cache mount is not part of the image layer, so /build/target does not
@@ -72,7 +68,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # ---- runtime stage ----
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
+    ca-certificates nftables \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /out/wireserve-agent /usr/local/bin/wireserve-agent
 
