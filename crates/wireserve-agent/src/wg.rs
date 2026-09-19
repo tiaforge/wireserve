@@ -47,6 +47,36 @@ pub fn clamp_private_key(key: &Key) -> Key {
     Key::new(bytes)
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "invalid interface name {0:?}: use 1-15 characters from A-Z, a-z, 0-9, '_', '.', '-' \
+     (and not \".\" or \"..\")"
+)]
+pub struct InvalidIfname(pub String);
+
+/// Rejects anything but a plain, exact interface name, before the name is
+/// used anywhere. Every firewall rule the agent installs — its own table
+/// and every rule it puts into another tool's chain — is scoped by this
+/// name, so a name that some tool reads as a *pattern* would open more
+/// than the mesh interface: iptables treats a trailing `+` as a wildcard
+/// (`-i wg+` matches every `wg*` interface) and nft accepts `*` wildcards
+/// in `iifname` strings. The kernel itself allows almost any byte except
+/// `/` and whitespace; this is deliberately much narrower. 15 bytes is
+/// `IFNAMSIZ` minus the NUL.
+pub fn validate_ifname(name: &str) -> Result<(), InvalidIfname> {
+    let ok = (1..=15).contains(&name.len())
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(InvalidIfname(name.to_string()))
+    }
+}
+
 /// A WireGuard peer's own `/32` + `/128` `AllowedIPs` — never a shared
 /// subnet block, so every peer only ever routes to itself on this
 /// interface (same non-overlapping-`AllowedIPs` reasoning as spec §9's
@@ -174,6 +204,61 @@ impl WgInterface {
         std::path::Path::new("/sys/class/net").join(ifname).exists()
     }
 
+
+    /// The ownership check `bring_up` depends on, runnable on its own —
+    /// `cmd_daemon` calls it **before touching any firewall state**. The
+    /// firewall rules are keyed on the interface *name*, so running them
+    /// first for a name that belongs to someone else (a wg-quick `wg0`, or
+    /// a typo like `--ifname eth0`) would default-deny that interface —
+    /// cutting off the other tunnel, or SSH — and the host-firewall
+    /// interop would open it through ufw/firewalld, all before `bring_up`
+    /// got the chance to refuse. Passing this means the name is free or
+    /// is this agent's own interface from a previous run.
+    pub fn preflight(&self, private_key_b64: &str) -> Result<(), BringUpError> {
+        if !Self::interface_exists(&self.ifname) {
+            return Ok(());
+        }
+
+        match self.api.read_interface_data() {
+            Ok(host) => {
+                // The kernel always reports a clamped key back (see
+                // `clamp_private_key`); clamp our own candidate too so
+                // an unclamped persisted key (e.g. from a state file
+                // written before this fix) still compares equal to the
+                // same key's clamped, kernel-reported form.
+                let ours = Key::try_from(private_key_b64)
+                    .ok()
+                    .map(|k| clamp_private_key(&k));
+                let matches = match (&host.private_key, &ours) {
+                    (Some(existing), Some(ours)) => existing == ours,
+                    _ => false,
+                };
+                if !matches {
+                    return Err(BringUpError::InterfaceConflict {
+                        ifname: self.ifname.clone(),
+                        reason: "it is a WireGuard interface configured with a different \
+                                 private key, so it belongs to another tunnel"
+                            .to_string(),
+                    });
+                }
+                tracing::info!(
+                    ifname = %self.ifname,
+                    "reusing this agent's own existing WireGuard interface"
+                );
+            }
+            Err(err) => {
+                return Err(BringUpError::InterfaceConflict {
+                    ifname: self.ifname.clone(),
+                    reason: format!(
+                        "an interface with that name exists but its WireGuard \
+                         configuration could not be read ({err})"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Creates the interface and applies this node's own identity. Must be
     /// called once at daemon startup before any peer reconciliation.
     ///
@@ -196,45 +281,9 @@ impl WgInterface {
         ip6: Ipv6Addr,
         listen_port: u16,
     ) -> Result<(), BringUpError> {
-        if Self::interface_exists(&self.ifname) {
-            match self.api.read_interface_data() {
-                Ok(host) => {
-                    // The kernel always reports a clamped key back (see
-                    // `clamp_private_key`); clamp our own candidate too so
-                    // an unclamped persisted key (e.g. from a state file
-                    // written before this fix) still compares equal to the
-                    // same key's clamped, kernel-reported form.
-                    let ours = Key::try_from(private_key_b64)
-                        .ok()
-                        .map(|k| clamp_private_key(&k));
-                    let matches = match (&host.private_key, &ours) {
-                        (Some(existing), Some(ours)) => existing == ours,
-                        _ => false,
-                    };
-                    if !matches {
-                        return Err(BringUpError::InterfaceConflict {
-                            ifname: self.ifname.clone(),
-                            reason: "it is a WireGuard interface configured with a different \
-                                     private key, so it belongs to another tunnel"
-                                .to_string(),
-                        });
-                    }
-                    tracing::info!(
-                        ifname = %self.ifname,
-                        "reusing this agent's own existing WireGuard interface"
-                    );
-                }
-                Err(err) => {
-                    return Err(BringUpError::InterfaceConflict {
-                        ifname: self.ifname.clone(),
-                        reason: format!(
-                            "an interface with that name exists but its WireGuard \
-                             configuration could not be read ({err})"
-                        ),
-                    });
-                }
-            }
-        }
+        // Checked again here even though `cmd_daemon` already ran it:
+        // cheap, and it keeps `bring_up` safe on its own.
+        self.preflight(private_key_b64)?;
 
         self.api.create_interface()?;
         let config = InterfaceConfiguration {
@@ -567,4 +616,33 @@ mod tests {
         assert_eq!(to_configure.len(), 1);
         assert_eq!(to_configure[0].public_key, b);
     }
+
+    // ---- validate_ifname ----
+
+    #[test]
+    fn validate_ifname_accepts_plain_names() {
+        for name in ["wg0", "wireserve0", "wg-mesh.1", "a", "x_y", "abcdefghijklmno"] {
+            assert_eq!(validate_ifname(name), Ok(()), "{name}");
+        }
+    }
+
+    #[test]
+    fn validate_ifname_rejects_anything_a_firewall_could_read_as_a_pattern_or_path() {
+        for name in [
+            "",
+            "abcdefghijklmnop", // 16 bytes: over IFNAMSIZ-1
+            "wg+",              // iptables wildcard
+            "wg*",              // nft wildcard
+            "a b",
+            "a/b",
+            "a\tb",
+            ".",
+            "..",
+            "wg\"0",
+            "wg0\u{e9}",
+        ] {
+            assert!(validate_ifname(name).is_err(), "{name:?} should be rejected");
+        }
+    }
 }
+

@@ -18,6 +18,10 @@
 # appropriate for a test harness like deploy/e2e, where the "node" is
 # the container.)
 #
+# Host firewalls (ufw/iptables/nftables) are opened for the mesh interface
+# from inside the container thanks to Network=host; firewalld can't be
+# reached from here — see the Dockerfile's note.
+#
 # Same caveat as the Dockerfile: the bind-mounted /etc/hosts below is
 # what makes spec §6's <name>.wg entries resolve for processes on the
 # HOST rather than just inside this container — omit it if nothing

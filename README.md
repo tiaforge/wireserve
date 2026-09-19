@@ -387,6 +387,49 @@ python3 -c "import secrets; h=secrets.token_bytes(5).hex(); print(f'fd{h[0:2]}:{
 The coordinator warns at startup if either configured range still matches
 one of these compiled-in defaults.
 
+### Other firewalls on the host
+
+A host firewall filters the mesh interface on its own, next to the agent's
+table: ufw's default deny, firewalld's default zone, or a hand-written
+`nftables.conf` with `policy drop` all block a declared service even though
+the agent allows it (netfilter lets every table drop a packet; an accept in
+one doesn't override a drop in another). So the agent makes them let the
+mesh interface through, the same way NetBird does, and its own table then
+decides what is actually reachable:
+
+- **nftables tables** (native configs, crowdsec, geoip-shell, …): a rule
+  `iifname "wg0" counter accept comment "wireserve:wg0"` at the top of every
+  other table's input filter chain.
+- **iptables** (ufw, Docker hosts, scripts; both nft-backed and legacy):
+  `-A INPUT -i wg0 -m comment --comment "wireserve:wg0" -j ACCEPT` at the top
+  of `INPUT`.
+- **firewalld**: the interface goes into the `trusted` zone for the current
+  boot only (never `--permanent`), plus a small table
+  `inet wireserve-interop` that drops traffic *forwarded* from the mesh
+  interface, because a trusted zone would otherwise let mesh peers route
+  through this host. A zone you bound the interface to yourself is left
+  alone (the agent logs that it did).
+
+All of it is scoped to exactly the mesh interface, and only to traffic
+addressed to this host: nothing is opened on any other interface, and
+nothing is opened for forwarded or outgoing traffic. The agent keeps it in
+place when another tool reloads (`ufw reload`, `firewall-cmd --reload`,
+`nft -f`), usually within a second, and removes all of it on stop or
+`leave`. To see what it added:
+
+```sh
+sudo nft list ruleset | grep wireserve:
+sudo iptables -S INPUT | grep wireserve:
+firewall-cmd --get-zone-of-interface=wg0
+```
+
+`sudo ufw allow in on wg0` or similar manual exceptions are not needed and
+can be removed.
+
+In a container (Docker/Podman with host networking) the same happens on
+the host, except for firewalld, which the container can't reach; the agent
+logs the command to run on the host instead.
+
 ## Building the container images
 
 Both Dockerfiles use build cache mounts for the cargo registry and the

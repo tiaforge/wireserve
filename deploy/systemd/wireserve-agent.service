@@ -14,6 +14,10 @@ Type=simple
 EnvironmentFile=-/etc/wireserve/agent.env
 
 ExecStartPre=/usr/bin/install -d -m 0700 /run/wireserve
+# Legacy iptables serialises through this lock file; it must exist before
+# the sandbox below is set up for ReadWritePaths to grant it (the `+` runs
+# this one step outside the sandbox). Harmless where nothing uses it.
+ExecStartPre=+/bin/sh -c 'test -e /run/xtables.lock || : > /run/xtables.lock'
 ExecStart=/usr/local/bin/wireserve-agent daemon
 Restart=on-failure
 RestartSec=2s
@@ -47,7 +51,8 @@ DeviceAllow=/dev/net/tun rw
 NoNewPrivileges=true
 ProtectHome=true
 PrivateTmp=true
-# Everything read-only except the three paths the agent actually writes,
+# Everything read-only except the paths the agent actually writes (plus
+# /run/xtables.lock, shared with ufw/iptables for host-firewall interop),
 # and the hosts file is granted as a single file rather than the whole of
 # /etc. That is only possible because `fsutil::atomic_write` falls back to
 # an in-place write when the *directory* refuses the temp file: with /etc
@@ -56,7 +61,7 @@ PrivateTmp=true
 # Before that fallback existed this line had to read `/etc`, which made
 # this unit meaningfully looser than the coordinator's for no benefit.
 ProtectSystem=strict
-ReadWritePaths=/var/lib/wireserve /run/wireserve /etc/hosts
+ReadWritePaths=/var/lib/wireserve /run/wireserve /etc/hosts -/run/xtables.lock
 
 [Install]
 WantedBy=multi-user.target

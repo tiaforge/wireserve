@@ -27,6 +27,14 @@
 # the point. (deploy/e2e deliberately runs agents in isolated namespaces
 # because there each container IS the node under test.)
 #
+# Host firewalls: the agent also makes ufw/iptables and other nftables
+# tables on the host let the mesh interface through (see README, "Other
+# firewalls on the host"), which with --network host happens on the host
+# itself — hence `nftables` and `iptables` in the image. firewalld is the
+# exception: it is driven over the host's D-Bus, which the container can't
+# reach, so on a firewalld host the agent logs the one command to run on
+# the host instead.
+#
 # IMPORTANT caveat, not a Dockerfile-solvable problem: the managed
 # /etc/hosts block (spec §6) is only useful to processes that share the
 # same hosts file the agent is writing. Inside a container, "/etc/hosts"
@@ -68,7 +76,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # ---- runtime stage ----
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates nftables \
+    ca-certificates nftables iptables \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /out/wireserve-agent /usr/local/bin/wireserve-agent
 

@@ -5,6 +5,6 @@
 # and should not include these tools.
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    iproute2 wireguard-tools nftables iputils-ping netcat-openbsd \
+    iproute2 wireguard-tools nftables iptables iputils-ping netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 CMD ["sleep", "infinity"]

@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use tokio::sync::{mpsc, Mutex};
 use wireserve_agent::ipc::{client, protocol::IpcRequest, AgentContext};
 use wireserve_agent::state::AgentState;
+use wireserve_agent::firewall::InteropHandle;
 use wireserve_agent::{firewall, paths, poll_loop, register, wg::WgInterface};
 use wireserve_types::{FirewallBackend, Proto};
 
@@ -205,6 +206,7 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
         return Err("not registered — run `wireserve-agent join` first".into());
     }
 
+    wireserve_agent::wg::validate_ifname(&ifname)?;
     let mut wg = WgInterface::new(&ifname)?;
     let ip4: std::net::Ipv4Addr = state.ip4.clone().unwrap_or_default().parse()?;
     let ip6: std::net::Ipv6Addr = state.ip6.clone().unwrap_or_default().parse()?;
@@ -230,9 +232,22 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
     // anyway — but that is a property of WireGuard's own behaviour rather
     // than of the guarantee spec §5 asks for, and it would quietly stop
     // holding if bring-up ever restored a peer set.
-    firewall::startup_sequence(&mut fw).map_err(|e| e.to_string())?;
-
-    wg.bring_up(&private_key, ip4, ip6, listen_port)?;
+    //
+    // The ownership preflight comes before all of it, and the host
+    // firewall interop (other firewalls on the host letting the mesh
+    // interface through to our table) right after our own default-deny —
+    // see `firewall::guarded_bring_up` for why that order, and what is
+    // undone if bring-up fails.
+    let mut interop = firewall::guarded_bring_up(
+        &mut fw,
+        &mut wg,
+        |wg| wg.preflight(&private_key).map_err(Into::into),
+        || start_interop(&ifname),
+        |wg| {
+            wg.bring_up(&private_key, ip4, ip6, listen_port)
+                .map_err(Into::<Box<dyn std::error::Error>>::into)
+        },
+    )?;
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
     // F1 (security review, round 2): exactly ONE in-memory copy of the
@@ -288,7 +303,7 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
         tokio::select! {
             _ = async { tokio::select! { _ = sigterm.recv() => {}, _ = tokio::signal::ctrl_c() => {} } } => {
                 tracing::info!("termination signal received — tearing down");
-                teardown_everything(&mut fw, &mut wg, &hosts_path, &socket_path, &shared_state, &state_path, false).await;
+                teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, &socket_path, &shared_state, &state_path, false).await;
                 break;
             }
             _ = interval.tick() => {
@@ -300,6 +315,9 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
                     firewall: &mut fw,
                 };
                 let result = poll_loop::run_once(&mut ctx, &shared_state).await;
+                // Safety net for host-firewall changes the interop's own
+                // change monitor can't see (legacy iptables, firewalld).
+                interop.tick();
 
                 match result {
                     Ok(_) => {
@@ -333,7 +351,7 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
                              again with a fresh token from `wireserve-admin rejoin` to rejoin)",
                             UNAUTHORIZED_STREAK_TO_TEARDOWN
                         );
-                        teardown_everything(&mut fw, &mut wg, &hosts_path, &socket_path, &shared_state, &state_path, false).await;
+                        teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, &socket_path, &shared_state, &state_path, false).await;
                         break;
                     }
                     Err(e) => tracing::error!(error = %e, "poll cycle failed, will retry next interval"),
@@ -341,7 +359,7 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
             }
             _ = shutdown_rx.recv() => {
                 tracing::info!("leave requested, tearing down");
-                teardown_everything(&mut fw, &mut wg, &hosts_path, &socket_path, &shared_state, &state_path, true).await;
+                teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, &socket_path, &shared_state, &state_path, true).await;
                 break;
             }
         }
@@ -351,15 +369,18 @@ async fn cmd_daemon(poll_interval_secs: u64, ifname: String) -> Result<(), Box<d
 }
 
 /// Shared by both the `leave` IPC path and F9's revoked-node auto-teardown:
-/// removes the managed hosts-file block, the firewall table, the
+/// removes the managed hosts-file block, the host-firewall interop, the
+/// firewall table, the
 /// WireGuard interface, the IPC socket, and resets local state to a clean
 /// default (security review F2 — spec §4.6 says `leave` "tears down
 /// interface, firewall, hosts block," but the original implementation did
 /// only the last two; the socket and lingering secrets in state were also
 /// flagged). Every step best-effort: a failure partway through (e.g. the
 /// interface already gone) must not stop the rest from running.
+#[allow(clippy::too_many_arguments)]
 async fn teardown_everything<F: FirewallBackend>(
     fw: &mut F,
+    interop: &mut impl InteropHandle,
     wg: &mut WgInterface,
     hosts_path: &std::path::Path,
     socket_path: &std::path::Path,
@@ -372,6 +393,10 @@ async fn teardown_everything<F: FirewallBackend>(
     if let Err(e) = wireserve_agent::hosts::remove_block(hosts_path) {
         tracing::warn!(error = %e, "failed to remove managed hosts-file block during teardown");
     }
+    // The host firewall closes back first, then our own table goes: the
+    // interface is never left open to the host firewalls' view while
+    // nothing of ours default-denies it.
+    interop.stop();
     if let Err(e) = fw.teardown() {
         tracing::warn!(error = %e, "failed to tear down firewall rules during teardown");
     }
@@ -448,6 +473,16 @@ fn print_response(resp: wireserve_agent::ipc::IpcResponse) {
             println!("{}", serde_json::to_string_pretty(&view).unwrap_or_default());
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn start_interop(ifname: &str) -> firewall::host_interop::HostInterop {
+    firewall::host_interop::HostInterop::start(ifname)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_interop(_ifname: &str) -> firewall::NoopInterop {
+    firewall::NoopInterop
 }
 
 /// Used only on non-Linux targets, where there is no nftables backend —

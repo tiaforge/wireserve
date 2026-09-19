@@ -1186,3 +1186,65 @@ what the library does and does not do on your behalf.
     JSON to real `nft` inside an unprivileged `unshare -rn` namespace (no
     root, nothing touches the host), skipped with a message where user
     namespaces are unavailable.
+
+70. **Host-firewall interop, NetBird-style.** A host firewall's own
+    base chains drop mesh traffic independently of our table (an accept
+    only ends its own chain; a drop anywhere is final), so declared
+    services were unreachable on ufw/firewalld/native-nftables hosts until
+    an operator added `ufw allow in on wg0` by hand. Tailscale's approach
+    (a jump into iptables `INPUT`) was compared against NetBird's
+    `InterfaceAllower`; the latter was chosen because it also covers
+    native nftables tables and firewalld. What the agent adds, all tagged
+    `wireserve:<ifname>` and all runtime-only: a head-inserted
+    `iifname <if> counter accept` in every foreign input-hook filter chain;
+    `-I INPUT 1 -i <if> … -j ACCEPT` via the real `iptables` binaries for
+    iptables-nft's `filter` table (recognised by its `INPUT` chain name —
+    such tables carry no marker) and for a loaded legacy `filter` table
+    (`/proc/net/ip_tables_names`; this closes a gap NetBird has); for
+    firewalld, the `trusted` zone at runtime **plus a forward guard**
+    (`inet wireserve-interop`, `iifname <if> drop` on the forward hook),
+    because a zone target also accepts forwarded traffic and trusting the
+    interface would otherwise let mesh peers route through the host. An
+    operator's own zone binding (permanent, or runtime to another zone) is
+    never changed. Never done: anything on another interface, anything on
+    forward/output besides the guard's drop, writes into owner-flagged
+    tables or iptables' other tables. Guard before trust, untrust before
+    guard removal, and the executor skips the second step if the first
+    failed; trust is not planned at all when the ruleset can't be read
+    (the guard couldn't be verified). Reconciled by a dedicated thread on
+    `nft -j monitor` events (debounced 500 ms; set/element churn and our
+    own tables ignored) and on every poll tick (legacy iptables, firewalld
+    reloads, a dead monitor). Always on with the nftables backend, no
+    opt-out, per the same decision as before. Everything is logged and
+    swallowed; our own table keeps default-denying regardless.
+
+    Found while designing this, and fixed with it: the WireGuard
+    ownership check ran inside `bring_up`, *after* the firewall was set
+    up, so `--ifname eth0` (or the default `wg0` next to a wg-quick `wg0`)
+    installed `iifname eth0 drop` — an SSH lockout — or cut off the other
+    tunnel's inbound traffic, and the daemon then exited without cleaning
+    up. `firewall::guarded_bring_up` now runs name validation and the
+    ownership preflight before any firewall change, and undoes interop and
+    our table if bring-up fails. `validate_ifname` restricts names to
+    `[A-Za-z0-9_.-]{1,15}` because every rule is keyed on the name and
+    iptables (`+`) and nft (`*`) read some characters as wildcards.
+
+    Out of scope, recorded: on hosts without firewalld, a Docker-published
+    port is reachable from the mesh through FORWARD whether declared or
+    not, since our table only hooks INPUT. Unchanged by this work; closing
+    it needs `ct original proto-dst` matching (possible now that the
+    backend speaks nft JSON, see #69).
+
+    Tests: the planner is pure and carries the contract (every insert is
+    for exactly the configured interface and only in input-hook filter
+    chains, skip rules, iptables-vs-nft routing, legacy, idempotency and
+    settling, stale/duplicate/misshapen tags, reload recovery, firewalld
+    operator choices, guard ordering, exact removal), run against
+    fixtures produced by real nft/iptables-nft. Mutation checks were used
+    to confirm the tests fail when the planner is broken (one gap — a
+    duplicate *correct* rule — was found that way and covered). Real-kernel
+    tests run inside `unshare -rn` without root: nft/iptables argv and JSON
+    accepted as written, read back as the planner expects, and the full
+    runtime (monitor, debounce, tick, stop) restoring rules after external
+    reloads — this last one re-execs the test binary inside the namespace,
+    with firewalld disabled because its D-Bus is not namespace-scoped.

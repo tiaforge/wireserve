@@ -8,6 +8,8 @@
 pub mod nft;
 #[cfg(target_os = "linux")]
 pub mod nftables;
+#[cfg(target_os = "linux")]
+pub mod host_interop;
 
 use wireserve_types::FirewallBackend;
 
@@ -19,6 +21,63 @@ use wireserve_types::FirewallBackend;
 pub fn startup_sequence<B: FirewallBackend>(backend: &mut B) -> Result<(), B::Error> {
     backend.teardown()?;
     backend.apply(&[])
+}
+
+/// The running host-firewall interop, as the daemon sees it.
+pub trait InteropHandle {
+    /// Poll-tick safety net: reconcile now.
+    fn tick(&self);
+    /// Remove everything the interop added. Idempotent.
+    fn stop(&mut self);
+}
+
+/// Stand-in where there is no host-firewall interop (non-Linux).
+pub struct NoopInterop;
+
+impl InteropHandle for NoopInterop {
+    fn tick(&self) {}
+    fn stop(&mut self) {}
+}
+
+/// The daemon's bring-up, in the only order that is safe:
+///
+/// 1. `preflight` — the interface name is ours to use (free, or this
+///    agent's own interface from a previous run). Runs **before any
+///    firewall change**: every rule below is keyed on the interface name,
+///    so running them for a name someone else owns (a wg-quick `wg0`, a
+///    typo such as `eth0`) would default-deny that interface — cutting off
+///    the other tunnel, or SSH — and open it through ufw/firewalld.
+/// 2. our own table: teardown, then deny-all (spec §5);
+/// 3. the host-firewall interop, now that our default-deny is in place;
+/// 4. `bring_up` — the interface itself, last.
+///
+/// If `bring_up` fails, steps 3 and 2 are undone (in that order) before
+/// the error is returned, so a daemon that never came up leaves nothing
+/// behind for an interface nobody manages.
+pub fn guarded_bring_up<B, W, I, E>(
+    backend: &mut B,
+    wg: &mut W,
+    preflight: impl FnOnce(&W) -> Result<(), E>,
+    start_interop: impl FnOnce() -> I,
+    bring_up: impl FnOnce(&mut W) -> Result<(), E>,
+) -> Result<I, E>
+where
+    B: FirewallBackend,
+    B::Error: std::fmt::Display,
+    I: InteropHandle,
+    E: From<B::Error>,
+{
+    preflight(wg)?;
+    startup_sequence(backend)?;
+    let mut interop = start_interop();
+    if let Err(e) = bring_up(wg) {
+        interop.stop();
+        if let Err(te) = backend.teardown() {
+            tracing::warn!(error = %te, "failed to remove firewall rules after a failed bring-up");
+        }
+        return Err(e);
+    }
+    Ok(interop)
 }
 
 #[cfg(test)]
@@ -93,6 +152,99 @@ mod tests {
                     port: 32400
                 }]),
             ]
+        );
+    }
+
+    // ---- guarded_bring_up ----
+
+    use super::{guarded_bring_up, InteropHandle};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    type Log = Rc<RefCell<Vec<&'static str>>>;
+
+    struct LoggingBackend(Log);
+    impl FirewallBackend for LoggingBackend {
+        type Error = super::fake::FakeError;
+        fn apply(&mut self, _rules: &[ServiceRule]) -> Result<(), Self::Error> {
+            self.0.borrow_mut().push("fw.apply");
+            Ok(())
+        }
+        fn teardown(&mut self) -> Result<(), Self::Error> {
+            self.0.borrow_mut().push("fw.teardown");
+            Ok(())
+        }
+    }
+
+    struct LoggingInterop(Log);
+    impl InteropHandle for LoggingInterop {
+        fn tick(&self) {}
+        fn stop(&mut self) {
+            self.0.borrow_mut().push("interop.stop");
+        }
+    }
+
+    #[derive(Debug)]
+    struct Failed;
+    impl From<super::fake::FakeError> for Failed {
+        fn from(_: super::fake::FakeError) -> Self {
+            Failed
+        }
+    }
+
+    fn run(preflight_ok: bool, bring_up_ok: bool) -> (Result<(), ()>, Vec<&'static str>) {
+        let log: Log = Rc::default();
+        let mut fw = LoggingBackend(log.clone());
+        let result = guarded_bring_up(
+            &mut fw,
+            &mut (),
+            |()| {
+                log.borrow_mut().push("preflight");
+                if preflight_ok { Ok(()) } else { Err(Failed) }
+            },
+            || {
+                log.borrow_mut().push("interop.start");
+                LoggingInterop(log.clone())
+            },
+            |()| {
+                log.borrow_mut().push("bring_up");
+                if bring_up_ok { Ok(()) } else { Err(Failed) }
+            },
+        );
+        let result = result.map(|_| ()).map_err(|_| ());
+        let entries = log.borrow().clone();
+        (result, entries)
+    }
+
+    #[test]
+    fn bring_up_runs_in_the_safe_order() {
+        assert_eq!(
+            run(true, true),
+            (Ok(()), vec!["preflight", "fw.teardown", "fw.apply", "interop.start", "bring_up"])
+        );
+    }
+
+    #[test]
+    fn failed_preflight_touches_no_firewall_at_all() {
+        assert_eq!(run(false, true), (Err(()), vec!["preflight"]));
+    }
+
+    #[test]
+    fn failed_bring_up_undoes_interop_then_our_table() {
+        assert_eq!(
+            run(true, false),
+            (
+                Err(()),
+                vec![
+                    "preflight",
+                    "fw.teardown",
+                    "fw.apply",
+                    "interop.start",
+                    "bring_up",
+                    "interop.stop",
+                    "fw.teardown"
+                ]
+            )
         );
     }
 }
