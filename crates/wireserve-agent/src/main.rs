@@ -24,31 +24,44 @@ struct Cli {
     command: Command,
 }
 
+/// Shared by `join` and `install` — the latter does everything the former
+/// does, plus installs the binary and systemd unit around it, so both
+/// take exactly the same bootstrap arguments.
+#[derive(clap::Args)]
+struct JoinArgs {
+    /// Prompted for if omitted and running interactively.
+    coordinator_url: Option<String>,
+    /// The join token, or `-` to read it from stdin. Security review
+    /// S7: a token passed directly on the command line lands in shell
+    /// history and is visible to any local user via `ps` for as long
+    /// as the process is alive — prefer `-` (piped in) or
+    /// `--join-token-file` when that matters.
+    join_token: Option<String>,
+    /// Read the join token from this file instead of the command line
+    /// or stdin (S7) — trailing whitespace/newline is trimmed.
+    #[arg(long, conflicts_with = "join_token")]
+    join_token_file: Option<std::path::PathBuf>,
+    /// The UDP port WireGuard listens on. Without it: this instance's
+    /// previous port on a re-join, otherwise the first free one from
+    /// 51820 up that no other instance on this host has.
+    #[arg(long)]
+    listen_port: Option<u16>,
+    #[arg(long)]
+    endpoint_addr: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// One-time bootstrap: redeem a join token issued by `wireserve-admin
     /// create-node`, generating this node's keypair locally.
-    Join {
-        /// Prompted for if omitted and running interactively.
-        coordinator_url: Option<String>,
-        /// The join token, or `-` to read it from stdin. Security review
-        /// S7: a token passed directly on the command line lands in shell
-        /// history and is visible to any local user via `ps` for as long
-        /// as the process is alive — prefer `-` (piped in) or
-        /// `--join-token-file` when that matters.
-        join_token: Option<String>,
-        /// Read the join token from this file instead of the command line
-        /// or stdin (S7) — trailing whitespace/newline is trimmed.
-        #[arg(long, conflicts_with = "join_token")]
-        join_token_file: Option<std::path::PathBuf>,
-        /// The UDP port WireGuard listens on. Without it: this instance's
-        /// previous port on a re-join, otherwise the first free one from
-        /// 51820 up that no other instance on this host has.
-        #[arg(long)]
-        listen_port: Option<u16>,
-        #[arg(long)]
-        endpoint_addr: Option<String>,
-    },
+    Join(JoinArgs),
+    /// Installs the binary to /usr/local/bin, installs and enables the
+    /// right systemd unit for this instance (plain, or the `@.service`
+    /// template for a named instance), then joins — everything
+    /// `wireserve-admin create-node`'s printed command needs, in one
+    /// step. Needs root, and Linux/systemd (Quadlet/podman deployments
+    /// install by hand, per `deploy/quadlet/`).
+    Install(JoinArgs),
     /// Runs the poll loop and IPC server. This is the long-running daemon.
     Daemon {
         #[arg(long, default_value_t = 20)]
@@ -122,13 +135,8 @@ async fn main() {
     let instance = cli.instance;
 
     let result = match cli.command {
-        Command::Join {
-            coordinator_url,
-            join_token,
-            join_token_file,
-            listen_port,
-            endpoint_addr,
-        } => cmd_join(&instance, coordinator_url, join_token, join_token_file, listen_port, endpoint_addr).await,
+        Command::Join(args) => cmd_join(&instance, args).await,
+        Command::Install(args) => cmd_install(&instance, args).await,
         Command::Daemon {
             poll_interval_secs,
             ifname,
@@ -145,14 +153,8 @@ async fn main() {
     }
 }
 
-async fn cmd_join(
-    instance: &Instance,
-    coordinator_url: Option<String>,
-    join_token: Option<String>,
-    join_token_file: Option<std::path::PathBuf>,
-    listen_port: Option<u16>,
-    endpoint_addr: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn cmd_join(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let JoinArgs { coordinator_url, join_token, join_token_file, listen_port, endpoint_addr } = args;
     // Held across the whole join: a daemon running on this instance would
     // otherwise keep using (and saving) the identity this is replacing.
     let _lock = lock::lock_instance(instance)?;
@@ -187,6 +189,26 @@ async fn cmd_join(
         state.ip4.unwrap_or_default(),
         state.ip6.unwrap_or_default()
     );
+    Ok(())
+}
+
+/// Installs the binary and this instance's systemd unit, then joins via
+/// exactly the same `cmd_join` a plain `wireserve-agent join` runs — the
+/// token prompt and every other bit of that behaviour lives in one place.
+/// Order: root/platform check, then the two installs (both idempotent),
+/// `daemon-reload`, the join itself, then `enable --now`. A failure at
+/// any step after the installs leaves them in place, so re-running
+/// `install` picks up where it left off.
+async fn cmd_install(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn std::error::Error>> {
+    wireserve_agent::install::require_root()?;
+    wireserve_agent::install::install_self()?;
+    let unit = wireserve_agent::install::install_unit(instance)?;
+    wireserve_agent::install::systemctl_daemon_reload()?;
+    cmd_join(instance, args).await?;
+    wireserve_agent::install::systemctl_enable_now(&unit)?;
+    let instance_flag = if instance.is_default() { String::new() } else { format!(" --instance {}", instance.name()) };
+    println!();
+    println!("{unit} is running — `wireserve-agent{instance_flag} list` shows its services and peers");
     Ok(())
 }
 

@@ -40,6 +40,13 @@ enum Command {
         /// coordinator's default (30 minutes). Use 0 for no expiry.
         #[arg(long)]
         ttl: Option<u64>,
+        /// Which agent instance this node will run as on its host —
+        /// only needed when it's an additional instance alongside
+        /// another agent already running there. Never sent to the
+        /// coordinator; it only fills in `--instance` on the printed
+        /// `wireserve-agent install` command.
+        #[arg(long)]
+        instance: Option<String>,
     },
     /// Revoke a node — its bearer token stops working on its very next
     /// poll, and its services are removed (spec §4.4).
@@ -51,6 +58,10 @@ enum Command {
         /// coordinator's default (30 minutes). Use 0 for no expiry.
         #[arg(long)]
         ttl: Option<u64>,
+        /// Same as `create-node --instance` — fills in `--instance` on
+        /// the printed `wireserve-agent install` command.
+        #[arg(long)]
+        instance: Option<String>,
     },
     /// Permanently delete a node record and free its name. Refused while
     /// the node is still active — revoke it first.
@@ -130,15 +141,19 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     } = cli;
 
     match command {
-        Command::CreateNode { name, kind, ttl } => {
+        Command::CreateNode { name, kind, ttl, instance } => {
             check_name(&name)?;
+            check_instance(instance.as_deref())?;
             let kind: NodeKind = kind.parse()?;
             let client = build_client(&coordinator_url, &admin_token)?;
             let resp = wireserve_admin::cmd_create_node(&client, &name, kind, ttl)?;
             println!("node '{}' created — join token: {}", resp.name, resp.join_token);
             print_expiry(resp.join_token_expires_at);
             if kind == NodeKind::Agent {
-                print_join_instructions(resolve_register_url_best_effort(register_url.as_deref()));
+                print_install_instructions(
+                    resolve_register_url_best_effort(register_url.as_deref()),
+                    instance.as_deref(),
+                );
             }
         }
         Command::Revoke { name } => {
@@ -147,8 +162,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             wireserve_admin::cmd_revoke(&client, &name)?;
             println!("node '{name}' revoked");
         }
-        Command::Rejoin { name, ttl } => {
+        Command::Rejoin { name, ttl, instance } => {
             check_name(&name)?;
+            check_instance(instance.as_deref())?;
             let client = build_client(&coordinator_url, &admin_token)?;
             let resp = wireserve_admin::cmd_rejoin(&client, &name, ttl)?;
             println!(
@@ -161,7 +177,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // static peer's `export-config` covers its own re-registration
             // anyway — an operator rejoining a static node manually is not
             // a case this needs to guess at, so this always assumes agent.
-            print_join_instructions(resolve_register_url_best_effort(register_url.as_deref()));
+            print_install_instructions(
+                resolve_register_url_best_effort(register_url.as_deref()),
+                instance.as_deref(),
+            );
         }
         Command::DeleteNode { name } => {
             check_name(&name)?;
@@ -294,6 +313,30 @@ fn check_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// `--instance` is never sent to the coordinator — it only ends up
+/// interpolated into the printed `wireserve-agent install` command — but
+/// spec §3's fail-fast rule still applies, and a name that broke that
+/// command's syntax would be a worse failure mode than rejecting it here.
+/// Mirrors `wireserve_agent::paths::Instance::new`'s rule (1-32 chars,
+/// alphanumeric/`_`/`-`, starting alphanumeric); wireserve-admin doesn't
+/// depend on the agent crate, so this is a small standalone check rather
+/// than a shared one.
+fn check_instance(instance: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(name) = instance else { return Ok(()) };
+    let ok = (1..=32).contains(&name.len())
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid instance name '{name}': use 1-32 characters from A-Z, a-z, 0-9, '_', '-', \
+             starting with a letter or digit"
+        )
+        .into())
+    }
+}
+
 /// Writes the rendered `.conf` at mode 600 from the moment of creation
 /// (security review S5) — it contains a WireGuard private key, the same
 /// sensitivity spec §7 requires for the agent's own local key material,
@@ -337,27 +380,40 @@ fn resolve_register_url_best_effort(cli_flag: Option<&str>) -> Option<String> {
 }
 
 /// Printed after a fresh join token, right where the operator is looking —
-/// the actual command to run on the new machine, not just the token it
-/// needs. Deliberately does not embed the token itself: a token as a
-/// command-line argument lands in shell history and `ps` output (S7,
-/// `wireserve-agent`'s own doc comment on its `join_token` argument), which
-/// `wireserve-agent join`'s interactive prompt exists to avoid — so the
-/// command printed here has no secret in it, and the token is pasted in
-/// response to that prompt instead.
-fn print_join_instructions(register_url: Option<String>) {
+/// the actual single command to run on the new machine (`wireserve-agent
+/// install`, which installs the binary and systemd unit, then joins),
+/// not just the token it needs. Deliberately does not embed the token
+/// itself: a token as a command-line argument lands in shell history and
+/// `ps` output (S7, `wireserve-agent`'s own doc comment on its
+/// `join_token` argument), which `install`/`join`'s interactive prompt
+/// exists to avoid — so the command printed here has no secret in it,
+/// and the token is pasted in response to that prompt instead.
+fn print_install_instructions(register_url: Option<String>, instance: Option<&str>) {
+    let instance_flag = instance_flag_suffix(instance);
     println!();
     println!("To add this node to the mesh:");
     match register_url {
-        Some(url) => println!("  wireserve-agent join {url}"),
+        Some(url) => println!("  sudo wireserve-agent install {url}{instance_flag}"),
         None => {
-            println!("  wireserve-agent join <this coordinator's public URL>");
+            println!("  sudo wireserve-agent install <this coordinator's public URL>{instance_flag}");
             println!(
                 "  (pass --register-url, or set WIRESERVE_REGISTER_URL, so this command is \
                  filled in for you)"
             );
         }
     }
+    println!("  (needs the wireserve-agent binary already on that machine, and root)");
     println!("  then paste the join token above when prompted");
+}
+
+/// `" --instance <name>"`, or empty for the default instance (implicit
+/// or explicit) — so the printed command only mentions `--instance` when
+/// it actually matters.
+fn instance_flag_suffix(instance: Option<&str>) -> String {
+    match instance {
+        Some(name) if name != "default" => format!(" --instance {name}"),
+        _ => String::new(),
+    }
 }
 
 /// Security review S6: neither client here refuses plain `http://` to a
@@ -411,5 +467,33 @@ mod tests {
         for url in ["http://127.0.0.1:8081", "https://example.com", "not-a-url", "http://"] {
             warn_if_plaintext_to_remote_host(url);
         }
+    }
+
+    #[test]
+    fn check_instance_accepts_none_and_valid_names() {
+        assert!(check_instance(None).is_ok());
+        assert!(check_instance(Some("work")).is_ok());
+        assert!(check_instance(Some("a")).is_ok());
+        assert!(check_instance(Some(&"a".repeat(32))).is_ok());
+    }
+
+    #[test]
+    fn check_instance_rejects_invalid_names() {
+        assert!(check_instance(Some("")).is_err());
+        assert!(check_instance(Some(&"a".repeat(33))).is_err());
+        assert!(check_instance(Some("-work")).is_err(), "must start alphanumeric");
+        assert!(check_instance(Some("has space")).is_err());
+        assert!(check_instance(Some("has/slash")).is_err());
+    }
+
+    #[test]
+    fn instance_flag_suffix_omits_default_and_none() {
+        assert_eq!(instance_flag_suffix(None), "");
+        assert_eq!(instance_flag_suffix(Some("default")), "");
+    }
+
+    #[test]
+    fn instance_flag_suffix_includes_named_instance() {
+        assert_eq!(instance_flag_suffix(Some("work")), " --instance work");
     }
 }

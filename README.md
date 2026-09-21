@@ -128,7 +128,8 @@ node 'homeserver' created — join token: jtk_...
   redeemable until: ...
 
 To add this node to the mesh:
-  wireserve-agent join https://wireserve.example.com
+  sudo wireserve-agent install https://wireserve.example.com
+  (needs the wireserve-agent binary already on that machine, and root)
   then paste the join token above when prompted
 ```
 
@@ -139,7 +140,24 @@ manager is not a live way into the mesh months later. If the window lapses,
 and address. Override with `--ttl <secs>` per token, or coordinator-wide
 with `WIRESERVE_JOIN_TOKEN_TTL_SECS`; `0` disables expiry.
 
-On the node itself:
+On the node itself, with the `wireserve-agent` binary already there (built
+via `cargo build --release --workspace` in a checkout, or copied over from
+wherever you built it):
+
+```sh
+sudo wireserve-agent install https://wireserve.example.com
+```
+
+One command: it installs the binary to `/usr/local/bin`, installs and
+enables the right systemd unit, then joins — prompting for the join token
+(masked, not echoed) exactly like `join` does below, so nothing sensitive
+ever lands in shell history. Running an *additional* agent on a host that
+already runs one? Add `--instance work` (see "Several agents on one host"
+below); `wireserve-admin create-node --instance work` fills that flag into
+the printed command for you. `install` needs Linux/systemd — Quadlet/podman
+deployments install by hand, per `deploy/quadlet/`.
+
+Or, step by step, if you'd rather not have `install` touch systemd for you:
 
 ```sh
 wireserve-agent join
@@ -312,6 +330,7 @@ On a node, talking to the local daemon over a Unix socket:
 
 | Command | What it does |
 | --- | --- |
+| `wireserve-agent install <url> [--instance name]` | installs the binary + systemd unit, then joins — one command, needs root |
 | `wireserve-agent join [url] [token]` | one-time bootstrap, generates the keypair — prompts for either if omitted |
 | `wireserve-agent serve <name> <[public:]target[/tcp\|/udp]>...` | publish a service on its own address |
 | `wireserve-agent unserve <name>` | withdraw one |
@@ -505,10 +524,16 @@ one) by running one agent *instance* per mesh. The plain unit runs the
 default instance; name the others:
 
 ```sh
-sudo wireserve-agent --instance work join          # prompts, as above
-sudo systemctl enable --now wireserve-agent@work   # deploy/systemd/wireserve-agent@.service
+sudo wireserve-agent install https://wireserve.example.com --instance work
 sudo wireserve-agent --instance work serve git 3000
 sudo wireserve-agent --instance work list
+```
+
+Or, by hand:
+
+```sh
+sudo wireserve-agent --instance work join          # prompts, as above
+sudo systemctl enable --now wireserve-agent@work   # deploy/systemd/wireserve-agent@.service
 ```
 
 (`WIRESERVE_INSTANCE=work` works in place of the flag.) Each instance is a
