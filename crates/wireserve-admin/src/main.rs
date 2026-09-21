@@ -193,7 +193,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // Same S2 defense in depth as list-peers: every field is
                 // sanitized, and denied_reason especially — it is the one
                 // field here an operator typed and a database round-tripped.
-                // `<vip or node address>\t<public→target/proto,...>`: where
+                // `<vip or node address>\t<mapping,...>` (in `serve` syntax): where
                 // `<name>.wg` resolves and what it serves there.
                 let address = s.vip4.as_deref().unwrap_or(&s.ip4);
                 let ports = if s.ports.is_empty() {

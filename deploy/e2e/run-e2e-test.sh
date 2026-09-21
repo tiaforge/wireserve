@@ -129,7 +129,7 @@ pass "agent1's wireserve0 has $PEER_COUNT configured peer(s)"
 # would silently stop finding anything the moment someone changes it.
 mesh_ip_of() {
     local from=$1 peer=$2
-    podman exec "$from" wireserve-agent list | python3 -c "
+    podman exec "$from" wireserve-agent list --json | python3 -c "
 import json, sys
 peers = json.load(sys.stdin).get('peers', [])
 match = [p['ip4'] for p in peers if p.get('name') == '$peer']
@@ -172,7 +172,7 @@ if podman exec "$AGENT2" grep -q "testsvc.wg" /etc/hosts; then
 fi
 pass "an unapproved service is withheld from the mesh directory"
 
-podman exec "$AGENT1" wireserve-agent list | grep -q '"pending": true' \
+podman exec "$AGENT1" wireserve-agent list --json | grep -q '"pending": true' \
     || fail "the declaring node does not show its own service as pending"
 pass "the declaring node reports its service as pending approval"
 
@@ -256,14 +256,17 @@ expect "$AGENT1" udp "$UVIP" 53 "udpsvc peer=$AGENT1_MESH_IP"
 pass "the owning node reaches its own services through their addresses"
 
 log "checking wireserve list reflects real data on agent1 (regression: F1)"
-podman exec "$AGENT1" wireserve-agent list | grep -q '"local": true' \
+podman exec "$AGENT1" wireserve-agent list --json | grep -q '"local": true' \
     || fail "wireserve list did not show the locally-declared service — the shared-state bug (F1) may have regressed"
 pass "wireserve list shows real, current data"
+podman exec "$AGENT2" wireserve-agent list | grep -E "^testsvc\.wg +$VIP +80:12345/tcp +node1 +online$" >/dev/null \
+    || fail "the human-readable list does not show testsvc.wg: $(podman exec "$AGENT2" wireserve-agent list)"
+pass "the human-readable list shows the service, its address and mapping"
 
 log "testing revoke propagation"
 podman exec "$COORD" wireserve-admin revoke node1
 sleep 8
-if podman exec "$AGENT2" wireserve-agent list | grep -q '"name": "node1"'; then
+if podman exec "$AGENT2" wireserve-agent list --json | grep -q '"name": "node1"'; then
     fail "node1 is still listed as a peer on agent2 after revoke"
 fi
 pass "node1 dropped out of agent2's peer list after revoke"

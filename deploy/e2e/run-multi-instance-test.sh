@@ -143,7 +143,7 @@ daemon() {  # side instance [args…]
     LAST_PID=$!
 }
 state() { python3 -c "import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])" "$1" "$2"; }
-list() { "$1" --instance "$2" list; }
+list() { "$1" --instance "$2" list --json; }
 field() { python3 -c "import json,sys; print(json.load(sys.stdin)[sys.argv[1]])" "$1"; }
 peer_ip() { python3 -c "
 import json, sys

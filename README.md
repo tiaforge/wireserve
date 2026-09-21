@@ -183,8 +183,8 @@ wireserve-admin list-services --pending
 wireserve-admin approve-service homeserver plex
 ```
 
-Until it is approved, `wireserve-agent list` shows the service with
-`"pending": true`, which is how you tell "waiting on an admin" from "this
+Until it is approved, `wireserve-agent list` shows the service as
+`pending approval`, which is how you tell "waiting on an admin" from "this
 node has not polled yet". The node's own firewall is ready immediately
 either way — it is only firewalling itself, and nothing routes to the
 service's address or resolves `<name>.wg` for it yet.
@@ -209,12 +209,35 @@ hosts file.
 wireserve-agent serve openobserve 80:5080          # openobserve.wg:80 -> :5080
 wireserve-agent serve mydns 53/udp 53/tcp 8080:8000 # several ports, TCP and UDP
 wireserve-agent serve plex 32400                    # a bare port maps to itself
-wireserve-agent list                    # what this node sees right now
+wireserve-agent list                    # what this node sees right now (--json for scripts)
 wireserve-agent unserve plex
 ```
 
 Each `PORT` is `[PUBLIC:]TARGET[/tcp|/udp]` (TCP unless given). Names are
 unique across the whole mesh, first come first served.
+
+`list` reads the daemon's cache of the last poll, no network call:
+
+```
+lego2, instance default on wireserve0
+
+SERVICE         ADDRESS          PORTS                        NODE               STATE
+mydns.wg        10.1.0.4         53/udp 53/tcp 8080:8000/tcp  lego2 (this node)  pending approval
+openobserve.wg  10.1.0.3         80:5080/tcp                  strato             online
+plex.wg         10.1.0.2 (node)  32400/tcp                    strato             offline
+
+PEER    ADDRESS   ENDPOINT              HANDSHAKE
+lego2   10.1.0.1  -                     this node
+strato  10.1.0.2  85.215.231.166:51820  1m ago
+```
+
+A peer's endpoint and handshake are read from the WireGuard interface
+itself: the address it really talks to, which can differ from the one the
+coordinator has on record (an IPv6 candidate this node can't use, say, or
+a peer that roamed).
+
+`(node)` marks a service without an address of its own, which resolves to
+its node: one declared by an agent from before service addresses.
 
 #### Service addresses
 
@@ -292,7 +315,7 @@ On a node, talking to the local daemon over a Unix socket:
 | `wireserve-agent join [url] [token]` | one-time bootstrap, generates the keypair — prompts for either if omitted |
 | `wireserve-agent serve <name> <[public:]target[/tcp\|/udp]>...` | publish a service on its own address |
 | `wireserve-agent unserve <name>` | withdraw one |
-| `wireserve-agent list` | peers, services and rejected declarations |
+| `wireserve-agent list [--json]` | services (name, address, ports, owner, state), peers and anything not published, from the last poll |
 | `wireserve-agent leave` | tear down interface, firewall, hosts block |
 
 Against the admin port (loopback-only by default; run from the coordinator

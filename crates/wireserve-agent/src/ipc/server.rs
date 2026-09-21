@@ -104,7 +104,9 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
     ListView {
         instance: ctx.instance.clone(),
         ifname: ctx.ifname.clone(),
+        node: self_name,
         peers: directory.peers,
+        tunnel: vec![],
         services,
         rejected_services: state.rejected_services.clone(),
     }
@@ -196,8 +198,17 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
             }
         }
         IpcRequest::List => {
-            let state = ctx.state.lock().await;
-            (IpcResponse::List(build_list_view(ctx, &state)), false)
+            let mut view = {
+                let state = ctx.state.lock().await;
+                build_list_view(ctx, &state)
+            };
+            let ifname = ctx.ifname.clone();
+            match tokio::task::spawn_blocking(move || crate::wg::tunnel_peers(&ifname)).await {
+                Ok(Ok(tunnel)) => view.tunnel = tunnel,
+                Ok(Err(e)) => tracing::debug!(error = %e, "could not read the interface for `list`"),
+                Err(e) => tracing::debug!(error = %e, "interface read for `list` panicked"),
+            }
+            (IpcResponse::List(view), false)
         }
         IpcRequest::Leave => (IpcResponse::Ok, true),
     }
@@ -509,7 +520,7 @@ mod tests {
         assert!(matches!(resp, IpcResponse::Ok), "{resp:?}");
         let state = ctx.state.lock().await;
         let d = &state.declared_services[0];
-        assert_eq!(d.port_maps().iter().map(ToString::to_string).collect::<Vec<_>>(), ["53→53/udp", "53→53/tcp", "8080→8000/tcp"]);
+        assert_eq!(d.port_maps().iter().map(ToString::to_string).collect::<Vec<_>>(), ["53/udp", "53/tcp", "8080:8000/tcp"]);
         // What an old coordinator reads.
         assert_eq!((d.port, d.proto), (53, wireserve_types::Proto::Udp));
     }

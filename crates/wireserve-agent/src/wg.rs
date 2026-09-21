@@ -260,6 +260,26 @@ pub fn peers_to_configure<'a>(
         .collect()
 }
 
+/// What the kernel reports for each peer on `ifname`, for `list`. Reads
+/// through its own handle rather than the daemon's `WgInterface`, which
+/// the poll loop owns; reading is harmless alongside it.
+pub fn tunnel_peers(ifname: &str) -> Result<Vec<crate::ipc::protocol::TunnelPeer>, WireguardInterfaceError> {
+    let host = WGApi::<Kernel>::new(ifname.to_string())?.read_interface_data()?;
+    Ok(host
+        .peers
+        .values()
+        .map(|p| crate::ipc::protocol::TunnelPeer {
+            pubkey: p.public_key.to_string(),
+            endpoint: p.endpoint.map(|e| e.to_string()),
+            // The kernel reports "never" as time zero.
+            last_handshake: p
+                .last_handshake
+                .filter(|t| *t > std::time::SystemTime::UNIX_EPOCH)
+                .map(chrono::DateTime::<chrono::Utc>::from),
+        })
+        .collect())
+}
+
 /// See [`WgInterface::classify`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Slot {
@@ -881,6 +901,18 @@ mod tests {
         let mut p = peer("peer", &key_b64(9));
         p.endpoint_addr = Some("10.99.0.1:51820".into());
         wg.reconcile(std::slice::from_ref(&p), &[], &own.public_key().to_string(), false).unwrap();
+
+        // What `list` reads: the configured endpoint, and no handshake
+        // yet — not a handshake in 1970, which is how the kernel says it.
+        let tunnel = tunnel_peers("wgtest").unwrap();
+        assert_eq!(
+            tunnel,
+            [crate::ipc::protocol::TunnelPeer {
+                pubkey: p.pubkey.clone(),
+                endpoint: Some("10.99.0.1:51820".into()),
+                last_handshake: None,
+            }]
+        );
 
         let routes = sh("ip -4 route show table all; ip -6 route show table all");
         assert!(!routes.contains("blackhole"), "{routes}");

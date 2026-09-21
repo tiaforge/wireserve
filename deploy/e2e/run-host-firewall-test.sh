@@ -110,7 +110,7 @@ print(sum(1 for o in d if 'rule' in o and str(o['rule'].get('comment', '')).star
 }
 
 mesh_ip_of() {
-    podman exec "$1" wireserve-agent list | python3 -c "
+    podman exec "$1" wireserve-agent list --json | python3 -c "
 import json, sys
 m = [p['ip4'] for p in json.load(sys.stdin).get('peers', []) if p.get('name') == '$2']
 print(m[0] if m else '')"

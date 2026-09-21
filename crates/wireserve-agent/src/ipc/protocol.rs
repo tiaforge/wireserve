@@ -62,7 +62,18 @@ pub struct ListView {
     pub instance: String,
     #[serde(default)]
     pub ifname: String,
+    /// This node's own name in the mesh, once a poll has told it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// The coordinator's view of every peer, as of the last poll.
     pub peers: Vec<PeerInfo>,
+    /// The kernel's view of the same peers, read when `list` asked: the
+    /// endpoint WireGuard is really using (the coordinator only knows the
+    /// candidates, and this node may have picked another, or the peer may
+    /// have roamed) and the real last handshake. Empty when the interface
+    /// couldn't be read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tunnel: Vec<TunnelPeer>,
     pub services: Vec<LocalServiceView>,
     /// Declarations the coordinator rejected (name collision, spec §4.3)
     /// — surfaced here rather than silently vanishing (security review
@@ -70,6 +81,17 @@ pub struct ListView {
     /// didn't take effect.
     #[serde(default)]
     pub rejected_services: Vec<crate::state::RejectedService>,
+}
+
+/// One peer as the kernel's WireGuard interface reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelPeer {
+    pub pubkey: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// `None` until the first handshake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_handshake: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -74,8 +74,13 @@ enum Command {
     },
     /// Queues a local service withdrawal, applied on the next poll.
     Unserve { name: String },
-    /// Reads locally cached state — no network call.
-    List,
+    /// Shows this node's services, peers and anything not published, from
+    /// the daemon's cache of the last poll — no network call.
+    List {
+        /// Print the cached view as JSON instead, for scripts.
+        #[arg(long)]
+        json: bool,
+    },
     /// Tears down the interface, firewall, and hosts-file block.
     Leave,
 }
@@ -130,7 +135,7 @@ async fn main() {
         } => cmd_daemon(&instance, poll_interval_secs, ifname).await,
         Command::Serve { name, ports } => cmd_serve(&instance, name, &ports).await,
         Command::Unserve { name } => cmd_unserve(&instance, name).await,
-        Command::List => cmd_list(&instance).await,
+        Command::List { json } => cmd_list(&instance, json).await,
         Command::Leave => cmd_leave(&instance).await,
     };
 
@@ -652,11 +657,14 @@ async fn cmd_unserve(instance: &Instance, name: String) -> Result<(), Box<dyn st
     Ok(())
 }
 
-async fn cmd_list(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
+async fn cmd_list(instance: &Instance, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let resp = client::call(&instance.socket_path(), &IpcRequest::List).await?;
     match resp {
-        wireserve_agent::ipc::IpcResponse::List(view) => {
+        wireserve_agent::ipc::IpcResponse::List(view) if json => {
             println!("{}", serde_json::to_string_pretty(&view)?);
+        }
+        wireserve_agent::ipc::IpcResponse::List(view) => {
+            print!("{}", wireserve_agent::ipc::render::render(&view, chrono::Utc::now()));
         }
         other => print_response(other),
     }

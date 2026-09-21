@@ -68,9 +68,15 @@ impl std::str::FromStr for PortMap {
     }
 }
 
+/// The same form `serve` takes, so a mapping can be copied from `list`
+/// straight back into `serve`; an identity mapping is just its port.
 impl fmt::Display for PortMap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}→{}/{}", self.public, self.target, self.proto.as_str())
+        if self.public == self.target {
+            write!(f, "{}/{}", self.public, self.proto.as_str())
+        } else {
+            write!(f, "{}:{}/{}", self.public, self.target, self.proto.as_str())
+        }
     }
 }
 
@@ -145,8 +151,14 @@ mod tests {
     }
 
     #[test]
-    fn display_round_trips_the_meaning() {
-        assert_eq!(pm(80, 5080, Proto::Tcp).to_string(), "80→5080/tcp");
+    fn display_is_the_serve_syntax_and_parses_back() {
+        for (map, text) in [
+            (pm(80, 5080, Proto::Tcp), "80:5080/tcp"),
+            (pm(53, 53, Proto::Udp), "53/udp"),
+        ] {
+            assert_eq!(map.to_string(), text);
+            assert_eq!(text.parse::<PortMap>().unwrap(), map);
+        }
     }
 
     #[test]

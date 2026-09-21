@@ -211,7 +211,7 @@ log "waiting for poll cycles and WireGuard handshakes"
 sleep 20
 
 mesh_ip_of() {
-    podman exec "$1" wireserve-agent list | python3 -c "
+    podman exec "$1" wireserve-agent list --json | python3 -c "
 import json, sys
 peers = json.load(sys.stdin).get('peers', [])
 m = [p['ip4'] for p in peers if p.get('name') == '$2']
