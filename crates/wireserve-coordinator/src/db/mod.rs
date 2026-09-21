@@ -94,6 +94,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0004_endpoint_cleared.sql")),
         M::up(include_str!("../../migrations/0005_dual_stack_endpoints.sql")),
         M::up(include_str!("../../migrations/0006_service_vips.sql")),
+        M::up(include_str!("../../migrations/0007_lan_addr.sql")),
     ])
 }
 

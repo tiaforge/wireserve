@@ -1477,3 +1477,87 @@ what the library does and does not do on your behalf.
     declarations and only the destination address from the directory —
     and an address missing for a declared service falls back to opening
     its target ports directly, as before addresses existed.
+
+## M21 — NAT-hairpin fix via LAN-address candidates
+
+85. **A second endpoint candidate: this node's own LAN address.** Two
+    nodes behind the same router each used to learn only their WAN
+    endpoint — the coordinator's observed address plus the node's own
+    declared listen port — which only reaches the other if the router
+    supports NAT hairpin/loopback, and plenty don't. Now every agent
+    also enumerates its own private-range (RFC1918) IPv4 interfaces
+    (`wg::local_lan_ifaces`, a `getifaddrs` walk skipping the mesh
+    interface itself and anything that looks virtual — `docker`, `veth`,
+    `tun`, `wg`, …) and reports the first one found as `lan_addr` on
+    every register/poll, same singular, on-by-default pattern as
+    `endpoint_addr_v4`/`_v6`. IPv4 only for v1 — real hairpin is an IPv4
+    NAT problem. A receiving node prefers a peer's `lan_addr` over every
+    WAN candidate, operator override included, whenever it falls inside
+    one of its own local subnets (`wg::is_on_own_lan`) — a direct,
+    router-free path is strictly better whenever it is actually offered.
+    No coordinator-side negotiation exists or is needed: WireGuard's
+    handshake is authenticated, so if one side successfully dials a
+    peer's LAN address, that peer's kernel self-corrects its own view of
+    the endpoint via ordinary roaming even if its own agent still thinks
+    the far side is at its WAN address.
+
+86. **Subnet collisions make a match a hint, not a fact, so the fallback
+    had to be real from the start.** `192.168.1.0/24` is the single most
+    common home-router default there is; two completely unrelated sites
+    can both claim it, and blindly trusting a match would point a node
+    at an address that is not its peer at all, wedging that connection
+    forever with no recovery. `wg::resolve_lan_candidate` treats a match
+    as an optimistic attempt, verified by an actual handshake within a
+    60-second grace window (`LAN_GRACE_WINDOW` — long enough for a
+    couple of `PersistentKeepalive`-triggered attempts): confirmed, it
+    stays on the LAN candidate and resets backoff; not confirmed by the
+    end of the window, it falls back to the WAN candidate and schedules
+    a retry after an exponential backoff (`LAN_RETRY_BACKOFF_INITIAL` 2
+    minutes, doubling to a `LAN_RETRY_BACKOFF_MAX` of 30 minutes) — so a
+    persistent false positive costs one brief, infrequent probe rather
+    than either permanent failure or hot flapping. A peer reporting a
+    different `lan_addr` than last seen (it roamed networks) resets to a
+    fresh optimistic attempt rather than inheriting its old failure
+    history.
+
+87. **Stays on the same pure/stateful split the rest of `wg.rs` already
+    uses.** `local_lan_ifaces` is the one impure piece (the actual
+    syscall); `pick_lan_address`, `own_lan_subnets`, `is_on_own_lan` and
+    `resolve_lan_candidate` are pure functions over its result, unit
+    tested directly including the deliberate subnet-collision false
+    positive. The per-peer state itself (`LanEndpointTracker`, keyed by
+    pubkey, in-memory only — never persisted, never compared across an
+    agent restart) lives beside `WgInterface` in the poll loop, not
+    inside it, with the same lifetime as its own `applied`/`routed`.
+    `choose_peer_endpoint` gained a third parameter for the resolved
+    candidate; the LAN candidate is a bare address, so it borrows its
+    port from whichever WAN endpoint field is present rather than
+    carrying its own. `desired_peers`/`WgInterface::reconcile` gained a
+    `lan_candidates` map, resolved once per poll cycle in
+    `poll_loop::run_once` from `tunnel_peers`' kernel handshake read (the
+    same one `list` already uses) before reconciliation — proven end to
+    end with a kernel-gated test asserting `reconcile` actually
+    configures a peer's LAN address, not `endpoint_addr`.
+
+88. **Coordinator side is the same shape as `endpoint_addr_v4`/`_v6`:**
+    migration `0007_lan_addr.sql` adds `nodes.lan_addr`; set directly (not
+    coalesced) on `/register`, coalesced on `/poll` so a cycle that can't
+    read its own interfaces doesn't erase a previously-known-good value;
+    validated server-side (`is_valid_lan_addr` — a bare IPv4 literal that
+    is actually RFC1918) as defense in depth against a malicious or buggy
+    agent claiming a public address as its "LAN" address; and folded into
+    `clear_endpoint`'s full-clear (`None` family) branch. `list-peers`
+    gained a `lan=` column for parity with `endpoint=`/`v4=`/`v6=`.
+    `export-config`/static peers are untouched on purpose: a `kind=static`
+    node has no agent and can never run the roaming/staleness logic this
+    feature depends on, so its exported config stays WAN-only.
+
+89. **`run-nat-test.sh`'s shared-NAT scenario is the direct regression
+    test.** `agent2` and `agent3` already sit behind one simulated router
+    with real site-local addresses captured as `AGENT2_LAN`/`AGENT3_LAN`;
+    its hairpin check was previously `optional` with a note that v1 had
+    no fix for it. Now required, plus a direct assertion that each
+    agent's configured `wg show ... endpoints` is the *other's LAN
+    address*, not the shared router's WAN address — proving the router
+    was bypassed entirely, not merely that connectivity happened to work
+    because this particular test router supports hairpin.

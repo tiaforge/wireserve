@@ -102,11 +102,13 @@ pub fn build_poll_request(
     declared: &[ServiceDecl],
     endpoint_addr: Option<String>,
     dual: &crate::probe::DualProbeResult,
+    lan_addr: Option<String>,
 ) -> PollRequest {
     PollRequest {
         endpoint_addr,
         endpoint_addr_v4: dual.v4.clone(),
         endpoint_addr_v6: dual.v6.clone(),
+        lan_addr,
         services: declared.to_vec(),
     }
 }
@@ -280,6 +282,10 @@ pub struct PollContext<'a, F: FirewallBackend> {
     pub state_path: &'a Path,
     pub wg: &'a mut WgInterface,
     pub firewall: &'a mut F,
+    /// NAT-hairpin fix (PLAN.md decisions log #85): per-peer LAN-vs-WAN
+    /// state across poll cycles. Lives exactly as long as `wg` — see
+    /// `crate::wg::LanEndpointTracker`.
+    pub lan_tracker: &'a mut crate::wg::LanEndpointTracker,
 }
 
 /// Runs exactly one poll cycle against the daemon's single shared `state`,
@@ -321,8 +327,18 @@ where
     let dual = crate::probe::probe_both(ctx.coordinator_url, listen_port, crate::probe::PROBE_TIMEOUT).await;
     let prefer_ipv6 = dual.v6.is_some();
 
+    // NAT-hairpin fix (PLAN.md decisions log #85): this node's own LAN
+    // interfaces, read once per cycle and reused for both the self-report
+    // below and the peer-side subnet-containment check in step 2.
+    // Best-effort — a probe failure here means "advertise nothing and
+    // treat every peer as plain-WAN this cycle", never a failed poll.
+    let ifname = ctx.wg.ifname().to_string();
+    let lan_ifaces = crate::wg::local_lan_ifaces(&ifname).unwrap_or_default();
+    let own_lan_subnets = crate::wg::own_lan_subnets(&lan_ifaces);
+    let lan_addr = crate::wg::pick_lan_address(&lan_ifaces).map(|ip| ip.to_string());
+
     // 1. send
-    let req = build_poll_request(&declared, endpoint_addr, &dual);
+    let req = build_poll_request(&declared, endpoint_addr, &dual, lan_addr);
     let url = format!("{}/poll", ctx.coordinator_url.trim_end_matches('/'));
     let resp = ctx
         .client
@@ -403,8 +419,40 @@ where
     let failures = tokio::task::block_in_place(|| {
         let mut failures = Vec::new();
 
+        // NAT-hairpin fix (PLAN.md decisions log #85): resolve each
+        // peer's LAN-vs-WAN candidate before reconciling. `tunnel_peers`
+        // is the same netlink read `list` already uses for
+        // `last_handshake`; reading it again here (rather than
+        // threading `list`'s own read through) keeps this step
+        // independent of whether anything is watching `list` right now.
+        let now = std::time::Instant::now();
+        let handshakes: std::collections::HashMap<String, Option<chrono::DateTime<chrono::Utc>>> =
+            crate::wg::tunnel_peers(&ifname)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| (t.pubkey, t.last_handshake))
+                .collect();
+        let lan_candidates: std::collections::HashMap<String, crate::wg::LanCandidate> = directory
+            .peers
+            .iter()
+            .filter(|p| p.pubkey != self_pubkey)
+            .map(|p| {
+                let candidate = ctx.lan_tracker.resolve(
+                    &p.pubkey,
+                    &own_lan_subnets,
+                    p.lan_addr.as_deref(),
+                    handshakes.get(&p.pubkey).copied().flatten(),
+                    now,
+                );
+                (p.pubkey.clone(), candidate)
+            })
+            .collect();
+        ctx.lan_tracker.prune(directory.peers.iter().map(|p| p.pubkey.as_str()));
+
         // 2. reconcile WireGuard peers
-        if let Err(e) = ctx.wg.reconcile(&directory.peers, &directory.services, &self_pubkey, prefer_ipv6) {
+        if let Err(e) =
+            ctx.wg.reconcile(&directory.peers, &directory.services, &self_pubkey, prefer_ipv6, &lan_candidates)
+        {
             failures.push(PollError::Wg(e));
         }
 
@@ -451,11 +499,12 @@ mod tests {
             v4: Some("203.0.113.5:51820".into()),
             v6: None,
         };
-        let req = build_poll_request(&declared, Some("host:51820".into()), &dual);
+        let req = build_poll_request(&declared, Some("host:51820".into()), &dual, Some("192.168.1.5".into()));
         assert_eq!(req.services.len(), 1);
         assert_eq!(req.endpoint_addr.as_deref(), Some("host:51820"));
         assert_eq!(req.endpoint_addr_v4.as_deref(), Some("203.0.113.5:51820"));
         assert!(req.endpoint_addr_v6.is_none());
+        assert_eq!(req.lan_addr.as_deref(), Some("192.168.1.5"));
     }
 
     const NODE: Ipv4Addr = Ipv4Addr::new(10, 9, 0, 1);

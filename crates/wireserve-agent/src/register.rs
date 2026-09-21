@@ -111,6 +111,10 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
         endpoint_addr: params.endpoint_addr.clone(),
         endpoint_addr_v4: dual.v4,
         endpoint_addr_v6: dual.v6,
+        lan_addr: crate::wg::pick_lan_address(
+            &crate::wg::local_lan_ifaces(params.ifname.as_deref().unwrap_or("")).unwrap_or_default(),
+        )
+        .map(|ip| ip.to_string()),
     };
 
     let resp = client.post(&url).json(&req).send().await?;
@@ -158,6 +162,7 @@ mod tests {
             endpoint_addr: None,
             endpoint_addr_v4: None,
             endpoint_addr_v6: None,
+            lan_addr: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains(&private_key.to_string()));

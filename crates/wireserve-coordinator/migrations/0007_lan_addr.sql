@@ -1,0 +1,15 @@
+-- NAT-hairpin fix via LAN-address candidates (PLAN.md M21, decisions log
+-- #85): each node's own private-LAN address, picked by the agent
+-- (getifaddrs walk, first non-virtual RFC1918 interface) and reported on
+-- every register/poll like endpoint_addr_v4/_v6 -- self-reported, never
+-- derived by the coordinator, and coalesced rather than overwritten by a
+-- poll that omits it, so one cycle that can't read its own interfaces
+-- doesn't erase a previously-known-good value.
+--
+-- No family-scoped considerations (v1 is IPv4-only) and no dedicated
+-- "_cleared" flag, same reasoning as endpoint_addr_v4/_v6's own migration:
+-- nothing coordinator-side ever re-derives this passively, so a plain NULL
+-- already is the complete "stop advertising it" action. clear_endpoint's
+-- family-less (None) form now also clears it, for an operator who wants to
+-- reset everything this node has self-reported about how to reach it.
+ALTER TABLE nodes ADD COLUMN lan_addr TEXT;

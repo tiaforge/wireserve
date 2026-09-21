@@ -330,20 +330,34 @@ check_pair "$AGENT1" "$SVC2" "port-forwarded node reaches back into the NAT-ed n
 check_pair "$AGENT3" "$SVC1" "the second NAT-ed node also reaches the port-forwarded node" required
 
 # Both of these sit behind the SAME router, which is two machines in one
-# house — an entirely ordinary homelab layout. Each knows the other only
-# by their shared router's external address, so reaching it means sending
-# a packet out to your own NAT's public side and expecting it back in.
-# That is NAT hairpinning, and plenty of routers do not do it.
+# house — an entirely ordinary homelab layout. Reaching each other via
+# their shared router's external address needs NAT hairpin/loopback,
+# which plenty of routers do not support — so each agent also advertises
+# its own site-local address (PLAN.md decisions log #85, "M21") and
+# prefers a peer's when it falls inside one of its own local subnets.
+# That is a direct LAN path that never involves the router at all, so
+# this must work regardless of whether this test's router happens to
+# support hairpin.
 log "the two nodes behind a shared NAT, which is the interesting case"
-if check_pair "$AGENT2" "$SVC3" "node behind a shared NAT reaches its neighbour" optional \
-   && check_pair "$AGENT3" "$SVC2" "and the reverse" optional; then
-    note "this router hairpins. Not every router does, so do not rely on it."
+check_pair "$AGENT2" "$SVC3" "node behind a shared NAT reaches its neighbour via the LAN path" required
+check_pair "$AGENT3" "$SVC2" "and the reverse" required
+
+log "confirming the LAN path was actually used, not a hairpin-capable router"
+# The direct regression test for the feature: the configured endpoint
+# must be the peer's site-local address, never the shared router's WAN
+# address — proving the router was bypassed entirely, not merely that
+# connectivity happened to work because this particular router hairpins.
+AGENT2_ENDPOINTS=$(in_netns "$AGENT2" wg show wireserve0 endpoints)
+AGENT3_ENDPOINTS=$(in_netns "$AGENT3" wg show wireserve0 endpoints)
+if echo "$AGENT2_ENDPOINTS" | grep -q "$AGENT3_LAN:$WG_PORT"; then
+    pass "agent2 reaches agent3 at its LAN address ($AGENT3_LAN:$WG_PORT), not the router's WAN address"
 else
-    note "Two nodes behind ONE router cannot reach each other here: each knows the"
-    note "other only by their shared external address, and reaching that from inside"
-    note "needs NAT hairpinning, which this router (and many real ones) will not do."
-    note "They both still reach everything outside that NAT normally. v1 has no STUN"
-    note "or local-endpoint discovery to fix this — spec lists both as deferred."
+    fail "agent2's configured endpoint for agent3 is not its LAN address — got: $AGENT2_ENDPOINTS"
+fi
+if echo "$AGENT3_ENDPOINTS" | grep -q "$AGENT2_LAN:$WG_PORT"; then
+    pass "agent3 reaches agent2 at its LAN address ($AGENT2_LAN:$WG_PORT), not the router's WAN address"
+else
+    fail "agent3's configured endpoint for agent2 is not its LAN address — got: $AGENT3_ENDPOINTS"
 fi
 
 log "default-deny still holds over a NAT-ed tunnel"

@@ -110,6 +110,19 @@ fn is_valid_hostname_label(label: &str) -> bool {
         .all(|&b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
+/// Validates a `lan_addr` value: a bare IPv4 literal — no port, unlike
+/// `endpoint_addr` (it always borrows a port from whichever WAN candidate
+/// a peer has, see `wireserve-agent`'s `wg::choose_peer_endpoint`) — that
+/// is actually inside RFC1918 private space. Server-side defense in
+/// depth: `wireserve-agent`'s own `wg::pick_lan_address` never emits
+/// anything else, but a malicious or buggy agent must not get a public
+/// address redistributed to every peer as a "same-LAN" candidate on
+/// client-side trust alone.
+#[must_use]
+pub fn is_valid_lan_addr(s: &str) -> bool {
+    s.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_private())
+}
+
 /// Whether `url` is plain `http://` to a host that is not loopback — i.e.
 /// a bearer/join/admin token sent to it would cross a network in clear
 /// (security review S6; spec §7 assumes TLS termination in front of the
@@ -343,5 +356,28 @@ mod tests {
     fn rejects_endpoint_addr_with_invalid_host_characters() {
         assert!(!is_valid_endpoint_addr("host with spaces:51820"));
         assert!(!is_valid_endpoint_addr("host/slash:51820"));
+    }
+
+    // ---- is_valid_lan_addr ----
+
+    #[test]
+    fn accepts_private_range_lan_addrs() {
+        for s in ["10.0.0.5", "172.16.4.9", "192.168.1.50"] {
+            assert!(is_valid_lan_addr(s), "expected {s:?} to be valid");
+        }
+    }
+
+    #[test]
+    fn rejects_non_private_or_malformed_lan_addrs() {
+        for s in [
+            "203.0.113.5",       // public
+            "127.0.0.1",         // loopback
+            "::1",                // IPv6
+            "192.168.1.50:51820", // host:port form, not a bare address
+            "",
+            "192.168.1.50\nAllowedIPs = 0.0.0.0/0",
+        ] {
+            assert!(!is_valid_lan_addr(s), "expected {s:?} to be rejected");
+        }
     }
 }

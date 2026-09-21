@@ -202,6 +202,7 @@ mod tests {
             endpoint_addr: None,
             endpoint_addr_v4: endpoint.map(Into::into),
             endpoint_addr_v6: None,
+            lan_addr: None,
             last_handshake: online.then(chrono::Utc::now),
         }
     }

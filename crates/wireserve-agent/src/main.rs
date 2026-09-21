@@ -345,6 +345,7 @@ async fn cmd_daemon(
     }
 
     let mut wg = WgInterface::new(&ifname)?;
+    let mut lan_tracker = wireserve_agent::wg::LanEndpointTracker::default();
 
     // An agent from before multi-instance support kept its firewall state
     // under fixed names. Nothing creates those any more, so whatever is
@@ -467,6 +468,7 @@ async fn cmd_daemon(
                     state_path: &state_path,
                     wg: &mut wg,
                     firewall: &mut fw,
+                    lan_tracker: &mut lan_tracker,
                 };
                 let result = poll_loop::run_once(&mut ctx, &shared_state).await;
                 // Safety net for host-firewall changes the interop's own

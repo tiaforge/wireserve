@@ -100,6 +100,15 @@ pub struct RegisterRequest {
     pub endpoint_addr_v4: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub endpoint_addr_v6: Option<String>,
+    /// This node's own single "best" private-LAN address (bare IPv4, no
+    /// port — RFC1918 only, v1), picked by `wireserve-agent`'s
+    /// `wg::pick_lan_address` from its own network interfaces. Reported
+    /// by default, same as `endpoint_addr_v4`/`_v6` — not an operator
+    /// opt-in. Lets a peer on the same LAN dial it directly instead of
+    /// round-tripping through a router that may not support NAT
+    /// hairpin/loopback (PLAN.md decisions log #85).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub lan_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +193,10 @@ pub struct PollRequest {
     pub endpoint_addr_v4: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub endpoint_addr_v6: Option<String>,
+    /// See `RegisterRequest::lan_addr`'s doc comment — same active
+    /// self-discovery, re-run every poll cycle.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub lan_addr: Option<String>,
     #[serde(default)]
     pub services: Vec<ServiceDecl>,
 }
@@ -204,6 +217,13 @@ pub struct PeerInfo {
     pub endpoint_addr_v4: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub endpoint_addr_v6: Option<String>,
+    /// This peer's own reported LAN address — see
+    /// `RegisterRequest::lan_addr`. Used by `wg::choose_peer_endpoint`
+    /// only when this node's own local subnets actually contain it; never
+    /// trusted on its own, since unrelated sites commonly share the same
+    /// private ranges (PLAN.md decisions log #85).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub lan_addr: Option<String>,
     /// See PLAN.md decisions log #3: approximated from the coordinator's
     /// own `last_seen` bookkeeping, not a true WireGuard handshake
     /// observation (the coordinator is never itself a WireGuard peer).
@@ -386,6 +406,7 @@ mod tests {
         assert!(req.endpoint_addr.is_none());
         assert!(req.endpoint_addr_v4.is_none());
         assert!(req.endpoint_addr_v6.is_none());
+        assert!(req.lan_addr.is_none());
     }
 
     #[test]
@@ -396,6 +417,7 @@ mod tests {
         assert!(req.endpoint_addr.is_none());
         assert!(req.endpoint_addr_v4.is_none());
         assert!(req.endpoint_addr_v6.is_none());
+        assert!(req.lan_addr.is_none());
     }
 
     #[test]
@@ -467,6 +489,7 @@ mod tests {
                 endpoint_addr: Some("duckdns.example.com:51820".into()),
                 endpoint_addr_v4: Some("203.0.113.5:51820".into()),
                 endpoint_addr_v6: None,
+                lan_addr: None,
                 last_handshake: None,
             }],
             services: vec![ServiceInfo {

@@ -25,6 +25,11 @@ pub struct NodeRow {
     /// `endpoint_addr` above.
     pub endpoint_addr_v4: Option<String>,
     pub endpoint_addr_v6: Option<String>,
+    /// This node's own self-reported private-LAN address (NAT-hairpin
+    /// fix, PLAN.md decisions log #85) — self-reported like `_v4`/`_v6`
+    /// above, never derived by the coordinator, and coalesced rather than
+    /// overwritten on a poll that omits it, for the same reason.
+    pub lan_addr: Option<String>,
     pub listen_port: Option<i64>,
     pub revoked: bool,
     pub last_seen: Option<DateTime<Utc>>,
@@ -45,6 +50,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
         endpoint_cleared: row.get("endpoint_cleared")?,
         endpoint_addr_v4: row.get("endpoint_addr_v4")?,
         endpoint_addr_v6: row.get("endpoint_addr_v6")?,
+        lan_addr: row.get("lan_addr")?,
         listen_port: row.get("listen_port")?,
         revoked: row.get("revoked")?,
         last_seen: last_seen_str.and_then(|s| parse_dt(&s)),
@@ -180,6 +186,8 @@ pub struct Redemption<'a> {
     /// history.
     pub endpoint_addr_v4: Option<&'a str>,
     pub endpoint_addr_v6: Option<&'a str>,
+    /// Same treatment as `endpoint_addr_v4`/`_v6` — see `NodeRow::lan_addr`.
+    pub lan_addr: Option<&'a str>,
     pub bearer_token_hash: &'a str,
 }
 
@@ -194,8 +202,8 @@ pub fn apply_redemption(conn: &Connection, node_id: i64, r: &Redemption<'_>) -> 
         "UPDATE nodes SET pubkey = ?1, ip4 = ?2, ip6 = ?3, listen_port = ?4, \
          endpoint_addr = ?5, bearer_token_hash = ?6, join_token_hash = NULL, \
          join_token_used = 1, revoked = 0, revoked_at = NULL, endpoint_cleared = 0, \
-         endpoint_addr_v4 = ?7, endpoint_addr_v6 = ?8 \
-         WHERE id = ?9",
+         endpoint_addr_v4 = ?7, endpoint_addr_v6 = ?8, lan_addr = ?9 \
+         WHERE id = ?10",
         rusqlite::params![
             r.pubkey,
             r.ip4.to_string(),
@@ -205,6 +213,7 @@ pub fn apply_redemption(conn: &Connection, node_id: i64, r: &Redemption<'_>) -> 
             r.bearer_token_hash,
             r.endpoint_addr_v4,
             r.endpoint_addr_v6,
+            r.lan_addr,
             node_id,
         ],
     )
@@ -244,6 +253,8 @@ pub struct EndpointUpdate<'a> {
     pub reset_cleared: bool,
     pub v4: Option<&'a str>,
     pub v6: Option<&'a str>,
+    /// Same COALESCE treatment as `v4`/`v6` — see `NodeRow::lan_addr`.
+    pub lan: Option<&'a str>,
 }
 
 pub fn update_poll_state(
@@ -255,14 +266,16 @@ pub fn update_poll_state(
         "UPDATE nodes SET last_seen = ?1, endpoint_addr = COALESCE(?2, endpoint_addr), \
          endpoint_cleared = CASE WHEN ?3 THEN 0 ELSE endpoint_cleared END, \
          endpoint_addr_v4 = COALESCE(?4, endpoint_addr_v4), \
-         endpoint_addr_v6 = COALESCE(?5, endpoint_addr_v6) \
-         WHERE id = ?6",
+         endpoint_addr_v6 = COALESCE(?5, endpoint_addr_v6), \
+         lan_addr = COALESCE(?6, lan_addr) \
+         WHERE id = ?7",
         rusqlite::params![
             now_str(),
             update.explicit,
             update.reset_cleared,
             update.v4,
             update.v6,
+            update.lan,
             node_id
         ],
     )?;
@@ -369,9 +382,10 @@ pub fn clear_bearer_token(conn: &Connection, node_id: i64) -> Result<(), DbError
 /// what actually makes the guarantee above true for the *auto-detected*
 /// case, not just the "node reports its own" case the doc comment above
 /// already covered before self-healing existed.
-/// `None` clears everything (the singular override plus both probed
-/// candidates) — today's default and the only behavior that existed
-/// before dual-stack tracking. `Some(family)` clears only that probed
+/// `None` clears everything (the singular override, both probed
+/// candidates, and the self-reported LAN address) — today's default and
+/// the only behavior that existed before dual-stack tracking.
+/// `Some(family)` clears only that probed
 /// candidate, leaving the singular `endpoint_addr` and the other family
 /// untouched — for the narrower case where only one family's advertised
 /// address has gone stale (e.g. this node lost its IPv6 route but its
@@ -396,7 +410,8 @@ pub fn clear_endpoint(
     match family {
         None => conn.execute(
             "UPDATE nodes SET endpoint_addr = NULL, endpoint_cleared = 1, \
-             endpoint_addr_v4 = NULL, endpoint_addr_v6 = NULL WHERE id = ?1",
+             endpoint_addr_v4 = NULL, endpoint_addr_v6 = NULL, lan_addr = NULL \
+             WHERE id = ?1",
             [node_id],
         ),
         Some(EndpointFamily::V4) => conn.execute(
@@ -512,6 +527,7 @@ mod tests {
                 bearer_token_hash: "bearerhash1",
                 endpoint_addr_v4: None,
                 endpoint_addr_v6: None,
+                lan_addr: None,
             },
         )
         .unwrap();
@@ -620,6 +636,7 @@ mod tests {
                 bearer_token_hash: "bearerhash1",
                 endpoint_addr_v4: None,
                 endpoint_addr_v6: None,
+                lan_addr: None,
             },
         )
         .unwrap();
@@ -647,6 +664,7 @@ mod tests {
                 bearer_token_hash: "bearerhash1",
                 endpoint_addr_v4: None,
                 endpoint_addr_v6: None,
+                lan_addr: None,
             },
         )
         .unwrap();
@@ -668,6 +686,7 @@ mod tests {
                 bearer_token_hash: "bearerhash2",
                 endpoint_addr_v4: None,
                 endpoint_addr_v6: None,
+                lan_addr: None,
             },
         )
         .unwrap();
@@ -726,6 +745,7 @@ mod tests {
                 bearer_token_hash: "bearerhash1",
                 endpoint_addr_v4: None,
                 endpoint_addr_v6: None,
+                lan_addr: None,
             },
         )
         .unwrap();
@@ -750,6 +770,7 @@ mod tests {
                 bearer_token_hash: "bearerhash1",
                 endpoint_addr_v4: None,
                 endpoint_addr_v6: None,
+                lan_addr: None,
             },
         )
         .unwrap();
@@ -785,6 +806,7 @@ mod tests {
                 bearer_token_hash: "bearerhash1",
                 endpoint_addr_v4: None,
                 endpoint_addr_v6: None,
+                lan_addr: None,
             },
         )
         .unwrap();
@@ -798,6 +820,7 @@ mod tests {
                 reset_cleared: false,
                 v4: None,
                 v6: None,
+                lan: None,
             },
         )
         .unwrap();
@@ -811,6 +834,7 @@ mod tests {
                 reset_cleared: true,
                 v4: None,
                 v6: None,
+                lan: None,
             },
         )
         .unwrap();
@@ -847,6 +871,7 @@ mod tests {
                 bearer_token_hash: "bearerhash1",
                 endpoint_addr_v4: Some("203.0.113.5:51820"),
                 endpoint_addr_v6: Some("[2001:db8::1]:51820"),
+                lan_addr: None,
             },
         )
         .unwrap();
@@ -880,6 +905,7 @@ mod tests {
                 bearer_token_hash: "bearerhash1",
                 endpoint_addr_v4: Some("203.0.113.5:51820"),
                 endpoint_addr_v6: None,
+                lan_addr: None,
             },
         )
         .unwrap();
@@ -894,6 +920,7 @@ mod tests {
                 reset_cleared: false,
                 v4: None,
                 v6: Some("[2001:db8::1]:51820"),
+                lan: None,
             },
         )
         .unwrap();
@@ -905,6 +932,109 @@ mod tests {
             "an omitted v4 this cycle preserves the earlier one"
         );
         assert_eq!(row.endpoint_addr_v6.as_deref(), Some("[2001:db8::1]:51820"));
+    }
+
+    // ---- NAT-hairpin fix: lan_addr (PLAN.md decisions log #85) ----
+
+    #[tokio::test]
+    async fn apply_redemption_stores_lan_addr() {
+        let db = test_db();
+        let conn = db.conn.lock().await;
+        let id = create_node(&conn, "n1", NodeKind::Agent, "hash1", None).unwrap();
+        apply_redemption(
+            &conn,
+            id,
+            &Redemption {
+                pubkey: "pk1",
+                ip4: "100.90.0.1".parse().unwrap(),
+                ip6: "fd00:90::1".parse().unwrap(),
+                listen_port: Some(51820),
+                endpoint_addr: None,
+                bearer_token_hash: "bearerhash1",
+                endpoint_addr_v4: None,
+                endpoint_addr_v6: None,
+                lan_addr: Some("192.168.1.50"),
+            },
+        )
+        .unwrap();
+
+        let row = find_by_name(&conn, "n1").unwrap().unwrap();
+        assert_eq!(row.lan_addr.as_deref(), Some("192.168.1.50"));
+    }
+
+    #[tokio::test]
+    async fn update_poll_state_coalesces_lan_addr_independently_of_v4_v6() {
+        let db = test_db();
+        let conn = db.conn.lock().await;
+        let id = create_node(&conn, "n1", NodeKind::Agent, "hash1", None).unwrap();
+        apply_redemption(
+            &conn,
+            id,
+            &Redemption {
+                pubkey: "pk1",
+                ip4: "100.90.0.1".parse().unwrap(),
+                ip6: "fd00:90::1".parse().unwrap(),
+                listen_port: Some(51820),
+                endpoint_addr: None,
+                bearer_token_hash: "bearerhash1",
+                endpoint_addr_v4: Some("203.0.113.5:51820"),
+                endpoint_addr_v6: None,
+                lan_addr: Some("192.168.1.50"),
+            },
+        )
+        .unwrap();
+
+        // A poll that couldn't read its own interfaces this cycle omits
+        // lan_addr — it must not erase the previously reported one, same
+        // COALESCE contract as v4/v6, and independent of them.
+        update_poll_state(
+            &conn,
+            id,
+            &EndpointUpdate {
+                explicit: None,
+                reset_cleared: false,
+                v4: None,
+                v6: Some("[2001:db8::1]:51820"),
+                lan: None,
+            },
+        )
+        .unwrap();
+
+        let row = find_by_name(&conn, "n1").unwrap().unwrap();
+        assert_eq!(
+            row.lan_addr.as_deref(),
+            Some("192.168.1.50"),
+            "an omitted lan_addr this cycle preserves the earlier one"
+        );
+        assert_eq!(row.endpoint_addr_v6.as_deref(), Some("[2001:db8::1]:51820"));
+    }
+
+    #[tokio::test]
+    async fn clear_endpoint_none_also_clears_lan_addr() {
+        let db = test_db();
+        let conn = db.conn.lock().await;
+        let id = create_node(&conn, "n1", NodeKind::Agent, "hash1", None).unwrap();
+        apply_redemption(
+            &conn,
+            id,
+            &Redemption {
+                pubkey: "pk1",
+                ip4: "100.90.0.1".parse().unwrap(),
+                ip6: "fd00:90::1".parse().unwrap(),
+                listen_port: Some(51820),
+                endpoint_addr: Some("explicit.example.com:51820"),
+                bearer_token_hash: "bearerhash1",
+                endpoint_addr_v4: Some("203.0.113.5:51820"),
+                endpoint_addr_v6: Some("[2001:db8::1]:51820"),
+                lan_addr: Some("192.168.1.50"),
+            },
+        )
+        .unwrap();
+
+        clear_endpoint(&conn, id, None).unwrap();
+
+        let row = find_by_name(&conn, "n1").unwrap().unwrap();
+        assert!(row.lan_addr.is_none());
     }
 
     #[tokio::test]
@@ -924,6 +1054,7 @@ mod tests {
                 bearer_token_hash: "bearerhash1",
                 endpoint_addr_v4: None,
                 endpoint_addr_v6: None,
+                lan_addr: None,
             },
         )
         .unwrap();

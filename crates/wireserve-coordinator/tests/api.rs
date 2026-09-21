@@ -660,6 +660,95 @@ async fn register_and_poll_propagate_dual_stack_endpoint_candidates() {
 }
 
 #[tokio::test]
+async fn register_rejects_a_public_ip_as_lan_addr() {
+    // NAT-hairpin fix (PLAN.md decisions log #85): server-side defense in
+    // depth against a malicious/buggy agent claiming a public address as
+    // its "LAN" address, which would then get redistributed to every peer
+    // as a same-LAN candidate.
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({
+            "join_token": t1,
+            "pubkey": pubkey_for("n1"),
+            "listen_port": 51820,
+            "lan_addr": "203.0.113.5",
+        }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert!(resp.status().is_client_error());
+}
+
+#[tokio::test]
+async fn register_and_poll_propagate_the_lan_addr_candidate() {
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({
+            "join_token": t1,
+            "pubkey": pubkey_for("n1"),
+            "listen_port": 51820,
+            "lan_addr": "192.168.1.50",
+        }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let t2 = admin_create_node(&app.router, "n2").await;
+    let r2 = register_node(&app.router, &t2, "n2", 51820).await;
+    let bearer2 = r2["bearer_token"].as_str().unwrap();
+    let req = json_request("POST", "/poll", Some(bearer2), json!({ "services": [] }));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let body = body_json(resp).await;
+    let n1_peer = body["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "n1")
+        .unwrap();
+    assert_eq!(n1_peer["lan_addr"], "192.168.1.50");
+}
+
+#[tokio::test]
+async fn poll_omitting_lan_addr_preserves_the_previous_value() {
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({
+            "join_token": t1,
+            "pubkey": pubkey_for("n1"),
+            "listen_port": 51820,
+            "lan_addr": "192.168.1.50",
+        }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let r1 = body_json(resp).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+
+    // A poll that can't currently read its own interfaces (or simply
+    // didn't change networks) omits lan_addr — the previously reported
+    // value must survive, same COALESCE contract as endpoint_addr_v4/_v6.
+    let req = json_request("POST", "/poll", Some(&bearer1), json!({ "services": [] }));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let conn = app.state.db.conn.lock().await;
+    let row = wireserve_coordinator::db::nodes::find_by_name(&conn, "n1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.lan_addr.as_deref(), Some("192.168.1.50"));
+}
+
+#[tokio::test]
 async fn admin_can_clear_a_single_endpoint_family() {
     let app = test_app();
     let t1 = admin_create_node(&app.router, "n1").await;

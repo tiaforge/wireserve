@@ -115,6 +115,258 @@ pub fn interfaces_with_address(addr: IpAddr, except: &str) -> std::io::Result<Ve
     Ok(out)
 }
 
+// ---- NAT-hairpin fix: LAN-address candidates (PLAN.md decisions log #85) ----
+
+/// One of this node's own IPv4 interfaces that looks like a real LAN
+/// uplink, for the NAT-hairpin LAN-candidate feature.
+#[derive(Debug, Clone, Copy)]
+pub struct LocalLan {
+    pub addr: Ipv4Addr,
+    pub prefix_len: u8,
+}
+
+/// Interface-name prefixes treated as virtual rather than a real LAN
+/// uplink — a private address on one of these is a container bridge or
+/// VPN overlay, not the home network this feature means to reach.
+/// Judgment call, not exhaustive; worth revisiting if a real deployment's
+/// LAN NIC gets misclassified.
+const VIRTUAL_IFACE_PREFIXES: &[&str] = &[
+    "lo", "docker", "veth", "br-", "virbr", "tun", "tap", "wg", "tailscale", "zt", "cni", "flannel", "podman",
+];
+
+fn looks_virtual(name: &str) -> bool {
+    VIRTUAL_IFACE_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// This node's own private-range (RFC1918) IPv4 interfaces, in
+/// `getifaddrs` enumeration order, excluding `except` (this node's own
+/// mesh interface — same hygiene `interfaces_with_address` applies) and
+/// anything that `looks_virtual`. IPv4 only: v1 of the NAT-hairpin fix has
+/// no IPv6 LAN candidate — real hairpin is an IPv4 NAT problem. Impure —
+/// the actual syscall; kept separate from the pure functions below so
+/// those stay unit-testable without a live interface, same probe/choice
+/// split as `interfaces_with_address` itself.
+pub fn local_lan_ifaces(except: &str) -> std::io::Result<Vec<LocalLan>> {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `head` with a list we free below.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut out = Vec::new();
+    let mut cursor = head;
+    while !cursor.is_null() {
+        // SAFETY: every node of the list is valid until freeifaddrs; the
+        // sockaddr is read as the type its family says it is.
+        let ifa = unsafe { &*cursor };
+        cursor = ifa.ifa_next;
+        if ifa.ifa_addr.is_null() || ifa.ifa_netmask.is_null() {
+            continue;
+        }
+        if i32::from(unsafe { (*ifa.ifa_addr).sa_family }) != libc::AF_INET {
+            continue;
+        }
+        // SAFETY: family checked above.
+        let sin = unsafe { &*ifa.ifa_addr.cast::<libc::sockaddr_in>() };
+        let addr = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+        // SAFETY: ifa_netmask is non-null and shares ifa_addr's family for
+        // an AF_INET entry.
+        let mask_sin = unsafe { &*ifa.ifa_netmask.cast::<libc::sockaddr_in>() };
+        let prefix_len = u32::from_be(mask_sin.sin_addr.s_addr).count_ones() as u8;
+        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_string_lossy().into_owned();
+        if addr.is_private() && name != except && !looks_virtual(&name) {
+            out.push(LocalLan { addr, prefix_len });
+        }
+    }
+    // SAFETY: `head` came from getifaddrs and is freed exactly once.
+    unsafe { libc::freeifaddrs(head) };
+    Ok(out)
+}
+
+/// This node's single "best" LAN address to advertise on `/register` and
+/// `/poll`: the first entry `local_lan_ifaces` found.
+#[must_use]
+pub fn pick_lan_address(ifaces: &[LocalLan]) -> Option<Ipv4Addr> {
+    ifaces.first().map(|i| i.addr)
+}
+
+fn mask_for(prefix_len: u8) -> u32 {
+    if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix_len))
+    }
+}
+
+fn network_address(addr: Ipv4Addr, prefix_len: u8) -> Ipv4Addr {
+    Ipv4Addr::from(u32::from(addr) & mask_for(prefix_len))
+}
+
+/// This node's own local subnets (network address, prefix length), masked
+/// down from each interface's address+netmask — used to test whether a
+/// PEER's `lan_addr` is reachable without a router at all.
+#[must_use]
+pub fn own_lan_subnets(ifaces: &[LocalLan]) -> Vec<(Ipv4Addr, u8)> {
+    ifaces.iter().map(|i| (network_address(i.addr, i.prefix_len), i.prefix_len)).collect()
+}
+
+/// Whether `addr` falls inside any of `own_subnets`. A `true` result is a
+/// hint, not proof, that a peer advertising it is actually on this LAN —
+/// two unrelated sites both using `192.168.1.0/24` collide here by
+/// construction, which is exactly why `resolve_lan_candidate` treats a
+/// match as an optimistic attempt to verify, never a fact.
+#[must_use]
+pub fn is_on_own_lan(own_subnets: &[(Ipv4Addr, u8)], addr: Ipv4Addr) -> bool {
+    own_subnets.iter().any(|&(net, prefix_len)| network_address(addr, prefix_len) == net)
+}
+
+/// This node's LAN-vs-WAN preference for reaching one peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LanCandidate {
+    Lan,
+    Wan,
+}
+
+/// Per-peer LAN-vs-WAN state across poll cycles. `Instant`, not
+/// wall-clock time — process-local scheduling only, never persisted,
+/// never compared across a restart (an agent restart simply repeats one
+/// optimistic LAN probe, which is acceptable).
+#[derive(Debug, Clone)]
+pub struct LanPeerState {
+    current: LanCandidate,
+    switched_at: std::time::Instant,
+    /// The kernel's `last_handshake` at the moment `current` last became
+    /// `Lan`. A grace-window "success" is detected as this value
+    /// *advancing* — a genuinely new handshake happened — never by
+    /// comparing it against `switched_at` directly: `Instant` and the
+    /// kernel's wall-clock `last_handshake` are different clocks and
+    /// cannot be compared. `switched_at` is used only for the (purely
+    /// relative, monotonic) grace-window/backoff deadlines below.
+    baseline_handshake: Option<chrono::DateTime<chrono::Utc>>,
+    last_seen_lan_addr: String,
+    next_lan_retry_at: Option<std::time::Instant>,
+    backoff: std::time::Duration,
+}
+
+/// How long a freshly-tried LAN candidate gets to produce a real
+/// handshake before falling back to the WAN one — long enough for at
+/// least two `persistent_keepalive`-triggered handshake attempts.
+pub const LAN_GRACE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// The first backoff before retrying a LAN candidate that just failed.
+pub const LAN_RETRY_BACKOFF_INITIAL: std::time::Duration = std::time::Duration::from_secs(120);
+/// The cap the backoff doubles up to on repeated failures — bounds the
+/// cost of a persistent subnet-collision false positive to one brief,
+/// infrequent probe rather than either permanent failure or hot flapping.
+pub const LAN_RETRY_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// Decides this cycle's LAN-vs-WAN preference for one peer, and the
+/// updated state to keep (`None` to stop tracking it entirely — no
+/// matching LAN candidate at all, today's plain-WAN behavior). Pure:
+/// `now` and `kernel_last_handshake` are read once per cycle by the
+/// caller (`poll_loop::run_once`, via `tunnel_peers`) and passed in, same
+/// pure-decision/stateful-caller split as the rest of this file.
+#[must_use]
+pub fn resolve_lan_candidate(
+    own_subnets: &[(Ipv4Addr, u8)],
+    peer_lan_addr: Option<&str>,
+    kernel_last_handshake: Option<chrono::DateTime<chrono::Utc>>,
+    state: Option<LanPeerState>,
+    now: std::time::Instant,
+) -> (LanCandidate, Option<LanPeerState>) {
+    let Some(lan_addr) = peer_lan_addr else {
+        return (LanCandidate::Wan, None);
+    };
+    let Ok(parsed) = lan_addr.parse::<Ipv4Addr>() else {
+        return (LanCandidate::Wan, None);
+    };
+    if !is_on_own_lan(own_subnets, parsed) {
+        return (LanCandidate::Wan, None);
+    }
+
+    let needs_fresh_start = match &state {
+        None => true,
+        // The peer roamed to a different LAN address — its own prior
+        // failure history says nothing about this new one.
+        Some(s) => s.last_seen_lan_addr != lan_addr,
+    };
+
+    let mut state = if needs_fresh_start {
+        LanPeerState {
+            current: LanCandidate::Lan,
+            switched_at: now,
+            baseline_handshake: kernel_last_handshake,
+            last_seen_lan_addr: lan_addr.to_string(),
+            next_lan_retry_at: None,
+            backoff: LAN_RETRY_BACKOFF_INITIAL,
+        }
+    } else {
+        state.expect("needs_fresh_start is false only when state is Some")
+    };
+
+    match state.current {
+        LanCandidate::Lan => {
+            let confirmed = match (kernel_last_handshake, state.baseline_handshake) {
+                (Some(h), Some(baseline)) => h > baseline,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if confirmed {
+                state.backoff = LAN_RETRY_BACKOFF_INITIAL;
+            } else if now.duration_since(state.switched_at) >= LAN_GRACE_WINDOW {
+                state.current = LanCandidate::Wan;
+                state.next_lan_retry_at = Some(now + state.backoff);
+                state.backoff = (state.backoff * 2).min(LAN_RETRY_BACKOFF_MAX);
+            }
+        }
+        LanCandidate::Wan => {
+            if state.next_lan_retry_at.is_some_and(|t| now >= t) {
+                state.current = LanCandidate::Lan;
+                state.switched_at = now;
+                state.baseline_handshake = kernel_last_handshake;
+                state.next_lan_retry_at = None;
+            }
+        }
+    }
+
+    let candidate = state.current;
+    (candidate, Some(state))
+}
+
+/// Tracks every peer's LAN-vs-WAN state across poll cycles — in-memory
+/// only. Constructed once at daemon startup and lives exactly as long as
+/// `WgInterface` (same lifetime pattern as its own `applied`/`routed`),
+/// threaded through `poll_loop::PollContext`.
+#[derive(Debug, Default)]
+pub struct LanEndpointTracker {
+    states: HashMap<String, LanPeerState>,
+}
+
+impl LanEndpointTracker {
+    pub fn resolve(
+        &mut self,
+        pubkey: &str,
+        own_subnets: &[(Ipv4Addr, u8)],
+        peer_lan_addr: Option<&str>,
+        kernel_last_handshake: Option<chrono::DateTime<chrono::Utc>>,
+        now: std::time::Instant,
+    ) -> LanCandidate {
+        let state = self.states.remove(pubkey);
+        let (candidate, new_state) =
+            resolve_lan_candidate(own_subnets, peer_lan_addr, kernel_last_handshake, state, now);
+        if let Some(new_state) = new_state {
+            self.states.insert(pubkey.to_string(), new_state);
+        }
+        candidate
+    }
+
+    /// Drops tracked state for any pubkey not in `current` — a peer that
+    /// left the mesh must not accumulate forever (same care as
+    /// `WgInterface::reconcile`'s `peers_to_remove`).
+    pub fn prune<'a>(&mut self, current: impl Iterator<Item = &'a str>) {
+        let keep: std::collections::HashSet<&str> = current.collect();
+        self.states.retain(|k, _| keep.contains(k.as_str()));
+    }
+}
+
 /// A WireGuard peer's own `/32` + `/128` `AllowedIPs` — never a shared
 /// subnet block, so every peer only ever routes to itself on this
 /// interface (same non-overlapping-`AllowedIPs` reasoning as spec §9's
@@ -147,7 +399,24 @@ pub fn peer_allowed_ips(ip4: &str, ip6: &str) -> Vec<IpAddrMask> {
 /// was added to fix: a peer's auto-detected endpoint happened to be IPv6,
 /// which an IPv6-less node could never dial — that fix only covered the
 /// pair, not this field, until now).
-pub fn choose_peer_endpoint(p: &PeerInfo, prefer_ipv6: bool) -> Option<String> {
+///
+/// `lan` — this cycle's `LanEndpointTracker::resolve` result for this
+/// peer (`None` when the peer has no LAN candidate the tracker is
+/// tracking at all) — takes priority over all of the above when it says
+/// `Lan`: a direct, router-free LAN path beats every WAN candidate,
+/// operator override included, since it can only ever be *offered* when
+/// it has already been optimistically verified or is being re-verified
+/// (see `resolve_lan_candidate`). Falls through to the WAN logic below
+/// when the LAN address doesn't parse or no WAN candidate exists to
+/// borrow a port from (PLAN.md decisions log #85).
+pub fn choose_peer_endpoint(p: &PeerInfo, prefer_ipv6: bool, lan: Option<LanCandidate>) -> Option<String> {
+    if lan == Some(LanCandidate::Lan) {
+        if let (Some(ip), Some(port)) =
+            (p.lan_addr.as_deref().and_then(|s| s.parse::<Ipv4Addr>().ok()), wan_port(p))
+        {
+            return Some(format!("{ip}:{port}"));
+        }
+    }
     if let Some(explicit) = &p.endpoint_addr {
         let is_ipv6_literal = explicit.starts_with('[');
         if !is_ipv6_literal || prefer_ipv6 {
@@ -162,6 +431,16 @@ pub fn choose_peer_endpoint(p: &PeerInfo, prefer_ipv6: bool) -> Option<String> {
     }
 }
 
+/// The port half of whichever WAN candidate a peer has — the LAN
+/// candidate is a bare address (`PeerInfo::lan_addr`), so it borrows its
+/// port from here rather than carrying its own.
+fn wan_port(p: &PeerInfo) -> Option<u16> {
+    [p.endpoint_addr_v4.as_deref(), p.endpoint_addr.as_deref(), p.endpoint_addr_v6.as_deref()]
+        .into_iter()
+        .flatten()
+        .find_map(|s| s.rsplit_once(':').and_then(|(_, port)| port.parse().ok()))
+}
+
 /// Builds the desired kernel peer set (keyed by pubkey) from a `/poll`
 /// response's `peers` array, skipping this node's own entry (peers
 /// includes self — PLAN.md decisions log #12) and any entry whose pubkey
@@ -174,11 +453,17 @@ pub fn choose_peer_endpoint(p: &PeerInfo, prefer_ipv6: bool) -> Option<String> {
 /// A peer's `AllowedIPs` also hold the address of every service it owns
 /// (`services`, already through `vip::sanitize`), which is what routes a
 /// connection to `<name>.wg` to that peer.
+///
+/// `lan_candidates` is this cycle's `LanEndpointTracker` resolution per
+/// peer pubkey (PLAN.md decisions log #85) — a peer absent from it (or
+/// resolved to `Wan`) gets plain WAN behavior, unchanged from before this
+/// feature existed.
 pub fn desired_peers(
     peers: &[PeerInfo],
     services: &[ServiceInfo],
     self_pubkey: &str,
     prefer_ipv6: bool,
+    lan_candidates: &HashMap<String, LanCandidate>,
 ) -> HashMap<Key, Peer> {
     let mut desired = HashMap::new();
     for p in peers {
@@ -194,7 +479,8 @@ pub fn desired_peers(
         peer.allowed_ips.extend(
             owned_vips(services, &p.name).map(|vip| IpAddrMask::host(IpAddr::V4(vip))),
         );
-        if let Some(endpoint) = choose_peer_endpoint(p, prefer_ipv6) {
+        let lan = lan_candidates.get(&p.pubkey).copied();
+        if let Some(endpoint) = choose_peer_endpoint(p, prefer_ipv6, lan) {
             if let Err(e) = peer.set_endpoint(&endpoint) {
                 tracing::warn!(peer = %p.name, error = %e, "could not resolve peer endpoint");
             }
@@ -306,6 +592,14 @@ impl WgInterface {
             applied: HashMap::new(),
             routed: BTreeSet::new(),
         })
+    }
+
+    /// This interface's name — for callers (the poll loop) that need to
+    /// pass it to a free function like `local_lan_ifaces`/`tunnel_peers`
+    /// without duplicating the string themselves.
+    #[must_use]
+    pub fn ifname(&self) -> &str {
+        &self.ifname
     }
 
     /// Whether a network interface with this name already exists on the
@@ -458,8 +752,9 @@ impl WgInterface {
         services: &[ServiceInfo],
         self_pubkey: &str,
         prefer_ipv6: bool,
+        lan_candidates: &HashMap<String, LanCandidate>,
     ) -> Result<(), WireguardInterfaceError> {
-        let desired = desired_peers(peers, services, self_pubkey, prefer_ipv6);
+        let desired = desired_peers(peers, services, self_pubkey, prefer_ipv6, lan_candidates);
 
         let to_remove = peers_to_remove(self.applied.keys(), &desired);
         for key in &to_remove {
@@ -543,6 +838,7 @@ mod tests {
             endpoint_addr: None,
             endpoint_addr_v4: None,
             endpoint_addr_v6: None,
+            lan_addr: None,
             last_handshake: None,
         }
     }
@@ -593,7 +889,7 @@ mod tests {
         let self_key = key_b64(1);
         let other_key = key_b64(2);
         let peers = vec![peer("me", &self_key), peer("other", &other_key)];
-        let desired = desired_peers(&peers, &[], &self_key, false);
+        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new());
         assert_eq!(desired.len(), 1);
     }
 
@@ -605,7 +901,7 @@ mod tests {
             peer("bad", "not-a-real-base64-key"),
             peer("good", &good_key),
         ];
-        let desired = desired_peers(&peers, &[], &self_key, false);
+        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new());
         assert_eq!(desired.len(), 1);
     }
 
@@ -634,7 +930,7 @@ mod tests {
             service("old", "other", None),
             service("mine", "me", Some("100.90.0.52")),
         ];
-        let desired = desired_peers(&[peer("me", &self_key), other], &services, &self_key, false);
+        let desired = desired_peers(&[peer("me", &self_key), other], &services, &self_key, false, &HashMap::new());
         let peer = desired.values().next().unwrap();
         let ips: Vec<String> = peer.allowed_ips.iter().map(ToString::to_string).collect();
         assert_eq!(ips, ["100.90.0.2/32", "fd00:90::2/128", "100.90.0.50/32", "100.90.0.51/32"]);
@@ -647,7 +943,7 @@ mod tests {
         other.ip4 = "100.90.0.2".into();
         other.ip6 = String::new();
         let services = [service("web", "other", Some("100.90.0.50"))];
-        let desired = desired_peers(&[other], &services, &self_key, false);
+        let desired = desired_peers(&[other], &services, &self_key, false, &HashMap::new());
         let own: Vec<Ipv4Addr> = vec!["100.90.0.60".parse().unwrap()];
         let routes: Vec<String> = desired_routes(&desired, own.into_iter()).iter().map(ToString::to_string).collect();
         assert_eq!(routes, ["100.90.0.2", "100.90.0.50", "100.90.0.60"]);
@@ -659,7 +955,7 @@ mod tests {
         p.endpoint_addr_v4 = Some("203.0.113.5:51820".into());
         p.endpoint_addr_v6 = Some("[2001:db8::1]:51820".into());
         assert_eq!(
-            choose_peer_endpoint(&p, false),
+            choose_peer_endpoint(&p, false, None),
             Some("203.0.113.5:51820".into())
         );
     }
@@ -670,7 +966,7 @@ mod tests {
         p.endpoint_addr_v4 = Some("203.0.113.5:51820".into());
         p.endpoint_addr_v6 = Some("[2001:db8::1]:51820".into());
         assert_eq!(
-            choose_peer_endpoint(&p, true),
+            choose_peer_endpoint(&p, true, None),
             Some("[2001:db8::1]:51820".into())
         );
     }
@@ -680,11 +976,11 @@ mod tests {
         let mut p = peer("n1", &key_b64(2));
         p.endpoint_addr_v6 = Some("[2001:db8::1]:51820".into());
         assert_eq!(
-            choose_peer_endpoint(&p, false),
+            choose_peer_endpoint(&p, false, None),
             Some("[2001:db8::1]:51820".into()),
             "no v4 candidate at all — v6 is used even though prefer_ipv6 is false"
         );
-        assert_eq!(choose_peer_endpoint(&p, true), Some("[2001:db8::1]:51820".into()));
+        assert_eq!(choose_peer_endpoint(&p, true, None), Some("[2001:db8::1]:51820".into()));
     }
 
     #[test]
@@ -694,11 +990,11 @@ mod tests {
         p.endpoint_addr_v4 = Some("203.0.113.5:51820".into());
         p.endpoint_addr_v6 = Some("[2001:db8::1]:51820".into());
         assert_eq!(
-            choose_peer_endpoint(&p, false),
+            choose_peer_endpoint(&p, false, None),
             Some("explicit.example.com:51820".into())
         );
         assert_eq!(
-            choose_peer_endpoint(&p, true),
+            choose_peer_endpoint(&p, true, None),
             Some("explicit.example.com:51820".into()),
             "explicit wins regardless of prefer_ipv6"
         );
@@ -716,14 +1012,64 @@ mod tests {
         p.endpoint_addr_v4 = Some("203.0.113.5:51820".into());
         p.endpoint_addr_v6 = Some("[2001:db8::1]:51820".into());
         assert_eq!(
-            choose_peer_endpoint(&p, false),
+            choose_peer_endpoint(&p, false, None),
             Some("203.0.113.5:51820".into()),
             "an IPv6-only explicit value is useless to a node with no working v6"
         );
         assert_eq!(
-            choose_peer_endpoint(&p, true),
+            choose_peer_endpoint(&p, true, None),
             Some("[2001:db8::1]:51820".into()),
             "a node with real v6 can still use it"
+        );
+    }
+
+    // ---- NAT-hairpin fix: choose_peer_endpoint's LAN preference ----
+
+    #[test]
+    fn choose_peer_endpoint_prefers_the_resolved_lan_candidate() {
+        // Even over an explicit operator override — see the doc comment
+        // on `choose_peer_endpoint` for why: a home-router-plus-dynamic-
+        // DNS deployment (the exact case this feature targets) almost
+        // always has an explicit endpoint_addr set, and the LAN path is
+        // strictly better whenever the tracker has actually offered it.
+        let mut p = peer("n1", &key_b64(2));
+        p.endpoint_addr = Some("duckdns.example.com:51820".into());
+        p.endpoint_addr_v4 = Some("203.0.113.5:51820".into());
+        p.lan_addr = Some("192.168.1.50".into());
+        assert_eq!(
+            choose_peer_endpoint(&p, false, Some(LanCandidate::Lan)),
+            Some("192.168.1.50:51820".into()),
+            "borrows its port from the v4 WAN candidate"
+        );
+        assert_eq!(
+            choose_peer_endpoint(&p, false, Some(LanCandidate::Wan)),
+            Some("duckdns.example.com:51820".into()),
+            "Wan resolves exactly as if lan were None"
+        );
+        assert_eq!(
+            choose_peer_endpoint(&p, false, None),
+            Some("duckdns.example.com:51820".into())
+        );
+    }
+
+    #[test]
+    fn choose_peer_endpoint_falls_back_when_lan_chosen_but_no_wan_port_is_known() {
+        // No endpoint_addr/_v4/_v6 at all to borrow a port from — the LAN
+        // candidate can't be used, so this falls through to ordinary WAN
+        // logic (here, nothing at all).
+        let mut p = peer("n1", &key_b64(2));
+        p.lan_addr = Some("192.168.1.50".into());
+        assert_eq!(choose_peer_endpoint(&p, false, Some(LanCandidate::Lan)), None);
+    }
+
+    #[test]
+    fn choose_peer_endpoint_falls_back_when_lan_is_some_but_lan_addr_is_unparseable() {
+        let mut p = peer("n1", &key_b64(2));
+        p.endpoint_addr_v4 = Some("203.0.113.5:51820".into());
+        p.lan_addr = Some("not-an-ip".into());
+        assert_eq!(
+            choose_peer_endpoint(&p, false, Some(LanCandidate::Lan)),
+            Some("203.0.113.5:51820".into())
         );
     }
 
@@ -734,14 +1080,14 @@ mod tests {
         other.endpoint_addr_v4 = Some("203.0.113.5:51820".into());
         other.endpoint_addr_v6 = Some("[2001:db8::1]:51820".into());
 
-        let desired_v4 = desired_peers(&[other.clone()], &[], &self_key, false);
+        let desired_v4 = desired_peers(&[other.clone()], &[], &self_key, false, &HashMap::new());
         let key = defguard_wireguard_rs::key::Key::try_from(key_b64(2).as_str()).unwrap();
         assert_eq!(
             desired_v4[&key].endpoint,
             Some("203.0.113.5:51820".parse().unwrap())
         );
 
-        let desired_v6 = desired_peers(&[other], &[], &self_key, true);
+        let desired_v6 = desired_peers(&[other], &[], &self_key, true, &HashMap::new());
         assert_eq!(
             desired_v6[&key].endpoint,
             Some("[2001:db8::1]:51820".parse::<std::net::SocketAddr>().unwrap())
@@ -832,6 +1178,268 @@ mod tests {
         assert_eq!(to_configure[0].public_key, b);
     }
 
+    // ---- NAT-hairpin fix: subnet math and containment ----
+
+    fn lan(addr: &str, prefix_len: u8) -> LocalLan {
+        LocalLan { addr: addr.parse().unwrap(), prefix_len }
+    }
+
+    #[test]
+    fn own_lan_subnets_masks_addresses_to_their_network() {
+        let subnets = own_lan_subnets(&[lan("192.168.1.50", 24), lan("10.0.5.9", 8)]);
+        assert_eq!(
+            subnets,
+            vec![("192.168.1.0".parse().unwrap(), 24), ("10.0.0.0".parse().unwrap(), 8)]
+        );
+    }
+
+    #[test]
+    fn own_lan_subnets_handles_a_host_route_and_the_whole_internet() {
+        assert_eq!(own_lan_subnets(&[lan("192.168.1.50", 32)])[0].0, "192.168.1.50".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(own_lan_subnets(&[lan("192.168.1.50", 0)])[0].0, "0.0.0.0".parse::<Ipv4Addr>().unwrap());
+    }
+
+    #[test]
+    fn is_on_own_lan_true_for_an_address_in_range() {
+        let subnets = own_lan_subnets(&[lan("192.168.1.50", 24)]);
+        assert!(is_on_own_lan(&subnets, "192.168.1.99".parse().unwrap()));
+    }
+
+    #[test]
+    fn is_on_own_lan_false_outside_every_own_subnet() {
+        let subnets = own_lan_subnets(&[lan("192.168.1.50", 24)]);
+        assert!(!is_on_own_lan(&subnets, "192.168.2.1".parse().unwrap()));
+        assert!(!is_on_own_lan(&subnets, "10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn is_on_own_lan_matches_purely_on_the_subnet_a_deliberate_false_positive() {
+        // The whole reason `resolve_lan_candidate` treats a match as an
+        // optimistic attempt rather than a fact: two completely unrelated
+        // sites both using the most common home-router default collide
+        // here by construction.
+        let subnets = own_lan_subnets(&[lan("192.168.1.2", 24)]);
+        assert!(is_on_own_lan(&subnets, "192.168.1.200".parse().unwrap()));
+    }
+
+    // ---- NAT-hairpin fix: resolve_lan_candidate's staleness state machine ----
+
+    const GRACE: std::time::Duration = LAN_GRACE_WINDOW;
+
+    fn subnets_containing(addr: &str) -> Vec<(Ipv4Addr, u8)> {
+        vec![(addr.parse().unwrap(), 24)]
+    }
+
+    #[test]
+    fn no_lan_addr_from_peer_is_plain_wan_untracked() {
+        let now = std::time::Instant::now();
+        let (candidate, state) = resolve_lan_candidate(&subnets_containing("192.168.1.0"), None, None, None, now);
+        assert_eq!(candidate, LanCandidate::Wan);
+        assert!(state.is_none());
+    }
+
+    #[test]
+    fn lan_addr_outside_every_own_subnet_is_plain_wan_untracked() {
+        let now = std::time::Instant::now();
+        let (candidate, state) = resolve_lan_candidate(
+            &subnets_containing("192.168.1.0"),
+            Some("10.0.0.5"),
+            None,
+            None,
+            now,
+        );
+        assert_eq!(candidate, LanCandidate::Wan);
+        assert!(state.is_none());
+    }
+
+    #[test]
+    fn first_cycle_on_a_matching_lan_optimistically_tries_lan() {
+        let now = std::time::Instant::now();
+        let (candidate, state) = resolve_lan_candidate(
+            &subnets_containing("192.168.1.0"),
+            Some("192.168.1.50"),
+            None,
+            None,
+            now,
+        );
+        assert_eq!(candidate, LanCandidate::Lan);
+        assert!(state.is_some());
+    }
+
+    #[test]
+    fn a_handshake_after_switching_confirms_lan_and_resets_backoff() {
+        let now = std::time::Instant::now();
+        let t0 = chrono::Utc::now();
+        let (_, state) = resolve_lan_candidate(
+            &subnets_containing("192.168.1.0"),
+            Some("192.168.1.50"),
+            Some(t0),
+            None,
+            now,
+        );
+        // A genuinely newer handshake than the baseline taken at switch time.
+        let newer = t0 + chrono::Duration::seconds(5);
+        let (candidate, state) = resolve_lan_candidate(
+            &subnets_containing("192.168.1.0"),
+            Some("192.168.1.50"),
+            Some(newer),
+            state,
+            now + std::time::Duration::from_secs(1),
+        );
+        assert_eq!(candidate, LanCandidate::Lan);
+        assert_eq!(state.unwrap().backoff, LAN_RETRY_BACKOFF_INITIAL);
+    }
+
+    #[test]
+    fn still_within_the_grace_window_stays_on_lan_awaiting_a_handshake() {
+        let now = std::time::Instant::now();
+        let (_, state) = resolve_lan_candidate(
+            &subnets_containing("192.168.1.0"),
+            Some("192.168.1.50"),
+            None,
+            None,
+            now,
+        );
+        let (candidate, _) = resolve_lan_candidate(
+            &subnets_containing("192.168.1.0"),
+            Some("192.168.1.50"),
+            None,
+            state,
+            now + GRACE / 2,
+        );
+        assert_eq!(candidate, LanCandidate::Lan);
+    }
+
+    #[test]
+    fn no_handshake_within_the_grace_window_falls_back_to_wan_and_schedules_a_retry() {
+        let now = std::time::Instant::now();
+        let (_, state) = resolve_lan_candidate(
+            &subnets_containing("192.168.1.0"),
+            Some("192.168.1.50"),
+            None,
+            None,
+            now,
+        );
+        let (candidate, state) = resolve_lan_candidate(
+            &subnets_containing("192.168.1.0"),
+            Some("192.168.1.50"),
+            None,
+            state,
+            now + GRACE,
+        );
+        assert_eq!(candidate, LanCandidate::Wan);
+        let state = state.unwrap();
+        assert!(state.next_lan_retry_at.is_some());
+        assert_eq!(state.backoff, LAN_RETRY_BACKOFF_INITIAL * 2);
+    }
+
+    #[test]
+    fn wan_retries_lan_once_the_backoff_elapses_not_before() {
+        let now = std::time::Instant::now();
+        let (_, state) = resolve_lan_candidate(
+            &subnets_containing("192.168.1.0"),
+            Some("192.168.1.50"),
+            None,
+            None,
+            now,
+        );
+        let (_, state) = resolve_lan_candidate(
+            &subnets_containing("192.168.1.0"),
+            Some("192.168.1.50"),
+            None,
+            state,
+            now + GRACE,
+        );
+        // Not due yet.
+        let (candidate, state) = resolve_lan_candidate(
+            &subnets_containing("192.168.1.0"),
+            Some("192.168.1.50"),
+            None,
+            state,
+            now + GRACE + std::time::Duration::from_secs(1),
+        );
+        assert_eq!(candidate, LanCandidate::Wan);
+        // Due.
+        let (candidate, _) = resolve_lan_candidate(
+            &subnets_containing("192.168.1.0"),
+            Some("192.168.1.50"),
+            None,
+            state,
+            now + GRACE + LAN_RETRY_BACKOFF_INITIAL,
+        );
+        assert_eq!(candidate, LanCandidate::Lan);
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_the_cap_on_repeated_failures() {
+        let now = std::time::Instant::now();
+        let (_, mut state) = resolve_lan_candidate(
+            &subnets_containing("192.168.1.0"),
+            Some("192.168.1.50"),
+            None,
+            None,
+            now,
+        );
+        let mut t = now;
+        let mut last_backoff = LAN_RETRY_BACKOFF_INITIAL;
+        for _ in 0..10 {
+            // Fail the grace window.
+            t += GRACE;
+            let (_, s) =
+                resolve_lan_candidate(&subnets_containing("192.168.1.0"), Some("192.168.1.50"), None, state, t);
+            let s = s.unwrap();
+            assert!(s.backoff <= LAN_RETRY_BACKOFF_MAX);
+            last_backoff = s.backoff;
+            // Retry LAN once due, so the next iteration fails from Lan again.
+            t = s.next_lan_retry_at.unwrap();
+            let (_, s) =
+                resolve_lan_candidate(&subnets_containing("192.168.1.0"), Some("192.168.1.50"), None, Some(s), t);
+            state = s;
+        }
+        assert_eq!(last_backoff, LAN_RETRY_BACKOFF_MAX, "must have capped by now");
+    }
+
+    #[test]
+    fn a_peer_roaming_to_a_different_lan_address_resets_to_a_fresh_optimistic_attempt() {
+        let now = std::time::Instant::now();
+        let subnets = vec![("192.168.1.0".parse().unwrap(), 24), ("192.168.2.0".parse().unwrap(), 24)];
+        let (_, state) = resolve_lan_candidate(&subnets, Some("192.168.1.50"), None, None, now);
+        // Fall back to Wan first, so the roam is a real behavior change,
+        // not just staying on Lan by coincidence.
+        let (_, state) = resolve_lan_candidate(&subnets, Some("192.168.1.50"), None, state, now + GRACE);
+        assert_eq!(state.as_ref().unwrap().current, LanCandidate::Wan);
+
+        let (candidate, state) =
+            resolve_lan_candidate(&subnets, Some("192.168.2.50"), None, state, now + GRACE + std::time::Duration::from_secs(1));
+        assert_eq!(candidate, LanCandidate::Lan, "a new address gets a fresh optimistic attempt");
+        assert_eq!(state.unwrap().backoff, LAN_RETRY_BACKOFF_INITIAL);
+    }
+
+    #[test]
+    fn lan_endpoint_tracker_resolves_per_pubkey_independently() {
+        let mut tracker = LanEndpointTracker::default();
+        let now = std::time::Instant::now();
+        let subnets = subnets_containing("192.168.1.0");
+        assert_eq!(tracker.resolve("pk-a", &subnets, Some("192.168.1.50"), None, now), LanCandidate::Lan);
+        assert_eq!(tracker.resolve("pk-b", &subnets, None, None, now), LanCandidate::Wan);
+        // pk-a's own state persists across calls, independent of pk-b's.
+        assert_eq!(
+            tracker.resolve("pk-a", &subnets, Some("192.168.1.50"), None, now + GRACE),
+            LanCandidate::Wan
+        );
+    }
+
+    #[test]
+    fn lan_endpoint_tracker_prune_drops_departed_peers() {
+        let mut tracker = LanEndpointTracker::default();
+        let now = std::time::Instant::now();
+        let subnets = subnets_containing("192.168.1.0");
+        tracker.resolve("pk-a", &subnets, Some("192.168.1.50"), None, now);
+        assert!(tracker.states.contains_key("pk-a"));
+        tracker.prune(std::iter::empty());
+        assert!(!tracker.states.contains_key("pk-a"));
+    }
+
     // ---- validate_ifname ----
 
     #[test]
@@ -905,7 +1513,7 @@ mod tests {
 
         let mut p = peer("peer", &key_b64(9));
         p.endpoint_addr = Some("10.99.0.1:51820".into());
-        wg.reconcile(std::slice::from_ref(&p), &[], &own.public_key().to_string(), false).unwrap();
+        wg.reconcile(std::slice::from_ref(&p), &[], &own.public_key().to_string(), false, &HashMap::new()).unwrap();
 
         // What `list` reads: the configured endpoint, and no handshake
         // yet — not a handshake in 1970, which is how the kernel says it.
@@ -925,7 +1533,7 @@ mod tests {
         assert!(routes.contains("100.90.0.5 dev wgtest"), "{routes}");
         assert!(routes.contains("fd00:90::5 dev wgtest"), "{routes}");
 
-        wg.reconcile(&[], &[], &own.public_key().to_string(), false).unwrap();
+        wg.reconcile(&[], &[], &own.public_key().to_string(), false, &HashMap::new()).unwrap();
         let routes = sh("ip -4 route show table all; ip -6 route show table all");
         assert!(!routes.contains("100.90.0.5") && !routes.contains("fd00:90::5"), "departed peer's route removed: {routes}");
         wg.teardown().unwrap();
@@ -961,7 +1569,7 @@ mod tests {
             service("web", "peer", Some("100.90.0.50")),
             service("mine", "me", Some("100.90.0.51")),
         ];
-        wg.reconcile(&peers, &services, &own_pub, false).unwrap();
+        wg.reconcile(&peers, &services, &own_pub, false, &HashMap::new()).unwrap();
 
         let routes = sh("ip -4 route show table all");
         assert!(routes.contains("100.90.0.50 dev wgtest"), "{routes}");
@@ -972,13 +1580,51 @@ mod tests {
             assert!(!allowed.contains("100.90.0.51"), "our own address is no peer's: {allowed}");
         }
 
-        wg.reconcile(&peers, &[], &own_pub, false).unwrap();
+        wg.reconcile(&peers, &[], &own_pub, false, &HashMap::new()).unwrap();
         let routes = sh("ip -4 route show table all");
         assert!(!routes.contains("100.90.0.50") && !routes.contains("100.90.0.51"), "{routes}");
 
         // Teardown deletes the interface itself, and is a no-op once gone.
         wg.teardown().unwrap();
         assert!(!sh("ip -o link show").contains("wgtest"), "interface still there after teardown");
+        wg.teardown().unwrap();
+    }
+
+    /// NAT-hairpin fix (PLAN.md decisions log #85), end to end: when the
+    /// tracker resolves a peer to `Lan`, `reconcile` actually configures
+    /// the kernel peer's endpoint as the LAN address, not `endpoint_addr`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_reconcile_configures_the_lan_endpoint_when_resolved() {
+        if !crate::firewall::netns::reexec("wg::tests::kernel_reconcile_configures_the_lan_endpoint_when_resolved") {
+            return;
+        }
+        let sh = |script: &str| {
+            let out = std::process::Command::new("sh").args(["-euc", script]).output().unwrap();
+            assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        sh("ip link set lo up");
+
+        let own = clamp_private_key(&Key::generate());
+        let mut wg = WgInterface::new("wgtest").unwrap();
+        wg.bring_up(&own.to_string(), "100.90.0.2".parse().unwrap(), "fd00:90::2".parse().unwrap(), 51820)
+            .unwrap();
+
+        let mut p = peer("peer", &key_b64(9));
+        p.endpoint_addr = Some("203.0.113.5:51820".into());
+        p.lan_addr = Some("192.168.1.50".into());
+
+        let mut lan_candidates = HashMap::new();
+        lan_candidates.insert(p.pubkey.clone(), LanCandidate::Lan);
+        wg.reconcile(std::slice::from_ref(&p), &[], &own.public_key().to_string(), false, &lan_candidates).unwrap();
+
+        let tunnel = tunnel_peers("wgtest").unwrap();
+        assert_eq!(
+            tunnel[0].endpoint.as_deref(),
+            Some("192.168.1.50:51820"),
+            "must configure the LAN address, not endpoint_addr, once the tracker resolves to Lan"
+        );
+
         wg.teardown().unwrap();
     }
 }

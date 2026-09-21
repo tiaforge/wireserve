@@ -88,6 +88,13 @@ pub async fn poll(
             ));
         }
     }
+    if let Some(lan) = req.lan_addr.as_deref() {
+        if !wireserve_types::is_valid_lan_addr(lan) {
+            return Err(AppError::BadRequest(
+                "lan_addr must be a private-range (RFC1918) IPv4 address".into(),
+            ));
+        }
+    }
 
     // Same observed-source-address fallback as `/register` (spec §4.2),
     // re-applied on every poll rather than frozen at join time — see
@@ -137,6 +144,7 @@ pub async fn poll(
             reset_cleared: explicit.is_some(),
             v4: req.endpoint_addr_v4.as_deref(),
             v6: req.endpoint_addr_v6.as_deref(),
+            lan: req.lan_addr.as_deref(),
         },
     )?;
 
