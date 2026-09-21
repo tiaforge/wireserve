@@ -132,18 +132,27 @@ pub fn peer_allowed_ips(ip4: &str, ip6: &str) -> Vec<IpAddrMask> {
 }
 
 /// Picks which of a peer's endpoint candidates to actually configure.
-/// The operator's/passive-fallback's explicit `endpoint_addr` always wins
-/// (unchanged behavior) over the actively-probed `endpoint_addr_v4`/`_v6`
-/// pair; between those two, `prefer_ipv6` — this node's own live "do I
-/// have real working IPv6 right now" self-test against the coordinator
-/// (see `probe::has_working_ipv6`, threaded in from `poll_loop::run_once`)
-/// — decides. A node with no real v6 of its own (the incident this
-/// feature exists to fix: a peer's auto-detected endpoint happened to be
-/// IPv6, which an IPv6-less node could never dial) always falls through
-/// to v4 here regardless of what the peer offers.
+/// The operator's/passive-fallback's explicit `endpoint_addr` wins over
+/// the actively-probed `endpoint_addr_v4`/`_v6` pair, *unless* it turns
+/// out to be an IPv6 literal and this node has no real v6 of its own —
+/// the coordinator's `endpoint_addr` column is filled from whatever
+/// family a node's poll happened to arrive over (routing, not a
+/// considered choice), so a dual-stack peer can just as easily end up
+/// with a v6 address sitting there as a v4 one. `prefer_ipv6` — this
+/// node's own live "do I have real working IPv6 right now" self-test
+/// against the coordinator (see `probe::has_working_ipv6`, threaded in
+/// from `poll_loop::run_once`) — is what an IPv6-less node lacks, so an
+/// unusable `endpoint_addr` falls through to the v4/v6 pair below exactly
+/// like the no-explicit-value case already did (the incident that pair
+/// was added to fix: a peer's auto-detected endpoint happened to be IPv6,
+/// which an IPv6-less node could never dial — that fix only covered the
+/// pair, not this field, until now).
 pub fn choose_peer_endpoint(p: &PeerInfo, prefer_ipv6: bool) -> Option<String> {
     if let Some(explicit) = &p.endpoint_addr {
-        return Some(explicit.clone());
+        let is_ipv6_literal = explicit.starts_with('[');
+        if !is_ipv6_literal || prefer_ipv6 {
+            return Some(explicit.clone());
+        }
     }
     match (&p.endpoint_addr_v4, &p.endpoint_addr_v6) {
         (Some(v4), Some(v6)) => Some(if prefer_ipv6 { v6.clone() } else { v4.clone() }),
@@ -583,6 +592,29 @@ mod tests {
             choose_peer_endpoint(&p, true),
             Some("explicit.example.com:51820".into()),
             "explicit wins regardless of prefer_ipv6"
+        );
+    }
+
+    #[test]
+    fn choose_peer_endpoint_falls_through_an_ipv6_only_explicit_field_when_this_node_has_no_v6() {
+        // The coordinator's `endpoint_addr` column is filled from
+        // whatever family a dual-stack peer's poll happened to arrive
+        // over — not a considered choice — so it can be IPv6 even though
+        // the peer also actively reported a perfectly good v4 candidate.
+        // An IPv6-less receiver must not be handed that anyway.
+        let mut p = peer("n1", &key_b64(2));
+        p.endpoint_addr = Some("[2001:db8::1]:51820".into());
+        p.endpoint_addr_v4 = Some("203.0.113.5:51820".into());
+        p.endpoint_addr_v6 = Some("[2001:db8::1]:51820".into());
+        assert_eq!(
+            choose_peer_endpoint(&p, false),
+            Some("203.0.113.5:51820".into()),
+            "an IPv6-only explicit value is useless to a node with no working v6"
+        );
+        assert_eq!(
+            choose_peer_endpoint(&p, true),
+            Some("[2001:db8::1]:51820".into()),
+            "a node with real v6 can still use it"
         );
     }
 

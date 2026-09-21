@@ -93,6 +93,13 @@ pub async fn poll(
     // `clear_endpoint` exists to make. An explicit report from the node
     // itself is exempt from that gate (and resets it): the node asserting
     // its own address is not the coordinator guessing again.
+    //
+    // This column is family-blind by design (a dual-stack node's poll can
+    // arrive over either family depending on nothing more than routing on
+    // that one request) — `wg::choose_peer_endpoint` is responsible for
+    // not handing an IPv6 value out of it to a peer that can't use v6,
+    // falling back to the actively-probed `endpoint_addr_v4`/`_v6` pair
+    // instead when that happens. Do not duplicate that family check here.
     let explicit = req.endpoint_addr.as_deref();
     let endpoint_addr = if explicit.is_some() {
         explicit.map(str::to_string)

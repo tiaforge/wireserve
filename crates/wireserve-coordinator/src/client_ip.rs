@@ -141,7 +141,20 @@ pub fn endpoint_fallback(
     if observed_is_unusable {
         return None;
     }
-    listen_port.map(|port| format!("{}:{port}", client.ip))
+    listen_port.map(|port| format_host_port(client.ip, port))
+}
+
+/// Formats `ip:port`, bracketing IPv6 (`[ip]:port`) the way
+/// `wireserve_types::is_valid_endpoint_addr` and `Peer::set_endpoint`
+/// require. Without this, an IPv6 `client.ip` produces an ambiguous
+/// string like `2a01:db8::1:51820` — indistinguishable from an IPv6
+/// literal with an extra hextet — that fails to parse as host:port at
+/// all downstream.
+fn format_host_port(ip: IpAddr, port: u16) -> String {
+    match ip {
+        IpAddr::V4(v4) => format!("{v4}:{port}"),
+        IpAddr::V6(v6) => format!("[{v6}]:{port}"),
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +218,18 @@ mod tests {
         let r = resolve_client(&headers_with_xff("192.168.20.5"), connect, false);
         assert_eq!(r.ip, connect);
         assert!(!r.from_forwarded_header);
+    }
+
+    #[test]
+    fn endpoint_fallback_brackets_an_ipv6_observed_address() {
+        let client = ResolvedClient {
+            ip: "2a01:4f8:1c1a:cf54::2".parse().unwrap(),
+            from_forwarded_header: true,
+        };
+        assert_eq!(
+            endpoint_fallback(None, &client, Some(51820), true),
+            Some("[2a01:4f8:1c1a:cf54::2]:51820".to_string())
+        );
     }
 
     #[test]
