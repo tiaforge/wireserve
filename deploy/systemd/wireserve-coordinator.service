@@ -35,6 +35,13 @@ Group=wireserve
 # endpoint fallback use the real client address instead of the proxy's.
 # Leaving it on with a directly reachable listener lets clients forge
 # their own source address.
+#
+# WIRESERVE_LISTEN_ADDR's port number also carries a self-hosted UDP
+# reflexive-address responder (NAT-traversal step 2, PLAN.md decisions
+# log #90+) — no capability change needed here (RestrictAddressFamilies=
+# below already permits AF_INET/AF_INET6 UDP sockets), but unlike the
+# HTTP side, that port needs its own direct UDP forward at your
+# firewall/router, since a reverse proxy only ever forwards HTTP.
 EnvironmentFile=-/etc/wireserve/coordinator.env
 
 ExecStart=/usr/local/bin/wireserve-coordinator

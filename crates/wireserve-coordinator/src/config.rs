@@ -55,6 +55,16 @@ pub struct Config {
     /// two extra `PollResponse` fields are provably empty and omitted
     /// from the JSON entirely.
     pub require_service_approval: bool,
+    /// Per-source budget for the self-hosted reflexive UDP responder
+    /// (PLAN.md M22, `crate::reflexive`) — deliberately separate from
+    /// `rate_limit_max`/`_window_secs`, which govern the HTTP failed-auth
+    /// path and have no "failure" concept to reuse here. Small on
+    /// purpose: a legitimate node probes this at most a few times per
+    /// process lifetime (see `wireserve-agent`'s one-shot pre-`bring_up`
+    /// probe), so there is no ordinary traffic pattern this could ever
+    /// throttle by mistake.
+    pub reflexive_rate_limit_max: u32,
+    pub reflexive_rate_limit_window_secs: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -121,6 +131,9 @@ impl Config {
             env_parse_or("WIRESERVE_GLOBAL_AUTH_FAILURE_WINDOW_SECS", 60u64)?;
         let require_service_approval =
             env_parse_or("WIRESERVE_REQUIRE_SERVICE_APPROVAL", true)?;
+        let reflexive_rate_limit_max = env_parse_or("WIRESERVE_REFLEXIVE_RATE_LIMIT_MAX", 20u32)?;
+        let reflexive_rate_limit_window_secs =
+            env_parse_or("WIRESERVE_REFLEXIVE_RATE_LIMIT_WINDOW_SECS", 10u64)?;
 
         Ok(Loaded {
             config: Self {
@@ -138,6 +151,8 @@ impl Config {
                 global_auth_failure_max,
                 global_auth_failure_window_secs,
                 require_service_approval,
+                reflexive_rate_limit_max,
+                reflexive_rate_limit_window_secs,
             },
             generated,
             secrets_path,

@@ -103,12 +103,14 @@ pub fn build_poll_request(
     endpoint_addr: Option<String>,
     dual: &crate::probe::DualProbeResult,
     lan_addr: Option<String>,
+    reflexive_addr: Option<String>,
 ) -> PollRequest {
     PollRequest {
         endpoint_addr,
         endpoint_addr_v4: dual.v4.clone(),
         endpoint_addr_v6: dual.v6.clone(),
         lan_addr,
+        reflexive_addr,
         services: declared.to_vec(),
     }
 }
@@ -282,10 +284,18 @@ pub struct PollContext<'a, F: FirewallBackend> {
     pub state_path: &'a Path,
     pub wg: &'a mut WgInterface,
     pub firewall: &'a mut F,
-    /// NAT-hairpin fix (PLAN.md decisions log #85): per-peer LAN-vs-WAN
-    /// state across poll cycles. Lives exactly as long as `wg` — see
-    /// `crate::wg::LanEndpointTracker`.
-    pub lan_tracker: &'a mut crate::wg::LanEndpointTracker,
+    /// NAT-traversal step 1/2 (PLAN.md decisions log #85, #90+): per-peer
+    /// endpoint-tier state across poll cycles. Lives exactly as long as
+    /// `wg` — see `crate::wg::EndpointTracker`.
+    pub endpoint_tracker: &'a mut crate::wg::EndpointTracker,
+    /// This node's own reflexive address, learned exactly once at daemon
+    /// startup by a one-shot probe run before `wg::WgInterface::bring_up`
+    /// claimed `listen_port` (see `crate::reflexive`'s module doc for
+    /// why it can't be re-probed mid-run). Resent verbatim on every poll
+    /// even though the value itself never changes cycle to cycle, so the
+    /// coordinator's COALESCE contract stays uniform across every
+    /// self-reported field.
+    pub own_reflexive_addr: Option<&'a str>,
 }
 
 /// Runs exactly one poll cycle against the daemon's single shared `state`,
@@ -338,7 +348,7 @@ where
     let lan_addr = crate::wg::pick_lan_address(&lan_ifaces).map(|ip| ip.to_string());
 
     // 1. send
-    let req = build_poll_request(&declared, endpoint_addr, &dual, lan_addr);
+    let req = build_poll_request(&declared, endpoint_addr, &dual, lan_addr, ctx.own_reflexive_addr.map(String::from));
     let url = format!("{}/poll", ctx.coordinator_url.trim_end_matches('/'));
     let resp = ctx
         .client
@@ -419,10 +429,10 @@ where
     let failures = tokio::task::block_in_place(|| {
         let mut failures = Vec::new();
 
-        // NAT-hairpin fix (PLAN.md decisions log #85): resolve each
-        // peer's LAN-vs-WAN candidate before reconciling. `tunnel_peers`
-        // is the same netlink read `list` already uses for
-        // `last_handshake`; reading it again here (rather than
+        // NAT-traversal steps 1/2 (PLAN.md decisions log #85, #90+):
+        // resolve each peer's best endpoint tier before reconciling.
+        // `tunnel_peers` is the same netlink read `list` already uses
+        // for `last_handshake`; reading it again here (rather than
         // threading `list`'s own read through) keeps this step
         // independent of whether anything is watching `list` right now.
         let now = std::time::Instant::now();
@@ -432,26 +442,26 @@ where
                 .into_iter()
                 .map(|t| (t.pubkey, t.last_handshake))
                 .collect();
-        let lan_candidates: std::collections::HashMap<String, crate::wg::LanCandidate> = directory
+        let endpoint_tiers: std::collections::HashMap<String, crate::wg::EndpointTier> = directory
             .peers
             .iter()
             .filter(|p| p.pubkey != self_pubkey)
             .map(|p| {
-                let candidate = ctx.lan_tracker.resolve(
+                let candidates = crate::wg::peer_tier_candidates(&own_lan_subnets, p);
+                let tier = ctx.endpoint_tracker.resolve(
                     &p.pubkey,
-                    &own_lan_subnets,
-                    p.lan_addr.as_deref(),
+                    candidates,
                     handshakes.get(&p.pubkey).copied().flatten(),
                     now,
                 );
-                (p.pubkey.clone(), candidate)
+                (p.pubkey.clone(), tier)
             })
             .collect();
-        ctx.lan_tracker.prune(directory.peers.iter().map(|p| p.pubkey.as_str()));
+        ctx.endpoint_tracker.prune(directory.peers.iter().map(|p| p.pubkey.as_str()));
 
         // 2. reconcile WireGuard peers
         if let Err(e) =
-            ctx.wg.reconcile(&directory.peers, &directory.services, &self_pubkey, prefer_ipv6, &lan_candidates)
+            ctx.wg.reconcile(&directory.peers, &directory.services, &self_pubkey, prefer_ipv6, &endpoint_tiers)
         {
             failures.push(PollError::Wg(e));
         }
@@ -499,12 +509,19 @@ mod tests {
             v4: Some("203.0.113.5:51820".into()),
             v6: None,
         };
-        let req = build_poll_request(&declared, Some("host:51820".into()), &dual, Some("192.168.1.5".into()));
+        let req = build_poll_request(
+            &declared,
+            Some("host:51820".into()),
+            &dual,
+            Some("192.168.1.5".into()),
+            Some("203.0.113.5:55123".into()),
+        );
         assert_eq!(req.services.len(), 1);
         assert_eq!(req.endpoint_addr.as_deref(), Some("host:51820"));
         assert_eq!(req.endpoint_addr_v4.as_deref(), Some("203.0.113.5:51820"));
         assert!(req.endpoint_addr_v6.is_none());
         assert_eq!(req.lan_addr.as_deref(), Some("192.168.1.5"));
+        assert_eq!(req.reflexive_addr.as_deref(), Some("203.0.113.5:55123"));
     }
 
     const NODE: Ipv4Addr = Ipv4Addr::new(10, 9, 0, 1);

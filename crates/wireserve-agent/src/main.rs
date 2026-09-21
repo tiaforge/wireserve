@@ -298,6 +298,7 @@ async fn cmd_daemon(
     let ip6: std::net::Ipv6Addr = state.ip6.clone().unwrap_or_default().parse()?;
     let listen_port = state.listen_port.unwrap_or(register::DEFAULT_LISTEN_PORT);
     let private_key = state.private_key.clone().unwrap_or_default();
+    let coordinator_url = state.coordinator_url.clone().unwrap_or_default();
 
     // Which interface. Claimed here and held for the life of the process,
     // before any firewall state keyed on the name is touched — see
@@ -345,7 +346,7 @@ async fn cmd_daemon(
     }
 
     let mut wg = WgInterface::new(&ifname)?;
-    let mut lan_tracker = wireserve_agent::wg::LanEndpointTracker::default();
+    let mut endpoint_tracker = wireserve_agent::wg::EndpointTracker::default();
 
     // An agent from before multi-instance support kept its firewall state
     // under fixed names. Nothing creates those any more, so whatever is
@@ -381,6 +382,19 @@ async fn cmd_daemon(
     // interface through to our table) right after our own default-deny —
     // see `firewall::guarded_bring_up` for why that order, and what is
     // undone if bring-up fails.
+    //
+    // NAT-traversal step 2 (PLAN.md decisions log #90+): the one-shot
+    // reflexive-address probe MUST run here, before `bring_up` claims
+    // `listen_port` in the kernel — see `reflexive` module doc for why
+    // it can never run again for the life of this process. IPv4 only,
+    // skipped entirely for a node with real working IPv6.
+    let own_reflexive_addr = if wireserve_agent::probe::has_working_ipv6(&coordinator_url, wireserve_agent::probe::PROBE_TIMEOUT).await {
+        None
+    } else {
+        wireserve_agent::reflexive::learn_reflexive_addr(&coordinator_url, listen_port, wireserve_agent::reflexive::PROBE_TIMEOUT).await
+    };
+    tracing::info!(reflexive_addr = ?own_reflexive_addr, "one-shot reflexive-address probe");
+
     let mut interop = firewall::guarded_bring_up(
         &mut fw,
         &mut wg,
@@ -399,7 +413,6 @@ async fn cmd_daemon(
     // boundaries, which still silently dropped any `serve`/`unserve`
     // issued while a poll request was in flight (the copy-back after the
     // poll overwrote it).
-    let coordinator_url = state.coordinator_url.clone().unwrap_or_default();
     let shared_state = Arc::new(Mutex::new(state));
     let ipc_ctx = AgentContext {
         state: shared_state.clone(),
@@ -468,7 +481,8 @@ async fn cmd_daemon(
                     state_path: &state_path,
                     wg: &mut wg,
                     firewall: &mut fw,
-                    lan_tracker: &mut lan_tracker,
+                    endpoint_tracker: &mut endpoint_tracker,
+                    own_reflexive_addr: own_reflexive_addr.as_deref(),
                 };
                 let result = poll_loop::run_once(&mut ctx, &shared_state).await;
                 // Safety net for host-firewall changes the interop's own

@@ -561,6 +561,7 @@ mod tests {
                 endpoint_addr_v4: None,
                 endpoint_addr_v6: None,
                 lan_addr: None,
+                reflexive_addr: None,
                 bearer_token_hash: &format!("bearer-{name}"),
             },
         )

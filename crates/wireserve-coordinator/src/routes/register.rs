@@ -54,6 +54,13 @@ pub async fn register(
             ));
         }
     }
+    if let Some(reflexive) = req.reflexive_addr.as_deref() {
+        if !wireserve_types::is_valid_reflexive_addr(reflexive) {
+            return Err(AppError::BadRequest(
+                "reflexive_addr must be a valid IPv4 ip:port".into(),
+            ));
+        }
+    }
 
     // The budget is read before the lookup and keyed on the
     // proxy-resolved client IP, not the raw TCP peer (which behind spec
@@ -211,6 +218,7 @@ pub async fn register(
             endpoint_addr_v4: endpoint_addr_v4.as_deref(),
             endpoint_addr_v6: endpoint_addr_v6.as_deref(),
             lan_addr: req.lan_addr.as_deref(),
+            reflexive_addr: req.reflexive_addr.as_deref(),
             bearer_token_hash: &bearer_hash,
         },
     )?;

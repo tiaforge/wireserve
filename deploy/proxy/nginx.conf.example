@@ -34,3 +34,9 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
+
+# The reflexive-address UDP responder (NAT-traversal step 2) rides the
+# same port number, 47820, but is intentionally OUTSIDE what this config
+# handles — the `location` block above only ever forwards HTTP over TCP.
+# It needs its own direct UDP forward at your firewall/router; see
+# deploy/env/coordinator.env.example.

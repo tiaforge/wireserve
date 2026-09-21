@@ -262,7 +262,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // only line of defense" reasoning as export_config's
                 // renderer.
                 println!(
-                    "{}\t{}\t{}\t{}\tendpoint={}\tv4={}\tv6={}\tlan={}",
+                    "{}\t{}\t{}\t{}\tendpoint={}\tv4={}\tv6={}\tlan={}\treflexive={}",
                     sanitize_for_terminal(&p.name),
                     sanitize_for_terminal(&p.pubkey),
                     sanitize_for_terminal(&p.ip4),
@@ -280,6 +280,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         .map(sanitize_for_terminal)
                         .unwrap_or_else(|| "-".to_string()),
                     p.lan_addr
+                        .as_deref()
+                        .map(sanitize_for_terminal)
+                        .unwrap_or_else(|| "-".to_string()),
+                    p.reflexive_addr
                         .as_deref()
                         .map(sanitize_for_terminal)
                         .unwrap_or_else(|| "-".to_string())

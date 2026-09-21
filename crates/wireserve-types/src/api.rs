@@ -76,6 +76,14 @@ pub struct CreateNodeResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeResponse {
     pub addr: String,
+    /// The UDP port `wireserve-coordinator`'s self-hosted reflexive
+    /// responder (`wireserve_types::reflexive`, PLAN.md M22) is bound
+    /// on — same port number as this HTTP API, just UDP (see that
+    /// module's doc comment for why no separate port exists). Absent
+    /// for an older coordinator that predates the feature, which an
+    /// agent must treat as a clean "nothing to probe," never an error.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reflexive_port: Option<u16>,
 }
 
 // ---- §4.2 Node: register ----
@@ -109,6 +117,18 @@ pub struct RegisterRequest {
     /// hairpin/loopback (PLAN.md decisions log #85).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub lan_addr: Option<String>,
+    /// This node's own `ip:port` as observed by the coordinator's
+    /// self-hosted reflexive UDP responder (PLAN.md M22) — learned once
+    /// per process lifetime via a one-shot probe run immediately before
+    /// `wg::WgInterface::bring_up` claims `listen_port`, since the
+    /// kernel WireGuard socket that will actually carry traffic can't be
+    /// multiplexed with a userspace probe. Unlike `lan_addr`, this
+    /// carries its own port — it comes straight from a real observed
+    /// socket address rather than borrowing one. `None` when the probe
+    /// failed, the node has real working IPv6 (this mechanism is
+    /// IPv4-only), or the coordinator predates the feature.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reflexive_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +217,12 @@ pub struct PollRequest {
     /// self-discovery, re-run every poll cycle.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub lan_addr: Option<String>,
+    /// See `RegisterRequest::reflexive_addr`'s doc comment. Resent
+    /// verbatim on every poll (the value itself is learned once, not
+    /// re-probed per cycle) so the coordinator's COALESCE contract stays
+    /// uniform across every self-reported field.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reflexive_addr: Option<String>,
     #[serde(default)]
     pub services: Vec<ServiceDecl>,
 }
@@ -224,6 +250,14 @@ pub struct PeerInfo {
     /// private ranges (PLAN.md decisions log #85).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub lan_addr: Option<String>,
+    /// This peer's own reflexive address — see
+    /// `RegisterRequest::reflexive_addr`. Used by
+    /// `wg::choose_peer_endpoint` once `wg::EndpointTracker` has
+    /// actually verified it with a real handshake; never trusted
+    /// outright, since a NAT's mapping can be wrong or the peer behind
+    /// symmetric NAT (PLAN.md decisions log #90+).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reflexive_addr: Option<String>,
     /// See PLAN.md decisions log #3: approximated from the coordinator's
     /// own `last_seen` bookkeeping, not a true WireGuard handshake
     /// observation (the coordinator is never itself a WireGuard peer).
@@ -407,6 +441,7 @@ mod tests {
         assert!(req.endpoint_addr_v4.is_none());
         assert!(req.endpoint_addr_v6.is_none());
         assert!(req.lan_addr.is_none());
+        assert!(req.reflexive_addr.is_none());
     }
 
     #[test]
@@ -418,6 +453,7 @@ mod tests {
         assert!(req.endpoint_addr_v4.is_none());
         assert!(req.endpoint_addr_v6.is_none());
         assert!(req.lan_addr.is_none());
+        assert!(req.reflexive_addr.is_none());
     }
 
     #[test]
@@ -490,6 +526,7 @@ mod tests {
                 endpoint_addr_v4: Some("203.0.113.5:51820".into()),
                 endpoint_addr_v6: None,
                 lan_addr: None,
+                reflexive_addr: Some("203.0.113.5:55123".into()),
                 last_handshake: None,
             }],
             services: vec![ServiceInfo {
@@ -513,6 +550,7 @@ mod tests {
             Some("203.0.113.5:51820")
         );
         assert!(back.peers[0].endpoint_addr_v6.is_none());
+        assert_eq!(back.peers[0].reflexive_addr.as_deref(), Some("203.0.113.5:55123"));
         assert_eq!(back.services[0].name, "plex");
         assert_eq!(back.services[0].proto, Proto::Tcp);
     }

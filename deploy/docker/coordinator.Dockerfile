@@ -83,4 +83,9 @@ ENV WIRESERVE_COORDINATOR_URL=http://127.0.0.1:47821
 ENV WIRESERVE_REGISTER_URL=http://127.0.0.1:47820
 VOLUME ["/var/lib/wireserve"]
 EXPOSE 47820
+# Same port number as the line above, over UDP: the reflexive-address
+# responder (NAT-traversal step 2, PLAN.md decisions log #90+). See
+# deploy/quadlet/wireserve-coordinator.container's comment on why this
+# one needs its own direct publish even when the TCP port isn't public.
+EXPOSE 47820/udp
 ENTRYPOINT ["/usr/local/bin/wireserve-coordinator"]

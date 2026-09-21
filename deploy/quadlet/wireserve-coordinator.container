@@ -25,6 +25,13 @@ EnvironmentFile=-/etc/wireserve/coordinator.env
 # PLAN.md decisions log #24 — a private Docker/Podman network reaching it
 # by container name is the common case).
 PublishPort=127.0.0.1:47820:47820
+# The reflexive UDP responder (NAT-traversal step 2, PLAN.md decisions
+# log #90+) rides the SAME port number as the line above, over UDP — but
+# unlike the HTTP API, it must be directly, publicly reachable (a reverse
+# proxy only forwards HTTP, never raw UDP), so it gets its own
+# deliberately non-loopback PublishPort line even where the TCP one above
+# is loopback-only or unpublished.
+PublishPort=0.0.0.0:47820:47820/udp
 # The admin port is deliberately not published at all. It binds loopback
 # INSIDE the container (spec §4.0: never 0.0.0.0), so a PublishPort for
 # it would forward to a port nothing listens on. Reach it with

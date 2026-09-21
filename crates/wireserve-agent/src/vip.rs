@@ -99,6 +99,7 @@ mod tests {
             endpoint_addr_v4: None,
             endpoint_addr_v6: None,
             lan_addr: None,
+            reflexive_addr: None,
             last_handshake: None,
         }
     }

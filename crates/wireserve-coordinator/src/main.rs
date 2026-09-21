@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use wireserve_coordinator::{build_state, config, db::Db, routes, Config};
+use wireserve_coordinator::{build_state, config, db::Db, rate_limit, reflexive, routes, Config};
 
 /// Initialises logging with `info` as the floor rather than tracing's own
 /// default.
@@ -67,6 +67,8 @@ async fn main() {
     let admin_listen_addr = config.admin_listen_addr;
     let net_v4_cidr = config.net_v4_cidr.clone();
     let net_v6_prefix = config.net_v6_prefix.clone();
+    let reflexive_rate_limit_max = config.reflexive_rate_limit_max;
+    let reflexive_rate_limit_window_secs = config.reflexive_rate_limit_window_secs;
     let state = build_state(config, db);
 
     let node_app = routes::node_router(state.clone())
@@ -83,6 +85,21 @@ async fn main() {
         .await
         .unwrap_or_else(|err| {
             eprintln!("failed to bind admin listener on {admin_listen_addr}: {err}");
+            std::process::exit(1);
+        });
+    // Same port NUMBER as the node-facing HTTP listener, just UDP — TCP
+    // and UDP are independent port namespaces, so this has never
+    // conflicted with the listener above (PLAN.md M22). Always bound to
+    // every interface regardless of what host `listen_addr` itself uses:
+    // that TCP side is commonly scoped to loopback/private on purpose (a
+    // reverse proxy in front, spec §7), but this responder's whole job
+    // is being directly reachable by NAT'd agents on the internet, so it
+    // must never inherit a narrower bind.
+    let reflexive_addr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_addr.port());
+    let reflexive_socket = tokio::net::UdpSocket::bind(reflexive_addr)
+        .await
+        .unwrap_or_else(|err| {
+            eprintln!("failed to bind reflexive UDP responder on {reflexive_addr}: {err}");
             std::process::exit(1);
         });
 
@@ -132,10 +149,23 @@ async fn main() {
     );
     eprintln!("  (it must terminate TLS — the coordinator itself never speaks TLS, §7)");
     eprintln!();
+    eprintln!(
+        "  Reflexive UDP responder (NAT-traversal step 2) is on port {} too — but that \
+         one your proxy can't forward: it needs its own direct UDP forward at your \
+         firewall/router, since a reverse proxy only speaks HTTP.",
+        listen_addr.port()
+    );
+    eprintln!();
     eprintln!("  Next: add a node —  wireserve-admin create-node <name>");
     eprintln!("========================================================================");
 
-    tracing::info!(%listen_addr, %admin_listen_addr, "wireserve-coordinator starting");
+    tracing::info!(%listen_addr, %admin_listen_addr, %reflexive_addr, "wireserve-coordinator starting");
+
+    let reflexive_limiter = std::sync::Arc::new(rate_limit::SlidingWindowLimiter::new(
+        reflexive_rate_limit_max,
+        reflexive_rate_limit_window_secs,
+    ));
+    tokio::spawn(reflexive::serve(reflexive_socket, reflexive_limiter));
 
     let node_server = axum::serve(node_listener, node_app);
     let admin_server = axum::serve(admin_listener, admin_app);

@@ -141,6 +141,17 @@ start_router() {
 log "starting the two NAT routers"
 start_router "$ROUTER_A" "$SITE_A"
 start_router "$ROUTER_B" "$SITE_B"
+# Router-b's masquerade rewrites the source port to a DIFFERENT one on
+# every new flow (NAT-traversal step 2, PLAN.md decisions log #90+),
+# instead of the plain masquerade's port-preserving default. Without
+# this, the coordinator's naive WAN-endpoint guess (observed IP + the
+# node's own declared listen_port) happens to already be correct on this
+# harness's simple masquerade, so it would never expose the bug the
+# reflexive-address responder exists to fix — real consumer NAT commonly
+# does not preserve the port either. Router-a is untouched: agent1 has a
+# real port-forward and its guessed endpoint is uninteresting here.
+podman exec "$ROUTER_B" nft flush chain ip nat postrouting
+podman exec "$ROUTER_B" nft 'add rule ip nat postrouting oifname "eth0" masquerade random'
 ROUTER_A_WAN=$(ip_on "$ROUTER_A" "$INET")
 ROUTER_A_LAN=$(ip_on "$ROUTER_A" "$SITE_A")
 ROUTER_B_WAN=$(ip_on "$ROUTER_B" "$INET")
@@ -358,6 +369,40 @@ if echo "$AGENT3_ENDPOINTS" | grep -q "$AGENT2_LAN:$WG_PORT"; then
     pass "agent3 reaches agent2 at its LAN address ($AGENT2_LAN:$WG_PORT), not the router's WAN address"
 else
     fail "agent3's configured endpoint for agent2 is not its LAN address — got: $AGENT3_ENDPOINTS"
+fi
+
+# NAT-traversal step 2 (PLAN.md decisions log #90+): agent1 (site-a) and
+# node2/agent2 (site-b) share no LAN, so this pair can only be reached
+# via the naive WAN guess (coordinator-observed IP + node2's own
+# declared listen_port) or the coordinator's self-hosted reflexive
+# responder. Router-b's `masquerade random` (set up before any node
+# registered) makes the naive guess provably wrong, so this is the
+# direct regression test for the feature — run only after the daemons
+# have been polling for a while (not right after `join`), since a UDP
+# conntrack entry from `join`'s own one-shot probe may have already
+# expired.
+list_peers_field() {
+    podman exec "$COORD" wireserve-admin list-peers \
+        | awk -v name="$1" -v prefix="$2" '$1 == name { for (i = 1; i <= NF; i++) if (index($i, prefix) == 1) print substr($i, length(prefix) + 1) }'
+}
+
+log "confirming the reflexive responder learned a real NAT-mapped port, not the naive guess"
+NODE2_REFLEXIVE=$(list_peers_field node2 "reflexive=")
+if [ -z "$NODE2_REFLEXIVE" ] || [ "$NODE2_REFLEXIVE" = "-" ]; then
+    fail "coordinator recorded no reflexive_addr for node2 — the one-shot probe did not succeed"
+fi
+NODE2_REFLEXIVE_PORT=${NODE2_REFLEXIVE##*:}
+if [ "$NODE2_REFLEXIVE_PORT" = "$WG_PORT" ]; then
+    fail "node2's reflexive port equals its own listen_port ($WG_PORT) — router-b's random masquerade should have made these differ"
+fi
+pass "node2's reflexive address ($NODE2_REFLEXIVE) carries a real NAT-mapped port, not the naive guess"
+
+log "confirming agent1 actually dials node2 at its reflexive address, not the naive endpoint= guess"
+AGENT1_ENDPOINTS=$(in_netns "$AGENT1" wg show wireserve0 endpoints)
+if echo "$AGENT1_ENDPOINTS" | grep -q "$NODE2_REFLEXIVE"; then
+    pass "agent1 reaches node2 at its reflexive address ($NODE2_REFLEXIVE)"
+else
+    fail "agent1's configured endpoint for node2 is not its reflexive address — got: $AGENT1_ENDPOINTS"
 fi
 
 log "default-deny still holds over a NAT-ed tunnel"

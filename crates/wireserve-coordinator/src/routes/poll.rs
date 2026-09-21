@@ -95,6 +95,13 @@ pub async fn poll(
             ));
         }
     }
+    if let Some(reflexive) = req.reflexive_addr.as_deref() {
+        if !wireserve_types::is_valid_reflexive_addr(reflexive) {
+            return Err(AppError::BadRequest(
+                "reflexive_addr must be a valid IPv4 ip:port".into(),
+            ));
+        }
+    }
 
     // Same observed-source-address fallback as `/register` (spec §4.2),
     // re-applied on every poll rather than frozen at join time — see
@@ -145,6 +152,7 @@ pub async fn poll(
             v4: req.endpoint_addr_v4.as_deref(),
             v6: req.endpoint_addr_v6.as_deref(),
             lan: req.lan_addr.as_deref(),
+            reflexive: req.reflexive_addr.as_deref(),
         },
     )?;
 

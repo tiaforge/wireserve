@@ -1561,3 +1561,92 @@ what the library does and does not do on your behalf.
     address*, not the shared router's WAN address — proving the router
     was bypassed entirely, not merely that connectivity happened to work
     because this particular test router supports hairpin.
+
+## M22 — reflexive (NAT-mapped) address discovery, NAT-traversal step 2
+
+90. **A self-hosted, STUN-like UDP responder, learned once per process
+    lifetime.** The only WAN endpoint a node ever reported
+    (`endpoint_addr_v4`/`_v6`) was the coordinator's TCP/HTTPS-*observed
+    source IP* paired with the node's own *self-declared* `listen_port` —
+    never an actually NAT-mapped port, so it was only ever correct for a
+    real public IP or a manual 1:1 port-forward. Now the coordinator runs
+    a minimal, fixed-size, unauthenticated UDP responder
+    (`wireserve_types::reflexive`, `wireserve-coordinator::reflexive`)
+    that echoes back the observed `ip:port` — deliberately not real RFC
+    5389 STUN, since nothing else needs to interoperate with it — and
+    each agent asks it once, from a socket it briefly binds to the exact
+    `listen_port` it is about to hand to `wg::WgInterface::bring_up`
+    (`wireserve-agent::reflexive::learn_reflexive_addr`), then closes,
+    relying on the NAT reusing that port's external mapping moments
+    later. Kernel WireGuard (`defguard_wireguard_rs::Kernel`) owns the
+    real socket once `bring_up` runs, with no way for the agent to
+    multiplex a probe through it the way a userspace WireGuard
+    implementation could — this is the reason it can only run once per
+    process lifetime (`register::join` and each `cmd_daemon` startup),
+    not every poll cycle, and why a NAT remapping later (a router
+    reboot) is only recovered by a restart, the same class of limitation
+    `listen_port` itself already has. IPv4 only, and skipped entirely
+    for a node with real working IPv6 (`probe::has_working_ipv6`).
+
+91. **The UDP responder is a public reflector, so its own size is the
+    security mechanism.** An unauthenticated address-echo service is a
+    classic reflection/amplification target — an attacker spoofs a
+    victim's source address so replies go there instead. Rather than
+    rely on rate limiting alone, `RESPONSE_LEN` (19 bytes) is smaller
+    than the required fixed `REQUEST_LEN` (64 bytes) by construction, so
+    the reflection factor is always under 1x regardless of request
+    shape — asserted at compile time (`const _: () = assert!(...)`), not
+    merely tested. On top of that, anything malformed or over its
+    per-source budget (`SlidingWindowLimiter`, extracted from
+    `RateLimiter`'s existing per-source half so the HTTP failed-auth
+    delay mechanism — which sleeps inside the caller — is never
+    accidentally reused for a UDP receive loop) is dropped silently,
+    never with an error reply, since an error reply is still a reflected
+    packet.
+
+92. **No new port to track.** TCP and UDP are independent port
+    namespaces, so the responder reuses `WIRESERVE_LISTEN_ADDR`'s own
+    port number, always bound to every interface regardless of what host
+    that TCP listener itself uses (which is commonly loopback/private on
+    purpose, spec §7's reverse proxy) — this responder's whole job is
+    being directly reachable, so it must never inherit a narrower bind.
+    The one new operational fact: a reverse proxy only forwards HTTP, so
+    this needs its own direct UDP forward at the firewall/router even
+    though it's "the same port" — called out in the startup banner, the
+    Quadlet file (two `PublishPort` lines, one per protocol, with
+    different bind scopes), the Dockerfile (`EXPOSE .../udp` alongside
+    the existing TCP one), and both proxy example configs.
+
+93. **The LAN tracker generalized into a multi-tier one, not duplicated.**
+    `LanCandidate`/`resolve_lan_candidate`/`LanEndpointTracker` (M21)
+    became `EndpointTier::{Lan, Reflexive, Wan}` /
+    `resolve_endpoint_candidate` / `EndpointTracker`, `RANKED_TIERS =
+    [Lan, Reflexive]` most-preferred first — a future relay tier (step 3,
+    not yet designed) is added to that one list and nowhere else in the
+    ranking logic. Every peer's per-tier grace-window/backoff state
+    (`TierState`) is now independent, and a real behavioral gap surfaced
+    while writing the generalized test suite: roam detection originally
+    lived on the single *active* tier only, so a NAT remapping on a tier
+    that was currently sitting out a backoff window on `Wan` was never
+    even noticed — fixed by moving `last_seen_value` into each tier's own
+    `TierState` rather than tracking it once per peer, so a value change
+    is detected (and that tier's stale backoff history discarded)
+    regardless of whether the tier is presently active. When the active
+    tier's grace window expires without a confirming handshake, the very
+    same cycle tries the next-best tier rather than waiting a cycle to
+    fall to `Wan`, proven by a dedicated tier-advancement test with
+    independent backoff timers per tier. `choose_peer_endpoint` gained a
+    `Reflexive` branch — unlike `Lan`, it carries its own port, so it
+    doesn't need `wan_port`'s borrowing trick.
+
+94. **`run-nat-test.sh`'s no-port-forward pair is the direct regression
+    test.** Its simple `masquerade` happened to preserve the WireGuard
+    socket's source port, so the pre-existing naive WAN guess was
+    *already* accidentally correct there — the harness never actually
+    exercised the bug this step fixes. Router-b's rule became `masquerade
+    random`, set up before any node registers; the new assertions check
+    that `list-peers` records a `reflexive=` port different from the
+    node's own `listen_port` (proving the guess really would have been
+    wrong), and that agent1 — which shares no LAN with node2/agent2, so
+    only the WAN tier is in play — actually dials node2 at that reflexive
+    address rather than the naive one.

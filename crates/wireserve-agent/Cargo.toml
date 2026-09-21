@@ -19,6 +19,7 @@ reqwest.workspace = true
 defguard_wireguard_rs.workspace = true
 rpassword.workspace = true
 libc.workspace = true
+rand.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nftables.workspace = true

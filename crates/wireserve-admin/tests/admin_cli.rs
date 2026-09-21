@@ -23,6 +23,7 @@ fn export_config_end_to_end_and_private_key_never_leaves_process() {
         endpoint_addr_v4: None,
         endpoint_addr_v6: None,
         lan_addr: None,
+        reflexive_addr: None,
         last_handshake: None,
     }]);
 
@@ -221,6 +222,7 @@ fn list_peers_reflects_mock_directory() {
         endpoint_addr_v4: None,
         endpoint_addr_v6: None,
         lan_addr: None,
+        reflexive_addr: None,
         last_handshake: None,
     }]);
     let client = AdminClient::new(mock.base_url.as_str(), TOKEN);

@@ -103,6 +103,22 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
         crate::probe::PROBE_TIMEOUT,
     )
     .await;
+    // NAT-hairpin/reflexive-address discovery (PLAN.md decisions log
+    // #85, #90+) is IPv4-only — a node with real working IPv6 (the same
+    // signal `dual.v6.is_some()` already reports) needs neither and
+    // skips both to avoid a redundant probe. Must run before `bring_up`
+    // claims `listen_port` — see `reflexive` module doc — which at join
+    // time hasn't happened yet at all, so this is always safe here.
+    let reflexive_addr = if dual.v6.is_some() {
+        None
+    } else {
+        crate::reflexive::learn_reflexive_addr(
+            params.coordinator_url,
+            params.listen_port,
+            crate::reflexive::PROBE_TIMEOUT,
+        )
+        .await
+    };
     let req = RegisterRequest {
         join_token: params.join_token.to_string(),
         pubkey: public_key.to_string(),
@@ -115,6 +131,7 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
             &crate::wg::local_lan_ifaces(params.ifname.as_deref().unwrap_or("")).unwrap_or_default(),
         )
         .map(|ip| ip.to_string()),
+        reflexive_addr,
     };
 
     let resp = client.post(&url).json(&req).send().await?;
@@ -163,6 +180,7 @@ mod tests {
             endpoint_addr_v4: None,
             endpoint_addr_v6: None,
             lan_addr: None,
+            reflexive_addr: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains(&private_key.to_string()));

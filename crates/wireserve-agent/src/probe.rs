@@ -70,14 +70,13 @@ fn format_endpoint(ip: IpAddr, port: u16) -> String {
     }
 }
 
-/// Forces one `GET {coordinator_url}/probe` over a connection pinned to
-/// `family`, returning the address the coordinator reports having
-/// observed.
-pub async fn probe_observed_addr(
-    coordinator_url: &str,
-    family: Family,
-    timeout: Duration,
-) -> Result<IpAddr, ProbeError> {
+/// Resolves the coordinator's host to a `(host, addr)` pair pinned to
+/// `family` — either literally (the URL is already a matching-family IP
+/// literal) or via DNS. Shared by `fetch_probe_response`'s family-pinned
+/// HTTP connection and `reflexive::learn_reflexive_addr`'s UDP send
+/// target, so the two never drift on what "the coordinator's address for
+/// family X" means.
+pub async fn resolve_family(coordinator_url: &str, family: Family) -> Result<(String, SocketAddr), ProbeError> {
     let url = reqwest::Url::parse(coordinator_url)
         .map_err(|e| ProbeError::BadUrl(e.to_string()))?;
     let host = url
@@ -102,20 +101,45 @@ pub async fn probe_observed_addr(
             .unwrap_or_default();
         pick_for_family(&candidates, family).ok_or(ProbeError::NoAddressForFamily(family))?
     };
+    Ok((host, pinned))
+}
 
+/// Forces one `GET {coordinator_url}/probe` over a connection pinned to
+/// `family`, returning the coordinator's raw response — the observed
+/// address (`probe_observed_addr`'s own concern) and, since PLAN.md M22,
+/// `reflexive_port` (`reflexive::learn_reflexive_addr`'s concern). Shared
+/// by both so there is exactly one place that makes this HTTP call.
+pub async fn fetch_probe_response(
+    coordinator_url: &str,
+    family: Family,
+    timeout: Duration,
+) -> Result<wireserve_types::ProbeResponse, ProbeError> {
+    let (host, pinned) = resolve_family(coordinator_url, family).await?;
     let client = reqwest::Client::builder()
         .resolve(&host, pinned)
         .timeout(timeout)
         .build()?;
 
     let probe_url = format!("{}/probe", coordinator_url.trim_end_matches('/'));
-    let resp: wireserve_types::ProbeResponse = client
+    let resp = client
         .get(&probe_url)
         .send()
         .await?
         .error_for_status()?
         .json()
         .await?;
+    Ok(resp)
+}
+
+/// Forces one `GET {coordinator_url}/probe` over a connection pinned to
+/// `family`, returning the address the coordinator reports having
+/// observed.
+pub async fn probe_observed_addr(
+    coordinator_url: &str,
+    family: Family,
+    timeout: Duration,
+) -> Result<IpAddr, ProbeError> {
+    let resp = fetch_probe_response(coordinator_url, family, timeout).await?;
     resp.addr
         .parse()
         .map_err(|_| ProbeError::BadResponse(resp.addr))

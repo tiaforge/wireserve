@@ -50,14 +50,74 @@ const DELAY_MAX: Duration = Duration::from_millis(1000);
 /// which is the exact shape of the problem it exists to reduce.
 const MAX_CONCURRENT_DELAYS: usize = 64;
 
-pub struct RateLimiter {
+/// A per-source sliding-window hit counter, with no notion of
+/// "failure," no global budget, and no response delay — just "has this
+/// source exceeded `max` recorded hits in the last `window`."
+/// `RateLimiter` wraps one of these for its own per-source half (see the
+/// module doc's mechanism (1)); the coordinator's reflexive UDP
+/// responder (PLAN.md M22) uses one directly, with its own, much smaller
+/// budget, since a stateless UDP echo has no "authentication failure" to
+/// count and — critically — must never sleep inside its single receive
+/// loop the way `RateLimiter`'s delay mechanism does, which would be a
+/// self-inflicted backlog for every other datagram waiting behind it.
+pub struct SlidingWindowLimiter {
     max: u32,
     window: Duration,
     hits: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+}
+
+impl SlidingWindowLimiter {
+    pub fn new(max: u32, window_secs: u64) -> Self {
+        Self {
+            max,
+            window: Duration::from_secs(window_secs),
+            hits: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Whether `ip` has already exhausted its budget for the current
+    /// window — a pure check, records nothing (security review G5: this
+    /// must never insert a map entry, or every distinct source address
+    /// ever seen would occupy memory forever).
+    pub fn is_blocked(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
+        hits.get(&ip).is_some_and(|entry| {
+            let live = entry
+                .iter()
+                .filter(|t| now.duration_since(**t) < self.window)
+                .count();
+            live as u32 >= self.max
+        })
+    }
+
+    /// Records one hit from `ip`. Also where the table is pruned: every
+    /// expired timestamp and every address left with none is dropped, so
+    /// the map is bounded by (sources with a live hit in the window ×
+    /// `max`).
+    pub fn record(&self, ip: IpAddr) {
+        let now = Instant::now();
+        let mut hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
+        hits.retain(|_, entry| {
+            entry.retain(|t| now.duration_since(*t) < self.window);
+            !entry.is_empty()
+        });
+        hits.entry(ip).or_default().push(now);
+    }
+
+    /// Number of source addresses currently tracked — exposed for tests
+    /// that pin down the no-growth guarantee above.
+    pub fn tracked_sources(&self) -> usize {
+        self.hits.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
+pub struct RateLimiter {
+    per_source: SlidingWindowLimiter,
     /// Failures across *all* sources, for the global budget. Kept
-    /// separate from `hits` rather than derived by summing it, because
-    /// `hits` is pruned per source and a sum over it would silently
-    /// change meaning the moment that pruning changed.
+    /// separate from `per_source` rather than derived by summing it,
+    /// because `per_source` is pruned per source and a sum over it would
+    /// silently change meaning the moment that pruning changed.
     global_max: u32,
     global_window: Duration,
     global: Mutex<Vec<Instant>>,
@@ -76,9 +136,7 @@ impl RateLimiter {
         global_window_secs: u64,
     ) -> Self {
         Self {
-            max,
-            window: Duration::from_secs(window_secs),
-            hits: Mutex::new(HashMap::new()),
+            per_source: SlidingWindowLimiter::new(max, window_secs),
             global_max,
             global_window: Duration::from_secs(global_window_secs),
             global: Mutex::new(Vec::new()),
@@ -151,23 +209,13 @@ impl RateLimiter {
     /// a map entry — otherwise every distinct source address ever seen
     /// would occupy memory forever.
     pub fn is_blocked(&self, ip: IpAddr) -> bool {
-        let now = Instant::now();
-        let hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
-        hits.get(&ip).is_some_and(|entry| {
-            let live = entry
-                .iter()
-                .filter(|t| now.duration_since(**t) < self.window)
-                .count();
-            live as u32 >= self.max
-        })
+        self.per_source.is_blocked(ip)
     }
 
     /// Records one failed attempt from `ip` — call only on an actual auth
     /// failure (never on success), so legitimate traffic never eats into
-    /// the budget. This is also where the table is pruned: every expired
-    /// timestamp and every address left with none is dropped, so the map
-    /// is bounded by (sources with a live failure in the window × `max`).
-    /// Failures are rare relative to requests, so the sweep is cheap.
+    /// the budget. Failures are rare relative to requests, so the sweep
+    /// `SlidingWindowLimiter::record` does is cheap.
     pub fn record_failure(&self, ip: IpAddr) {
         let now = Instant::now();
         {
@@ -175,18 +223,13 @@ impl RateLimiter {
             g.retain(|t| now.duration_since(*t) < self.global_window);
             g.push(now);
         }
-        let mut hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
-        hits.retain(|_, entry| {
-            entry.retain(|t| now.duration_since(*t) < self.window);
-            !entry.is_empty()
-        });
-        hits.entry(ip).or_default().push(now);
+        self.per_source.record(ip);
     }
 
     /// Number of source addresses currently tracked — exposed for tests
     /// that pin down the no-growth guarantee above.
     pub fn tracked_sources(&self) -> usize {
-        self.hits.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.per_source.tracked_sources()
     }
 }
 
@@ -197,6 +240,56 @@ mod tests {
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
     }
+
+    // ---- SlidingWindowLimiter, standalone ----
+
+    #[test]
+    fn sliding_window_allows_up_to_max_then_blocks() {
+        let l = SlidingWindowLimiter::new(3, 60);
+        let a = ip("10.0.0.1");
+        for _ in 0..3 {
+            assert!(!l.is_blocked(a));
+            l.record(a);
+        }
+        assert!(l.is_blocked(a), "4th hit within window must be blocked");
+    }
+
+    #[test]
+    fn sliding_window_is_keyed_per_ip() {
+        let l = SlidingWindowLimiter::new(1, 60);
+        let (a, b) = (ip("10.0.0.1"), ip("10.0.0.2"));
+        l.record(a);
+        assert!(l.is_blocked(a));
+        assert!(!l.is_blocked(b), "a different source IP must not be affected");
+    }
+
+    #[test]
+    fn sliding_window_resets_after_window_elapses() {
+        let l = SlidingWindowLimiter::new(1, 0);
+        let a = ip("10.0.0.1");
+        l.record(a);
+        assert!(!l.is_blocked(a));
+    }
+
+    #[test]
+    fn sliding_window_is_blocked_never_inserts_an_entry() {
+        let l = SlidingWindowLimiter::new(1, 60);
+        for n in 0..100u8 {
+            assert!(!l.is_blocked(ip(&format!("203.0.113.{n}"))));
+        }
+        assert_eq!(l.tracked_sources(), 0, "checking must not allocate per source");
+    }
+
+    #[test]
+    fn sliding_window_record_prunes_expired_sources() {
+        let l = SlidingWindowLimiter::new(5, 0);
+        l.record(ip("10.0.0.1"));
+        l.record(ip("10.0.0.2"));
+        l.record(ip("10.0.0.3"));
+        assert_eq!(l.tracked_sources(), 1);
+    }
+
+    // ---- RateLimiter, now delegating to SlidingWindowLimiter ----
 
     #[test]
     fn allows_up_to_max_failures_then_blocks() {

@@ -41,6 +41,8 @@ fn test_config(db_path: &str) -> Config {
         // propagation that was the only behaviour then. They run with it
         // off; the approval tests set it explicitly.
         require_service_approval: false,
+        reflexive_rate_limit_max: 1000,
+        reflexive_rate_limit_window_secs: 60,
     }
 }
 

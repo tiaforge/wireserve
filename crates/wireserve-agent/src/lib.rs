@@ -8,6 +8,7 @@ pub mod lock;
 pub mod paths;
 pub mod poll_loop;
 pub mod probe;
+pub mod reflexive;
 pub mod register;
 #[cfg(target_os = "linux")]
 pub mod routes;

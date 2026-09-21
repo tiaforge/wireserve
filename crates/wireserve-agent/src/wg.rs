@@ -219,143 +219,249 @@ pub fn is_on_own_lan(own_subnets: &[(Ipv4Addr, u8)], addr: Ipv4Addr) -> bool {
     own_subnets.iter().any(|&(net, prefix_len)| network_address(addr, prefix_len) == net)
 }
 
-/// This node's LAN-vs-WAN preference for reaching one peer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LanCandidate {
+/// This node's ranked endpoint-candidate tiers for reaching a peer.
+/// `Wan` needs no entry in [`RANKED_TIERS`]: every peer always resolves
+/// *some* WAN candidate via `choose_peer_endpoint`'s existing explicit/
+/// v4/v6 chain (or `None`), so it is [`EndpointTracker`]'s universal,
+/// always-available fallback — only ever a *return value*, never a key
+/// tracked in its per-tier backoff state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EndpointTier {
     Lan,
+    Reflexive,
     Wan,
 }
 
-/// Per-peer LAN-vs-WAN state across poll cycles. `Instant`, not
-/// wall-clock time — process-local scheduling only, never persisted,
-/// never compared across a restart (an agent restart simply repeats one
-/// optimistic LAN probe, which is acceptable).
+/// Every tracked tier, most-preferred first. A future relay tier (NAT
+/// traversal step 3, not yet designed) is added here and nowhere else in
+/// the ranking logic below.
+const RANKED_TIERS: &[EndpointTier] = &[EndpointTier::Lan, EndpointTier::Reflexive];
+
+/// One peer's currently-advertised candidate values, this cycle, built
+/// once per cycle by the caller (`poll_loop::run_once`) from a
+/// `PeerInfo` plus this node's own `own_lan_subnets` (the `Lan` tier's
+/// subnet-containment check happens here — `Reflexive` has no analogous
+/// check; any structurally well-formed value is a plausible candidate,
+/// same as `is_valid_reflexive_addr`'s own limited guarantee).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PeerTierCandidates<'a> {
+    pub lan: Option<&'a str>,
+    pub reflexive: Option<&'a str>,
+}
+
+/// Builds `peer`'s candidates for this cycle. A `Lan` value is present
+/// only when it both parses and falls inside one of `own_subnets` (see
+/// `is_on_own_lan`'s doc comment on why that's a hint, not proof); a
+/// `Reflexive` value is present whenever it's structurally well-formed.
+#[must_use]
+pub fn peer_tier_candidates<'a>(own_subnets: &[(Ipv4Addr, u8)], peer: &'a PeerInfo) -> PeerTierCandidates<'a> {
+    let lan = peer
+        .lan_addr
+        .as_deref()
+        .filter(|s| s.parse::<Ipv4Addr>().is_ok_and(|a| is_on_own_lan(own_subnets, a)));
+    let reflexive = peer.reflexive_addr.as_deref().filter(|s| wireserve_types::is_valid_reflexive_addr(s));
+    PeerTierCandidates { lan, reflexive }
+}
+
+fn candidate_value<'a>(candidates: &PeerTierCandidates<'a>, tier: EndpointTier) -> Option<&'a str> {
+    match tier {
+        EndpointTier::Lan => candidates.lan,
+        EndpointTier::Reflexive => candidates.reflexive,
+        EndpointTier::Wan => None,
+    }
+}
+
+/// Per-tier grace/backoff bookkeeping — at most `RANKED_TIERS.len()`
+/// entries ever exist in an `EndpointPeerState`'s map. `last_seen_value`
+/// lives here, per tier, rather than once on `EndpointPeerState`: roam
+/// detection (see `resolve_endpoint_candidate`) has to work for a tier
+/// that isn't even the currently-active one — a NAT remapping can just
+/// as easily happen to a candidate that's presently sitting out a
+/// backoff window on `Wan`, and that stale backoff history must not
+/// survive the address it was measured against.
 #[derive(Debug, Clone)]
-pub struct LanPeerState {
-    current: LanCandidate,
-    switched_at: std::time::Instant,
-    /// The kernel's `last_handshake` at the moment `current` last became
-    /// `Lan`. A grace-window "success" is detected as this value
-    /// *advancing* — a genuinely new handshake happened — never by
-    /// comparing it against `switched_at` directly: `Instant` and the
-    /// kernel's wall-clock `last_handshake` are different clocks and
-    /// cannot be compared. `switched_at` is used only for the (purely
-    /// relative, monotonic) grace-window/backoff deadlines below.
-    baseline_handshake: Option<chrono::DateTime<chrono::Utc>>,
-    last_seen_lan_addr: String,
-    next_lan_retry_at: Option<std::time::Instant>,
+struct TierState {
+    last_seen_value: String,
+    next_retry_at: Option<std::time::Instant>,
     backoff: std::time::Duration,
 }
 
-/// How long a freshly-tried LAN candidate gets to produce a real
-/// handshake before falling back to the WAN one — long enough for at
-/// least two `persistent_keepalive`-triggered handshake attempts.
-pub const LAN_GRACE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
-/// The first backoff before retrying a LAN candidate that just failed.
-pub const LAN_RETRY_BACKOFF_INITIAL: std::time::Duration = std::time::Duration::from_secs(120);
+impl TierState {
+    fn fresh(value: &str) -> Self {
+        Self { last_seen_value: value.to_string(), next_retry_at: None, backoff: ENDPOINT_RETRY_BACKOFF_INITIAL }
+    }
+}
+
+/// Per-peer endpoint-tier state across poll cycles. `Instant`, not
+/// wall-clock time — process-local scheduling only, never persisted,
+/// never compared across a restart (an agent restart simply repeats one
+/// optimistic attempt per tier, which is acceptable).
+#[derive(Debug, Clone)]
+pub struct EndpointPeerState {
+    current: EndpointTier,
+    switched_at: std::time::Instant,
+    /// The kernel's `last_handshake` at the moment `current` last
+    /// switched to its present tier. A grace-window "success" is
+    /// detected as this value *advancing* — a genuinely new handshake
+    /// happened — never by comparing it against `switched_at` directly:
+    /// `Instant` and the kernel's wall-clock `last_handshake` are
+    /// different clocks and cannot be compared. `switched_at` is used
+    /// only for the (purely relative, monotonic) grace-window/backoff
+    /// deadlines below.
+    baseline_handshake: Option<chrono::DateTime<chrono::Utc>>,
+    per_tier: HashMap<EndpointTier, TierState>,
+}
+
+/// How long a freshly-tried tier gets to produce a real handshake before
+/// falling back — long enough for at least two
+/// `persistent_keepalive`-triggered handshake attempts.
+pub const ENDPOINT_GRACE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// The first backoff before retrying a tier that just failed.
+pub const ENDPOINT_RETRY_BACKOFF_INITIAL: std::time::Duration = std::time::Duration::from_secs(120);
 /// The cap the backoff doubles up to on repeated failures — bounds the
-/// cost of a persistent subnet-collision false positive to one brief,
-/// infrequent probe rather than either permanent failure or hot flapping.
-pub const LAN_RETRY_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(1800);
+/// cost of a persistently-wrong candidate (a subnet collision, a stale
+/// NAT mapping) to one brief, infrequent probe rather than either
+/// permanent failure or hot flapping.
+pub const ENDPOINT_RETRY_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(1800);
 
-/// Decides this cycle's LAN-vs-WAN preference for one peer, and the
-/// updated state to keep (`None` to stop tracking it entirely — no
-/// matching LAN candidate at all, today's plain-WAN behavior). Pure:
-/// `now` and `kernel_last_handshake` are read once per cycle by the
-/// caller (`poll_loop::run_once`, via `tunnel_peers`) and passed in, same
-/// pure-decision/stateful-caller split as the rest of this file.
-#[must_use]
-pub fn resolve_lan_candidate(
-    own_subnets: &[(Ipv4Addr, u8)],
-    peer_lan_addr: Option<&str>,
-    kernel_last_handshake: Option<chrono::DateTime<chrono::Utc>>,
-    state: Option<LanPeerState>,
+/// Picks the best tier available this cycle: the first (most preferred)
+/// tier in [`RANKED_TIERS`] that both has a candidate this cycle and
+/// isn't itself inside a backoff window. `None` if every ranked tier is
+/// unavailable or backed off, meaning fall to [`EndpointTier::Wan`].
+fn pick_tier(
+    candidates: &PeerTierCandidates<'_>,
+    per_tier: &HashMap<EndpointTier, TierState>,
     now: std::time::Instant,
-) -> (LanCandidate, Option<LanPeerState>) {
-    let Some(lan_addr) = peer_lan_addr else {
-        return (LanCandidate::Wan, None);
-    };
-    let Ok(parsed) = lan_addr.parse::<Ipv4Addr>() else {
-        return (LanCandidate::Wan, None);
-    };
-    if !is_on_own_lan(own_subnets, parsed) {
-        return (LanCandidate::Wan, None);
-    }
-
-    let needs_fresh_start = match &state {
-        None => true,
-        // The peer roamed to a different LAN address — its own prior
-        // failure history says nothing about this new one.
-        Some(s) => s.last_seen_lan_addr != lan_addr,
-    };
-
-    let mut state = if needs_fresh_start {
-        LanPeerState {
-            current: LanCandidate::Lan,
-            switched_at: now,
-            baseline_handshake: kernel_last_handshake,
-            last_seen_lan_addr: lan_addr.to_string(),
-            next_lan_retry_at: None,
-            backoff: LAN_RETRY_BACKOFF_INITIAL,
+) -> Option<EndpointTier> {
+    RANKED_TIERS.iter().copied().find(|&tier| {
+        if candidate_value(candidates, tier).is_none() {
+            return false;
         }
-    } else {
-        state.expect("needs_fresh_start is false only when state is Some")
-    };
-
-    match state.current {
-        LanCandidate::Lan => {
-            let confirmed = match (kernel_last_handshake, state.baseline_handshake) {
-                (Some(h), Some(baseline)) => h > baseline,
-                (Some(_), None) => true,
-                (None, _) => false,
-            };
-            if confirmed {
-                state.backoff = LAN_RETRY_BACKOFF_INITIAL;
-            } else if now.duration_since(state.switched_at) >= LAN_GRACE_WINDOW {
-                state.current = LanCandidate::Wan;
-                state.next_lan_retry_at = Some(now + state.backoff);
-                state.backoff = (state.backoff * 2).min(LAN_RETRY_BACKOFF_MAX);
-            }
+        match per_tier.get(&tier).and_then(|t| t.next_retry_at) {
+            Some(retry_at) => now >= retry_at,
+            None => true,
         }
-        LanCandidate::Wan => {
-            if state.next_lan_retry_at.is_some_and(|t| now >= t) {
-                state.current = LanCandidate::Lan;
-                state.switched_at = now;
-                state.baseline_handshake = kernel_last_handshake;
-                state.next_lan_retry_at = None;
-            }
-        }
-    }
-
-    let candidate = state.current;
-    (candidate, Some(state))
+    })
 }
 
-/// Tracks every peer's LAN-vs-WAN state across poll cycles — in-memory
-/// only. Constructed once at daemon startup and lives exactly as long as
-/// `WgInterface` (same lifetime pattern as its own `applied`/`routed`),
-/// threaded through `poll_loop::PollContext`.
+/// Decides this cycle's endpoint-tier preference for one peer, and the
+/// updated state to keep (`None` to stop tracking it entirely — no
+/// candidate on any ranked tier at all, today's plain-`Wan` behavior).
+/// Pure: `now` and `kernel_last_handshake` are read once per cycle by
+/// the caller (`poll_loop::run_once`, via `tunnel_peers`) and passed in,
+/// same pure-decision/stateful-caller split as the rest of this file.
+///
+/// Generalizes the original LAN-only state machine to any number of
+/// ranked tiers: each tracks its own independent grace-window/backoff
+/// schedule (`EndpointPeerState::per_tier`), and when the active tier's
+/// grace window expires without confirmation, the very same cycle tries
+/// the next-best tier that isn't itself backed off — rather than
+/// jumping straight to `Wan` — before eventually landing there once
+/// nothing ranked is available.
+#[must_use]
+pub fn resolve_endpoint_candidate(
+    candidates: PeerTierCandidates<'_>,
+    kernel_last_handshake: Option<chrono::DateTime<chrono::Utc>>,
+    state: Option<EndpointPeerState>,
+    now: std::time::Instant,
+) -> (EndpointTier, Option<EndpointPeerState>) {
+    if RANKED_TIERS.iter().all(|&t| candidate_value(&candidates, t).is_none()) {
+        return (EndpointTier::Wan, None);
+    }
+
+    let mut per_tier: HashMap<EndpointTier, TierState> =
+        state.as_ref().map(|s| s.per_tier.clone()).unwrap_or_default();
+
+    // Roam detection, per tier, independent of which tier (if any) is
+    // currently active: a candidate whose value differs from what was
+    // last seen for that specific tier gets a fresh start -- its prior
+    // backoff history says nothing about a new address/NAT mapping.
+    for &tier in RANKED_TIERS {
+        if let Some(value) = candidate_value(&candidates, tier) {
+            if per_tier.get(&tier).is_some_and(|t| t.last_seen_value != value) {
+                per_tier.remove(&tier);
+            }
+        }
+    }
+
+    // Try to continue on the currently-active tier, if it's ranked,
+    // still has a candidate this cycle, and didn't just get reset above
+    // by the roam check (a survived entry means "same tier, same value").
+    if let Some(s) = &state {
+        if RANKED_TIERS.contains(&s.current) {
+            if let (Some(_value), true) = (candidate_value(&candidates, s.current), per_tier.contains_key(&s.current)) {
+                let confirmed = match (kernel_last_handshake, s.baseline_handshake) {
+                    (Some(h), Some(baseline)) => h > baseline,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                };
+                let tier = s.current;
+                if confirmed {
+                    per_tier.get_mut(&tier).unwrap().backoff = ENDPOINT_RETRY_BACKOFF_INITIAL;
+                    return (
+                        tier,
+                        Some(EndpointPeerState { current: tier, switched_at: s.switched_at, baseline_handshake: kernel_last_handshake, per_tier }),
+                    );
+                } else if now.duration_since(s.switched_at) < ENDPOINT_GRACE_WINDOW {
+                    return (
+                        tier,
+                        Some(EndpointPeerState { current: tier, switched_at: s.switched_at, baseline_handshake: s.baseline_handshake, per_tier }),
+                    );
+                }
+                // Grace window expired without confirmation -- fail this
+                // tier's own backoff, then fall through to reselect.
+                let entry = per_tier.get_mut(&tier).unwrap();
+                entry.next_retry_at = Some(now + entry.backoff);
+                entry.backoff = (entry.backoff * 2).min(ENDPOINT_RETRY_BACKOFF_MAX);
+            }
+        }
+    }
+
+    // Reselect: reached for a brand-new peer, a peer currently on `Wan`,
+    // an active tier whose candidate vanished or just roamed, or an
+    // active tier that just failed its grace window above -- in every
+    // case, pick whichever ranked tier is best available this cycle
+    // (preserving any existing tier's accumulated backoff, since a
+    // retry-due tier is not a fresh one), or fall to `Wan`.
+    match pick_tier(&candidates, &per_tier, now) {
+        Some(tier) => {
+            let value = candidate_value(&candidates, tier).expect("pick_tier only ever returns a tier with a candidate this cycle");
+            per_tier.entry(tier).or_insert_with(|| TierState::fresh(value));
+            (
+                tier,
+                Some(EndpointPeerState { current: tier, switched_at: now, baseline_handshake: kernel_last_handshake, per_tier }),
+            )
+        }
+        None => (
+            EndpointTier::Wan,
+            Some(EndpointPeerState { current: EndpointTier::Wan, switched_at: now, baseline_handshake: None, per_tier }),
+        ),
+    }
+}
+
+/// Tracks every peer's endpoint-tier state across poll cycles —
+/// in-memory only. Constructed once at daemon startup and lives exactly
+/// as long as `WgInterface` (same lifetime pattern as its own
+/// `applied`/`routed`), threaded through `poll_loop::PollContext`.
 #[derive(Debug, Default)]
-pub struct LanEndpointTracker {
-    states: HashMap<String, LanPeerState>,
+pub struct EndpointTracker {
+    states: HashMap<String, EndpointPeerState>,
 }
 
-impl LanEndpointTracker {
+impl EndpointTracker {
     pub fn resolve(
         &mut self,
         pubkey: &str,
-        own_subnets: &[(Ipv4Addr, u8)],
-        peer_lan_addr: Option<&str>,
+        candidates: PeerTierCandidates<'_>,
         kernel_last_handshake: Option<chrono::DateTime<chrono::Utc>>,
         now: std::time::Instant,
-    ) -> LanCandidate {
+    ) -> EndpointTier {
         let state = self.states.remove(pubkey);
-        let (candidate, new_state) =
-            resolve_lan_candidate(own_subnets, peer_lan_addr, kernel_last_handshake, state, now);
+        let (tier, new_state) = resolve_endpoint_candidate(candidates, kernel_last_handshake, state, now);
         if let Some(new_state) = new_state {
             self.states.insert(pubkey.to_string(), new_state);
         }
-        candidate
+        tier
     }
 
     /// Drops tracked state for any pubkey not in `current` — a peer that
@@ -400,22 +506,34 @@ pub fn peer_allowed_ips(ip4: &str, ip6: &str) -> Vec<IpAddrMask> {
 /// which an IPv6-less node could never dial — that fix only covered the
 /// pair, not this field, until now).
 ///
-/// `lan` — this cycle's `LanEndpointTracker::resolve` result for this
-/// peer (`None` when the peer has no LAN candidate the tracker is
-/// tracking at all) — takes priority over all of the above when it says
-/// `Lan`: a direct, router-free LAN path beats every WAN candidate,
-/// operator override included, since it can only ever be *offered* when
-/// it has already been optimistically verified or is being re-verified
-/// (see `resolve_lan_candidate`). Falls through to the WAN logic below
-/// when the LAN address doesn't parse or no WAN candidate exists to
-/// borrow a port from (PLAN.md decisions log #85).
-pub fn choose_peer_endpoint(p: &PeerInfo, prefer_ipv6: bool, lan: Option<LanCandidate>) -> Option<String> {
-    if lan == Some(LanCandidate::Lan) {
-        if let (Some(ip), Some(port)) =
-            (p.lan_addr.as_deref().and_then(|s| s.parse::<Ipv4Addr>().ok()), wan_port(p))
-        {
-            return Some(format!("{ip}:{port}"));
+/// `tier` — this cycle's `EndpointTracker::resolve` result for this peer
+/// (`None` when the tracker isn't tracking any ranked candidate for it
+/// at all) — takes priority over all of the above when it names a
+/// ranked tier: a direct, router-free (`Lan`) or NAT-punched
+/// (`Reflexive`) path beats every WAN candidate, operator override
+/// included, since a ranked tier is only ever *offered* when it has
+/// already been optimistically verified or is being re-verified (see
+/// `resolve_endpoint_candidate`). Falls through to the WAN logic below
+/// when the named tier's own value doesn't parse, or (for `Lan`, which
+/// is a bare address) no WAN candidate exists to borrow a port from
+/// (PLAN.md decisions log #85, #90+).
+pub fn choose_peer_endpoint(p: &PeerInfo, prefer_ipv6: bool, tier: Option<EndpointTier>) -> Option<String> {
+    match tier {
+        Some(EndpointTier::Lan) => {
+            if let (Some(ip), Some(port)) =
+                (p.lan_addr.as_deref().and_then(|s| s.parse::<Ipv4Addr>().ok()), wan_port(p))
+            {
+                return Some(format!("{ip}:{port}"));
+            }
         }
+        Some(EndpointTier::Reflexive) => {
+            if let Some(addr) = p.reflexive_addr.as_deref() {
+                if wireserve_types::is_valid_reflexive_addr(addr) {
+                    return Some(addr.to_string());
+                }
+            }
+        }
+        Some(EndpointTier::Wan) | None => {}
     }
     if let Some(explicit) = &p.endpoint_addr {
         let is_ipv6_literal = explicit.starts_with('[');
@@ -454,16 +572,16 @@ fn wan_port(p: &PeerInfo) -> Option<u16> {
 /// (`services`, already through `vip::sanitize`), which is what routes a
 /// connection to `<name>.wg` to that peer.
 ///
-/// `lan_candidates` is this cycle's `LanEndpointTracker` resolution per
-/// peer pubkey (PLAN.md decisions log #85) — a peer absent from it (or
-/// resolved to `Wan`) gets plain WAN behavior, unchanged from before this
-/// feature existed.
+/// `endpoint_tiers` is this cycle's `EndpointTracker` resolution per
+/// peer pubkey (PLAN.md decisions log #85, #90+) — a peer absent from it
+/// (or resolved to `Wan`) gets plain WAN behavior, unchanged from before
+/// this feature existed.
 pub fn desired_peers(
     peers: &[PeerInfo],
     services: &[ServiceInfo],
     self_pubkey: &str,
     prefer_ipv6: bool,
-    lan_candidates: &HashMap<String, LanCandidate>,
+    endpoint_tiers: &HashMap<String, EndpointTier>,
 ) -> HashMap<Key, Peer> {
     let mut desired = HashMap::new();
     for p in peers {
@@ -479,8 +597,8 @@ pub fn desired_peers(
         peer.allowed_ips.extend(
             owned_vips(services, &p.name).map(|vip| IpAddrMask::host(IpAddr::V4(vip))),
         );
-        let lan = lan_candidates.get(&p.pubkey).copied();
-        if let Some(endpoint) = choose_peer_endpoint(p, prefer_ipv6, lan) {
+        let tier = endpoint_tiers.get(&p.pubkey).copied();
+        if let Some(endpoint) = choose_peer_endpoint(p, prefer_ipv6, tier) {
             if let Err(e) = peer.set_endpoint(&endpoint) {
                 tracing::warn!(peer = %p.name, error = %e, "could not resolve peer endpoint");
             }
@@ -752,9 +870,9 @@ impl WgInterface {
         services: &[ServiceInfo],
         self_pubkey: &str,
         prefer_ipv6: bool,
-        lan_candidates: &HashMap<String, LanCandidate>,
+        endpoint_tiers: &HashMap<String, EndpointTier>,
     ) -> Result<(), WireguardInterfaceError> {
-        let desired = desired_peers(peers, services, self_pubkey, prefer_ipv6, lan_candidates);
+        let desired = desired_peers(peers, services, self_pubkey, prefer_ipv6, endpoint_tiers);
 
         let to_remove = peers_to_remove(self.applied.keys(), &desired);
         for key in &to_remove {
@@ -839,6 +957,7 @@ mod tests {
             endpoint_addr_v4: None,
             endpoint_addr_v6: None,
             lan_addr: None,
+            reflexive_addr: None,
             last_handshake: None,
         }
     }
@@ -1037,14 +1156,14 @@ mod tests {
         p.endpoint_addr_v4 = Some("203.0.113.5:51820".into());
         p.lan_addr = Some("192.168.1.50".into());
         assert_eq!(
-            choose_peer_endpoint(&p, false, Some(LanCandidate::Lan)),
+            choose_peer_endpoint(&p, false, Some(EndpointTier::Lan)),
             Some("192.168.1.50:51820".into()),
             "borrows its port from the v4 WAN candidate"
         );
         assert_eq!(
-            choose_peer_endpoint(&p, false, Some(LanCandidate::Wan)),
+            choose_peer_endpoint(&p, false, Some(EndpointTier::Wan)),
             Some("duckdns.example.com:51820".into()),
-            "Wan resolves exactly as if lan were None"
+            "Wan resolves exactly as if tier were None"
         );
         assert_eq!(
             choose_peer_endpoint(&p, false, None),
@@ -1059,7 +1178,7 @@ mod tests {
         // logic (here, nothing at all).
         let mut p = peer("n1", &key_b64(2));
         p.lan_addr = Some("192.168.1.50".into());
-        assert_eq!(choose_peer_endpoint(&p, false, Some(LanCandidate::Lan)), None);
+        assert_eq!(choose_peer_endpoint(&p, false, Some(EndpointTier::Lan)), None);
     }
 
     #[test]
@@ -1068,7 +1187,34 @@ mod tests {
         p.endpoint_addr_v4 = Some("203.0.113.5:51820".into());
         p.lan_addr = Some("not-an-ip".into());
         assert_eq!(
-            choose_peer_endpoint(&p, false, Some(LanCandidate::Lan)),
+            choose_peer_endpoint(&p, false, Some(EndpointTier::Lan)),
+            Some("203.0.113.5:51820".into())
+        );
+    }
+
+    #[test]
+    fn choose_peer_endpoint_prefers_the_resolved_reflexive_candidate() {
+        let mut p = peer("n1", &key_b64(2));
+        p.endpoint_addr = Some("duckdns.example.com:51820".into());
+        p.reflexive_addr = Some("203.0.113.5:55123".into());
+        assert_eq!(
+            choose_peer_endpoint(&p, false, Some(EndpointTier::Reflexive)),
+            Some("203.0.113.5:55123".into()),
+            "carries its own port, unlike Lan"
+        );
+        assert_eq!(
+            choose_peer_endpoint(&p, false, Some(EndpointTier::Wan)),
+            Some("duckdns.example.com:51820".into())
+        );
+    }
+
+    #[test]
+    fn choose_peer_endpoint_falls_back_when_reflexive_chosen_but_malformed() {
+        let mut p = peer("n1", &key_b64(2));
+        p.endpoint_addr_v4 = Some("203.0.113.5:51820".into());
+        p.reflexive_addr = Some("not-an-ip:port".into());
+        assert_eq!(
+            choose_peer_endpoint(&p, false, Some(EndpointTier::Reflexive)),
             Some("203.0.113.5:51820".into())
         );
     }
@@ -1222,219 +1368,257 @@ mod tests {
         assert!(is_on_own_lan(&subnets, "192.168.1.200".parse().unwrap()));
     }
 
-    // ---- NAT-hairpin fix: resolve_lan_candidate's staleness state machine ----
+    // ---- NAT-hairpin fix: peer_tier_candidates ----
 
-    const GRACE: std::time::Duration = LAN_GRACE_WINDOW;
-
-    fn subnets_containing(addr: &str) -> Vec<(Ipv4Addr, u8)> {
-        vec![(addr.parse().unwrap(), 24)]
+    fn info_with(lan_addr: Option<&str>, reflexive_addr: Option<&str>) -> PeerInfo {
+        let mut p = peer("n1", &key_b64(2));
+        p.lan_addr = lan_addr.map(String::from);
+        p.reflexive_addr = reflexive_addr.map(String::from);
+        p
     }
 
     #[test]
-    fn no_lan_addr_from_peer_is_plain_wan_untracked() {
-        let now = std::time::Instant::now();
-        let (candidate, state) = resolve_lan_candidate(&subnets_containing("192.168.1.0"), None, None, None, now);
-        assert_eq!(candidate, LanCandidate::Wan);
-        assert!(state.is_none());
+    fn peer_tier_candidates_keeps_a_lan_addr_inside_an_own_subnet() {
+        let subnets = own_lan_subnets(&[lan("192.168.1.2", 24)]);
+        let p = info_with(Some("192.168.1.50"), None);
+        assert_eq!(peer_tier_candidates(&subnets, &p).lan, Some("192.168.1.50"));
     }
 
     #[test]
-    fn lan_addr_outside_every_own_subnet_is_plain_wan_untracked() {
+    fn peer_tier_candidates_drops_a_lan_addr_outside_every_own_subnet() {
+        let subnets = own_lan_subnets(&[lan("192.168.1.2", 24)]);
+        let p = info_with(Some("10.0.0.5"), None);
+        assert_eq!(peer_tier_candidates(&subnets, &p).lan, None);
+    }
+
+    #[test]
+    fn peer_tier_candidates_keeps_a_well_formed_reflexive_addr() {
+        let p = info_with(None, Some("203.0.113.5:55123"));
+        assert_eq!(peer_tier_candidates(&[], &p).reflexive, Some("203.0.113.5:55123"));
+    }
+
+    #[test]
+    fn peer_tier_candidates_drops_a_malformed_reflexive_addr() {
+        let p = info_with(None, Some("not-an-ip:port"));
+        assert_eq!(peer_tier_candidates(&[], &p).reflexive, None);
+    }
+
+    // ---- NAT-hairpin fix: resolve_endpoint_candidate's staleness state machine ----
+
+    const GRACE: std::time::Duration = ENDPOINT_GRACE_WINDOW;
+
+    fn lan_only(addr: &str) -> PeerTierCandidates<'_> {
+        PeerTierCandidates { lan: Some(addr), reflexive: None }
+    }
+
+    fn reflexive_only(addr: &str) -> PeerTierCandidates<'_> {
+        PeerTierCandidates { lan: None, reflexive: Some(addr) }
+    }
+
+    #[test]
+    fn no_candidate_on_any_tier_is_plain_wan_untracked() {
         let now = std::time::Instant::now();
-        let (candidate, state) = resolve_lan_candidate(
-            &subnets_containing("192.168.1.0"),
-            Some("10.0.0.5"),
-            None,
-            None,
-            now,
-        );
-        assert_eq!(candidate, LanCandidate::Wan);
+        let (tier, state) = resolve_endpoint_candidate(PeerTierCandidates::default(), None, None, now);
+        assert_eq!(tier, EndpointTier::Wan);
         assert!(state.is_none());
     }
 
     #[test]
     fn first_cycle_on_a_matching_lan_optimistically_tries_lan() {
         let now = std::time::Instant::now();
-        let (candidate, state) = resolve_lan_candidate(
-            &subnets_containing("192.168.1.0"),
-            Some("192.168.1.50"),
-            None,
-            None,
-            now,
-        );
-        assert_eq!(candidate, LanCandidate::Lan);
+        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, now);
+        assert_eq!(tier, EndpointTier::Lan);
         assert!(state.is_some());
     }
 
     #[test]
-    fn a_handshake_after_switching_confirms_lan_and_resets_backoff() {
+    fn a_handshake_after_switching_confirms_the_tier_and_resets_its_backoff() {
         let now = std::time::Instant::now();
         let t0 = chrono::Utc::now();
-        let (_, state) = resolve_lan_candidate(
-            &subnets_containing("192.168.1.0"),
-            Some("192.168.1.50"),
-            Some(t0),
-            None,
-            now,
-        );
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), None, now);
         // A genuinely newer handshake than the baseline taken at switch time.
         let newer = t0 + chrono::Duration::seconds(5);
-        let (candidate, state) = resolve_lan_candidate(
-            &subnets_containing("192.168.1.0"),
-            Some("192.168.1.50"),
+        let (tier, state) = resolve_endpoint_candidate(
+            lan_only("192.168.1.50"),
             Some(newer),
             state,
             now + std::time::Duration::from_secs(1),
         );
-        assert_eq!(candidate, LanCandidate::Lan);
-        assert_eq!(state.unwrap().backoff, LAN_RETRY_BACKOFF_INITIAL);
+        assert_eq!(tier, EndpointTier::Lan);
+        assert_eq!(state.unwrap().per_tier[&EndpointTier::Lan].backoff, ENDPOINT_RETRY_BACKOFF_INITIAL);
     }
 
     #[test]
-    fn still_within_the_grace_window_stays_on_lan_awaiting_a_handshake() {
+    fn still_within_the_grace_window_stays_put_awaiting_a_handshake() {
         let now = std::time::Instant::now();
-        let (_, state) = resolve_lan_candidate(
-            &subnets_containing("192.168.1.0"),
-            Some("192.168.1.50"),
-            None,
-            None,
-            now,
-        );
-        let (candidate, _) = resolve_lan_candidate(
-            &subnets_containing("192.168.1.0"),
-            Some("192.168.1.50"),
-            None,
-            state,
-            now + GRACE / 2,
-        );
-        assert_eq!(candidate, LanCandidate::Lan);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, now);
+        let (tier, _) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, now + GRACE / 2);
+        assert_eq!(tier, EndpointTier::Lan);
     }
 
     #[test]
     fn no_handshake_within_the_grace_window_falls_back_to_wan_and_schedules_a_retry() {
         let now = std::time::Instant::now();
-        let (_, state) = resolve_lan_candidate(
-            &subnets_containing("192.168.1.0"),
-            Some("192.168.1.50"),
-            None,
-            None,
-            now,
-        );
-        let (candidate, state) = resolve_lan_candidate(
-            &subnets_containing("192.168.1.0"),
-            Some("192.168.1.50"),
-            None,
-            state,
-            now + GRACE,
-        );
-        assert_eq!(candidate, LanCandidate::Wan);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, now);
+        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, now + GRACE);
+        assert_eq!(tier, EndpointTier::Wan);
         let state = state.unwrap();
-        assert!(state.next_lan_retry_at.is_some());
-        assert_eq!(state.backoff, LAN_RETRY_BACKOFF_INITIAL * 2);
+        let lan = &state.per_tier[&EndpointTier::Lan];
+        assert!(lan.next_retry_at.is_some());
+        assert_eq!(lan.backoff, ENDPOINT_RETRY_BACKOFF_INITIAL * 2);
     }
 
     #[test]
-    fn wan_retries_lan_once_the_backoff_elapses_not_before() {
+    fn wan_retries_the_tier_once_the_backoff_elapses_not_before() {
         let now = std::time::Instant::now();
-        let (_, state) = resolve_lan_candidate(
-            &subnets_containing("192.168.1.0"),
-            Some("192.168.1.50"),
-            None,
-            None,
-            now,
-        );
-        let (_, state) = resolve_lan_candidate(
-            &subnets_containing("192.168.1.0"),
-            Some("192.168.1.50"),
-            None,
-            state,
-            now + GRACE,
-        );
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, now);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, now + GRACE);
         // Not due yet.
-        let (candidate, state) = resolve_lan_candidate(
-            &subnets_containing("192.168.1.0"),
-            Some("192.168.1.50"),
+        let (tier, state) = resolve_endpoint_candidate(
+            lan_only("192.168.1.50"),
             None,
             state,
             now + GRACE + std::time::Duration::from_secs(1),
         );
-        assert_eq!(candidate, LanCandidate::Wan);
+        assert_eq!(tier, EndpointTier::Wan);
         // Due.
-        let (candidate, _) = resolve_lan_candidate(
-            &subnets_containing("192.168.1.0"),
-            Some("192.168.1.50"),
+        let (tier, _) = resolve_endpoint_candidate(
+            lan_only("192.168.1.50"),
             None,
             state,
-            now + GRACE + LAN_RETRY_BACKOFF_INITIAL,
+            now + GRACE + ENDPOINT_RETRY_BACKOFF_INITIAL,
         );
-        assert_eq!(candidate, LanCandidate::Lan);
+        assert_eq!(tier, EndpointTier::Lan);
     }
 
     #[test]
     fn backoff_doubles_up_to_the_cap_on_repeated_failures() {
         let now = std::time::Instant::now();
-        let (_, mut state) = resolve_lan_candidate(
-            &subnets_containing("192.168.1.0"),
-            Some("192.168.1.50"),
-            None,
-            None,
-            now,
-        );
+        let (_, mut state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, now);
         let mut t = now;
-        let mut last_backoff = LAN_RETRY_BACKOFF_INITIAL;
+        let mut last_backoff = ENDPOINT_RETRY_BACKOFF_INITIAL;
         for _ in 0..10 {
             // Fail the grace window.
             t += GRACE;
-            let (_, s) =
-                resolve_lan_candidate(&subnets_containing("192.168.1.0"), Some("192.168.1.50"), None, state, t);
+            let (_, s) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, t);
             let s = s.unwrap();
-            assert!(s.backoff <= LAN_RETRY_BACKOFF_MAX);
-            last_backoff = s.backoff;
-            // Retry LAN once due, so the next iteration fails from Lan again.
-            t = s.next_lan_retry_at.unwrap();
-            let (_, s) =
-                resolve_lan_candidate(&subnets_containing("192.168.1.0"), Some("192.168.1.50"), None, Some(s), t);
+            let lan = s.per_tier[&EndpointTier::Lan].clone();
+            assert!(lan.backoff <= ENDPOINT_RETRY_BACKOFF_MAX);
+            last_backoff = lan.backoff;
+            // Retry once due, so the next iteration fails from Lan again.
+            t = lan.next_retry_at.unwrap();
+            let (_, s) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, Some(s), t);
             state = s;
         }
-        assert_eq!(last_backoff, LAN_RETRY_BACKOFF_MAX, "must have capped by now");
+        assert_eq!(last_backoff, ENDPOINT_RETRY_BACKOFF_MAX, "must have capped by now");
     }
 
     #[test]
     fn a_peer_roaming_to_a_different_lan_address_resets_to_a_fresh_optimistic_attempt() {
         let now = std::time::Instant::now();
-        let subnets = vec![("192.168.1.0".parse().unwrap(), 24), ("192.168.2.0".parse().unwrap(), 24)];
-        let (_, state) = resolve_lan_candidate(&subnets, Some("192.168.1.50"), None, None, now);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, now);
         // Fall back to Wan first, so the roam is a real behavior change,
         // not just staying on Lan by coincidence.
-        let (_, state) = resolve_lan_candidate(&subnets, Some("192.168.1.50"), None, state, now + GRACE);
-        assert_eq!(state.as_ref().unwrap().current, LanCandidate::Wan);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, now + GRACE);
+        assert_eq!(state.as_ref().unwrap().current, EndpointTier::Wan);
 
-        let (candidate, state) =
-            resolve_lan_candidate(&subnets, Some("192.168.2.50"), None, state, now + GRACE + std::time::Duration::from_secs(1));
-        assert_eq!(candidate, LanCandidate::Lan, "a new address gets a fresh optimistic attempt");
-        assert_eq!(state.unwrap().backoff, LAN_RETRY_BACKOFF_INITIAL);
+        let (tier, state) = resolve_endpoint_candidate(
+            lan_only("192.168.2.50"),
+            None,
+            state,
+            now + GRACE + std::time::Duration::from_secs(1),
+        );
+        assert_eq!(tier, EndpointTier::Lan, "a new address gets a fresh optimistic attempt");
+        assert_eq!(state.unwrap().per_tier[&EndpointTier::Lan].backoff, ENDPOINT_RETRY_BACKOFF_INITIAL);
     }
 
     #[test]
-    fn lan_endpoint_tracker_resolves_per_pubkey_independently() {
-        let mut tracker = LanEndpointTracker::default();
+    fn a_peer_roaming_to_a_different_reflexive_address_resets_to_a_fresh_optimistic_attempt() {
         let now = std::time::Instant::now();
-        let subnets = subnets_containing("192.168.1.0");
-        assert_eq!(tracker.resolve("pk-a", &subnets, Some("192.168.1.50"), None, now), LanCandidate::Lan);
-        assert_eq!(tracker.resolve("pk-b", &subnets, None, None, now), LanCandidate::Wan);
-        // pk-a's own state persists across calls, independent of pk-b's.
+        let (_, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:55123"), None, None, now);
+        let (_, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:55123"), None, state, now + GRACE);
+        assert_eq!(state.as_ref().unwrap().current, EndpointTier::Wan);
+
+        let (tier, state) = resolve_endpoint_candidate(
+            reflexive_only("203.0.113.5:60000"),
+            None,
+            state,
+            now + GRACE + std::time::Duration::from_secs(1),
+        );
+        assert_eq!(tier, EndpointTier::Reflexive);
+        assert_eq!(state.unwrap().per_tier[&EndpointTier::Reflexive].backoff, ENDPOINT_RETRY_BACKOFF_INITIAL);
+    }
+
+    // ---- the genuinely new behavior: tier advancement ----
+
+    fn lan_and_reflexive<'a>(lan: &'a str, reflexive: &'a str) -> PeerTierCandidates<'a> {
+        PeerTierCandidates { lan: Some(lan), reflexive: Some(reflexive) }
+    }
+
+    #[test]
+    fn lan_failing_its_grace_window_advances_to_reflexive_in_the_same_cycle() {
+        let now = std::time::Instant::now();
+        let candidates = lan_and_reflexive("192.168.1.50", "203.0.113.5:55123");
+        let (tier, state) = resolve_endpoint_candidate(candidates, None, None, now);
+        assert_eq!(tier, EndpointTier::Lan);
+
+        // Lan never confirms within its own grace window.
+        let (tier, state) = resolve_endpoint_candidate(candidates, None, state, now + GRACE);
         assert_eq!(
-            tracker.resolve("pk-a", &subnets, Some("192.168.1.50"), None, now + GRACE),
-            LanCandidate::Wan
+            tier,
+            EndpointTier::Reflexive,
+            "must advance to the next-best tier this same cycle, not fall straight to Wan"
+        );
+        let state = state.unwrap();
+        assert!(
+            state.per_tier[&EndpointTier::Lan].next_retry_at.is_some(),
+            "Lan's own backoff is scheduled independently of Reflexive's"
+        );
+        assert!(state.per_tier.get(&EndpointTier::Reflexive).is_none_or(|b| b.next_retry_at.is_none()));
+    }
+
+    #[test]
+    fn reflexive_also_failing_falls_back_to_wan_with_independent_backoff_timers() {
+        let now = std::time::Instant::now();
+        let candidates = lan_and_reflexive("192.168.1.50", "203.0.113.5:55123");
+        let (_, state) = resolve_endpoint_candidate(candidates, None, None, now);
+        // Lan fails -> advances to Reflexive this same cycle.
+        let (tier, state) = resolve_endpoint_candidate(candidates, None, state, now + GRACE);
+        assert_eq!(tier, EndpointTier::Reflexive);
+        // Reflexive, now active, also fails its own grace window.
+        let (tier, state) = resolve_endpoint_candidate(candidates, None, state, now + GRACE + GRACE);
+        assert_eq!(tier, EndpointTier::Wan);
+        let state = state.unwrap();
+        assert_eq!(
+            state.per_tier[&EndpointTier::Lan].backoff,
+            ENDPOINT_RETRY_BACKOFF_INITIAL * 2,
+            "Lan failed once"
+        );
+        assert_eq!(
+            state.per_tier[&EndpointTier::Reflexive].backoff,
+            ENDPOINT_RETRY_BACKOFF_INITIAL * 2,
+            "Reflexive failed once, independently of Lan's own timer"
         );
     }
 
     #[test]
-    fn lan_endpoint_tracker_prune_drops_departed_peers() {
-        let mut tracker = LanEndpointTracker::default();
+    fn endpoint_tracker_resolves_per_pubkey_independently() {
+        let mut tracker = EndpointTracker::default();
         let now = std::time::Instant::now();
-        let subnets = subnets_containing("192.168.1.0");
-        tracker.resolve("pk-a", &subnets, Some("192.168.1.50"), None, now);
+        assert_eq!(tracker.resolve("pk-a", lan_only("192.168.1.50"), None, now), EndpointTier::Lan);
+        assert_eq!(tracker.resolve("pk-b", PeerTierCandidates::default(), None, now), EndpointTier::Wan);
+        // pk-a's own state persists across calls, independent of pk-b's.
+        assert_eq!(
+            tracker.resolve("pk-a", lan_only("192.168.1.50"), None, now + GRACE),
+            EndpointTier::Wan
+        );
+    }
+
+    #[test]
+    fn endpoint_tracker_prune_drops_departed_peers() {
+        let mut tracker = EndpointTracker::default();
+        let now = std::time::Instant::now();
+        tracker.resolve("pk-a", lan_only("192.168.1.50"), None, now);
         assert!(tracker.states.contains_key("pk-a"));
         tracker.prune(std::iter::empty());
         assert!(!tracker.states.contains_key("pk-a"));
@@ -1614,15 +1798,53 @@ mod tests {
         p.endpoint_addr = Some("203.0.113.5:51820".into());
         p.lan_addr = Some("192.168.1.50".into());
 
-        let mut lan_candidates = HashMap::new();
-        lan_candidates.insert(p.pubkey.clone(), LanCandidate::Lan);
-        wg.reconcile(std::slice::from_ref(&p), &[], &own.public_key().to_string(), false, &lan_candidates).unwrap();
+        let mut endpoint_tiers = HashMap::new();
+        endpoint_tiers.insert(p.pubkey.clone(), EndpointTier::Lan);
+        wg.reconcile(std::slice::from_ref(&p), &[], &own.public_key().to_string(), false, &endpoint_tiers).unwrap();
 
         let tunnel = tunnel_peers("wgtest").unwrap();
         assert_eq!(
             tunnel[0].endpoint.as_deref(),
             Some("192.168.1.50:51820"),
             "must configure the LAN address, not endpoint_addr, once the tracker resolves to Lan"
+        );
+
+        wg.teardown().unwrap();
+    }
+
+    /// Sibling of the above: when the tracker resolves a peer to
+    /// `Reflexive`, `reconcile` configures the peer's `reflexive_addr`,
+    /// not `endpoint_addr`/`lan_addr` (PLAN.md decisions log #90+).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_reconcile_configures_the_reflexive_endpoint_when_resolved() {
+        if !crate::firewall::netns::reexec("wg::tests::kernel_reconcile_configures_the_reflexive_endpoint_when_resolved") {
+            return;
+        }
+        let sh = |script: &str| {
+            let out = std::process::Command::new("sh").args(["-euc", script]).output().unwrap();
+            assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        sh("ip link set lo up");
+
+        let own = clamp_private_key(&Key::generate());
+        let mut wg = WgInterface::new("wgtest2").unwrap();
+        wg.bring_up(&own.to_string(), "100.90.0.3".parse().unwrap(), "fd00:90::3".parse().unwrap(), 51821)
+            .unwrap();
+
+        let mut p = peer("peer", &key_b64(10));
+        p.endpoint_addr = Some("203.0.113.5:51820".into());
+        p.reflexive_addr = Some("198.51.100.9:55123".into());
+
+        let mut endpoint_tiers = HashMap::new();
+        endpoint_tiers.insert(p.pubkey.clone(), EndpointTier::Reflexive);
+        wg.reconcile(std::slice::from_ref(&p), &[], &own.public_key().to_string(), false, &endpoint_tiers).unwrap();
+
+        let tunnel = tunnel_peers("wgtest2").unwrap();
+        assert_eq!(
+            tunnel[0].endpoint.as_deref(),
+            Some("198.51.100.9:55123"),
+            "must configure the reflexive address, not endpoint_addr, once the tracker resolves to Reflexive"
         );
 
         wg.teardown().unwrap();

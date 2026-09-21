@@ -123,6 +123,30 @@ pub fn is_valid_lan_addr(s: &str) -> bool {
     s.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_private())
 }
 
+/// Validates a `reflexive_addr` value: bare `ip:port`, `ip` a literal
+/// IPv4 address (never a hostname, never a bracketed IPv6 literal — this
+/// value is only ever produced from a raw socket address the
+/// coordinator's UDP reflexive responder itself observed, never
+/// resolved), port 1-65535.
+///
+/// Unlike [`is_valid_lan_addr`], privacy is deliberately NOT required
+/// here: in a fully internal deployment with no real NAT between a node
+/// and the coordinator, the reflexive address legitimately IS a private
+/// one (same reasoning `wireserve-coordinator`'s `client_ip` module
+/// gives for why `endpoint_addr`'s own fallback doesn't reject private
+/// addresses outright). This only enforces literal-IPv4:port structure,
+/// as defense in depth against a malicious or buggy agent smuggling
+/// something else into a value that gets redistributed to every peer
+/// and configured as a live WireGuard endpoint
+/// (`wireserve-agent`'s `wg::choose_peer_endpoint`).
+#[must_use]
+pub fn is_valid_reflexive_addr(s: &str) -> bool {
+    let Some((host, port)) = s.rsplit_once(':') else {
+        return false;
+    };
+    host.parse::<std::net::Ipv4Addr>().is_ok() && matches!(port.parse::<u16>(), Ok(p) if p != 0)
+}
+
 /// Whether `url` is plain `http://` to a host that is not loopback — i.e.
 /// a bearer/join/admin token sent to it would cross a network in clear
 /// (security review S6; spec §7 assumes TLS termination in front of the
@@ -356,6 +380,32 @@ mod tests {
     fn rejects_endpoint_addr_with_invalid_host_characters() {
         assert!(!is_valid_endpoint_addr("host with spaces:51820"));
         assert!(!is_valid_endpoint_addr("host/slash:51820"));
+    }
+
+    // ---- is_valid_reflexive_addr ----
+
+    #[test]
+    fn accepts_a_bare_ipv4_port() {
+        assert!(is_valid_reflexive_addr("203.0.113.5:51820"));
+        // Deliberately not RFC1918-only, unlike is_valid_lan_addr — a
+        // private reflexive address is legitimate on an internal mesh.
+        assert!(is_valid_reflexive_addr("192.168.1.5:51820"));
+    }
+
+    #[test]
+    fn rejects_non_ipv4_port_forms() {
+        for s in [
+            "duckdns.example.com:51820", // hostname
+            "[2001:db8::1]:51820",       // bracketed IPv6
+            "203.0.113.5",               // no port
+            "203.0.113.5:0",
+            "203.0.113.5:70000",
+            "203.0.113.5:notaport",
+            "",
+            "203.0.113.5:51820\nAllowedIPs = 0.0.0.0/0",
+        ] {
+            assert!(!is_valid_reflexive_addr(s), "expected {s:?} to be rejected");
+        }
     }
 
     // ---- is_valid_lan_addr ----
