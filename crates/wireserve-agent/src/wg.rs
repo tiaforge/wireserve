@@ -512,8 +512,13 @@ impl WgInterface {
         Ok(())
     }
 
+    /// Deletes the interface, and with it its addresses and routes. Not
+    /// defguard's `remove_interface`; see `routes::delete_link` for why.
     pub fn teardown(&mut self) -> Result<(), WireguardInterfaceError> {
-        self.api.remove_interface()
+        crate::routes::delete_link(&self.ifname)?;
+        self.applied.clear();
+        self.routed.clear();
+        Ok(())
     }
 }
 
@@ -970,6 +975,10 @@ mod tests {
         wg.reconcile(&peers, &[], &own_pub, false).unwrap();
         let routes = sh("ip -4 route show table all");
         assert!(!routes.contains("100.90.0.50") && !routes.contains("100.90.0.51"), "{routes}");
+
+        // Teardown deletes the interface itself, and is a no-op once gone.
+        wg.teardown().unwrap();
+        assert!(!sh("ip -o link show").contains("wgtest"), "interface still there after teardown");
         wg.teardown().unwrap();
     }
 }

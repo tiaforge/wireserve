@@ -24,6 +24,7 @@ use std::net::IpAddr;
 use netlink_packet_core::{
     NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REQUEST,
 };
+use netlink_packet_route::link::LinkMessage;
 use netlink_packet_route::route::{
     RouteAddress, RouteAttribute, RouteHeader, RouteMessage, RouteProtocol, RouteScope, RouteType,
 };
@@ -95,11 +96,39 @@ fn route_message(index: u32, addr: IpAddr) -> RouteMessage {
 /// done. A delete carries the output interface, so only our interface's
 /// route to that address is ever removed — never another mesh's.
 fn request(message: RouteMessage, add: bool) -> io::Result<()> {
-    let (payload, flags) = if add {
-        (RouteNetlinkMessage::NewRoute(message), NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL)
+    if add {
+        send(
+            RouteNetlinkMessage::NewRoute(message),
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+            &[libc::EEXIST],
+        )
     } else {
-        (RouteNetlinkMessage::DelRoute(message), NLM_F_REQUEST | NLM_F_ACK)
+        send(RouteNetlinkMessage::DelRoute(message), NLM_F_REQUEST | NLM_F_ACK, &[libc::ESRCH, libc::ENOENT])
+    }
+}
+
+/// Deletes the interface `ifname`; one already gone counts as done.
+///
+/// Instead of defguard's `remove_interface`, which also "clears the DNS
+/// configuration" of the interface on the way out: `resolvectl revert` and
+/// then `resolvectl flush-caches`, emptying the whole host's DNS cache on
+/// every stop — for an interface this agent never configures DNS on. From
+/// an unprivileged test namespace the same call even reached the host's
+/// resolver over D-Bus and raised a password prompt on the desktop.
+pub fn delete_link(ifname: &str) -> io::Result<()> {
+    let index = match interface_index(ifname) {
+        Ok(index) => index,
+        Err(e) if e.raw_os_error() == Some(libc::ENODEV) => return Ok(()),
+        Err(e) => return Err(e),
     };
+    let mut message = LinkMessage::default();
+    message.header.index = index;
+    send(RouteNetlinkMessage::DelLink(message), NLM_F_REQUEST | NLM_F_ACK, &[libc::ENODEV])
+}
+
+/// Sends one request and waits for the kernel's answer; an error whose
+/// code is in `done` counts as success.
+fn send(payload: RouteNetlinkMessage, flags: u16, done: &[i32]) -> io::Result<()> {
     let mut req = NetlinkMessage::from(payload);
     req.header.flags = flags;
     req.finalize();
@@ -122,12 +151,8 @@ fn request(message: RouteMessage, add: bool) -> io::Result<()> {
                 NetlinkPayload::Error(e) if e.code.is_none() => return Ok(()),
                 NetlinkPayload::Error(e) => {
                     let err = e.to_io();
-                    let done = match err.raw_os_error() {
-                        Some(libc::EEXIST) => add,
-                        Some(libc::ESRCH | libc::ENOENT) => !add,
-                        _ => false,
-                    };
-                    return if done { Ok(()) } else { Err(err) };
+                    let ok = err.raw_os_error().is_some_and(|code| done.contains(&code));
+                    return if ok { Ok(()) } else { Err(err) };
                 }
                 NetlinkPayload::Done(_) => return Ok(()),
                 _ => {}
