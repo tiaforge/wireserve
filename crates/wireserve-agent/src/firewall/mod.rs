@@ -136,7 +136,7 @@ mod tests {
         let mut backend = FakeFirewallBackend::default();
         startup_sequence(&mut backend).unwrap();
         backend
-            .apply(&[ServiceRule {
+            .apply(&[ServiceRule::Open {
                 proto: Proto::Tcp,
                 port: 32400,
             }])
@@ -147,7 +147,7 @@ mod tests {
             vec![
                 Call::Teardown,
                 Call::Apply(vec![]),
-                Call::Apply(vec![ServiceRule {
+                Call::Apply(vec![ServiceRule::Open {
                     proto: Proto::Tcp,
                     port: 32400
                 }]),
@@ -292,6 +292,17 @@ pub mod netns {
             .unwrap();
         assert!(status.success(), "in-namespace run failed");
         false
+    }
+
+    /// Like [`run`], but a failing script is returned rather than a
+    /// panic: stdout and stderr, for a test that inspects what failed.
+    pub fn run_capturing(script: &str) -> Option<(String, String)> {
+        if !available() {
+            eprintln!("SKIPPED: unprivileged network namespaces or nft unavailable");
+            return None;
+        }
+        let out = Command::new("unshare").args(["-rn", "sh", "-euc", script]).output().expect("spawn unshare");
+        Some((String::from_utf8(out.stdout).unwrap(), String::from_utf8(out.stderr).unwrap()))
     }
 
     /// Runs `script` with `sh -c` in a fresh namespace. Returns stdout, or

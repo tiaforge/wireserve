@@ -19,6 +19,7 @@ the reasoning, and `PLAN.md` for implementation status.
                                     ├─ configure WireGuard peers
                                     ├─ open only declared ports on wireserve0
                                     └─ write <service>.wg into /etc/hosts
+                                       (each service has its own address)
 ```
 
 The coordinator holds no private keys and is never itself a WireGuard peer.
@@ -174,8 +175,8 @@ is pure ceremony.
 So the flow is two steps:
 
 ```sh
-# on the node
-wireserve-agent serve plex 32400 tcp
+# on the node: plex.wg:80 reaches this node's port 32400
+wireserve-agent serve plex 80:32400
 
 # on the coordinator — see what is waiting, then approve it
 wireserve-admin list-services --pending
@@ -184,9 +185,9 @@ wireserve-admin approve-service homeserver plex
 
 Until it is approved, `wireserve-agent list` shows the service with
 `"pending": true`, which is how you tell "waiting on an admin" from "this
-node has not polled yet". The node's own firewall hole opens immediately
-either way — it is only firewalling itself, and nothing resolves
-`<name>.wg` for it yet.
+node has not polled yet". The node's own firewall is ready immediately
+either way — it is only firewalling itself, and nothing routes to the
+service's address or resolves `<name>.wg` for it yet.
 
 `wireserve-admin deny-service <node> <service> --reason '...'` refuses one,
 and the declaring node withdraws it and closes the hole on its next poll.
@@ -200,19 +201,57 @@ holds its globally-unique name until the declaring node withdraws it, and a
 node you do not trust will not withdraw anything. `revoke` deletes all of
 its declarations and kills its token.
 
-Once approved, the declaration takes effect on the next poll:
-the port opens on the tunnel and the name appears in every other node's
+Once approved, the declaration takes effect on the next poll: the service's
+address is routed to its node and its name appears in every other node's
 hosts file.
 
 ```sh
-wireserve-agent serve plex 32400 tcp
+wireserve-agent serve openobserve 80:5080          # openobserve.wg:80 -> :5080
+wireserve-agent serve mydns 53/udp 53/tcp 8080:8000 # several ports, TCP and UDP
+wireserve-agent serve plex 32400                    # a bare port maps to itself
 wireserve-agent list                    # what this node sees right now
 wireserve-agent unserve plex
 ```
 
-Any other node can then reach `plex.wg:32400`. Names are unique across the
-whole mesh, first come first served. Note that the hostname carries the
-address only, not the port, which is what `list` is for.
+Each `PORT` is `[PUBLIC:]TARGET[/tcp|/udp]` (TCP unless given). Names are
+unique across the whole mesh, first come first served.
+
+#### Service addresses
+
+Every service gets **its own mesh address** from the coordinator, and
+`<name>.wg` resolves to it, so any number of services on one node can each
+answer on `:80`. Peers route that address to the owning node, whose
+firewall rewrites `address:PUBLIC` to `node:TARGET` in the kernel:
+
+- **Only the published ports answer.** The target port is closed to the
+  mesh, on the node's own address and on the service's: after
+  `serve openobserve 80:5080`, `openobserve.wg:80` works and
+  `openobserve.wg:5080` does not.
+- **The service sees the real client.** Nothing is proxied; any TCP or UDP
+  protocol works, and logs, rate limits and allowlists see the peer's own
+  mesh address. (A connection from the owning node itself shows up as that
+  node, as local connections do.)
+- **Containers work**, published ports included, whatever the runtime —
+  the rewrite happens before connection tracking, so a published port's
+  own NAT still applies (rootful Podman, Docker with or without its
+  userland proxy). The target must listen somewhere the mesh can reach:
+  `0.0.0.0`, or the node's mesh address. A service bound to `127.0.0.1`
+  is not reachable, by design.
+- A target port can back one mapping per node (per protocol); `serve`
+  refuses a second.
+- Addresses come from the mesh range, shared with the nodes (a `/24`
+  holds 253 nodes and services together), and stay with a service until
+  it is withdrawn.
+
+Rewriting packets needs the agent to run as root in the host's own
+namespaces, as the shipped systemd unit and quadlets do. The kernel refuses
+it inside an unprivileged container (LXC, rootless podman); the agent says
+so in its log, and the services on that node stay unreachable.
+
+Upgrade every agent: an agent from before service addresses still resolves
+new services to their node's address, where their ports are now closed.
+Its own declarations keep working the old way (node address, same port)
+until it is upgraded.
 
 ### 4. Add a phone or laptop
 
@@ -227,9 +266,9 @@ podman exec wireserve-coordinator wireserve-admin export-config myphone \
 Import it into the official WireGuard app, by file or by feeding the
 contents to any QR-code generator. The file contains a private key, so it
 is written mode 600; move it, do not copy it. Such a peer gets a mesh
-address and reaches every service by IP and port, but has no `.wg` name
-resolution, and it is a snapshot: re-export and reimport after new nodes
-join.
+address and reaches every service by its address (in `wireserve-admin
+list-services`) and port, but has no `.wg` name resolution, and it is a
+snapshot: re-export and reimport after new nodes or services appear.
 
 ### 5. When a machine is lost or compromised
 
@@ -251,7 +290,7 @@ On a node, talking to the local daemon over a Unix socket:
 | Command | What it does |
 | --- | --- |
 | `wireserve-agent join [url] [token]` | one-time bootstrap, generates the keypair — prompts for either if omitted |
-| `wireserve-agent serve <name> <port> [tcp\|udp]` | publish a service |
+| `wireserve-agent serve <name> <[public:]target[/tcp\|/udp]>...` | publish a service on its own address |
 | `wireserve-agent unserve <name>` | withdraw one |
 | `wireserve-agent list` | peers, services and rejected declarations |
 | `wireserve-agent leave` | tear down interface, firewall, hosts block |

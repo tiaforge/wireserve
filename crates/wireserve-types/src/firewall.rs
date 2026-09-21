@@ -4,12 +4,27 @@
 //! and keeping it here avoids a cross-crate trait-orphan problem if
 //! anything else ever needs to reference `ServiceRule`.
 
-use crate::node::Proto;
+use std::net::Ipv4Addr;
 
+use crate::node::Proto;
+use crate::ports::PortMap;
+
+/// One hole in the default-deny on the mesh interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ServiceRule {
-    pub proto: Proto,
-    pub port: u16,
+pub enum ServiceRule {
+    /// `vip:map.public` → `node:map.target`, and nothing else of the
+    /// target port: a peer connecting straight to `node:map.target` (or
+    /// `vip:map.target`) is still refused. The client's own address is
+    /// kept end to end — the service sees who is really connecting.
+    Mapped {
+        vip: Ipv4Addr,
+        node: Ipv4Addr,
+        map: PortMap,
+    },
+    /// `port` opened on the node's own address, as before service
+    /// addresses existed. Only used while the coordinator hands out no
+    /// address for a service, i.e. one that predates them.
+    Open { proto: Proto, port: u16 },
 }
 
 /// Replaces the current WireGuard-interface ruleset with exactly the given

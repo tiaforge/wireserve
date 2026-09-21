@@ -38,8 +38,9 @@ fn export_config_end_to_end_and_private_key_never_leaves_process() {
     assert!(conf.contains("AllowedIPs = 100.90.0.3/32, fd00:90::3/128"));
     assert!(conf.contains("Endpoint = duckdns.example.com:51820"));
 
-    // create-node, register, list-peers — exactly three requests, no more.
-    assert_eq!(mock.request_count(), 3);
+    // create-node, register, list-peers, list-services (for the service
+    // addresses each peer owns) — exactly four requests, no more.
+    assert_eq!(mock.request_count(), 4);
 
     let private_key = conf
         .lines()

@@ -8,12 +8,13 @@
 # history doesn't have to repeat itself by hand in a future session.
 #
 # Prerequisites:
-#   - podman (rootless is fine — this script was developed and verified
-#     against rootless Podman; rootless containers get CAP_NET_ADMIN
-#     scoped to their own network namespace via --cap-add, which is
-#     sufficient for creating a WireGuard interface inside that
-#     namespace — no host-level CAP_NET_ADMIN or root needed on the
-#     invoking shell)
+#   - ROOTFUL podman (`sudo`). Rootless used to be enough — rootless
+#     containers get CAP_NET_ADMIN over their own network namespace, which
+#     covers WireGuard and nftables — but service addresses (PLAN.md M20)
+#     rewrite packet headers, and since the "netfilter: disable payload
+#     mangling in userns" hardening the kernel refuses that in any network
+#     namespace a non-init user namespace owns, which is every rootless
+#     container. See run-service-vip-spike.sh.
 #   - the WireGuard kernel module available on the host (`modinfo
 #     wireguard` must succeed) — defguard_wireguard_rs's Kernel backend
 #     needs it; there is no userspace fallback wired up in this project
@@ -23,7 +24,7 @@
 #     reliably provide it (see the note in coordinator.Dockerfile/
 #     agent.Dockerfile about DNS inside a custom Podman network)
 #
-# Usage: ./deploy/e2e/run-e2e-test.sh
+# Usage: sudo ./deploy/e2e/run-e2e-test.sh
 # Exit code 0 = every check passed. `set -e` aborts immediately on the
 # first failing command, with that command visible in the output.
 
@@ -60,6 +61,8 @@ log "checking prerequisites"
 command -v podman >/dev/null || fail "podman not found on PATH"
 command -v python3 >/dev/null || fail "python3 not found on PATH (used to parse \`wireserve-agent list\`)"
 modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available (modinfo wireguard failed)"
+[ "$(podman info --format '{{.Host.Security.Rootless}}')" = false ] \
+    || fail "needs rootful podman (the kernel refuses service-address rewrites in user namespaces): sudo $0"
 pass "podman and the WireGuard kernel module are present"
 
 log "building images"
@@ -150,8 +153,13 @@ podman exec "$DEBUG_CONTAINER" ping -c2 -W3 "$AGENT2_MESH_IP" >/dev/null 2>&1 \
             "default-deny on wireserve0 drops inbound echo requests (they are neither" \
             "ESTABLISHED/RELATED nor a declared service port)."
 
-log "declaring a service on agent1 — it must NOT propagate before approval"
-podman exec "$AGENT1" wireserve-agent serve testsvc 12345 tcp
+log "declaring services on agent1 — they must NOT propagate before approval"
+# Each service gets its own address (PLAN.md M20), so two of them can both
+# answer on :80 of one node: testsvc maps 80 onto the listener on 12345,
+# web2 maps 80 onto 12347, udpsvc maps UDP 53 onto 5353.
+podman exec "$AGENT1" wireserve-agent serve testsvc 80:12345
+podman exec "$AGENT1" wireserve-agent serve web2 80:12347
+podman exec "$AGENT1" wireserve-agent serve udpsvc 53:5353/udp
 sleep 8
 # Service approval is on by default: a declaration is stored but withheld
 # from every other node's directory until an admin approves it, so that
@@ -168,48 +176,84 @@ podman exec "$AGENT1" wireserve-agent list | grep -q '"pending": true' \
     || fail "the declaring node does not show its own service as pending"
 pass "the declaring node reports its service as pending approval"
 
-log "approving the service and checking hosts-file sync on agent2"
-podman exec "$COORD" wireserve-admin approve-service node1 testsvc \
-    || fail "could not approve testsvc for node1"
+log "approving the services and checking hosts-file sync on agent2"
+for svc in testsvc web2 udpsvc; do
+    podman exec "$COORD" wireserve-admin approve-service node1 "$svc" \
+        || fail "could not approve $svc for node1"
+done
 sleep 8
 podman exec "$AGENT2" grep -q "testsvc.wg" /etc/hosts \
     || fail "agent2's /etc/hosts never picked up testsvc.wg after approval"
 pass "agent2's /etc/hosts synced testsvc.wg once approved"
 
-log "checking the firewall allows the declared port and denies everything else"
-# agent1 declared testsvc on tcp/12345 above. Both listeners below run in
-# the debug container, which shares agent1's network namespace, so they
-# listen on agent1's wireserve0 and are governed by agent1's nftables rules.
-# Listening on BOTH ports is what makes this a real test: with nothing
-# bound to the undeclared port, an unreachable result would prove nothing,
-# since "refused because nothing is listening" and "dropped by the
-# firewall" look identical from the far end.
+AGENT1_MESH_IP=$(mesh_ip_of "$AGENT1" node1)
+[ -n "$AGENT1_MESH_IP" ] || fail "could not determine agent1's mesh address"
+resolve() { podman exec "$AGENT2" getent hosts "$1" | awk '{print $1}'; }
+VIP=$(resolve testsvc.wg)
+VIP2=$(resolve web2.wg)
+UVIP=$(resolve udpsvc.wg)
+echo "agent1 mesh address: $AGENT1_MESH_IP; testsvc.wg=$VIP web2.wg=$VIP2 udpsvc.wg=$UVIP"
+for v in "$VIP" "$VIP2" "$UVIP"; do
+    [ -n "$v" ] && [ "$v" != "$AGENT1_MESH_IP" ] \
+        || fail "a service name does not resolve to its own address (got '$v')"
+done
+[ "$(printf '%s\n' "$VIP" "$VIP2" "$UVIP" | sort -u | wc -l)" = 3 ] \
+    || fail "two services share an address"
+pass "every service name resolves to an address of its own"
+
+log "checking the service addresses carry traffic, and nothing else does"
+# The listeners run in the debug container, which shares agent1's network
+# namespace, so they sit behind agent1's nftables rules. Each answers with
+# the address it saw the client connect from: a service reached through
+# its address must still see the real client, not the node or the VIP.
+# A listener on the undeclared port too, or an unreachable result there
+# would prove nothing ("refused because nothing listens" and "dropped by
+# the firewall" look identical from the far end).
 #
 # Connections are made with `bash`, not `sh`: /dev/tcp is a bash builtin
 # and the image's /bin/sh is dash, where it silently fails and would make
 # every one of these checks pass regardless of the firewall.
-AGENT1_MESH_IP=$(mesh_ip_of "$AGENT1" node1)
-[ -n "$AGENT1_MESH_IP" ] || fail "could not determine agent1's mesh address"
-echo "agent1 mesh address: $AGENT1_MESH_IP"
-
-podman exec -d "$DEBUG_CONTAINER" nc -l -k -p 12345
-podman exec -d "$DEBUG_CONTAINER" nc -l -k -p 12346
+listen() { podman exec -d "$DEBUG_CONTAINER" socat "$1" SYSTEM:"echo $2 peer=\$SOCAT_PEERADDR"; }
+listen TCP-LISTEN:12345,fork,reuseaddr testsvc
+listen TCP-LISTEN:12347,fork,reuseaddr web2
+listen TCP-LISTEN:12346,fork,reuseaddr undeclared
+listen UDP-RECVFROM:5353,fork udpsvc
 sleep 1
 
-# Sanity: both listeners must be reachable from INSIDE agent1's own
-# namespace, or the checks below would be testing a broken listener rather
-# than the firewall. Loopback is not subject to the wireserve0-scoped rules.
-podman exec "$DEBUG_CONTAINER" timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/12346" \
-    || fail "the undeclared-port listener is not actually listening — the firewall check below would be meaningless"
+ask() { # from proto addr port
+    podman exec "$1" timeout 5 bash -c "exec 3<>/dev/$2/$3/$4 && { [ $2 = tcp ] || echo hi >&3; } && head -1 <&3" 2>/dev/null || true
+}
+expect() { # from proto addr port expected
+    local got; got=$(ask "$1" "$2" "$3" "$4")
+    [ "$got" = "$5" ] || fail "$3:$4/$2 from $1: expected '$5', got '${got:-nothing}'"
+}
+refused() { # from proto addr port
+    local got; got=$(ask "$1" "$2" "$3" "$4")
+    [ -z "$got" ] || fail "$3:$4/$2 from $1 should be closed to the mesh, got '$got'"
+}
 
-podman exec "$AGENT2" timeout 5 bash -c "exec 3<>/dev/tcp/$AGENT1_MESH_IP/12345" \
-    || fail "declared service port 12345 is NOT reachable across the mesh"
-pass "the declared service port is reachable across the mesh"
+# Sanity: the undeclared listener answers inside agent1's own namespace.
+[ "$(ask "$DEBUG_CONTAINER" tcp 127.0.0.1 12346)" = "undeclared peer=127.0.0.1" ] \
+    || fail "the undeclared-port listener is not actually listening — the checks below would be meaningless"
 
-if podman exec "$AGENT2" timeout 5 bash -c "exec 3<>/dev/tcp/$AGENT1_MESH_IP/12346" 2>/dev/null; then
-    fail "an UNDECLARED port was reachable across the mesh — default-deny is not working"
-fi
+expect "$AGENT2" tcp "$VIP" 80 "testsvc peer=$AGENT2_MESH_IP"
+pass "testsvc.wg:80 reaches the listener on 12345, which sees agent2's real address"
+expect "$AGENT2" tcp "$VIP2" 80 "web2 peer=$AGENT2_MESH_IP"
+pass "a second service on the same node answers on :80 of its own address"
+expect "$AGENT2" udp "$UVIP" 53 "udpsvc peer=$AGENT2_MESH_IP"
+pass "udpsvc.wg:53/udp reaches 5353/udp, with the real client address"
+
+refused "$AGENT2" tcp "$AGENT1_MESH_IP" 12345
+refused "$AGENT2" tcp "$VIP" 12345
+refused "$AGENT2" tcp "$VIP" 81
+refused "$AGENT2" udp "$AGENT1_MESH_IP" 5353
+pass "the target ports are closed to the mesh: only the published ports answer"
+refused "$AGENT2" tcp "$AGENT1_MESH_IP" 12346
 pass "an undeclared port is refused across the mesh (default-deny holds)"
+
+expect "$AGENT1" tcp "$VIP" 80 "testsvc peer=$AGENT1_MESH_IP"
+expect "$AGENT1" udp "$UVIP" 53 "udpsvc peer=$AGENT1_MESH_IP"
+pass "the owning node reaches its own services through their addresses"
 
 log "checking wireserve list reflects real data on agent1 (regression: F1)"
 podman exec "$AGENT1" wireserve-agent list | grep -q '"local": true' \

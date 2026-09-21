@@ -10,7 +10,7 @@ use defguard_wireguard_rs::key::Key;
 use defguard_wireguard_rs::net::IpAddrMask;
 use defguard_wireguard_rs::peer::Peer;
 use defguard_wireguard_rs::{InterfaceConfiguration, Kernel, WGApi, WireguardInterfaceApi};
-use wireserve_types::PeerInfo;
+use wireserve_types::{PeerInfo, ServiceInfo};
 
 /// Why `bring_up` can fail before it has touched anything.
 #[derive(Debug, thiserror::Error)]
@@ -170,7 +170,16 @@ pub fn choose_peer_endpoint(p: &PeerInfo, prefer_ipv6: bool) -> Option<String> {
 /// live self-test result — see `choose_peer_endpoint`. Stays fully
 /// pure/network-free: the actual probe happens once per cycle in
 /// `poll_loop::run_once`, outside this module.
-pub fn desired_peers(peers: &[PeerInfo], self_pubkey: &str, prefer_ipv6: bool) -> HashMap<Key, Peer> {
+///
+/// A peer's `AllowedIPs` also hold the address of every service it owns
+/// (`services`, already through `vip::sanitize`), which is what routes a
+/// connection to `<name>.wg` to that peer.
+pub fn desired_peers(
+    peers: &[PeerInfo],
+    services: &[ServiceInfo],
+    self_pubkey: &str,
+    prefer_ipv6: bool,
+) -> HashMap<Key, Peer> {
     let mut desired = HashMap::new();
     for p in peers {
         if p.pubkey == self_pubkey {
@@ -182,6 +191,9 @@ pub fn desired_peers(peers: &[PeerInfo], self_pubkey: &str, prefer_ipv6: bool) -
         };
         let mut peer = Peer::new(key.clone());
         peer.allowed_ips = peer_allowed_ips(&p.ip4, &p.ip6);
+        peer.allowed_ips.extend(
+            owned_vips(services, &p.name).map(|vip| IpAddrMask::host(IpAddr::V4(vip))),
+        );
         if let Some(endpoint) = choose_peer_endpoint(p, prefer_ipv6) {
             if let Err(e) = peer.set_endpoint(&endpoint) {
                 tracing::warn!(peer = %p.name, error = %e, "could not resolve peer endpoint");
@@ -193,6 +205,30 @@ pub fn desired_peers(peers: &[PeerInfo], self_pubkey: &str, prefer_ipv6: bool) -
         desired.insert(key, peer);
     }
     desired
+}
+
+/// The addresses of the services `node` owns.
+fn owned_vips<'a>(services: &'a [ServiceInfo], node: &'a str) -> impl Iterator<Item = Ipv4Addr> + 'a {
+    services
+        .iter()
+        .filter(move |s| s.node == node)
+        .filter_map(|s| s.vip4.as_deref()?.parse().ok())
+}
+
+/// Every address this node routes into the mesh interface: each peer's
+/// `AllowedIPs`, and this node's own service addresses. The latter reach
+/// no peer — the firewall's output rewrite turns a local connection to one
+/// into a local connection to the service's target port — but they need a
+/// route for the connection to start at all on a host with no default
+/// route, and it has to be this interface, whose address a local client
+/// then connects from.
+pub fn desired_routes(peers: &HashMap<Key, Peer>, own_vips: impl Iterator<Item = Ipv4Addr>) -> BTreeSet<IpAddr> {
+    peers
+        .values()
+        .flat_map(|p| &p.allowed_ips)
+        .map(|a| a.address)
+        .chain(own_vips.map(IpAddr::V4))
+        .collect()
 }
 
 /// Computes which currently-applied pubkeys are no longer desired (to
@@ -236,6 +272,8 @@ pub struct WgInterface {
     api: WGApi<Kernel>,
     ifname: String,
     applied: HashMap<Key, Peer>,
+    /// What `routes::sync` last installed, so it only runs on a change.
+    routed: BTreeSet<IpAddr>,
 }
 
 impl WgInterface {
@@ -246,6 +284,7 @@ impl WgInterface {
             api,
             ifname,
             applied: HashMap::new(),
+            routed: BTreeSet::new(),
         })
     }
 
@@ -396,10 +435,11 @@ impl WgInterface {
     pub fn reconcile(
         &mut self,
         peers: &[PeerInfo],
+        services: &[ServiceInfo],
         self_pubkey: &str,
         prefer_ipv6: bool,
     ) -> Result<(), WireguardInterfaceError> {
-        let desired = desired_peers(peers, self_pubkey, prefer_ipv6);
+        let desired = desired_peers(peers, services, self_pubkey, prefer_ipv6);
 
         let to_remove = peers_to_remove(self.applied.keys(), &desired);
         for key in &to_remove {
@@ -433,18 +473,18 @@ impl WgInterface {
         // also routes every peer *endpoint* via the default gateway — and
         // blackholes it on a host without one. See `crate::routes`.
         //
-        // Only run when the peer set actually changed, to keep it off the
+        // Only run when the routed set actually changed, to keep it off the
         // steady-state path.
-        if !to_remove.is_empty() || !to_configure.is_empty() {
-            let addresses = |peers: &HashMap<Key, Peer>| -> BTreeSet<IpAddr> {
-                peers.values().flat_map(|p| &p.allowed_ips).map(|a| a.address).collect()
-            };
+        let self_name = peers.iter().find(|p| p.pubkey == self_pubkey).map(|p| p.name.as_str());
+        let routes = desired_routes(&desired, self_name.into_iter().flat_map(|n| owned_vips(services, n)));
+        if routes != self.routed {
             // A route that couldn't be set is logged (by `sync`) and retried
-            // on the next change, not fatal: failing here would leave
+            // on the next cycle, not fatal: failing here would leave
             // `applied` stale and reconfigure every peer next cycle, which
             // resets WireGuard's own endpoint roaming (see above).
-            if let Err(e) = crate::routes::sync(&self.ifname, &addresses(&self.applied), &addresses(&desired)) {
-                tracing::warn!(ifname = %self.ifname, error = %e, "peer routes are incomplete");
+            match crate::routes::sync(&self.ifname, &self.routed, &routes) {
+                Ok(()) => self.routed = routes,
+                Err(e) => tracing::warn!(ifname = %self.ifname, error = %e, "peer routes are incomplete"),
             }
         }
 
@@ -528,7 +568,7 @@ mod tests {
         let self_key = key_b64(1);
         let other_key = key_b64(2);
         let peers = vec![peer("me", &self_key), peer("other", &other_key)];
-        let desired = desired_peers(&peers, &self_key, false);
+        let desired = desired_peers(&peers, &[], &self_key, false);
         assert_eq!(desired.len(), 1);
     }
 
@@ -540,8 +580,52 @@ mod tests {
             peer("bad", "not-a-real-base64-key"),
             peer("good", &good_key),
         ];
-        let desired = desired_peers(&peers, &self_key, false);
+        let desired = desired_peers(&peers, &[], &self_key, false);
         assert_eq!(desired.len(), 1);
+    }
+
+    fn service(name: &str, node: &str, vip4: Option<&str>) -> ServiceInfo {
+        ServiceInfo {
+            name: name.into(),
+            node: node.into(),
+            ip4: String::new(),
+            port: 80,
+            proto: wireserve_types::Proto::Tcp,
+            online: true,
+            vip4: vip4.map(Into::into),
+            ports: vec![],
+        }
+    }
+
+    #[test]
+    fn a_peers_allowed_ips_include_the_addresses_of_its_services() {
+        let self_key = key_b64(1);
+        let mut other = peer("other", &key_b64(2));
+        other.ip4 = "100.90.0.2".into();
+        other.ip6 = "fd00:90::2".into();
+        let services = [
+            service("web", "other", Some("100.90.0.50")),
+            service("dns", "other", Some("100.90.0.51")),
+            service("old", "other", None),
+            service("mine", "me", Some("100.90.0.52")),
+        ];
+        let desired = desired_peers(&[peer("me", &self_key), other], &services, &self_key, false);
+        let peer = desired.values().next().unwrap();
+        let ips: Vec<String> = peer.allowed_ips.iter().map(ToString::to_string).collect();
+        assert_eq!(ips, ["100.90.0.2/32", "fd00:90::2/128", "100.90.0.50/32", "100.90.0.51/32"]);
+    }
+
+    #[test]
+    fn routes_cover_every_allowed_ip_and_this_nodes_own_service_addresses() {
+        let self_key = key_b64(1);
+        let mut other = peer("other", &key_b64(2));
+        other.ip4 = "100.90.0.2".into();
+        other.ip6 = String::new();
+        let services = [service("web", "other", Some("100.90.0.50"))];
+        let desired = desired_peers(&[other], &services, &self_key, false);
+        let own: Vec<Ipv4Addr> = vec!["100.90.0.60".parse().unwrap()];
+        let routes: Vec<String> = desired_routes(&desired, own.into_iter()).iter().map(ToString::to_string).collect();
+        assert_eq!(routes, ["100.90.0.2", "100.90.0.50", "100.90.0.60"]);
     }
 
     #[test]
@@ -625,14 +709,14 @@ mod tests {
         other.endpoint_addr_v4 = Some("203.0.113.5:51820".into());
         other.endpoint_addr_v6 = Some("[2001:db8::1]:51820".into());
 
-        let desired_v4 = desired_peers(&[other.clone()], &self_key, false);
+        let desired_v4 = desired_peers(&[other.clone()], &[], &self_key, false);
         let key = defguard_wireguard_rs::key::Key::try_from(key_b64(2).as_str()).unwrap();
         assert_eq!(
             desired_v4[&key].endpoint,
             Some("203.0.113.5:51820".parse().unwrap())
         );
 
-        let desired_v6 = desired_peers(&[other], &self_key, true);
+        let desired_v6 = desired_peers(&[other], &[], &self_key, true);
         assert_eq!(
             desired_v6[&key].endpoint,
             Some("[2001:db8::1]:51820".parse::<std::net::SocketAddr>().unwrap())
@@ -796,7 +880,7 @@ mod tests {
 
         let mut p = peer("peer", &key_b64(9));
         p.endpoint_addr = Some("10.99.0.1:51820".into());
-        wg.reconcile(std::slice::from_ref(&p), &own.public_key().to_string(), false).unwrap();
+        wg.reconcile(std::slice::from_ref(&p), &[], &own.public_key().to_string(), false).unwrap();
 
         let routes = sh("ip -4 route show table all; ip -6 route show table all");
         assert!(!routes.contains("blackhole"), "{routes}");
@@ -804,9 +888,56 @@ mod tests {
         assert!(routes.contains("100.90.0.5 dev wgtest"), "{routes}");
         assert!(routes.contains("fd00:90::5 dev wgtest"), "{routes}");
 
-        wg.reconcile(&[], &own.public_key().to_string(), false).unwrap();
+        wg.reconcile(&[], &[], &own.public_key().to_string(), false).unwrap();
         let routes = sh("ip -4 route show table all; ip -6 route show table all");
         assert!(!routes.contains("100.90.0.5") && !routes.contains("fd00:90::5"), "departed peer's route removed: {routes}");
+        wg.teardown().unwrap();
+    }
+
+    /// Service addresses: a peer's is routed to the interface and handed
+    /// to that peer, this node's own is routed to the interface for local
+    /// clients, and both go again when the service does — even while the
+    /// peer set itself stays exactly the same.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_reconcile_routes_service_addresses() {
+        if !crate::firewall::netns::reexec("wg::tests::kernel_reconcile_routes_service_addresses") {
+            return;
+        }
+        let sh = |script: &str| {
+            let out = std::process::Command::new("sh").args(["-euc", script]).output().unwrap();
+            assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap()
+        };
+        sh("ip link set lo up");
+        let own = clamp_private_key(&Key::generate());
+        let own_pub = own.public_key().to_string();
+        let mut wg = WgInterface::new("wgtest").unwrap();
+        wg.bring_up(&own.to_string(), "100.90.0.2".parse().unwrap(), "fd00:90::2".parse().unwrap(), 51820)
+            .unwrap();
+
+        let mut me = peer("me", &own_pub);
+        me.ip4 = "100.90.0.2".into();
+        let other = peer("peer", &key_b64(9));
+        let peers = [me, other];
+        let services = [
+            service("web", "peer", Some("100.90.0.50")),
+            service("mine", "me", Some("100.90.0.51")),
+        ];
+        wg.reconcile(&peers, &services, &own_pub, false).unwrap();
+
+        let routes = sh("ip -4 route show table all");
+        assert!(routes.contains("100.90.0.50 dev wgtest"), "{routes}");
+        assert!(routes.contains("100.90.0.51 dev wgtest"), "{routes}");
+        let allowed = sh("wg show wgtest allowed-ips 2>/dev/null || true");
+        if !allowed.is_empty() {
+            assert!(allowed.contains("100.90.0.50/32"), "{allowed}");
+            assert!(!allowed.contains("100.90.0.51"), "our own address is no peer's: {allowed}");
+        }
+
+        wg.reconcile(&peers, &[], &own_pub, false).unwrap();
+        let routes = sh("ip -4 route show table all");
+        assert!(!routes.contains("100.90.0.50") && !routes.contains("100.90.0.51"), "{routes}");
         wg.teardown().unwrap();
     }
 }

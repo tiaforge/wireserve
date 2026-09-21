@@ -193,14 +193,21 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // Same S2 defense in depth as list-peers: every field is
                 // sanitized, and denied_reason especially — it is the one
                 // field here an operator typed and a database round-tripped.
+                // `<vip or node address>\t<public→target/proto,...>`: where
+                // `<name>.wg` resolves and what it serves there.
+                let address = s.vip4.as_deref().unwrap_or(&s.ip4);
+                let ports = if s.ports.is_empty() {
+                    format!("{}/{}", s.port, s.proto.as_str())
+                } else {
+                    s.ports.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
+                };
                 println!(
-                    "{}\t{}\t{}\t{}\t{}/{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}",
                     sanitize_for_terminal(&s.name),
                     sanitize_for_terminal(&s.node),
                     state,
-                    sanitize_for_terminal(&s.ip4),
-                    s.port,
-                    s.proto.as_str(),
+                    sanitize_for_terminal(address),
+                    ports,
                     s.denied_reason
                         .as_deref()
                         .map(sanitize_for_terminal)

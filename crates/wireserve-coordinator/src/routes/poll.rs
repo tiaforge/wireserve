@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use axum::extract::{ConnectInfo, State};
 use axum::Json;
-use wireserve_types::{PollRequest, PollResponse, Proto};
+use wireserve_types::{PollRequest, PollResponse};
 
 use crate::auth::BearerNode;
 use crate::db::{nodes, services};
@@ -61,6 +61,13 @@ pub async fn poll(
                 "invalid port 0 for service '{}'",
                 decl.name
             )));
+        }
+        // The same per-service check the agent's `serve` makes. The
+        // per-node one (a target port mapped once) is left to the agent:
+        // it concerns only its own firewall, and a declaration list from
+        // before port mappings may legitimately alias a port.
+        if let Err(e) = wireserve_types::validate_service_ports(&decl.port_maps()) {
+            return Err(AppError::BadRequest(format!("service '{}': {e}", decl.name)));
         }
     }
     // S2 (security review): endpoint_addr is redistributed verbatim to
@@ -133,13 +140,9 @@ pub async fn poll(
         },
     )?;
 
-    let desired: Vec<(String, u16, Proto)> = req
-        .services
-        .iter()
-        .map(|d| (d.name.clone(), d.port, d.proto))
-        .collect();
+    let desired = &req.services;
     let desired_names: std::collections::HashSet<&str> =
-        desired.iter().map(|(n, _, _)| n.as_str()).collect();
+        desired.iter().map(|d| d.name.as_str()).collect();
     let previous = services::list_for_node(&conn, node.id)?;
     let previous_names: std::collections::HashSet<&str> =
         previous.iter().map(|s| s.name.as_str()).collect();
@@ -149,7 +152,7 @@ pub async fn poll(
     } else {
         services::ApprovalMode::AutoApprove
     };
-    let outcome = services::upsert_for_node(&mut conn, node.id, &desired, mode)?;
+    let outcome = services::upsert_for_node(&mut conn, node.id, desired, mode, &state.config.net_v4_cidr)?;
 
     for name in desired_names.difference(&previous_names) {
         tracing::info!(event = "service_declared", node_name = %node.name, service = %name);

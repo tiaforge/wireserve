@@ -8,11 +8,11 @@
 # removes everything on `leave`, and touches nothing when it refuses to
 # start on an interface it doesn't own.
 #
-# Same prerequisites as run-e2e-test.sh (podman, the WireGuard kernel
-# module, internet access at build time). firewalld is not covered here —
+# Same prerequisites as run-e2e-test.sh (ROOTFUL podman, the WireGuard
+# kernel module, internet access at build time). firewalld is not covered here —
 # it needs systemd and D-Bus inside the node.
 #
-# Usage: ./deploy/e2e/run-host-firewall-test.sh
+# Usage: sudo ./deploy/e2e/run-host-firewall-test.sh
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."   # repo root
@@ -44,6 +44,8 @@ log "checking prerequisites"
 command -v podman >/dev/null || fail "podman not found on PATH"
 command -v python3 >/dev/null || fail "python3 not found on PATH"
 modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available"
+[ "$(podman info --format '{{.Host.Security.Rootless}}')" = false ] \
+    || fail "needs rootful podman (the kernel refuses service-address rewrites in user namespaces): sudo $0"
 pass "prerequisites present"
 
 log "building images"
@@ -145,12 +147,17 @@ echo "$NFT" | grep 'wireserve:wireserve0' | grep -q 'iifname "wireserve0" counte
 pass "iptables and the native input chain each have exactly one wireserve0-scoped accept"
 
 log "declaring and approving a service on agent1"
-podman exec "$AGENT1" wireserve-agent serve testsvc 12345 tcp
+# Published on :80 of its own address (PLAN.md M20), onto 12345: the
+# rewritten packet still arrives on wireserve0, so it is the same
+# interface-scoped accept in the host firewalls that has to let it in.
+podman exec "$AGENT1" wireserve-agent serve testsvc 80:12345
 sleep 6
 podman exec "$COORD" wireserve-admin approve-service node1 testsvc
 sleep 6
 AGENT1_MESH_IP=$(mesh_ip_of "$AGENT2" node1)
 [ -n "$AGENT1_MESH_IP" ] || fail "could not determine agent1's mesh address"
+VIP=$(podman exec "$AGENT2" getent hosts testsvc.wg | awk '{print $1}')
+[ -n "$VIP" ] || fail "testsvc.wg does not resolve on agent2"
 AGENT1_BRIDGE_IP=$(podman inspect "$AGENT1" --format "{{(index .NetworkSettings.Networks \"$NET\").IPAddress}}")
 
 podman exec -d "$DBG1" nc -l -k -p 12345
@@ -162,8 +169,12 @@ podman exec "$DBG1" timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/12345" \
 can_connect() { podman exec "$AGENT2" timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
 
 log "E1/E2: declared port reachable over the mesh, nothing else, nothing on eth0"
-can_connect "$AGENT1_MESH_IP" 12345 || fail "declared service NOT reachable over the mesh through the host firewalls"
+can_connect "$VIP" 80 || fail "declared service NOT reachable over the mesh through the host firewalls"
 pass "declared service reachable over the mesh despite iptables DROP + native nftables DROP"
+if can_connect "$AGENT1_MESH_IP" 12345; then
+    fail "the service's target port is reachable straight on the node's mesh address"
+fi
+pass "only the published port answers; the target port itself stays closed to the mesh"
 if can_connect "$AGENT1_MESH_IP" 12346; then
     fail "an undeclared port is reachable over the mesh — our default-deny is not deciding"
 fi
@@ -181,7 +192,7 @@ for _ in $(seq 1 30); do
     sleep 0.1
 done
 in_dbg "nft list table inet filter" | grep -q 'wireserve:wireserve0' || fail "rule not restored within 3s after reload"
-can_connect "$AGENT1_MESH_IP" 12345 || fail "service unreachable after the reload was repaired"
+can_connect "$VIP" 80 || fail "service unreachable after the reload was repaired"
 pass "native table reload repaired within 3s; service reachable again"
 
 log "E3: an iptables rule removed by hand comes back within one poll"

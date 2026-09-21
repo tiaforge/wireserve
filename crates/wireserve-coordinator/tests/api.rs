@@ -2295,3 +2295,104 @@ async fn a_full_size_legitimate_poll_is_still_accepted() {
     let resp = app.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+// ---- service addresses and port mappings (PLAN.md M20) ----
+
+async fn poll_with(router: &Router, bearer: &str, services: Value) -> (StatusCode, Value) {
+    let req = json_request("POST", "/poll", Some(bearer), json!({ "services": services }));
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, body_json(resp).await)
+}
+
+#[tokio::test]
+async fn a_mapped_service_gets_its_own_address_in_every_directory() {
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "owner").await;
+    let t2 = admin_create_node(&app.router, "client").await;
+    let owner = register_node(&app.router, &t1, "pk1", 51820).await;
+    let client = register_node(&app.router, &t2, "pk2", 51821).await;
+    let owner_bearer = owner["bearer_token"].as_str().unwrap();
+
+    let web = json!({"name": "web", "port": 5080, "proto": "tcp",
+                     "ports": [{"public": 80, "target": 5080, "proto": "tcp"}]});
+    let dns = json!({"name": "dns", "port": 53, "proto": "udp",
+                     "ports": [{"public": 53, "target": 53, "proto": "udp"},
+                               {"public": 8080, "target": 8000, "proto": "tcp"}]});
+    let (status, _) = poll_with(&app.router, owner_bearer, json!([web, dns])).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, body) = poll_with(&app.router, client["bearer_token"].as_str().unwrap(), json!([])).await;
+    let services = body["services"].as_array().unwrap();
+    let by_name = |n: &str| services.iter().find(|s| s["name"] == n).unwrap().clone();
+    let (web, dns) = (by_name("web"), by_name("dns"));
+    // Two nodes hold .1 and .2; the services get the next free addresses.
+    assert_eq!(web["vip4"], "100.90.0.3");
+    assert_eq!(dns["vip4"], "100.90.0.4");
+    assert_eq!(web["ip4"], owner["ip4"], "ip4 stays the owning node's, for older agents");
+    assert_eq!(web["ports"], json!([{"public": 80, "target": 5080, "proto": "tcp"}]));
+    assert_eq!(dns["ports"].as_array().unwrap().len(), 2);
+
+    // A node registered afterwards doesn't collide with either.
+    let t3 = admin_create_node(&app.router, "late").await;
+    let late = register_node(&app.router, &t3, "pk3", 51822).await;
+    assert_eq!(late["ip4"], "100.90.0.5");
+}
+
+#[tokio::test]
+async fn an_old_agents_declaration_gets_no_address_and_the_old_wire_shape() {
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "pk1", 51820).await;
+    let (_, body) = poll_with(
+        &app.router,
+        r1["bearer_token"].as_str().unwrap(),
+        json!([{"name": "plex", "port": 32400, "proto": "tcp"}]),
+    )
+    .await;
+    let plex = &body["services"][0];
+    assert!(plex.get("vip4").is_none(), "{plex}");
+    assert!(plex.get("ports").is_none(), "{plex}");
+    assert_eq!(plex["port"], 32400);
+}
+
+#[tokio::test]
+async fn a_pending_service_tells_only_its_owner_its_address() {
+    let mut config = test_config("");
+    config.require_service_approval = true;
+    let app = app_with_config(config);
+    let t1 = admin_create_node(&app.router, "owner").await;
+    let t2 = admin_create_node(&app.router, "client").await;
+    let owner = register_node(&app.router, &t1, "pk1", 51820).await;
+    let client = register_node(&app.router, &t2, "pk2", 51821).await;
+
+    let web = json!([{"name": "web", "port": 5080, "proto": "tcp",
+                      "ports": [{"public": 80, "target": 5080, "proto": "tcp"}]}]);
+    let (_, body) = poll_with(&app.router, owner["bearer_token"].as_str().unwrap(), web).await;
+    assert!(body["services"].as_array().unwrap().is_empty());
+    assert_eq!(body["pending_services"][0]["vip4"], "100.90.0.3");
+
+    let (_, body) = poll_with(&app.router, client["bearer_token"].as_str().unwrap(), json!([])).await;
+    assert!(!body.to_string().contains("100.90.0.3"), "nobody else learns it before approval: {body}");
+}
+
+#[tokio::test]
+async fn poll_rejects_a_malformed_port_mapping() {
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "pk1", 51820).await;
+    let bearer = r1["bearer_token"].as_str().unwrap();
+    for ports in [
+        json!([{"public": 80, "target": 5080, "proto": "tcp"}, {"public": 80, "target": 6080, "proto": "tcp"}]),
+        json!([{"public": 0, "target": 5080, "proto": "tcp"}]),
+        json!([{"public": 80, "target": 0, "proto": "tcp"}]),
+    ] {
+        let (status, body) = poll_with(
+            &app.router,
+            bearer,
+            json!([{"name": "web", "port": 5080, "proto": "tcp", "ports": ports}]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{ports}: {body}");
+    }
+}

@@ -4,7 +4,7 @@
 //! WireGuard client.
 
 use defguard_wireguard_rs::key::Key;
-use wireserve_types::{NodeKind, PeerInfo, RegisterRequest};
+use wireserve_types::{AdminServiceInfo, NodeKind, PeerInfo, RegisterRequest, ServiceApprovalState};
 
 use crate::client::{self, AdminClient, ClientError};
 
@@ -31,7 +31,8 @@ pub struct InterfaceParams {
 /// way it must never get a `[Peer]` block pointing at itself).
 ///
 /// Every peer's `AllowedIPs` is that peer's own `/32` (v4) + `/128` (v6),
-/// never a shared mesh CIDR block — spec §9 is explicit about why: a wider
+/// plus the `/32` of every approved service it owns (`services`, PLAN.md
+/// M20 — the same rule the agent applies), never a shared mesh CIDR block — spec §9 is explicit about why: a wider
 /// block would make this device act as a router for other peers' traffic,
 /// and WireGuard requires non-overlapping `AllowedIPs` across peers on one
 /// interface regardless.
@@ -47,7 +48,7 @@ pub struct InterfaceParams {
 /// (e.g. an `endpoint_addr` of `"1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0"`
 /// hijacking this exported device's routing).
 #[must_use]
-pub fn render_conf(iface: &InterfaceParams, peers: &[PeerInfo]) -> String {
+pub fn render_conf(iface: &InterfaceParams, peers: &[PeerInfo], services: &[AdminServiceInfo]) -> String {
     let mut out = String::new();
     out.push_str("[Interface]\n");
     out.push_str(&format!("PrivateKey = {}\n", iface.private_key));
@@ -80,7 +81,11 @@ pub fn render_conf(iface: &InterfaceParams, peers: &[PeerInfo]) -> String {
         out.push('\n');
         out.push_str("[Peer]\n");
         out.push_str(&format!("PublicKey = {}\n", peer.pubkey));
-        out.push_str(&format!("AllowedIPs = {}/32, {}/128\n", peer.ip4, peer.ip6));
+        let mut allowed = format!("{}/32, {}/128", peer.ip4, peer.ip6);
+        for vip in service_addresses(services, &peer.name) {
+            allowed.push_str(&format!(", {vip}/32"));
+        }
+        out.push_str(&format!("AllowedIPs = {allowed}\n"));
         if let Some(endpoint) = &endpoint {
             out.push_str(&format!("Endpoint = {endpoint}\n"));
         }
@@ -90,6 +95,16 @@ pub fn render_conf(iface: &InterfaceParams, peers: &[PeerInfo]) -> String {
     }
 
     out
+}
+
+/// The addresses of `node`'s approved services. Parsed, not copied: like
+/// the pubkey and endpoint above, nothing but a literal address may reach
+/// the `.conf`.
+fn service_addresses<'a>(services: &'a [AdminServiceInfo], node: &'a str) -> impl Iterator<Item = std::net::Ipv4Addr> + 'a {
+    services
+        .iter()
+        .filter(move |s| s.node == node && s.state == ServiceApprovalState::Approved)
+        .filter_map(|s| s.vip4.as_deref()?.parse().ok())
 }
 
 fn contains_newline(s: &str) -> bool {
@@ -133,6 +148,7 @@ pub fn run(
     )?;
 
     let directory = admin_client.list_peers()?;
+    let services = admin_client.list_services()?;
 
     let iface = InterfaceParams {
         private_key: private_key.to_string(),
@@ -141,7 +157,7 @@ pub fn run(
         own_pubkey: public_key.to_string(),
     };
 
-    Ok(render_conf(&iface, &directory.peers))
+    Ok(render_conf(&iface, &directory.peers, &services.services))
 }
 
 #[cfg(test)]
@@ -170,9 +186,42 @@ mod tests {
         }
     }
 
+    fn service(node: &str, vip4: Option<&str>, state: ServiceApprovalState) -> AdminServiceInfo {
+        AdminServiceInfo {
+            name: "web".into(),
+            node: node.into(),
+            ip4: String::new(),
+            port: 80,
+            proto: wireserve_types::Proto::Tcp,
+            vip4: vip4.map(Into::into),
+            ports: vec![],
+            state,
+            declared_at: None,
+            approved_at: None,
+            denied_at: None,
+            denied_reason: None,
+        }
+    }
+
+    #[test]
+    fn a_peers_approved_service_addresses_are_routed_to_it() {
+        let mut p = peer("pk1", "100.90.0.3", "fd00:90::3", None);
+        p.name = "owner".into();
+        let services = [
+            service("owner", Some("100.90.0.50"), ServiceApprovalState::Approved),
+            service("owner", Some("100.90.0.51"), ServiceApprovalState::Pending),
+            service("owner", None, ServiceApprovalState::Approved),
+            service("owner", Some("100.90.0.52\nAllowedIPs = 0.0.0.0/0"), ServiceApprovalState::Approved),
+            service("other", Some("100.90.0.53"), ServiceApprovalState::Approved),
+        ];
+        let conf = render_conf(&iface(), &[p], &services);
+        assert!(conf.contains("AllowedIPs = 100.90.0.3/32, fd00:90::3/128, 100.90.0.50/32\n"), "{conf}");
+        assert!(!conf.contains("0.0.0.0/0"), "{conf}");
+    }
+
     #[test]
     fn renders_interface_block() {
-        let conf = render_conf(&iface(), &[]);
+        let conf = render_conf(&iface(), &[], &[]);
         assert!(conf.contains("[Interface]"));
         assert!(conf.contains("PrivateKey = privkeybase64=="));
         assert!(conf.contains("Address = 100.90.0.7/32, fd00:90::7/128"));
@@ -181,7 +230,7 @@ mod tests {
     #[test]
     fn omits_endpoint_line_when_absent() {
         let peers = vec![peer("otherpubkey", "100.90.0.3", "fd00:90::3", None)];
-        let conf = render_conf(&iface(), &peers);
+        let conf = render_conf(&iface(), &peers, &[]);
         assert!(!conf.contains("Endpoint ="));
     }
 
@@ -193,7 +242,7 @@ mod tests {
             "fd00:90::3",
             Some("duckdns.example.com:51820"),
         )];
-        let conf = render_conf(&iface(), &peers);
+        let conf = render_conf(&iface(), &peers, &[]);
         assert!(conf.contains("Endpoint = duckdns.example.com:51820"));
     }
 
@@ -202,7 +251,7 @@ mod tests {
         let mut p = peer("otherpubkey", "100.90.0.3", "fd00:90::3", None);
         p.endpoint_addr_v4 = Some("203.0.113.5:51820".into());
         p.endpoint_addr_v6 = Some("[2001:db8::1]:51820".into());
-        let conf = render_conf(&iface(), &[p]);
+        let conf = render_conf(&iface(), &[p], &[]);
         assert!(conf.contains("Endpoint = 203.0.113.5:51820"));
     }
 
@@ -210,7 +259,7 @@ mod tests {
     fn falls_back_to_v6_when_only_v6_is_available() {
         let mut p = peer("otherpubkey", "100.90.0.3", "fd00:90::3", None);
         p.endpoint_addr_v6 = Some("[2001:db8::1]:51820".into());
-        let conf = render_conf(&iface(), &[p]);
+        let conf = render_conf(&iface(), &[p], &[]);
         assert!(conf.contains("Endpoint = [2001:db8::1]:51820"));
     }
 
@@ -220,7 +269,7 @@ mod tests {
             peer("p1", "100.90.0.3", "fd00:90::3", None),
             peer("p2", "100.90.0.4", "fd00:90::4", None),
         ];
-        let conf = render_conf(&iface(), &peers);
+        let conf = render_conf(&iface(), &peers, &[]);
         assert!(conf.contains("AllowedIPs = 100.90.0.3/32, fd00:90::3/128"));
         assert!(conf.contains("AllowedIPs = 100.90.0.4/32, fd00:90::4/128"));
         assert!(!conf.contains("/24"));
@@ -234,7 +283,7 @@ mod tests {
             peer("p1", "100.90.0.3", "fd00:90::3", None),
             peer("p2", "100.90.0.4", "fd00:90::4", None),
         ];
-        let conf = render_conf(&iface(), &peers);
+        let conf = render_conf(&iface(), &peers, &[]);
         assert_eq!(conf.matches("[Peer]").count(), 2);
     }
 
@@ -245,7 +294,7 @@ mod tests {
             peer(&i.own_pubkey, "100.90.0.7", "fd00:90::7", None),
             peer("someone-else", "100.90.0.3", "fd00:90::3", None),
         ];
-        let conf = render_conf(&i, &peers);
+        let conf = render_conf(&i, &peers, &[]);
         assert_eq!(conf.matches("[Peer]").count(), 1);
         assert!(conf.contains("someone-else"));
     }
@@ -260,7 +309,7 @@ mod tests {
             "fd00:90::3",
             Some("1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0"),
         )];
-        let conf = render_conf(&iface(), &peers);
+        let conf = render_conf(&iface(), &peers, &[]);
         assert!(
             !conf.contains("[Peer]"),
             "a peer carrying a config-injection payload must be skipped entirely, not rendered"
@@ -276,7 +325,7 @@ mod tests {
             "fd00:90::3",
             None,
         )];
-        let conf = render_conf(&iface(), &peers);
+        let conf = render_conf(&iface(), &peers, &[]);
         assert!(!conf.contains("[Peer]"));
         assert!(!conf.contains("evil.example"));
     }
@@ -293,7 +342,7 @@ mod tests {
             ),
             peer("good2", "100.90.0.5", "fd00:90::5", None),
         ];
-        let conf = render_conf(&iface(), &peers);
+        let conf = render_conf(&iface(), &peers, &[]);
         assert_eq!(conf.matches("[Peer]").count(), 2);
         assert!(conf.contains("good1"));
         assert!(conf.contains("good2"));

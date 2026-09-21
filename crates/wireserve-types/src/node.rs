@@ -33,7 +33,7 @@ impl std::str::FromStr for NodeKind {
 }
 
 /// Transport-layer protocol a declared service listens on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Proto {
     Tcp,

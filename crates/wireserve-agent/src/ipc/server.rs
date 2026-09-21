@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, Mutex};
-use wireserve_types::{PollResponse, ServiceDecl};
+use wireserve_types::{PollResponse, PortMap, ServiceDecl};
 
 use crate::ipc::protocol::{IpcRequest, IpcResponse, ListView, LocalServiceView};
 use crate::state::AgentState;
@@ -65,6 +65,8 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
             ip4: s.ip4.clone(),
             port: s.port,
             proto: s.proto,
+            vip4: s.vip4.clone(),
+            ports: s.port_maps(),
             online: s.online,
             local: declared_names.contains(s.name.as_str()),
             // Always false in practice for a directory-derived entry,
@@ -84,6 +86,14 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
                 ip4: state.ip4.clone().unwrap_or_default(),
                 port: d.port,
                 proto: d.proto,
+                // The address a pending declaration will have, if the
+                // coordinator already said.
+                vip4: directory
+                    .pending_services
+                    .iter()
+                    .find(|p| p.name == d.name)
+                    .and_then(|p| p.vip4.clone()),
+                ports: d.port_maps(),
                 online: false,
                 local: true,
                 pending: pending_names.contains(d.name.as_str()),
@@ -104,17 +114,42 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
 /// shutdown (from `leave`) should be signalled after it's sent.
 async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
     match req {
-        IpcRequest::Serve { name, port, proto } => {
+        IpcRequest::Serve { name, port, proto, ports } => {
             if !wireserve_types::is_valid_dns_label(&name) {
                 return (
                     IpcResponse::error(format!("invalid service name: {name}")),
                     false,
                 );
             }
-            if port == 0 {
-                return (IpcResponse::error("port must be 1-65535"), false);
+            let ports = if ports.is_empty() { vec![PortMap::identity(port, proto)] } else { ports };
+            if let Err(e) = wireserve_types::validate_service_ports(&ports) {
+                return (IpcResponse::error(e), false);
             }
             let mut state = ctx.state.lock().await;
+            // A target port answers for one mapping per node; see
+            // `validate_node_targets`. Checked for this declaration against
+            // the ones it would sit beside (not its own old version), and
+            // only for this one: a state file from before port mappings can
+            // hold two names aliasing one port, and refusing every later
+            // `serve` over that would leave no way to fix it but `unserve`.
+            if let Err(e) = wireserve_types::validate_node_targets(ports.iter().map(|m| (name.as_str(), m))) {
+                return (IpcResponse::error(e), false);
+            }
+            for d in state.declared_services.iter().filter(|d| d.name != name) {
+                for theirs in d.port_maps() {
+                    if let Some(m) = ports.iter().find(|m| m.target == theirs.target && m.proto == theirs.proto) {
+                        return (
+                            IpcResponse::error(format!(
+                                "target port {}/{} is already mapped by '{}'",
+                                m.target,
+                                m.proto.as_str(),
+                                d.name
+                            )),
+                            false,
+                        );
+                    }
+                }
+            }
             // Enforce the coordinator's own per-node limit here too, on
             // the count this declaration would produce. A limit checked
             // only at the coordinator is not a limit, it is a trap: the
@@ -146,7 +181,7 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
             // goes for a stale "waiting on approval" marker.
             state.rejected_services.retain(|r| r.name != name);
             state.pending_services.retain(|n| n != &name);
-            state.declared_services.push(ServiceDecl { name, port, proto });
+            state.declared_services.push(ServiceDecl::new(name, ports));
             match state.save(&ctx.state_path) {
                 Ok(()) => (IpcResponse::Ok, false),
                 Err(e) => (IpcResponse::error(e.to_string()), false),
@@ -302,6 +337,7 @@ mod tests {
                 name: "plex".into(),
                 port: 32400,
                 proto: wireserve_types::Proto::Tcp,
+                ports: vec![],
             });
             state.pending_services.push("plex".into());
         }
@@ -322,6 +358,7 @@ mod tests {
                 name: "plex".into(),
                 port: 32400,
                 proto: wireserve_types::Proto::Tcp,
+                ports: vec![],
             });
             // Approval is observed as the name leaving pending_services.
         }
@@ -348,6 +385,7 @@ mod tests {
                 name: "plex".into(),
                 port: 32400,
                 proto: wireserve_types::Proto::Tcp,
+                ports: vec![],
             },
         )
         .await;
@@ -398,6 +436,7 @@ mod tests {
                 name: "plex".into(),
                 port: 32400,
                 proto: wireserve_types::Proto::Tcp,
+                ports: vec![],
             });
         }
 
@@ -453,6 +492,58 @@ mod tests {
         assert!(ctx.state.lock().await.declared_services.is_empty());
     }
 
+    fn serve_req(name: &str, ports: &[&str]) -> IpcRequest {
+        let ports: Vec<PortMap> = ports.iter().map(|p| p.parse().unwrap()).collect();
+        IpcRequest::Serve {
+            name: name.into(),
+            port: ports[0].target,
+            proto: ports[0].proto,
+            ports,
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_stores_every_port_mapping() {
+        let (ctx, _dir, _rx) = test_ctx();
+        let (resp, _) = dispatch(&ctx, serve_req("dns", &["53/udp", "53/tcp", "8080:8000"])).await;
+        assert!(matches!(resp, IpcResponse::Ok), "{resp:?}");
+        let state = ctx.state.lock().await;
+        let d = &state.declared_services[0];
+        assert_eq!(d.port_maps().iter().map(ToString::to_string).collect::<Vec<_>>(), ["53→53/udp", "53→53/tcp", "8080→8000/tcp"]);
+        // What an old coordinator reads.
+        assert_eq!((d.port, d.proto), (53, wireserve_types::Proto::Udp));
+    }
+
+    #[tokio::test]
+    async fn serve_refuses_a_target_port_another_service_maps() {
+        let (ctx, _dir, _rx) = test_ctx();
+        assert!(matches!(dispatch(&ctx, serve_req("web", &["80:5080"])).await.0, IpcResponse::Ok));
+        let (resp, _) = dispatch(&ctx, serve_req("api", &["8080:5080"])).await;
+        assert!(matches!(&resp, IpcResponse::Error { message } if message.contains("'web'")), "{resp:?}");
+        // Same port, other protocol: a different socket, fine.
+        assert!(matches!(dispatch(&ctx, serve_req("api", &["8080:5080/udp"])).await.0, IpcResponse::Ok));
+        // Re-declaring a service may reuse its own old targets.
+        assert!(matches!(dispatch(&ctx, serve_req("web", &["8081:5080"])).await.0, IpcResponse::Ok));
+        assert_eq!(ctx.state.lock().await.declared_services.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn serve_refuses_a_public_port_mapped_twice() {
+        let (ctx, _dir, _rx) = test_ctx();
+        let (resp, _) = dispatch(&ctx, serve_req("web", &["80:5080", "80:6080"])).await;
+        assert!(matches!(resp, IpcResponse::Error { .. }));
+        assert!(ctx.state.lock().await.declared_services.is_empty());
+    }
+
+    #[tokio::test]
+    async fn serve_from_an_old_cli_is_its_identity_mapping() {
+        let (ctx, _dir, _rx) = test_ctx();
+        let req = crate::ipc::protocol::parse_request(r#"{"op":"serve","name":"plex","port":32400,"proto":"tcp"}"#).unwrap();
+        assert!(matches!(dispatch(&ctx, req).await.0, IpcResponse::Ok));
+        let state = ctx.state.lock().await;
+        assert_eq!(state.declared_services[0].port_maps(), vec![PortMap::identity(32400, wireserve_types::Proto::Tcp)]);
+    }
+
     #[tokio::test]
     async fn serve_refuses_to_exceed_the_coordinators_per_node_service_limit() {
         // Going over the limit locally would be persisted and resent on
@@ -468,6 +559,7 @@ mod tests {
                     name: format!("svc-{i}"),
                     port: 1000,
                     proto: wireserve_types::Proto::Tcp,
+                    ports: vec![],
                 });
             }
         }
@@ -505,6 +597,7 @@ mod tests {
                     name: format!("svc-{i}"),
                     port: 1000,
                     proto: wireserve_types::Proto::Tcp,
+                    ports: vec![],
                 });
             }
         }

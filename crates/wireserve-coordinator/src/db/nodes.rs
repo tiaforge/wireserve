@@ -423,9 +423,14 @@ pub fn delete_node(conn: &Connection, node_id: i64) -> Result<(), DbError> {
 }
 
 /// All addresses currently allocated (any node, regardless of registration
-/// state) — used by the IP allocator to avoid handing out a duplicate.
+/// state, and every service address) — used by the IP allocator to avoid
+/// handing out a duplicate. Nodes and services share one range (migration
+/// 0006), so each allocation must avoid both.
 pub fn all_allocated_ip4(conn: &Connection) -> Result<Vec<Ipv4Addr>, DbError> {
-    let mut stmt = conn.prepare("SELECT ip4 FROM nodes WHERE ip4 IS NOT NULL")?;
+    let mut stmt = conn.prepare(
+        "SELECT ip4 FROM nodes WHERE ip4 IS NOT NULL \
+         UNION SELECT vip4 FROM services WHERE vip4 IS NOT NULL",
+    )?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let mut out = Vec::new();
     for r in rows {

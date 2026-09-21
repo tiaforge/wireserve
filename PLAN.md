@@ -1394,3 +1394,86 @@ what the library does and does not do on your behalf.
     it holds.
 
     Also: removing the block no longer eats the file's final newline.
+
+## M20 — service addresses and port mappings
+
+80. **Each service has its own address.** `<name>.wg` resolved to the
+    owning node, so services on one node shared its address and had to
+    be reached on their real ports, and only one of them could ever sit
+    on `:80`. Now the coordinator gives every declaration that carries
+    port mappings an address from the mesh range (`services.vip4`,
+    migration 0006), shared with node addresses so a static peer routing
+    the range reaches it; peers add it to the owner's `AllowedIPs` and
+    route it; the hosts file points the name at it. A declaration keeps
+    its address across re-declarations and approval, and frees it when
+    withdrawn. One from an agent that predates mappings gets none and
+    loses any it had, since that agent can't serve it — so a mixed mesh
+    degrades to the old behaviour per service instead of breaking. An
+    exhausted range is logged and leaves the service on its node's
+    address rather than failing the poll (which would resend forever).
+
+81. **`serve <name> [PUBLIC:]TARGET[/proto]...`**: several mappings per
+    service, TCP and UDP. Only the published ports answer — the target
+    port is closed to the mesh on every address — at the user's request.
+    `ServiceDecl` keeps `port`/`proto` (the first mapping's target) for old
+    coordinators; `ports` absent means the identity mapping, so old agents,
+    old state files and old CLIs all still mean what they meant. The
+    agent refuses a target port already used by another mapping of the
+    node (its replies would be ambiguous, see #82); the coordinator only
+    checks each service's own mappings, because a declaration list from
+    before mappings may legitimately alias one port under two names — the
+    agent's rule generator maps such an alias once and warns.
+
+82. **Kernel data path: a stateless rewrite before conntrack, not a DNAT,
+    not a proxy.** The services must see the real client address and
+    carry any protocol, which rules out a userspace proxy (it would also
+    hand every mesh peer whatever trust a service gives localhost). A
+    DNAT of ours doesn't compose with containers: a connection gets one
+    destination NAT per direction, and a published port of rootful
+    Podman (netavark) or Docker without its userland proxy *is* one — ours
+    would win and the runtime's never run. So `svc-pre` (prerouting, raw
+    −300) rewrites `vip:public` to `node:target` with nft payload
+    statements before conntrack exists and sets a mark bit; `svc-out`
+    (output, raw, a `route` chain so the kernel re-routes) does the same
+    for the owner's own clients, whose initial lookup succeeds because the
+    owner routes its own addresses into the mesh interface. Conntrack,
+    the runtime's NAT and the service then see an ordinary
+    `client → node:target` flow. `svc-mark-*` (mangle) copies the mark onto
+    the flow; the input filter accepts marked flows only; `svc-rev-post`
+    and `svc-rev-in` (priority 300, after every NAT hook) rewrite replies
+    of marked flows from `node:target` back to `vip:public`. The mark is
+    one bit (`0x01000000`), only ever OR-ed in and tested under its mask.
+    A new `wireserve-fwd` chain default-denies what the mesh would reach
+    *through* the node, which a container's published port is — that was
+    open to every peer before, declared or not. Proven first with a
+    hand-written ruleset against a netavark-style DNAT in three
+    namespaces (`deploy/e2e/run-service-vip-spike.sh`), TCP and UDP, both
+    directions, checksums verified.
+
+83. **Rewriting needs the host's own user namespace.** Since the
+    "netfilter: disable payload mangling in userns" hardening (in the 7.x
+    kernels), nft payload writes fail with EPERM in any network namespace
+    owned by a non-init user namespace. A real agent runs as root on the
+    host and is unaffected; one in an unprivileged container (LXC,
+    rootless podman) fails its firewall step with a message naming the
+    cause, and a service with an address is unreachable there. Every e2e
+    suite that serves now needs `sudo` (rootful podman, or `unshare -n`
+    as root for the multi-instance one). Unit tests in an unprivileged
+    namespace check that EPERM on the rewrite statements is the only
+    error nft reports, i.e. it parsed and evaluated every statement; as
+    root they check the rendered ruleset. A plain-DNAT fallback for
+    unprivileged containers (keeping the client address, losing the
+    container composition) was considered and left for later.
+
+84. **Coordinator trust for addresses.** `vip::sanitize` is the single
+    place the agent checks the addresses it received before WireGuard,
+    the firewall and the hosts file act on them: implausible ones
+    (loopback, multicast, link-local, …), one equal to any node's
+    address, and one given to two services are cleared. A range check
+    isn't possible (the agent doesn't know the range) and isn't needed
+    for parity: the coordinator could already route any address to a
+    peer through that peer's own `ip4`. The coordinator never chooses a
+    port that is opened — rules take every port from the node's own
+    declarations and only the destination address from the directory —
+    and an address missing for a declared service falls back to opening
+    its target ports directly, as before addresses existed.

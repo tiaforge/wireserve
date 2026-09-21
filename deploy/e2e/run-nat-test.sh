@@ -22,12 +22,13 @@
 # agent2's NAT, because two machines in the same house behind one router
 # is entirely normal and is where source-port assumptions break.
 #
-# Everything runs in rootless Podman: the routers are ordinary containers
+# Everything runs in (rootful — service addresses rewrite packet headers,
+# which the kernel refuses in a user namespace) Podman: the routers are ordinary containers
 # with CAP_NET_ADMIN doing real nftables masquerade and DNAT, and the site
 # networks are `--internal` so Podman itself adds no path to the outside.
 # The only way out of a site is through its router.
 #
-# Usage: ./deploy/e2e/run-nat-test.sh
+# Usage: sudo ./deploy/e2e/run-nat-test.sh
 # Exit code 0 = every check passed.
 
 set -euo pipefail
@@ -85,6 +86,8 @@ log "checking prerequisites"
 command -v podman >/dev/null || fail "podman not found on PATH"
 command -v python3 >/dev/null || fail "python3 not found on PATH"
 modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available"
+[ "$(podman info --format '{{.Host.Security.Rootless}}')" = false ] \
+    || fail "needs rootful podman (the kernel refuses service-address rewrites in user namespaces): sudo $0"
 pass "podman, python3 and the WireGuard kernel module are present"
 
 log "building images"
@@ -226,6 +229,7 @@ echo "node2 mesh address: $AGENT2_MESH"
 log "declaring a service on each of agent1 and agent2"
 podman exec "$AGENT1" wireserve-agent serve svc-one 12345 tcp
 podman exec "$AGENT2" wireserve-agent serve svc-two 12345 tcp
+podman exec "$AGENT3" wireserve-agent serve svc-three 12345 tcp
 sleep 8
 # Service approval is on by default. This harness is about NAT traversal,
 # not about the approval gate (run-e2e-test.sh covers that), so approve
@@ -234,7 +238,17 @@ podman exec "$COORD" wireserve-admin approve-service node1 svc-one \
     || fail "could not approve svc-one"
 podman exec "$COORD" wireserve-admin approve-service node2 svc-two \
     || fail "could not approve svc-two"
+podman exec "$COORD" wireserve-admin approve-service node3 svc-three \
+    || fail "could not approve svc-three"
 sleep 12
+# Each service answers on its own address (PLAN.md M20), not on its
+# node's: resolve them the way any client would.
+svc_addr() { podman exec "$1" getent hosts "$2" | awk '{print $1}'; }
+SVC1=$(svc_addr "$AGENT2" svc-one.wg)
+SVC2=$(svc_addr "$AGENT1" svc-two.wg)
+SVC3=$(svc_addr "$AGENT1" svc-three.wg)
+[ -n "$SVC1" ] && [ -n "$SVC2" ] && [ -n "$SVC3" ] || fail "a service name does not resolve ($SVC1/$SVC2/$SVC3)"
+echo "svc-one.wg=$SVC1 svc-two.wg=$SVC2 svc-three.wg=$SVC3"
 in_netns_bg "$AGENT1" nc -l -k -p 12345
 in_netns_bg "$AGENT2" nc -l -k -p 12345
 sleep 2
@@ -245,7 +259,7 @@ log "NAT-ed client to port-forwarded server (agent2 -> agent1)"
 # The easy direction: agent2 initiates, its router creates a mapping, and
 # agent1 is directly reachable anyway. This is the case every home setup
 # depends on and it must work.
-if podman exec "$AGENT2" timeout 15 bash -c "exec 3<>/dev/tcp/$AGENT1_MESH/12345"; then
+if podman exec "$AGENT2" timeout 15 bash -c "exec 3<>/dev/tcp/$SVC1/12345"; then
     pass "a node behind NAT reaches a port-forwarded node's declared service"
 else
     fail "a node behind NAT could NOT reach a port-forwarded node — this is the baseline case and must work"
@@ -257,7 +271,7 @@ log "port-forwarded server back to NAT-ed client (agent1 -> agent2)"
 # PersistentKeepalive have already opened a mapping through router-b, and
 # because WireGuard corrected agent2's endpoint from the packets it
 # actually received rather than trusting what the coordinator said.
-if podman exec "$AGENT1" timeout 15 bash -c "exec 3<>/dev/tcp/$AGENT2_MESH/12345"; then
+if podman exec "$AGENT1" timeout 15 bash -c "exec 3<>/dev/tcp/$SVC2/12345"; then
     pass "the port-forwarded node reaches back into the NAT-ed node (keepalive plus endpoint correction work)"
 else
     fail "could not reach back into the NAT-ed node"
@@ -293,7 +307,6 @@ fi
 log "connectivity between every pair of nodes"
 in_netns_bg "$AGENT3" nc -l -k -p 12345
 sleep 2
-A3_MESH=$(mesh_ip_of "$AGENT1" node3)
 
 check_pair() {
     local from=$1 to_ip=$2 label=$3 required=$4
@@ -312,9 +325,9 @@ check_pair() {
 # interesting half: nothing is forwarded to agent2, so it can only work
 # because agent2's keepalive holds a mapping open through its router and
 # WireGuard corrected agent2's endpoint from the traffic it received.
-check_pair "$AGENT2" "$AGENT1_MESH" "NAT-ed node reaches the port-forwarded node" required
-check_pair "$AGENT1" "$AGENT2_MESH" "port-forwarded node reaches back into the NAT-ed node" required
-check_pair "$AGENT3" "$AGENT1_MESH" "the second NAT-ed node also reaches the port-forwarded node" required
+check_pair "$AGENT2" "$SVC1" "NAT-ed node reaches the port-forwarded node" required
+check_pair "$AGENT1" "$SVC2" "port-forwarded node reaches back into the NAT-ed node" required
+check_pair "$AGENT3" "$SVC1" "the second NAT-ed node also reaches the port-forwarded node" required
 
 # Both of these sit behind the SAME router, which is two machines in one
 # house — an entirely ordinary homelab layout. Each knows the other only
@@ -322,8 +335,8 @@ check_pair "$AGENT3" "$AGENT1_MESH" "the second NAT-ed node also reaches the por
 # a packet out to your own NAT's public side and expecting it back in.
 # That is NAT hairpinning, and plenty of routers do not do it.
 log "the two nodes behind a shared NAT, which is the interesting case"
-if check_pair "$AGENT2" "$A3_MESH" "node behind a shared NAT reaches its neighbour" optional \
-   && check_pair "$AGENT3" "$AGENT2_MESH" "and the reverse" optional; then
+if check_pair "$AGENT2" "$SVC3" "node behind a shared NAT reaches its neighbour" optional \
+   && check_pair "$AGENT3" "$SVC2" "and the reverse" optional; then
     note "this router hairpins. Not every router does, so do not rely on it."
 else
     note "Two nodes behind ONE router cannot reach each other here: each knows the"

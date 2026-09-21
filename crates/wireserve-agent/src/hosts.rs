@@ -1,6 +1,7 @@
 //! Managed `/etc/hosts` block (spec §6). Every declared service gets a
-//! synthetic `<service-name>.wg` hostname pointing at its owning node's
-//! IPv4 address. Entries live between fixed markers so each poll cycle can
+//! synthetic `<service-name>.wg` hostname pointing at its own address
+//! (PLAN.md M20), or at its owning node's IPv4 address for a service the
+//! coordinator gave no address of its own. Entries live between fixed markers so each poll cycle can
 //! safely wipe-and-rewrite just that span without touching anything else
 //! already in the file.
 //!
@@ -34,7 +35,7 @@ fn render_block(services: &[ServiceInfo]) -> String {
     let mut lines: Vec<String> = services
         .iter()
         .filter(|s| is_safe_entry(s))
-        .map(|s| format!("{} {}.wg", s.ip4, s.name))
+        .map(|s| format!("{} {}.wg", address(s), s.name))
         .collect();
     lines.sort();
     lines.join("\n")
@@ -49,7 +50,7 @@ fn render_block(services: &[ServiceInfo]) -> String {
 /// a loud warning rather than trusting the wire.
 fn is_safe_entry(s: &ServiceInfo) -> bool {
     let ok = wireserve_types::is_valid_dns_label(&s.name)
-        && s.ip4.parse::<std::net::Ipv4Addr>().is_ok();
+        && address(s).parse::<std::net::Ipv4Addr>().is_ok();
     if !ok {
         tracing::warn!(
             service = %s.name.escape_debug(),
@@ -58,6 +59,12 @@ fn is_safe_entry(s: &ServiceInfo) -> bool {
         );
     }
     ok
+}
+
+/// What `<name>.wg` resolves to: the service's own address when it has
+/// one, else its owning node's.
+fn address(s: &ServiceInfo) -> &str {
+    s.vip4.as_deref().unwrap_or(&s.ip4)
 }
 
 /// The byte span of this label's block: from the start of its begin line
@@ -243,7 +250,26 @@ mod tests {
             port: 1234,
             proto: Proto::Tcp,
             online: true,
+            vip4: None,
+            ports: vec![],
         }
+    }
+
+    #[test]
+    fn a_service_with_its_own_address_resolves_to_it() {
+        let mut web = svc("web", "100.90.0.3");
+        web.vip4 = Some("100.90.0.50".into());
+        let old = svc("plex", "100.90.0.3");
+        assert_eq!(render_block(&[web, old]), "100.90.0.3 plex.wg\n100.90.0.50 web.wg");
+    }
+
+    #[test]
+    fn a_malformed_service_address_drops_the_entry() {
+        // `vip::sanitize` clears these before they get here; this writer
+        // still refuses to be the one that puts text in /etc/hosts.
+        let mut web = svc("web", "100.90.0.3");
+        web.vip4 = Some("100.90.0.50 evil.example".into());
+        assert_eq!(render_block(&[web]), "");
     }
 
     #[test]

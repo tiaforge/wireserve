@@ -8,7 +8,7 @@ use wireserve_agent::state::AgentState;
 use wireserve_agent::firewall::InteropHandle;
 use wireserve_agent::paths::{self, Instance};
 use wireserve_agent::{firewall, ifname, lock, poll_loop, register, wg::WgInterface};
-use wireserve_types::{FirewallBackend, Proto};
+use wireserve_types::{FirewallBackend, PortMap, Proto};
 
 #[derive(Parser)]
 #[command(name = "wireserve-agent")]
@@ -62,11 +62,15 @@ enum Command {
         ifname: Option<ifname::Flag>,
     },
     /// Queues a local service declaration, applied on the next poll.
+    ///
+    /// Each PORT is `[PUBLIC:]TARGET[/tcp|/udp]`: `<name>.wg:PUBLIC`
+    /// reaches TARGET on this node (TCP unless given; a bare port maps to
+    /// itself). `serve web 80:5080`, `serve dns 53/udp 53/tcp 8080:8000`.
+    /// The older `serve <name> <port> [tcp|udp]` still works.
     Serve {
         name: String,
-        port: u16,
-        #[arg(default_value = "tcp")]
-        proto: String,
+        #[arg(required = true, value_name = "PORT")]
+        ports: Vec<String>,
     },
     /// Queues a local service withdrawal, applied on the next poll.
     Unserve { name: String },
@@ -124,7 +128,7 @@ async fn main() {
             poll_interval_secs,
             ifname,
         } => cmd_daemon(&instance, poll_interval_secs, ifname).await,
-        Command::Serve { name, port, proto } => cmd_serve(&instance, name, port, proto).await,
+        Command::Serve { name, ports } => cmd_serve(&instance, name, &ports).await,
         Command::Unserve { name } => cmd_unserve(&instance, name).await,
         Command::List => cmd_list(&instance).await,
         Command::Leave => cmd_leave(&instance).await,
@@ -599,9 +603,32 @@ async fn teardown_everything<F: FirewallBackend>(
     }
 }
 
-async fn cmd_serve(instance: &Instance, name: String, port: u16, proto: String) -> Result<(), Box<dyn std::error::Error>> {
-    let proto: Proto = proto.parse().map_err(|e: String| e)?;
-    let resp = client::call(&instance.socket_path(), &IpcRequest::Serve { name, port, proto }).await?;
+/// `serve`'s port arguments: each a [`PortMap`], or the older
+/// `<port> <tcp|udp>` pair, told apart by the protocol word standing alone.
+fn parse_serve_ports(args: &[String]) -> Result<Vec<PortMap>, String> {
+    if let [port, proto] = args {
+        if let Ok(proto) = proto.parse::<Proto>() {
+            let port: u16 = port.parse().map_err(|_| format!("invalid port '{port}'"))?;
+            return Ok(vec![PortMap::identity(port, proto)]);
+        }
+    }
+    args.iter().map(|a| a.parse::<PortMap>()).collect()
+}
+
+async fn cmd_serve(instance: &Instance, name: String, ports: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let ports = parse_serve_ports(ports)?;
+    wireserve_types::validate_service_ports(&ports)?;
+    let first = ports[0];
+    let resp = client::call(
+        &instance.socket_path(),
+        &IpcRequest::Serve {
+            name,
+            port: first.target,
+            proto: first.proto,
+            ports,
+        },
+    )
+    .await?;
     // "ok" alone overstates what just happened: the declaration is queued
     // locally and only reaches the coordinator on the next poll, and if
     // that coordinator requires approval it will sit pending until an
@@ -683,6 +710,35 @@ impl FirewallBackend for NoopFirewall {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn serve_takes_port_mappings() {
+        assert_eq!(
+            parse_serve_ports(&args(&["53/udp", "53/tcp", "8080:8000"])).unwrap(),
+            vec![
+                PortMap { public: 53, target: 53, proto: Proto::Udp },
+                PortMap { public: 53, target: 53, proto: Proto::Tcp },
+                PortMap { public: 8080, target: 8000, proto: Proto::Tcp },
+            ]
+        );
+        assert_eq!(parse_serve_ports(&args(&["80:5080"])).unwrap(), vec!["80:5080".parse().unwrap()]);
+    }
+
+    #[test]
+    fn serve_still_takes_the_old_port_and_protocol_form() {
+        assert_eq!(parse_serve_ports(&args(&["32400"])).unwrap(), vec![PortMap::identity(32400, Proto::Tcp)]);
+        assert_eq!(parse_serve_ports(&args(&["53", "udp"])).unwrap(), vec![PortMap::identity(53, Proto::Udp)]);
+        assert!(parse_serve_ports(&args(&["x", "udp"])).is_err());
+    }
+
+    #[test]
+    fn serve_rejects_a_bad_mapping() {
+        assert!(parse_serve_ports(&args(&["80:5080", "nope"])).is_err());
+    }
 
     // ---- S7: resolve_join_token ----
 

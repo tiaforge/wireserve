@@ -11,4 +11,5 @@ pub mod register;
 #[cfg(target_os = "linux")]
 pub mod routes;
 pub mod state;
+pub mod vip;
 pub mod wg;

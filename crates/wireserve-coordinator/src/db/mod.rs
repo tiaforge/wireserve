@@ -93,6 +93,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0003_service_approval.sql")),
         M::up(include_str!("../../migrations/0004_endpoint_cleared.sql")),
         M::up(include_str!("../../migrations/0005_dual_stack_endpoints.sql")),
+        M::up(include_str!("../../migrations/0006_service_vips.sql")),
     ])
 }
 
@@ -360,6 +361,41 @@ mod tests {
         let row = crate::db::nodes::find_by_name(&conn, "n1").unwrap().unwrap();
         assert!(row.endpoint_addr_v4.is_none());
         assert!(row.endpoint_addr_v6.is_none());
+    }
+
+    #[test]
+    fn migration_leaves_existing_services_without_an_address() {
+        // An existing service keeps resolving to its node until its (then
+        // upgraded) agent declares mappings: no address, no mappings.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        migrations().to_version(&mut conn, 5).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (name, kind, pubkey, ip4, ip6, join_token_used) \
+             VALUES ('n1', 'agent', 'pk1', '100.90.0.1', 'fd00:90::1', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO services (node_id, name, port, proto, declared_at, approved_at) \
+             VALUES (1, 'plex', 32400, 'tcp', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        migrations().to_latest(&mut conn).unwrap();
+
+        let rows = crate::db::services::list_approved(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].vip4.is_none());
+        assert!(rows[0].ports.is_empty());
+        // And the unique index is there: one address, one service.
+        conn.execute("UPDATE services SET vip4 = '100.90.0.9'", []).unwrap();
+        conn.execute(
+            "INSERT INTO services (node_id, name, port, proto, vip4) VALUES (1, 'x', 1, 'tcp', '100.90.0.9')",
+            [],
+        )
+        .unwrap_err();
     }
 
     #[test]

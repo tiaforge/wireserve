@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Several agents on one host, end to end, with the real binaries — and no
-# root, no containers: everything runs inside a throwaway unprivileged
-# user + network namespace (`unshare -rn`), so nothing touches the
-# machine's own interfaces, firewall or /etc/hosts.
+# Several agents on one host, end to end, with the real binaries and no
+# containers: everything runs inside a throwaway network namespace
+# (`unshare -n`), so nothing touches the machine's own interfaces,
+# firewall or /etc/hosts. It needs root all the same: service addresses
+# (PLAN.md M20) rewrite packet headers, which the kernel refuses in a
+# network namespace owned by any user namespace but the host's own — so
+# the unprivileged `unshare -rn` this used to run in is no longer enough.
 #
 # Topology, all inside that namespace:
 #
@@ -21,9 +24,9 @@
 # the host firewall, clean up after each other only once one is dead, and
 # that the default instance clears up after a pre-instances (wg0) agent.
 #
-# Prerequisites: unprivileged user namespaces, the WireGuard kernel
-# module, nft, iptables-nft, wg, python3. Usage:
-#   cargo build --workspace && ./deploy/e2e/run-multi-instance-test.sh
+# Prerequisites: root, the WireGuard kernel module, nft, iptables-nft, wg,
+# python3. Usage:
+#   cargo build --workspace && sudo ./deploy/e2e/run-multi-instance-test.sh
 # Exit code 0 = every check passed.
 
 set -euo pipefail
@@ -37,7 +40,8 @@ if [ -z "${WIRESERVE_IN_TEST_NETNS:-}" ]; then
     for b in wireserve-agent wireserve-coordinator wireserve-admin; do
         [ -x "$BIN/$b" ] || { echo "FAIL: $BIN/$b missing — run cargo build --workspace" >&2; exit 1; }
     done
-    WIRESERVE_IN_TEST_NETNS=1 exec unshare -rn "$0" "$@"
+    [ "$(id -u)" = 0 ] || { echo "FAIL: needs root (service addresses rewrite packet headers): sudo $0" >&2; exit 1; }
+    WIRESERVE_IN_TEST_NETNS=1 exec unshare -n "$0" "$@"
 fi
 
 WORK=$(mktemp -d)
@@ -202,15 +206,20 @@ sleep $((POLL * 3))
 
 HOST_A=$(list peer default | peer_ip host-a)
 HOST_B=$(list peer work | peer_ip host-b)
-echo "host's mesh addresses: $HOST_A (mesh A), $HOST_B (mesh B)"
+# Each service answers on its own address, as the peer's hosts file says.
+ALPHA=$(awk '$2 == "alpha.wg" {print $1}' "$WORK/peer/hosts")
+BETA=$(awk '$2 == "beta.wg" {print $1}' "$WORK/peer/hosts")
+echo "host's mesh addresses: $HOST_A (mesh A), $HOST_B (mesh B); alpha.wg=$ALPHA beta.wg=$BETA"
+[ -n "$ALPHA" ] && [ -n "$BETA" ] || fail "the peer's hosts file lacks alpha.wg or beta.wg: $(cat "$WORK/peer/hosts")"
 reach() { in_peer timeout 3 python3 -c "import socket,sys; socket.create_connection((sys.argv[1], int(sys.argv[2])), 2)" "$1" "$2" 2>/dev/null; }
-reach "$HOST_A" 7001 || fail "mesh A: declared port 7001 unreachable"
-reach "$HOST_B" 7002 || fail "mesh B: declared port 7002 unreachable"
-pass "each mesh reaches the port its own instance declared (through the host firewall)"
+reach "$ALPHA" 7001 || fail "mesh A: alpha.wg:7001 unreachable"
+reach "$BETA" 7002 || fail "mesh B: beta.wg:7002 unreachable"
+pass "each mesh reaches the service its own instance declared (through the host firewall)"
+if reach "$HOST_A" 7001 || reach "$HOST_B" 7002; then fail "a service's port answered on its node's own address"; fi
 if reach "$HOST_A" 7002; then fail "mesh A reached 7002, which only the other instance declared"; fi
 if reach "$HOST_B" 7001; then fail "mesh B reached 7001, which only the other instance declared"; fi
 if reach "$HOST_A" 7003 || reach "$HOST_B" 7003; then fail "an undeclared port was reachable"; fi
-pass "nothing else is reachable: not the other instance's port, not an undeclared one"
+pass "nothing else is reachable: not a node address, not the other instance's port, not an undeclared one"
 
 grep -qx '# BEGIN WIRESERVE' "$WORK/peer/hosts" && grep -q 'alpha.wg' "$WORK/peer/hosts" \
     || fail "peer default block missing alpha: $(cat "$WORK/peer/hosts")"
@@ -242,7 +251,7 @@ daemon host work; HOST_WORK=$LAST_PID; up host work
 sleep $((POLL * 2))
 [ "$(list host work | field ifname)" = wireserve2 ] || fail "restarted instance moved off wireserve2"
 [ "$(tags wireserve2)" = 2 ] || fail "restarted instance's accepts not back"
-reach "$HOST_B" 7002 || fail "mesh B unreachable after the restart"
+reach "$BETA" 7002 || fail "mesh B unreachable after the restart"
 pass "the restarted instance is back on wireserve2 with its rules"
 
 # ---------------------------------------------------------------------
@@ -255,7 +264,7 @@ ip link show wireserve1 >/dev/null 2>&1 && fail "wireserve1 still exists after s
 nft list tables | grep -q 'wireserve.wireserve1' && fail "stopped instance left its table"
 grep -qx '# BEGIN WIRESERVE' "$WORK/host/hosts" && fail "stopped instance left its hosts block"
 grep -qx '# BEGIN WIRESERVE work' "$WORK/host/hosts" || fail "the other instance's hosts block went too"
-reach "$HOST_B" 7002 || fail "mesh B stopped working when the other instance stopped"
+reach "$BETA" 7002 || fail "mesh B stopped working when the other instance stopped"
 pass "interface, table, accepts and hosts block of the stopped instance are gone; the other still serves"
 
 # ---------------------------------------------------------------------
@@ -278,7 +287,7 @@ ip link show wg0 >/dev/null 2>&1 && fail "the old agent's wg0 is still there"
 nft list tables | grep -Eqx 'table inet (wireserve|wireserve-interop)' && fail "legacy tables still there: $(nft list tables)"
 [ "$(tags wg0)" = 0 ] || fail "legacy wireserve:wg0 accepts still there"
 [ "$(list host default | field ifname)" = wireserve1 ] || fail "default instance not back on wireserve1"
-reach "$HOST_A" 7001 || fail "mesh A unreachable after the upgrade cleanup"
+reach "$ALPHA" 7001 || fail "mesh A unreachable after the upgrade cleanup"
 pass "legacy wg0, tables and accepts removed; the instance came back on its own interface"
 
 # ---------------------------------------------------------------------

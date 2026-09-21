@@ -39,6 +39,8 @@ pub fn service_info(service: &ServiceRow, node: &NodeRow, online_threshold_secs:
         port: service.port,
         proto: service.proto,
         online: is_recent(node.last_seen, online_threshold_secs),
+        vip4: service.vip4.clone(),
+        ports: service.ports.clone(),
     }
 }
 
@@ -64,6 +66,7 @@ pub fn pending_service(service: &ServiceRow) -> PendingService {
         name: service.name.clone(),
         port: service.port,
         proto: service.proto,
+        vip4: service.vip4.clone(),
         declared_at: service.declared_at,
     }
 }
@@ -85,6 +88,8 @@ pub fn admin_service_info(service: &ServiceRow, owner: &NodeRow) -> AdminService
         ip4: owner.ip4.clone().unwrap_or_default(),
         port: service.port,
         proto: service.proto,
+        vip4: service.vip4.clone(),
+        ports: service.ports.clone(),
         state: approval_state(service),
         declared_at: service.declared_at,
         approved_at: service.approved_at,
@@ -146,6 +151,8 @@ mod tests {
             name: "plex".into(),
             port: 32400,
             proto: wireserve_types::Proto::Tcp,
+            vip4: None,
+            ports: vec![],
             declared_at: None,
             approved_at: Some(Utc::now()),
             denied_at: None,

@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::node::{NodeKind, Proto};
+use crate::ports::PortMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorBody {
@@ -132,8 +133,45 @@ pub const MAX_SERVICES_PER_NODE: usize = 64;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceDecl {
     pub name: String,
+    /// The first mapping's target port and protocol. All a coordinator
+    /// from before port mappings understands; a newer one reads `ports`.
     pub port: u16,
     pub proto: Proto,
+    /// Public→target mappings on the service's own address. Empty on a
+    /// declaration from before port mappings existed, which stands for
+    /// the one identity mapping `port:port/proto` — see
+    /// [`ServiceDecl::port_maps`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<PortMap>,
+}
+
+impl ServiceDecl {
+    /// A declaration of `ports`, which must not be empty (validate with
+    /// [`crate::validate_service_ports`] first).
+    #[must_use]
+    pub fn new(name: impl Into<String>, ports: Vec<PortMap>) -> Self {
+        let first = ports[0];
+        Self {
+            name: name.into(),
+            port: first.target,
+            proto: first.proto,
+            ports,
+        }
+    }
+
+    /// The mappings this declaration stands for, old form included.
+    #[must_use]
+    pub fn port_maps(&self) -> Vec<PortMap> {
+        effective_ports(&self.ports, self.port, self.proto)
+    }
+}
+
+fn effective_ports(ports: &[PortMap], port: u16, proto: Proto) -> Vec<PortMap> {
+    if ports.is_empty() {
+        vec![PortMap::identity(port, proto)]
+    } else {
+        ports.to_vec()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,10 +215,30 @@ pub struct PeerInfo {
 pub struct ServiceInfo {
     pub name: String,
     pub node: String,
+    /// The owning NODE's address. Older agents write this into their
+    /// hosts file; newer ones prefer `vip4`.
     pub ip4: String,
     pub port: u16,
     pub proto: Proto,
     pub online: bool,
+    /// The service's own address, which `<name>.wg` resolves to and every
+    /// peer routes to the owning node. `None` from a coordinator that
+    /// predates service addresses, or for a declaration from an agent
+    /// that does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vip4: Option<String>,
+    /// Empty from a coordinator that predates port mappings; see
+    /// [`ServiceInfo::port_maps`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<PortMap>,
+}
+
+impl ServiceInfo {
+    /// The mappings this entry stands for, old form included.
+    #[must_use]
+    pub fn port_maps(&self) -> Vec<PortMap> {
+        effective_ports(&self.ports, self.port, self.proto)
+    }
 }
 
 /// A declaration the coordinator accepted and stored but has NOT put in
@@ -191,6 +249,12 @@ pub struct PendingService {
     pub name: String,
     pub port: u16,
     pub proto: Proto,
+    /// The address the service will have once approved. Sent to its owner
+    /// alone, so the owner's firewall is ready the moment approval puts
+    /// the service in everyone else's directory — nothing routes to it
+    /// before then.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub vip4: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub declared_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -259,6 +323,10 @@ pub struct AdminServiceInfo {
     pub ip4: String,
     pub port: u16,
     pub proto: Proto,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub vip4: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<PortMap>,
     pub state: ServiceApprovalState,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub declared_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -355,6 +423,40 @@ mod tests {
     }
 
     #[test]
+    fn a_declaration_without_ports_stands_for_its_identity_mapping() {
+        // What an agent from before port mappings sends, and what its
+        // state file holds.
+        let d: ServiceDecl = serde_json::from_str(r#"{"name":"plex","port":32400,"proto":"tcp"}"#).unwrap();
+        assert!(d.ports.is_empty());
+        assert_eq!(d.port_maps(), vec![PortMap::identity(32400, Proto::Tcp)]);
+    }
+
+    #[test]
+    fn a_new_declaration_still_carries_port_and_proto_for_old_coordinators() {
+        let maps = vec!["80:5080".parse().unwrap(), "53/udp".parse().unwrap()];
+        let d = ServiceDecl::new("web", maps);
+        let json: serde_json::Value = serde_json::to_value(&d).unwrap();
+        assert_eq!(json["port"], 5080);
+        assert_eq!(json["proto"], "tcp");
+        assert_eq!(json["ports"][0], serde_json::json!({"public": 80, "target": 5080, "proto": "tcp"}));
+        assert_eq!(d.port_maps(), d.ports);
+    }
+
+    #[test]
+    fn a_service_entry_from_an_old_coordinator_has_no_address_and_one_mapping() {
+        let s: ServiceInfo = serde_json::from_str(
+            r#"{"name":"plex","node":"n","ip4":"10.0.0.3","port":32400,"proto":"tcp","online":true}"#,
+        )
+        .unwrap();
+        assert!(s.vip4.is_none());
+        assert_eq!(s.port_maps(), vec![PortMap::identity(32400, Proto::Tcp)]);
+        // And the new fields stay off the wire when unset, so an old agent
+        // sees exactly the shape it always did.
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("vip4") && !json.contains("ports"), "{json}");
+    }
+
+    #[test]
     fn poll_response_roundtrips() {
         let resp = PollResponse {
             peers: vec![PeerInfo {
@@ -374,6 +476,8 @@ mod tests {
                 port: 32400,
                 proto: Proto::Tcp,
                 online: true,
+                vip4: None,
+                ports: vec![],
             }],
             pending_services: vec![],
             denied_services: vec![],

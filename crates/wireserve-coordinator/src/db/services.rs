@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension};
-use wireserve_types::Proto;
+use wireserve_types::{PortMap, Proto, ServiceDecl};
 
 use super::DbError;
 
@@ -10,6 +10,11 @@ pub struct ServiceRow {
     pub name: String,
     pub port: u16,
     pub proto: Proto,
+    /// The service's own address; see migration 0006. `None` for a
+    /// declaration from an agent that predates port mappings.
+    pub vip4: Option<String>,
+    /// Empty means the identity mapping of `port`/`proto`.
+    pub ports: Vec<PortMap>,
     pub declared_at: Option<DateTime<Utc>>,
     /// Non-NULL means an admin has approved this node's claim to this
     /// name. NULL with `denied_at` also NULL means pending; NULL with
@@ -60,6 +65,11 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRow> {
         name: row.get("name")?,
         port: port as u16,
         proto: proto_str.parse().unwrap_or(Proto::Tcp),
+        vip4: row.get("vip4")?,
+        ports: row
+            .get::<_, Option<String>>("ports")?
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default(),
         declared_at: dt("declared_at")?,
         approved_at: dt("approved_at")?,
         denied_at: dt("denied_at")?,
@@ -185,18 +195,28 @@ fn owner_of(conn: &Connection, name: &str) -> Result<Option<i64>, DbError> {
 ///   what gives it time to learn about the denial and withdraw.
 /// * **A pending row heals to approved under `AutoApprove`**, which is
 ///   what an operator turning the flag back off should get.
+///
+/// Service addresses (migration 0006): a declaration carrying `ports`
+/// gets one from `vip_range` the first time, and keeps it for as long as
+/// the row lives — across re-declarations, port changes and approval.
+/// One without (an agent from before port mappings, which could not serve
+/// an address) has none, and loses any it had. An exhausted range is
+/// logged and leaves the service without one, falling back to the owning
+/// node's address, rather than failing the poll: the agent would resend
+/// the same declaration every cycle and never get a directory again.
 pub fn upsert_for_node(
     conn: &mut Connection,
     node_id: i64,
-    desired: &[(String, u16, Proto)],
+    desired: &[ServiceDecl],
     mode: ApprovalMode,
+    vip_range: &str,
 ) -> Result<UpsertOutcome, DbError> {
     let tx = conn.transaction()?;
 
     // Validate every desired name against other nodes BEFORE mutating
     // anything, so a collision on entry N doesn't leave entries 1..N-1
     // applied.
-    for (name, _, _) in desired {
+    for ServiceDecl { name, .. } in desired {
         if let Some(owner) = owner_of(&tx, name)? {
             if owner != node_id {
                 return Err(DbError::ServiceNameCollision(name.clone()));
@@ -210,7 +230,7 @@ pub fn upsert_for_node(
         rows.collect::<Result<Vec<_>, _>>()?
     };
 
-    let desired_names: Vec<&str> = desired.iter().map(|(n, _, _)| n.as_str()).collect();
+    let desired_names: Vec<&str> = desired.iter().map(|d| d.name.as_str()).collect();
 
     for name in &current {
         if !desired_names.contains(&name.as_str()) {
@@ -223,13 +243,19 @@ pub fn upsert_for_node(
 
     let now = super::nodes::now_str();
     let stamp = mode.stamp();
-    for (name, port, proto) in desired {
+    for ServiceDecl { name, port, proto, ports } in desired {
+        let ports_json = if ports.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(ports).expect("PortMap always serializes"))
+        };
         tx.execute(
-            "INSERT INTO services (node_id, name, port, proto, declared_at, approved_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+            "INSERT INTO services (node_id, name, port, proto, ports, declared_at, approved_at) \
+             VALUES (?1, ?2, ?3, ?4, ?7, ?5, ?6) \
              ON CONFLICT(name) DO UPDATE SET \
                port = excluded.port, \
                proto = excluded.proto, \
+               ports = excluded.ports, \
                approved_at = COALESCE(services.approved_at, excluded.approved_at), \
                denied_at = CASE \
                  WHEN COALESCE(services.approved_at, excluded.approved_at) IS NULL \
@@ -238,8 +264,16 @@ pub fn upsert_for_node(
                  WHEN COALESCE(services.approved_at, excluded.approved_at) IS NULL \
                  THEN services.denied_reason ELSE NULL END \
              WHERE node_id = excluded.node_id",
-            rusqlite::params![node_id, name, port, proto.as_str(), now, stamp],
+            rusqlite::params![node_id, name, port, proto.as_str(), now, stamp, ports_json],
         )?;
+        if ports.is_empty() {
+            tx.execute(
+                "UPDATE services SET vip4 = NULL WHERE node_id = ?1 AND name = ?2",
+                rusqlite::params![node_id, name],
+            )?;
+        } else {
+            assign_vip(&tx, node_id, name, vip_range)?;
+        }
     }
 
     // Read the verdict back inside the same transaction, so what `/poll`
@@ -267,6 +301,35 @@ pub fn upsert_for_node(
 
     tx.commit()?;
     Ok(outcome)
+}
+
+/// Gives `name` an address from `vip_range` unless it already has one.
+fn assign_vip(tx: &Connection, node_id: i64, name: &str, vip_range: &str) -> Result<(), DbError> {
+    let has: Option<String> = tx.query_row(
+        "SELECT vip4 FROM services WHERE node_id = ?1 AND name = ?2",
+        rusqlite::params![node_id, name],
+        |row| row.get(0),
+    )?;
+    if has.is_some() {
+        return Ok(());
+    }
+    let used = super::nodes::all_allocated_ip4(tx)?;
+    match crate::ipam::allocate_v4(vip_range, &used) {
+        Ok(vip) => {
+            tx.execute(
+                "UPDATE services SET vip4 = ?1 WHERE node_id = ?2 AND name = ?3",
+                rusqlite::params![vip.to_string(), node_id, name],
+            )?;
+            tracing::info!(event = "service_address_assigned", service = %name, vip4 = %vip);
+        }
+        Err(e) => tracing::warn!(
+            service = %name,
+            range = %vip_range,
+            error = %e,
+            "no address left for a service; it stays reachable at its node's address only"
+        ),
+    }
+    Ok(())
 }
 
 /// Outcome of [`approve`]. An enum rather than a `DbError` variant so the
@@ -383,6 +446,102 @@ mod tests {
     use crate::db::Db;
     use wireserve_types::NodeKind;
 
+    const RANGE: &str = "100.90.0.0/24";
+
+    /// A declaration from an agent that predates port mappings.
+    fn decl(name: &str, port: u16, proto: Proto) -> ServiceDecl {
+        ServiceDecl {
+            name: name.into(),
+            port,
+            proto,
+            ports: vec![],
+        }
+    }
+
+    fn mapped(name: &str, maps: &[&str]) -> ServiceDecl {
+        ServiceDecl::new(name, maps.iter().map(|m| m.parse().unwrap()).collect())
+    }
+
+    fn vip_of(conn: &Connection, name: &str) -> Option<String> {
+        row_for_name(conn, name).unwrap().unwrap().vip4
+    }
+
+    #[tokio::test]
+    async fn a_declaration_with_ports_gets_an_address_off_every_node() {
+        let db = Db::open_in_memory_for_test();
+        let id1 = node_with_id(&db, "n1", "h1").await; // 100.90.0.1
+        let id2 = node_with_id(&db, "n2", "h2").await; // 100.90.0.2
+        let mut conn = db.conn.lock().await;
+        upsert_for_node(&mut conn, id1, &[mapped("web", &["80:5080"]), mapped("dns", &["53/udp"])], ApprovalMode::AutoApprove, RANGE).unwrap();
+        let web = vip_of(&conn, "web").unwrap();
+        let dns = vip_of(&conn, "dns").unwrap();
+        assert_eq!(web, "100.90.0.3");
+        assert_eq!(dns, "100.90.0.4");
+        // And a node registered next avoids them.
+        let used = crate::db::nodes::all_allocated_ip4(&conn).unwrap();
+        assert_eq!(crate::ipam::allocate_v4(RANGE, &used).unwrap().to_string(), "100.90.0.5");
+        let row = row_for_name(&conn, "web").unwrap().unwrap();
+        assert_eq!(row.ports, vec!["80:5080".parse::<PortMap>().unwrap()]);
+        let _ = id2;
+    }
+
+    #[tokio::test]
+    async fn a_service_keeps_its_address_across_redeclarations_and_approval() {
+        let db = Db::open_in_memory_for_test();
+        let id = node_with_id(&db, "n1", "h1").await;
+        let mut conn = db.conn.lock().await;
+        upsert_for_node(&mut conn, id, &[mapped("web", &["80:5080"])], ApprovalMode::RequireApproval, RANGE).unwrap();
+        let first = vip_of(&conn, "web").unwrap();
+        // A pending service already has its address (its owner's firewall
+        // gets ready before approval).
+        upsert_for_node(&mut conn, id, &[mapped("other", &["1"]), mapped("web", &["80:5080", "443:5443"])], ApprovalMode::RequireApproval, RANGE).unwrap();
+        approve(&conn, id, "web").unwrap();
+        upsert_for_node(&mut conn, id, &[mapped("web", &["8080:5080"])], ApprovalMode::RequireApproval, RANGE).unwrap();
+        assert_eq!(vip_of(&conn, "web").unwrap(), first);
+        assert_eq!(row_for_name(&conn, "web").unwrap().unwrap().ports, vec!["8080:5080".parse::<PortMap>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn withdrawing_a_service_frees_its_address() {
+        let db = Db::open_in_memory_for_test();
+        let id = node_with_id(&db, "n1", "h1").await;
+        let mut conn = db.conn.lock().await;
+        upsert_for_node(&mut conn, id, &[mapped("web", &["80:5080"])], ApprovalMode::AutoApprove, RANGE).unwrap();
+        let vip = vip_of(&conn, "web").unwrap();
+        upsert_for_node(&mut conn, id, &[], ApprovalMode::AutoApprove, RANGE).unwrap();
+        upsert_for_node(&mut conn, id, &[mapped("api", &["80:6080"])], ApprovalMode::AutoApprove, RANGE).unwrap();
+        assert_eq!(vip_of(&conn, "api").unwrap(), vip, "the freed address is the first free one again");
+    }
+
+    #[tokio::test]
+    async fn an_old_agents_declaration_has_no_address() {
+        let db = Db::open_in_memory_for_test();
+        let id = node_with_id(&db, "n1", "h1").await;
+        let mut conn = db.conn.lock().await;
+        upsert_for_node(&mut conn, id, &[decl("plex", 32400, Proto::Tcp)], ApprovalMode::AutoApprove, RANGE).unwrap();
+        assert_eq!(vip_of(&conn, "plex"), None);
+        assert!(row_for_name(&conn, "plex").unwrap().unwrap().ports.is_empty());
+        // Upgraded agent: gets one. Downgraded again: loses it, since an
+        // old agent can't serve it.
+        upsert_for_node(&mut conn, id, &[mapped("plex", &["32400"])], ApprovalMode::AutoApprove, RANGE).unwrap();
+        assert!(vip_of(&conn, "plex").is_some());
+        upsert_for_node(&mut conn, id, &[decl("plex", 32400, Proto::Tcp)], ApprovalMode::AutoApprove, RANGE).unwrap();
+        assert_eq!(vip_of(&conn, "plex"), None);
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_range_leaves_the_service_without_an_address_but_declared() {
+        let db = Db::open_in_memory_for_test();
+        let id = node_with_id(&db, "n1", "h1").await; // 100.90.0.1, the only host of a /30 besides .2
+        let mut conn = db.conn.lock().await;
+        let range = "100.90.0.0/30";
+        let outcome = upsert_for_node(&mut conn, id, &[mapped("a", &["1"]), mapped("b", &["2"])], ApprovalMode::AutoApprove, range).unwrap();
+        assert!(outcome.pending.is_empty());
+        assert_eq!(vip_of(&conn, "a").as_deref(), Some("100.90.0.2"));
+        assert_eq!(vip_of(&conn, "b"), None);
+        assert_eq!(list_for_node(&conn, id).unwrap().len(), 2);
+    }
+
     async fn node_with_id(db: &Db, name: &str, hash: &str) -> i64 {
         let conn = db.conn.lock().await;
         let id = create_node(&conn, name, NodeKind::Agent, hash, None).unwrap();
@@ -413,10 +572,10 @@ mod tests {
         let db = Db::open_in_memory_for_test();
         let id = node_with_id(&db, "n1", "h1").await;
         let mut conn = db.conn.lock().await;
-        upsert_for_node(&mut conn, id, &[("plex".into(), 32400, Proto::Tcp)], ApprovalMode::AutoApprove).unwrap();
+        upsert_for_node(&mut conn, id, &[decl("plex", 32400, Proto::Tcp)], ApprovalMode::AutoApprove, RANGE).unwrap();
         assert_eq!(list_for_node(&conn, id).unwrap().len(), 1);
 
-        upsert_for_node(&mut conn, id, &[], ApprovalMode::AutoApprove).unwrap();
+        upsert_for_node(&mut conn, id, &[], ApprovalMode::AutoApprove, RANGE).unwrap();
         assert_eq!(list_for_node(&conn, id).unwrap().len(), 0);
     }
 
@@ -425,7 +584,7 @@ mod tests {
         let db = Db::open_in_memory_for_test();
         let id = node_with_id(&db, "n1", "h1").await;
         let mut conn = db.conn.lock().await;
-        let outcome = upsert_for_node(&mut conn, id, &[("plex".into(), 32400, Proto::Tcp)], ApprovalMode::AutoApprove).unwrap();
+        let outcome = upsert_for_node(&mut conn, id, &[decl("plex", 32400, Proto::Tcp)], ApprovalMode::AutoApprove, RANGE).unwrap();
         assert_eq!(list_approved(&conn).unwrap().len(), 1);
         assert!(outcome.pending.is_empty());
         assert!(outcome.denied.is_empty());
@@ -436,7 +595,7 @@ mod tests {
         let db = Db::open_in_memory_for_test();
         let id = node_with_id(&db, "n1", "h1").await;
         let mut conn = db.conn.lock().await;
-        let outcome = upsert_for_node(&mut conn, id, &[("plex".into(), 32400, Proto::Tcp)], ApprovalMode::RequireApproval).unwrap();
+        let outcome = upsert_for_node(&mut conn, id, &[decl("plex", 32400, Proto::Tcp)], ApprovalMode::RequireApproval, RANGE).unwrap();
         assert!(list_approved(&conn).unwrap().is_empty(), "no other node may see it");
         assert_eq!(list_for_node(&conn, id).unwrap().len(), 1, "its owner still does");
         assert_eq!(outcome.pending.len(), 1);
@@ -453,12 +612,12 @@ mod tests {
         let id2 = node_with_id(&db, "n2", "h2").await;
         let mut conn = db.conn.lock().await;
 
-        upsert_for_node(&mut conn, id1, &[("plex".into(), 1, Proto::Tcp)], ApprovalMode::RequireApproval).unwrap();
+        upsert_for_node(&mut conn, id1, &[decl("plex", 1, Proto::Tcp)], ApprovalMode::RequireApproval, RANGE).unwrap();
         assert_eq!(approve(&conn, id1, "plex").unwrap(), ApproveOutcome::Approved);
         assert_eq!(list_approved(&conn).unwrap().len(), 1);
 
-        upsert_for_node(&mut conn, id1, &[], ApprovalMode::RequireApproval).unwrap();
-        let outcome = upsert_for_node(&mut conn, id2, &[("plex".into(), 1, Proto::Tcp)], ApprovalMode::RequireApproval).unwrap();
+        upsert_for_node(&mut conn, id1, &[], ApprovalMode::RequireApproval, RANGE).unwrap();
+        let outcome = upsert_for_node(&mut conn, id2, &[decl("plex", 1, Proto::Tcp)], ApprovalMode::RequireApproval, RANGE).unwrap();
 
         assert!(list_approved(&conn).unwrap().is_empty());
         assert_eq!(outcome.pending.len(), 1, "n2 inherits nothing from n1's approval");
@@ -470,7 +629,7 @@ mod tests {
         let id1 = node_with_id(&db, "n1", "h1").await;
         let id2 = node_with_id(&db, "n2", "h2").await;
         let mut conn = db.conn.lock().await;
-        upsert_for_node(&mut conn, id1, &[("plex".into(), 1, Proto::Tcp)], ApprovalMode::RequireApproval).unwrap();
+        upsert_for_node(&mut conn, id1, &[decl("plex", 1, Proto::Tcp)], ApprovalMode::RequireApproval, RANGE).unwrap();
 
         assert_eq!(
             approve(&conn, id2, "plex").unwrap(),
@@ -484,7 +643,7 @@ mod tests {
         let db = Db::open_in_memory_for_test();
         let id = node_with_id(&db, "n1", "h1").await;
         let mut conn = db.conn.lock().await;
-        upsert_for_node(&mut conn, id, &[("plex".into(), 1, Proto::Tcp)], ApprovalMode::RequireApproval).unwrap();
+        upsert_for_node(&mut conn, id, &[decl("plex", 1, Proto::Tcp)], ApprovalMode::RequireApproval, RANGE).unwrap();
 
         approve(&conn, id, "plex").unwrap();
         let first = list_approved(&conn).unwrap()[0].approved_at;
@@ -508,10 +667,10 @@ mod tests {
         let db = Db::open_in_memory_for_test();
         let id = node_with_id(&db, "n1", "h1").await;
         let mut conn = db.conn.lock().await;
-        upsert_for_node(&mut conn, id, &[("plex".into(), 32400, Proto::Tcp)], ApprovalMode::RequireApproval).unwrap();
+        upsert_for_node(&mut conn, id, &[decl("plex", 32400, Proto::Tcp)], ApprovalMode::RequireApproval, RANGE).unwrap();
         approve(&conn, id, "plex").unwrap();
 
-        let outcome = upsert_for_node(&mut conn, id, &[("plex".into(), 32401, Proto::Tcp)], ApprovalMode::RequireApproval).unwrap();
+        let outcome = upsert_for_node(&mut conn, id, &[decl("plex", 32401, Proto::Tcp)], ApprovalMode::RequireApproval, RANGE).unwrap();
 
         assert!(outcome.pending.is_empty(), "a port change is not a re-claim");
         let rows = list_approved(&conn).unwrap();
@@ -527,10 +686,10 @@ mod tests {
         let db = Db::open_in_memory_for_test();
         let id = node_with_id(&db, "n1", "h1").await;
         let mut conn = db.conn.lock().await;
-        upsert_for_node(&mut conn, id, &[("plex".into(), 1, Proto::Tcp)], ApprovalMode::RequireApproval).unwrap();
+        upsert_for_node(&mut conn, id, &[decl("plex", 1, Proto::Tcp)], ApprovalMode::RequireApproval, RANGE).unwrap();
         assert_eq!(deny(&conn, id, "plex", Some("not this one")).unwrap(), DenyOutcome::Denied);
 
-        let outcome = upsert_for_node(&mut conn, id, &[("plex".into(), 1, Proto::Tcp)], ApprovalMode::RequireApproval).unwrap();
+        let outcome = upsert_for_node(&mut conn, id, &[decl("plex", 1, Proto::Tcp)], ApprovalMode::RequireApproval, RANGE).unwrap();
 
         assert!(outcome.pending.is_empty());
         assert_eq!(outcome.denied.len(), 1);
@@ -544,11 +703,11 @@ mod tests {
         let id1 = node_with_id(&db, "n1", "h1").await;
         let id2 = node_with_id(&db, "n2", "h2").await;
         let mut conn = db.conn.lock().await;
-        upsert_for_node(&mut conn, id1, &[("plex".into(), 1, Proto::Tcp)], ApprovalMode::RequireApproval).unwrap();
+        upsert_for_node(&mut conn, id1, &[decl("plex", 1, Proto::Tcp)], ApprovalMode::RequireApproval, RANGE).unwrap();
         deny(&conn, id1, "plex", None).unwrap();
 
-        upsert_for_node(&mut conn, id1, &[], ApprovalMode::RequireApproval).unwrap();
-        upsert_for_node(&mut conn, id2, &[("plex".into(), 1, Proto::Tcp)], ApprovalMode::RequireApproval).unwrap();
+        upsert_for_node(&mut conn, id1, &[], ApprovalMode::RequireApproval, RANGE).unwrap();
+        upsert_for_node(&mut conn, id2, &[decl("plex", 1, Proto::Tcp)], ApprovalMode::RequireApproval, RANGE).unwrap();
 
         assert_eq!(owner_of(&conn, "plex").unwrap(), Some(id2));
     }
@@ -560,7 +719,7 @@ mod tests {
         let db = Db::open_in_memory_for_test();
         let id = node_with_id(&db, "n1", "h1").await;
         let mut conn = db.conn.lock().await;
-        upsert_for_node(&mut conn, id, &[("plex".into(), 1, Proto::Tcp)], ApprovalMode::AutoApprove).unwrap();
+        upsert_for_node(&mut conn, id, &[decl("plex", 1, Proto::Tcp)], ApprovalMode::AutoApprove, RANGE).unwrap();
         assert_eq!(list_approved(&conn).unwrap().len(), 1);
 
         assert_eq!(deny(&conn, id, "plex", None).unwrap(), DenyOutcome::Denied);
@@ -573,7 +732,7 @@ mod tests {
         let db = Db::open_in_memory_for_test();
         let id = node_with_id(&db, "n1", "h1").await;
         let mut conn = db.conn.lock().await;
-        upsert_for_node(&mut conn, id, &[("plex".into(), 1, Proto::Tcp)], ApprovalMode::RequireApproval).unwrap();
+        upsert_for_node(&mut conn, id, &[decl("plex", 1, Proto::Tcp)], ApprovalMode::RequireApproval, RANGE).unwrap();
         deny(&conn, id, "plex", Some("on reflection, no")).unwrap();
 
         assert_eq!(approve(&conn, id, "plex").unwrap(), ApproveOutcome::Approved);
@@ -588,10 +747,10 @@ mod tests {
         let db = Db::open_in_memory_for_test();
         let id = node_with_id(&db, "n1", "h1").await;
         let mut conn = db.conn.lock().await;
-        upsert_for_node(&mut conn, id, &[("a".into(), 1, Proto::Tcp), ("b".into(), 2, Proto::Tcp)], ApprovalMode::RequireApproval).unwrap();
+        upsert_for_node(&mut conn, id, &[decl("a", 1, Proto::Tcp), decl("b", 2, Proto::Tcp)], ApprovalMode::RequireApproval, RANGE).unwrap();
         deny(&conn, id, "b", None).unwrap();
 
-        let outcome = upsert_for_node(&mut conn, id, &[("a".into(), 1, Proto::Tcp), ("b".into(), 2, Proto::Tcp)], ApprovalMode::AutoApprove).unwrap();
+        let outcome = upsert_for_node(&mut conn, id, &[decl("a", 1, Proto::Tcp), decl("b", 2, Proto::Tcp)], ApprovalMode::AutoApprove, RANGE).unwrap();
 
         assert!(outcome.pending.is_empty());
         assert!(outcome.denied.is_empty());
@@ -604,9 +763,9 @@ mod tests {
         let id1 = node_with_id(&db, "n1", "h1").await;
         let id2 = node_with_id(&db, "n2", "h2").await;
         let mut conn = db.conn.lock().await;
-        upsert_for_node(&mut conn, id1, &[("plex".into(), 1, Proto::Tcp)], ApprovalMode::RequireApproval).unwrap();
+        upsert_for_node(&mut conn, id1, &[decl("plex", 1, Proto::Tcp)], ApprovalMode::RequireApproval, RANGE).unwrap();
 
-        let err = upsert_for_node(&mut conn, id2, &[("plex".into(), 1, Proto::Tcp)], ApprovalMode::RequireApproval).unwrap_err();
+        let err = upsert_for_node(&mut conn, id2, &[decl("plex", 1, Proto::Tcp)], ApprovalMode::RequireApproval, RANGE).unwrap_err();
         assert!(matches!(err, DbError::ServiceNameCollision(_)));
     }
 
@@ -616,9 +775,9 @@ mod tests {
         let id1 = node_with_id(&db, "n1", "h1").await;
         let id2 = node_with_id(&db, "n2", "h2").await;
         let mut conn = db.conn.lock().await;
-        upsert_for_node(&mut conn, id1, &[("plex".into(), 32400, Proto::Tcp)], ApprovalMode::AutoApprove).unwrap();
+        upsert_for_node(&mut conn, id1, &[decl("plex", 32400, Proto::Tcp)], ApprovalMode::AutoApprove, RANGE).unwrap();
 
-        let err = upsert_for_node(&mut conn, id2, &[("plex".into(), 1, Proto::Tcp)], ApprovalMode::AutoApprove).unwrap_err();
+        let err = upsert_for_node(&mut conn, id2, &[decl("plex", 1, Proto::Tcp)], ApprovalMode::AutoApprove, RANGE).unwrap_err();
         match err {
             DbError::ServiceNameCollision(name) => assert_eq!(name, "plex"),
             other => panic!("expected collision error, got {other:?}"),
@@ -638,16 +797,17 @@ mod tests {
         let id1 = node_with_id(&db, "n1", "h1").await;
         let id2 = node_with_id(&db, "n2", "h2").await;
         let mut conn = db.conn.lock().await;
-        upsert_for_node(&mut conn, id1, &[("taken".into(), 1, Proto::Tcp)], ApprovalMode::AutoApprove).unwrap();
+        upsert_for_node(&mut conn, id1, &[decl("taken", 1, Proto::Tcp)], ApprovalMode::AutoApprove, RANGE).unwrap();
 
         let err = upsert_for_node(
             &mut conn,
             id2,
             &[
-                ("free-one".into(), 2, Proto::Tcp),
-                ("taken".into(), 3, Proto::Tcp),
+                decl("free-one", 2, Proto::Tcp),
+                decl("taken", 3, Proto::Tcp),
             ],
             ApprovalMode::AutoApprove,
+            RANGE,
         )
         .unwrap_err();
         assert!(matches!(err, DbError::ServiceNameCollision(_)));

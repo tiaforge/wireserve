@@ -3,12 +3,21 @@
 //! request/response per connection).
 
 use serde::{Deserialize, Serialize};
-use wireserve_types::{PeerInfo, Proto};
+use wireserve_types::{PeerInfo, PortMap, Proto};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum IpcRequest {
-    Serve { name: String, port: u16, proto: Proto },
+    /// `port`/`proto` is the whole declaration from a CLI that predates
+    /// port mappings, and the first mapping's target from one that
+    /// doesn't; `ports`, when present, is what is declared.
+    Serve {
+        name: String,
+        port: u16,
+        proto: Proto,
+        #[serde(default)]
+        ports: Vec<PortMap>,
+    },
     Unserve { name: String },
     List,
     Leave,
@@ -26,6 +35,11 @@ pub struct LocalServiceView {
     pub ip4: String,
     pub port: u16,
     pub proto: Proto,
+    /// The service's own address and mappings; see `ServiceInfo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vip4: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<PortMap>,
     pub online: bool,
     pub local: bool,
     /// Declared by this node and accepted by the coordinator, but waiting
@@ -91,6 +105,7 @@ mod tests {
             name: "plex".into(),
             port: 32400,
             proto: Proto::Tcp,
+            ports: vec![],
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: IpcRequest = serde_json::from_str(&json).unwrap();
