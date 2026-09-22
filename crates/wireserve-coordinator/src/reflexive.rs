@@ -56,10 +56,12 @@ async fn handle_datagram(socket: &UdpSocket, datagram: &[u8], src: SocketAddr, l
     let Some(nonce) = wireserve_types::reflexive::parse_request(datagram) else {
         return;
     };
-    if limiter.is_blocked(src.ip()) {
+    // Silent when over budget, and also when the limiter is full and
+    // cannot track this source at all: answering an untracked source is
+    // the unlimited reflection the limiter is there to prevent.
+    if limiter.is_blocked(src.ip()) || !limiter.record(src.ip()) {
         return;
     }
-    limiter.record(src.ip());
 
     let response = wireserve_types::reflexive::build_response(nonce, src4);
     if let Err(e) = socket.send_to(&response, src).await {
@@ -74,11 +76,24 @@ mod tests {
     use wireserve_types::reflexive::{build_request, parse_response, REQUEST_LEN};
 
     async fn spawn_responder(rate_limit_max: u32) -> SocketAddr {
+        spawn_responder_with(SlidingWindowLimiter::new(rate_limit_max, 60)).await
+    }
+
+    async fn spawn_responder_with(limiter: SlidingWindowLimiter) -> SocketAddr {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
-        let limiter = Arc::new(SlidingWindowLimiter::new(rate_limit_max, 60));
-        tokio::spawn(serve(socket, limiter));
+        tokio::spawn(serve(socket, Arc::new(limiter)));
         addr
+    }
+
+    #[tokio::test]
+    async fn a_source_the_full_limiter_cannot_track_gets_no_reply() {
+        // Room for no sources at all: nothing is ever tracked, so nothing
+        // may be answered.
+        let responder_addr = spawn_responder_with(SlidingWindowLimiter::with_max_sources(100, 60, 0)).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(&build_request([7; 8]), responder_addr).await.unwrap();
+        assert!(recv_with_timeout(&client).await.is_none());
     }
 
     async fn recv_with_timeout(socket: &UdpSocket) -> Option<(usize, SocketAddr, [u8; 64])> {

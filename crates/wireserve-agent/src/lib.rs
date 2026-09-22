@@ -5,6 +5,7 @@ pub mod ifname;
 pub mod install;
 pub mod ipc;
 pub mod lock;
+pub mod mesh;
 pub mod paths;
 pub mod poll_loop;
 pub mod probe;

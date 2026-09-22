@@ -32,8 +32,8 @@
 //! this process, can see the real client address and holds the privilege
 //! to act on it — can block the source. See `deploy/fail2ban/`.
 
-use std::collections::HashMap;
-use std::net::IpAddr;
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -50,6 +50,29 @@ const DELAY_MAX: Duration = Duration::from_millis(1000);
 /// which is the exact shape of the problem it exists to reduce.
 const MAX_CONCURRENT_DELAYS: usize = 64;
 
+/// How many distinct sources one limiter tracks at once (security review
+/// finding #7). Without a ceiling the table grew with every source seen
+/// in a window — and the reflexive responder's sources are spoofable UDP,
+/// so "every source" is whatever an attacker chooses to send. A full
+/// table stops tracking new sources; what that means differs per caller
+/// (see [`SlidingWindowLimiter::record`]).
+pub const MAX_TRACKED_SOURCES: usize = 65_536;
+
+/// The key a source is counted under: an IPv4 address as is, an IPv6
+/// address by its /64. A single IPv6 host is routinely handed a whole /64
+/// and can send from any address in it, so per-address keys gave it
+/// 2^64 fresh budgets. An IPv4-mapped IPv6 address counts as the IPv4
+/// address it maps.
+fn source_key(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => {
+            let bits = u128::from(v6) & !((1u128 << 64) - 1);
+            IpAddr::V6(Ipv6Addr::from(bits))
+        }
+        v4 => v4,
+    }
+}
+
 /// A per-source sliding-window hit counter, with no notion of
 /// "failure," no global budget, and no response delay — just "has this
 /// source exceeded `max` recorded hits in the last `window`."
@@ -60,55 +83,157 @@ const MAX_CONCURRENT_DELAYS: usize = 64;
 /// count and — critically — must never sleep inside its single receive
 /// loop the way `RateLimiter`'s delay mechanism does, which would be a
 /// self-inflicted backlog for every other datagram waiting behind it.
+///
+/// **Bounded in memory and in per-call work** (security review finding
+/// #7). Each source keeps at most `max` timestamps; at most
+/// [`MAX_TRACKED_SOURCES`] sources are tracked; and expired sources are
+/// swept once per window rather than on every hit. The previous version
+/// swept the entire table on every `record` while holding this mutex,
+/// which a flood of distinct (spoofed) sources turned into quadratic
+/// work, blocking an async worker thread for as long as it lasted.
 pub struct SlidingWindowLimiter {
     max: u32,
     window: Duration,
-    hits: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    max_sources: usize,
+    inner: Mutex<Inner>,
+}
+
+struct Inner {
+    hits: HashMap<IpAddr, VecDeque<Instant>>,
+    last_sweep: Instant,
 }
 
 impl SlidingWindowLimiter {
     pub fn new(max: u32, window_secs: u64) -> Self {
+        Self::with_max_sources(max, window_secs, MAX_TRACKED_SOURCES)
+    }
+
+    pub fn with_max_sources(max: u32, window_secs: u64, max_sources: usize) -> Self {
         Self {
             max,
             window: Duration::from_secs(window_secs),
-            hits: Mutex::new(HashMap::new()),
+            max_sources,
+            inner: Mutex::new(Inner {
+                hits: HashMap::new(),
+                last_sweep: Instant::now(),
+            }),
         }
+    }
+
+    fn live(&self, entry: &VecDeque<Instant>, now: Instant) -> usize {
+        entry.iter().filter(|t| now.duration_since(**t) < self.window).count()
     }
 
     /// Whether `ip` has already exhausted its budget for the current
     /// window — a pure check, records nothing (security review G5: this
     /// must never insert a map entry, or every distinct source address
-    /// ever seen would occupy memory forever).
+    /// ever seen would occupy memory forever). At most `max` timestamps
+    /// are looked at.
     pub fn is_blocked(&self, ip: IpAddr) -> bool {
         let now = Instant::now();
-        let hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
-        hits.get(&ip).is_some_and(|entry| {
-            let live = entry
-                .iter()
-                .filter(|t| now.duration_since(**t) < self.window)
-                .count();
-            live as u32 >= self.max
-        })
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .hits
+            .get(&source_key(ip))
+            .is_some_and(|entry| self.live(entry, now) as u64 >= u64::from(self.max))
     }
 
-    /// Records one hit from `ip`. Also where the table is pruned: every
-    /// expired timestamp and every address left with none is dropped, so
-    /// the map is bounded by (sources with a live hit in the window ×
-    /// `max`).
-    pub fn record(&self, ip: IpAddr) {
+    /// Records one hit from `ip`, returning whether it was recorded.
+    ///
+    /// `false` means the table is full and `ip` is not already in it — the
+    /// hit could not be counted. The reflexive responder treats that as
+    /// "blocked" and stays silent: answering untracked sources is exactly
+    /// the unlimited reflection the limiter exists to prevent, and a
+    /// legitimate node's probe is best-effort anyway. The auth limiter
+    /// ignores it: per-source state there only picks 429 over 401, and
+    /// the global budget still counts the failure.
+    pub fn record(&self, ip: IpAddr) -> bool {
         let now = Instant::now();
-        let mut hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
-        hits.retain(|_, entry| {
-            entry.retain(|t| now.duration_since(*t) < self.window);
-            !entry.is_empty()
-        });
-        hits.entry(ip).or_default().push(now);
+        let key = source_key(ip);
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if now.duration_since(inner.last_sweep) >= self.window {
+            let window = self.window;
+            inner.hits.retain(|_, entry| {
+                entry.retain(|t| now.duration_since(*t) < window);
+                !entry.is_empty()
+            });
+            inner.last_sweep = now;
+        }
+        let full = inner.hits.len() >= self.max_sources;
+        let entry = match inner.hits.get_mut(&key) {
+            Some(entry) => entry,
+            None if full => return false,
+            None => inner.hits.entry(key).or_default(),
+        };
+        while entry.front().is_some_and(|t| now.duration_since(*t) >= self.window) {
+            entry.pop_front();
+        }
+        entry.push_back(now);
+        // Only the newest `max` can matter: `max` live hits already mean
+        // blocked, and older ones expire first.
+        let cap = usize::try_from(self.max).unwrap_or(usize::MAX).max(1);
+        while entry.len() > cap {
+            entry.pop_front();
+        }
+        true
     }
 
-    /// Number of source addresses currently tracked — exposed for tests
-    /// that pin down the no-growth guarantee above.
+    /// Number of sources currently tracked — exposed for tests that pin
+    /// down the no-growth guarantees above.
     pub fn tracked_sources(&self) -> usize {
-        self.hits.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).hits.len()
+    }
+
+    #[cfg(test)]
+    fn timestamps_for(&self, ip: IpAddr) -> usize {
+        let inner = self.inner.lock().unwrap();
+        inner.hits.get(&source_key(ip)).map_or(0, VecDeque::len)
+    }
+}
+
+/// Failures across every source, counted in one-second buckets: a fixed
+/// `window_secs` of memory and O(window) work however many failures
+/// arrive (security review finding #7 — this used to be a list with one
+/// timestamp per failure, swept in full on every failure).
+struct GlobalCounter {
+    window_secs: u64,
+    epoch: Instant,
+    /// `(second since epoch, failures in it)`, indexed by second modulo
+    /// the window.
+    buckets: Vec<(u64, u64)>,
+}
+
+impl GlobalCounter {
+    fn new(window_secs: u64) -> Self {
+        let len = usize::try_from(window_secs.max(1)).unwrap_or(usize::MAX).min(3600);
+        Self {
+            window_secs,
+            epoch: Instant::now(),
+            buckets: vec![(0, 0); len],
+        }
+    }
+
+    fn now_sec(&self) -> u64 {
+        self.epoch.elapsed().as_secs()
+    }
+
+    fn record(&mut self) {
+        let sec = self.now_sec();
+        let len = self.buckets.len() as u64;
+        let slot = &mut self.buckets[usize::try_from(sec % len).unwrap_or(0)];
+        if slot.0 != sec {
+            *slot = (sec, 0);
+        }
+        slot.1 = slot.1.saturating_add(1);
+    }
+
+    fn live(&self) -> u64 {
+        let now = self.now_sec();
+        self.buckets
+            .iter()
+            .filter(|(sec, _)| now - sec < self.window_secs)
+            .map(|(_, n)| n)
+            .sum()
     }
 }
 
@@ -119,8 +244,7 @@ pub struct RateLimiter {
     /// because `per_source` is pruned per source and a sum over it would
     /// silently change meaning the moment that pruning changed.
     global_max: u32,
-    global_window: Duration,
-    global: Mutex<Vec<Instant>>,
+    global: Mutex<GlobalCounter>,
     delaying: AtomicUsize,
 }
 
@@ -138,8 +262,7 @@ impl RateLimiter {
         Self {
             per_source: SlidingWindowLimiter::new(max, window_secs),
             global_max,
-            global_window: Duration::from_secs(global_window_secs),
-            global: Mutex::new(Vec::new()),
+            global: Mutex::new(GlobalCounter::new(global_window_secs)),
             delaying: AtomicUsize::new(0),
         }
     }
@@ -155,12 +278,7 @@ impl RateLimiter {
     /// mitigation into a total denial of service.
     #[must_use]
     pub fn failure_delay(&self) -> Option<Duration> {
-        let now = Instant::now();
-        let live = {
-            let mut g = self.global.lock().unwrap_or_else(|e| e.into_inner());
-            g.retain(|t| now.duration_since(*t) < self.global_window);
-            g.len() as u64
-        };
+        let live = self.global.lock().unwrap_or_else(|e| e.into_inner()).live();
         let over = live.saturating_sub(u64::from(self.global_max));
         if over == 0 {
             return None;
@@ -214,16 +332,12 @@ impl RateLimiter {
 
     /// Records one failed attempt from `ip` — call only on an actual auth
     /// failure (never on success), so legitimate traffic never eats into
-    /// the budget. Failures are rare relative to requests, so the sweep
-    /// `SlidingWindowLimiter::record` does is cheap.
+    /// the budget.
     pub fn record_failure(&self, ip: IpAddr) {
-        let now = Instant::now();
-        {
-            let mut g = self.global.lock().unwrap_or_else(|e| e.into_inner());
-            g.retain(|t| now.duration_since(*t) < self.global_window);
-            g.push(now);
-        }
-        self.per_source.record(ip);
+        self.global.lock().unwrap_or_else(|e| e.into_inner()).record();
+        // A full table leaves this source untracked, which only costs it
+        // the 429 in place of a 401; see `SlidingWindowLimiter::record`.
+        let _ = self.per_source.record(ip);
     }
 
     /// Number of source addresses currently tracked — exposed for tests
@@ -287,6 +401,50 @@ mod tests {
         l.record(ip("10.0.0.2"));
         l.record(ip("10.0.0.3"));
         assert_eq!(l.tracked_sources(), 1);
+    }
+
+    #[test]
+    fn the_source_table_stops_growing_at_its_cap() {
+        let l = SlidingWindowLimiter::with_max_sources(5, 60, 3);
+        for n in 0..3u8 {
+            assert!(l.record(ip(&format!("203.0.113.{n}"))));
+        }
+        assert!(!l.record(ip("203.0.113.99")), "a new source past the cap is not tracked");
+        assert!(l.record(ip("203.0.113.0")), "a source already tracked still is");
+        assert_eq!(l.tracked_sources(), 3);
+    }
+
+    #[test]
+    fn a_full_table_frees_up_once_its_entries_expire() {
+        let l = SlidingWindowLimiter::with_max_sources(5, 0, 1);
+        assert!(l.record(ip("10.0.0.1")));
+        assert!(l.record(ip("10.0.0.2")), "the expired entry is swept, not held forever");
+    }
+
+    #[test]
+    fn a_source_keeps_at_most_max_timestamps() {
+        let l = SlidingWindowLimiter::new(3, 60);
+        let a = ip("10.0.0.1");
+        for _ in 0..10_000 {
+            l.record(a);
+        }
+        assert_eq!(l.timestamps_for(a), 3);
+        assert!(l.is_blocked(a));
+    }
+
+    #[test]
+    fn an_ipv6_source_is_counted_by_its_64() {
+        let l = SlidingWindowLimiter::new(1, 60);
+        l.record(ip("2001:db8:1:2::1"));
+        assert!(l.is_blocked(ip("2001:db8:1:2:ffff::9")), "same /64, same budget");
+        assert!(!l.is_blocked(ip("2001:db8:1:3::1")), "another /64 is another source");
+    }
+
+    #[test]
+    fn an_ipv4_mapped_source_counts_as_its_ipv4_address() {
+        let l = SlidingWindowLimiter::new(1, 60);
+        l.record(ip("::ffff:192.0.2.7"));
+        assert!(l.is_blocked(ip("192.0.2.7")));
     }
 
     // ---- RateLimiter, now delegating to SlidingWindowLimiter ----
@@ -377,6 +535,19 @@ mod tests {
             rl.failure_delay().is_none(),
             "a 0s window means every recorded failure is already stale"
         );
+    }
+
+    #[test]
+    fn the_global_budget_uses_fixed_memory_however_many_failures_arrive() {
+        let rl = RateLimiter::with_global_budget(u32::MAX, 60, 0, 60);
+        for n in 0..100_000u32 {
+            rl.record_failure(IpAddr::from(n.to_be_bytes()));
+        }
+        let g = rl.global.lock().unwrap();
+        assert_eq!(g.buckets.len(), 60);
+        assert_eq!(g.live(), 100_000);
+        drop(g);
+        assert!(rl.tracked_sources() <= MAX_TRACKED_SOURCES);
     }
 
     #[tokio::test]

@@ -129,6 +129,45 @@ pub fn build_poll_request(
     }
 }
 
+/// The mesh ranges to check this cycle's directory against (see
+/// `crate::mesh`): the pinned ones, pinning `offered` first if nothing is
+/// pinned yet and it contains this node's own addresses. `None` — nothing
+/// filtered — only while no verifiable range has ever been offered, i.e.
+/// against a coordinator that predates them.
+async fn pinned_mesh_ranges(
+    state: &Mutex<AgentState>,
+    state_path: &Path,
+    offered: Option<&wireserve_types::MeshInfo>,
+) -> Result<Option<wireserve_types::MeshRanges>, PollError> {
+    static DIFFERENT_OFFER_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let mut s = state.lock().await;
+    match (&s.mesh, offered) {
+        (None, Some(offered)) if crate::mesh::pinnable(offered, s.ip4.as_deref(), s.ip6.as_deref()) => {
+            tracing::info!(
+                v4 = %offered.net_v4_cidr,
+                v6 = %offered.net_v6_prefix,
+                "pinned the mesh ranges; directory entries outside them are ignored from now on"
+            );
+            s.mesh = Some(offered.clone());
+            s.save(state_path)?;
+        }
+        (Some(pinned), Some(offered))
+            if pinned != offered && !DIFFERENT_OFFER_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) =>
+        {
+            tracing::warn!(
+                pinned_v4 = %pinned.net_v4_cidr,
+                pinned_v6 = %pinned.net_v6_prefix,
+                offered_v4 = %offered.net_v4_cidr.escape_debug(),
+                offered_v6 = %offered.net_v6_prefix.escape_debug(),
+                "the coordinator now reports different mesh ranges than this node pinned; keeping \
+                 the pinned ones (join again to adopt the new ranges)"
+            );
+        }
+        _ => {}
+    }
+    Ok(s.mesh.as_ref().and_then(wireserve_types::MeshRanges::parse))
+}
+
 /// Firewall rules are derived from what THIS node declared in the request
 /// it just sent — never from the full mesh directory (spec §5: "a node
 /// only ever firewalls itself").
@@ -453,8 +492,11 @@ where
         });
     }
     let mut directory: PollResponse = resp.json().await?;
-    // Before anything acts on a service address: peers, firewall, hosts
-    // file and the saved directory all see the same, checked, set.
+    // Before anything acts on an address: peers, firewall, hosts file and
+    // the saved directory all see the same, checked, set.
+    if let Some(ranges) = pinned_mesh_ranges(state, ctx.state_path, directory.mesh.as_ref()).await? {
+        crate::mesh::sanitize(&mut directory, &ranges);
+    }
     crate::vip::sanitize(&mut directory);
 
     // Approval verdicts are folded in BEFORE the firewall rules are
@@ -595,7 +637,55 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wireserve_types::{PortMap, Proto, ServiceInfo};
+    use wireserve_types::{MeshInfo, PortMap, Proto, ServiceInfo};
+
+    fn mesh(v4: &str) -> MeshInfo {
+        MeshInfo { net_v4_cidr: v4.into(), net_v6_prefix: "fdb4:d481:7c21::/64".into() }
+    }
+
+    fn joined_state() -> AgentState {
+        AgentState {
+            ip4: Some("10.9.0.7".into()),
+            ip6: Some("fdb4:d481:7c21::7".into()),
+            ..AgentState::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_first_verifiable_offer_is_pinned_and_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let state = Mutex::new(joined_state());
+
+        let r = pinned_mesh_ranges(&state, &path, Some(&mesh("10.9.0.0/24"))).await.unwrap();
+        assert!(r.is_some_and(|r| r.contains4("10.9.0.1".parse().unwrap())));
+        assert_eq!(state.lock().await.mesh, Some(mesh("10.9.0.0/24")));
+        assert_eq!(AgentState::load(&path).unwrap().mesh, Some(mesh("10.9.0.0/24")), "persisted");
+    }
+
+    #[tokio::test]
+    async fn a_later_different_offer_never_replaces_the_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let state = Mutex::new(AgentState { mesh: Some(mesh("10.9.0.0/24")), ..joined_state() });
+
+        // Wider, and still containing this node: exactly what an attacker
+        // rewriting the response would send to widen what it may route.
+        let r = pinned_mesh_ranges(&state, &path, Some(&mesh("0.0.0.0/0"))).await.unwrap().unwrap();
+        assert!(!r.contains4("192.168.1.1".parse().unwrap()));
+        assert_eq!(state.lock().await.mesh, Some(mesh("10.9.0.0/24")));
+    }
+
+    #[tokio::test]
+    async fn an_offer_not_containing_this_node_is_not_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let state = Mutex::new(joined_state());
+
+        assert!(pinned_mesh_ranges(&state, &path, Some(&mesh("10.8.0.0/24"))).await.unwrap().is_none());
+        assert!(pinned_mesh_ranges(&state, &path, None).await.unwrap().is_none(), "an old coordinator: nothing to check against");
+        assert!(state.lock().await.mesh.is_none());
+    }
 
     #[test]
     fn build_poll_request_carries_declared_services_verbatim() {
@@ -790,6 +880,7 @@ mod tests {
                 .collect(),
             transit_carrying: vec![],
             transit_awaiting_approval: false,
+            mesh: None,
         }
     }
 

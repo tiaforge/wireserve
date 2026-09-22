@@ -167,6 +167,18 @@ impl Config {
     }
 }
 
+impl Config {
+    /// The mesh ranges as nodes are told them (security review finding
+    /// #4): at registration, for the agent to pin, and on every poll.
+    #[must_use]
+    pub fn mesh_info(&self) -> wireserve_types::MeshInfo {
+        wireserve_types::MeshInfo {
+            net_v4_cidr: self.net_v4_cidr.clone(),
+            net_v6_prefix: self.net_v6_prefix.clone(),
+        }
+    }
+}
+
 /// The result of [`Config::load`]: the config itself, plus which first-run
 /// values (if any) were freshly generated this call and where they were
 /// persisted — `main` uses these two to print a one-time banner.

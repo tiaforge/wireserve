@@ -290,5 +290,6 @@ pub async fn poll(
         denied_services: outcome.denied.iter().map(directory::denied_service).collect(),
         transit_carrying,
         transit_awaiting_approval,
+        mesh: Some(state.config.mesh_info()),
     }))
 }

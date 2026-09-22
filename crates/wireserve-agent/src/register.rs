@@ -190,7 +190,12 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
         ifname_pinned: params.ifname_pinned,
         transit_capable: false,
         allow_plaintext_http: params.allow_plaintext_http,
+        mesh: None,
     };
+    let mut state = state;
+    if let Some(offered) = reg.mesh.filter(|m| crate::mesh::pinnable(m, state.ip4.as_deref(), state.ip6.as_deref())) {
+        state.mesh = Some(offered);
+    }
     state.save(params.state_path)?;
     Ok(state)
 }

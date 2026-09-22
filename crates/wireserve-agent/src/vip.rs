@@ -126,6 +126,7 @@ mod tests {
             denied_services: vec![],
             transit_carrying: vec![],
             transit_awaiting_approval: false,
+            mesh: None,
         }
     }
 

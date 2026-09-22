@@ -37,6 +37,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
             denied_services: vec![],
             transit_carrying: vec![],
             transit_awaiting_approval: false,
+            mesh: None,
         });
 
     let self_name = state.public_key.as_ref().and_then(|pk| {

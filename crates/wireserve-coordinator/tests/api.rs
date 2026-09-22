@@ -2707,6 +2707,24 @@ async fn rejoin_removes_the_old_key_from_every_other_nodes_directory_at_once() {
     assert_eq!(n1["pubkey"].as_str().unwrap(), pubkey_for("n1-new"));
 }
 
+// Security review finding #4: the agent pins the mesh ranges from the
+// register response (or, for an older node, its first poll), so both must
+// carry them.
+#[tokio::test]
+async fn register_and_poll_report_the_mesh_ranges() {
+    let app = test_app();
+    let t = admin_create_node(&app.router, "n1").await;
+    let r = register_node(&app.router, &t, "n1", 51820).await;
+    let expected = json!({
+        "net_v4_cidr": app.state.config.net_v4_cidr,
+        "net_v6_prefix": app.state.config.net_v6_prefix,
+    });
+    assert_eq!(r["mesh"], expected);
+
+    let (_, body) = poll_full(&app.router, r["bearer_token"].as_str().unwrap(), json!({ "services": [] })).await;
+    assert_eq!(body["mesh"], expected);
+}
+
 #[tokio::test]
 async fn malformed_transit_pubkeys_are_dropped_not_rejected() {
     let app = test_app();

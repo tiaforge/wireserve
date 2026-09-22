@@ -234,5 +234,6 @@ pub async fn register(
         bearer_token,
         ip4: ip4.to_string(),
         ip6: ip6.to_string(),
+        mesh: Some(state.config.mesh_info()),
     }))
 }

@@ -1,5 +1,6 @@
 pub mod api;
 pub mod firewall;
+pub mod mesh;
 pub mod node;
 pub mod ports;
 pub mod reflexive;
@@ -7,6 +8,7 @@ pub mod token;
 pub mod validation;
 
 pub use api::*;
+pub use mesh::{MeshInfo, MeshRanges};
 pub use firewall::{FirewallBackend, ServiceRule, TransitEndpoint, TransitForward};
 pub use node::{NodeKind, Proto};
 pub use ports::{validate_node_targets, validate_service_ports, PortMap, MAX_PORTS_PER_SERVICE};

@@ -525,7 +525,11 @@ explicitly, or who is running against an older deployment that still has
 the binary's compiled-in defaults — either way, both are poor choices, for
 unrelated reasons, and changing them requires care: addresses are
 allocated once and kept for the life of the node record, so a later change
-leaves the mesh addressed out of two ranges.
+leaves the mesh addressed out of two ranges. Each node also pins the ranges
+it joined with and ignores any peer or service address outside them (so a
+compromised coordinator can't route arbitrary addresses into its tunnel).
+After a change, nodes joined under the new ranges therefore don't see
+peers still addressed from the old ones until those are re-joined.
 
 The compiled-in IPv4 default `100.90.0.0/24` sits inside `100.64.0.0/10`,
 the carrier-grade-NAT block Tailscale allocates all of its addresses from

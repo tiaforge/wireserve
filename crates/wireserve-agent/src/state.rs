@@ -73,6 +73,12 @@ pub struct AgentState {
     /// its own.
     #[serde(default)]
     pub allow_plaintext_http: bool,
+    /// The mesh ranges this node checks every directory against (see
+    /// `crate::mesh`), pinned once — at join, or on the first poll for a
+    /// node that joined before registration carried them — and never
+    /// replaced by a later report.
+    #[serde(default)]
+    pub mesh: Option<wireserve_types::MeshInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

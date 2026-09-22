@@ -143,6 +143,10 @@ pub struct RegisterResponse {
     pub bearer_token: String,
     pub ip4: String,
     pub ip6: String,
+    /// The mesh ranges `ip4`/`ip6` came from, for the agent to pin — see
+    /// [`crate::MeshInfo`]. Absent from a coordinator that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<crate::MeshInfo>,
 }
 
 // ---- §4.3 Node: poll ----
@@ -425,6 +429,12 @@ pub struct PollResponse {
     /// anything; absent from the JSON when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub transit_awaiting_approval: bool,
+    /// The coordinator's mesh ranges. A node that joined before
+    /// registration carried them pins them from here, once; after that a
+    /// different value is only ever reported, never adopted — see
+    /// [`crate::MeshInfo`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<crate::MeshInfo>,
     /// THIS node's own declarations awaiting approval — never anyone
     /// else's.
     ///
@@ -558,6 +568,7 @@ mod tests {
             denied_services: vec![],
             transit_carrying: vec![],
             transit_awaiting_approval: false,
+            mesh: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("pending_services"), "{json}");
@@ -639,6 +650,7 @@ mod tests {
             denied_services: vec![],
             transit_carrying: vec![],
             transit_awaiting_approval: false,
+            mesh: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: PollResponse = serde_json::from_str(&json).unwrap();
