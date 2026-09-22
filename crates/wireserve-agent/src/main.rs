@@ -434,11 +434,17 @@ async fn cmd_daemon(
     };
     tracing::info!(reflexive_addr = ?own_reflexive_addr, "one-shot reflexive-address probe");
 
+    // Where the interop restores our own table from, if something else on
+    // the host removes it (see `nftables::SharedRuleset`).
+    #[cfg(target_os = "linux")]
+    let own_table = fw.last_applied();
+    #[cfg(not(target_os = "linux"))]
+    let own_table = ();
     let mut interop = firewall::guarded_bring_up(
         &mut fw,
         &mut wg,
         |wg| wg.preflight(&private_key).map_err(Into::into),
-        || start_interop(&ifname, state.transit_capable),
+        || start_interop(&ifname, state.transit_capable, own_table),
         |wg| {
             wg.bring_up(&private_key, ip4, ip6, listen_port)
                 .map_err(Into::<Box<dyn std::error::Error>>::into)
@@ -783,12 +789,16 @@ fn print_response(resp: wireserve_agent::ipc::IpcResponse) {
 }
 
 #[cfg(target_os = "linux")]
-fn start_interop(ifname: &str, transit_capable: bool) -> firewall::host_interop::HostInterop {
-    firewall::host_interop::HostInterop::start(ifname, transit_capable)
+fn start_interop(
+    ifname: &str,
+    transit_capable: bool,
+    own_table: firewall::nftables::SharedRuleset,
+) -> firewall::host_interop::HostInterop {
+    firewall::host_interop::HostInterop::start(ifname, transit_capable, own_table)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn start_interop(_ifname: &str, _transit_capable: bool) -> firewall::NoopInterop {
+fn start_interop(_ifname: &str, _transit_capable: bool, _own_table: ()) -> firewall::NoopInterop {
     firewall::NoopInterop
 }
 

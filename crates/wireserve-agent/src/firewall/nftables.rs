@@ -3,6 +3,7 @@
 //! `rustables`).
 
 use std::borrow::Cow;
+use std::sync::{Arc, Mutex};
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -22,8 +23,8 @@ pub const TABLE_PREFIX: &str = "wireserve.";
 /// The single fixed-name table every version before multi-instance
 /// support used. Nothing creates it any more; see `remove_legacy_table`.
 pub const LEGACY_TABLE_NAME: &str = "wireserve";
-const CHAIN_NAME: &str = "wireserve-in";
-const FORWARD_CHAIN: &str = "wireserve-fwd";
+pub(crate) const CHAIN_NAME: &str = "wireserve-in";
+pub(crate) const FORWARD_CHAIN: &str = "wireserve-fwd";
 const PRE_CHAIN: &str = "svc-pre";
 const OUT_CHAIN: &str = "svc-out";
 const MARK_PRE_CHAIN: &str = "svc-mark-pre";
@@ -68,12 +69,35 @@ pub fn table_name(ifname: &str) -> String {
     format!("{TABLE_PREFIX}{ifname}")
 }
 
+/// The last ruleset [`NftablesBackend`] applied in full, shared with the
+/// host-firewall interop so it can put our table back when something else
+/// removes it (security review: `flush ruleset` from an nftables.service
+/// reload deleted it, the interop re-opened the host firewall for the
+/// interface within a second, and nothing restored the deny until the
+/// next successful poll — never, while the coordinator was unreachable).
+///
+/// The lock is held across every apply, restore and teardown, never just
+/// the read: a restore that read the previous ruleset while a poll was
+/// applying the next could otherwise put the older one back over it.
+pub type SharedRuleset = Arc<Mutex<Option<Nftables<'static>>>>;
+
+/// Re-applies the ruleset in `shared`, if there is one. `Ok(false)` when
+/// nothing has been applied yet or the backend was torn down.
+pub fn restore(nft: &Nft, shared: &SharedRuleset) -> Result<bool, NftError> {
+    let last = shared.lock().unwrap_or_else(|e| e.into_inner());
+    match last.as_ref() {
+        Some(batch) => nft.apply(batch).map(|()| true),
+        None => Ok(false),
+    }
+}
+
 pub struct NftablesBackend {
     /// The WireGuard interface every rule is scoped to — this backend must
     /// never install a rule that isn't `iifname`-restricted to it, or it
     /// would be firewalling the whole host rather than just the mesh.
     ifname: String,
     nft: Nft,
+    last: SharedRuleset,
 }
 
 impl NftablesBackend {
@@ -83,7 +107,14 @@ impl NftablesBackend {
         Ok(Self {
             ifname: ifname.into(),
             nft: Nft::locate()?,
+            last: SharedRuleset::default(),
         })
+    }
+
+    /// The handle the host-firewall interop restores our table from.
+    #[must_use]
+    pub fn last_applied(&self) -> SharedRuleset {
+        Arc::clone(&self.last)
     }
 }
 
@@ -544,19 +575,28 @@ impl FirewallBackend for NftablesBackend {
     /// the same transaction, so a mid-cycle failure can never leave them
     /// disagreeing about which cycle they reflect.
     fn apply(&mut self, rules: &[ServiceRule], transit: &[TransitForward]) -> Result<(), Self::Error> {
-        match self.nft.apply(&apply_batch(&self.ifname, rules, transit)) {
+        let batch = apply_batch(&self.ifname, rules, transit);
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        match self.nft.apply(&batch) {
+            Ok(()) => {
+                *last = Some(batch);
+                Ok(())
+            }
             Err(e @ NftError::Failed { .. })
                 if e.to_string().contains("Operation not permitted")
                     && rules.iter().any(|r| matches!(r, ServiceRule::Mapped { .. })) =>
             {
                 Err(NftablesError::RewriteRefused(e))
             }
-            other => Ok(other?),
+            Err(e) => Err(e.into()),
         }
     }
 
-    /// Removes this interface's table entirely, if present.
+    /// Removes this interface's table entirely, if present — and forgets
+    /// it, so nothing restores a table that was meant to go.
     fn teardown(&mut self) -> Result<(), Self::Error> {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        *last = None;
         self.nft.apply(&teardown_batch(&table_name(&self.ifname)))?;
         Ok(())
     }

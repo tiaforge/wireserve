@@ -20,9 +20,17 @@ use serde_json::Value;
 use super::model::{is_own_table, Family};
 use crate::firewall::nft::Nft;
 
-/// Should this `nft -j monitor` line trigger a reconcile?
+/// Should this `nft -j monitor` line trigger a reconcile for `ifname`?
+///
+/// Changes outside our own tables, and deletions inside `ifname`'s own
+/// deny table: a `flush ruleset` or `flush chain` shows up as exactly
+/// those, and the reconcile is what restores the table (see the module
+/// doc of `host_interop`). Our own per-poll replace deletes too, which
+/// costs one reconcile that finds everything in place. Other agents'
+/// tables stay ignored: reacting to each other's polls would have them
+/// reconciling in response to one another.
 #[must_use]
-pub fn is_relevant(line: &str) -> bool {
+pub fn is_relevant(line: &str, ifname: &str) -> bool {
     let Ok(Value::Object(event)) = serde_json::from_str::<Value>(line) else {
         return false;
     };
@@ -44,7 +52,9 @@ pub fn is_relevant(line: &str) -> bool {
         .and_then(Family::parse)
         .is_some();
     let table = object.get(table_key).and_then(Value::as_str).unwrap_or_default();
-    family_ok && !is_own_table(table)
+    let our_deny_table_lost_something =
+        event.get("delete").is_some() && table == crate::firewall::nftables::table_name(ifname);
+    family_ok && (!is_own_table(table) || our_deny_table_lost_something)
 }
 
 /// Collapses a burst of events into one action `delay` after the last.
@@ -92,6 +102,7 @@ pub struct Monitor {
 impl Monitor {
     pub fn spawn<M: Send + 'static>(
         nft: &Nft,
+        ifname: &str,
         tx: Sender<M>,
         on_event: fn() -> M,
         on_exit: fn() -> M,
@@ -103,12 +114,13 @@ impl Monitor {
             .stderr(Stdio::null())
             .spawn()?;
         let stdout = child.stdout.take().expect("stdout was piped");
+        let ifname = ifname.to_string();
         std::thread::Builder::new()
             .name("nft-monitor".into())
             .spawn(move || {
                 for line in BufReader::new(stdout).lines() {
                     let Ok(line) = line else { break };
-                    if is_relevant(&line) && tx.send(on_event()).is_err() {
+                    if is_relevant(&line, &ifname) && tx.send(on_event()).is_err() {
                         return;
                     }
                 }
@@ -147,7 +159,7 @@ mod tests {
     #[test]
     fn foreign_table_chain_and_rule_changes_are_relevant() {
         for line in [FOREIGN_RULE_ADD, FOREIGN_RULE_DEL, FOREIGN_CHAIN_DEL, FOREIGN_TABLE_ADD, LOOKALIKE_TABLE_ADD] {
-            assert!(is_relevant(line), "{line}");
+            assert!(is_relevant(line, "wg0"), "{line}");
         }
     }
 
@@ -165,14 +177,32 @@ mod tests {
             OTHER_AGENT_GUARD_ADD,
             BRIDGE_RULE,
         ] {
-            assert!(!is_relevant(line), "{line}");
+            assert!(!is_relevant(line, "wg0"), "{line}");
         }
+    }
+
+    #[test]
+    fn a_deletion_in_our_own_deny_table_is_relevant_to_us_alone() {
+        // What `flush ruleset` and `flush chain` look like to the monitor
+        // (captured from nftables 1.1.6): our table losing its drop rule,
+        // its chain, the table itself.
+        let lost = [
+            r#"{"delete": {"rule": {"family": "inet", "table": "wireserve.wg0", "chain": "wireserve-in", "handle": 2, "expr": [{"drop": null}]}}}"#,
+            r#"{"delete": {"chain": {"family": "inet", "table": "wireserve.wg0", "name": "wireserve-in", "handle": 1}}}"#,
+            r#"{"delete": {"table": {"family": "inet", "name": "wireserve.wg0", "handle": 1}}}"#,
+        ];
+        for line in lost {
+            assert!(is_relevant(line, "wg0"), "{line}");
+            assert!(!is_relevant(line, "wireserve1"), "another agent's table is not ours to restore: {line}");
+        }
+        let added = r#"{"add": {"table": {"family": "inet", "name": "wireserve.wg0", "handle": 1}}}"#;
+        assert!(!is_relevant(added, "wg0"), "our own table being written is no news");
     }
 
     #[test]
     fn garbage_is_ignored() {
         for line in ["", "not json", "[]", r#"{"metainfo": {}}"#, r#"{"add": 5}"#] {
-            assert!(!is_relevant(line), "{line:?}");
+            assert!(!is_relevant(line, "wg0"), "{line:?}");
         }
     }
 
@@ -211,7 +241,7 @@ mod tests {
         let Some(out) = crate::firewall::netns::run(&script) else {
             return;
         };
-        let relevant: Vec<&str> = out.lines().filter(|l| is_relevant(l)).collect();
+        let relevant: Vec<&str> = out.lines().filter(|l| is_relevant(l, "wg0")).collect();
         assert_eq!(relevant.len(), 3, "crowdsec table, filter table, filter chain:\n{out}");
         assert!(out.lines().any(|l| l.contains("\"element\"")), "monitor saw the set churn:\n{out}");
     }

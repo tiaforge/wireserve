@@ -51,10 +51,21 @@
 //!
 //! Runs on one dedicated thread (so no locking), woken by `nft -j monitor`
 //! events (debounced), by every poll tick (the safety net), and by stop.
-//! Every failure is logged, never propagated: our own table keeps
-//! default-denying the interface regardless, so the worst case is the
-//! behavior from before this existed — declared services blocked by the
-//! host firewall.
+//! Every failure is logged, never propagated.
+//!
+//! **Everything here depends on our own table being in place**, because
+//! what this module adds tells every other firewall to leave the
+//! interface to that table. So each reconcile first checks it (see
+//! `planner::own_table_intact`): if something else removed it — a
+//! `flush ruleset` from an nftables.service reload, a `flush chain` — the
+//! reconcile puts back the last ruleset the backend applied
+//! (`nftables::SharedRuleset`), and if that isn't possible it removes
+//! everything this module added instead of adding it, so the host
+//! firewalls go back to blocking the interface. The monitor reacts to
+//! deletions in our table for the same reason. Before this, a reload
+//! left the interface open to every mesh peer on every port until the
+//! next successful poll, and indefinitely while the coordinator was
+//! unreachable.
 
 pub mod firewalld;
 pub mod iptables;
@@ -108,8 +119,11 @@ impl HostInterop {
     /// node's FORWARD hook is opened at all, alongside the INPUT hook this
     /// module has always opened. A node that never opts into transit gets
     /// exactly the footprint this module had before transit existed.
+    ///
+    /// `own_table` is the backend's last applied ruleset, which a
+    /// reconcile restores when our table has gone missing.
     #[must_use]
-    pub fn start(ifname: &str, transit_capable: bool) -> Self {
+    pub fn start(ifname: &str, transit_capable: bool, own_table: super::nftables::SharedRuleset) -> Self {
         let nft = match Nft::locate() {
             Ok(nft) => nft,
             Err(e) => {
@@ -120,7 +134,7 @@ impl HostInterop {
                 };
             }
         };
-        Self::start_with(ifname, nft.clone(), RealOps::new(nft), transit_capable)
+        Self::start_with(ifname, nft.clone(), RealOps::new(nft).with_own_table(own_table), transit_capable)
     }
 
     fn start_with(ifname: &str, nft: Nft, mut ops: RealOps, forward_wanted: bool) -> Self {
@@ -133,6 +147,8 @@ impl HostInterop {
         let worker = std::thread::Builder::new()
             .name("host-interop".into())
             .spawn(move || run(ops, &ifname, forward_wanted, &nft, &rx, &monitor_tx, told));
+        // `run` reconciles on monitor events, which it filters by this
+        // interface (see `monitor::is_relevant`).
         match worker {
             Ok(worker) => Self {
                 tx: Some(tx),
@@ -215,7 +231,7 @@ fn run(
     tx: &Sender<Msg>,
     mut told: HashSet<String>,
 ) {
-    let spawn_monitor = || match Monitor::spawn(nft, tx.clone(), || Msg::Changed, || Msg::MonitorExited) {
+    let spawn_monitor = || match Monitor::spawn(nft, ifname, tx.clone(), || Msg::Changed, || Msg::MonitorExited) {
         Ok(m) => Some(m),
         Err(e) => {
             tracing::warn!(error = %e, "could not start `nft monitor`; relying on the poll tick");
@@ -285,6 +301,66 @@ mod tests {
         listing.matches("wireserve:wg0").count()
     }
 
+    /// Our own deny table for `ifname`, applied the way the daemon applies
+    /// it before starting the interop, plus the handle the interop
+    /// restores it from.
+    fn own_table(ifname: &str) -> (crate::firewall::nftables::NftablesBackend, super::super::nftables::SharedRuleset) {
+        use wireserve_types::FirewallBackend;
+        let mut backend = crate::firewall::nftables::NftablesBackend::new(ifname).unwrap();
+        backend.apply(&[], &[]).unwrap();
+        let shared = backend.last_applied();
+        (backend, shared)
+    }
+
+    const NATIVE_DROP_ALL: &str = "table inet filter {\n chain input {\n  type filter hook input priority 0; policy drop;\n  iif lo accept\n }\n}\n";
+
+    /// Security review: an nftables.service reload (`flush ruleset`, then
+    /// the host's own config) used to leave the interface open to every
+    /// mesh peer — our table gone, our accept back in the host's chain
+    /// within a second. Now the same reconcile puts our table back first.
+    #[test]
+    fn kernel_a_flushed_ruleset_gets_our_table_back_before_anything_is_reopened() {
+        if !crate::firewall::netns::reexec(
+            "firewall::host_interop::tests::kernel_a_flushed_ruleset_gets_our_table_back_before_anything_is_reopened",
+        ) {
+            return;
+        }
+        sh(&format!("printf '{NATIVE_DROP_ALL}' | nft -f -"));
+        let nft = Nft::locate().unwrap();
+        let (_backend, shared) = own_table("wg0");
+        let _interop = HostInterop::start_with("wg0", nft.clone(), RealOps::without_firewalld(nft).with_own_table(shared), false);
+        assert_eq!(tags(&sh("nft list table inet filter")), 1);
+
+        sh(&format!("printf 'flush ruleset\n{NATIVE_DROP_ALL}' | nft -f -"));
+        wait_for("our table restored and the host firewall reopened", Duration::from_secs(5), || {
+            let all = sh("nft list ruleset");
+            all.contains("table inet wireserve.wg0") && tags(&all) == 1
+        });
+        let ours = sh("nft list table inet wireserve.wg0");
+        assert!(ours.contains("iifname \"wg0\" drop"), "{ours}");
+    }
+
+    /// With nothing to restore from, losing our table must close the host
+    /// firewalls again rather than leave them opened for it.
+    #[test]
+    fn kernel_losing_our_table_with_nothing_to_restore_closes_the_host_firewall() {
+        if !crate::firewall::netns::reexec(
+            "firewall::host_interop::tests::kernel_losing_our_table_with_nothing_to_restore_closes_the_host_firewall",
+        ) {
+            return;
+        }
+        sh(&format!("iptables-nft -P INPUT DROP; printf '{NATIVE_DROP_ALL}' | nft -f -"));
+        let nft = Nft::locate().unwrap();
+        let (_backend, _shared) = own_table("wg0");
+        let _interop = HostInterop::start_with("wg0", nft.clone(), RealOps::without_firewalld(nft), false);
+        assert_eq!(tags(&sh("nft list ruleset; iptables-nft -S INPUT")), 2);
+
+        sh("nft flush chain inet wireserve.wg0 wireserve-in");
+        wait_for("host firewalls closed again", Duration::from_secs(5), || {
+            tags(&sh("nft list ruleset; iptables-nft -S INPUT")) == 0
+        });
+    }
+
     /// The whole runtime — worker thread, `nft monitor`, debounce, tick,
     /// stop — against a real kernel. Re-runs this test binary inside a
     /// fresh unprivileged network namespace (so nothing touches the host),
@@ -301,7 +377,8 @@ mod tests {
         let list = || sh("nft list ruleset; iptables-nft -S INPUT");
 
         let nft = Nft::locate().unwrap();
-        let mut interop = HostInterop::start_with("wg0", nft.clone(), RealOps::without_firewalld(nft), false);
+        let (_backend, shared) = own_table("wg0");
+        let mut interop = HostInterop::start_with("wg0", nft.clone(), RealOps::without_firewalld(nft).with_own_table(shared), false);
 
         // Synchronously in place when start() returns: native chain + iptables.
         let after_start = list();
@@ -350,8 +427,10 @@ mod tests {
         let nft = Nft::locate().unwrap();
         crate::lock::IfnameClaim::take("wireserve0").unwrap().unwrap().hold();
         crate::lock::IfnameClaim::take("wireserve1").unwrap().unwrap().hold();
-        let mut a = HostInterop::start_with("wireserve0", nft.clone(), RealOps::without_firewalld(nft.clone()), false);
-        let mut b = HostInterop::start_with("wireserve1", nft.clone(), RealOps::without_firewalld(nft), false);
+        let (_backend_a, shared_a) = own_table("wireserve0");
+        let (_backend_b, shared_b) = own_table("wireserve1");
+        let mut a = HostInterop::start_with("wireserve0", nft.clone(), RealOps::without_firewalld(nft.clone()).with_own_table(shared_a), false);
+        let mut b = HostInterop::start_with("wireserve1", nft.clone(), RealOps::without_firewalld(nft).with_own_table(shared_b), false);
         assert_eq!((count("wireserve0"), count("wireserve1")), (2, 2));
 
         // Each one's monitor sees the other's inserts; let that settle, then

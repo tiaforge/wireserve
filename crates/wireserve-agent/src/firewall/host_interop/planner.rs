@@ -66,6 +66,32 @@ pub fn is_accept_shape(rule: &RuleInfo, ifname: &str, hook: Hook) -> bool {
     }
 }
 
+/// Whether `ifname`'s own deny table (`inet wireserve.<ifname>`) is in
+/// place: both its input and its forward chain present and ending in
+/// `iifname "<ifname>" drop`, as every ruleset the backend applies does.
+///
+/// Everything [`plan_reconcile`] opens hands the interface over to that
+/// table, so without it the reconcile must open nothing (see
+/// `ops::reconcile`). An unreadable ruleset counts as not in place: fail
+/// closed.
+#[must_use]
+pub fn own_table_intact(observed: &Observed, ifname: &str) -> bool {
+    use crate::firewall::nftables::{table_name, CHAIN_NAME, FORWARD_CHAIN};
+    let Some(view) = &observed.nft else {
+        return false;
+    };
+    let table = table_name(ifname);
+    let ends_in_drop = |name: &str| {
+        view.chains.iter().any(|c| {
+            c.chain.family == Family::Inet
+                && c.chain.table == table
+                && c.chain.chain == name
+                && c.rules.last().is_some_and(|r| is_guard_drop_shape(r, ifname))
+        })
+    };
+    ends_in_drop(CHAIN_NAME) && ends_in_drop(FORWARD_CHAIN)
+}
+
 /// Is `rule` exactly the guard's plain `iifname "<ifname>" drop`?
 #[must_use]
 pub fn is_guard_drop_shape(rule: &RuleInfo, ifname: &str) -> bool {
