@@ -66,6 +66,13 @@ pub struct AgentState {
     /// `RegisterRequest::transit_capable` always does at join time.
     #[serde(default)]
     pub transit_capable: bool,
+    /// Set by `join --allow-plaintext-http`: the operator accepted talking
+    /// to a non-loopback coordinator over plain `http://`. Kept so the
+    /// daemon, which refuses such a URL otherwise (security review
+    /// finding #4), honours the choice made at join without a flag of
+    /// its own.
+    #[serde(default)]
+    pub allow_plaintext_http: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

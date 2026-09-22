@@ -203,13 +203,13 @@ JT2=$(create_node node2)
 JT3=$(create_node node3)
 # agent1 knows its public endpoint, because somebody configured the
 # port-forward and told it so. This is the normal home-server case.
-podman exec "$AGENT1" wireserve-agent join "http://$COORD_IP:47820" "$JT1" \
+podman exec "$AGENT1" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT1" \
     --listen-port "$WG_PORT" --endpoint-addr "$ROUTER_A_WAN:$WG_PORT" 2>/dev/null
 # agent2 and agent3 do not: they are behind NAT with nothing forwarded, so
 # they leave it unset and the coordinator falls back to the source address
 # it observes (spec §4.2).
-podman exec "$AGENT2" wireserve-agent join "http://$COORD_IP:47820" "$JT2" --listen-port "$WG_PORT" 2>/dev/null
-podman exec "$AGENT3" wireserve-agent join "http://$COORD_IP:47820" "$JT3" --listen-port "$WG_PORT" 2>/dev/null
+podman exec "$AGENT2" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT2" --listen-port "$WG_PORT" 2>/dev/null
+podman exec "$AGENT3" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT3" --listen-port "$WG_PORT" 2>/dev/null
 pass "all three nodes registered from behind NAT"
 
 log "what endpoint did the coordinator record for each node?"

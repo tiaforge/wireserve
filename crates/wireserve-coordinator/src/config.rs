@@ -90,7 +90,14 @@ impl Config {
     /// [`crate::bootstrap`] for the resolution order and where those values
     /// are written.
     pub fn load() -> Result<Loaded, ConfigError> {
-        let listen_addr = env_or("WIRESERVE_LISTEN_ADDR", "0.0.0.0:47820")?;
+        // Loopback by default (security review finding #4): the node API
+        // speaks plain HTTP and spec §7 puts a TLS-terminating proxy in
+        // front of it, which on the usual single-host setup reaches it
+        // over loopback. A wildcard default exposed it unencrypted to
+        // every network the host is on unless the operator remembered to
+        // firewall it. A proxy on another host, or a container publishing
+        // the port, sets this explicitly (the image does).
+        let listen_addr = env_or("WIRESERVE_LISTEN_ADDR", DEFAULT_LISTEN_ADDR)?;
         let admin_listen_addr = env_or("WIRESERVE_ADMIN_LISTEN_ADDR", "127.0.0.1:47821")?;
         validate_admin_listener(admin_listen_addr)?;
 
@@ -163,6 +170,9 @@ impl Config {
 /// The result of [`Config::load`]: the config itself, plus which first-run
 /// values (if any) were freshly generated this call and where they were
 /// persisted — `main` uses these two to print a one-time banner.
+/// See the comment where it is used in [`Config::load`].
+pub const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:47820";
+
 pub struct Loaded {
     pub config: Config,
     pub generated: Vec<&'static str>,
@@ -315,6 +325,12 @@ pub fn is_loopback_or_private(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_node_api_listens_on_loopback_unless_told_otherwise() {
+        let addr: SocketAddr = DEFAULT_LISTEN_ADDR.parse().unwrap();
+        assert!(addr.ip().is_loopback());
+    }
 
     #[test]
     fn rejects_wildcard_bind() {

@@ -72,11 +72,16 @@ fn lock_file(instance: &str, path: PathBuf) -> Result<InstanceLock, LockError> {
             .create(parent)
             .map_err(io_err)?;
     }
+    // O_NOFOLLOW: this runs as root, and a symlink planted at the lock
+    // path would otherwise have root create (at mode 600) whatever file
+    // it points to (security review finding #6). The directory is
+    // root-only in every shipped deployment; this is the second layer.
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
         .map_err(io_err)?;
     // SAFETY: a plain syscall on a descriptor we own for the call's duration.
@@ -327,6 +332,16 @@ mod tests {
         assert!(matches!(second, Err(LockError::Busy { .. })), "{second:?}");
         drop(first);
         lock_file("t", path).unwrap();
+    }
+
+    #[test]
+    fn a_symlink_at_the_lock_path_is_refused_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere");
+        let path = dir.path().join("agent.lock");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(lock_file("t", path).is_err());
+        assert!(!target.exists(), "the symlink's target must not have been created");
     }
 
     #[cfg(target_os = "linux")]

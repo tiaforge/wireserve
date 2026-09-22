@@ -126,8 +126,8 @@ in_dbg "$HOST_FIREWALL"
 BEFORE_IPT=$(in_dbg "iptables -S INPUT")
 BEFORE_NFT=$(in_dbg "nft list table inet filter")
 
-podman exec "$AGENT1" wireserve-agent join "http://$COORD_IP:47820" "$JT1" --listen-port 51820
-podman exec "$AGENT2" wireserve-agent join "http://$COORD_IP:47820" "$JT2" --listen-port 51820
+podman exec "$AGENT1" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT1" --listen-port 51820
+podman exec "$AGENT2" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT2" --listen-port 51820
 podman exec -d "$AGENT1" wireserve-agent daemon --poll-interval-secs 5
 podman exec -d "$AGENT2" wireserve-agent daemon --poll-interval-secs 5
 sleep 8
@@ -224,7 +224,7 @@ podman exec "$DBG_GUARD" sh -c "wg genkey > /tmp/k && ip link add wg0 type wireg
 guard_rules() { podman exec "$DBG_GUARD" sh -c "nft -s list ruleset; iptables -S"; }
 GUARD_BEFORE=$(guard_rules)
 JT3=$(create_node node3)
-podman exec "$GUARD" wireserve-agent join "http://$COORD_IP:47820" "$JT3" --listen-port 51820
+podman exec "$GUARD" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT3" --listen-port 51820
 # Pinned to that name (without --ifname it would simply pick another), so
 # the agent has to refuse — and must do so before any firewall change,
 # since every rule it would install is keyed on the name.
@@ -248,7 +248,7 @@ debug_for "$DBG_LEGACY" "$LEGACY"
 if podman exec "$DBG_LEGACY" sh -c "iptables-legacy -A INPUT -i lo -j ACCEPT && iptables-legacy -P INPUT DROP" 2>/dev/null \
    && podman exec "$DBG_LEGACY" grep -qx filter /proc/net/ip_tables_names; then
     JT4=$(create_node node4)
-    podman exec "$LEGACY" wireserve-agent join "http://$COORD_IP:47820" "$JT4" --listen-port 51820
+    podman exec "$LEGACY" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT4" --listen-port 51820
     podman exec -d "$LEGACY" wireserve-agent daemon --poll-interval-secs 5
     sleep 6
     podman exec "$DBG_LEGACY" iptables-legacy -S INPUT | sed -n 2p \

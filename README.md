@@ -48,19 +48,19 @@ sudo systemctl enable --now wireserve-coordinator
 ```
 
 No `/etc/wireserve/coordinator.env` is required for this — the unit's
-`StateDirectory=` gives the coordinator `/var/lib/wireserve` to work with,
+`StateDirectory=` gives the coordinator `/var/lib/wireserve-coordinator` to work with,
 and it generates its own admin token and mesh ranges there on first start.
 Get the admin token it generated:
 
 ```sh
-sudo grep WIRESERVE_ADMIN_TOKEN /var/lib/wireserve/coordinator-secrets.env
+sudo grep WIRESERVE_ADMIN_TOKEN /var/lib/wireserve-coordinator/coordinator-secrets.env
 ```
 
 and save it once so `wireserve-admin` never needs a flag or env var again:
 
 ```sh
 mkdir -p ~/.config/wireserve-admin
-sudo grep WIRESERVE_ADMIN_TOKEN /var/lib/wireserve/coordinator-secrets.env \
+sudo grep WIRESERVE_ADMIN_TOKEN /var/lib/wireserve-coordinator/coordinator-secrets.env \
     | cut -d= -f2 > ~/.config/wireserve-admin/admin_token
 chmod 600 ~/.config/wireserve-admin/admin_token
 ```
@@ -78,7 +78,15 @@ over the generated one.
 **Point a reverse proxy at `127.0.0.1:47820`.** `deploy/proxy/` has a
 ready-to-use `Caddyfile.example` (auto-TLS via Let's Encrypt, about five
 lines) and `nginx.conf.example`. This is the one piece the coordinator
-deliberately never does itself — see spec §7 for why.
+deliberately never does itself — see spec §7 for why. The coordinator
+listens on loopback only unless you set `WIRESERVE_LISTEN_ADDR`, so a
+proxy on a different host needs that set to an address it can reach.
+
+An existing install that predates the coordinator's own state directory
+used `/var/lib/wireserve`, which it shared with the agent. The unit moves
+the database and `coordinator-secrets.env` over on its first start
+(unless `WIRESERVE_DB_PATH` is set explicitly), and refuses to start
+rather than move anything that is a symlink.
 
 **Containers**, if you'd rather not use systemd directly:
 
@@ -156,6 +164,15 @@ already runs one? Add `--instance work` (see "Several agents on one host"
 below); `wireserve-admin create-node --instance work` fills that flag into
 the printed command for you. `install` needs Linux/systemd — Quadlet/podman
 deployments install by hand, per `deploy/quadlet/`.
+
+The coordinator URL must be `https://` (or `http://` to loopback): the join
+token, the node's bearer token and the peer directory all travel over it,
+and the directory decides which keys the node trusts. For a coordinator
+reached only over a network you trust end to end, pass
+`--allow-plaintext-http` to `install`/`join`; the node remembers the
+choice. A node that joined over plain HTTP before this check existed
+refuses to start until you set `WIRESERVE_ALLOW_PLAINTEXT_HTTP=1` in
+`/etc/wireserve/agent.env` (or join again).
 
 Or, step by step, if you'd rather not have `install` touch systemd for you:
 

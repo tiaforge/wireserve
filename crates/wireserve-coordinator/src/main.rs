@@ -31,31 +31,7 @@ async fn main() {
     let config = loaded.config;
 
     if !loaded.generated.is_empty() {
-        eprintln!("======================================================================");
-        eprintln!("wireserve-coordinator: first run — generated the following and saved");
-        eprintln!("them to {}:", loaded.secrets_path.display());
-        for key in &loaded.generated {
-            match *key {
-                "WIRESERVE_ADMIN_TOKEN" => {
-                    eprintln!("  WIRESERVE_ADMIN_TOKEN = {}", config.admin_token);
-                }
-                "WIRESERVE_NET_V4_CIDR" => {
-                    eprintln!("  WIRESERVE_NET_V4_CIDR = {}", config.net_v4_cidr);
-                }
-                "WIRESERVE_NET_V6_PREFIX" => {
-                    eprintln!("  WIRESERVE_NET_V6_PREFIX = {}", config.net_v6_prefix);
-                }
-                _ => {}
-            }
-        }
-        eprintln!(
-            "These are kept for the life of this mesh — nothing else needs to be done, and \
-             `sudo cat {}` retrieves them again any time. Set any of these as an environment \
-             variable yourself if you'd rather manage it your own way; an explicit value \
-             always overrides what's stored here.",
-            loaded.secrets_path.display()
-        );
-        eprintln!("======================================================================");
+        eprint!("{}", first_run_banner(&loaded.generated, &config, &loaded.secrets_path));
     }
 
     let db = Db::open(&config.db_path).unwrap_or_else(|err| {
@@ -176,6 +152,49 @@ async fn main() {
     }
 }
 
+/// The one-time notice printed when first-run values were generated.
+///
+/// Names the admin token but never prints it (security review finding
+/// #5): stderr is the journal under systemd, readable by every member of
+/// `systemd-journal`/`adm` and kept for as long as the journal is, and
+/// the token controls the whole mesh. The mesh ranges are not secret and
+/// stay inline. The file itself is mode 600.
+fn first_run_banner(generated: &[&str], config: &Config, secrets_path: &std::path::Path) -> String {
+    use std::fmt::Write;
+    let rule = "======================================================================";
+    let path = secrets_path.display();
+    let mut out = String::new();
+    let _ = writeln!(out, "{rule}");
+    let _ = writeln!(out, "wireserve-coordinator: first run — generated the following and saved");
+    let _ = writeln!(out, "them to {path}:");
+    for key in generated {
+        match *key {
+            "WIRESERVE_ADMIN_TOKEN" => {
+                let _ = writeln!(out, "  WIRESERVE_ADMIN_TOKEN   (not shown here, so it stays out of the logs)");
+            }
+            "WIRESERVE_NET_V4_CIDR" => {
+                let _ = writeln!(out, "  WIRESERVE_NET_V4_CIDR = {}", config.net_v4_cidr);
+            }
+            "WIRESERVE_NET_V6_PREFIX" => {
+                let _ = writeln!(out, "  WIRESERVE_NET_V6_PREFIX = {}", config.net_v6_prefix);
+            }
+            _ => {}
+        }
+    }
+    if generated.contains(&"WIRESERVE_ADMIN_TOKEN") {
+        let _ = writeln!(out, "Read the admin token with:  sudo grep WIRESERVE_ADMIN_TOKEN {path}");
+    }
+    let _ = writeln!(
+        out,
+        "These are kept for the life of this mesh — nothing else needs to be done, and \
+         `sudo cat {path}` retrieves them again any time. Set any of these as an environment \
+         variable yourself if you'd rather manage it your own way; an explicit value \
+         always overrides what's stored here."
+    );
+    let _ = writeln!(out, "{rule}");
+    out
+}
+
 /// Resolves a listen address to the one a reverse proxy on the same host
 /// should actually be told to connect to. A wildcard bind (`0.0.0.0` or
 /// `::`) is not itself a connectable address — nothing dials `0.0.0.0` —
@@ -198,6 +217,34 @@ fn proxy_target(addr: SocketAddr) -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_run_banner_never_contains_the_admin_token() {
+        let config = Config {
+            listen_addr: "127.0.0.1:47820".parse().unwrap(),
+            admin_listen_addr: "127.0.0.1:47821".parse().unwrap(),
+            admin_token: "s3cr3t-admin-token-value".into(),
+            db_path: "x.db".into(),
+            net_v4_cidr: "10.1.2.0/24".into(),
+            net_v6_prefix: "fdab:cdef:1234::/64".into(),
+            online_threshold_secs: 180,
+            rate_limit_max: 10,
+            rate_limit_window_secs: 60,
+            trust_proxy_headers: false,
+            join_token_ttl_secs: 1800,
+            global_auth_failure_max: 20,
+            global_auth_failure_window_secs: 60,
+            require_service_approval: true,
+            reflexive_rate_limit_max: 20,
+            reflexive_rate_limit_window_secs: 10,
+        };
+        let generated = ["WIRESERVE_ADMIN_TOKEN", "WIRESERVE_NET_V4_CIDR", "WIRESERVE_NET_V6_PREFIX"];
+        let path = std::path::Path::new("/var/lib/wireserve-coordinator/coordinator-secrets.env");
+        let banner = first_run_banner(&generated, &config, path);
+        assert!(!banner.contains("s3cr3t-admin-token-value"), "{banner}");
+        assert!(banner.contains("sudo grep WIRESERVE_ADMIN_TOKEN /var/lib/wireserve-coordinator/coordinator-secrets.env"));
+        assert!(banner.contains("10.1.2.0/24") && banner.contains("fdab:cdef:1234::/64"));
+    }
 
     #[test]
     fn wildcard_v4_resolves_to_loopback() {

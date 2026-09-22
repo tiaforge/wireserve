@@ -16,6 +16,38 @@ pub enum JoinError {
     Rejected(String),
     #[error(transparent)]
     State(#[from] crate::state::StateError),
+    #[error("{0}")]
+    PlaintextHttp(String),
+}
+
+/// The environment override for [`check_coordinator_transport`], for a
+/// node that joined before the flag existed: set to `1` in its
+/// `agent.env` rather than joining again.
+pub const ALLOW_PLAINTEXT_HTTP_ENV: &str = "WIRESERVE_ALLOW_PLAINTEXT_HTTP";
+
+/// Refuses a plain-`http://` coordinator URL to anything but loopback
+/// unless the operator explicitly allowed it (security review finding
+/// #4, superseding S6's warning).
+///
+/// A warning was not enough, because of what crosses that connection:
+/// the join token, the bearer token on every poll, and the peer
+/// directory — which decides which WireGuard keys this node accepts and
+/// what it routes to them. Anyone on the path can take over the node's
+/// view of the mesh. An internal network without TLS is still a
+/// legitimate topology, so it stays possible, but as a decision rather
+/// than a default.
+pub fn check_coordinator_transport(url: &str, allowed: bool) -> Result<(), JoinError> {
+    if allowed || !wireserve_types::is_plaintext_http_to_remote_host(url) {
+        return Ok(());
+    }
+    Err(JoinError::PlaintextHttp(format!(
+        "refusing to use {url} over plain HTTP: the join token, this node's bearer token and \
+         the peer directory (which decides which WireGuard keys this node trusts) would cross \
+         the network unprotected. Use an https:// URL through a TLS-terminating reverse proxy \
+         (spec §7), or, only if every network between here and the coordinator is trusted, \
+         pass --allow-plaintext-http to `join`/`install` (or set \
+         {ALLOW_PLAINTEXT_HTTP_ENV}=1 for a node that already joined)"
+    )))
 }
 
 pub struct JoinParams<'a> {
@@ -28,6 +60,8 @@ pub struct JoinParams<'a> {
     /// keeps its interface.
     pub ifname: Option<String>,
     pub ifname_pinned: bool,
+    /// `--allow-plaintext-http`; see [`check_coordinator_transport`].
+    pub allow_plaintext_http: bool,
 }
 
 /// The first WireGuard port tried, and how many after it.
@@ -74,16 +108,13 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
     let private_key = crate::wg::clamp_private_key(&Key::generate());
     let public_key = private_key.public_key();
 
-    // Security review S6: the join token (and the bearer token coming
-    // back) would cross the network in clear over plain http:// to a
-    // non-loopback host. A warning, not a refusal — a loopback or
-    // internal-network coordinator without TLS is a legitimate topology.
+    // Before any network traffic at all, the probes below included.
+    check_coordinator_transport(params.coordinator_url, params.allow_plaintext_http)?;
     if wireserve_types::is_plaintext_http_to_remote_host(params.coordinator_url) {
         eprintln!(
-            "warning: registering with {} over plain HTTP — the join token and the returned \
-             bearer token will cross the network in clear. Spec §7 assumes a TLS-terminating \
-             reverse proxy in front of the coordinator; use an https:// URL unless this really \
-             is a loopback/trusted-local connection.",
+            "warning: registering with {} over plain HTTP, as allowed by \
+             --allow-plaintext-http — the join token, the bearer token and the peer directory \
+             cross the network unprotected",
             params.coordinator_url
         );
     }
@@ -158,6 +189,7 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
         ifname: params.ifname,
         ifname_pinned: params.ifname_pinned,
         transit_capable: false,
+        allow_plaintext_http: params.allow_plaintext_http,
     };
     state.save(params.state_path)?;
     Ok(state)
@@ -166,6 +198,26 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_http_to_a_remote_coordinator_is_refused_unless_allowed() {
+        for url in ["http://wireserve.example.com", "http://10.0.0.5:47820", "http://[fd00::1]:47820"] {
+            assert!(check_coordinator_transport(url, false).is_err(), "{url}");
+            assert!(check_coordinator_transport(url, true).is_ok(), "{url}");
+        }
+    }
+
+    #[test]
+    fn https_and_loopback_http_need_no_opt_in() {
+        for url in [
+            "https://wireserve.example.com",
+            "http://127.0.0.1:47820",
+            "http://localhost:47820",
+            "http://[::1]:47820",
+        ] {
+            assert!(check_coordinator_transport(url, false).is_ok(), "{url}");
+        }
+    }
 
     #[test]
     fn generated_private_key_never_appears_in_the_register_request() {

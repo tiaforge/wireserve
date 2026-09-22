@@ -48,6 +48,13 @@ struct JoinArgs {
     listen_port: Option<u16>,
     #[arg(long)]
     endpoint_addr: Option<String>,
+    /// Allow a plain http:// coordinator URL to a non-loopback host.
+    /// Refused otherwise: the join token, this node's bearer token and
+    /// the peer directory would all cross the network unprotected. Only
+    /// for a coordinator reached over a network you trust end to end;
+    /// remembered for the daemon.
+    #[arg(long)]
+    allow_plaintext_http: bool,
 }
 
 #[derive(Subcommand)]
@@ -172,11 +179,14 @@ async fn main() {
 }
 
 async fn cmd_join(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let JoinArgs { coordinator_url, join_token, join_token_file, listen_port, endpoint_addr } = args;
+    let JoinArgs { coordinator_url, join_token, join_token_file, listen_port, endpoint_addr, allow_plaintext_http } =
+        args;
     // Held across the whole join: a daemon running on this instance would
     // otherwise keep using (and saving) the identity this is replacing.
     let _lock = lock::lock_instance(instance)?;
     let coordinator_url = resolve_coordinator_url(coordinator_url)?;
+    // Before asking for the token, so a refused URL costs no typing.
+    register::check_coordinator_transport(&coordinator_url, allow_plaintext_http)?;
     let join_token = resolve_join_token(join_token, join_token_file)?;
     let state_path = instance.state_path();
     // A re-join keeps the interface and port this instance already uses.
@@ -200,6 +210,7 @@ async fn cmd_join(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn std
         state_path: &state_path,
         ifname: previous.ifname,
         ifname_pinned: previous.ifname_pinned,
+        allow_plaintext_http,
     })
     .await?;
     println!(
@@ -218,6 +229,10 @@ async fn cmd_join(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn std
 /// any step after the installs leaves them in place, so re-running
 /// `install` picks up where it left off.
 async fn cmd_install(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Refused before anything is installed, not after.
+    if let Some(url) = &args.coordinator_url {
+        register::check_coordinator_transport(url, args.allow_plaintext_http)?;
+    }
     wireserve_agent::install::require_root()?;
     wireserve_agent::install::install_self()?;
     let unit = wireserve_agent::install::install_unit(instance)?;
@@ -311,6 +326,12 @@ async fn cmd_daemon(
     if state.bearer_token.is_none() {
         return Err("not registered — run `wireserve-agent join` first".into());
     }
+    // A node that joined before `--allow-plaintext-http` existed has no
+    // record of the choice; the environment variable is its way to make
+    // it without joining again.
+    let plaintext_allowed = state.allow_plaintext_http
+        || std::env::var(register::ALLOW_PLAINTEXT_HTTP_ENV).is_ok_and(|v| v == "1");
+    register::check_coordinator_transport(state.coordinator_url.as_deref().unwrap_or_default(), plaintext_allowed)?;
 
     let ip4: std::net::Ipv4Addr = state.ip4.clone().unwrap_or_default().parse()?;
     let ip6: std::net::Ipv6Addr = state.ip6.clone().unwrap_or_default().parse()?;

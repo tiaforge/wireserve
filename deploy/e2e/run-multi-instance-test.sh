@@ -151,10 +151,10 @@ print(next(p['ip4'] for p in json.load(sys.stdin)['peers'] if p['name'] == sys.a
 
 # ---------------------------------------------------------------------
 log "joining: host default + work, peer default + work"
-host --instance default join http://10.99.0.1:47820 "$(token 47820 host-a)" --endpoint-addr 10.99.0.1:51820 >/dev/null
-host --instance work join http://10.99.0.1:47830 "$(token 47830 host-b)" --endpoint-addr 10.99.0.1:51821 >/dev/null
-peer --instance default join http://10.99.0.1:47820 "$(token 47820 peer-a)" --listen-port 51820 --endpoint-addr 10.99.0.2:51820 >/dev/null
-peer --instance work join http://10.99.0.1:47830 "$(token 47830 peer-b)" --listen-port 51821 --endpoint-addr 10.99.0.2:51821 >/dev/null
+host --instance default join http://10.99.0.1:47820 --allow-plaintext-http "$(token 47820 host-a)" --endpoint-addr 10.99.0.1:51820 >/dev/null
+host --instance work join http://10.99.0.1:47830 --allow-plaintext-http "$(token 47830 host-b)" --endpoint-addr 10.99.0.1:51821 >/dev/null
+peer --instance default join http://10.99.0.1:47820 --allow-plaintext-http "$(token 47820 peer-a)" --listen-port 51820 --endpoint-addr 10.99.0.2:51820 >/dev/null
+peer --instance work join http://10.99.0.1:47830 --allow-plaintext-http "$(token 47830 peer-b)" --listen-port 51821 --endpoint-addr 10.99.0.2:51821 >/dev/null
 
 [ "$(state "$WORK/host/lib/agent-state.json" listen_port)" = 51820 ] || fail "default instance did not get port 51820"
 [ "$(state "$WORK/host/lib/instances/work/agent-state.json" listen_port)" = 51821 ] \

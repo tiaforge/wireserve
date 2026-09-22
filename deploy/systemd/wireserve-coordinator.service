@@ -44,19 +44,53 @@ Group=wireserve
 # firewall/router, since a reverse proxy only ever forwards HTTP.
 EnvironmentFile=-/etc/wireserve/coordinator.env
 
+# One-time move from the directory this unit used to share with the agent
+# (/var/lib/wireserve) to its own (security review finding #6): systemd
+# recursively chowns a StateDirectory= to the unit's User= whenever the
+# owner doesn't match, so while both units named the same directory,
+# starting this one handed the agent's WireGuard private key and bearer
+# token to the unprivileged `wireserve` user. Runs as root (`+`) because
+# the old directory may be root-owned by then; does nothing once the new
+# directory has a database, when there is nothing to move, or when
+# WIRESERVE_DB_PATH is set explicitly (that database is left where the
+# operator put it). A symlink among the files is never moved or followed:
+# it fails the start instead, since moving the rest would leave the
+# database next to a freshly generated admin token and mesh ranges.
+ExecStartPre=+/bin/sh -c '\
+    old=/var/lib/wireserve; new=/var/lib/wireserve-coordinator; \
+    files="coordinator.db coordinator.db-wal coordinator.db-shm coordinator-secrets.env"; \
+    [ -e "$$new/coordinator.db" ] && exit 0; \
+    grep -qs "^[[:space:]]*WIRESERVE_DB_PATH=" /etc/wireserve/coordinator.env && exit 0; \
+    [ -e "$$old/coordinator.db" ] || [ -L "$$old/coordinator.db" ] || exit 0; \
+    for f in $$files; do \
+        if [ -L "$$old/$$f" ] || { [ -e "$$old/$$f" ] && [ ! -f "$$old/$$f" ]; }; then \
+            echo "refusing to move $$old/$$f: not a regular file" >&2; exit 1; \
+        fi; \
+    done; \
+    for f in $$files; do \
+        if [ -f "$$old/$$f" ]; then \
+            mv "$$old/$$f" "$$new/$$f" && [ ! -L "$$new/$$f" ] && chmod 600 "$$new/$$f" \
+                && chown -h wireserve:wireserve "$$new/$$f" || exit 1; \
+        fi; \
+    done; \
+    echo "moved the coordinator database from $$old to $$new"'
+
 ExecStart=/usr/local/bin/wireserve-coordinator
 Restart=on-failure
 RestartSec=2s
 
 # The coordinator never touches WireGuard or the host firewall — it is a
 # plain HTTP API and needs no special capabilities (spec §8).
-StateDirectory=wireserve
+#
+# Its own directory, never the agent's /var/lib/wireserve: see the
+# ExecStartPre= above for what sharing one did.
+StateDirectory=wireserve-coordinator
 StateDirectoryMode=0700
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/wireserve
+ReadWritePaths=/var/lib/wireserve-coordinator
 CapabilityBoundingSet=
 AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

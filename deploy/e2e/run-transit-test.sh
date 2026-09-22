@@ -187,10 +187,10 @@ log "joining the three nodes"
 JT1=$(create_node node1)
 JT2=$(create_node node2)
 JT4=$(create_node node4)
-podman exec "$AGENT1" wireserve-agent join "http://$COORD_IP:47820" "$JT1" \
+podman exec "$AGENT1" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT1" \
     --listen-port "$WG_PORT" --endpoint-addr "$ROUTER_A_WAN:$WG_PORT" 2>/dev/null
-podman exec "$AGENT2" wireserve-agent join "http://$COORD_IP:47820" "$JT2" --listen-port "$WG_PORT" 2>/dev/null
-podman exec "$AGENT4" wireserve-agent join "http://$COORD_IP:47820" "$JT4" --listen-port "$WG_PORT" 2>/dev/null
+podman exec "$AGENT2" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT2" --listen-port "$WG_PORT" 2>/dev/null
+podman exec "$AGENT4" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT4" --listen-port "$WG_PORT" 2>/dev/null
 pass "all three nodes registered"
 
 for a in "$AGENT1" "$AGENT2" "$AGENT4"; do
