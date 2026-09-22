@@ -21,10 +21,23 @@ pub enum ServiceRule {
         node: Ipv4Addr,
         map: PortMap,
     },
-    /// `port` opened on the node's own address, as before service
+    /// `port` opened on the node's own mesh address(es), as before service
     /// addresses existed. Only used while the coordinator hands out no
     /// address for a service, i.e. one that predates them.
-    Open { proto: Proto, port: u16 },
+    ///
+    /// The addresses are part of the rule, not decoration (security
+    /// review finding #3): matched on the port alone, the hole also
+    /// admitted a peer's packets *addressed to somewhere else* on that
+    /// port — another local address of the node, a container or VM
+    /// bridge behind it, its LAN — whenever the node forwards, turning a
+    /// declared service into a relay. Only a connection the peer
+    /// addressed to one of these is let through.
+    Open {
+        proto: Proto,
+        port: u16,
+        node: Ipv4Addr,
+        node6: Option<Ipv6Addr>,
+    },
 }
 
 /// One side of an active [`TransitForward`] pairing (PLAN.md M23): every

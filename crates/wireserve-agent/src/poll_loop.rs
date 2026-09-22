@@ -5,7 +5,7 @@
 //! already-correctly-configured interface (a transient coordinator/network
 //! blip shouldn't make things *more* broken than they already were).
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
 use tokio::sync::Mutex;
@@ -143,12 +143,22 @@ pub fn build_poll_request(
 /// service addresses, or one [`crate::vip::sanitize`] refused — is opened
 /// on its target ports directly, the way every service was before.
 ///
+/// A service opened directly is opened on this node's own mesh addresses
+/// only (`node_ip`, plus `node_ip6` when it has one) — never on the port
+/// alone, see `ServiceRule::Open`. With no IPv4 mesh address known there
+/// is nothing to scope it to, so nothing is opened at all.
+///
 /// A target port can carry only one mapping (see
 /// `wireserve_types::validate_node_targets`); `serve` refuses a second,
 /// but a state file from before port mappings may still alias one port
 /// under two names. The first keeps it, and the later ones get no mapping
 /// rather than one whose replies would come back from the wrong address.
-pub fn service_rules(declared: &[ServiceDecl], node_ip: Option<Ipv4Addr>, directory: &PollResponse) -> Vec<ServiceRule> {
+pub fn service_rules(
+    declared: &[ServiceDecl],
+    node_ip: Option<Ipv4Addr>,
+    node_ip6: Option<Ipv6Addr>,
+    directory: &PollResponse,
+) -> Vec<ServiceRule> {
     let mut rules = Vec::new();
     let mut targets: Vec<(u16, wireserve_types::Proto)> = Vec::new();
     for d in declared {
@@ -167,10 +177,13 @@ pub fn service_rules(declared: &[ServiceDecl], node_ip: Option<Ipv4Addr>, direct
                     targets.push((map.target, map.proto));
                     ServiceRule::Mapped { vip, node, map }
                 }
-                _ => ServiceRule::Open {
+                (None, Some(node)) => ServiceRule::Open {
                     proto: map.proto,
                     port: map.target,
+                    node,
+                    node6: node_ip6,
                 },
+                (_, None) => continue,
             };
             rules.push(rule);
         }
@@ -331,7 +344,7 @@ where
     F::Error: std::fmt::Display,
 {
     // Snapshot exactly what this cycle sends, then release the lock.
-    let (bearer, self_pubkey, declared, endpoint_addr, listen_port, node_ip, transit_capable) = {
+    let (bearer, self_pubkey, declared, endpoint_addr, listen_port, node_ip, node_ip6, transit_capable) = {
         let s = state.lock().await;
         (
             s.bearer_token.clone().ok_or(PollError::NotRegistered)?,
@@ -340,6 +353,7 @@ where
             s.endpoint_addr.clone(),
             s.listen_port.unwrap_or(51820),
             s.ip4.as_deref().and_then(|ip| ip.parse::<Ipv4Addr>().ok()),
+            s.ip6.as_deref().and_then(|ip| ip.parse::<Ipv6Addr>().ok()),
             s.transit_capable,
         )
     };
@@ -480,7 +494,7 @@ where
     // that failed on every cycle silently froze everything after it: a
     // hosts block written once, empty, while peers and routes (step 2,
     // which ran first) kept tracking the directory perfectly.
-    let rules = service_rules(&declared, node_ip, &directory);
+    let rules = service_rules(&declared, node_ip, node_ip6, &directory);
     // Transit assignments (PLAN.md M23): the coordinator's per-(requester,
     // peer) routing hint, keyed by the transited peer's own pubkey,
     // filtered to exclude this node's own pubkey as a key — defensive,
@@ -649,7 +663,7 @@ mod tests {
     #[test]
     fn a_service_with_an_address_gets_one_mapped_rule_per_port() {
         let declared = vec![ServiceDecl::new("dns", vec![pm("53/udp"), pm("53/tcp"), pm("8080:8000")])];
-        let rules = service_rules(&declared, Some(NODE), &with_services(vec![published("dns", NODE, Some(VIP))]));
+        let rules = service_rules(&declared, Some(NODE), None, &with_services(vec![published("dns", NODE, Some(VIP))]));
         assert_eq!(
             rules,
             vec![
@@ -668,14 +682,32 @@ mod tests {
             ServiceDecl { name: "plex".into(), port: 32400, proto: Proto::Tcp, ports: vec![] },
             ServiceDecl::new("web", vec![pm("80:5080")]),
         ];
-        let rules = service_rules(&declared, Some(NODE), &with_services(vec![published("plex", NODE, None)]));
+        let rules = service_rules(&declared, Some(NODE), None, &with_services(vec![published("plex", NODE, None)]));
         assert_eq!(
             rules,
             vec![
-                ServiceRule::Open { proto: Proto::Tcp, port: 32400 },
-                ServiceRule::Open { proto: Proto::Tcp, port: 5080 },
+                ServiceRule::Open { proto: Proto::Tcp, port: 32400, node: NODE, node6: None },
+                ServiceRule::Open { proto: Proto::Tcp, port: 5080, node: NODE, node6: None },
             ]
         );
+    }
+
+    #[test]
+    fn a_directly_opened_service_is_scoped_to_both_of_the_nodes_own_addresses() {
+        let declared = vec![ServiceDecl::new("web", vec![pm("80:5080")])];
+        let node6: Ipv6Addr = "fd00:90::2".parse().unwrap();
+        assert_eq!(
+            service_rules(&declared, Some(NODE), Some(node6), &with_services(vec![])),
+            vec![ServiceRule::Open { proto: Proto::Tcp, port: 5080, node: NODE, node6: Some(node6) }]
+        );
+    }
+
+    #[test]
+    fn without_a_mesh_address_nothing_is_opened() {
+        // Nothing to scope the hole to — an unscoped one is exactly the
+        // relay `ServiceRule::Open`'s addresses exist to prevent.
+        let declared = vec![ServiceDecl::new("web", vec![pm("80:5080")])];
+        assert!(service_rules(&declared, None, None, &with_services(vec![])).is_empty());
     }
 
     #[test]
@@ -684,7 +716,7 @@ mod tests {
         let mut dir = directory_with(&["web"], &[]);
         dir.pending_services[0].vip4 = Some(VIP.to_string());
         assert_eq!(
-            service_rules(&declared, Some(NODE), &dir),
+            service_rules(&declared, Some(NODE), None, &dir),
             vec![ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("80:5080") }]
         );
     }
@@ -696,7 +728,7 @@ mod tests {
         let declared = vec![ServiceDecl::new("web", vec![pm("80:5080")])];
         let mut entry = published("web", NODE, Some(VIP));
         entry.ports = vec![pm("22:22"), pm("80:22")];
-        let rules = service_rules(&declared, Some(NODE), &with_services(vec![entry]));
+        let rules = service_rules(&declared, Some(NODE), None, &with_services(vec![entry]));
         assert_eq!(rules, vec![ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("80:5080") }]);
     }
 
@@ -704,8 +736,8 @@ mod tests {
     fn another_nodes_entry_of_the_same_name_is_not_ours() {
         let declared = vec![ServiceDecl::new("web", vec![pm("80:5080")])];
         let other = Ipv4Addr::new(10, 9, 0, 2);
-        let rules = service_rules(&declared, Some(NODE), &with_services(vec![published("web", other, Some(VIP))]));
-        assert_eq!(rules, vec![ServiceRule::Open { proto: Proto::Tcp, port: 5080 }]);
+        let rules = service_rules(&declared, Some(NODE), None, &with_services(vec![published("web", other, Some(VIP))]));
+        assert_eq!(rules, vec![ServiceRule::Open { proto: Proto::Tcp, port: 5080, node: NODE, node6: None }]);
     }
 
     #[test]
@@ -718,14 +750,14 @@ mod tests {
         let other = Ipv4Addr::new(10, 9, 0, 51);
         let dir = with_services(vec![published("plex", NODE, Some(VIP)), published("media", NODE, Some(other))]);
         assert_eq!(
-            service_rules(&declared, Some(NODE), &dir),
+            service_rules(&declared, Some(NODE), None, &dir),
             vec![ServiceRule::Mapped { vip: VIP, node: NODE, map: PortMap::identity(32400, Proto::Tcp) }]
         );
     }
 
     #[test]
     fn nothing_undeclared_is_ever_in_a_rule() {
-        let rules = service_rules(&[], Some(NODE), &with_services(vec![published("web", NODE, Some(VIP))]));
+        let rules = service_rules(&[], Some(NODE), None, &with_services(vec![published("web", NODE, Some(VIP))]));
         assert!(rules.is_empty());
     }
 
@@ -785,12 +817,12 @@ mod tests {
         // exactly that reason.
         let mut state = state_with_declared(&["plex", "git"]);
         state.declared_services[0].port = 32400;
-        assert!(reaches(&service_rules(&state.declared_services, Some(NODE), &directory_with(&[], &[])), 32400));
+        assert!(reaches(&service_rules(&state.declared_services, Some(NODE), None, &directory_with(&[], &[])), 32400));
 
         apply_approval_verdicts(&mut state, &directory_with(&[], &[("plex", None)]));
 
         assert!(
-            !reaches(&service_rules(&state.declared_services, Some(NODE), &directory_with(&[], &[])), 32400),
+            !reaches(&service_rules(&state.declared_services, Some(NODE), None, &directory_with(&[], &[])), 32400),
             "a denied service's port must not survive in the rule set"
         );
     }
@@ -809,7 +841,7 @@ mod tests {
         assert_eq!(state.declared_services.len(), 1, "still declared");
         assert!(state.rejected_services.is_empty(), "pending is not a rejection");
         assert_eq!(state.pending_services, vec!["plex".to_string()]);
-        assert!(reaches(&service_rules(&state.declared_services, Some(NODE), &directory_with(&[], &[])), 32400));
+        assert!(reaches(&service_rules(&state.declared_services, Some(NODE), None, &directory_with(&[], &[])), 32400));
     }
 
     #[test]

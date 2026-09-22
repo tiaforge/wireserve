@@ -132,6 +132,8 @@ mod tests {
         assert_eq!(backend.calls, vec![Call::Teardown, Call::Apply(vec![], vec![])]);
     }
 
+    const NODE: std::net::Ipv4Addr = std::net::Ipv4Addr::new(100, 90, 0, 2);
+
     #[test]
     fn startup_sequence_runs_strictly_before_first_real_apply() {
         let mut backend = FakeFirewallBackend::default();
@@ -141,6 +143,8 @@ mod tests {
                 &[ServiceRule::Open {
                     proto: Proto::Tcp,
                     port: 32400,
+                    node: NODE,
+                    node6: None,
                 }],
                 &[],
             )
@@ -154,7 +158,9 @@ mod tests {
                 Call::Apply(
                     vec![ServiceRule::Open {
                         proto: Proto::Tcp,
-                        port: 32400
+                        port: 32400,
+                        node: NODE,
+                        node6: None,
                     }],
                     vec![]
                 ),
