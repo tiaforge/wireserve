@@ -476,19 +476,44 @@ impl EndpointTracker {
 
     /// Every pubkey with real tracked history (it once had a ranked
     /// candidate to try) whose current resolution has fallen all the way
-    /// to [`EndpointTier::Wan`] — this node's own "I need transit help
-    /// reaching these" signal (PLAN.md M23). Excludes a pubkey with no
-    /// tracked entry at all: the ordinary plain-WAN-works-fine case,
-    /// which must never request transit help for free. This is exactly
+    /// to [`EndpointTier::Wan`]. Excludes a pubkey with no tracked entry
+    /// at all: the ordinary plain-WAN-works-fine case, which must never
+    /// request transit help for free. This is exactly
     /// `EndpointPeerState::current == Wan` on an entry that exists —
     /// already present in the state machine above, no new tracking
     /// needed.
+    ///
+    /// This is the raw *tier* signal only — "my LAN/Reflexive NAT-punch
+    /// probe failed" — not this node's actual "I need transit help"
+    /// signal, since a failed probe still falls back to a working plain
+    /// WAN dial in the common case. See [`Self::peers_wanting_transit`]
+    /// for the signal that accounts for that.
     pub fn peers_on_wan(&self) -> Vec<&str> {
         self.states
             .iter()
             .filter(|(_, s)| s.current == EndpointTier::Wan)
             .map(|(k, _)| k.as_str())
             .collect()
+    }
+
+    /// This node's actual "I need transit help reaching this peer" signal
+    /// (PLAN.md M23) — [`Self::peers_on_wan`] narrowed to peers this node
+    /// does NOT currently have a live handshake with. `peers_on_wan`
+    /// alone conflates "my LAN/Reflexive NAT-punch probe failed" with "I
+    /// can't reach this peer at all" — but a failed probe still falls
+    /// back to a working plain WAN dial in the common case, and that
+    /// fallback must not trigger a false transit request. Uses the same
+    /// freshness ground truth as [`transit_reachable_peers`],
+    /// deliberately: a peer must be able to fail this same test on both
+    /// the "do I need help" and "can I offer help" sides for the same
+    /// reason.
+    pub fn peers_wanting_transit<'a>(
+        &'a self,
+        handshakes: &HashMap<String, Option<chrono::DateTime<chrono::Utc>>>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<&'a str> {
+        let fresh: std::collections::HashSet<&str> = transit_reachable_peers(handshakes, now).into_iter().collect();
+        self.peers_on_wan().into_iter().filter(|pk| !fresh.contains(pk)).collect()
     }
 }
 
@@ -1282,6 +1307,47 @@ mod tests {
         let tier = tracker.resolve(&pubkey, lan_only("192.168.1.50"), None, now + GRACE);
         assert_eq!(tier, EndpointTier::Wan);
         assert_eq!(tracker.peers_on_wan(), vec![pubkey.as_str()]);
+    }
+
+    #[test]
+    fn peers_wanting_transit_excludes_a_wan_peer_with_a_fresh_handshake() {
+        // The false-positive this whole method exists to fix: a peer
+        // whose LAN/Reflexive probe failed (landing it on `Wan`, per
+        // `peers_on_wan_includes_a_peer_tracked_and_resolved_to_wan`
+        // above) but whose plain WAN dial is, in fact, live right now —
+        // it must never request transit help for free.
+        let now = std::time::Instant::now();
+        let mut tracker = EndpointTracker::default();
+        let pubkey = key_b64(2).to_string();
+        tracker.resolve(&pubkey, lan_only("192.168.1.50"), None, now);
+        let tier = tracker.resolve(&pubkey, lan_only("192.168.1.50"), None, now + GRACE);
+        assert_eq!(tier, EndpointTier::Wan);
+
+        let now_utc = chrono::Utc::now();
+        let handshakes = HashMap::from([(pubkey.clone(), Some(now_utc))]);
+        assert!(tracker.peers_wanting_transit(&handshakes, now_utc).is_empty());
+    }
+
+    #[test]
+    fn peers_wanting_transit_includes_a_wan_peer_with_a_stale_or_missing_handshake() {
+        let now = std::time::Instant::now();
+        let mut tracker = EndpointTracker::default();
+        let pubkey = key_b64(2).to_string();
+        tracker.resolve(&pubkey, lan_only("192.168.1.50"), None, now);
+        let tier = tracker.resolve(&pubkey, lan_only("192.168.1.50"), None, now + GRACE);
+        assert_eq!(tier, EndpointTier::Wan);
+
+        let now_utc = chrono::Utc::now();
+        // No entry at all for this pubkey in `handshakes` — never handshaked.
+        assert_eq!(tracker.peers_wanting_transit(&HashMap::new(), now_utc), vec![pubkey.as_str()]);
+
+        // A handshake that exists but is older than
+        // `TRANSIT_REACHABLE_HANDSHAKE_MAX` counts the same as none.
+        let stale = HashMap::from([(
+            pubkey.clone(),
+            Some(now_utc - chrono::Duration::from_std(TRANSIT_REACHABLE_HANDSHAKE_MAX).unwrap() - chrono::Duration::seconds(1)),
+        )]);
+        assert_eq!(tracker.peers_wanting_transit(&stale, now_utc), vec![pubkey.as_str()]);
     }
 
     #[test]

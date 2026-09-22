@@ -373,8 +373,9 @@ where
             .into_iter()
             .map(|t| (t.pubkey, t.last_handshake))
             .collect();
+    let now_utc = chrono::Utc::now();
     let transit_reachable: Vec<String> = if transit_capable {
-        let mut r: Vec<String> = crate::wg::transit_reachable_peers(&handshakes, chrono::Utc::now())
+        let mut r: Vec<String> = crate::wg::transit_reachable_peers(&handshakes, now_utc)
             .into_iter()
             .map(String::from)
             .collect();
@@ -385,8 +386,12 @@ where
     };
     // Sent regardless of `transit_capable` — any node may need transit
     // help even if it can't offer it.
-    let mut transit_wanted: Vec<String> =
-        ctx.endpoint_tracker.peers_on_wan().into_iter().map(String::from).collect();
+    let mut transit_wanted: Vec<String> = ctx
+        .endpoint_tracker
+        .peers_wanting_transit(&handshakes, now_utc)
+        .into_iter()
+        .map(String::from)
+        .collect();
     transit_wanted.sort_unstable();
     transit_wanted.truncate(wireserve_types::MAX_TRANSIT_WANTED_PER_POLL);
 
