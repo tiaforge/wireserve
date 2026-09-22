@@ -663,6 +663,10 @@ pub type TransitAssignments<'a> = HashMap<&'a str, &'a str>;
 /// (or resolved to `Wan`) gets plain WAN behavior, unchanged from before
 /// this feature existed.
 ///
+/// `resolve` turns the chosen endpoint string into an address — see
+/// `crate::endpoint_dns`; a peer whose endpoint it can't resolve (yet)
+/// gets none this cycle, which leaves the kernel's current one in place.
+///
 /// `transit` (PLAN.md M23) makes this a **two-pass** build. `AllowedIPs`
 /// is dual-purpose — an outbound routing table and an inbound
 /// cryptographic source filter — so a destination can only ever sit in
@@ -692,6 +696,7 @@ pub fn desired_peers(
     prefer_ipv6: bool,
     endpoint_tiers: &HashMap<String, EndpointTier>,
     transit: &TransitAssignments<'_>,
+    resolve: &dyn Fn(&str) -> Option<std::net::SocketAddr>,
 ) -> HashMap<Key, Peer> {
     let mut desired = HashMap::new();
     for p in peers {
@@ -709,9 +714,7 @@ pub fn desired_peers(
         );
         let tier = endpoint_tiers.get(&p.pubkey).copied();
         if let Some(endpoint) = choose_peer_endpoint(p, prefer_ipv6, tier) {
-            if let Err(e) = peer.set_endpoint(&endpoint) {
-                tracing::warn!(peer = %p.name, error = %e, "could not resolve peer endpoint");
-            }
+            peer.endpoint = resolve(&endpoint);
         }
         // This node likely roams networks (dynamic DNS, NAT rebinding) —
         // same reasoning as spec §9's export-config PersistentKeepalive.
@@ -849,6 +852,7 @@ pub struct WgInterface {
     applied: HashMap<Key, Peer>,
     /// What `routes::sync` last installed, so it only runs on a change.
     routed: BTreeSet<IpAddr>,
+    resolver: crate::endpoint_dns::EndpointResolver,
 }
 
 impl WgInterface {
@@ -860,6 +864,7 @@ impl WgInterface {
             ifname,
             applied: HashMap::new(),
             routed: BTreeSet::new(),
+            resolver: crate::endpoint_dns::EndpointResolver::default(),
         })
     }
 
@@ -1024,7 +1029,18 @@ impl WgInterface {
         endpoint_tiers: &HashMap<String, EndpointTier>,
         transit: &TransitAssignments<'_>,
     ) -> Result<(), WireguardInterfaceError> {
-        let desired = desired_peers(peers, services, self_pubkey, prefer_ipv6, endpoint_tiers, transit);
+        // Hostname endpoints are looked up here, bounded, before the pure
+        // build below reads them — never inside it (see `endpoint_dns`).
+        let endpoints: Vec<String> = peers
+            .iter()
+            .filter(|p| p.pubkey != self_pubkey && !transit.contains_key(p.pubkey.as_str()))
+            .filter_map(|p| choose_peer_endpoint(p, prefer_ipv6, endpoint_tiers.get(&p.pubkey).copied()))
+            .collect();
+        self.resolver.prepare(endpoints.iter().map(String::as_str));
+        self.resolver.retain(endpoints.iter().map(String::as_str));
+        let resolver = &self.resolver;
+        let desired =
+            desired_peers(peers, services, self_pubkey, prefer_ipv6, endpoint_tiers, transit, &|e| resolver.get(e));
 
         let to_remove = peers_to_remove(self.applied.keys(), &desired);
         for key in &to_remove {
@@ -1161,7 +1177,7 @@ mod tests {
         let self_key = key_b64(1);
         let other_key = key_b64(2);
         let peers = vec![peer("me", &self_key), peer("other", &other_key)];
-        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &HashMap::new());
+        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &HashMap::new(), &crate::endpoint_dns::literal_only);
         assert_eq!(desired.len(), 1);
     }
 
@@ -1173,7 +1189,7 @@ mod tests {
             peer("bad", "not-a-real-base64-key"),
             peer("good", &good_key),
         ];
-        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &HashMap::new());
+        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &HashMap::new(), &crate::endpoint_dns::literal_only);
         assert_eq!(desired.len(), 1);
     }
 
@@ -1185,7 +1201,7 @@ mod tests {
         let (b_key, c_key) = (key_b64(2), key_b64(3));
         let peers = vec![peer("b", &b_key), peer("c", &c_key)];
         let transit: TransitAssignments<'_> = HashMap::from([(c_key.as_str(), b_key.as_str())]);
-        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &transit);
+        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &transit, &crate::endpoint_dns::literal_only);
         assert_eq!(desired.len(), 1);
         assert!(desired.contains_key(&Key::try_from(b_key.as_str()).unwrap()));
     }
@@ -1202,7 +1218,7 @@ mod tests {
         c.ip6 = String::new();
         let services = [service("web", "c", Some("100.90.0.53"))];
         let transit: TransitAssignments<'_> = HashMap::from([(c_key.as_str(), b_key.as_str())]);
-        let desired = desired_peers(&[b, c], &services, &self_key, false, &HashMap::new(), &transit);
+        let desired = desired_peers(&[b, c], &services, &self_key, false, &HashMap::new(), &transit, &crate::endpoint_dns::literal_only);
         let via = desired.get(&Key::try_from(b_key.as_str()).unwrap()).unwrap();
         let ips: Vec<String> = via.allowed_ips.iter().map(ToString::to_string).collect();
         assert_eq!(ips, ["100.90.0.2/32", "100.90.0.3/32", "100.90.0.53/32"]);
@@ -1219,7 +1235,7 @@ mod tests {
         c.ip4 = "100.90.0.3".into();
         c.ip6 = String::new();
         let transit: TransitAssignments<'_> = HashMap::from([(c_key.as_str(), b_key.as_str())]);
-        let desired = desired_peers(&[b, c], &[], &self_key, false, &HashMap::new(), &transit);
+        let desired = desired_peers(&[b, c], &[], &self_key, false, &HashMap::new(), &transit, &crate::endpoint_dns::literal_only);
         assert_eq!(desired.len(), 1);
         let via = desired.get(&Key::try_from(b_key.as_str()).unwrap()).unwrap();
         let ips: Vec<String> = via.allowed_ips.iter().map(ToString::to_string).collect();
@@ -1233,7 +1249,7 @@ mod tests {
         let unknown_via = key_b64(9);
         let peers = vec![peer("c", &c_key)];
         let transit: TransitAssignments<'_> = HashMap::from([(c_key.as_str(), unknown_via.as_str())]);
-        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &transit);
+        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &transit, &crate::endpoint_dns::literal_only);
         assert!(desired.is_empty());
     }
 
@@ -1244,7 +1260,7 @@ mod tests {
         let peers = vec![peer("b", &b_key), peer("c", &c_key)];
         // A stale/adversarial coordinator naming each as the other's via.
         let transit: TransitAssignments<'_> = HashMap::from([(b_key.as_str(), c_key.as_str()), (c_key.as_str(), b_key.as_str())]);
-        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &transit);
+        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &transit, &crate::endpoint_dns::literal_only);
         assert!(desired.is_empty());
     }
 
@@ -1259,7 +1275,7 @@ mod tests {
         c.ip4 = "100.90.0.3".into();
         c.ip6 = String::new();
         let transit: TransitAssignments<'_> = HashMap::from([(c_key.as_str(), b_key.as_str())]);
-        let desired = desired_peers(&[b, c], &[], &self_key, false, &HashMap::new(), &transit);
+        let desired = desired_peers(&[b, c], &[], &self_key, false, &HashMap::new(), &transit, &crate::endpoint_dns::literal_only);
         let routes: Vec<String> =
             desired_routes(&desired, std::iter::empty()).iter().map(ToString::to_string).collect();
         assert_eq!(routes, ["100.90.0.2", "100.90.0.3"]);
@@ -1401,7 +1417,7 @@ mod tests {
             service("old", "other", None),
             service("mine", "me", Some("100.90.0.52")),
         ];
-        let desired = desired_peers(&[peer("me", &self_key), other], &services, &self_key, false, &HashMap::new(), &HashMap::new());
+        let desired = desired_peers(&[peer("me", &self_key), other], &services, &self_key, false, &HashMap::new(), &HashMap::new(), &crate::endpoint_dns::literal_only);
         let peer = desired.values().next().unwrap();
         let ips: Vec<String> = peer.allowed_ips.iter().map(ToString::to_string).collect();
         assert_eq!(ips, ["100.90.0.2/32", "fd00:90::2/128", "100.90.0.50/32", "100.90.0.51/32"]);
@@ -1414,7 +1430,7 @@ mod tests {
         other.ip4 = "100.90.0.2".into();
         other.ip6 = String::new();
         let services = [service("web", "other", Some("100.90.0.50"))];
-        let desired = desired_peers(&[other], &services, &self_key, false, &HashMap::new(), &HashMap::new());
+        let desired = desired_peers(&[other], &services, &self_key, false, &HashMap::new(), &HashMap::new(), &crate::endpoint_dns::literal_only);
         let own: Vec<Ipv4Addr> = vec!["100.90.0.60".parse().unwrap()];
         let routes: Vec<String> = desired_routes(&desired, own.into_iter()).iter().map(ToString::to_string).collect();
         assert_eq!(routes, ["100.90.0.2", "100.90.0.50", "100.90.0.60"]);
@@ -1578,14 +1594,14 @@ mod tests {
         other.endpoint_addr_v4 = Some("203.0.113.5:51820".into());
         other.endpoint_addr_v6 = Some("[2001:db8::1]:51820".into());
 
-        let desired_v4 = desired_peers(&[other.clone()], &[], &self_key, false, &HashMap::new(), &HashMap::new());
+        let desired_v4 = desired_peers(&[other.clone()], &[], &self_key, false, &HashMap::new(), &HashMap::new(), &crate::endpoint_dns::literal_only);
         let key = defguard_wireguard_rs::key::Key::try_from(key_b64(2).as_str()).unwrap();
         assert_eq!(
             desired_v4[&key].endpoint,
             Some("203.0.113.5:51820".parse().unwrap())
         );
 
-        let desired_v6 = desired_peers(&[other], &[], &self_key, true, &HashMap::new(), &HashMap::new());
+        let desired_v6 = desired_peers(&[other], &[], &self_key, true, &HashMap::new(), &HashMap::new(), &crate::endpoint_dns::literal_only);
         assert_eq!(
             desired_v6[&key].endpoint,
             Some("[2001:db8::1]:51820".parse::<std::net::SocketAddr>().unwrap())

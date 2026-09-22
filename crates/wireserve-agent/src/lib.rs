@@ -1,3 +1,4 @@
+pub mod endpoint_dns;
 pub mod firewall;
 pub mod fsutil;
 pub mod hosts;
