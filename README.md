@@ -324,6 +324,51 @@ for the same name and address when the machine itself is still trusted;
 `delete-node` frees the name entirely, and refuses until the node is
 revoked.
 
+### 6. Route through another node when NAT blocks a direct path
+
+Two nodes each behind their own hard (symmetric) NAT — no shared LAN,
+nothing port-forwarded to either — can end up with no direct path at all:
+a symmetric NAT maps a different external port per destination, so
+whatever WireServe's own NAT-traversal already learned for one peer is
+useless for reaching a different one. When that happens, a third node
+that already reaches both can carry the connection: WireGuard itself
+decrypts and re-encrypts at the kernel layer and forwards it on, the same
+way any router forwards a packet — no separate relay server, no new
+protocol, and the coordinator never sees the traffic.
+
+**This is opt-in, per node, and off by default.** Nothing is ever picked
+as a carrier just because it happens to be reachable — a node with a
+data cap, say, should simply never be used:
+
+```sh
+wireserve-agent transit on   # this node may now carry traffic for others
+wireserve-agent transit off  # stop — takes effect on the next poll, no rejoin
+```
+
+The trade-off to know before opting in: unlike an ordinary connection,
+which is end-to-end between the two nodes involved, a carrier genuinely
+sees the mesh-layer plaintext of whatever pairs route through it. Nothing
+else about it needs an opt-in on the *other* two nodes' side — every
+member of a mesh already trusts every other member, so the carrier's own
+opt-in is the only trust boundary this needs.
+
+`wireserve-agent list` shows the outcome, both for a peer this node can't
+reach directly and for what this node is carrying on others' behalf:
+
+```
+PEER    ADDRESS   ENDPOINT  HANDSHAKE  ROUTE
+laptop  10.1.0.5  -         never      via homeserver
+
+Transit: on, carrying: laptop <-> phone
+```
+
+`direct` is the ordinary case; `via <name>` means this node is one end of
+a pair being routed through a carrier. Only a single hop is ever used —
+the carrier must already, currently reach both ends itself — and nothing
+here is a substitute for a real port-forward or a working reflexive
+address when one is available; it only ever engages once every other path
+has failed.
+
 ## Command reference
 
 On a node, talking to the local daemon over a Unix socket:
@@ -334,7 +379,8 @@ On a node, talking to the local daemon over a Unix socket:
 | `wireserve-agent join [url] [token]` | one-time bootstrap, generates the keypair — prompts for either if omitted |
 | `wireserve-agent serve <name> <[public:]target[/tcp\|/udp]>...` | publish a service on its own address |
 | `wireserve-agent unserve <name>` | withdraw one |
-| `wireserve-agent list [--json]` | services (name, address, ports, owner, state), peers and anything not published, from the last poll |
+| `wireserve-agent transit on\|off` | opt in/out of carrying traffic for two other nodes that can't reach each other directly |
+| `wireserve-agent list [--json]` | services (name, address, ports, owner, state), peers (with each one's route — direct or via a carrier) and anything not published, from the last poll |
 | `wireserve-agent leave` | tear down interface, firewall, hosts block |
 
 Against the admin port (loopback-only by default; run from the coordinator
