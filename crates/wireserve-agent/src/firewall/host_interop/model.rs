@@ -244,13 +244,18 @@ pub enum Action {
     FirewalldTrust { ifname: String },
     /// `firewall-cmd --zone=trusted --remove-interface=<ifname>` (runtime only).
     FirewalldUntrust { ifname: String },
-    /// (Re)create table `inet wireserve-interop.<ifname>` with a forward-hook chain
-    /// holding exactly `iifname "<ifname>" drop`. firewalld's zone target
-    /// applies to forwarded traffic too, so trusting the interface would
-    /// otherwise let mesh peers route through this host into its other
-    /// networks. A drop is final across all chains, so this keeps
-    /// forwarding from the mesh exactly as blocked as it was before.
-    GuardCreate { ifname: String },
+    /// (Re)create table `inet wireserve-interop.<ifname>` with a forward-hook
+    /// chain holding `iifname "<ifname>" drop`, plus — only when
+    /// `forward_wanted` (this node is transit-capable, PLAN.md M23) — a
+    /// hairpin exception ahead of it: `iifname "<ifname>" oifname
+    /// "<ifname>" accept`. firewalld's zone target applies to forwarded
+    /// traffic too, so trusting the interface would otherwise let mesh
+    /// peers route through this host into its other networks. A drop is
+    /// final across all chains, so without the exception this keeps
+    /// forwarding from the mesh exactly as blocked as it was before
+    /// transit existed; with it, only traffic routed back onto this same
+    /// interface ever escapes the drop.
+    GuardCreate { ifname: String, forward_wanted: bool },
     /// Delete a guard table, given by its full name (the legacy
     /// fixed-name one included).
     GuardDelete { table: String },

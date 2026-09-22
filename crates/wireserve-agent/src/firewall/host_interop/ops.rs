@@ -75,7 +75,7 @@ impl HostOps for RealOps {
         match action {
             Action::NftInsert { chain, ifname, hook } => nft(nft_ops::insert_accept(chain, ifname, *hook)),
             Action::NftDelete { chain, handle } => nft(nft_ops::delete_rule(chain, *handle)),
-            Action::GuardCreate { ifname } => nft(nft_ops::guard_create(ifname)),
+            Action::GuardCreate { ifname, forward_wanted } => nft(nft_ops::guard_create(ifname, *forward_wanted)),
             Action::GuardDelete { table } => nft(nft_ops::guard_delete(table)),
             Action::IptablesInsert { target, ifname, hook } => {
                 iptables::run(target, &iptables::insert_args(ifname, *hook)).map(|_| ())
@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn no_firewalld_trust_without_the_forward_guard() {
-        let guard = Action::GuardCreate { ifname: "wg0".into() };
+        let guard = Action::GuardCreate { ifname: "wg0".into(), forward_wanted: false };
         let trust = Action::FirewalldTrust { ifname: "wg0".into() };
         let mut ops = fake(vec![guard.clone()]);
         assert_eq!(execute_all(&mut ops, &[guard.clone(), trust]), 2);
@@ -295,7 +295,7 @@ mod tests {
         assert_eq!(
             ops.executed,
             [
-                Action::GuardCreate { ifname: "wg0".into() },
+                Action::GuardCreate { ifname: "wg0".into(), forward_wanted: false },
                 Action::FirewalldTrust { ifname: "wg0".into() }
             ]
         );

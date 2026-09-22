@@ -5,11 +5,16 @@
 //! behavior live.
 //!
 //! Safety properties, each pinned by a test below:
-//! - every accept we add matches exactly `iifname == <ifname>` and sits in
-//!   an INPUT-hook chain: nothing is ever opened on another interface, and
-//!   nothing is ever opened for forwarded or outgoing traffic;
-//! - the only forward-hook object we create is the guard, which only
-//!   drops, and only exists while firewalld trust is in place;
+//! - every INPUT-hook accept we add matches exactly `iifname == <ifname>`;
+//!   nothing is ever opened for outgoing traffic;
+//! - every FORWARD-hook object — an accept, or the guard's hairpin
+//!   exception — additionally requires `oifname == <ifname>`, so it only
+//!   ever opens hairpin traffic back onto this same interface, never
+//!   routing to another interface on the host, and only exists at all
+//!   when `forward_wanted` (this node is transit-capable, PLAN.md M23);
+//! - the guard's unconditional drop (no hairpin exception) is the only
+//!   forward-hook object ever created without `forward_wanted`, and only
+//!   exists while firewalld trust is in place;
 //! - repeated planning on the resulting state yields no actions (it
 //!   settles instead of churning on its own writes);
 //! - another running agent's rules (tagged for an interface in
@@ -61,11 +66,38 @@ pub fn is_accept_shape(rule: &RuleInfo, ifname: &str, hook: Hook) -> bool {
     }
 }
 
-/// Is `rule` exactly the guard's `iifname "<ifname>" drop`?
+/// Is `rule` exactly the guard's plain `iifname "<ifname>" drop`?
 #[must_use]
-pub fn is_guard_shape(rule: &RuleInfo, ifname: &str) -> bool {
+pub fn is_guard_drop_shape(rule: &RuleInfo, ifname: &str) -> bool {
     matches!(rule.expr.as_slice(),
         [iif, verdict] if *iif == iifname_match(ifname) && *verdict == json!({"drop": null}))
+}
+
+/// Is `rule` exactly the guard's hairpin exception, `iifname "<ifname>"
+/// oifname "<ifname>" accept`?
+#[must_use]
+pub fn is_guard_hairpin_shape(rule: &RuleInfo, ifname: &str) -> bool {
+    matches!(rule.expr.as_slice(),
+        [iif, oif, verdict]
+            if *iif == iifname_match(ifname) && *oif == oifname_match(ifname) && *verdict == json!({"accept": null}))
+}
+
+/// Are `rules` exactly the guard's rules for `forward_wanted`? Without
+/// transit, unchanged from before it existed: one rule,
+/// `iifname "<ifname>" drop`, final across every chain on the hook. With
+/// transit (PLAN.md M23), a hairpin exception goes *ahead* of that same
+/// drop — `iifname "<ifname>" oifname "<ifname>" accept`, then the drop —
+/// so only traffic routed back onto this same interface ever escapes it;
+/// forwarding to any other interface on the host stays exactly as blocked
+/// as it always was, even though firewalld's `trusted` zone would
+/// otherwise allow it host-wide.
+#[must_use]
+pub fn is_guard_shape(rules: &[RuleInfo], ifname: &str, forward_wanted: bool) -> bool {
+    match (rules, forward_wanted) {
+        ([drop], false) => is_guard_drop_shape(drop, ifname),
+        ([accept, drop], true) => is_guard_hairpin_shape(accept, ifname) && is_guard_drop_shape(drop, ifname),
+        _ => false,
+    }
 }
 
 fn is_ours(rule: &RuleInfo) -> bool {
@@ -187,7 +219,7 @@ pub fn plan_reconcile(observed: &Observed, ifname: &str, forward_wanted: bool) -
         plan_iptables(obs, ifname, observed.nft.as_ref(), forward_wanted, &observed.live, &mut actions);
     }
 
-    plan_firewalld(observed, ifname, &mut actions);
+    plan_firewalld(observed, ifname, forward_wanted, &mut actions);
     actions
 }
 
@@ -299,7 +331,7 @@ fn iptables_line_removable(line: &str, ifname: &str, live: &BTreeSet<String>) ->
     removable(tag.as_deref().and_then(tag_owner), ifname, live)
 }
 
-fn guard_state(nft: Option<&NftView>, ifname: &str) -> GuardState {
+fn guard_state(nft: Option<&NftView>, ifname: &str, forward_wanted: bool) -> GuardState {
     let Some(view) = nft else {
         return GuardState::Unknown;
     };
@@ -312,11 +344,7 @@ fn guard_state(nft: Option<&NftView>, ifname: &str) -> GuardState {
         .iter()
         .any(|t| t.family == Family::Inet && t.name == table);
     match chain {
-        Some(c)
-            if c.hook.as_deref() == Some("forward")
-                && c.rules.len() == 1
-                && is_guard_shape(&c.rules[0], ifname) =>
-        {
+        Some(c) if c.hook.as_deref() == Some("forward") && is_guard_shape(&c.rules, ifname, forward_wanted) => {
             GuardState::Correct
         }
         _ if table_exists => GuardState::Wrong,
@@ -332,8 +360,12 @@ enum GuardState {
     Unknown,
 }
 
-fn plan_firewalld(observed: &Observed, ifname: &str, actions: &mut Vec<Action>) {
-    let guard = guard_state(observed.nft.as_ref(), ifname);
+/// `forward_wanted` (this node is transit-capable, PLAN.md M23) only ever
+/// changes the guard's own *shape* (see `is_guard_shape`) — whether the
+/// guard exists at all is still purely about firewalld's own state, same
+/// as before transit existed.
+fn plan_firewalld(observed: &Observed, ifname: &str, forward_wanted: bool, actions: &mut Vec<Action>) {
+    let guard = guard_state(observed.nft.as_ref(), ifname, forward_wanted);
     if guard == GuardState::Unknown {
         // The ruleset couldn't be read, so whether the forward guard is in
         // place can't be verified — and trust without the guard would open
@@ -364,6 +396,7 @@ fn plan_firewalld(observed: &Observed, ifname: &str, actions: &mut Vec<Action>) 
     match (want_guard, guard) {
         (true, GuardState::Absent | GuardState::Wrong) => actions.push(Action::GuardCreate {
             ifname: ifname.to_string(),
+            forward_wanted,
         }),
         (false, GuardState::Correct | GuardState::Wrong) => actions.push(Action::GuardDelete {
             table: guard_table(ifname),
@@ -578,7 +611,7 @@ pub(crate) fn simulate(observed: &Observed, actions: &[Action]) -> Observed {
                     *runtime_zone = None;
                 }
             }
-            Action::GuardCreate { ifname } => {
+            Action::GuardCreate { ifname, forward_wanted } => {
                 let table = guard_table(ifname);
                 let view = out.nft.as_mut().unwrap();
                 view.tables.retain(|t| t.name != table);
@@ -588,7 +621,21 @@ pub(crate) fn simulate(observed: &Observed, actions: &[Action]) -> Observed {
                     name: table.clone(),
                     flags: vec![],
                 });
+                let mut rules = Vec::new();
+                if *forward_wanted {
+                    next_handle += 1;
+                    rules.push(RuleInfo {
+                        handle: next_handle,
+                        comment: None,
+                        expr: vec![iifname_match(ifname), oifname_match(ifname), json!({"accept": null})],
+                    });
+                }
                 next_handle += 1;
+                rules.push(RuleInfo {
+                    handle: next_handle,
+                    comment: None,
+                    expr: vec![iifname_match(ifname), json!({"drop": null})],
+                });
                 view.chains.push(ChainInfo {
                     chain: ChainRef {
                         family: Family::Inet,
@@ -597,11 +644,7 @@ pub(crate) fn simulate(observed: &Observed, actions: &[Action]) -> Observed {
                     },
                     hook: Some("forward".into()),
                     chain_type: Some("filter".into()),
-                    rules: vec![RuleInfo {
-                        handle: next_handle,
-                        comment: None,
-                        expr: vec![iifname_match(ifname), json!({"drop": null})],
-                    }],
+                    rules,
                 });
             }
             Action::GuardDelete { table } => {

@@ -115,7 +115,7 @@ fn every_insert_is_for_exactly_the_configured_interface() {
                     Action::NftInsert { ifname: i, .. }
                     | Action::IptablesInsert { ifname: i, .. }
                     | Action::FirewalldTrust { ifname: i }
-                    | Action::GuardCreate { ifname: i } => assert_eq!(i, ifname),
+                    | Action::GuardCreate { ifname: i, .. } => assert_eq!(i, ifname),
                     Action::NftDelete { .. }
                     | Action::IptablesDelete { .. }
                     | Action::FirewalldUntrust { .. }
@@ -196,7 +196,10 @@ fn forward_guard_only_drops_and_only_exists_with_firewalld_trust() {
     };
     let actions = plan_reconcile(&obs, "wg0", false);
     assert!(actions.contains(&Action::FirewalldTrust { ifname: "wg0".into() }));
-    assert!(actions.contains(&Action::GuardCreate { ifname: "wg0".into() }));
+    assert!(actions.contains(&Action::GuardCreate {
+        ifname: "wg0".into(),
+        forward_wanted: false
+    }));
 
     let after = simulate(&obs, &actions);
     let guard = after
@@ -207,7 +210,7 @@ fn forward_guard_only_drops_and_only_exists_with_firewalld_trust() {
         .iter()
         .find(|c| c.chain.table == guard_table("wg0"))
         .unwrap();
-    assert!(guard.rules.iter().all(|r| is_guard_shape(r, "wg0")));
+    assert!(is_guard_shape(&guard.rules, "wg0", false));
 
     // Without firewalld there is no guard, and a leftover one is removed.
     let mut gone = after.clone();
@@ -218,6 +221,70 @@ fn forward_guard_only_drops_and_only_exists_with_firewalld_trust() {
     assert!(!plan_reconcile(&observed(view(NATIVE)), "wg0", false)
         .iter()
         .any(|a| matches!(a, Action::GuardCreate { .. })));
+}
+
+#[test]
+fn firewalld_guard_gets_a_hairpin_exception_when_transit_capable() {
+    // firewalld's `trusted` zone opens forwarding host-wide once the
+    // interface is a member — this is the one place that's true, unlike
+    // ufw/iptables/native nft, where each foreign chain only ever sees an
+    // explicit accept for this exact interface. The guard's hairpin
+    // exception is what keeps the same narrow "only wireserve0 back onto
+    // wireserve0" promise true here too (PLAN.md M23).
+    let mut obs = observed(view(NATIVE));
+    obs.firewalld = FirewalldState::Running {
+        runtime_zone: None,
+        permanent_zone: None,
+    };
+    let actions = plan_reconcile(&obs, "wg0", true);
+    assert!(actions.contains(&Action::GuardCreate {
+        ifname: "wg0".into(),
+        forward_wanted: true
+    }));
+
+    let after = simulate(&obs, &actions);
+    let guard = after
+        .nft
+        .as_ref()
+        .unwrap()
+        .chains
+        .iter()
+        .find(|c| c.chain.table == guard_table("wg0"))
+        .unwrap();
+    assert!(is_guard_shape(&guard.rules, "wg0", true));
+    assert_eq!(guard.rules.len(), 2, "the hairpin exception sits ahead of the still-present drop");
+    assert_eq!(plan_reconcile(&after, "wg0", true), vec![], "settled");
+}
+
+#[test]
+fn firewalld_guard_shape_is_corrected_when_transit_capable_changes() {
+    // transit_capable only ever changes across a restart (join time), but
+    // the guard left by a previous run must still converge to whichever
+    // shape this run actually wants, not get stuck as "close enough".
+    let mut obs = observed(view(NATIVE));
+    obs.firewalld = FirewalldState::Running {
+        runtime_zone: None,
+        permanent_zone: None,
+    };
+    let with_transit = simulate(&obs, &plan_reconcile(&obs, "wg0", true));
+    let actions = plan_reconcile(&with_transit, "wg0", false);
+    assert!(
+        actions.contains(&Action::GuardCreate {
+            ifname: "wg0".into(),
+            forward_wanted: false
+        }),
+        "{actions:#?}"
+    );
+
+    let without_transit = simulate(&obs, &plan_reconcile(&obs, "wg0", false));
+    let actions = plan_reconcile(&without_transit, "wg0", true);
+    assert!(
+        actions.contains(&Action::GuardCreate {
+            ifname: "wg0".into(),
+            forward_wanted: true
+        }),
+        "{actions:#?}"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -614,12 +681,21 @@ fn firewalld_operator_choices_are_respected() {
     assert_eq!(
         running(None, None),
         [
-            Action::GuardCreate { ifname: "wg0".into() },
+            Action::GuardCreate {
+                ifname: "wg0".into(),
+                forward_wanted: false
+            },
             Action::FirewalldTrust { ifname: "wg0".into() }
         ]
     );
     // Already trusted at runtime by us (e.g. after a restart) → guard only.
-    assert_eq!(running(Some("trusted"), None), [Action::GuardCreate { ifname: "wg0".into() }]);
+    assert_eq!(
+        running(Some("trusted"), None),
+        [Action::GuardCreate {
+            ifname: "wg0".into(),
+            forward_wanted: false
+        }]
+    );
     // Anything an operator chose is left exactly as it is, with no guard.
     assert_eq!(running(Some("public"), None), []);
     assert_eq!(running(Some("public"), Some("public")), []);
@@ -850,7 +926,8 @@ fn each_agent_keeps_its_own_forward_guard() {
     // its own guard and never deletes A's.
     let b_actions = plan_reconcile(&firewalld(&seen_by(&a, &["wireserve0"])), "wireserve1", false);
     assert!(b_actions.contains(&Action::GuardCreate {
-        ifname: "wireserve1".into()
+        ifname: "wireserve1".into(),
+        forward_wanted: false
     }));
     assert!(!b_actions.iter().any(|x| matches!(x, Action::GuardDelete { .. })), "{b_actions:?}");
     let both = simulate(&a, &b_actions);

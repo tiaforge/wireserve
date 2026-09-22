@@ -28,13 +28,14 @@
 //! `-I FORWARD 1 -i <if> -o <if> … -j ACCEPT` (iptables) — pinned to
 //! *both* interfaces being this one, so this only ever opens hairpin
 //! traffic back onto the mesh, never routing from the mesh to any other
-//! interface on the host. A node that never opts into transit gets
-//! exactly the footprint this module had before transit existed. This
-//! does not yet extend to firewalld's own forwarding permission (its
-//! `trusted` zone opens forwarding host-wide, not scoped to one
-//! interface pair, so narrowing it safely is deliberately left as a
-//! follow-up rather than guessed at here) — a transit-capable node under
-//! firewalld still needs an operator to open FORWARD for it by hand.
+//! interface on the host. firewalld gets the equivalent instead: since its
+//! `trusted` zone opens forwarding host-wide (not scoped to one interface
+//! pair) once the interface is a member, the existing forward guard —
+//! which already exists purely to keep that from happening — gains the
+//! same hairpin exception *ahead* of its unconditional drop, so only
+//! traffic routed back onto this same interface ever escapes it. A node
+//! that never opts into transit gets exactly the footprint this module
+//! had before transit existed.
 //!
 //! Several agents can run on one host, each on its own interface. Each
 //! one only ever adds, keeps and removes what is tagged with its own

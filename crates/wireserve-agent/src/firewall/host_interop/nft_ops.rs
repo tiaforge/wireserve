@@ -105,13 +105,17 @@ fn delete_table_cmds(name: &str) -> Vec<NfObject<'static>> {
     ]
 }
 
-/// Atomically (re)creates `inet wireserve-interop.<ifname>` holding exactly one
-/// forward-hook rule: `iifname "<ifname>" drop`. A drop is final across
-/// every chain on the hook, so while this exists nothing — firewalld's
-/// `trusted` zone included — can let traffic from the mesh be forwarded
-/// to another interface.
+/// Atomically (re)creates `inet wireserve-interop.<ifname>` holding a
+/// forward-hook `iifname "<ifname>" drop`, plus — only when
+/// `forward_wanted` (this node is transit-capable, PLAN.md M23) — a
+/// hairpin exception added *ahead* of it: `iifname "<ifname>" oifname
+/// "<ifname>" accept`. A drop is final across every chain on the hook, so
+/// without the exception nothing — firewalld's `trusted` zone included —
+/// can let traffic from the mesh be forwarded to another interface; with
+/// it, only traffic routed back onto this same interface ever escapes
+/// that drop.
 #[must_use]
-pub fn guard_create(ifname: &str) -> Nftables<'static> {
+pub fn guard_create(ifname: &str, forward_wanted: bool) -> Nftables<'static> {
     let table = guard_table(ifname);
     let mut objects = delete_table_cmds(&table);
     objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Table(inet_table(&table)))));
@@ -125,6 +129,17 @@ pub fn guard_create(ifname: &str) -> Nftables<'static> {
         policy: Some(NfChainPolicy::Accept),
         ..Chain::default()
     }))));
+    if forward_wanted {
+        objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(Rule {
+            family: NfFamily::INet,
+            table: Cow::Owned(table.clone()),
+            chain: GUARD_CHAIN.into(),
+            expr: vec![iifname_is(ifname), oifname_is(ifname), Statement::Accept(None::<Accept>)].into(),
+            handle: None,
+            index: None,
+            comment: None,
+        }))));
+    }
     objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(Rule {
         family: NfFamily::INet,
         table: Cow::Owned(table),
@@ -205,7 +220,7 @@ mod tests {
     fn guard_json_is_exact_and_only_drops() {
         let t = json!({"family": "inet", "name": "wireserve-interop.wg0"});
         assert_eq!(
-            serde_json::to_value(guard_create("wg0")).unwrap(),
+            serde_json::to_value(guard_create("wg0", false)).unwrap(),
             json!({"nftables": [
                 {"add": {"table": t}},
                 {"delete": {"table": t}},
@@ -226,6 +241,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn guard_json_with_transit_adds_a_hairpin_exception_ahead_of_the_drop() {
+        assert_eq!(
+            serde_json::to_value(guard_create("wg0", true)).unwrap(),
+            json!({"nftables": [
+                {"add": {"table": {"family": "inet", "name": "wireserve-interop.wg0"}}},
+                {"delete": {"table": {"family": "inet", "name": "wireserve-interop.wg0"}}},
+                {"add": {"table": {"family": "inet", "name": "wireserve-interop.wg0"}}},
+                {"add": {"chain": {"family": "inet", "table": "wireserve-interop.wg0",
+                    "name": "forward-guard", "type": "filter", "hook": "forward",
+                    "prio": 0, "policy": "accept"}}},
+                {"add": {"rule": {"family": "inet", "table": "wireserve-interop.wg0",
+                    "chain": "forward-guard", "expr": [
+                        {"match": {"op": "==", "left": {"meta": {"key": "iifname"}}, "right": "wg0"}},
+                        {"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "wg0"}},
+                        {"accept": null}
+                    ]}}},
+                {"add": {"rule": {"family": "inet", "table": "wireserve-interop.wg0",
+                    "chain": "forward-guard", "expr": [
+                        {"match": {"op": "==", "left": {"meta": {"key": "iifname"}}, "right": "wg0"}},
+                        {"drop": null}
+                    ]}}}
+            ]})
+        );
+    }
+
     fn apply_script(batch: &Nftables<'_>) -> String {
         format!("nft -j -f - <<'JSON'\n{}\nJSON\n", serde_json::to_string(batch).unwrap())
     }
@@ -242,7 +283,7 @@ mod tests {
         let script = format!(
             "{setup}{}{}nft -j list ruleset",
             apply_script(&insert_accept(&chain(), "wg0", Hook::Input)),
-            apply_script(&guard_create("wg0")),
+            apply_script(&guard_create("wg0", false)),
         );
         let Some(out) = crate::firewall::netns::run(&script) else {
             return;
@@ -266,7 +307,7 @@ mod tests {
 
         // Removal, using the handles the kernel reported.
         let removal = planner::plan_removal(&observed, "wg0");
-        let mut script = format!("{setup}{}{}", apply_script(&insert_accept(&chain(), "wg0", Hook::Input)), apply_script(&guard_create("wg0")));
+        let mut script = format!("{setup}{}{}", apply_script(&insert_accept(&chain(), "wg0", Hook::Input)), apply_script(&guard_create("wg0", false)));
         for action in &removal {
             match action {
                 Action::NftDelete { chain, handle } => script += &apply_script(&delete_rule(chain, *handle)),
@@ -291,5 +332,38 @@ mod tests {
                 "}"
             ]
         );
+    }
+
+    /// The transit-shaped guard (PLAN.md M23) against a real kernel: the
+    /// hairpin exception plus the still-present drop both read back and
+    /// are recognised as the planner's "correct guard", and settle (no
+    /// further actions) exactly like the plain drop-only guard already
+    /// does above.
+    #[test]
+    fn kernel_transit_guard_round_trips_and_settles() {
+        let script = format!("{}nft -j list ruleset", apply_script(&guard_create("wg0", true)));
+        let Some(out) = crate::firewall::netns::run(&script) else {
+            return;
+        };
+        let view = ruleset::parse(out.as_bytes()).unwrap();
+        let guard = view
+            .chains
+            .iter()
+            .find(|c| c.chain.chain == "forward-guard")
+            .expect("guard chain present");
+        assert_eq!(guard.rules.len(), 2, "{:?}", guard.rules);
+        assert!(planner::is_guard_shape(&guard.rules, "wg0", true), "{:?}", guard.rules);
+        assert!(!planner::is_guard_shape(&guard.rules, "wg0", false), "the false shape must not also match");
+
+        let observed = Observed {
+            nft: Some(view),
+            iptables: vec![],
+            firewalld: FirewalldState::Running {
+                runtime_zone: Some("trusted".into()),
+                permanent_zone: None,
+            },
+            live: Default::default(),
+        };
+        assert_eq!(planner::plan_reconcile(&observed, "wg0", true), vec![], "settled on real kernel output");
     }
 }
