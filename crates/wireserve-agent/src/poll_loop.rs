@@ -92,6 +92,16 @@ impl PollError {
     }
 }
 
+/// This node's own transit self-report for one poll cycle (PLAN.md M23) —
+/// bundled into its own type rather than three more `build_poll_request`
+/// parameters. See `PollRequest`'s own field doc comments for what each
+/// one means.
+pub struct TransitSelfReport {
+    pub capable: bool,
+    pub reachable: Vec<String>,
+    pub wanted: Vec<String>,
+}
+
 /// Builds the request body from currently-declared services — this is the
 /// node's own view of what it's serving, independent of anything the
 /// coordinator has told it. `dual` is this cycle's actively-probed
@@ -104,6 +114,7 @@ pub fn build_poll_request(
     dual: &crate::probe::DualProbeResult,
     lan_addr: Option<String>,
     reflexive_addr: Option<String>,
+    transit: TransitSelfReport,
 ) -> PollRequest {
     PollRequest {
         endpoint_addr,
@@ -111,6 +122,9 @@ pub fn build_poll_request(
         endpoint_addr_v6: dual.v6.clone(),
         lan_addr,
         reflexive_addr,
+        transit_capable: transit.capable,
+        transit_reachable: transit.reachable,
+        transit_wanted: transit.wanted,
         services: declared.to_vec(),
     }
 }
@@ -317,7 +331,7 @@ where
     F::Error: std::fmt::Display,
 {
     // Snapshot exactly what this cycle sends, then release the lock.
-    let (bearer, self_pubkey, declared, endpoint_addr, listen_port, node_ip) = {
+    let (bearer, self_pubkey, declared, endpoint_addr, listen_port, node_ip, transit_capable) = {
         let s = state.lock().await;
         (
             s.bearer_token.clone().ok_or(PollError::NotRegistered)?,
@@ -326,6 +340,7 @@ where
             s.endpoint_addr.clone(),
             s.listen_port.unwrap_or(51820),
             s.ip4.as_deref().and_then(|ip| ip.parse::<Ipv4Addr>().ok()),
+            s.transit_capable,
         )
     };
 
@@ -347,8 +362,43 @@ where
     let own_lan_subnets = crate::wg::own_lan_subnets(&lan_ifaces);
     let lan_addr = crate::wg::pick_lan_address(&lan_ifaces).map(|ip| ip.to_string());
 
+    // Transit self-report (PLAN.md M23), read once per cycle from purely
+    // local state — same netlink read step 2 below already needs for
+    // endpoint-tier resolution, hoisted up here and reused rather than
+    // read twice, so it can also go out in THIS cycle's own request
+    // rather than lagging a cycle behind.
+    let handshakes: std::collections::HashMap<String, Option<chrono::DateTime<chrono::Utc>>> =
+        crate::wg::tunnel_peers(&ifname)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| (t.pubkey, t.last_handshake))
+            .collect();
+    let transit_reachable: Vec<String> = if transit_capable {
+        let mut r: Vec<String> = crate::wg::transit_reachable_peers(&handshakes, chrono::Utc::now())
+            .into_iter()
+            .map(String::from)
+            .collect();
+        r.truncate(wireserve_types::MAX_TRANSIT_REACHABLE_PER_POLL);
+        r
+    } else {
+        Vec::new()
+    };
+    // Sent regardless of `transit_capable` — any node may need transit
+    // help even if it can't offer it.
+    let mut transit_wanted: Vec<String> =
+        ctx.endpoint_tracker.peers_on_wan().into_iter().map(String::from).collect();
+    transit_wanted.sort_unstable();
+    transit_wanted.truncate(wireserve_types::MAX_TRANSIT_WANTED_PER_POLL);
+
     // 1. send
-    let req = build_poll_request(&declared, endpoint_addr, &dual, lan_addr, ctx.own_reflexive_addr.map(String::from));
+    let req = build_poll_request(
+        &declared,
+        endpoint_addr,
+        &dual,
+        lan_addr,
+        ctx.own_reflexive_addr.map(String::from),
+        TransitSelfReport { capable: transit_capable, reachable: transit_reachable, wanted: transit_wanted },
+    );
     let url = format!("{}/poll", ctx.coordinator_url.trim_end_matches('/'));
     let resp = ctx
         .client
@@ -426,22 +476,33 @@ where
     // hosts block written once, empty, while peers and routes (step 2,
     // which ran first) kept tracking the directory perfectly.
     let rules = service_rules(&declared, node_ip, &directory);
+    // Transit assignments (PLAN.md M23): the coordinator's per-(requester,
+    // peer) routing hint, keyed by the transited peer's own pubkey,
+    // filtered to exclude this node's own pubkey as a key — defensive,
+    // the coordinator should never send this node a `transit_via` about
+    // itself.
+    let transit: crate::wg::TransitAssignments<'_> = directory
+        .peers
+        .iter()
+        .filter(|p| p.pubkey != self_pubkey)
+        .filter_map(|p| p.transit_via.as_deref().map(|via| (p.pubkey.as_str(), via)))
+        .collect();
+    // This node's own carrier role this cycle (PLAN.md M23) — built from
+    // `transit_carrying`, never from `transit` above: `transit` is about
+    // how *this* node reaches *its own* peers, which is never itself a
+    // signal that this node is carrying for someone else (see
+    // `TransitPair`'s doc comment for why a bare `transit_via` can never
+    // fire on this node's own response).
+    let transit_forwards =
+        crate::wg::transit_forwards(&directory.peers, &directory.services, &directory.transit_carrying);
     let failures = tokio::task::block_in_place(|| {
         let mut failures = Vec::new();
 
         // NAT-traversal steps 1/2 (PLAN.md decisions log #85, #90+):
         // resolve each peer's best endpoint tier before reconciling.
-        // `tunnel_peers` is the same netlink read `list` already uses
-        // for `last_handshake`; reading it again here (rather than
-        // threading `list`'s own read through) keeps this step
-        // independent of whether anything is watching `list` right now.
+        // Reuses the `handshakes` map already read above (pre-request),
+        // rather than reading the kernel's peer table a second time.
         let now = std::time::Instant::now();
-        let handshakes: std::collections::HashMap<String, Option<chrono::DateTime<chrono::Utc>>> =
-            crate::wg::tunnel_peers(&ifname)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|t| (t.pubkey, t.last_handshake))
-                .collect();
         let endpoint_tiers: std::collections::HashMap<String, crate::wg::EndpointTier> = directory
             .peers
             .iter()
@@ -460,9 +521,14 @@ where
         ctx.endpoint_tracker.prune(directory.peers.iter().map(|p| p.pubkey.as_str()));
 
         // 2. reconcile WireGuard peers
-        if let Err(e) =
-            ctx.wg.reconcile(&directory.peers, &directory.services, &self_pubkey, prefer_ipv6, &endpoint_tiers)
-        {
+        if let Err(e) = ctx.wg.reconcile(
+            &directory.peers,
+            &directory.services,
+            &self_pubkey,
+            prefer_ipv6,
+            &endpoint_tiers,
+            &transit,
+        ) {
             failures.push(PollError::Wg(e));
         }
 
@@ -471,9 +537,19 @@ where
         //    directory and not from whatever `serve` may have queued
         //    since. The one exception is an admin denial, already folded
         //    in above, which can only ever close a hole; see there.
-        if let Err(e) = ctx.firewall.apply(&rules) {
+        //    `transit_forwards` (PLAN.md M23) is this node's own role as
+        //    a transit carrier this cycle — empty whenever it carries
+        //    none, whether or not it opted in.
+        if let Err(e) = ctx.firewall.apply(&rules, &transit_forwards) {
             failures.push(PollError::Firewall(e.to_string()));
         }
+        // Interface-scoped forwarding (PLAN.md M23) — touched only when
+        // this node currently carries at least one active transit pair,
+        // so opting in but never being selected leaves the host's
+        // forwarding posture completely alone. See `ip_forward` module
+        // doc for why this is scoped to `ifname` and never the host's
+        // global/`all` forwarding switches.
+        crate::firewall::ip_forward::set_enabled(&ifname, !transit_forwards.is_empty());
 
         // 4. rewrite the hosts-file managed block from the full directory.
         if let Err(e) = crate::hosts::sync(ctx.hosts_path, ctx.hosts_label, &directory.services) {
@@ -515,6 +591,11 @@ mod tests {
             &dual,
             Some("192.168.1.5".into()),
             Some("203.0.113.5:55123".into()),
+            TransitSelfReport {
+                capable: true,
+                reachable: vec!["reachable-pk".into()],
+                wanted: vec!["wanted-pk".into()],
+            },
         );
         assert_eq!(req.services.len(), 1);
         assert_eq!(req.endpoint_addr.as_deref(), Some("host:51820"));
@@ -522,6 +603,9 @@ mod tests {
         assert!(req.endpoint_addr_v6.is_none());
         assert_eq!(req.lan_addr.as_deref(), Some("192.168.1.5"));
         assert_eq!(req.reflexive_addr.as_deref(), Some("203.0.113.5:55123"));
+        assert!(req.transit_capable);
+        assert_eq!(req.transit_reachable, vec!["reachable-pk".to_string()]);
+        assert_eq!(req.transit_wanted, vec!["wanted-pk".to_string()]);
     }
 
     const NODE: Ipv4Addr = Ipv4Addr::new(10, 9, 0, 1);
@@ -667,6 +751,7 @@ mod tests {
                     denied_at: None,
                 })
                 .collect(),
+            transit_carrying: vec![],
         }
     }
 

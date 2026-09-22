@@ -58,6 +58,14 @@ pub struct AgentState {
     /// Set by `--ifname <name>`: use exactly `ifname`, never pick another.
     #[serde(default)]
     pub ifname_pinned: bool,
+    /// This node's own live opt-in to carry transit traffic for other
+    /// mesh peers (PLAN.md M23), set by `wireserve-agent transit on|off`
+    /// via IPC and read fresh every poll cycle — matches `serve`/
+    /// `unserve`'s shape (a live operational decision on a running
+    /// daemon), not a join-time flag. Defaults to `false`, same as
+    /// `RegisterRequest::transit_capable` always does at join time.
+    #[serde(default)]
+    pub transit_capable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

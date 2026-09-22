@@ -9,11 +9,16 @@ source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
 **Currently working on:** nothing open — all milestones complete through
-M16. 208 tests passing across `cargo test --workspace`, plus three
-container harnesses in `deploy/e2e/` that all pass on a real kernel:
-`run-e2e-test.sh` (mesh, firewall, interface guard), `run-nat-test.sh`
-(two NAT-ed sites) and `run-proxy-test.sh` (TLS-terminating reverse proxy,
-the topology spec §7 actually mandates).
+M23 (opt-in single-hop transit, NAT-traversal step 3). 592 tests passing
+across `cargo test --workspace`. Several container harnesses in
+`deploy/e2e/` pass on a real kernel: `run-e2e-test.sh` (mesh, firewall,
+interface guard), `run-nat-test.sh` (two NAT-ed sites) and
+`run-proxy-test.sh` (TLS-terminating reverse proxy, the topology spec §7
+actually mandates). **M23's own `run-transit-test.sh` has NOT been run**
+— written against the same rootful-Podman pattern as the others, but
+needs `sudo` and hasn't had its first real execution yet, so M23's actual
+end-to-end behaviour (as opposed to its unit/integration/kernel-gated
+tests, which have all run and pass) is unverified until it has.
 
 Everything that can be verified here now is. What remains unverified is
 scale (three nodes, not thirty), real WAN paths, and long-running
@@ -1650,3 +1655,144 @@ what the library does and does not do on your behalf.
     wrong), and that agent1 — which shares no LAN with node2/agent2, so
     only the WAN tier is in play — actually dials node2 at that reflexive
     address rather than the naive one.
+
+## M23 — opt-in single-hop transit, NAT-traversal step 3
+
+Symmetric NAT (both sides, no shared LAN — the case M21/M22 cannot solve:
+a symmetric NAT maps a different external port per *destination*, so the
+reflexive port either side learns talking to the coordinator is useless
+to the other) is bridged via true multi-hop routing through an
+already-connected third mesh member, using WireGuard's own `AllowedIPs`
+as both an outbound routing table and an inbound cryptographic source
+filter — no new relay server, no new protocol, no port pool.
+
+95. **The coordinator-hosted blind-relay draft was designed in full, then
+    rejected.** The first complete design was a coordinator-owned UDP
+    relay with its own dynamic port pool and session table. Rejected
+    because it would have been the first time the coordinator ever
+    touched live mesh traffic — breaking the project's own stated
+    principle that the coordinator is a plain HTTP control plane that
+    never touches WireGuard, the firewall, or live traffic — and because
+    it concentrated relay bandwidth on one process instead of spreading it
+    across the mesh the way the adopted design does. Naming is
+    deliberately **"transit," never "relay,"** throughout the code and
+    this log, specifically so this pivot stays legible to a later reader
+    and the rejected shape is never accidentally resurrected.
+
+96. **Transit is a routing overlay, not a fourth `EndpointTier`.** It
+    reroutes `AllowedIPs`, never `Endpoint=`, so `EndpointTier::{Lan,
+    Reflexive, Wan}` and `choose_peer_endpoint` are untouched.
+    `wg::desired_peers` became a two-pass builder: pass 1 is the
+    unchanged single-pass logic, run only for peers that are *not* a
+    transited key this cycle; pass 2 folds a transited peer's address(es)
+    and owned VIPs into its `via` peer's already-built entry instead of
+    giving the transited peer a kernel entry of its own. A transited
+    peer's own entry is dropped entirely while transit is active — no
+    wasted entry, no keepalive noise for a connection deliberately not
+    dialed directly. `wg::desired_routes` needed **no change at all**: it
+    already flattens every peer's `AllowedIPs` regardless of whose entry
+    an address sits under, confirmed by reading the code before writing
+    any of this, not assumed.
+
+97. **Discovering "am I the transit carrier" needed its own signal — the
+    original plan's own wording was ambiguous about this and got fixed
+    while implementing.** A node picked as `via` for a pair always
+    already reaches both endpoints directly (that is `TransitState::select`'s
+    own requirement), so its own peer-a/peer-c entries never need routing
+    help and so never carry a `transit_via` of their own — a bare
+    `transit_via` can structurally never fire on the carrier's own poll
+    response. Fixed with a dedicated field: `PollResponse::transit_carrying:
+    Vec<TransitPair>`, populated only in the *carrier's* own response,
+    listing every pair it must forward between this cycle. The requester
+    side keeps the original design: `PeerInfo::transit_via: Option<String>`,
+    computed fresh per (requester, peer) pair every poll, `None` meaning
+    "dial directly," exactly as before.
+
+98. **`TransitState` (`wireserve-coordinator::transit`) is ephemeral,
+    in-memory, never the database** — same shape as `RateLimiter`'s own
+    `AppState` field, not a `NodeRow` column or a migration, unlike
+    `lan_addr`/`reflexive_addr` (M21/M22), which are durable identity
+    facts worth surviving a coordinator restart. Every report here is
+    refreshed on a ≤20s cycle and meaningless once stale. `select(a, c,
+    fresh_secs)` is a pure function of the current snapshot: capable,
+    fresh, reaches both, never either endpoint itself, tie-broken
+    deterministically by pubkey ascending — the determinism is what lets
+    `a`'s poll and `c`'s poll, landing on whatever cycle each happens to,
+    independently converge on the same `via` with no coordination between
+    them. `either_wants(a, c)` checks both sides' independently-stored
+    reports, so the *first* side to give up on a peer drives both
+    directions to a `transit_via` on their own very next poll, rather than
+    requiring both sides to time out in the same window. Revoke calls
+    `TransitState::forget`, so a revoked node's stale report can't linger
+    and still get selected for up to one `online_threshold_secs` window.
+
+99. **A real security regression was found and fixed during this review,
+    before any of it shipped, by re-reading `nftables.rs`'s own
+    `apply_batch` doc comment.** The `wireserve-fwd` FORWARD chain's base
+    policy is deliberately `accept` — a past live-deployment bug (see
+    M11's own decisions log) taught this project that a stricter base
+    policy silently firewalls off traffic on *every* interface, not just
+    the ones the chain's own rules `iifname`-match, because a base
+    chain's policy is global. The first draft of transit's `ip_forward`
+    module wrote the host's *global* forwarding switches
+    (`net.ipv4.ip_forward`, `net.ipv6.conf.all.forwarding`). Combined with
+    the accept-by-default base policy, that would have let any multi-homed
+    transit-enabled host (a second NIC, a LAN, a container bridge) forward
+    traffic freely between its *other* interfaces too, the instant transit
+    turned the global switch on — an unintended "this node becomes an open
+    router" regression with no corresponding opt-in, on any host with more
+    than one network interface. **Fixed**: `firewall::ip_forward::set_enabled`
+    writes the wg interface's own per-interface forwarding files
+    (`/proc/sys/net/{ipv4,ipv6}/conf/<ifname>/forwarding`) and never the
+    `all`/global ones — mirroring the same interface-scoping discipline
+    the firewall rules already apply. A real kernel test
+    (`set_enabled_scopes_forwarding_to_the_named_interface_only`, two real
+    dummy interfaces in a fresh network namespace) pins this down as a
+    regression guard, not just a doc comment.
+
+100. **The `in` operator against an address set needed nft's `Set`
+    literal, not a bare JSON array — caught by a real kernel, not assumed
+    from documentation.** `established_or_related()`'s own `ct state { … }`
+    match works with a plain `Expression::List` because `ct state` is a
+    bitmask/flags-typed field; the transit forward rule's `ip saddr`/`ip
+    daddr in { … }` match against a *non*-bitmask (address) type does not
+    — a real `nft` refused it with "Basetype of type IPv4 address is not
+    bitmask." Fixed by building an anonymous `NamedExpression::Set`
+    (`{"set": […]}`) instead, which is what
+    `kernel_accepts_a_transit_pairs_ruleset` exists to keep catching if it
+    regresses.
+
+101. **Wire fields, all `#[serde(default)]`, no behavior change alone.**
+    `PollRequest` gains `transit_capable`/`transit_reachable`/
+    `transit_wanted` (both capped at 64, matching `MAX_SERVICES_PER_NODE`'s
+    own precedent); `RegisterRequest` gains `transit_capable` (always
+    `false` at join time — opt-in is a live, post-join decision, never an
+    identity fact); `PeerInfo` gains `transit_via`; `PollResponse` gains
+    `transit_carrying`. `GET /admin/peers` leaves `transit_via` always
+    `None` on purpose — an admin isn't "a requester" polling on behalf of
+    a specific node, so there is no requester to compute it relative to.
+
+102. **Opt-in is a live IPC toggle, not a join-time flag** — `wireserve-agent
+    transit on|off`, `IpcRequest::TransitCapable`, `AgentState::transit_capable`
+    (`#[serde(default)]`) — same shape as `serve`/`unserve`: mutates the
+    running daemon directly, takes effect next poll, no rejoin. Motivated
+    directly by the user: a node with a traffic cap is an operational fact
+    that should flip without a rejoin, not an addressing fact resolved
+    once at bootstrap the way `--endpoint-addr` is.
+
+103. **One question raised and explicitly settled, not left as a gap: A
+    and C (the transited pair) get no opt-in or opt-out of their own,
+    only B's opt-in gates anything.** This is a private mesh where every
+    member already trusts every other member equally; B seeing A/C's
+    mesh-layer plaintext is exactly the new trust surface B's own opt-in
+    is meant to gate, and a separate per-node "allow being transited"
+    flag was deliberately not added.
+
+Explicitly out of scope, same as originally planned: multi-hop
+pathfinding beyond one transit hop; automatic/mandatory transit selection
+(opt-in only, full stop); bandwidth accounting/metering for transit nodes;
+NAT-type classification (still relies on tier grace-window/backoff
+discovery instead, consistent with M21/M22).
+
+`deploy/e2e/run-transit-test.sh` (new, sibling to `run-nat-test.sh`) is
+written but **not yet run** — see "Currently working on" above.

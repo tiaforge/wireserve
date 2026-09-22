@@ -10,6 +10,7 @@ pub mod nft;
 pub mod nftables;
 #[cfg(target_os = "linux")]
 pub mod host_interop;
+pub mod ip_forward;
 
 use wireserve_types::FirewallBackend;
 
@@ -20,7 +21,7 @@ use wireserve_types::FirewallBackend;
 /// satisfies that regardless of backend.
 pub fn startup_sequence<B: FirewallBackend>(backend: &mut B) -> Result<(), B::Error> {
     backend.teardown()?;
-    backend.apply(&[])
+    backend.apply(&[], &[])
 }
 
 /// The running host-firewall interop, as the daemon sees it.
@@ -86,12 +87,12 @@ pub mod fake {
     //! startup-sequencing requirement can be verified without a real
     //! nftables backend (which needs root and a kernel netfilter hook).
 
-    use wireserve_types::{FirewallBackend, ServiceRule};
+    use wireserve_types::{FirewallBackend, ServiceRule, TransitForward};
 
     #[derive(Debug, Clone, PartialEq)]
     pub enum Call {
         Teardown,
-        Apply(Vec<ServiceRule>),
+        Apply(Vec<ServiceRule>, Vec<TransitForward>),
     }
 
     #[derive(Debug, thiserror::Error)]
@@ -106,8 +107,8 @@ pub mod fake {
     impl FirewallBackend for FakeFirewallBackend {
         type Error = FakeError;
 
-        fn apply(&mut self, rules: &[ServiceRule]) -> Result<(), Self::Error> {
-            self.calls.push(Call::Apply(rules.to_vec()));
+        fn apply(&mut self, rules: &[ServiceRule], transit: &[TransitForward]) -> Result<(), Self::Error> {
+            self.calls.push(Call::Apply(rules.to_vec(), transit.to_vec()));
             Ok(())
         }
 
@@ -128,7 +129,7 @@ mod tests {
     fn startup_sequence_tears_down_then_applies_empty_ruleset() {
         let mut backend = FakeFirewallBackend::default();
         startup_sequence(&mut backend).unwrap();
-        assert_eq!(backend.calls, vec![Call::Teardown, Call::Apply(vec![])]);
+        assert_eq!(backend.calls, vec![Call::Teardown, Call::Apply(vec![], vec![])]);
     }
 
     #[test]
@@ -136,21 +137,27 @@ mod tests {
         let mut backend = FakeFirewallBackend::default();
         startup_sequence(&mut backend).unwrap();
         backend
-            .apply(&[ServiceRule::Open {
-                proto: Proto::Tcp,
-                port: 32400,
-            }])
+            .apply(
+                &[ServiceRule::Open {
+                    proto: Proto::Tcp,
+                    port: 32400,
+                }],
+                &[],
+            )
             .unwrap();
 
         assert_eq!(
             backend.calls,
             vec![
                 Call::Teardown,
-                Call::Apply(vec![]),
-                Call::Apply(vec![ServiceRule::Open {
-                    proto: Proto::Tcp,
-                    port: 32400
-                }]),
+                Call::Apply(vec![], vec![]),
+                Call::Apply(
+                    vec![ServiceRule::Open {
+                        proto: Proto::Tcp,
+                        port: 32400
+                    }],
+                    vec![]
+                ),
             ]
         );
     }
@@ -166,7 +173,7 @@ mod tests {
     struct LoggingBackend(Log);
     impl FirewallBackend for LoggingBackend {
         type Error = super::fake::FakeError;
-        fn apply(&mut self, _rules: &[ServiceRule]) -> Result<(), Self::Error> {
+        fn apply(&mut self, _rules: &[ServiceRule], _transit: &[wireserve_types::TransitForward]) -> Result<(), Self::Error> {
             self.0.borrow_mut().push("fw.apply");
             Ok(())
         }

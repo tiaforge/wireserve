@@ -129,6 +129,13 @@ pub struct RegisterRequest {
     /// IPv4-only), or the coordinator predates the feature.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reflexive_addr: Option<String>,
+    /// This node's own opt-in to carry transit traffic for other peers
+    /// (PLAN.md M23) — always `false` at join time. Opt-in is a live,
+    /// post-join operational decision (`wireserve-agent transit on`), not
+    /// an identity fact resolved once at bootstrap, so registration never
+    /// reports anything but the default.
+    #[serde(default)]
+    pub transit_capable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +165,19 @@ pub struct RegisterResponse {
 /// sides to agree on the number up front.
 pub const MAX_SERVICES_PER_NODE: usize = 64;
 
+/// Upper bound on `PollRequest::transit_reachable` — how many pubkeys a
+/// transit-capable node reports itself as currently, actually reaching
+/// (PLAN.md M23). Same order of magnitude as [`MAX_SERVICES_PER_NODE`],
+/// for the same reason: a self-reported, unbounded-by-spec array fanned
+/// into shared state on every poll needs a cap agreed by both sides up
+/// front, not enforced coordinator-side alone.
+pub const MAX_TRANSIT_REACHABLE_PER_POLL: usize = 64;
+
+/// Upper bound on `PollRequest::transit_wanted` — how many pubkeys a node
+/// reports itself as unable to reach directly and wanting transit help
+/// for (PLAN.md M23). Same reasoning and value as
+/// [`MAX_TRANSIT_REACHABLE_PER_POLL`].
+pub const MAX_TRANSIT_WANTED_PER_POLL: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceDecl {
@@ -223,6 +243,26 @@ pub struct PollRequest {
     /// uniform across every self-reported field.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reflexive_addr: Option<String>,
+    /// This node's own live opt-in to carry transit traffic (PLAN.md
+    /// M23) — see `RegisterRequest::transit_capable`. Resent every poll,
+    /// same as every other self-reported field, since it's a live toggle
+    /// (`wireserve-agent transit on/off`) rather than a one-time fact.
+    #[serde(default)]
+    pub transit_capable: bool,
+    /// Pubkeys this node currently sees a fresh kernel handshake with —
+    /// its own ground truth for "I actually reach this peer right now"
+    /// (PLAN.md M23). Only meaningful, and only populated, when
+    /// `transit_capable` is true; capped at
+    /// [`MAX_TRANSIT_REACHABLE_PER_POLL`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transit_reachable: Vec<String>,
+    /// Pubkeys this node's own `wg::EndpointTracker` has given up on
+    /// every ranked tier for — "I need help reaching these" (PLAN.md
+    /// M23). Sent regardless of this node's own `transit_capable` value,
+    /// since any node may need transit help even if it can't offer it;
+    /// capped at [`MAX_TRANSIT_WANTED_PER_POLL`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transit_wanted: Vec<String>,
     #[serde(default)]
     pub services: Vec<ServiceDecl>,
 }
@@ -263,6 +303,17 @@ pub struct PeerInfo {
     /// observation (the coordinator is never itself a WireGuard peer).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_handshake: Option<chrono::DateTime<chrono::Utc>>,
+    /// The pubkey of the node the *requester* of this poll should route
+    /// through to reach this peer (PLAN.md M23), computed fresh per
+    /// (requester, peer) pair every poll — `None` when this peer should
+    /// be dialed directly, as before this feature existed. Pairwise, not
+    /// a property of the peer itself: two different requesters can (and
+    /// often will) get different answers for "the same" peer entry.
+    /// `GET /admin/peers` always leaves this `None` — an admin isn't "a
+    /// requester" polling on behalf of a specific node, so there is no
+    /// requester to compute it relative to.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub transit_via: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -335,10 +386,36 @@ pub struct DeniedService {
 /// [`MAX_SERVICES_PER_NODE`].
 pub const MAX_DENY_REASON_LEN: usize = 256;
 
+/// One active transit pairing THIS polling node must carry (PLAN.md M23)
+/// — present only in the poll response of the node selected as `via` for
+/// this pair, never in `a`'s or `c`'s own response (they instead see
+/// `PeerInfo::transit_via` naming this node on the *other* endpoint's own
+/// entry). This is how a node discovers its own role as transit carrier:
+/// a bare `transit_via` can never fire on a node's own poll response,
+/// since `select` only ever picks a node that already reaches both
+/// endpoints directly — its own peer entries for `a` and `c` need no
+/// routing help and so never carry `transit_via` themselves.
+///
+/// Both `a` and `c` are guaranteed to be real peers already present in
+/// this same response's `peers` array — look up each one's addresses and
+/// owned service VIPs there to build the actual forwarding rule
+/// (`wireserve-agent`'s `wg::transit_forwards`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransitPair {
+    pub a: String,
+    pub c: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PollResponse {
     pub peers: Vec<PeerInfo>,
     pub services: Vec<ServiceInfo>,
+    /// Every active transit pairing THIS node currently carries as `via`
+    /// (PLAN.md M23) — see [`TransitPair`]. Empty for a node that never
+    /// opted in, or that opted in but wasn't selected for anything this
+    /// cycle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transit_carrying: Vec<TransitPair>,
     /// THIS node's own declarations awaiting approval — never anyone
     /// else's.
     ///
@@ -465,10 +542,12 @@ mod tests {
             services: vec![],
             pending_services: vec![],
             denied_services: vec![],
+            transit_carrying: vec![],
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("pending_services"), "{json}");
         assert!(!json.contains("denied_services"), "{json}");
+        assert!(!json.contains("transit_carrying"), "{json}");
     }
 
     #[test]
@@ -528,6 +607,7 @@ mod tests {
                 lan_addr: None,
                 reflexive_addr: Some("203.0.113.5:55123".into()),
                 last_handshake: None,
+                transit_via: None,
             }],
             services: vec![ServiceInfo {
                 name: "plex".into(),
@@ -541,6 +621,7 @@ mod tests {
             }],
             pending_services: vec![],
             denied_services: vec![],
+            transit_carrying: vec![],
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: PollResponse = serde_json::from_str(&json).unwrap();

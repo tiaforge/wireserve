@@ -146,6 +146,7 @@ pub fn run(
             endpoint_addr_v6: None,
             lan_addr: None,
             reflexive_addr: None,
+            transit_capable: false,
         },
     )?;
 
@@ -178,6 +179,7 @@ mod tests {
             lan_addr: None,
             reflexive_addr: None,
             last_handshake: None,
+            transit_via: None,
         }
     }
 
@@ -367,6 +369,7 @@ mod tests {
             endpoint_addr_v6: None,
             lan_addr: None,
             reflexive_addr: None,
+            transit_capable: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains(&private_key.to_string()));

@@ -102,6 +102,25 @@ pub async fn poll(
             ));
         }
     }
+    // Transit self-report (PLAN.md M23): hints, not identity/addressing
+    // facts, so a malformed entry is dropped silently rather than
+    // rejecting the whole poll the way an invalid endpoint_addr does —
+    // the same posture `transit_wanted`/`transit_reachable`'s own doc
+    // comments describe.
+    let self_pubkey = node.pubkey.clone().unwrap_or_default();
+    let transit_reachable: Vec<String> = req
+        .transit_reachable
+        .iter()
+        .filter(|pk| wireserve_types::is_valid_wg_pubkey(pk))
+        .cloned()
+        .collect();
+    let transit_wanted: Vec<String> = req
+        .transit_wanted
+        .iter()
+        .filter(|pk| wireserve_types::is_valid_wg_pubkey(pk))
+        .cloned()
+        .collect();
+    state.transit.report(&self_pubkey, req.transit_capable, &transit_reachable, &transit_wanted);
 
     // Same observed-source-address fallback as `/register` (spec §4.2),
     // re-applied on every poll rather than frozen at join time — see
@@ -194,10 +213,54 @@ pub async fn poll(
     let all_peers = nodes::list_all_peers(&conn)?;
     let all_services = services::list_approved(&conn)?;
 
-    let peers = all_peers
+    let mut peers: Vec<wireserve_types::PeerInfo> = all_peers
         .iter()
         .map(|n| directory::peer_info(n, state.config.online_threshold_secs))
         .collect();
+
+    // Second pass (PLAN.md M23): `transit_via` is requester-relative —
+    // "how THIS polling node should reach each peer" — which
+    // `directory::peer_info` structurally can't express on its own.
+    // `GET /admin/peers` deliberately skips this and leaves it always
+    // `None`: an admin isn't "a requester" polling on behalf of a
+    // specific node, so there is no requester to compute it relative to.
+    for peer in &mut peers {
+        if peer.pubkey == self_pubkey {
+            continue;
+        }
+        if state.transit.either_wants(&self_pubkey, &peer.pubkey) {
+            peer.transit_via = state
+                .transit
+                .select(&self_pubkey, &peer.pubkey, state.config.online_threshold_secs)
+                .filter(|via| via != &self_pubkey);
+        }
+    }
+
+    // This requester's own carrier role this cycle (PLAN.md M23): every
+    // OTHER pair (x, y) — neither of them this requester — that wants
+    // transit help and for which `select` names this requester as `via`.
+    // A node discovers its own role as `via` purely from this list; it
+    // never appears via a bare `transit_via` on its own response (by
+    // construction, `select` only ever picks a node that already reaches
+    // both endpoints directly, so its own peer-a/peer-c entries never
+    // need routing help and so never carry `transit_via` themselves).
+    let all_pubkeys: Vec<&str> = all_peers.iter().filter_map(|n| n.pubkey.as_deref()).collect();
+    let mut transit_carrying = Vec::new();
+    for (i, &x) in all_pubkeys.iter().enumerate() {
+        if x == self_pubkey {
+            continue;
+        }
+        for &y in &all_pubkeys[i + 1..] {
+            if y == self_pubkey {
+                continue;
+            }
+            if state.transit.either_wants(x, y)
+                && state.transit.select(x, y, state.config.online_threshold_secs).as_deref() == Some(self_pubkey.as_str())
+            {
+                transit_carrying.push(wireserve_types::TransitPair { a: x.to_string(), c: y.to_string() });
+            }
+        }
+    }
 
     let peers_by_id: std::collections::HashMap<i64, &nodes::NodeRow> =
         all_peers.iter().map(|n| (n.id, n)).collect();
@@ -215,5 +278,6 @@ pub async fn poll(
         services,
         pending_services: outcome.pending.iter().map(directory::pending_service).collect(),
         denied_services: outcome.denied.iter().map(directory::denied_service).collect(),
+        transit_carrying,
     }))
 }

@@ -30,6 +30,12 @@ pub fn peer_info(node: &NodeRow, online_threshold_secs: i64) -> PeerInfo {
         lan_addr: node.lan_addr.clone(),
         reflexive_addr: node.reflexive_addr.clone(),
         last_handshake: if recent { node.last_seen } else { None },
+        // Requester-relative (PLAN.md M23) — a single-peer function
+        // structurally can't express it. Filled by a second pass in
+        // `routes/poll.rs`, once the requester is known; left `None`
+        // here and (deliberately) by `GET /admin/peers`, which has no
+        // requester to compute it relative to.
+        transit_via: None,
     }
 }
 

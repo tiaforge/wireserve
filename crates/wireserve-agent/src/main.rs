@@ -87,6 +87,15 @@ enum Command {
     },
     /// Queues a local service withdrawal, applied on the next poll.
     Unserve { name: String },
+    /// Opts this node in or out of carrying transit traffic for other mesh
+    /// peers that can't reach each other directly (PLAN.md M23) — a live
+    /// operational toggle, same shape as `serve`/`unserve`: takes effect
+    /// next poll, no rejoin. Off by default; a node with metered/capped
+    /// traffic should simply never turn it on.
+    Transit {
+        #[command(subcommand)]
+        action: TransitAction,
+    },
     /// Shows this node's services, peers and anything not published, from
     /// the daemon's cache of the last poll — no network call.
     List {
@@ -96,6 +105,12 @@ enum Command {
     },
     /// Tears down the interface, firewall, and hosts-file block.
     Leave,
+}
+
+#[derive(Subcommand)]
+enum TransitAction {
+    On,
+    Off,
 }
 
 /// Initialises logging with `info` as the floor rather than tracing's own
@@ -143,6 +158,7 @@ async fn main() {
         } => cmd_daemon(&instance, poll_interval_secs, ifname).await,
         Command::Serve { name, ports } => cmd_serve(&instance, name, &ports).await,
         Command::Unserve { name } => cmd_unserve(&instance, name).await,
+        Command::Transit { action } => cmd_transit(&instance, action).await,
         Command::List { json } => cmd_list(&instance, json).await,
         Command::Leave => cmd_leave(&instance).await,
     };
@@ -695,6 +711,20 @@ async fn cmd_unserve(instance: &Instance, name: String) -> Result<(), Box<dyn st
     Ok(())
 }
 
+async fn cmd_transit(instance: &Instance, action: TransitAction) -> Result<(), Box<dyn std::error::Error>> {
+    let enabled = matches!(action, TransitAction::On);
+    let resp = client::call(&instance.socket_path(), &IpcRequest::TransitCapable { enabled }).await?;
+    if matches!(resp, wireserve_agent::ipc::IpcResponse::Ok) {
+        println!(
+            "ok — transit {}; takes effect on the next poll",
+            if enabled { "enabled" } else { "disabled" }
+        );
+        return Ok(());
+    }
+    print_response(resp);
+    Ok(())
+}
+
 async fn cmd_list(instance: &Instance, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let resp = client::call(&instance.socket_path(), &IpcRequest::List).await?;
     match resp {
@@ -744,7 +774,11 @@ struct NoopFirewall;
 #[cfg(not(target_os = "linux"))]
 impl FirewallBackend for NoopFirewall {
     type Error = std::convert::Infallible;
-    fn apply(&mut self, _rules: &[wireserve_types::ServiceRule]) -> Result<(), Self::Error> {
+    fn apply(
+        &mut self,
+        _rules: &[wireserve_types::ServiceRule],
+        _transit: &[wireserve_types::TransitForward],
+    ) -> Result<(), Self::Error> {
         tracing::warn!("nftables backend not compiled in — firewall rules are NOT being applied");
         Ok(())
     }

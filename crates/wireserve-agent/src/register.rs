@@ -132,6 +132,7 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
         )
         .map(|ip| ip.to_string()),
         reflexive_addr,
+        transit_capable: false,
     };
 
     let resp = client.post(&url).json(&req).send().await?;
@@ -156,6 +157,7 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
         rejected_services: Vec::new(),
         ifname: params.ifname,
         ifname_pinned: params.ifname_pinned,
+        transit_capable: false,
     };
     state.save(params.state_path)?;
     Ok(state)
@@ -181,6 +183,7 @@ mod tests {
             endpoint_addr_v6: None,
             lan_addr: None,
             reflexive_addr: None,
+            transit_capable: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains(&private_key.to_string()));

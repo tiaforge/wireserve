@@ -101,6 +101,7 @@ mod tests {
             lan_addr: None,
             reflexive_addr: None,
             last_handshake: None,
+            transit_via: None,
         }
     }
 
@@ -123,6 +124,7 @@ mod tests {
             services,
             pending_services: vec![],
             denied_services: vec![],
+            transit_carrying: vec![],
         }
     }
 

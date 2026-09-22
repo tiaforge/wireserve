@@ -7,12 +7,12 @@ use std::borrow::Cow;
 use std::net::Ipv4Addr;
 
 use nftables::expr::{
-    BinaryOperation, CTDir, Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, CT,
+    BinaryOperation, CTDir, Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, SetItem, CT,
 };
 use nftables::schema::{Chain, NfCmd, NfListObject, NfObject, Nftables, Rule, Table};
 use nftables::stmt::{Accept, Drop, Mangle, Match, Operator, Statement};
 use nftables::types::{NfChainPolicy, NfChainType, NfFamily, NfHook};
-use wireserve_types::{FirewallBackend, PortMap, Proto, ServiceRule};
+use wireserve_types::{FirewallBackend, PortMap, Proto, ServiceRule, TransitEndpoint, TransitForward};
 
 use super::nft::{Nft, NftError};
 
@@ -167,6 +167,25 @@ fn addr(ip: Ipv4Addr) -> Expression<'static> {
     Expression::String(Cow::Owned(ip.to_string()))
 }
 
+fn addr6(ip: std::net::Ipv6Addr) -> Expression<'static> {
+    Expression::String(Cow::Owned(ip.to_string()))
+}
+
+/// `<left> in { values... }` — an anonymous nft *set* literal
+/// (`NamedExpression::Set`), not `Expression::List`: nft's JSON grammar
+/// only accepts a bare array for a bitmask/flags-typed field (`ct state`,
+/// used by `established_or_related` above); for an address-typed field it
+/// refuses a bare array with "Basetype of type IPv4 address is not
+/// bitmask" — caught by `kernel_accepts_a_transit_pairs_ruleset` against
+/// a real kernel, not assumed from documentation.
+fn in_list(left: Expression<'static>, values: Vec<Expression<'static>>) -> Statement<'static> {
+    Statement::Match(Match {
+        left,
+        right: Expression::Named(NamedExpression::Set(values.into_iter().map(SetItem::Element).collect())),
+        op: Operator::IN,
+    })
+}
+
 fn is(left: Expression<'static>, right: Expression<'static>) -> Statement<'static> {
     Statement::Match(Match {
         left,
@@ -225,6 +244,48 @@ fn reverse_rewrite(vip: Ipv4Addr, node: Ipv4Addr, map: &PortMap) -> Vec<Statemen
         set(payload("ip", "saddr"), addr(vip)),
         set(payload(l4(map.proto), "sport"), Expression::Number(u32::from(map.public))),
     ]
+}
+
+/// Every rule for one active transit pair (PLAN.md M23): one direction ×
+/// one address family, only when that family actually has an address on
+/// both ends of that direction. `TransitEndpoint::addrs4`/`addrs6` are
+/// this endpoint's host address plus every owned VIP — matches
+/// `ServiceRule::Mapped`'s existing "the node's own service addresses are
+/// just more addresses that route to it" treatment.
+fn transit_forward_rules(t: &str, ifname: &str, pair: &TransitForward) -> Vec<NfObject<'static>> {
+    fn addrs4(e: &TransitEndpoint) -> Vec<Ipv4Addr> {
+        e.ip4.into_iter().chain(e.vips.iter().copied()).collect()
+    }
+    fn addrs6(e: &TransitEndpoint) -> Vec<std::net::Ipv6Addr> {
+        e.ip6.into_iter().collect()
+    }
+
+    let mut out = Vec::new();
+    let accept = || Statement::Accept(None::<Accept>);
+
+    let (near4, far4) = (addrs4(&pair.near), addrs4(&pair.far));
+    if !near4.is_empty() && !far4.is_empty() {
+        for (from, to) in [(&near4, &far4), (&far4, &near4)] {
+            out.push(rule(t, FORWARD_CHAIN, vec![
+                iifname_is(ifname),
+                in_list(payload("ip", "saddr"), from.iter().map(|a| addr(*a)).collect()),
+                in_list(payload("ip", "daddr"), to.iter().map(|a| addr(*a)).collect()),
+                accept(),
+            ]));
+        }
+    }
+    let (near6, far6) = (addrs6(&pair.near), addrs6(&pair.far));
+    if !near6.is_empty() && !far6.is_empty() {
+        for (from, to) in [(&near6, &far6), (&far6, &near6)] {
+            out.push(rule(t, FORWARD_CHAIN, vec![
+                iifname_is(ifname),
+                in_list(payload("ip6", "saddr"), from.iter().map(|a| addr6(*a)).collect()),
+                in_list(payload("ip6", "daddr"), to.iter().map(|a| addr6(*a)).collect()),
+                accept(),
+            ]));
+        }
+    }
+    out
 }
 
 fn chain(table: &str, name: &'static str, kind: NfChainType, hook: NfHook, prio: i32) -> NfObject<'static> {
@@ -287,7 +348,7 @@ fn rule(table: &str, chain: &'static str, expr: Vec<Statement<'static>>) -> NfOb
 /// Rewriting headers needs the host's own user namespace: since the
 /// "disable payload mangling in userns" hardening the kernel refuses it
 /// with EPERM anywhere else (see `NftablesError::RewriteRefused`).
-pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule]) -> Nftables<'static> {
+pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], transit: &[TransitForward]) -> Nftables<'static> {
     let name = table_name(ifname);
     let t = name.as_str();
     let mut objects: Vec<NfObject<'static>> = delete_table_cmds(t).into();
@@ -347,8 +408,26 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule]) -> Nftables<'stat
     if !mapped.is_empty() {
         objects.push(rule(t, FORWARD_CHAIN, vec![iifname_is(ifname), has_mark(ct("mark", None)), accept()]));
     }
+    // Opt-in transit (PLAN.md M23): this node is B, forwarding an
+    // ordinary connection between two other peers, decrypted and
+    // re-encrypted at the kernel WireGuard layer — never rewritten,
+    // unlike a service address above. Only a *new* connection needs its
+    // own rule here in each direction; its own reply traffic is already
+    // covered by the `established_or_related()` accept above, the same
+    // way a service's reply traffic is. One rule per direction per
+    // family that actually has addresses on both ends (up to four for a
+    // fully dual-stack pair), narrowly scoped to exactly this pair's own
+    // addresses — never a blanket forward-everything rule.
+    for pair in transit {
+        objects.extend(transit_forward_rules(t, ifname, pair));
+    }
     objects.push(rule(t, FORWARD_CHAIN, vec![iifname_is(ifname), Statement::Drop(None::<Drop>)]));
 
+    // The chains below are the service-address rewrite machinery
+    // (PLAN.md M20) — transit needs none of it (a transited connection is
+    // forwarded exactly as received, never rewritten), so this early
+    // return is unaffected by `transit` and stays keyed on `mapped`
+    // alone, same as before this feature existed.
     if mapped.is_empty() {
         return Nftables { objects: objects.into() };
     }
@@ -416,9 +495,12 @@ impl FirewallBackend for NftablesBackend {
     type Error = NftablesError;
 
     /// Full-replace in one atomic transaction: the previous table (if any)
-    /// is deleted and the table/chain/rules recreated from scratch.
-    fn apply(&mut self, rules: &[ServiceRule]) -> Result<(), Self::Error> {
-        match self.nft.apply(&apply_batch(&self.ifname, rules)) {
+    /// is deleted and the table/chain/rules recreated from scratch. Service
+    /// rules and transit forwarding pairs (PLAN.md M23) apply together, in
+    /// the same transaction, so a mid-cycle failure can never leave them
+    /// disagreeing about which cycle they reflect.
+    fn apply(&mut self, rules: &[ServiceRule], transit: &[TransitForward]) -> Result<(), Self::Error> {
+        match self.nft.apply(&apply_batch(&self.ifname, rules, transit)) {
             Err(e @ NftError::Failed { .. })
                 if e.to_string().contains("Operation not permitted")
                     && rules.iter().any(|r| matches!(r, ServiceRule::Mapped { .. })) =>
@@ -477,6 +559,10 @@ mod tests {
         json!({"match": {"op": "in", "left": {"ct": {"key": "state"}}, "right": ["established", "related"]}})
     }
 
+    fn in_addrs(protocol: &str, field: &str, addrs: &[&str]) -> Value {
+        json!({"match": {"op": "in", "left": {"payload": {"protocol": protocol, "field": field}}, "right": {"set": addrs}}})
+    }
+
     fn prelude() -> Vec<Value> {
         vec![
             json!({"add": {"table": table_json()}}),
@@ -514,7 +600,7 @@ mod tests {
         let mut expected = prelude();
         expected.push(rule_json(json!([iif("wg0"), {"drop": null}])));
         expected.extend(forward(vec![]));
-        assert_eq!(as_json(&apply_batch("wg0", &[])), json!({ "nftables": expected }));
+        assert_eq!(as_json(&apply_batch("wg0", &[], &[])), json!({ "nftables": expected }));
     }
 
     #[test]
@@ -548,7 +634,72 @@ mod tests {
                 {"accept": null}
             ])),
         ]));
-        assert_eq!(as_json(&apply_batch("wg0", &rules)), json!({ "nftables": expected }));
+        assert_eq!(as_json(&apply_batch("wg0", &rules, &[])), json!({ "nftables": expected }));
+    }
+
+    fn endpoint4(ip: &str, vips: &[&str]) -> TransitEndpoint {
+        TransitEndpoint { ip4: Some(ip.parse().unwrap()), ip6: None, vips: vips.iter().map(|v| v.parse().unwrap()).collect() }
+    }
+
+    #[test]
+    fn a_transit_pair_produces_bidirectional_address_scoped_forward_rules() {
+        let pair = TransitForward {
+            near: endpoint4("100.90.0.10", &["100.90.0.50"]),
+            far: endpoint4("100.90.0.20", &[]),
+        };
+        let mut expected = prelude();
+        expected.push(rule_json(json!([iif("wg0"), {"drop": null}])));
+        expected.extend(forward(vec![
+            rule_in("wireserve-fwd", json!([
+                iif("wg0"),
+                in_addrs("ip", "saddr", &["100.90.0.10", "100.90.0.50"]),
+                in_addrs("ip", "daddr", &["100.90.0.20"]),
+                {"accept": null}
+            ])),
+            rule_in("wireserve-fwd", json!([
+                iif("wg0"),
+                in_addrs("ip", "saddr", &["100.90.0.20"]),
+                in_addrs("ip", "daddr", &["100.90.0.10", "100.90.0.50"]),
+                {"accept": null}
+            ])),
+        ]));
+        assert_eq!(as_json(&apply_batch("wg0", &[], &[pair])), json!({ "nftables": expected }));
+    }
+
+    #[test]
+    fn a_v6_only_transit_pair_produces_ip6_rules_not_ip4() {
+        let pair = TransitForward {
+            near: TransitEndpoint { ip4: None, ip6: Some("fd00:90::10".parse().unwrap()), vips: vec![] },
+            far: TransitEndpoint { ip4: None, ip6: Some("fd00:90::20".parse().unwrap()), vips: vec![] },
+        };
+        let batch = as_json(&apply_batch("wg0", &[], &[pair])).to_string();
+        assert!(batch.contains("\"protocol\":\"ip6\""), "{batch}");
+        assert!(!batch.contains("\"protocol\":\"ip\""), "{batch}");
+    }
+
+    #[test]
+    fn a_transit_pair_missing_one_sides_family_emits_no_rule_for_that_family() {
+        // `near` has no v6 address at all — a rule with an empty `saddr`
+        // set would be nonsensical (and, more importantly, would nft
+        // reject or mis-render it as "match nothing" vs "match
+        // everything"?). Emitting no rule for that family is the only
+        // safe reading, mirrored on `desired_peers`'s dangling-`via`
+        // handling: nothing to fold into, so nothing is misrouted either.
+        let pair = TransitForward {
+            near: endpoint4("100.90.0.10", &[]),
+            far: TransitEndpoint { ip4: Some("100.90.0.20".parse().unwrap()), ip6: Some("fd00:90::20".parse().unwrap()), vips: vec![] },
+        };
+        let batch = as_json(&apply_batch("wg0", &[], &[pair])).to_string();
+        assert!(!batch.contains("ip6"), "{batch}");
+    }
+
+    #[test]
+    fn no_transit_pairs_is_byte_for_byte_unchanged_from_before_the_feature() {
+        assert_eq!(apply_batch("wg0", &[], &[]), apply_batch("wg0", &[], &[]));
+        let mut expected = prelude();
+        expected.push(rule_json(json!([iif("wg0"), {"drop": null}])));
+        expected.extend(forward(vec![]));
+        assert_eq!(as_json(&apply_batch("wg0", &[], &[])), json!({ "nftables": expected }));
     }
 
     fn has_mark(key: Value) -> Value {
@@ -565,7 +716,7 @@ mod tests {
 
     #[test]
     fn a_mapped_service_gets_the_rewrite_in_both_directions() {
-        let batch = as_json(&apply_batch("wg0", &[mapped("80:5080")]));
+        let batch = as_json(&apply_batch("wg0", &[mapped("80:5080")], &[]));
         let objects = batch["nftables"].as_array().unwrap();
         let rules_of = |chain: &str| -> Vec<Value> {
             objects
@@ -643,7 +794,7 @@ mod tests {
 
     #[test]
     fn without_a_mapped_service_there_are_no_rewrite_chains() {
-        let batch = as_json(&apply_batch("wg0", &[open(Proto::Tcp, 22)])).to_string();
+        let batch = as_json(&apply_batch("wg0", &[open(Proto::Tcp, 22)], &[])).to_string();
         assert!(!batch.contains("svc-") && !batch.contains("mangle"), "{batch}");
     }
 
@@ -656,7 +807,7 @@ mod tests {
         // service address as destination, or its own mark.
         let rules = [open(Proto::Tcp, 22), mapped("80:5080"), mapped("53:5353/udp")];
         for ifname in ["wg0", "wireserve0", "wg-mesh.1"] {
-            let batch = as_json(&apply_batch(ifname, &rules));
+            let batch = as_json(&apply_batch(ifname, &rules, &[]));
             let rules: Vec<&Value> = batch["nftables"]
                 .as_array()
                 .unwrap()
@@ -684,7 +835,7 @@ mod tests {
     fn the_mark_is_only_ever_or_ed_in_and_tested_under_its_mask() {
         // Other software uses the packet and conntrack marks too; this
         // agent must never overwrite or compare their bits.
-        let batch = as_json(&apply_batch("wg0", &[mapped("80:5080")]));
+        let batch = as_json(&apply_batch("wg0", &[mapped("80:5080")], &[]));
         for r in batch["nftables"].as_array().unwrap().iter().filter_map(|o| o.pointer("/add/rule")) {
             for stmt in r["expr"].as_array().unwrap() {
                 let text = stmt.to_string();
@@ -733,7 +884,7 @@ mod tests {
 
     #[test]
     fn kernel_accepts_apply_and_renders_the_expected_ruleset() {
-        let script = nft_script(&[apply_batch("wg0", &[open(Proto::Tcp, 32400)])]) + "nft list table inet wireserve.wg0";
+        let script = nft_script(&[apply_batch("wg0", &[open(Proto::Tcp, 32400)], &[])]) + "nft list table inet wireserve.wg0";
         let Some(listing) = crate::firewall::netns::run(&script) else {
             return;
         };
@@ -758,6 +909,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn kernel_accepts_a_transit_pairs_ruleset() {
+        let pair = TransitForward {
+            near: endpoint4("100.90.0.10", &["100.90.0.50"]),
+            far: endpoint4("100.90.0.20", &[]),
+        };
+        let script = nft_script(&[apply_batch("wg0", &[], &[pair])]) + "nft list table inet wireserve.wg0";
+        let Some(listing) = crate::firewall::netns::run(&script) else {
+            return;
+        };
+        assert_eq!(
+            normalised_lines(&listing),
+            [
+                "table inet wireserve.wg0 {",
+                "chain wireserve-in {",
+                "type filter hook input priority filter; policy accept;",
+                "iifname \"wg0\" ct state established,related accept",
+                "iifname \"wg0\" drop",
+                "}",
+                "chain wireserve-fwd {",
+                "type filter hook forward priority filter; policy accept;",
+                "iifname \"wg0\" ct state established,related accept",
+                "iifname \"wg0\" ip saddr { 100.90.0.10, 100.90.0.50 } ip daddr 100.90.0.20 accept",
+                "iifname \"wg0\" ip saddr 100.90.0.20 ip daddr { 100.90.0.10, 100.90.0.50 } accept",
+                "iifname \"wg0\" drop",
+                "}",
+                "}",
+            ]
+        );
+    }
+
     /// The service-address chains. Rewriting headers needs the host's own
     /// user namespace, which an unprivileged test namespace is not: there
     /// the kernel refuses exactly the rules that rewrite, with EPERM, after
@@ -767,7 +949,7 @@ mod tests {
     #[test]
     fn kernel_accepts_the_service_address_chains() {
         let rules = [mapped("80:5080"), mapped("53:5353/udp")];
-        let batch = serde_json::to_string(&apply_batch("wg0", &rules)).unwrap();
+        let batch = serde_json::to_string(&apply_batch("wg0", &rules, &[])).unwrap();
         let script = format!("nft -j -f - <<'JSON' || true\n{batch}\nJSON\nnft list ruleset");
         let Some((listing, stderr)) = crate::firewall::netns::run_capturing(&script) else {
             return;
@@ -801,7 +983,7 @@ mod tests {
     #[test]
     fn kernel_apply_twice_replaces_rather_than_accumulates() {
         let tcp = |port| open(Proto::Tcp, port);
-        let script = nft_script(&[apply_batch("wg0", &[tcp(1)]), apply_batch("wg0", &[tcp(2)])])
+        let script = nft_script(&[apply_batch("wg0", &[tcp(1)], &[]), apply_batch("wg0", &[tcp(2)], &[])])
             + "nft list table inet wireserve.wg0";
         let Some(listing) = crate::firewall::netns::run(&script) else {
             return;
@@ -818,7 +1000,7 @@ mod tests {
         // after apply must leave nothing behind.
         let script = nft_script(&[
             teardown_batch("wireserve.wg0"),
-            apply_batch("wg0", &[]),
+            apply_batch("wg0", &[], &[]),
             teardown_batch("wireserve.wg0"),
         ])
             + "nft list ruleset";
@@ -831,7 +1013,7 @@ mod tests {
     #[test]
     fn every_interface_gets_its_own_table() {
         for ifname in ["wg0", "wireserve1"] {
-            let batch = as_json(&apply_batch(ifname, &[mapped("80:5080")]));
+            let batch = as_json(&apply_batch(ifname, &[mapped("80:5080")], &[]));
             for object in batch["nftables"].as_array().unwrap() {
                 let body = object.get("add").or_else(|| object.get("delete")).unwrap();
                 let table = match body.get("table") {
@@ -847,9 +1029,9 @@ mod tests {
     fn kernel_two_interfaces_keep_separate_tables() {
         let tcp = |port| open(Proto::Tcp, port);
         let script = nft_script(&[
-            apply_batch("wireserve0", &[tcp(1)]),
-            apply_batch("wireserve1", &[tcp(2)]),
-            apply_batch("wireserve0", &[tcp(3)]),
+            apply_batch("wireserve0", &[tcp(1)], &[]),
+            apply_batch("wireserve1", &[tcp(2)], &[]),
+            apply_batch("wireserve0", &[tcp(3)], &[]),
             teardown_batch("wireserve.wireserve0"),
         ]) + "nft list ruleset";
         let Some(listing) = crate::firewall::netns::run(&script) else {

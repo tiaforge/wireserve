@@ -205,6 +205,7 @@ mod tests {
             lan_addr: None,
             reflexive_addr: None,
             last_handshake: online.then(chrono::Utc::now),
+            transit_via: None,
         }
     }
 
@@ -220,6 +221,7 @@ mod tests {
             instance: "default".into(),
             ifname: "wireserve0".into(),
             node: Some("lego2".into()),
+            transit_capable: false,
             // The coordinator recorded strato's IPv6 candidate; WireGuard
             // is really talking to its IPv4 one.
             peers: vec![

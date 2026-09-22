@@ -19,6 +19,11 @@ pub enum IpcRequest {
         ports: Vec<PortMap>,
     },
     Unserve { name: String },
+    /// This node's live opt-in to carry transit traffic for other mesh
+    /// peers (PLAN.md M23) — `wireserve-agent transit on|off`. Same shape
+    /// as `Serve`/`Unserve`: mutates the running daemon's state directly,
+    /// takes effect next poll, no rejoin.
+    TransitCapable { enabled: bool },
     List,
     Leave,
 }
@@ -65,6 +70,10 @@ pub struct ListView {
     /// This node's own name in the mesh, once a poll has told it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
+    /// This node's own live opt-in to carry transit traffic for other
+    /// mesh peers (PLAN.md M23) — see `state::AgentState::transit_capable`.
+    #[serde(default)]
+    pub transit_capable: bool,
     /// The coordinator's view of every peer, as of the last poll.
     pub peers: Vec<PeerInfo>,
     /// The kernel's view of the same peers, read when `list` asked: the

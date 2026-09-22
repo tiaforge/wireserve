@@ -11,6 +11,7 @@ pub mod reflexive;
 pub mod routes;
 pub mod state;
 pub mod tokengen;
+pub mod transit;
 
 use std::sync::Arc;
 
@@ -29,6 +30,7 @@ pub fn build_state(config: Config, db: db::Db) -> AppState {
             config.global_auth_failure_max,
             config.global_auth_failure_window_secs,
         )),
+        transit: Arc::new(transit::TransitState::default()),
         config: Arc::new(config),
     }
 }

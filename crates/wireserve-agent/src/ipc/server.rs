@@ -35,6 +35,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
             services: vec![],
             pending_services: vec![],
             denied_services: vec![],
+            transit_carrying: vec![],
         });
 
     let self_name = state.public_key.as_ref().and_then(|pk| {
@@ -105,6 +106,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
         instance: ctx.instance.clone(),
         ifname: ctx.ifname.clone(),
         node: self_name,
+        transit_capable: state.transit_capable,
         peers: directory.peers,
         tunnel: vec![],
         services,
@@ -192,6 +194,14 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
         IpcRequest::Unserve { name } => {
             let mut state = ctx.state.lock().await;
             state.declared_services.retain(|d| d.name != name);
+            match state.save(&ctx.state_path) {
+                Ok(()) => (IpcResponse::Ok, false),
+                Err(e) => (IpcResponse::error(e.to_string()), false),
+            }
+        }
+        IpcRequest::TransitCapable { enabled } => {
+            let mut state = ctx.state.lock().await;
+            state.transit_capable = enabled;
             match state.save(&ctx.state_path) {
                 Ok(()) => (IpcResponse::Ok, false),
                 Err(e) => (IpcResponse::error(e.to_string()), false),

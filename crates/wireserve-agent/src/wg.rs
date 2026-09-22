@@ -10,7 +10,7 @@ use defguard_wireguard_rs::key::Key;
 use defguard_wireguard_rs::net::IpAddrMask;
 use defguard_wireguard_rs::peer::Peer;
 use defguard_wireguard_rs::{InterfaceConfiguration, Kernel, WGApi, WireguardInterfaceApi};
-use wireserve_types::{PeerInfo, ServiceInfo};
+use wireserve_types::{PeerInfo, ServiceInfo, TransitEndpoint, TransitForward, TransitPair};
 
 /// Why `bring_up` can fail before it has touched anything.
 #[derive(Debug, thiserror::Error)]
@@ -232,9 +232,11 @@ pub enum EndpointTier {
     Wan,
 }
 
-/// Every tracked tier, most-preferred first. A future relay tier (NAT
-/// traversal step 3, not yet designed) is added here and nowhere else in
-/// the ranking logic below.
+/// Every tracked tier, most-preferred first. NAT-traversal step 3
+/// (PLAN.md M23, opt-in transit) is deliberately **not** a tier here —
+/// it reroutes `AllowedIPs`, not `Endpoint=`, and is layered above this
+/// whole mechanism instead. See `TransitAssignments` and
+/// `desired_peers`'s pass 2.
 const RANKED_TIERS: &[EndpointTier] = &[EndpointTier::Lan, EndpointTier::Reflexive];
 
 /// One peer's currently-advertised candidate values, this cycle, built
@@ -471,6 +473,58 @@ impl EndpointTracker {
         let keep: std::collections::HashSet<&str> = current.collect();
         self.states.retain(|k, _| keep.contains(k.as_str()));
     }
+
+    /// Every pubkey with real tracked history (it once had a ranked
+    /// candidate to try) whose current resolution has fallen all the way
+    /// to [`EndpointTier::Wan`] — this node's own "I need transit help
+    /// reaching these" signal (PLAN.md M23). Excludes a pubkey with no
+    /// tracked entry at all: the ordinary plain-WAN-works-fine case,
+    /// which must never request transit help for free. This is exactly
+    /// `EndpointPeerState::current == Wan` on an entry that exists —
+    /// already present in the state machine above, no new tracking
+    /// needed.
+    pub fn peers_on_wan(&self) -> Vec<&str> {
+        self.states
+            .iter()
+            .filter(|(_, s)| s.current == EndpointTier::Wan)
+            .map(|(k, _)| k.as_str())
+            .collect()
+    }
+}
+
+/// How fresh a kernel `last_handshake` must be to count as "currently,
+/// actually reachable" for transit purposes (PLAN.md M23) — comfortably
+/// above WireGuard's own ~120s `REKEY_AFTER_TIME` ceiling under
+/// continuous 25s keepalive traffic (see `desired_peers`'s
+/// `persistent_keepalive_interval`), so a genuinely live connection is
+/// never misreported, while still catching a dropped peer within a
+/// handful of poll cycles.
+pub const TRANSIT_REACHABLE_HANDSHAKE_MAX: std::time::Duration = std::time::Duration::from_secs(150);
+
+/// This node's own ground truth for "I actually reach this peer right
+/// now" (PLAN.md M23) — the kernel's own `last_handshake` freshness,
+/// **not** `EndpointTracker`'s tier state, which conflates "never had a
+/// ranked candidate to try" (the ordinary, fine, plain-WAN case) with
+/// "tried and failed." Sorted for deterministic truncation by the caller
+/// (`poll_loop::run_once`, to
+/// [`wireserve_types::MAX_TRANSIT_REACHABLE_PER_POLL`]) — never
+/// `HashMap`-iteration-order-dependent.
+#[must_use]
+pub fn transit_reachable_peers(
+    handshakes: &HashMap<String, Option<chrono::DateTime<chrono::Utc>>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<&str> {
+    let max_age = chrono::Duration::from_std(TRANSIT_REACHABLE_HANDSHAKE_MAX)
+        .expect("TRANSIT_REACHABLE_HANDSHAKE_MAX fits in a chrono::Duration");
+    let mut fresh: Vec<&str> = handshakes
+        .iter()
+        .filter_map(|(pubkey, handshake)| {
+            let h = (*handshake)?;
+            (now - h <= max_age).then_some(pubkey.as_str())
+        })
+        .collect();
+    fresh.sort_unstable();
+    fresh
 }
 
 /// A WireGuard peer's own `/32` + `/128` `AllowedIPs` — never a shared
@@ -559,6 +613,13 @@ fn wan_port(p: &PeerInfo) -> Option<u16> {
         .find_map(|s| s.rsplit_once(':').and_then(|(_, port)| port.parse().ok()))
 }
 
+/// Transited peer's pubkey → its via peer's pubkey (PLAN.md M23), built
+/// once per cycle in `poll_loop::run_once` from a `/poll` response's
+/// `PeerInfo::transit_via` fields, filtered to exclude this node's own
+/// pubkey as a key (defensive — the coordinator should never name this
+/// node itself as something to route via itself).
+pub type TransitAssignments<'a> = HashMap<&'a str, &'a str>;
+
 /// Builds the desired kernel peer set (keyed by pubkey) from a `/poll`
 /// response's `peers` array, skipping this node's own entry (peers
 /// includes self — PLAN.md decisions log #12) and any entry whose pubkey
@@ -576,16 +637,40 @@ fn wan_port(p: &PeerInfo) -> Option<u16> {
 /// peer pubkey (PLAN.md decisions log #85, #90+) — a peer absent from it
 /// (or resolved to `Wan`) gets plain WAN behavior, unchanged from before
 /// this feature existed.
+///
+/// `transit` (PLAN.md M23) makes this a **two-pass** build. `AllowedIPs`
+/// is dual-purpose — an outbound routing table and an inbound
+/// cryptographic source filter — so a destination can only ever sit in
+/// one peer's `AllowedIPs` at a time:
+///
+/// - **Pass 1** builds one entry for every peer that is *not* a key in
+///   `transit` (i.e. not itself being redirected elsewhere) — the same
+///   logic as before this feature existed.
+/// - **Pass 2** folds each transited peer's address(es) and owned VIPs
+///   into its `via` peer's *already-built* entry from pass 1, instead of
+///   giving the transited peer its own entry at all.
+///
+/// Edge cases, all handled by construction, not special-cased: a `via`
+/// peer that's also an ordinary direct peer is the common case, not
+/// special (pass 1 builds it normally, pass 2 just extends it); a
+/// dangling `via` (unparseable, or naming a peer this node has no record
+/// for — a stale/inconsistent directory) is a safe no-op, since there is
+/// nothing to fold into and the transited peer correctly gets no entry
+/// either; a cycle (A via B, B via A — shouldn't happen given the
+/// coordinator excludes both endpoints from candidacy, but a
+/// stale/adversarial coordinator could send it) leaves both peers with
+/// no entry at all, safely, since pass 1 skips both.
 pub fn desired_peers(
     peers: &[PeerInfo],
     services: &[ServiceInfo],
     self_pubkey: &str,
     prefer_ipv6: bool,
     endpoint_tiers: &HashMap<String, EndpointTier>,
+    transit: &TransitAssignments<'_>,
 ) -> HashMap<Key, Peer> {
     let mut desired = HashMap::new();
     for p in peers {
-        if p.pubkey == self_pubkey {
+        if p.pubkey == self_pubkey || transit.contains_key(p.pubkey.as_str()) {
             continue;
         }
         let Ok(key) = Key::try_from(p.pubkey.as_str()) else {
@@ -608,6 +693,24 @@ pub fn desired_peers(
         peer.persistent_keepalive_interval = Some(25);
         desired.insert(key, peer);
     }
+
+    // Pass 2: fold each transited peer into its via peer's entry above.
+    for p in peers {
+        let Some(&via) = transit.get(p.pubkey.as_str()) else {
+            continue;
+        };
+        let Ok(via_key) = Key::try_from(via) else {
+            continue;
+        };
+        let Some(via_peer) = desired.get_mut(&via_key) else {
+            continue;
+        };
+        via_peer.allowed_ips.extend(peer_allowed_ips(&p.ip4, &p.ip6));
+        via_peer
+            .allowed_ips
+            .extend(owned_vips(services, &p.name).map(|vip| IpAddrMask::host(IpAddr::V4(vip))));
+    }
+
     desired
 }
 
@@ -617,6 +720,29 @@ fn owned_vips<'a>(services: &'a [ServiceInfo], node: &'a str) -> impl Iterator<I
         .iter()
         .filter(move |s| s.node == node)
         .filter_map(|s| s.vip4.as_deref()?.parse().ok())
+}
+
+/// Builds this node's own forwarding rules for the transit pairs it
+/// carries this cycle (PLAN.md M23), from `PollResponse::transit_carrying`
+/// plus each named pubkey's own `PeerInfo`/`ServiceInfo` entries in the
+/// same response. A pair naming a pubkey this node has no peer record for
+/// (a stale/inconsistent directory) is a safe no-op — dropped rather than
+/// guessed at, same defensive posture as `desired_peers`'s dangling-`via`
+/// handling.
+#[must_use]
+pub fn transit_forwards(peers: &[PeerInfo], services: &[ServiceInfo], carrying: &[TransitPair]) -> Vec<TransitForward> {
+    let endpoint = |pubkey: &str| -> Option<TransitEndpoint> {
+        let p = peers.iter().find(|p| p.pubkey == pubkey)?;
+        Some(TransitEndpoint {
+            ip4: p.ip4.parse().ok(),
+            ip6: p.ip6.parse().ok(),
+            vips: owned_vips(services, &p.name).collect(),
+        })
+    };
+    carrying
+        .iter()
+        .filter_map(|pair| Some(TransitForward { near: endpoint(&pair.a)?, far: endpoint(&pair.c)? }))
+        .collect()
 }
 
 /// Every address this node routes into the mesh interface: each peer's
@@ -871,8 +997,9 @@ impl WgInterface {
         self_pubkey: &str,
         prefer_ipv6: bool,
         endpoint_tiers: &HashMap<String, EndpointTier>,
+        transit: &TransitAssignments<'_>,
     ) -> Result<(), WireguardInterfaceError> {
-        let desired = desired_peers(peers, services, self_pubkey, prefer_ipv6, endpoint_tiers);
+        let desired = desired_peers(peers, services, self_pubkey, prefer_ipv6, endpoint_tiers, transit);
 
         let to_remove = peers_to_remove(self.applied.keys(), &desired);
         for key in &to_remove {
@@ -959,6 +1086,7 @@ mod tests {
             lan_addr: None,
             reflexive_addr: None,
             last_handshake: None,
+            transit_via: None,
         }
     }
 
@@ -1008,7 +1136,7 @@ mod tests {
         let self_key = key_b64(1);
         let other_key = key_b64(2);
         let peers = vec![peer("me", &self_key), peer("other", &other_key)];
-        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new());
+        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &HashMap::new());
         assert_eq!(desired.len(), 1);
     }
 
@@ -1020,8 +1148,166 @@ mod tests {
             peer("bad", "not-a-real-base64-key"),
             peer("good", &good_key),
         ];
-        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new());
+        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &HashMap::new());
         assert_eq!(desired.len(), 1);
+    }
+
+    // ---- transit (PLAN.md M23) ----
+
+    #[test]
+    fn a_transited_peer_gets_no_kernel_entry_of_its_own() {
+        let self_key = key_b64(1);
+        let (b_key, c_key) = (key_b64(2), key_b64(3));
+        let peers = vec![peer("b", &b_key), peer("c", &c_key)];
+        let transit: TransitAssignments<'_> = HashMap::from([(c_key.as_str(), b_key.as_str())]);
+        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &transit);
+        assert_eq!(desired.len(), 1);
+        assert!(desired.contains_key(&Key::try_from(b_key.as_str()).unwrap()));
+    }
+
+    #[test]
+    fn a_transited_peers_address_and_vips_fold_into_its_via_peers_entry() {
+        let self_key = key_b64(1);
+        let (b_key, c_key) = (key_b64(2), key_b64(3));
+        let mut b = peer("b", &b_key);
+        b.ip4 = "100.90.0.2".into();
+        b.ip6 = String::new();
+        let mut c = peer("c", &c_key);
+        c.ip4 = "100.90.0.3".into();
+        c.ip6 = String::new();
+        let services = [service("web", "c", Some("100.90.0.53"))];
+        let transit: TransitAssignments<'_> = HashMap::from([(c_key.as_str(), b_key.as_str())]);
+        let desired = desired_peers(&[b, c], &services, &self_key, false, &HashMap::new(), &transit);
+        let via = desired.get(&Key::try_from(b_key.as_str()).unwrap()).unwrap();
+        let ips: Vec<String> = via.allowed_ips.iter().map(ToString::to_string).collect();
+        assert_eq!(ips, ["100.90.0.2/32", "100.90.0.3/32", "100.90.0.53/32"]);
+    }
+
+    #[test]
+    fn a_direct_peer_that_is_also_a_via_peer_keeps_both_its_own_and_the_transited_address() {
+        let self_key = key_b64(1);
+        let (b_key, c_key) = (key_b64(2), key_b64(3));
+        let mut b = peer("b", &b_key);
+        b.ip4 = "100.90.0.2".into();
+        b.ip6 = String::new();
+        let mut c = peer("c", &c_key);
+        c.ip4 = "100.90.0.3".into();
+        c.ip6 = String::new();
+        let transit: TransitAssignments<'_> = HashMap::from([(c_key.as_str(), b_key.as_str())]);
+        let desired = desired_peers(&[b, c], &[], &self_key, false, &HashMap::new(), &transit);
+        assert_eq!(desired.len(), 1);
+        let via = desired.get(&Key::try_from(b_key.as_str()).unwrap()).unwrap();
+        let ips: Vec<String> = via.allowed_ips.iter().map(ToString::to_string).collect();
+        assert_eq!(ips, ["100.90.0.2/32", "100.90.0.3/32"]);
+    }
+
+    #[test]
+    fn a_dangling_via_naming_an_unknown_peer_is_a_safe_no_op() {
+        let self_key = key_b64(1);
+        let c_key = key_b64(3);
+        let unknown_via = key_b64(9);
+        let peers = vec![peer("c", &c_key)];
+        let transit: TransitAssignments<'_> = HashMap::from([(c_key.as_str(), unknown_via.as_str())]);
+        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &transit);
+        assert!(desired.is_empty());
+    }
+
+    #[test]
+    fn a_transit_cycle_leaves_both_sides_unreachable_rather_than_misrouted() {
+        let self_key = key_b64(1);
+        let (b_key, c_key) = (key_b64(2), key_b64(3));
+        let peers = vec![peer("b", &b_key), peer("c", &c_key)];
+        // A stale/adversarial coordinator naming each as the other's via.
+        let transit: TransitAssignments<'_> = HashMap::from([(b_key.as_str(), c_key.as_str()), (c_key.as_str(), b_key.as_str())]);
+        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &transit);
+        assert!(desired.is_empty());
+    }
+
+    #[test]
+    fn desired_routes_still_covers_a_transited_peers_address() {
+        let self_key = key_b64(1);
+        let (b_key, c_key) = (key_b64(2), key_b64(3));
+        let mut b = peer("b", &b_key);
+        b.ip4 = "100.90.0.2".into();
+        b.ip6 = String::new();
+        let mut c = peer("c", &c_key);
+        c.ip4 = "100.90.0.3".into();
+        c.ip6 = String::new();
+        let transit: TransitAssignments<'_> = HashMap::from([(c_key.as_str(), b_key.as_str())]);
+        let desired = desired_peers(&[b, c], &[], &self_key, false, &HashMap::new(), &transit);
+        let routes: Vec<String> =
+            desired_routes(&desired, std::iter::empty()).iter().map(ToString::to_string).collect();
+        assert_eq!(routes, ["100.90.0.2", "100.90.0.3"]);
+    }
+
+    #[test]
+    fn transit_reachable_peers_keeps_only_fresh_handshakes_sorted_and_deduped_order() {
+        let now = chrono::Utc::now();
+        let handshakes = HashMap::from([
+            ("fresh".to_string(), Some(now - chrono::Duration::seconds(10))),
+            ("stale".to_string(), Some(now - chrono::Duration::seconds(200))),
+            ("never".to_string(), None),
+        ]);
+        assert_eq!(transit_reachable_peers(&handshakes, now), vec!["fresh"]);
+    }
+
+    #[test]
+    fn transit_reachable_peers_boundary_is_inclusive() {
+        let now = chrono::Utc::now();
+        let handshakes = HashMap::from([(
+            "edge".to_string(),
+            Some(now - chrono::Duration::from_std(TRANSIT_REACHABLE_HANDSHAKE_MAX).unwrap()),
+        )]);
+        assert_eq!(transit_reachable_peers(&handshakes, now), vec!["edge"]);
+    }
+
+    #[test]
+    fn peers_on_wan_excludes_a_peer_with_no_tracked_history() {
+        let tracker = EndpointTracker::default();
+        assert!(tracker.peers_on_wan().is_empty());
+    }
+
+    #[test]
+    fn peers_on_wan_includes_a_peer_tracked_and_resolved_to_wan() {
+        // Same shape as `no_handshake_within_the_grace_window_falls_back_
+        // to_wan_and_schedules_a_retry`: a peer that DID have a ranked
+        // candidate (real tracked history), whose grace window then
+        // expired without a handshake, landing it on `Wan` — as opposed
+        // to a peer with no ranked candidate at all, the ordinary
+        // untracked plain-WAN case, which must never show up here.
+        let now = std::time::Instant::now();
+        let mut tracker = EndpointTracker::default();
+        let pubkey = key_b64(2).to_string();
+        tracker.resolve(&pubkey, lan_only("192.168.1.50"), None, now);
+        let tier = tracker.resolve(&pubkey, lan_only("192.168.1.50"), None, now + GRACE);
+        assert_eq!(tier, EndpointTier::Wan);
+        assert_eq!(tracker.peers_on_wan(), vec![pubkey.as_str()]);
+    }
+
+    #[test]
+    fn transit_forwards_builds_near_and_far_from_the_named_peers_own_entries() {
+        let (a_key, c_key) = (key_b64(2), key_b64(3));
+        let mut a = peer("a", &a_key);
+        a.ip4 = "100.90.0.2".into();
+        a.ip6 = String::new();
+        let mut c = peer("c", &c_key);
+        c.ip4 = "100.90.0.3".into();
+        c.ip6 = String::new();
+        let services = [service("web", "c", Some("100.90.0.53"))];
+        let carrying = vec![TransitPair { a: a_key.clone(), c: c_key.clone() }];
+        let forwards = transit_forwards(&[a, c], &services, &carrying);
+        assert_eq!(forwards.len(), 1);
+        assert_eq!(forwards[0].near.ip4, Some("100.90.0.2".parse().unwrap()));
+        assert_eq!(forwards[0].far.ip4, Some("100.90.0.3".parse().unwrap()));
+        assert_eq!(forwards[0].far.vips, vec!["100.90.0.53".parse::<Ipv4Addr>().unwrap()]);
+    }
+
+    #[test]
+    fn transit_forwards_drops_a_pair_naming_an_unknown_peer() {
+        let a_key = key_b64(2);
+        let a = peer("a", &a_key);
+        let carrying = vec![TransitPair { a: a_key, c: key_b64(9) }];
+        assert!(transit_forwards(&[a], &[], &carrying).is_empty());
     }
 
     fn service(name: &str, node: &str, vip4: Option<&str>) -> ServiceInfo {
@@ -1049,7 +1335,7 @@ mod tests {
             service("old", "other", None),
             service("mine", "me", Some("100.90.0.52")),
         ];
-        let desired = desired_peers(&[peer("me", &self_key), other], &services, &self_key, false, &HashMap::new());
+        let desired = desired_peers(&[peer("me", &self_key), other], &services, &self_key, false, &HashMap::new(), &HashMap::new());
         let peer = desired.values().next().unwrap();
         let ips: Vec<String> = peer.allowed_ips.iter().map(ToString::to_string).collect();
         assert_eq!(ips, ["100.90.0.2/32", "fd00:90::2/128", "100.90.0.50/32", "100.90.0.51/32"]);
@@ -1062,7 +1348,7 @@ mod tests {
         other.ip4 = "100.90.0.2".into();
         other.ip6 = String::new();
         let services = [service("web", "other", Some("100.90.0.50"))];
-        let desired = desired_peers(&[other], &services, &self_key, false, &HashMap::new());
+        let desired = desired_peers(&[other], &services, &self_key, false, &HashMap::new(), &HashMap::new());
         let own: Vec<Ipv4Addr> = vec!["100.90.0.60".parse().unwrap()];
         let routes: Vec<String> = desired_routes(&desired, own.into_iter()).iter().map(ToString::to_string).collect();
         assert_eq!(routes, ["100.90.0.2", "100.90.0.50", "100.90.0.60"]);
@@ -1226,14 +1512,14 @@ mod tests {
         other.endpoint_addr_v4 = Some("203.0.113.5:51820".into());
         other.endpoint_addr_v6 = Some("[2001:db8::1]:51820".into());
 
-        let desired_v4 = desired_peers(&[other.clone()], &[], &self_key, false, &HashMap::new());
+        let desired_v4 = desired_peers(&[other.clone()], &[], &self_key, false, &HashMap::new(), &HashMap::new());
         let key = defguard_wireguard_rs::key::Key::try_from(key_b64(2).as_str()).unwrap();
         assert_eq!(
             desired_v4[&key].endpoint,
             Some("203.0.113.5:51820".parse().unwrap())
         );
 
-        let desired_v6 = desired_peers(&[other], &[], &self_key, true, &HashMap::new());
+        let desired_v6 = desired_peers(&[other], &[], &self_key, true, &HashMap::new(), &HashMap::new());
         assert_eq!(
             desired_v6[&key].endpoint,
             Some("[2001:db8::1]:51820".parse::<std::net::SocketAddr>().unwrap())
@@ -1697,7 +1983,7 @@ mod tests {
 
         let mut p = peer("peer", &key_b64(9));
         p.endpoint_addr = Some("10.99.0.1:51820".into());
-        wg.reconcile(std::slice::from_ref(&p), &[], &own.public_key().to_string(), false, &HashMap::new()).unwrap();
+        wg.reconcile(std::slice::from_ref(&p), &[], &own.public_key().to_string(), false, &HashMap::new(), &HashMap::new()).unwrap();
 
         // What `list` reads: the configured endpoint, and no handshake
         // yet — not a handshake in 1970, which is how the kernel says it.
@@ -1717,7 +2003,7 @@ mod tests {
         assert!(routes.contains("100.90.0.5 dev wgtest"), "{routes}");
         assert!(routes.contains("fd00:90::5 dev wgtest"), "{routes}");
 
-        wg.reconcile(&[], &[], &own.public_key().to_string(), false, &HashMap::new()).unwrap();
+        wg.reconcile(&[], &[], &own.public_key().to_string(), false, &HashMap::new(), &HashMap::new()).unwrap();
         let routes = sh("ip -4 route show table all; ip -6 route show table all");
         assert!(!routes.contains("100.90.0.5") && !routes.contains("fd00:90::5"), "departed peer's route removed: {routes}");
         wg.teardown().unwrap();
@@ -1753,7 +2039,7 @@ mod tests {
             service("web", "peer", Some("100.90.0.50")),
             service("mine", "me", Some("100.90.0.51")),
         ];
-        wg.reconcile(&peers, &services, &own_pub, false, &HashMap::new()).unwrap();
+        wg.reconcile(&peers, &services, &own_pub, false, &HashMap::new(), &HashMap::new()).unwrap();
 
         let routes = sh("ip -4 route show table all");
         assert!(routes.contains("100.90.0.50 dev wgtest"), "{routes}");
@@ -1764,7 +2050,7 @@ mod tests {
             assert!(!allowed.contains("100.90.0.51"), "our own address is no peer's: {allowed}");
         }
 
-        wg.reconcile(&peers, &[], &own_pub, false, &HashMap::new()).unwrap();
+        wg.reconcile(&peers, &[], &own_pub, false, &HashMap::new(), &HashMap::new()).unwrap();
         let routes = sh("ip -4 route show table all");
         assert!(!routes.contains("100.90.0.50") && !routes.contains("100.90.0.51"), "{routes}");
 
@@ -1800,7 +2086,7 @@ mod tests {
 
         let mut endpoint_tiers = HashMap::new();
         endpoint_tiers.insert(p.pubkey.clone(), EndpointTier::Lan);
-        wg.reconcile(std::slice::from_ref(&p), &[], &own.public_key().to_string(), false, &endpoint_tiers).unwrap();
+        wg.reconcile(std::slice::from_ref(&p), &[], &own.public_key().to_string(), false, &endpoint_tiers, &HashMap::new()).unwrap();
 
         let tunnel = tunnel_peers("wgtest").unwrap();
         assert_eq!(
@@ -1838,7 +2124,7 @@ mod tests {
 
         let mut endpoint_tiers = HashMap::new();
         endpoint_tiers.insert(p.pubkey.clone(), EndpointTier::Reflexive);
-        wg.reconcile(std::slice::from_ref(&p), &[], &own.public_key().to_string(), false, &endpoint_tiers).unwrap();
+        wg.reconcile(std::slice::from_ref(&p), &[], &own.public_key().to_string(), false, &endpoint_tiers, &HashMap::new()).unwrap();
 
         let tunnel = tunnel_peers("wgtest2").unwrap();
         assert_eq!(

@@ -25,6 +25,7 @@ fn export_config_end_to_end_and_private_key_never_leaves_process() {
         lan_addr: None,
         reflexive_addr: None,
         last_handshake: None,
+        transit_via: None,
     }]);
 
     let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
@@ -224,6 +225,7 @@ fn list_peers_reflects_mock_directory() {
         lan_addr: None,
         reflexive_addr: None,
         last_handshake: None,
+        transit_via: None,
     }]);
     let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
     let resp = wireserve_admin::cmd_list_peers(&client).unwrap();

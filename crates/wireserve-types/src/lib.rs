@@ -7,7 +7,7 @@ pub mod token;
 pub mod validation;
 
 pub use api::*;
-pub use firewall::{FirewallBackend, ServiceRule};
+pub use firewall::{FirewallBackend, ServiceRule, TransitEndpoint, TransitForward};
 pub use node::{NodeKind, Proto};
 pub use ports::{validate_node_targets, validate_service_ports, PortMap, MAX_PORTS_PER_SERVICE};
 pub use token::{hash_token, BEARER_TOKEN_PREFIX, JOIN_TOKEN_PREFIX};

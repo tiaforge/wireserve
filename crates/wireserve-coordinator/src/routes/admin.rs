@@ -67,6 +67,12 @@ pub async fn revoke_node(
     let conn = state.db.conn.lock().await;
     let node = nodes::find_by_name(&conn, &name)?.ok_or(AppError::NotFound)?;
     nodes::revoke(&conn, node.id)?;
+    // PLAN.md M23: a revoked node's transit report can't linger and still
+    // get selected as transit, or still show up as wanting help, for up
+    // to one `online_threshold_secs` window after revocation.
+    if let Some(pubkey) = &node.pubkey {
+        state.transit.forget(pubkey);
+    }
     tracing::info!(event = "node_revoked", node_name = %name);
     Ok(())
 }
@@ -313,6 +319,13 @@ pub async fn deny_service(
 }
 
 /// `GET /admin/peers` (spec §4.5.1).
+///
+/// Every entry's `transit_via` (PLAN.md M23) is always `None` here —
+/// deliberately, not an oversight: it's requester-relative ("how THIS
+/// polling node should reach this peer"), and an admin browsing the
+/// directory isn't a requester polling on behalf of a specific node, so
+/// there is no requester to compute it relative to. `POST /poll` fills it
+/// in for real; see `routes::poll::poll`.
 pub async fn list_peers(
     State(state): State<AppState>,
     _admin: AdminAuth,

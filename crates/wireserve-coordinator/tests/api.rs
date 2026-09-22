@@ -2487,3 +2487,126 @@ async fn poll_rejects_a_malformed_port_mapping() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{ports}: {body}");
     }
 }
+
+// ---- Opt-in transit selection (PLAN.md M23) ----
+
+async fn poll_full(router: &Router, bearer: &str, body: Value) -> (StatusCode, Value) {
+    let req = json_request("POST", "/poll", Some(bearer), body);
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, body_json(resp).await)
+}
+
+fn transit_via_for(body: &Value, peer_name: &str) -> Option<String> {
+    body["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == peer_name)
+        .and_then(|p| p["transit_via"].as_str())
+        .map(str::to_string)
+}
+
+#[tokio::test]
+async fn transit_via_is_filled_once_a_capable_node_reports_reaching_both_wanted_peers() {
+    let app = test_app();
+    let ta = admin_create_node(&app.router, "a").await;
+    let tc = admin_create_node(&app.router, "c").await;
+    let tb = admin_create_node(&app.router, "b").await;
+    let a = register_node(&app.router, &ta, "pk-a", 51820).await;
+    let c = register_node(&app.router, &tc, "pk-c", 51821).await;
+    let b = register_node(&app.router, &tb, "pk-b", 51822).await;
+    let (a_bearer, c_bearer, b_bearer) = (
+        a["bearer_token"].as_str().unwrap(),
+        c["bearer_token"].as_str().unwrap(),
+        b["bearer_token"].as_str().unwrap(),
+    );
+    let (pk_a, pk_c, pk_b) = (pubkey_for("pk-a"), pubkey_for("pk-c"), pubkey_for("pk-b"));
+
+    // A gives up reaching C directly.
+    let (status, _) = poll_full(&app.router, a_bearer, json!({ "services": [], "transit_wanted": [pk_c] })).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // B opts in and reports it currently, actually reaches both.
+    let (status, b_body) = poll_full(
+        &app.router,
+        b_bearer,
+        json!({ "services": [], "transit_capable": true, "transit_reachable": [pk_a, pk_c] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // B's own carrier role this cycle: it discovers it must forward for
+    // (a, c) purely from `transit_carrying` — never from a bare
+    // `transit_via` on its own peer entries, which stay `None` since B
+    // reaches both directly.
+    assert!(transit_via_for(&b_body, "a").is_none());
+    assert!(transit_via_for(&b_body, "c").is_none());
+    let carrying = b_body["transit_carrying"].as_array().unwrap();
+    assert_eq!(carrying.len(), 1);
+    let pair: std::collections::HashSet<&str> =
+        [carrying[0]["a"].as_str().unwrap(), carrying[0]["c"].as_str().unwrap()].into_iter().collect();
+    assert_eq!(pair, [pk_a.as_str(), pk_c.as_str()].into_iter().collect());
+
+    // C's very next poll gets `transit_via = b` for peer a — without C
+    // itself ever having reported wanting anything: A's own earlier
+    // report was enough, via `either_wants`.
+    let (status, c_body) = poll_full(&app.router, c_bearer, json!({ "services": [] })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(transit_via_for(&c_body, "a").as_deref(), Some(pk_b.as_str()));
+
+    // A's next poll gets the same answer for peer c — A must keep
+    // resending `transit_wanted` every cycle (same "resend every poll"
+    // contract as every other self-reported field, e.g. reflexive_addr)
+    // for its own report not to go stale and get wiped by an empty one.
+    let (status, a_body) =
+        poll_full(&app.router, a_bearer, json!({ "services": [], "transit_wanted": [pk_c] })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(transit_via_for(&a_body, "c").as_deref(), Some(pk_b.as_str()));
+}
+
+#[tokio::test]
+async fn malformed_transit_pubkeys_are_dropped_not_rejected() {
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "pk1", 51820).await;
+    let bearer = r1["bearer_token"].as_str().unwrap();
+    let (status, _) = poll_full(
+        &app.router,
+        bearer,
+        json!({
+            "services": [],
+            "transit_capable": true,
+            "transit_reachable": ["not a real pubkey"],
+            "transit_wanted": ["also not one"],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "hints, not identity/addressing facts — never a 400 for the whole poll");
+}
+
+#[tokio::test]
+async fn revoke_removes_a_node_from_transit_consideration() {
+    let app = test_app();
+    let ta = admin_create_node(&app.router, "a").await;
+    let tc = admin_create_node(&app.router, "c").await;
+    let tb = admin_create_node(&app.router, "b").await;
+    let a = register_node(&app.router, &ta, "pk-a", 51820).await;
+    let c = register_node(&app.router, &tc, "pk-c", 51821).await;
+    let b = register_node(&app.router, &tb, "pk-b", 51822).await;
+    let (a_bearer, b_bearer) = (a["bearer_token"].as_str().unwrap(), b["bearer_token"].as_str().unwrap());
+    let (pk_a, pk_c) = (pubkey_for("pk-a"), pubkey_for("pk-c"));
+    let _ = c["bearer_token"].as_str().unwrap();
+
+    poll_full(&app.router, a_bearer, json!({ "services": [], "transit_wanted": [pk_c] })).await;
+    poll_full(&app.router, b_bearer, json!({ "services": [], "transit_capable": true, "transit_reachable": [pk_a, pk_c] })).await;
+
+    let revoke = json_request("POST", "/admin/nodes/b/revoke", Some(ADMIN), json!({}));
+    let resp = app.router.clone().oneshot(revoke).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (_, a_body) = poll_full(&app.router, a_bearer, json!({ "services": [], "transit_wanted": [pk_c] })).await;
+    assert!(
+        transit_via_for(&a_body, "c").is_none(),
+        "a revoked node's stale report must not linger as a transit candidate: {a_body}"
+    );
+}
