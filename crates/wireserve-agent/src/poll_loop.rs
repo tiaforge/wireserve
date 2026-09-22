@@ -757,6 +757,7 @@ mod tests {
                 })
                 .collect(),
             transit_carrying: vec![],
+            transit_awaiting_approval: false,
         }
     }
 

@@ -52,6 +52,11 @@ pub fn admin_router(state: AppState) -> Router {
             "/admin/nodes/{name}/endpoint/{family}",
             delete(admin::clear_node_endpoint_family),
         )
+        .route(
+            "/admin/nodes/{name}/transit/approve",
+            post(admin::approve_transit),
+        )
+        .route("/admin/nodes/{name}/transit/deny", post(admin::deny_transit))
         .route("/admin/peers", get(admin::list_peers))
         .route("/admin/services", get(admin::list_services))
         .route(

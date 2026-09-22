@@ -120,7 +120,17 @@ pub async fn poll(
         .filter(|pk| wireserve_types::is_valid_wg_pubkey(pk))
         .cloned()
         .collect();
-    state.transit.report(&self_pubkey, req.transit_capable, &transit_reachable, &transit_wanted);
+    // Only an admin makes a node a carrier (security review finding #1).
+    // A carrier sees what it relays in the clear, and the two ends put
+    // the other end's addresses in its `AllowedIPs`, so it can also send
+    // packets as either of them. Everything a node reports about itself —
+    // that it is willing, which peers it reaches — is unverified, so the
+    // offer alone would let any one compromised node volunteer for every
+    // pair in the mesh (and win the lowest-pubkey tie-break with a ground
+    // key). Unapproved, the offer is recorded as no offer at all.
+    let transit_capable = req.transit_capable && node.transit_approved;
+    let transit_awaiting_approval = req.transit_capable && !node.transit_approved;
+    state.transit.report(&self_pubkey, transit_capable, &transit_reachable, &transit_wanted);
 
     // Same observed-source-address fallback as `/register` (spec §4.2),
     // re-applied on every poll rather than frozen at join time — see
@@ -279,5 +289,6 @@ pub async fn poll(
         pending_services: outcome.pending.iter().map(directory::pending_service).collect(),
         denied_services: outcome.denied.iter().map(directory::denied_service).collect(),
         transit_carrying,
+        transit_awaiting_approval,
     }))
 }

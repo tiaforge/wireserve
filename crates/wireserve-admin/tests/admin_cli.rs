@@ -120,6 +120,24 @@ fn approve_service_puts_both_names_in_the_path() {
 }
 
 #[test]
+fn transit_approval_targets_the_named_node() {
+    let mock = MockCoordinator::start(TOKEN);
+    let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
+
+    wireserve_admin::cmd_approve_transit(&client, "relay").unwrap();
+    wireserve_admin::cmd_deny_transit(&client, "relay").unwrap();
+    assert!(wireserve_admin::cmd_approve_transit(&client, "../peers").is_err());
+
+    assert_eq!(
+        mock.paths(),
+        vec![
+            "/admin/nodes/relay/transit/approve".to_string(),
+            "/admin/nodes/relay/transit/deny".to_string(),
+        ]
+    );
+}
+
+#[test]
 fn deny_service_sends_the_reason_in_the_body() {
     let mock = MockCoordinator::start(TOKEN);
     let client = AdminClient::new(mock.base_url.as_str(), TOKEN);

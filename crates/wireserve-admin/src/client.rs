@@ -177,6 +177,28 @@ impl AdminClient {
         Ok(())
     }
 
+    /// `POST /admin/nodes/{name}/transit/approve`.
+    pub fn approve_transit(&self, name: &str) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/admin/nodes/{name}/transit/approve")))
+            .bearer_auth(&self.admin_token)
+            .send()?;
+        Self::check_status(resp)?;
+        Ok(())
+    }
+
+    /// `POST /admin/nodes/{name}/transit/deny`.
+    pub fn deny_transit(&self, name: &str) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/admin/nodes/{name}/transit/deny")))
+            .bearer_auth(&self.admin_token)
+            .send()?;
+        Self::check_status(resp)?;
+        Ok(())
+    }
+
     /// `POST /admin/nodes/{node}/services/{service}/deny`.
     pub fn deny_service(
         &self,

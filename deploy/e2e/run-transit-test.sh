@@ -245,6 +245,8 @@ pass "agent2 and agent4 cannot reach each other directly — this is the case tr
 
 log "opting agent1 in as transit"
 podman exec "$AGENT1" wireserve-agent transit on
+log "approving node1 as a carrier (the node's own opt-in is not enough on its own)"
+podman exec "$COORD" wireserve-admin approve-transit node1 || fail "could not approve node1 for transit"
 log "waiting for transit selection to propagate (up to one poll interval each side)"
 sleep 20
 

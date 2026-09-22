@@ -200,7 +200,9 @@ pub fn render(view: &ListView, now: DateTime<Utc>) -> String {
     if view.transit_capable || !view.transit_carrying.is_empty() {
         out.push('\n');
         out.push_str(&format!("Transit: {}", if view.transit_capable { "on" } else { "off" }));
-        if view.transit_carrying.is_empty() {
+        if view.transit_awaiting_approval {
+            out.push_str(", waiting for an admin to approve this node as a carrier\n");
+        } else if view.transit_carrying.is_empty() {
             out.push_str(", carrying nothing right now\n");
         } else {
             let pairs: Vec<String> = view
@@ -270,6 +272,7 @@ mod tests {
             node: Some("lego2".into()),
             transit_capable: false,
             transit_carrying: vec![],
+            transit_awaiting_approval: false,
             // The coordinator recorded strato's IPv6 candidate; WireGuard
             // is really talking to its IPv4 one.
             peers: vec![
@@ -355,6 +358,13 @@ Not published:
         let view = ListView { transit_capable: true, ..Default::default() };
         let out = render(&view, now());
         assert!(out.contains("Transit: on, carrying nothing right now"), "{out}");
+    }
+
+    #[test]
+    fn transit_on_but_unapproved_says_what_it_is_waiting_for() {
+        let view = ListView { transit_capable: true, transit_awaiting_approval: true, ..Default::default() };
+        let out = render(&view, now());
+        assert!(out.contains("Transit: on, waiting for an admin to approve this node as a carrier"), "{out}");
     }
 
     #[test]

@@ -150,15 +150,16 @@ pub async fn clear_node_endpoint_family(
 
 /// `POST /admin/nodes/{name}/rejoin` (spec §4.5).
 ///
-/// Also clears the node's current bearer token immediately (security
-/// review S8): spec §4.5 explicitly covers calling this on a node whose
-/// key is "suspected compromised" while the node itself isn't yet
-/// revoked — leaving the OLD bearer token live until a new `/register`
-/// completes would mean a compromised credential keeps working for the
-/// entire window between "we suspect this" and "the physical operator
-/// gets around to re-registering it," which defeats the point of having
-/// this path at all. `revoked` itself still only clears back to `0` on a
-/// *successful* subsequent `/register` (unchanged).
+/// Also cuts off the node's current identity immediately — its bearer
+/// token (security review S8) and its WireGuard pubkey (finding #2), see
+/// `nodes::reissue_join_token`. Spec §4.5 explicitly covers calling this
+/// on a node whose key is "suspected compromised" while the node itself
+/// isn't yet revoked; leaving either credential live until a new
+/// `/register` completes would mean the compromised one keeps working for
+/// the entire window between "we suspect this" and "the physical
+/// operator gets around to re-registering it," which defeats the point of
+/// having this path at all. `revoked` itself still only clears back to
+/// `0` on a *successful* subsequent `/register` (unchanged).
 pub async fn rejoin_node(
     State(state): State<AppState>,
     _admin: AdminAuth,
@@ -180,7 +181,11 @@ pub async fn rejoin_node(
     let join_token = tokengen::generate(JOIN_TOKEN_PREFIX);
     let hash = wireserve_types::hash_token(&join_token);
     nodes::reissue_join_token(&conn, node.id, &hash, expires_at.as_deref())?;
-    nodes::clear_bearer_token(&conn, node.id)?;
+    // Same as revoke: the old key must not linger as a carrier or as a
+    // node wanting transit help until its report goes stale.
+    if let Some(pubkey) = &node.pubkey {
+        state.transit.forget(pubkey);
+    }
 
     tracing::info!(event = "node_rejoined", node_name = %name, join_token_ttl_secs = ttl);
 
@@ -318,6 +323,58 @@ pub async fn deny_service(
     }
 }
 
+/// `POST /admin/nodes/{name}/transit/approve`.
+///
+/// Lets a node carry transit traffic for other peers, from its next poll
+/// on, provided it has also opted in itself (`wireserve-agent transit
+/// on`). Both halves are required: the node's own opt-in is its
+/// operator's consent to spend the bandwidth, this is the mesh admin's
+/// trust in it — a carrier sees relayed traffic in the clear and can
+/// send packets as either end (security review finding #1).
+///
+/// Granted to the node's current identity: revoke and rejoin both
+/// withdraw it.
+pub async fn approve_transit(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path(name): Path<String>,
+) -> Result<(), AppError> {
+    let conn = state.db.conn.lock().await;
+    let node = nodes::find_by_name(&conn, &name)?.ok_or(AppError::NotFound)?;
+    if node.kind == wireserve_types::NodeKind::Static {
+        return Err(AppError::BadRequest(
+            "a kind=static node never polls, so it can never carry transit".into(),
+        ));
+    }
+    if node.revoked {
+        return Err(AppError::Conflict(
+            "node is revoked — rejoin and re-register it before approving it".into(),
+        ));
+    }
+    nodes::set_transit_approved(&conn, node.id, true)?;
+    tracing::info!(event = "transit_approved", node_name = %name);
+    Ok(())
+}
+
+/// `POST /admin/nodes/{name}/transit/deny` — withdraws transit approval.
+/// Effective immediately for carrier selection, not at the node's next
+/// poll: pairs it was carrying get a new carrier (or none) on their own
+/// next polls.
+pub async fn deny_transit(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path(name): Path<String>,
+) -> Result<(), AppError> {
+    let conn = state.db.conn.lock().await;
+    let node = nodes::find_by_name(&conn, &name)?.ok_or(AppError::NotFound)?;
+    nodes::set_transit_approved(&conn, node.id, false)?;
+    if let Some(pubkey) = &node.pubkey {
+        state.transit.withdraw_carrier(pubkey);
+    }
+    tracing::info!(event = "transit_denied", node_name = %name);
+    Ok(())
+}
+
 /// `GET /admin/peers` (spec §4.5.1).
 ///
 /// Every entry's `transit_via` (PLAN.md M23) is always `None` here —
@@ -331,9 +388,15 @@ pub async fn list_peers(
     _admin: AdminAuth,
 ) -> Result<Json<AdminPeersResponse>, AppError> {
     let conn = state.db.conn.lock().await;
-    let peers = nodes::list_all_peers(&conn)?
+    let rows = nodes::list_all_peers(&conn)?;
+    let peers = rows
         .iter()
         .map(|n| crate::directory::peer_info(n, state.config.online_threshold_secs))
         .collect();
-    Ok(Json(AdminPeersResponse { peers }))
+    let transit_approved = rows
+        .iter()
+        .filter(|n| n.transit_approved)
+        .map(|n| n.name.clone())
+        .collect();
+    Ok(Json(AdminPeersResponse { peers, transit_approved }))
 }

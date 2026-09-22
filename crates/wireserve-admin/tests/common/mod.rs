@@ -276,7 +276,31 @@ async fn list_peers(
         return Err(StatusCode::UNAUTHORIZED);
     }
     let peers = state.peers.lock().unwrap().clone();
-    Ok(Json(AdminPeersResponse { peers }))
+    Ok(Json(AdminPeersResponse { peers, transit_approved: vec![] }))
+}
+
+async fn approve_transit(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    record(&state, "POST", &format!("/admin/nodes/{name}/transit/approve"), b"");
+    if !admin_auth_ok(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(StatusCode::OK)
+}
+
+async fn deny_transit(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    record(&state, "POST", &format!("/admin/nodes/{name}/transit/deny"), b"");
+    if !admin_auth_ok(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(StatusCode::OK)
 }
 
 async fn register(
@@ -303,6 +327,8 @@ fn admin_only_routes() -> Router<MockState> {
             "/admin/nodes/{name}/endpoint",
             axum::routing::delete(clear_endpoint),
         )
+        .route("/admin/nodes/{name}/transit/approve", post(approve_transit))
+        .route("/admin/nodes/{name}/transit/deny", post(deny_transit))
         .route("/admin/peers", get(list_peers))
         .route("/admin/services", get(list_services))
         .route(

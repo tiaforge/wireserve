@@ -103,6 +103,17 @@ enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Allow a node to carry transit traffic for peers that can't reach
+    /// each other directly. The node must also opt in itself
+    /// (`wireserve-agent transit on`). A carrier sees the traffic it
+    /// relays unencrypted and can send packets as either end, so approve
+    /// only nodes you trust as much as the traffic between any two
+    /// others. Revoke and rejoin both withdraw the approval.
+    ApproveTransit { name: String },
+    /// Withdraw a node's approval to carry transit traffic. Takes effect
+    /// for new carrier choices at once; the pairs it carried move off it
+    /// on their next poll.
+    DenyTransit { name: String },
     /// Generate a WireGuard .conf for an agent-less consumer-only device
     /// (spec §9).
     ExportConfig {
@@ -252,17 +263,33 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                  (up to one poll interval from now)"
             );
         }
+        Command::ApproveTransit { name } => {
+            check_name(&name)?;
+            let client = build_client(&coordinator_url, &admin_token)?;
+            wireserve_admin::cmd_approve_transit(&client, &name)?;
+            println!("node '{name}' approved to carry transit traffic");
+            println!(
+                "  it carries nothing until it has also run `wireserve-agent transit on`"
+            );
+        }
+        Command::DenyTransit { name } => {
+            check_name(&name)?;
+            let client = build_client(&coordinator_url, &admin_token)?;
+            wireserve_admin::cmd_deny_transit(&client, &name)?;
+            println!("node '{name}' may no longer carry transit traffic");
+        }
         Command::ListPeers => {
             let client = build_client(&coordinator_url, &admin_token)?;
             let resp = wireserve_admin::cmd_list_peers(&client)?;
             for p in resp.peers {
+                let transit = if resp.transit_approved.contains(&p.name) { "approved" } else { "-" };
                 // S2 defense in depth: a peer field containing a newline
                 // could otherwise spoof extra lines of terminal output —
                 // same "don't trust the coordinator's validation as the
                 // only line of defense" reasoning as export_config's
                 // renderer.
                 println!(
-                    "{}\t{}\t{}\t{}\tendpoint={}\tv4={}\tv6={}\tlan={}\treflexive={}",
+                    "{}\t{}\t{}\t{}\tendpoint={}\tv4={}\tv6={}\tlan={}\treflexive={}\ttransit={}",
                     sanitize_for_terminal(&p.name),
                     sanitize_for_terminal(&p.pubkey),
                     sanitize_for_terminal(&p.ip4),
@@ -286,7 +313,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     p.reflexive_addr
                         .as_deref()
                         .map(sanitize_for_terminal)
-                        .unwrap_or_else(|| "-".to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    transit
                 );
             }
         }

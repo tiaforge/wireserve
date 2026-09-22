@@ -2522,12 +2522,14 @@ async fn transit_via_is_filled_once_a_capable_node_reports_reaching_both_wanted_
         b["bearer_token"].as_str().unwrap(),
     );
     let (pk_a, pk_c, pk_b) = (pubkey_for("pk-a"), pubkey_for("pk-c"), pubkey_for("pk-b"));
+    assert_eq!(admin_post(&app.router, "/admin/nodes/b/transit/approve").await, StatusCode::OK);
 
     // A gives up reaching C directly.
     let (status, _) = poll_full(&app.router, a_bearer, json!({ "services": [], "transit_wanted": [pk_c] })).await;
     assert_eq!(status, StatusCode::OK);
 
-    // B opts in and reports it currently, actually reaches both.
+    // B, approved by the admin, opts in and reports it currently,
+    // actually reaches both.
     let (status, b_body) = poll_full(
         &app.router,
         b_bearer,
@@ -2562,6 +2564,147 @@ async fn transit_via_is_filled_once_a_capable_node_reports_reaching_both_wanted_
         poll_full(&app.router, a_bearer, json!({ "services": [], "transit_wanted": [pk_c] })).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(transit_via_for(&a_body, "c").as_deref(), Some(pk_b.as_str()));
+}
+
+async fn admin_peers(router: &Router) -> Value {
+    let req = raw_request("GET", "/admin/peers", Some(&format!("Bearer {ADMIN}")));
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
+}
+
+/// A, B and C registered; A wants transit to C; B offers to carry and
+/// claims to reach both. Returns the three bearer tokens.
+async fn transit_scenario(app: &TestApp) -> (String, String, String) {
+    let ta = admin_create_node(&app.router, "a").await;
+    let tc = admin_create_node(&app.router, "c").await;
+    let tb = admin_create_node(&app.router, "b").await;
+    let bearer = |v: Value| v["bearer_token"].as_str().unwrap().to_string();
+    let a = bearer(register_node(&app.router, &ta, "pk-a", 51820).await);
+    let c = bearer(register_node(&app.router, &tc, "pk-c", 51821).await);
+    let b = bearer(register_node(&app.router, &tb, "pk-b", 51822).await);
+    let (status, _) =
+        poll_full(&app.router, &a, json!({ "services": [], "transit_wanted": [pubkey_for("pk-c")] })).await;
+    assert_eq!(status, StatusCode::OK);
+    (a, b, c)
+}
+
+fn b_offers_transit() -> Value {
+    json!({
+        "services": [],
+        "transit_capable": true,
+        "transit_reachable": [pubkey_for("pk-a"), pubkey_for("pk-c")],
+    })
+}
+
+// Security review finding #1: a node's own offer to carry transit, and its
+// own claim about which peers it reaches, are unverified — never enough
+// to make it the node two others route through.
+#[tokio::test]
+async fn an_unapproved_node_is_never_chosen_as_a_carrier_however_it_reports() {
+    let app = test_app();
+    let (_a, b, c) = transit_scenario(&app).await;
+
+    let (status, b_body) = poll_full(&app.router, &b, b_offers_transit()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(b_body.get("transit_carrying").is_none(), "{b_body}");
+    assert_eq!(b_body["transit_awaiting_approval"], json!(true), "the node is told why");
+
+    let (_, c_body) = poll_full(&app.router, &c, json!({ "services": [] })).await;
+    assert!(transit_via_for(&c_body, "a").is_none(), "nobody is routed through an unapproved node");
+}
+
+#[tokio::test]
+async fn approving_a_node_lets_it_carry_and_denying_it_stops_selection_at_once() {
+    let app = test_app();
+    let (_a, b, c) = transit_scenario(&app).await;
+    let pk_b = pubkey_for("pk-b");
+
+    assert_eq!(admin_post(&app.router, "/admin/nodes/b/transit/approve").await, StatusCode::OK);
+    let (_, b_body) = poll_full(&app.router, &b, b_offers_transit()).await;
+    assert!(b_body.get("transit_awaiting_approval").is_none(), "{b_body}");
+    assert_eq!(b_body["transit_carrying"].as_array().unwrap().len(), 1);
+    let (_, c_body) = poll_full(&app.router, &c, json!({ "services": [] })).await;
+    assert_eq!(transit_via_for(&c_body, "a").as_deref(), Some(pk_b.as_str()));
+    assert_eq!(admin_peers(&app.router).await["transit_approved"], json!(["b"]));
+
+    // Withdrawn: C's very next poll routes directly again, without B
+    // having polled in between to refresh its own report.
+    assert_eq!(admin_post(&app.router, "/admin/nodes/b/transit/deny").await, StatusCode::OK);
+    let (_, c_body) = poll_full(&app.router, &c, json!({ "services": [] })).await;
+    assert!(transit_via_for(&c_body, "a").is_none());
+    assert!(admin_peers(&app.router).await.get("transit_approved").is_none());
+
+    let (_, b_body) = poll_full(&app.router, &b, b_offers_transit()).await;
+    assert!(b_body.get("transit_carrying").is_none());
+    assert_eq!(b_body["transit_awaiting_approval"], json!(true));
+}
+
+#[tokio::test]
+async fn transit_approval_is_refused_where_it_cannot_mean_anything() {
+    let app = test_app();
+    assert_eq!(admin_post(&app.router, "/admin/nodes/ghost/transit/approve").await, StatusCode::NOT_FOUND);
+
+    let req = json_request("POST", "/admin/nodes", Some(ADMIN), json!({ "name": "phone", "kind": "static" }));
+    assert_eq!(app.router.clone().oneshot(req).await.unwrap().status(), StatusCode::CREATED);
+    assert_eq!(admin_post(&app.router, "/admin/nodes/phone/transit/approve").await, StatusCode::BAD_REQUEST);
+
+    let t = admin_create_node(&app.router, "gone").await;
+    register_node(&app.router, &t, "pk-gone", 51820).await;
+    assert_eq!(admin_post(&app.router, "/admin/nodes/gone/revoke").await, StatusCode::OK);
+    assert_eq!(admin_post(&app.router, "/admin/nodes/gone/transit/approve").await, StatusCode::CONFLICT);
+
+    let req = json_request("POST", "/admin/nodes/gone/transit/approve", Some("wrong-token"), json!({}));
+    assert_eq!(app.router.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn rejoin_withdraws_transit_approval_and_the_old_carrier_report() {
+    let app = test_app();
+    let (_a, b, c) = transit_scenario(&app).await;
+    assert_eq!(admin_post(&app.router, "/admin/nodes/b/transit/approve").await, StatusCode::OK);
+    poll_full(&app.router, &b, b_offers_transit()).await;
+
+    let req = json_request("POST", "/admin/nodes/b/rejoin", Some(ADMIN), json!({}));
+    let body = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
+    let (_, c_body) = poll_full(&app.router, &c, json!({ "services": [] })).await;
+    assert!(transit_via_for(&c_body, "a").is_none(), "the replaced key must stop carrying at once");
+
+    let new_b = register_node(&app.router, body["join_token"].as_str().unwrap(), "pk-b-new", 51822).await;
+    let (_, b_body) = poll_full(&app.router, new_b["bearer_token"].as_str().unwrap(), b_offers_transit()).await;
+    assert_eq!(b_body["transit_awaiting_approval"], json!(true), "the new identity needs its own approval");
+}
+
+// Security review finding #2: rejoin is the path for a key "suspected
+// compromised" (spec §4.5), so the old WireGuard key must stop being a
+// peer of every other node immediately — not when, or if, the real
+// machine re-registers.
+#[tokio::test]
+async fn rejoin_removes_the_old_key_from_every_other_nodes_directory_at_once() {
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let t2 = admin_create_node(&app.router, "n2").await;
+    register_node(&app.router, &t1, "n1-old", 51820).await;
+    let r2 = register_node(&app.router, &t2, "n2", 51821).await;
+    let n2_bearer = r2["bearer_token"].as_str().unwrap();
+    let old_key = pubkey_for("n1-old");
+
+    let req = json_request("POST", "/admin/nodes/n1/rejoin", Some(ADMIN), json!({}));
+    let body = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
+
+    let (_, n2_body) = poll_full(&app.router, n2_bearer, json!({ "services": [] })).await;
+    let pubkeys: Vec<&str> =
+        n2_body["peers"].as_array().unwrap().iter().map(|p| p["pubkey"].as_str().unwrap()).collect();
+    assert!(!pubkeys.contains(&old_key.as_str()), "old key still handed out: {pubkeys:?}");
+    assert!(
+        !admin_peers(&app.router).await["peers"].as_array().unwrap().iter().any(|p| p["name"] == "n1"),
+        "not a peer at all until it registers again"
+    );
+
+    register_node(&app.router, body["join_token"].as_str().unwrap(), "n1-new", 51820).await;
+    let (_, n2_body) = poll_full(&app.router, n2_bearer, json!({ "services": [] })).await;
+    let n1 = n2_body["peers"].as_array().unwrap().iter().find(|p| p["name"] == "n1").expect("back under its new key");
+    assert_eq!(n1["pubkey"].as_str().unwrap(), pubkey_for("n1-new"));
 }
 
 #[tokio::test]

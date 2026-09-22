@@ -78,6 +78,10 @@ pub struct ListView {
     /// of the last poll — see `wireserve_types::PollResponse::transit_carrying`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transit_carrying: Vec<wireserve_types::TransitPair>,
+    /// Opted in, but no admin has approved this node as a carrier yet —
+    /// see `wireserve_types::PollResponse::transit_awaiting_approval`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transit_awaiting_approval: bool,
     /// The coordinator's view of every peer, as of the last poll.
     pub peers: Vec<PeerInfo>,
     /// The kernel's view of the same peers, read when `list` asked: the

@@ -96,6 +96,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0006_service_vips.sql")),
         M::up(include_str!("../../migrations/0007_lan_addr.sql")),
         M::up(include_str!("../../migrations/0008_reflexive_addr.sql")),
+        M::up(include_str!("../../migrations/0009_transit_approval.sql")),
     ])
 }
 
@@ -341,6 +342,27 @@ mod tests {
 
         let row = crate::db::nodes::find_by_name(&conn, "n1").unwrap().unwrap();
         assert!(!row.endpoint_cleared);
+    }
+
+    #[test]
+    fn migration_approves_no_existing_node_for_transit() {
+        // The opposite of grandfathering: nodes that were already
+        // relaying before approval existed got there by self-report
+        // alone, which is exactly what approval exists to stop.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        migrations().to_version(&mut conn, 8).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (name, kind, pubkey, ip4, ip6, join_token_used) \
+             VALUES ('n1', 'agent', 'pk1', '100.90.0.1', 'fd00:90::1', 1)",
+            [],
+        )
+        .unwrap();
+
+        migrations().to_latest(&mut conn).unwrap();
+
+        let row = crate::db::nodes::find_by_name(&conn, "n1").unwrap().unwrap();
+        assert!(!row.transit_approved);
     }
 
     #[test]

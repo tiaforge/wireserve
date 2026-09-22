@@ -112,6 +112,16 @@ pub fn cmd_deny_service(
     Ok(client.deny_service(node, service, reason)?)
 }
 
+pub fn cmd_approve_transit(client: &AdminClient, name: &str) -> Result<(), CliError> {
+    validate_name(name)?;
+    Ok(client.approve_transit(name)?)
+}
+
+pub fn cmd_deny_transit(client: &AdminClient, name: &str) -> Result<(), CliError> {
+    validate_name(name)?;
+    Ok(client.deny_transit(name)?)
+}
+
 pub fn cmd_export_config(
     admin_client: &AdminClient,
     node_facing_url: &str,

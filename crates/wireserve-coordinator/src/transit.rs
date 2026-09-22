@@ -86,8 +86,21 @@ impl TransitState {
         wants(a, c) || wants(c, a)
     }
 
-    /// Drops a node's report — on revoke, so it can never be selected as
-    /// transit and never shows up as wanting anything afterward.
+    /// Stops a node being selected as a carrier from this moment, keeping
+    /// the rest of its report (what it wants) — for an admin withdrawing
+    /// its transit approval, which should not wait for the node's next
+    /// poll to take effect.
+    pub fn withdraw_carrier(&self, pubkey: &str) {
+        let mut by_pubkey = self.by_pubkey.lock().expect("transit state mutex poisoned");
+        if let Some(report) = by_pubkey.get_mut(pubkey) {
+            report.transit_capable = false;
+            report.reachable.clear();
+        }
+    }
+
+    /// Drops a node's report — on revoke and rejoin, so it can never be
+    /// selected as transit and never shows up as wanting anything
+    /// afterward.
     pub fn forget(&self, pubkey: &str) {
         let mut by_pubkey = self.by_pubkey.lock().expect("transit state mutex poisoned");
         by_pubkey.remove(pubkey);
@@ -174,6 +187,15 @@ mod tests {
         s.report("b", true, &["a".into(), "c".into()], &[]);
         s.report("b", true, &["a".into()], &[]);
         assert_eq!(s.select("a", "c", 30), None);
+    }
+
+    #[test]
+    fn withdraw_carrier_stops_selection_but_keeps_what_the_node_wants() {
+        let s = TransitState::default();
+        s.report("b", true, &["a".into(), "c".into()], &["x".into()]);
+        s.withdraw_carrier("b");
+        assert_eq!(s.select("a", "c", 30), None);
+        assert!(s.either_wants("b", "x"));
     }
 
     #[test]

@@ -129,6 +129,7 @@ mod tests {
             listen_port: Some(51820),
             revoked: false,
             last_seen,
+            transit_approved: false,
         }
     }
 

@@ -125,6 +125,7 @@ mod tests {
             pending_services: vec![],
             denied_services: vec![],
             transit_carrying: vec![],
+            transit_awaiting_approval: false,
         }
     }
 

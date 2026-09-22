@@ -320,9 +320,11 @@ podman exec wireserve-coordinator wireserve-admin revoke homeserver
 The node's token stops working immediately, and every other node drops it
 as a peer on its own next poll, so removal across the mesh is bounded by
 the poll interval rather than instant. `rejoin` issues a fresh join token
-for the same name and address when the machine itself is still trusted;
-`delete-node` frees the name entirely, and refuses until the node is
-revoked.
+for the same name and address when the machine itself is still trusted
+but its key may not be: the old key and token stop working at once, and
+the node drops out of every other node's peer list until it registers
+again under a new key. `delete-node` frees the name entirely, and refuses
+until the node is revoked.
 
 ### 6. Route through another node when NAT blocks a direct path
 
@@ -336,21 +338,29 @@ decrypts and re-encrypts at the kernel layer and forwards it on, the same
 way any router forwards a packet — no separate relay server, no new
 protocol, and the coordinator never sees the traffic.
 
-**This is opt-in, per node, and off by default.** Nothing is ever picked
-as a carrier just because it happens to be reachable — a node with a
-data cap, say, should simply never be used:
+**A node carries traffic only with two approvals, and has neither by
+default.** Its own operator opts in, so a node with a data cap, say, is
+never used; and the mesh admin approves it as a carrier:
 
 ```sh
-wireserve-agent transit on   # this node may now carry traffic for others
+wireserve-agent transit on   # on the node: willing to carry traffic for others
 wireserve-agent transit off  # stop — takes effect on the next poll, no rejoin
+
+wireserve-admin approve-transit homeserver   # on the admin side: trusted to
+wireserve-admin deny-transit homeserver      # withdraw it again
 ```
 
-The trade-off to know before opting in: unlike an ordinary connection,
-which is end-to-end between the two nodes involved, a carrier genuinely
-sees the mesh-layer plaintext of whatever pairs route through it. Nothing
-else about it needs an opt-in on the *other* two nodes' side — every
-member of a mesh already trusts every other member, so the carrier's own
-opt-in is the only trust boundary this needs.
+The admin half is there because of what a carrier can do. Unlike an
+ordinary connection, which is end-to-end between the two nodes involved,
+a carrier sees the mesh-layer plaintext of whatever pairs route through
+it, and can send packets that appear to come from either end. What a node
+says about itself (that it is willing, which peers it reaches) cannot be
+verified, so without approval a single compromised node could offer to
+carry every pair in the mesh. Until it is approved, `wireserve-agent
+list` on that node says `Transit: on, waiting for an admin to approve
+this node as a carrier`. Revoking or rejoining a node withdraws its
+approval, and `list-peers` shows who currently has one
+(`transit=approved`).
 
 `wireserve-agent list` shows the outcome, both for a peer this node can't
 reach directly and for what this node is carrying on others' behalf:
@@ -379,7 +389,7 @@ On a node, talking to the local daemon over a Unix socket:
 | `wireserve-agent join [url] [token]` | one-time bootstrap, generates the keypair — prompts for either if omitted |
 | `wireserve-agent serve <name> <[public:]target[/tcp\|/udp]>...` | publish a service on its own address |
 | `wireserve-agent unserve <name>` | withdraw one |
-| `wireserve-agent transit on\|off` | opt in/out of carrying traffic for two other nodes that can't reach each other directly |
+| `wireserve-agent transit on\|off` | opt in/out of carrying traffic for two other nodes that can't reach each other directly (also needs `approve-transit`) |
 | `wireserve-agent list [--json]` | services (name, address, ports, owner, state), peers (with each one's route — direct or via a carrier) and anything not published, from the last poll |
 | `wireserve-agent leave` | tear down interface, firewall, hosts block |
 
@@ -393,12 +403,14 @@ anywhere that can reach it):
 | `wireserve-admin export-config <name>` | create a static peer, print a `.conf` |
 | `wireserve-admin list-peers` | the full directory |
 | `wireserve-admin revoke <name>` | cut a node off, keep its name reserved |
-| `wireserve-admin rejoin <name>` | fresh join token, same name and address |
+| `wireserve-admin rejoin <name>` | fresh join token, same name and address; the old key stops working at once |
 | `wireserve-admin delete-node <name>` | remove the record, free the name |
 | `wireserve-admin clear-endpoint <name>` | drop a stale advertised endpoint |
 | `wireserve-admin list-services [--pending]` | declared services and their approval state |
 | `wireserve-admin approve-service <node> <svc>` | let a declaration reach the mesh |
 | `wireserve-admin deny-service <node> <svc>` | refuse one, or withdraw an approval |
+| `wireserve-admin approve-transit <name>` | let a node that opted in carry traffic for others |
+| `wireserve-admin deny-transit <name>` | withdraw that |
 
 ## Workspace layout
 

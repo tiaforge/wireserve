@@ -91,7 +91,9 @@ enum Command {
     /// peers that can't reach each other directly (PLAN.md M23) — a live
     /// operational toggle, same shape as `serve`/`unserve`: takes effect
     /// next poll, no rejoin. Off by default; a node with metered/capped
-    /// traffic should simply never turn it on.
+    /// traffic should simply never turn it on. Opting in is only half:
+    /// the coordinator ignores the offer until an admin also approves
+    /// this node with `wireserve-admin approve-transit`.
     Transit {
         #[command(subcommand)]
         action: TransitAction,
@@ -715,10 +717,14 @@ async fn cmd_transit(instance: &Instance, action: TransitAction) -> Result<(), B
     let enabled = matches!(action, TransitAction::On);
     let resp = client::call(&instance.socket_path(), &IpcRequest::TransitCapable { enabled }).await?;
     if matches!(resp, wireserve_agent::ipc::IpcResponse::Ok) {
-        println!(
-            "ok — transit {}; takes effect on the next poll",
-            if enabled { "enabled" } else { "disabled" }
-        );
+        if enabled {
+            println!(
+                "ok — transit enabled; this node carries traffic only once an admin approves \
+                 it (`wireserve-admin approve-transit <node>`), from the next poll after that"
+            );
+        } else {
+            println!("ok — transit disabled; takes effect on the next poll");
+        }
         return Ok(());
     }
     print_response(resp);

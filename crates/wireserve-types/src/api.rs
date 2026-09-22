@@ -416,6 +416,15 @@ pub struct PollResponse {
     /// cycle.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transit_carrying: Vec<TransitPair>,
+    /// THIS node asked to carry transit (`transit_capable`) but no admin
+    /// has approved it as a carrier, so the coordinator is ignoring the
+    /// offer. A self-reported offer is never enough on its own: a carrier
+    /// sees the traffic it relays in the clear and can send packets as
+    /// either end, so only an admin decides who may be one. Reported so
+    /// `wireserve-agent list` can say why the node never carries
+    /// anything; absent from the JSON when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transit_awaiting_approval: bool,
     /// THIS node's own declarations awaiting approval — never anyone
     /// else's.
     ///
@@ -502,6 +511,11 @@ pub struct RejoinResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminPeersResponse {
     pub peers: Vec<PeerInfo>,
+    /// Names of the nodes an admin has approved to carry transit traffic.
+    /// Admin-only on purpose: `PeerInfo` also goes to every node, and
+    /// which nodes may relay is nothing the rest of the mesh needs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transit_approved: Vec<String>,
 }
 
 #[cfg(test)]
@@ -543,11 +557,13 @@ mod tests {
             pending_services: vec![],
             denied_services: vec![],
             transit_carrying: vec![],
+            transit_awaiting_approval: false,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("pending_services"), "{json}");
         assert!(!json.contains("denied_services"), "{json}");
         assert!(!json.contains("transit_carrying"), "{json}");
+        assert!(!json.contains("transit_awaiting_approval"), "{json}");
     }
 
     #[test]
@@ -622,6 +638,7 @@ mod tests {
             pending_services: vec![],
             denied_services: vec![],
             transit_carrying: vec![],
+            transit_awaiting_approval: false,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: PollResponse = serde_json::from_str(&json).unwrap();

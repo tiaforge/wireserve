@@ -37,6 +37,10 @@ pub struct NodeRow {
     pub listen_port: Option<i64>,
     pub revoked: bool,
     pub last_seen: Option<DateTime<Utc>>,
+    /// Whether an admin has approved this node to carry transit traffic
+    /// for other peers (`transit_approved_at IS NOT NULL`). The node's own
+    /// `transit_capable` report counts for nothing without it.
+    pub transit_approved: bool,
 }
 
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
@@ -59,6 +63,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
         listen_port: row.get("listen_port")?,
         revoked: row.get("revoked")?,
         last_seen: last_seen_str.and_then(|s| parse_dt(&s)),
+        transit_approved: row.get::<_, Option<String>>("transit_approved_at")?.is_some(),
     })
 }
 
@@ -326,7 +331,7 @@ pub fn revoke(conn: &Connection, node_id: i64) -> Result<(), DbError> {
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "UPDATE nodes SET revoked = 1, revoked_at = ?1, bearer_token_hash = NULL, \
-         join_token_hash = NULL, join_token_used = 1 \
+         join_token_hash = NULL, join_token_used = 1, transit_approved_at = NULL \
          WHERE id = ?2",
         rusqlite::params![now_str(), node_id],
     )?;
@@ -335,8 +340,26 @@ pub fn revoke(conn: &Connection, node_id: i64) -> Result<(), DbError> {
     Ok(())
 }
 
-/// Issues a fresh one-time join token for an existing node record (spec
-/// §4.5). Does NOT clear `revoked` — see `apply_redemption`.
+/// Issues a fresh join token for a node (spec §4.5) and, in the same
+/// statement, cuts off the identity it had: bearer token, WireGuard
+/// pubkey and transit approval. Does NOT touch `revoked` — see
+/// `apply_redemption`.
+///
+/// **The pubkey is cleared, not just the bearer token (security review
+/// S8, then finding #2).** Rejoin is the path for a key "suspected
+/// compromised" (spec §4.5), and `list_all_peers` hands out every node
+/// with a non-NULL pubkey. Clearing only the bearer token stopped the old
+/// credential polling, but left the old WireGuard key configured as a
+/// peer on every other node — so whoever held the stolen private key kept
+/// full access to the mesh until the real machine re-registered, and
+/// forever if it never did. With the pubkey gone the node drops out of
+/// the directory (and its services with it) on everyone's next poll, and
+/// `apply_redemption` brings it back under its new key. Its addresses
+/// are kept, so a static peer's exported `.conf` still points at the
+/// right IP afterwards.
+///
+/// Transit approval goes too: it was granted to the identity being
+/// replaced.
 pub fn reissue_join_token(
     conn: &Connection,
     node_id: i64,
@@ -344,23 +367,27 @@ pub fn reissue_join_token(
     join_token_expires_at: Option<&str>,
 ) -> Result<(), DbError> {
     conn.execute(
-        "UPDATE nodes SET join_token_hash = ?1, join_token_used = 0, \
-         join_token_expires_at = ?2 WHERE id = ?3",
+        "UPDATE nodes SET join_token_hash = ?1, join_token_used = 0, join_token_expires_at = ?2, \
+         bearer_token_hash = NULL, pubkey = NULL, transit_approved_at = NULL \
+         WHERE id = ?3",
         rusqlite::params![join_token_hash, join_token_expires_at, node_id],
     )
     .map_err(map_unique_violation)?;
     Ok(())
 }
 
-/// Clears a node's current bearer token without touching `revoked` (see
-/// `reissue_join_token`'s doc comment / PLAN.md decisions log — security
-/// review S8). The node simply can't `/poll` until it redeems a new join
-/// token via `/register`.
-pub fn clear_bearer_token(conn: &Connection, node_id: i64) -> Result<(), DbError> {
-    conn.execute(
-        "UPDATE nodes SET bearer_token_hash = NULL WHERE id = ?1",
-        [node_id],
-    )?;
+/// Grants (`true`) or withdraws (`false`) a node's approval to carry
+/// transit traffic. Idempotent in both directions; an existing grant
+/// keeps its original timestamp.
+pub fn set_transit_approved(conn: &Connection, node_id: i64, approved: bool) -> Result<(), DbError> {
+    if approved {
+        conn.execute(
+            "UPDATE nodes SET transit_approved_at = COALESCE(transit_approved_at, ?1) WHERE id = ?2",
+            rusqlite::params![now_str(), node_id],
+        )?;
+    } else {
+        conn.execute("UPDATE nodes SET transit_approved_at = NULL WHERE id = ?1", [node_id])?;
+    }
     Ok(())
 }
 
@@ -770,6 +797,84 @@ mod tests {
         .unwrap();
         let row = find_by_name(&conn, "n1").unwrap().unwrap();
         assert!(!row.revoked, "rejoin + register is still the way back in");
+    }
+
+    fn register(conn: &Connection, id: i64, pubkey: &str, bearer_hash: &str) {
+        apply_redemption(
+            conn,
+            id,
+            &Redemption {
+                pubkey,
+                ip4: "100.90.0.1".parse().unwrap(),
+                ip6: "fd00:90::1".parse().unwrap(),
+                listen_port: Some(51820),
+                endpoint_addr: None,
+                bearer_token_hash: bearer_hash,
+                endpoint_addr_v4: None,
+                endpoint_addr_v6: None,
+                lan_addr: None,
+                reflexive_addr: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejoin_drops_the_old_key_from_the_directory_but_keeps_the_addresses() {
+        // Rejoin is for a suspected-compromised key: the old key must stop
+        // being handed out as a peer at once, not when (or if) the real
+        // machine gets around to re-registering.
+        let db = test_db();
+        let conn = db.conn.lock().await;
+        let id = create_node(&conn, "n1", NodeKind::Agent, "joinhash1", None).unwrap();
+        register(&conn, id, "pk-old", "bearer-old");
+        set_transit_approved(&conn, id, true).unwrap();
+
+        reissue_join_token(&conn, id, "joinhash2", None).unwrap();
+
+        let row = find_by_name(&conn, "n1").unwrap().unwrap();
+        assert!(row.pubkey.is_none(), "the old key must be gone");
+        assert!(!row.transit_approved, "approval belonged to the old identity");
+        assert_eq!(row.ip4.as_deref(), Some("100.90.0.1"), "addresses survive rejoin");
+        assert!(find_by_bearer_hash(&conn, "bearer-old").unwrap().is_none());
+        assert!(list_all_peers(&conn).unwrap().is_empty(), "no longer a peer of anyone");
+
+        register(&conn, id, "pk-new", "bearer-new");
+        let peers = list_all_peers(&conn).unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].pubkey.as_deref(), Some("pk-new"));
+        assert_eq!(peers[0].ip4.as_deref(), Some("100.90.0.1"));
+    }
+
+    #[tokio::test]
+    async fn transit_approval_is_off_by_default_and_toggles_idempotently() {
+        let db = test_db();
+        let conn = db.conn.lock().await;
+        let id = create_node(&conn, "n1", NodeKind::Agent, "joinhash1", None).unwrap();
+        assert!(!find_by_id(&conn, id).unwrap().unwrap().transit_approved);
+
+        set_transit_approved(&conn, id, true).unwrap();
+        set_transit_approved(&conn, id, true).unwrap();
+        assert!(find_by_id(&conn, id).unwrap().unwrap().transit_approved);
+
+        set_transit_approved(&conn, id, false).unwrap();
+        set_transit_approved(&conn, id, false).unwrap();
+        assert!(!find_by_id(&conn, id).unwrap().unwrap().transit_approved);
+    }
+
+    #[tokio::test]
+    async fn revoke_withdraws_transit_approval() {
+        // Otherwise a revoke followed by rejoin + register would bring the
+        // node back as an approved carrier nobody re-approved.
+        let db = test_db();
+        let conn = db.conn.lock().await;
+        let id = create_node(&conn, "n1", NodeKind::Agent, "joinhash1", None).unwrap();
+        register(&conn, id, "pk1", "bearer1");
+        set_transit_approved(&conn, id, true).unwrap();
+
+        revoke(&conn, id).unwrap();
+
+        assert!(!find_by_id(&conn, id).unwrap().unwrap().transit_approved);
     }
 
     #[tokio::test]
