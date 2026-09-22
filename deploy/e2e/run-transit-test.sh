@@ -199,6 +199,19 @@ done
 log "waiting for poll cycles and WireGuard handshakes (transit still off everywhere)"
 sleep 20
 
+# Baselines for the interface-scoped-forwarding check further down. NOT
+# assumed to be "0": a fresh network namespace inherits its own starting
+# `conf.all.forwarding` (and so every interface's own initial value) from
+# whatever the HOST namespace already has at container-creation time —
+# and Podman/netavark itself turns the host's own ip_forward on as a
+# normal, expected part of setting up bridge networking, which this very
+# script's own network segments already trigger. So the meaningful
+# assertion is never "reads 0", only "stays exactly what it started at
+# once our own code has run" — captured here, before anyone opts in.
+AGENT1_ALL_BASELINE=$(in_netns "$AGENT1" cat /proc/sys/net/ipv4/conf/all/forwarding 2>/dev/null || echo "?")
+AGENT2_WG_BASELINE=$(in_netns "$AGENT2" cat /proc/sys/net/ipv4/conf/wireserve0/forwarding 2>/dev/null || echo "?")
+AGENT4_WG_BASELINE=$(in_netns "$AGENT4" cat /proc/sys/net/ipv4/conf/wireserve0/forwarding 2>/dev/null || echo "?")
+
 log "declaring a service on agent2 and agent4"
 podman exec "$AGENT2" wireserve-agent serve svc-two 12345 tcp
 podman exec "$AGENT4" wireserve-agent serve svc-four 12345 tcp
@@ -279,11 +292,14 @@ log "confirming interface-scoped forwarding, not the host's global switch"
 AGENT1_WG_FWD=$(in_netns "$AGENT1" cat /proc/sys/net/ipv4/conf/wireserve0/forwarding 2>/dev/null || echo "?")
 AGENT1_ALL_FWD=$(in_netns "$AGENT1" cat /proc/sys/net/ipv4/conf/all/forwarding 2>/dev/null || echo "?")
 [ "$AGENT1_WG_FWD" = "1" ] || fail "agent1's wireserve0 forwarding flag is not 1 (got '$AGENT1_WG_FWD') — transit traffic would be dropped at the kernel level"
-[ "$AGENT1_ALL_FWD" = "0" ] || fail "agent1's GLOBAL forwarding switch was touched (got '$AGENT1_ALL_FWD') — this is exactly the open-router regression the interface-scoped design exists to avoid"
-pass "agent1 forwards on its wg interface alone; the host-wide switch was never touched"
-for a in "$AGENT2" "$AGENT4"; do
+[ "$AGENT1_ALL_FWD" = "$AGENT1_ALL_BASELINE" ] \
+    || fail "agent1's GLOBAL forwarding switch changed (baseline '$AGENT1_ALL_BASELINE', now '$AGENT1_ALL_FWD') — this is exactly the open-router regression the interface-scoped design exists to avoid"
+pass "agent1 forwards on its wg interface alone; the host-wide switch was never touched (baseline '$AGENT1_ALL_BASELINE', unchanged)"
+for entry in "$AGENT2:$AGENT2_WG_BASELINE" "$AGENT4:$AGENT4_WG_BASELINE"; do
+    a=${entry%%:*}
+    baseline=${entry#*:}
     FWD=$(in_netns "$a" cat /proc/sys/net/ipv4/conf/wireserve0/forwarding 2>/dev/null || echo "?")
-    [ "$FWD" = "0" ] || fail "$a never opted in as transit, but its forwarding flag is '$FWD' — should be untouched at 0"
+    [ "$FWD" = "$baseline" ] || fail "$a never opted in as transit, but its forwarding flag moved from '$baseline' to '$FWD' — should be untouched"
 done
 pass "the two nodes that never opted in have their forwarding posture completely untouched"
 

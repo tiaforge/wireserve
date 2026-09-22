@@ -71,10 +71,25 @@ mod tests {
 
     /// Regression test for the exact gap this module exists to close: a
     /// real kernel network namespace with two interfaces, asserting
-    /// `set_enabled` turns forwarding on for the named one alone — the
-    /// other interface, and the global `all` switch, must stay `0`
-    /// throughout, never getting stamped to `1` as a side effect the way
-    /// writing to `conf/all/forwarding` itself would have.
+    /// `set_enabled` turns forwarding on for the named one alone.
+    ///
+    /// **Not asserted against a hardcoded `"0"` baseline.** A fresh
+    /// `unshare -rn` namespace inherits `conf.default.forwarding` (and so
+    /// every new interface's own starting value, `conf.all.forwarding`
+    /// included) from whatever the *host's* namespace already has at the
+    /// moment of the clone — confirmed empirically, not assumed: on a
+    /// host where Podman/netavark has already turned on `ip_forward=1`
+    /// for its own bridge networking (completely normal — and, on a dev
+    /// machine that has ever run this project's own container-based e2e
+    /// suites, likely already true), a brand-new namespace's `all`,
+    /// `default`, and every freshly-created interface all start at `1`,
+    /// not `0`. The `other` interface is explicitly zeroed as a control
+    /// *before* `set_enabled` runs, specifically so this test still
+    /// proves the real property (our write never touches anything but
+    /// the named interface) regardless of that ambient inherited value —
+    /// asserting a literal `"0"` here previously made this test fail on
+    /// exactly the environment it most needs to run correctly in: a
+    /// container test host.
     #[test]
     fn set_enabled_scopes_forwarding_to_the_named_interface_only() {
         if !crate::firewall::netns::reexec(
@@ -92,13 +107,14 @@ mod tests {
         let wgtest_v6 = "/proc/sys/net/ipv6/conf/wgtest/forwarding";
         let other_v4 = "/proc/sys/net/ipv4/conf/other/forwarding";
         let all_v4 = "/proc/sys/net/ipv4/conf/all/forwarding";
-        assert_eq!(read(all_v4), "0", "precondition: forwarding starts off");
+        std::fs::write(other_v4, b"0").unwrap();
+        let all_baseline = read(all_v4);
 
         set_enabled("wgtest", true);
         assert_eq!(read(wgtest_v4), "1");
         assert_eq!(read(wgtest_v6), "1");
         assert_eq!(read(other_v4), "0", "an unrelated interface must never be turned into a router as a side effect");
-        assert_eq!(read(all_v4), "0", "the global switch must never be written");
+        assert_eq!(read(all_v4), all_baseline, "the global switch must never be written, whatever it started at");
 
         // Only disables what this process itself enabled.
         ENABLED_BY_US.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -108,5 +124,6 @@ mod tests {
         ENABLED_BY_US.store(true, std::sync::atomic::Ordering::Relaxed);
         set_enabled("wgtest", false);
         assert_eq!(read(wgtest_v4), "0");
+        assert_eq!(read(all_v4), all_baseline, "still never written, even on the disable path");
     }
 }
