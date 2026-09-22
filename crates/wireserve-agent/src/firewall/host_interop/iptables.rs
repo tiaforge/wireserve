@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::model::{tag, IpVersion, IptablesObservation, IptablesTarget, IptablesVariant, TAG_PREFIX};
+use super::model::{tag, Hook, IpVersion, IptablesObservation, IptablesTarget, IptablesVariant, TAG_PREFIX};
 
 const SEARCH_DIRS: &[&str] = &["/usr/sbin", "/sbin", "/usr/bin", "/bin"];
 
@@ -91,43 +91,46 @@ pub fn names_include_filter(names: &str) -> bool {
 
 // ---- argv builders (exact, pinned by tests) ----
 
-fn rule_spec(ifname: &str) -> Vec<String> {
-    vec![
-        "-i".into(),
-        ifname.into(),
-        "-m".into(),
-        "comment".into(),
-        "--comment".into(),
-        tag(ifname),
-        "-j".into(),
-        "ACCEPT".into(),
-    ]
+/// `-i <ifname>`, plus `-o <ifname>` too for `Forward` — `INPUT` traffic is
+/// always "to this host" regardless of egress, but `FORWARD` must be pinned
+/// to both interfaces or it would open routing from the mesh to any other
+/// interface on the host, not just hairpin traffic back onto the mesh.
+fn rule_spec(ifname: &str, hook: Hook) -> Vec<String> {
+    let mut spec = vec!["-i".to_string(), ifname.into()];
+    if hook == Hook::Forward {
+        spec.push("-o".into());
+        spec.push(ifname.into());
+    }
+    spec.extend(["-m".into(), "comment".into(), "--comment".into(), tag(ifname), "-j".into(), "ACCEPT".into()]);
+    spec
 }
 
 #[must_use]
-pub fn insert_args(ifname: &str) -> Vec<String> {
-    let mut args: Vec<String> = ["-w", LOCK_WAIT_SECS, "-I", "INPUT", "1"].map(Into::into).into();
-    args.extend(rule_spec(ifname));
+pub fn insert_args(ifname: &str, hook: Hook) -> Vec<String> {
+    let mut args: Vec<String> = ["-w", LOCK_WAIT_SECS, "-I", hook.iptables_chain(), "1"].map(Into::into).into();
+    args.extend(rule_spec(ifname, hook));
     args
 }
 
 #[must_use]
-pub fn list_args() -> Vec<String> {
-    ["-w", LOCK_WAIT_SECS, "-S", "INPUT"].map(Into::into).into()
+pub fn list_args(hook: Hook) -> Vec<String> {
+    ["-w", LOCK_WAIT_SECS, "-S", hook.iptables_chain()].map(Into::into).into()
 }
 
-/// `-D` for one line exactly as `-S INPUT` printed it (`-A INPUT …`), so
-/// that stale rules for other interface names, or hand-edited ones, are
-/// deleted by their real spec rather than one rebuilt from a guess.
+/// `-D` for one line exactly as `-S INPUT`/`-S FORWARD` printed it
+/// (`-A INPUT …`/`-A FORWARD …`), so that stale rules for other interface
+/// names, or hand-edited ones, are deleted by their real spec rather than
+/// one rebuilt from a guess.
 pub fn delete_args(line: &str) -> Result<Vec<String>, String> {
     let words = split_words(line)?;
     match words.as_slice() {
-        [a, chain, rest @ ..] if a == "-A" && chain == "INPUT" => {
-            let mut args: Vec<String> = ["-w", LOCK_WAIT_SECS, "-D", "INPUT"].map(Into::into).into();
+        [a, chain, rest @ ..] if a == "-A" && (chain == "INPUT" || chain == "FORWARD") => {
+            let mut args: Vec<String> = ["-w", LOCK_WAIT_SECS, "-D"].map(Into::into).into();
+            args.push(chain.clone());
             args.extend(rest.iter().cloned());
             Ok(args)
         }
-        _ => Err(format!("not an `-A INPUT` line: {line:?}")),
+        _ => Err(format!("not an `-A INPUT`/`-A FORWARD` line: {line:?}")),
     }
 }
 
@@ -182,13 +185,14 @@ pub fn line_tag(line: &str) -> Option<String> {
         .map(|p| p[1].clone())
 }
 
-/// Every `-A INPUT` line in `-S INPUT` output whose comment carries our
-/// tag prefix — nothing else, however similar.
+/// Every `-A INPUT`/`-A FORWARD` line in `-S <hook>` output whose comment
+/// carries our tag prefix — nothing else, however similar.
 #[must_use]
-pub fn tagged_lines(listing: &str) -> Vec<String> {
+pub fn tagged_lines(listing: &str, hook: Hook) -> Vec<String> {
+    let prefix = format!("-A {} ", hook.iptables_chain());
     listing
         .lines()
-        .filter(|l| l.starts_with("-A INPUT "))
+        .filter(|l| l.starts_with(&prefix))
         .filter(|l| line_tag(l).is_some())
         .map(str::to_string)
         .collect()
@@ -216,10 +220,16 @@ pub fn run(target: &IptablesTarget, args: &[String]) -> Result<String, String> {
 /// Every iptables ruleset worth looking at on this host, with our tagged
 /// lines in each. iptables-nft is observed whenever its binary exists
 /// (the planner decides whether its table is in use); legacy only when
-/// its `filter` table is actually loaded.
+/// its `filter` table is actually loaded. Both `INPUT` and `FORWARD` are
+/// always observed, regardless of `transit_capable` — the planner is what
+/// gates whether `FORWARD` ever gets a rule *inserted*, but observing it
+/// regardless means a stray rule left behind by an earlier, transit-capable
+/// run still gets found and removed after a restart with transit turned
+/// back off (PLAN.md M23), the same as the nft side already does.
 #[must_use]
 pub fn observe() -> Vec<IptablesObservation> {
     let mut out = Vec::new();
+    let hooks: &[Hook] = &[Hook::Input, Hook::Forward];
     for version in [IpVersion::V4, IpVersion::V6] {
         let mut targets = Vec::new();
         if let Some(t) = locate(version, IptablesVariant::Nft) {
@@ -237,17 +247,20 @@ pub fn observe() -> Vec<IptablesObservation> {
             }
         }
         for target in targets {
-            let tagged = match run(&target, &list_args()) {
-                Ok(listing) => Some(tagged_lines(&listing)),
-                Err(e) => {
-                    tracing::debug!(error = %e, "iptables listing failed");
-                    None
-                }
-            };
-            out.push(IptablesObservation {
-                target,
-                tagged_lines: tagged,
-            });
+            for &hook in hooks {
+                let tagged = match run(&target, &list_args(hook)) {
+                    Ok(listing) => Some(tagged_lines(&listing, hook)),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "iptables listing failed");
+                        None
+                    }
+                };
+                out.push(IptablesObservation {
+                    target: target.clone(),
+                    hook,
+                    tagged_lines: tagged,
+                });
+            }
         }
     }
     out
@@ -260,17 +273,26 @@ mod tests {
     #[test]
     fn insert_args_are_exact_and_scoped_to_the_interface() {
         assert_eq!(
-            insert_args("wg0"),
+            insert_args("wg0", Hook::Input),
             [
                 "-w", "5", "-I", "INPUT", "1", "-i", "wg0", "-m", "comment", "--comment",
                 "wireserve:wg0", "-j", "ACCEPT"
             ]
         );
-        for ifname in ["wg0", "wireserve0", "a.b-c_d"] {
-            let args = insert_args(ifname);
-            let i = args.iter().position(|a| a == "-i").unwrap();
-            assert_eq!(args[i + 1], ifname);
-            assert!(args.iter().all(|a| !a.contains('+')), "no iptables wildcard: {args:?}");
+        assert_eq!(
+            insert_args("wg0", Hook::Forward),
+            [
+                "-w", "5", "-I", "FORWARD", "1", "-i", "wg0", "-o", "wg0", "-m", "comment", "--comment",
+                "wireserve:wg0", "-j", "ACCEPT"
+            ]
+        );
+        for hook in [Hook::Input, Hook::Forward] {
+            for ifname in ["wg0", "wireserve0", "a.b-c_d"] {
+                let args = insert_args(ifname, hook);
+                let i = args.iter().position(|a| a == "-i").unwrap();
+                assert_eq!(args[i + 1], ifname);
+                assert!(args.iter().all(|a| !a.contains('+')), "no iptables wildcard: {args:?}");
+            }
         }
     }
 
@@ -284,13 +306,22 @@ mod tests {
                 "wireserve:wg1", "-j", "ACCEPT"
             ]
         );
-        assert!(delete_args("-A FORWARD -j ACCEPT").is_err());
+        let fwd_line = "-A FORWARD -i wg1 -o wg1 -m comment --comment \"wireserve:wg1\" -j ACCEPT";
+        assert_eq!(
+            delete_args(fwd_line).unwrap(),
+            [
+                "-w", "5", "-D", "FORWARD", "-i", "wg1", "-o", "wg1", "-m", "comment", "--comment",
+                "wireserve:wg1", "-j", "ACCEPT"
+            ]
+        );
+        assert!(delete_args("-A OUTPUT -j ACCEPT").is_err());
         assert!(delete_args("-P INPUT DROP").is_err());
     }
 
     #[test]
     fn list_args_are_exact() {
-        assert_eq!(list_args(), ["-w", "5", "-S", "INPUT"]);
+        assert_eq!(list_args(Hook::Input), ["-w", "5", "-S", "INPUT"]);
+        assert_eq!(list_args(Hook::Forward), ["-w", "5", "-S", "FORWARD"]);
     }
 
     #[test]
@@ -319,14 +350,22 @@ mod tests {
     #[test]
     fn tagged_lines_finds_only_our_rules() {
         assert_eq!(
-            tagged_lines(UFW_LISTING),
+            tagged_lines(UFW_LISTING, Hook::Input),
             [
                 "-A INPUT -i wg0 -m comment --comment \"wireserve:wg0\" -j ACCEPT",
                 "-A INPUT -i old0 -m comment --comment \"wireserve:old0\" -j ACCEPT",
             ]
         );
-        assert!(tagged_lines("-P INPUT ACCEPT\n").is_empty());
-        assert!(tagged_lines("").is_empty());
+        assert!(tagged_lines("-P INPUT ACCEPT\n", Hook::Input).is_empty());
+        assert!(tagged_lines("", Hook::Input).is_empty());
+        // A FORWARD listing is never confused with INPUT's, even sharing a
+        // host: only its own chain's lines match.
+        let fwd = "-P FORWARD DROP\n-A FORWARD -i wg0 -o wg0 -m comment --comment \"wireserve:wg0\" -j ACCEPT\n";
+        assert_eq!(
+            tagged_lines(fwd, Hook::Forward),
+            ["-A FORWARD -i wg0 -o wg0 -m comment --comment \"wireserve:wg0\" -j ACCEPT"]
+        );
+        assert!(tagged_lines(fwd, Hook::Input).is_empty());
     }
 
     #[test]
@@ -334,8 +373,8 @@ mod tests {
         // What we insert must read back as exactly what the planner keeps,
         // or every reconcile would delete and re-insert it.
         assert_eq!(
-            tagged_lines(UFW_LISTING)[0],
-            super::super::planner::iptables_line("wg0")
+            tagged_lines(UFW_LISTING, Hook::Input)[0],
+            super::super::planner::iptables_line("wg0", Hook::Input)
         );
     }
 
@@ -377,9 +416,9 @@ mod tests {
         let script = format!(
             "{bin} -P INPUT DROP\n{bin} -A INPUT -i lo -j ACCEPT\n\
              {bin} {ins}\n{bin} {list}\necho ---\n{bin} {del}\n{bin} {list}",
-            ins = q(insert_args("wg0")),
-            list = q(list_args()),
-            del = q(delete_args(&super::super::planner::iptables_line("wg0")).unwrap()),
+            ins = q(insert_args("wg0", Hook::Input)),
+            list = q(list_args(Hook::Input)),
+            del = q(delete_args(&super::super::planner::iptables_line("wg0", Hook::Input)).unwrap()),
         );
         let Some(out) = crate::firewall::netns::run(&script) else {
             return;
@@ -387,11 +426,11 @@ mod tests {
         let (before, after) = out.split_once("---\n").unwrap();
         assert_eq!(
             before.lines().nth(1),
-            Some(super::super::planner::iptables_line("wg0").as_str()),
+            Some(super::super::planner::iptables_line("wg0", Hook::Input).as_str()),
             "inserted at the head of INPUT:\n{before}"
         );
-        assert_eq!(tagged_lines(before).len(), 1);
-        assert!(tagged_lines(after).is_empty(), "{after}");
+        assert_eq!(tagged_lines(before, Hook::Input).len(), 1);
+        assert!(tagged_lines(after, Hook::Input).is_empty(), "{after}");
         assert!(after.contains("-A INPUT -i lo -j ACCEPT"), "foreign rules untouched: {after}");
     }
 }

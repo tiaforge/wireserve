@@ -10,7 +10,7 @@ use nftables::schema::{Chain, NfCmd, NfListObject, NfObject, Nftables, Rule, Tab
 use nftables::stmt::{Accept, Counter, Drop, Match, Operator, Statement};
 use nftables::types::{NfChainPolicy, NfChainType, NfFamily, NfHook};
 
-use super::model::{guard_table, tag, ChainRef, Family, GUARD_CHAIN};
+use super::model::{guard_table, tag, ChainRef, Family, Hook, GUARD_CHAIN};
 
 fn nf_family(family: Family) -> NfFamily {
     match family {
@@ -30,22 +30,39 @@ fn iifname_is(ifname: &str) -> Statement<'static> {
     })
 }
 
-/// `insert rule <chain> iifname "<ifname>" counter accept comment "wireserve:<ifname>"`
-/// — `insert` without a position puts it at the head of the chain, ahead
-/// of that chain's own drops.
+/// `oifname "<ifname>"` — added alongside `iifname` for `Forward` only.
+/// `INPUT` traffic is always "to this host" regardless of egress, but
+/// `FORWARD` must be pinned to both interfaces or it would open routing
+/// from the mesh to any other interface on the host, not just hairpin
+/// traffic back onto the mesh (PLAN.md M23's transit).
+fn oifname_is(ifname: &str) -> Statement<'static> {
+    Statement::Match(Match {
+        left: Expression::Named(NamedExpression::Meta(Meta {
+            key: MetaKey::Oifname,
+        })),
+        right: Expression::String(Cow::Owned(ifname.to_string())),
+        op: Operator::EQ,
+    })
+}
+
+/// `insert rule <chain> iifname "<ifname>" [oifname "<ifname>"] counter
+/// accept comment "wireserve:<ifname>"` — `insert` without a position puts
+/// it at the head of the chain, ahead of that chain's own drops. The
+/// `oifname` match is added only for `Hook::Forward` — see `oifname_is`.
 #[must_use]
-pub fn insert_accept(chain: &ChainRef, ifname: &str) -> Nftables<'static> {
+pub fn insert_accept(chain: &ChainRef, ifname: &str, hook: Hook) -> Nftables<'static> {
+    let mut expr = vec![iifname_is(ifname)];
+    if hook == Hook::Forward {
+        expr.push(oifname_is(ifname));
+    }
+    expr.push(Statement::Counter(Counter::Anonymous(None)));
+    expr.push(Statement::Accept(None::<Accept>));
     Nftables {
         objects: vec![NfObject::CmdObject(NfCmd::Insert(NfListObject::Rule(Rule {
             family: nf_family(chain.family),
             table: Cow::Owned(chain.table.clone()),
             chain: Cow::Owned(chain.chain.clone()),
-            expr: vec![
-                iifname_is(ifname),
-                Statement::Counter(Counter::Anonymous(None)),
-                Statement::Accept(None::<Accept>),
-            ]
-            .into(),
+            expr: expr.into(),
             handle: None,
             index: None,
             comment: Some(Cow::Owned(tag(ifname))),
@@ -148,11 +165,24 @@ mod tests {
     #[test]
     fn insert_accept_json_is_exact() {
         assert_eq!(
-            serde_json::to_value(insert_accept(&chain(), "wg0")).unwrap(),
+            serde_json::to_value(insert_accept(&chain(), "wg0", Hook::Input)).unwrap(),
             json!({"nftables": [{"insert": {"rule": {
                 "family": "inet", "table": "filter", "chain": "input",
                 "expr": [
                     {"match": {"op": "==", "left": {"meta": {"key": "iifname"}}, "right": "wg0"}},
+                    {"counter": null},
+                    {"accept": null}
+                ],
+                "comment": "wireserve:wg0"
+            }}}]})
+        );
+        assert_eq!(
+            serde_json::to_value(insert_accept(&chain(), "wg0", Hook::Forward)).unwrap(),
+            json!({"nftables": [{"insert": {"rule": {
+                "family": "inet", "table": "filter", "chain": "input",
+                "expr": [
+                    {"match": {"op": "==", "left": {"meta": {"key": "iifname"}}, "right": "wg0"}},
+                    {"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "wg0"}},
                     {"counter": null},
                     {"accept": null}
                 ],
@@ -211,7 +241,7 @@ mod tests {
             table inet filter {\n  chain input {\n    type filter hook input priority 0; policy drop;\n    iif lo accept\n  }\n}\nEOF\n";
         let script = format!(
             "{setup}{}{}nft -j list ruleset",
-            apply_script(&insert_accept(&chain(), "wg0")),
+            apply_script(&insert_accept(&chain(), "wg0", Hook::Input)),
             apply_script(&guard_create("wg0")),
         );
         let Some(out) = crate::firewall::netns::run(&script) else {
@@ -220,7 +250,7 @@ mod tests {
         let view = ruleset::parse(out.as_bytes()).unwrap();
         let input = view.chains.iter().find(|c| c.chain == chain()).unwrap();
         assert_eq!(input.rules.len(), 2);
-        assert!(planner::is_accept_shape(&input.rules[0], "wg0"), "{:?}", input.rules[0]);
+        assert!(planner::is_accept_shape(&input.rules[0], "wg0", Hook::Input), "{:?}", input.rules[0]);
         assert_eq!(input.rules[0].comment.as_deref(), Some("wireserve:wg0"));
 
         let observed = Observed {
@@ -232,11 +262,11 @@ mod tests {
             },
             live: Default::default(),
         };
-        assert_eq!(planner::plan_reconcile(&observed, "wg0"), vec![], "settled on real kernel output");
+        assert_eq!(planner::plan_reconcile(&observed, "wg0", false), vec![], "settled on real kernel output");
 
         // Removal, using the handles the kernel reported.
         let removal = planner::plan_removal(&observed, "wg0");
-        let mut script = format!("{setup}{}{}", apply_script(&insert_accept(&chain(), "wg0")), apply_script(&guard_create("wg0")));
+        let mut script = format!("{setup}{}{}", apply_script(&insert_accept(&chain(), "wg0", Hook::Input)), apply_script(&guard_create("wg0")));
         for action in &removal {
             match action {
                 Action::NftDelete { chain, handle } => script += &apply_script(&delete_rule(chain, *handle)),

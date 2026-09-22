@@ -55,6 +55,35 @@ pub fn is_own_table(name: &str) -> bool {
 
 pub const GUARD_CHAIN: &str = "forward-guard";
 
+/// Which base-chain hook a foreign-firewall rule targets. `Input` is always
+/// opened (declared services must reach this host); `Forward` is opened
+/// only for a transit-capable node (PLAN.md M23) — see `HostInterop::start`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Hook {
+    Input,
+    Forward,
+}
+
+impl Hook {
+    /// iptables-nft always names its base chains upper-case, regardless of
+    /// how a native nftables config names its own (usually lower-case).
+    #[must_use]
+    pub fn iptables_chain(self) -> &'static str {
+        match self {
+            Self::Input => "INPUT",
+            Self::Forward => "FORWARD",
+        }
+    }
+
+    #[must_use]
+    pub fn nft_hook(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Forward => "forward",
+        }
+    }
+}
+
 /// firewalld's own table. firewalld (nftables backend) creates it with the
 /// `owner` flag, so writes into it fail with EPERM; firewalld is handled
 /// through its zones instead.
@@ -157,14 +186,15 @@ pub struct IptablesTarget {
     pub binary: PathBuf,
 }
 
-/// One `iptables -S INPUT` observation.
+/// One `iptables -S INPUT`/`-S FORWARD` observation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IptablesObservation {
     pub target: IptablesTarget,
-    /// Every `-A INPUT …` line carrying our tag, verbatim. `None` when
-    /// listing failed (binary broken, or the table is not one iptables
-    /// can read — a native nftables table that happens to be called
-    /// `filter`).
+    pub hook: Hook,
+    /// Every `-A INPUT …`/`-A FORWARD …` line carrying our tag, verbatim.
+    /// `None` when listing failed (binary broken, or the table is not one
+    /// iptables can read — a native nftables table that happens to be
+    /// called `filter`).
     pub tagged_lines: Option<Vec<String>>,
 }
 
@@ -201,12 +231,14 @@ pub struct Observed {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Action {
-    /// Head-insert `iifname "<ifname>" counter accept comment "wireserve:<ifname>"`.
-    NftInsert { chain: ChainRef, ifname: String },
+    /// Head-insert `iifname "<ifname>" [oifname "<ifname>"] counter accept
+    /// comment "wireserve:<ifname>"` — the `oifname` match only for `Forward`.
+    NftInsert { chain: ChainRef, ifname: String, hook: Hook },
     NftDelete { chain: ChainRef, handle: u64 },
-    /// `-I INPUT 1 -i <ifname> -m comment --comment wireserve:<ifname> -j ACCEPT`.
-    IptablesInsert { target: IptablesTarget, ifname: String },
-    /// `-D` with the exact spec of one tagged line from `-S INPUT`.
+    /// `-I <INPUT|FORWARD> 1 -i <ifname> [-o <ifname>] -m comment --comment
+    /// wireserve:<ifname> -j ACCEPT`.
+    IptablesInsert { target: IptablesTarget, ifname: String, hook: Hook },
+    /// `-D` with the exact spec of one tagged line from `-S INPUT`/`-S FORWARD`.
     IptablesDelete { target: IptablesTarget, line: String },
     /// `firewall-cmd --zone=trusted --change-interface=<ifname>` (runtime only).
     FirewalldTrust { ifname: String },

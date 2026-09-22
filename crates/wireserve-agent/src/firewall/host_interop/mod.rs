@@ -22,6 +22,20 @@
 //!   traffic from the interface, because a zone's target also covers
 //!   forwarding.
 //!
+//! A transit-capable node (PLAN.md M23) additionally, for exactly as long
+//! as it stays transit-capable, gets the same treatment on the FORWARD
+//! hook too — `iifname "<if>" oifname "<if>" counter accept` (nft) /
+//! `-I FORWARD 1 -i <if> -o <if> … -j ACCEPT` (iptables) — pinned to
+//! *both* interfaces being this one, so this only ever opens hairpin
+//! traffic back onto the mesh, never routing from the mesh to any other
+//! interface on the host. A node that never opts into transit gets
+//! exactly the footprint this module had before transit existed. This
+//! does not yet extend to firewalld's own forwarding permission (its
+//! `trusted` zone opens forwarding host-wide, not scoped to one
+//! interface pair, so narrowing it safely is deliberately left as a
+//! follow-up rather than guessed at here) — a transit-capable node under
+//! firewalld still needs an operator to open FORWARD for it by hand.
+//!
 //! Several agents can run on one host, each on its own interface. Each
 //! one only ever adds, keeps and removes what is tagged with its own
 //! interface name; a tagged rule for another name is left alone while a
@@ -29,10 +43,10 @@
 //! leftover once none does.
 //!
 //! What is never done: anything on another interface, anything on the
-//! forward or output path other than the guard's drop, anything to an
-//! operator's own firewalld zone choice, writing into an owned table.
-//! The pure rules for all of that are in `planner`; `planner_tests` pins
-//! them.
+//! forward or output path beyond the above and the guard's drop, anything
+//! to an operator's own firewalld zone choice, writing into an owned
+//! table. The pure rules for all of that are in `planner`; `planner_tests`
+//! pins them.
 //!
 //! Runs on one dedicated thread (so no locking), woken by `nft -j monitor`
 //! events (debounced), by every poll tick (the safety net), and by stop.
@@ -86,8 +100,15 @@ impl HostInterop {
     /// way from a background thread. Never fails: if `nft` can't be found
     /// the handle is inert (the nftables backend would already have refused
     /// to start in that case).
+    ///
+    /// `transit_capable` (PLAN.md M23) — set once at join time and never
+    /// changed for the life of a running agent, so it is safe to capture
+    /// once here rather than re-read every reconcile — is whether this
+    /// node's FORWARD hook is opened at all, alongside the INPUT hook this
+    /// module has always opened. A node that never opts into transit gets
+    /// exactly the footprint this module had before transit existed.
     #[must_use]
-    pub fn start(ifname: &str) -> Self {
+    pub fn start(ifname: &str, transit_capable: bool) -> Self {
         let nft = match Nft::locate() {
             Ok(nft) => nft,
             Err(e) => {
@@ -98,19 +119,19 @@ impl HostInterop {
                 };
             }
         };
-        Self::start_with(ifname, nft.clone(), RealOps::new(nft))
+        Self::start_with(ifname, nft.clone(), RealOps::new(nft), transit_capable)
     }
 
-    fn start_with(ifname: &str, nft: Nft, mut ops: RealOps) -> Self {
+    fn start_with(ifname: &str, nft: Nft, mut ops: RealOps, forward_wanted: bool) -> Self {
         let mut told = HashSet::new();
-        ops::reconcile(&mut ops, ifname, &mut told);
+        ops::reconcile(&mut ops, ifname, forward_wanted, &mut told);
 
         let (tx, rx) = mpsc::channel();
         let ifname = ifname.to_string();
         let monitor_tx = tx.clone();
         let worker = std::thread::Builder::new()
             .name("host-interop".into())
-            .spawn(move || run(ops, &ifname, &nft, &rx, &monitor_tx, told));
+            .spawn(move || run(ops, &ifname, forward_wanted, &nft, &rx, &monitor_tx, told));
         match worker {
             Ok(worker) => Self {
                 tx: Some(tx),
@@ -187,6 +208,7 @@ impl Drop for HostInterop {
 fn run(
     mut ops: RealOps,
     ifname: &str,
+    forward_wanted: bool,
     nft: &Nft,
     rx: &Receiver<Msg>,
     tx: &Sender<Msg>,
@@ -215,7 +237,7 @@ fn run(
                 if monitor.is_none() {
                     monitor = spawn_monitor();
                 }
-                ops::reconcile(&mut ops, ifname, &mut told);
+                ops::reconcile(&mut ops, ifname, forward_wanted, &mut told);
             }
             Ok(Msg::Stop(done)) => {
                 drop(monitor.take());
@@ -227,7 +249,7 @@ fn run(
             Err(RecvTimeoutError::Disconnected) => return,
         }
         if debounce.take_due(Instant::now()) {
-            let planned = ops::reconcile(&mut ops, ifname, &mut told);
+            let planned = ops::reconcile(&mut ops, ifname, forward_wanted, &mut told);
             if planned > 0 {
                 tracing::info!(changes = planned, "restored host firewall interop after an external change");
             }
@@ -278,7 +300,7 @@ mod tests {
         let list = || sh("nft list ruleset; iptables-nft -S INPUT");
 
         let nft = Nft::locate().unwrap();
-        let mut interop = HostInterop::start_with("wg0", nft.clone(), RealOps::without_firewalld(nft));
+        let mut interop = HostInterop::start_with("wg0", nft.clone(), RealOps::without_firewalld(nft), false);
 
         // Synchronously in place when start() returns: native chain + iptables.
         let after_start = list();
@@ -327,8 +349,8 @@ mod tests {
         let nft = Nft::locate().unwrap();
         crate::lock::IfnameClaim::take("wireserve0").unwrap().unwrap().hold();
         crate::lock::IfnameClaim::take("wireserve1").unwrap().unwrap().hold();
-        let mut a = HostInterop::start_with("wireserve0", nft.clone(), RealOps::without_firewalld(nft.clone()));
-        let mut b = HostInterop::start_with("wireserve1", nft.clone(), RealOps::without_firewalld(nft));
+        let mut a = HostInterop::start_with("wireserve0", nft.clone(), RealOps::without_firewalld(nft.clone()), false);
+        let mut b = HostInterop::start_with("wireserve1", nft.clone(), RealOps::without_firewalld(nft), false);
         assert_eq!((count("wireserve0"), count("wireserve1")), (2, 2));
 
         // Each one's monitor sees the other's inserts; let that settle, then

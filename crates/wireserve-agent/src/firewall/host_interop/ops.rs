@@ -51,6 +51,9 @@ impl HostOps for RealOps {
                 None
             }
         };
+        // Both INPUT and FORWARD are always observed — see `iptables::observe`
+        // for why (PLAN.md M23: cleanup must find a FORWARD-hook leftover
+        // even on a run that no longer wants it inserted).
         let iptables = iptables::observe();
         let live = live_owners(nft.as_ref(), &iptables, ifname, |o| {
             crate::lock::holder(o).is_agent()
@@ -70,12 +73,12 @@ impl HostOps for RealOps {
     fn execute(&mut self, action: &Action) -> Result<(), String> {
         let nft = |batch| self.nft.apply(&batch).map_err(|e| e.to_string());
         match action {
-            Action::NftInsert { chain, ifname } => nft(nft_ops::insert_accept(chain, ifname)),
+            Action::NftInsert { chain, ifname, hook } => nft(nft_ops::insert_accept(chain, ifname, *hook)),
             Action::NftDelete { chain, handle } => nft(nft_ops::delete_rule(chain, *handle)),
             Action::GuardCreate { ifname } => nft(nft_ops::guard_create(ifname)),
             Action::GuardDelete { table } => nft(nft_ops::guard_delete(table)),
-            Action::IptablesInsert { target, ifname } => {
-                iptables::run(target, &iptables::insert_args(ifname)).map(|_| ())
+            Action::IptablesInsert { target, ifname, hook } => {
+                iptables::run(target, &iptables::insert_args(ifname, *hook)).map(|_| ())
             }
             Action::IptablesDelete { target, line } => {
                 iptables::run(target, &iptables::delete_args(line)?).map(|_| ())
@@ -152,15 +155,18 @@ pub fn execute_all(ops: &mut impl HostOps, actions: &[Action]) -> usize {
 
 /// One reconcile pass. Returns the number of actions it planned (0 once
 /// settled). `told` remembers which operator notices were already logged,
-/// so each is logged once rather than every poll.
-pub fn reconcile(ops: &mut impl HostOps, ifname: &str, told: &mut HashSet<String>) -> usize {
+/// so each is logged once rather than every poll. `forward_wanted` must
+/// match what `ops` itself was constructed with (`RealOps::new`'s own
+/// flag) — kept as an explicit parameter here too since this function is
+/// generic over `HostOps` and so can't reach into `ops`'s own state.
+pub fn reconcile(ops: &mut impl HostOps, ifname: &str, forward_wanted: bool, told: &mut HashSet<String>) -> usize {
     let observed = ops.observe(ifname);
     for notice in planner::notices(&observed, ifname) {
         if told.insert(notice.clone()) {
             tracing::warn!("{notice}");
         }
     }
-    let actions = planner::plan_reconcile(&observed, ifname);
+    let actions = planner::plan_reconcile(&observed, ifname, forward_wanted);
     execute_all(ops, &actions);
     actions.len()
 }
@@ -240,10 +246,12 @@ mod tests {
         let a = Action::NftInsert {
             chain: chain("a"),
             ifname: "wg0".into(),
+            hook: crate::firewall::host_interop::model::Hook::Input,
         };
         let b = Action::NftInsert {
             chain: chain("b"),
             ifname: "wg0".into(),
+            hook: crate::firewall::host_interop::model::Hook::Input,
         };
         let mut ops = fake(vec![a.clone()]);
         assert_eq!(execute_all(&mut ops, &[a.clone(), b.clone()]), 1);
@@ -279,11 +287,11 @@ mod tests {
         };
         // No nft view: the forward guard can't be verified, so firewalld
         // is not touched either.
-        assert_eq!(reconcile(&mut ops, "wg0", &mut HashSet::new()), 0);
+        assert_eq!(reconcile(&mut ops, "wg0", false, &mut HashSet::new()), 0);
         assert!(ops.executed.is_empty());
 
         ops.observed.nft = Some(Default::default());
-        assert_eq!(reconcile(&mut ops, "wg0", &mut HashSet::new()), 2);
+        assert_eq!(reconcile(&mut ops, "wg0", false, &mut HashSet::new()), 2);
         assert_eq!(
             ops.executed,
             [
@@ -295,7 +303,7 @@ mod tests {
 
     #[test]
     fn only_other_interfaces_a_running_agent_holds_are_live() {
-        use crate::firewall::host_interop::model::{ChainInfo, IptablesTarget, IptablesVariant, IpVersion, RuleInfo};
+        use crate::firewall::host_interop::model::{ChainInfo, Hook, IptablesTarget, IptablesVariant, IpVersion, RuleInfo};
         let rule = |comment: &str| RuleInfo {
             handle: 1,
             comment: Some(comment.into()),
@@ -316,6 +324,7 @@ mod tests {
                 variant: IptablesVariant::Nft,
                 binary: "/usr/sbin/iptables".into(),
             },
+            hook: Hook::Input,
             tagged_lines: Some(vec![
                 "-A INPUT -i alive2 -m comment --comment \"wireserve:alive2\" -j ACCEPT".into(),
             ]),

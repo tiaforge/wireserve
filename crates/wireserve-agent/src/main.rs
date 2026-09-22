@@ -415,7 +415,7 @@ async fn cmd_daemon(
         &mut fw,
         &mut wg,
         |wg| wg.preflight(&private_key).map_err(Into::into),
-        || start_interop(&ifname),
+        || start_interop(&ifname, state.transit_capable),
         |wg| {
             wg.bring_up(&private_key, ip4, ip6, listen_port)
                 .map_err(Into::<Box<dyn std::error::Error>>::into)
@@ -756,12 +756,12 @@ fn print_response(resp: wireserve_agent::ipc::IpcResponse) {
 }
 
 #[cfg(target_os = "linux")]
-fn start_interop(ifname: &str) -> firewall::host_interop::HostInterop {
-    firewall::host_interop::HostInterop::start(ifname)
+fn start_interop(ifname: &str, transit_capable: bool) -> firewall::host_interop::HostInterop {
+    firewall::host_interop::HostInterop::start(ifname, transit_capable)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn start_interop(_ifname: &str) -> firewall::NoopInterop {
+fn start_interop(_ifname: &str, _transit_capable: bool) -> firewall::NoopInterop {
     firewall::NoopInterop
 }
 
