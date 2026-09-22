@@ -74,6 +74,10 @@ pub struct ListView {
     /// mesh peers (PLAN.md M23) — see `state::AgentState::transit_capable`.
     #[serde(default)]
     pub transit_capable: bool,
+    /// Every active transit pairing this node is currently carrying, as
+    /// of the last poll — see `wireserve_types::PollResponse::transit_carrying`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transit_carrying: Vec<wireserve_types::TransitPair>,
     /// The coordinator's view of every peer, as of the last poll.
     pub peers: Vec<PeerInfo>,
     /// The kernel's view of the same peers, read when `list` asked: the

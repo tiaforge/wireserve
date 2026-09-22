@@ -89,6 +89,34 @@ fn ago(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
     }
 }
 
+/// This node's own name for whichever peer `view.peers` lists under
+/// `pubkey`, or the pubkey itself (truncated) if no such peer is known —
+/// a dangling `transit_via`/`TransitPair` entry (a stale/inconsistent
+/// directory) should never crash rendering, only degrade to something
+/// still readable.
+fn peer_name(view: &ListView, pubkey: &str) -> String {
+    view.peers
+        .iter()
+        .find(|p| p.pubkey == pubkey)
+        .map_or_else(|| format!("{}…", &pubkey[..pubkey.len().min(8)]), |p| clean(&p.name))
+}
+
+/// "direct" or "via <name>" (PLAN.md M23) — this node's own routing
+/// decision for `p`, from the coordinator's `transit_via` hint on its
+/// most recent poll response. Never reflects the kernel's actual live
+/// `AllowedIPs` state (`list` reads `tunnel` for endpoint/handshake, but
+/// `wg show allowed-ips` isn't parsed here) — the coordinator's hint and
+/// what `wg::desired_peers` actually configured agree by construction
+/// once a poll cycle has completed, so this is accurate as of the same
+/// "last poll" staleness every other cached field in this view already
+/// has.
+fn route(p: &PeerInfo, view: &ListView) -> String {
+    match p.transit_via.as_deref() {
+        Some(via) => format!("via {}", peer_name(view, via)),
+        None => "direct".to_string(),
+    }
+}
+
 /// A peer's endpoint and last handshake, from the kernel when the daemon
 /// could read it — the endpoint WireGuard really uses can differ from the
 /// coordinator's record (a candidate of the other address family, say,
@@ -114,7 +142,8 @@ fn peer_row(p: &PeerInfo, view: &ListView, is_self: bool, now: DateTime<Utc>) ->
             None => (recorded(), "not configured".to_string()),
         }
     };
-    vec![clean(&p.name), clean(&p.ip4), endpoint, handshake]
+    let route = if is_self { "-".to_string() } else { route(p, view) };
+    vec![clean(&p.name), clean(&p.ip4), endpoint, handshake, route]
 }
 
 /// A rejection's reason is either an admin's text or a coordinator error
@@ -155,13 +184,31 @@ pub fn render(view: &ListView, now: DateTime<Utc>) -> String {
             .into_iter()
             .map(|p| peer_row(p, view, this.as_deref() == Some(clean(&p.name).as_str()), now))
             .collect();
-        out.push_str(&table(&["PEER", "ADDRESS", "ENDPOINT", "HANDSHAKE"], &rows));
+        out.push_str(&table(&["PEER", "ADDRESS", "ENDPOINT", "HANDSHAKE", "ROUTE"], &rows));
     }
 
     if !view.rejected_services.is_empty() {
         out.push_str("\nNot published:\n");
         for r in &view.rejected_services {
             out.push_str(&format!("  {}: {}\n", clean(&r.name), reason(&r.reason)));
+        }
+    }
+
+    // Transit (PLAN.md M23): silent in the common case (opted out, not
+    // carrying anything) so this stays out of the way for every node that
+    // never touches the feature.
+    if view.transit_capable || !view.transit_carrying.is_empty() {
+        out.push('\n');
+        out.push_str(&format!("Transit: {}", if view.transit_capable { "on" } else { "off" }));
+        if view.transit_carrying.is_empty() {
+            out.push_str(", carrying nothing right now\n");
+        } else {
+            let pairs: Vec<String> = view
+                .transit_carrying
+                .iter()
+                .map(|pair| format!("{} <-> {}", peer_name(view, &pair.a), peer_name(view, &pair.c)))
+                .collect();
+            out.push_str(&format!(", carrying: {}\n", pairs.join(", ")));
         }
     }
     out
@@ -222,6 +269,7 @@ mod tests {
             ifname: "wireserve0".into(),
             node: Some("lego2".into()),
             transit_capable: false,
+            transit_carrying: vec![],
             // The coordinator recorded strato's IPv6 candidate; WireGuard
             // is really talking to its IPv4 one.
             peers: vec![
@@ -253,10 +301,10 @@ mydns.wg        10.1.0.4         53/udp 53/tcp 8080:8000/tcp  lego2 (this node) 
 openobserve.wg  10.1.0.3         80:5080/tcp                  strato             online
 plex.wg         10.1.0.2 (node)  32400/tcp                    strato             offline
 
-PEER    ADDRESS   ENDPOINT              HANDSHAKE
-lego2   10.1.0.1  -                     this node
-newbie  10.1.0.5  198.51.100.7:51820    never
-strato  10.1.0.2  85.215.231.166:51820  1m ago
+PEER    ADDRESS   ENDPOINT              HANDSHAKE  ROUTE
+lego2   10.1.0.1  -                     this node  -
+newbie  10.1.0.5  198.51.100.7:51820    never      direct
+strato  10.1.0.2  85.215.231.166:51820  1m ago     direct
 
 Not published:
   git: service name 'git' is already declared by another node
@@ -272,6 +320,53 @@ Not published:
         };
         let out = render(&view, now());
         assert!(out.contains("strato  10.1.0.2  [2a01:4f8::2]:51820  unknown"), "{out}");
+    }
+
+    #[test]
+    fn a_peer_routed_via_transit_shows_the_via_peers_name_not_its_pubkey() {
+        let mut c = peer("c", "10.1.0.3", None, true);
+        c.transit_via = Some("pk-b".into());
+        let view = ListView {
+            peers: vec![peer("b", "10.1.0.2", None, true), c],
+            ..Default::default()
+        };
+        let out = render(&view, now());
+        assert!(out.contains("via b"), "{out}");
+        assert!(!out.contains("pk-b"), "{out}");
+    }
+
+    #[test]
+    fn a_dangling_transit_via_naming_an_unknown_peer_degrades_to_a_truncated_pubkey_not_a_panic() {
+        let mut c = peer("c", "10.1.0.3", None, true);
+        c.transit_via = Some("pk-does-not-exist".into());
+        let view = ListView { peers: vec![c], ..Default::default() };
+        let out = render(&view, now());
+        assert!(out.contains("via pk-does-…"), "{out}");
+    }
+
+    #[test]
+    fn transit_status_is_silent_when_off_and_carrying_nothing() {
+        let out = render(&ListView::default(), now());
+        assert!(!out.contains("Transit:"), "{out}");
+    }
+
+    #[test]
+    fn transit_on_but_idle_says_so() {
+        let view = ListView { transit_capable: true, ..Default::default() };
+        let out = render(&view, now());
+        assert!(out.contains("Transit: on, carrying nothing right now"), "{out}");
+    }
+
+    #[test]
+    fn a_carried_pair_is_shown_by_name() {
+        let view = ListView {
+            transit_capable: true,
+            transit_carrying: vec![wireserve_types::TransitPair { a: "pk-a".into(), c: "pk-c".into() }],
+            peers: vec![peer("a", "10.1.0.1", None, true), peer("c", "10.1.0.3", None, true)],
+            ..Default::default()
+        };
+        let out = render(&view, now());
+        assert!(out.contains("Transit: on, carrying: a <-> c"), "{out}");
     }
 
     #[test]

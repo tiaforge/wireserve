@@ -107,6 +107,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
         ifname: ctx.ifname.clone(),
         node: self_name,
         transit_capable: state.transit_capable,
+        transit_carrying: directory.transit_carrying.clone(),
         peers: directory.peers,
         tunnel: vec![],
         services,
