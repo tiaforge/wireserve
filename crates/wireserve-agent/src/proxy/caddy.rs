@@ -205,9 +205,14 @@ impl ProxyBackend for Caddy {
 
 /// The generated fragment.
 ///
-/// `http://` to the backend on purpose: 443 is the *published* port, which the
-/// owning node's firewall rewrites to whatever the service really listens on,
-/// and that is plain HTTP. There is no second TLS hop to verify.
+/// Plain HTTP to the backend on purpose: 443 is the *published* port, which
+/// the owning node's firewall rewrites to whatever the service really
+/// listens on, and that hop is plain HTTP — there is no second TLS hop to
+/// verify. But an explicit `http://` scheme on an address ending in `:443`
+/// is exactly the mistake Caddy's own upstream parser rejects on sight
+/// ("conflicting scheme and port"), since 443 usually *does* mean TLS. The
+/// transport is forced explicitly instead, so the intent doesn't depend on
+/// a scheme shorthand Caddy won't accept for this port.
 #[must_use]
 pub fn render(vhosts: &[VHost]) -> String {
     let mut out = String::from(
@@ -218,7 +223,9 @@ pub fn render(vhosts: &[VHost]) -> String {
         // parsed address, so neither can carry Caddyfile syntax.
         out.push_str(&format!("@{} host {}\n", matcher_name(&v.host), v.host));
         out.push_str(&format!("handle @{} {{\n", matcher_name(&v.host)));
-        out.push_str(&format!("\treverse_proxy http://{}:{}\n", v.upstream, v.port));
+        out.push_str(&format!("\treverse_proxy {}:{} {{\n", v.upstream, v.port));
+        out.push_str("\t\ttransport http\n");
+        out.push_str("\t}\n");
         out.push_str("}\n");
     }
     out
@@ -248,7 +255,19 @@ mod tests {
         let out = render(&[vh("plex", "10.0.0.50")]);
         assert!(out.contains("@plex host plex.int.example.com\n"), "{out}");
         assert!(out.contains("handle @plex {\n"), "{out}");
-        assert!(out.contains("reverse_proxy http://10.0.0.50:443\n"), "{out}");
+        assert!(out.contains("reverse_proxy 10.0.0.50:443 {\n"), "{out}");
+        assert!(out.contains("\t\ttransport http\n"), "{out}");
+    }
+
+    #[test]
+    fn the_upstream_forces_plain_http_without_a_scheme_prefix() {
+        // `http://host:443` is exactly what Caddy's own upstream-address
+        // parser rejects ("conflicting scheme and port"), since 443 usually
+        // means TLS. The hop really is plaintext, so the transport is forced
+        // explicitly instead of relying on a scheme Caddy would refuse.
+        let out = render(&[vh("plex", "10.0.0.50")]);
+        assert!(!out.contains("http://"), "{out}");
+        assert!(out.contains("reverse_proxy 10.0.0.50:443 {\n\t\ttransport http\n\t}\n"), "{out}");
     }
 
     #[test]
