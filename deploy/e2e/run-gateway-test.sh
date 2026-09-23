@@ -143,11 +143,19 @@ podman run -d --name "$GW" --network "$INET" \
     --entrypoint sleep wireserve-agent:gw-test infinity >/dev/null
 sleep 1
 GW_IP=$(ip_on "$GW" "$INET")
-echo "gw: $GW_IP (routable, will be the gateway)"
+# A hostname, not the literal address, and for a real reason rather than
+# cosmetics: gateway eligibility requires a *globally routable* endpoint, and
+# every address in this topology is RFC1918 because podman networks are. A
+# node on a real public IP would pass on the literal; a node on dynamic DNS —
+# which is what most people actually run — passes on the name. So the test
+# exercises the same path a real deployment does. `--add-host` below gives the
+# containers that have to dial it a way to resolve it.
+GW_HOST=gw.test
+echo "gw: $GW_IP, advertised as $GW_HOST:$WG_PORT (will be the gateway)"
 
 log "starting the homeserver agent behind NAT"
 podman run -d --name "$HOME_AGENT" --network "$SITE_H" \
-    --cap-add=NET_ADMIN --device /dev/net/tun \
+    --cap-add=NET_ADMIN --device /dev/net/tun --add-host "$GW_HOST:$GW_IP" \
     --entrypoint sleep wireserve-agent:gw-test infinity >/dev/null
 sleep 1
 in_netns "$HOME_AGENT" ip route replace default via "$ROUTER_H_LAN" >/dev/null
@@ -159,7 +167,7 @@ log "joining the two agents"
 JT_GW=$(create_node node-gw)
 JT_HOME=$(create_node node-home)
 podman exec "$GW" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_GW" \
-    --listen-port "$WG_PORT" --endpoint-addr "$GW_IP:$WG_PORT" 2>/dev/null
+    --listen-port "$WG_PORT" --endpoint-addr "$GW_HOST:$WG_PORT" 2>/dev/null
 podman exec "$HOME_AGENT" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_HOME" \
     --listen-port "$WG_PORT" 2>/dev/null
 for a in "$GW" "$HOME_AGENT"; do
@@ -210,7 +218,8 @@ pass "exactly one [Peer] block — the gateway, rendered once"
 
 log "bringing the phone up as a plain WireGuard client, no agent"
 podman run -d --name "$PHONE" --network "$SITE_P" \
-    --cap-add=NET_ADMIN --device /dev/net/tun "$DEBUG_IMG" sleep infinity >/dev/null
+    --cap-add=NET_ADMIN --device /dev/net/tun --add-host "$GW_HOST:$GW_IP" \
+    "$DEBUG_IMG" sleep infinity >/dev/null
 sleep 1
 podman exec "$PHONE" ip route replace default via "$ROUTER_P_LAN"
 podman exec "$PHONE" mkdir -p /etc/wireguard
