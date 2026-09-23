@@ -2381,3 +2381,30 @@ leak rather than a cost.
     us), the 500 ms debounce, the poll tick as the safety net, and the
     restart-on-next-tick when the listener dies. The agent no longer runs
     any long-lived child.
+
+133. **What it came to, as the operator's unit reports it.** One node,
+    4.4 MB of `nft -j list ruleset`, crowdsec and geoip-shell:
+
+    | after | `Memory:` | peak | agent's own `VmRSS` |
+    | --- | --- | --- | --- |
+    | (before) | — | — | 215 MB |
+    | #128 streaming ruleset reader | 70 M | 169 M | — |
+    | #129 streaming event filter | 57.5 M | 102.9 M | 27.7 MB |
+    | #130 terse listing | 57.4 M | 57.9 M | — |
+    | #132 own event listener | **4.9 M** | **12.9 M** | — |
+
+    The last step is bigger than removing the `nft monitor` child explains:
+    that child was ~30 M of the 57.4 M, so the agent's own footprint fell
+    by roughly 23 MB as well. The likeliest reason is the reader thread it
+    replaced — a `String` per line and a parse per line, tens of thousands
+    of times per blocklist reload, on a thread with its own glibc arena
+    that never gave the high-water back. #131's probe measured that churn
+    on the main thread of a short-lived process and found no growth; it did
+    not measure a dedicated thread's arena in a process that lives for
+    weeks. Recorded as the likeliest explanation, not a demonstrated one —
+    the same mistake #131 exists to correct would be to state it as fact.
+
+    Either way the shape is what matters: nothing left in this path scales
+    with the host's other firewalls. The ruleset reader skips what it does
+    not keep, the listing leaves set contents in the kernel, and the event
+    listener reads three fields out of a message it usually drops.
