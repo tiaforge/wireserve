@@ -227,6 +227,8 @@ mod tests {
             db_path: "x.db".into(),
             net_v4_cidr: "10.1.2.0/24".into(),
             net_v6_prefix: "fdab:cdef:1234::/64".into(),
+            service_domain: None,
+            service_proxy: None,
             online_threshold_secs: 180,
             rate_limit_max: 10,
             rate_limit_window_secs: 60,

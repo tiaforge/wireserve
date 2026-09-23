@@ -235,5 +235,6 @@ pub async fn register(
         ip4: ip4.to_string(),
         ip6: ip6.to_string(),
         mesh: Some(state.config.mesh_info()),
+        naming: state.config.service_naming(),
     }))
 }

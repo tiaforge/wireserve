@@ -1,0 +1,63 @@
+# Publishing mesh services by name (PLAN.md M25).
+#
+# This is the half you write. The agent generates the other half — one
+# matcher and one handler per service published on TCP 443 — into the file
+# imported below, and rewrites it whenever the mesh changes.
+#
+# Unrelated to the coordinator's own reverse proxy (Caddyfile.example next to
+# this file); that terminates TLS for the control plane, this serves the mesh.
+#
+# Setup, once:
+#
+#   1. On the coordinator:
+#        WIRESERVE_SERVICE_DOMAIN=int.example.com
+#        WIRESERVE_SERVICE_PROXY=web
+#      Every node then calls its services `<name>.int.example.com` instead of
+#      `<name>.wg`, and anything published on 443 resolves to `web`'s address.
+#
+#   2. On this node, publish the proxy itself and run the agent with it:
+#        wireserve-agent serve web 443:8443
+#        wireserve-agent daemon --proxy caddy
+#
+#   3. Point *.int.example.com at `web`'s SERVICE address — the one
+#      `wireserve-agent list` shows, not the node's mesh address. The
+#      firewall opens `vip:443` and deliberately refuses `node:443`, so a
+#      record aimed at the node is dropped by this node's own firewall.
+#
+#      *.int.example.com.  A  10.77.0.3
+#
+#      If that name does not resolve on some networks but works on others,
+#      it is almost certainly DNS rebinding protection: resolvers strip
+#      RFC1918 and IPv6 ULA answers from public DNS by default, and both of
+#      WireServe's generated ranges are on that list. See the README.
+#
+#   4. Caddy needs a DNS provider module for the wildcard certificate, which
+#      the stock binary does not ship:
+#        xcaddy build --with github.com/caddy-dns/cloudflare
+#      DNS-01 works fine for a name the internet cannot reach; it only needs
+#      the _acme-challenge TXT record.
+
+# Global options must be the first block in a Caddyfile. 8443 is what
+# `serve web 443:8443` maps to; Caddy binds every interface, and the mesh
+# firewall is what decides who reaches it — it opens only the service
+# address, never this node's own.
+{
+	https_port 8443
+}
+
+*.int.example.com {
+	# One wildcard certificate covers every service that will ever exist.
+	tls {
+		dns cloudflare {env.CF_API_TOKEN}
+	}
+
+	# Generated. Do not edit; the agent rewrites it.
+	import /etc/caddy/conf.d/wireserve.caddy
+
+	# Anything published on a port other than 443 is not proxied — it keeps
+	# its own address and the real client address with it — so its name
+	# lands here.
+	handle {
+		respond "not a published service" 404
+	}
+}

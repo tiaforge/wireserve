@@ -38,6 +38,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
             transit_carrying: vec![],
             transit_awaiting_approval: false,
             mesh: None,
+            naming: None,
         });
 
     let self_name = state.public_key.as_ref().and_then(|pk| {
@@ -113,6 +114,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
         // Only meaningful while opted in: the directory can be one poll
         // older than a `transit off` issued since.
         transit_awaiting_approval: state.transit_capable && directory.transit_awaiting_approval,
+        service_domain: directory.naming.as_ref().map(|n| n.domain.clone()),
         peers: directory.peers,
         tunnel: vec![],
         services,

@@ -9,7 +9,7 @@ source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
 **Currently working on:** nothing open — all milestones complete through
-M24 (refreshable static peers and gateway routing). 698 tests passing
+M25 (service FQDNs and auto-published vhosts). 726 tests passing
 across `cargo test --workspace`. Several container harnesses in
 `deploy/e2e/` pass on a real kernel: `run-e2e-test.sh` (mesh, firewall,
 interface guard), `run-nat-test.sh` (two NAT-ed sites) and
@@ -1979,3 +1979,153 @@ gateway (only `kind=static` peers do).
 
 `deploy/e2e/run-gateway-test.sh` is written but **not yet run** — same
 rootful-Podman pattern and same caveat as `run-transit-test.sh`.
+
+## M25 — service FQDNs, and publishing them through a reverse proxy
+
+M24 gave a phone *reachability*; it still had no *names*, because `.wg` lives
+in `/etc/hosts` and a phone has none. #104 had already ruled out the mesh
+resolver on client-implementation evidence and named the alternative — "a
+reverse proxy plus one public wildcard record, with no port 53 anywhere".
+This is that, and the shape it settled into is narrower and cheaper than the
+plan it started from.
+
+116. **Publishing TCP 443 is the opt-in, and it is an existing field.** The
+    first design had no opt-in at all and published every service; that gives
+    an SSH or Postgres service a public hostname, an ACME order and a vhost
+    that answers HTTP at something which is not HTTP. The second had a new
+    per-service attribute, which means a wire field, a migration, a `serve`
+    flag and an admin surface. Using the *published port* costs none of that:
+    `serve plex 443:32400` says "serve this under its name with TLS" and
+    `serve prom 80:9090` says "internal". The proxy still speaks plain HTTP
+    to the backend — 443 is the published port, which the owning node's
+    existing rewrite maps to whatever the service really listens on, so there
+    is no second TLS hop and no certificate to verify inside the mesh.
+
+117. **The suffix is replaced, not supplemented, and that is the point.**
+    `<name>.wg` becomes `<name>.<domain>` when a domain is set. Keeping both
+    was the original plan and it is wrong for a reason that has nothing to do
+    with tidiness: an application has *one* configured base URL — Gitea's
+    `ROOT_URL`, Grafana's `root_url`, an OIDC `redirect_uri` — so a second
+    working name is not a convenience, it is sessions and redirects bouncing
+    between two origins. One service, one name.
+
+    Which address that name points at then falls out per service rather than
+    globally: a 443 service resolves to the proxy from everywhere, so one base
+    URL is correct from a node and from a phone; anything else resolves to its
+    own address from everywhere, keeping the direct path, the real client
+    address and no hop. Neither ever has two names. The cost, stated plainly:
+    a non-443 service is not reachable *by name* from a device with no hosts
+    file. It is reachable at `address:port`, and publishing it on 443 is how
+    you ask for the name.
+
+118. **The domain is mesh-wide and comes from the coordinator; the proxy
+    configuration is written by the agent.** These are different questions and
+    got different answers. Nodes that disagreed about the suffix would
+    disagree about their own services' names, so `WIRESERVE_SERVICE_DOMAIN`
+    and `WIRESERVE_SERVICE_PROXY` ride the poll and register responses exactly
+    as `MeshInfo` does (#4's precedent), with no DB, no per-service column and
+    no admin verb. But the coordinator cannot write a file on the proxy node —
+    it usually is not the proxy node, there is no push channel, and #95
+    rejected the coordinator-hosted relay precisely because it would have been
+    the first time the coordinator touched anything live. The agent already
+    receives the directory every poll and already renders it into a managed
+    file; `hosts.rs` is the template.
+
+    `WIRESERVE_SERVICE_PROXY` names the *service*, not the node: the proxy is
+    reached at a service address, a node could publish several things on 443,
+    and it is the same value that goes in the wildcard DNS record.
+
+119. **Matchers inside one wildcard site block, never a site block per
+    service.** `plex.int.example.com { … }` is more specific than the
+    operator's `*.int.example.com`, so Caddy would try HTTP-01 for it — which
+    cannot work for a name resolving to a mesh address — and one site block
+    per service is also one ACME order per service, against Let's Encrypt's
+    fifty-certificates-per-registered-domain-per-week limit. One wildcard
+    certificate covers every service that will ever exist.
+
+120. **The DNS record points at the proxy's service address, not its node
+    address.** `ServiceRule::Mapped` opens `vip:public` and deliberately
+    refuses `node:target`, so a wildcard aimed at the node's mesh address is
+    dropped by that node's own firewall. Documented in the README and in
+    `deploy/proxy/Caddyfile.services.example`, because the failure looks like
+    a proxy problem and is not one.
+
+121. **A proxy failure is a warning, never a failed step.** `run_once` returns
+    before persisting `last_directory` when any step fails, so folding the
+    proxy into `failures` would freeze `wireserve-agent list` on a stale
+    directory whenever Caddy was down — a baffling symptom for an unrelated
+    cause. The proxy is a convenience layer on a working mesh and must not
+    degrade the mesh's own bookkeeping. It is retried every cycle regardless,
+    because the backend compares against what is on disk rather than what it
+    last wrote. `publish_to_proxy` returns `()` for exactly this reason, and
+    is its own function so that is testable.
+
+122. **The generated file is owned outright, and a bad one is rolled back.**
+    It is a whole file in `/etc/caddy/conf.d/`, not a managed block in a
+    shared one: teardown is an unlink and there is no need for `hosts.rs`'s
+    flock dance, which exists only because every instance shares one
+    `/etc/hosts`. `fsutil::atomic_write` stages at `.<name>.tmp`, so an
+    `import conf.d/*.caddy` glob can never pick up a half-written file —
+    pinned by a test, since the alternative is a proxy that occasionally loads
+    a truncated config. On a failed `validate` or `reload` the previous bytes
+    are restored: Caddy's reload is atomic and keeps the running config, so a
+    bad fragment cannot take the proxy down *now*, but left on disk it would
+    take it down at the next restart — a reboot or a package upgrade, hours
+    later, with nothing connecting it to this agent.
+
+123. **Teardown only on an explicit `leave`.** Every daemon restart runs
+    `teardown_everything` too, and removing the vhosts to re-add them seconds
+    later means two reloads and needless re-provisioning. Gated on
+    `reset_state`, the same distinction that path already draws for state.
+
+124. **Deliberately not filtered on `ServiceInfo::online`.** A flapping node
+    would otherwise rewrite the configuration and reload the proxy on every
+    transition. A name resolving to a service that is down is a 502, which is
+    a better failure than a name that comes and goes.
+
+125. **`ProxyBackend` is agent-local, unlike `FirewallBackend`.** That trait
+    lives in `wireserve-types` for two stated reasons — a future Windows
+    implementation, and avoiding an orphan rule around `ServiceRule` — and
+    neither applies here: one implementation by decision, and `ServiceInfo`
+    already lives in types. It stays a trait only so `run_once` has a fake to
+    test against, which is the same reason `FirewallBackend` has one. Its
+    error is a boxed `dyn Error` rather than an associated type, because the
+    poll context holds it as `Option<&mut dyn ProxyBackend>` — the proxy is
+    genuinely absent on almost every node — and an associated type is not
+    object-safe.
+
+126. **The port-sharing fix that was going to ride along does not work, and
+    the investigation is worth keeping.** The idea was to match a reply on
+    `ct original ip daddr == vip` rather than `(saddr == node, sport ==
+    target)`, freeing several services on one node to share a target port.
+    `svc-pre` runs at `PRIO_RAW` (−300) and conntrack registers at −200, so
+    the tuple conntrack records is already the rewritten one and `ct original`
+    names the node for every mapped service. `ct_original_daddr()` at
+    `nftables.rs:477` is the *inverse* case — it matches a container runtime's
+    DNAT at −100, after conntrack — so the precedent does not transfer.
+    Moving the rewrite later does not help either: conntrack would then expect
+    a reply from `vip:public`, the real reply from `node:target` would match
+    nothing, and `ct direction reply`, the ct mark and the runtime's own NAT
+    would break together.
+
+    The replacement, a per-mapping index in the mark, has three problems that
+    together make it its own milestone: nft refuses a binary operation whose
+    right operand is another register, so the carry rule must fan out to one
+    rule per index; 128 index values do not cover 64 services × 16 ports; and
+    the ruleset is full-replaced every poll while conntrack entries outlive
+    it, so an index assigned by position renumbers on an unrelated `serve` —
+    `ipc/server.rs` does `retain` then `push` — and silently misroutes or
+    blackholes open flows on *other* services. Doing it properly means
+    persistent index slots in `AgentState` keyed by `(name, public, target,
+    proto)`, indexing only where a collision actually exists, and refusing at
+    `serve` time on exhaustion. That is the packet-rewrite core, where #99
+    records a security regression, and it needs its own kernel tests.
+
+Explicitly out of scope: a mesh DNS resolver (#104, still ruled out); per-node
+TLS termination with every service on its own `VIP:443` (needs the port fix
+above *and* per-service DNS records, since a wildcard cannot point at
+different addresses); more than one proxy per mesh; non-HTTP services by name.
+
+`deploy/e2e/run-proxy-publish-test.sh` is **not yet written** — the unit and
+integration tests cover rendering, selection and the warn-only property, but
+nothing has yet driven a real Caddy with a real certificate.

@@ -82,6 +82,10 @@ pub struct ListView {
     /// see `wireserve_types::PollResponse::transit_awaiting_approval`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub transit_awaiting_approval: bool,
+    /// The domain services are named under (PLAN.md M25), so `list` shows
+    /// the same name the hosts file writes. Absent means `.wg`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_domain: Option<String>,
     /// The coordinator's view of every peer, as of the last poll.
     pub peers: Vec<PeerInfo>,
     /// The kernel's view of the same peers, read when `list` asked: the

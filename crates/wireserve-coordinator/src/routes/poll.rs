@@ -373,5 +373,6 @@ pub async fn poll(
         transit_carrying,
         transit_awaiting_approval,
         mesh: Some(state.config.mesh_info()),
+        naming: state.config.service_naming(),
     }))
 }

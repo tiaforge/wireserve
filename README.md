@@ -364,6 +364,92 @@ working immediately and the device is briefly absent from the mesh while
 the new one is redeemed. It refuses outright if the name belongs to a node
 that runs the agent.
 
+### 4b. Give services real names, reachable from a phone
+
+`<service>.wg` lives in each agent's `/etc/hosts`, which a phone does not
+have. To give services a name that works everywhere, point one node's reverse
+proxy at the mesh and tell the coordinator the domain:
+
+```sh
+# on the coordinator
+WIRESERVE_SERVICE_DOMAIN=int.example.com
+WIRESERVE_SERVICE_PROXY=web
+```
+
+Every service is then `<name>.int.example.com` instead of `<name>.wg` — the
+suffix is **replaced, not added to**. Two working names would mean two base
+URLs, and anything with a single configured one (Gitea's `ROOT_URL`, Grafana's
+`root_url`, an OIDC `redirect_uri`) emits redirects that bounce between them.
+
+**Publishing on TCP 443 is what asks for a name with TLS:**
+
+```sh
+wireserve-agent serve plex 443:32400   # plex.int.example.com, via the proxy
+wireserve-agent serve prom 80:9090     # prom.int.example.com, direct
+```
+
+| Published on | Resolves to | From a node | From a phone |
+| --- | --- | --- | --- |
+| 443 | the proxy | via the proxy, HTTPS | via the proxy, HTTPS |
+| anything else | its own address | direct, plain HTTP | 404 at the proxy |
+
+A 443 service resolves to the same place with the same scheme wherever you
+ask, which is what makes one configured base URL correct everywhere. Anything
+else keeps the direct path, and with it the real client address and no extra
+hop — it simply is not reachable *by name* from a phone. Publish it on 443 if
+you want the name; reach it at `address:port` if you do not. Nothing that is
+not HTTP ever gets a hostname or a certificate it did not ask for.
+
+On the proxy node, publish the proxy itself and run the agent with it:
+
+```sh
+wireserve-agent serve web 443:8443
+wireserve-agent daemon --proxy caddy
+```
+
+The agent then writes one matcher and one handler per 443 service into
+`/etc/caddy/conf.d/wireserve.caddy` on every poll that changes anything, and
+reloads Caddy. `deploy/proxy/Caddyfile.services.example` is the half you
+write. A service declared later appears by itself; nothing on any device
+changes, ever.
+
+Two things to get right:
+
+- **Point the wildcard DNS record at the proxy's *service* address**, the one
+  `wireserve-agent list` shows — not at the node's mesh address. The firewall
+  opens `service:443` and deliberately refuses `node:443`, so a record aimed
+  at the node is dropped by that node's own firewall.
+- **Caddy needs a custom build** for the wildcard certificate: the stock
+  binary ships no DNS provider module (`xcaddy build --with
+  github.com/caddy-dns/cloudflare`). DNS-01 itself is fine for a name the
+  internet cannot reach — it only needs the `_acme-challenge` TXT record.
+
+#### If the name resolves on one network but not another
+
+This is almost always **DNS rebinding protection**, and it is worth knowing
+before it costs you an evening. Resolvers strip private addresses out of
+answers from public DNS by default; the usual list is `127/8`, `10/8`,
+`172.16/12`, `192.168/16`, `169.254/16`, `fd00::/8` and `fe80::/10`. The
+coordinator generates a `10.x.x.0/24` mesh and an `fd..::/64` prefix, so
+**both families are on that list** and the wildcard record is silently
+dropped — no error, just a name that does not resolve.
+
+OpenWrt's dnsmasq enables this by default, as do pfSense, NextDNS and AdGuard.
+The usual offender is your own router, and every one of them has a per-domain
+exception:
+
+```
+rebind-domain-ok=/int.example.com/       # dnsmasq, OpenWrt
+private-domain: "int.example.com"        # unbound, pfSense
+```
+
+NextDNS and AdGuard take an allowlist entry for the domain. Carrier and plain
+public resolvers generally do not filter, which is why the symptom is often
+"works on cellular, fails at home".
+
+`100.64.0.0/10` is not on the strip list, but do not reach for it — see the
+mesh-range warning further down, since Tailscale allocates that entire `/10`.
+
 ### 5. When a machine is lost or compromised
 
 ```sh
@@ -441,6 +527,7 @@ On a node, talking to the local daemon over a Unix socket:
 | `wireserve-agent install <url> [--instance name]` | installs the binary + systemd unit, then joins — one command, needs root |
 | `wireserve-agent join [url] [token]` | one-time bootstrap, generates the keypair — prompts for either if omitted |
 | `wireserve-agent serve <name> <[public:]target[/tcp\|/udp]>...` | publish a service on its own address |
+| `wireserve-agent daemon --proxy caddy` | publish this mesh's 443 services as vhosts on the reverse proxy running here |
 | `wireserve-agent unserve <name>` | withdraw one |
 | `wireserve-agent transit on\|off` | opt in/out of carrying traffic for two other nodes that can't reach each other directly (also needs `approve-transit`) |
 | `wireserve-agent list [--json]` | services (name, address, ports, owner, state), peers (with each one's route — direct or via a carrier) and anything not published, from the last poll |

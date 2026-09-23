@@ -128,6 +128,7 @@ mod tests {
 
     fn directory(peers: Vec<PeerInfo>, services: Vec<ServiceInfo>) -> PollResponse {
         PollResponse {
+            naming: None,
             peers,
             services,
             pending_services: vec![],

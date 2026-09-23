@@ -328,6 +328,7 @@ async fn register(
         ip4: "100.90.0.9".to_string(),
         ip6: "fd00:90::9".to_string(),
         mesh: None,
+        naming: None,
     }))
 }
 

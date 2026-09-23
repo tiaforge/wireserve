@@ -8,6 +8,12 @@ pub struct Config {
     pub db_path: String,
     pub net_v4_cidr: String,
     pub net_v6_prefix: String,
+    /// The domain services are named under (PLAN.md M25), e.g.
+    /// `int.example.com`. Unset leaves `<name>.wg` exactly as it was.
+    pub service_domain: Option<String>,
+    /// The service that fronts everything published on 443. Meaningless
+    /// without `service_domain`.
+    pub service_proxy: Option<String>,
     pub online_threshold_secs: i64,
     pub rate_limit_max: u32,
     pub rate_limit_window_secs: u64,
@@ -142,6 +148,38 @@ impl Config {
         let reflexive_rate_limit_window_secs =
             env_parse_or("WIRESERVE_REFLEXIVE_RATE_LIMIT_WINDOW_SECS", 10u64)?;
 
+        // Rejected loudly rather than ignored: a typo here would silently
+        // rename nothing and leave the operator hunting for why their
+        // services still answer to `.wg`.
+        let service_domain = match std::env::var("WIRESERVE_SERVICE_DOMAIN") {
+            Ok(d) if d.trim().is_empty() => None,
+            Ok(d) => {
+                let d = d.trim().to_string();
+                if !wireserve_types::is_valid_hostname(&d) {
+                    return Err(ConfigError::Invalid(
+                        "WIRESERVE_SERVICE_DOMAIN",
+                        format!("{d:?} is not a valid domain (needs at least two labels)"),
+                    ));
+                }
+                Some(d)
+            }
+            Err(_) => None,
+        };
+        let service_proxy = match std::env::var("WIRESERVE_SERVICE_PROXY") {
+            Ok(p) if p.trim().is_empty() => None,
+            Ok(p) => {
+                let p = p.trim().to_string();
+                if !wireserve_types::is_valid_dns_label(&p) {
+                    return Err(ConfigError::Invalid(
+                        "WIRESERVE_SERVICE_PROXY",
+                        format!("{p:?} must be a service name, not a node or a domain"),
+                    ));
+                }
+                Some(p)
+            }
+            Err(_) => None,
+        };
+
         Ok(Loaded {
             config: Self {
                 listen_addr,
@@ -150,6 +188,8 @@ impl Config {
                 db_path,
                 net_v4_cidr,
                 net_v6_prefix,
+                service_domain,
+                service_proxy,
                 online_threshold_secs,
                 rate_limit_max,
                 rate_limit_window_secs,
@@ -176,6 +216,20 @@ impl Config {
             net_v4_cidr: self.net_v4_cidr.clone(),
             net_v6_prefix: self.net_v6_prefix.clone(),
         }
+    }
+}
+
+impl Config {
+    /// How services are named, as nodes are told it (PLAN.md M25) — at
+    /// registration and on every poll, the same shape and for the same reason
+    /// as [`Config::mesh_info`]. `None` when no domain is set, which is the
+    /// pre-M25 behaviour and stays the default.
+    #[must_use]
+    pub fn service_naming(&self) -> Option<wireserve_types::ServiceNaming> {
+        self.service_domain.as_ref().map(|domain| wireserve_types::ServiceNaming {
+            domain: domain.clone(),
+            proxy_service: self.service_proxy.clone(),
+        })
     }
 }
 

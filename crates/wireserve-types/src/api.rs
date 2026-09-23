@@ -147,6 +147,11 @@ pub struct RegisterResponse {
     /// [`crate::MeshInfo`]. Absent from a coordinator that predates it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<crate::MeshInfo>,
+    /// How services are named on this mesh (PLAN.md M25). Absent when the
+    /// coordinator has no domain configured, which leaves `<name>.wg`
+    /// untouched — and absent from a coordinator that predates it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub naming: Option<crate::ServiceNaming>,
 }
 
 // ---- §4.3 Node: poll ----
@@ -435,6 +440,11 @@ pub struct PollResponse {
     /// [`crate::MeshInfo`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<crate::MeshInfo>,
+    /// How services are named on this mesh (PLAN.md M25). Absent when the
+    /// coordinator has no domain configured, which leaves `<name>.wg`
+    /// untouched — and absent from a coordinator that predates it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub naming: Option<crate::ServiceNaming>,
     /// THIS node's own declarations awaiting approval — never anyone
     /// else's.
     ///
@@ -617,6 +627,7 @@ mod tests {
             transit_carrying: vec![],
             transit_awaiting_approval: false,
             mesh: None,
+            naming: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("pending_services"), "{json}");
@@ -699,6 +710,7 @@ mod tests {
             transit_carrying: vec![],
             transit_awaiting_approval: false,
             mesh: None,
+            naming: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: PollResponse = serde_json::from_str(&json).unwrap();

@@ -10,6 +10,7 @@ pub mod mesh;
 pub mod paths;
 pub mod poll_loop;
 pub mod probe;
+pub mod proxy;
 pub mod reflexive;
 pub mod register;
 #[cfg(target_os = "linux")]

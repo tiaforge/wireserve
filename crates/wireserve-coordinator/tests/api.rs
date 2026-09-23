@@ -26,6 +26,8 @@ fn test_config(db_path: &str) -> Config {
         db_path: db_path.to_string(),
         net_v4_cidr: "100.90.0.0/24".to_string(),
         net_v6_prefix: "fd00:90::/64".to_string(),
+        service_domain: None,
+        service_proxy: None,
         online_threshold_secs: 180,
         rate_limit_max: 1000,
         rate_limit_window_secs: 60,

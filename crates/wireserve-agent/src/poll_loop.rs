@@ -362,6 +362,34 @@ pub struct PollContext<'a, F: FirewallBackend> {
     /// coordinator's COALESCE contract stays uniform across every
     /// self-reported field.
     pub own_reflexive_addr: Option<&'a str>,
+    /// The reverse proxy this node fronts services with (PLAN.md M25), or
+    /// `None` on the overwhelming majority of nodes, which run none.
+    pub proxy: Option<&'a mut dyn crate::proxy::ProxyBackend>,
+}
+
+/// Publishes this cycle's services to the node's reverse proxy, if it runs
+/// one (PLAN.md M25).
+///
+/// Returns nothing on purpose, and that is the whole point of it being its
+/// own function: a proxy failure must never reach `run_once`'s `failures`
+/// vec. That function returns before persisting `last_directory` when any
+/// step fails, so a proxy that is down or misconfigured would otherwise
+/// freeze `wireserve-agent list` on a stale directory — a baffling symptom
+/// for an unrelated cause. The proxy is a convenience layer on top of a
+/// working mesh and must not degrade the mesh's own bookkeeping. It is
+/// retried next cycle regardless, because the backend compares against what
+/// is on disk rather than what it last wrote.
+fn publish_to_proxy(
+    proxy: Option<&mut (dyn crate::proxy::ProxyBackend + '_)>,
+    directory: &PollResponse,
+) {
+    let (Some(proxy), Some(naming)) = (proxy, directory.naming.as_ref()) else {
+        return;
+    };
+    let vhosts = crate::proxy::vhosts(&directory.services, naming);
+    if let Err(e) = proxy.sync(&vhosts) {
+        tracing::warn!(error = %e, "could not publish services to the reverse proxy");
+    }
 }
 
 /// Runs exactly one poll cycle against the daemon's single shared `state`,
@@ -613,7 +641,23 @@ where
         crate::firewall::ip_forward::set_enabled(&ifname, !transit_forwards.is_empty());
 
         // 4. rewrite the hosts-file managed block from the full directory.
-        if let Err(e) = crate::hosts::sync(ctx.hosts_path, ctx.hosts_label, &directory.services) {
+        // Step 4b (PLAN.md M25): publish services to this node's reverse
+        // proxy, if it runs one.
+        //
+        // Warn-only, and deliberately NOT a member of `failures`. This
+        // function returns before persisting `last_directory` when any step
+        // fails, so a proxy that is down or misconfigured would otherwise
+        // freeze `wireserve-agent list` on a stale directory — a baffling
+        // symptom for an unrelated cause. The proxy is a convenience layer on
+        // top of a working mesh; it must not degrade the mesh's own
+        // bookkeeping. Retried next cycle regardless, since the backend
+        // compares against what is on disk rather than what it last wrote.
+        publish_to_proxy(ctx.proxy.as_deref_mut(), &directory);
+
+        let naming = crate::hosts::Naming::new(directory.naming.as_ref(), &directory.services);
+        if let Err(e) =
+            crate::hosts::sync(ctx.hosts_path, ctx.hosts_label, &directory.services, naming)
+        {
             failures.push(PollError::Hosts(e));
         }
         failures
@@ -738,7 +782,8 @@ mod tests {
     }
 
     fn with_services(services: Vec<ServiceInfo>) -> PollResponse {
-        PollResponse { services, ..directory_with(&[], &[]) }
+        PollResponse {
+            naming: None, services, ..directory_with(&[], &[]) }
     }
 
     /// Whether any rule makes `port` reachable in some form — opened
@@ -858,6 +903,7 @@ mod tests {
         denied: &[(&str, Option<&str>)],
     ) -> PollResponse {
         PollResponse {
+            naming: None,
             peers: vec![],
             services: vec![],
             pending_services: pending
@@ -1081,5 +1127,67 @@ mod tests {
         let msg = PollError::Incomplete(vec![PollError::Firewall("nft said no".into()), io(libc::EROFS)]).to_string();
         assert!(msg.contains("firewall reconciliation failed: nft said no"), "{msg}");
         assert!(msg.contains("hosts-file sync failed"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod proxy_step_tests {
+    use super::*;
+    use crate::proxy::fake::FakeProxyBackend;
+    use wireserve_types::{PortMap, Proto, ServiceInfo, ServiceNaming};
+
+    fn directory(naming: Option<ServiceNaming>) -> PollResponse {
+        PollResponse {
+            naming,
+            peers: vec![],
+            services: vec![ServiceInfo {
+                name: "plex".into(),
+                node: "n".into(),
+                ip4: "10.9.0.3".into(),
+                port: 443,
+                proto: Proto::Tcp,
+                online: true,
+                vip4: Some("10.9.0.50".into()),
+                ports: vec![PortMap { public: 443, target: 32400, proto: Proto::Tcp }],
+            }],
+            pending_services: vec![],
+            denied_services: vec![],
+            transit_carrying: vec![],
+            transit_awaiting_approval: false,
+            mesh: None,
+        }
+    }
+
+    fn naming() -> ServiceNaming {
+        ServiceNaming { domain: "int.example.com".into(), proxy_service: None }
+    }
+
+    #[test]
+    fn a_failing_proxy_never_fails_the_cycle() {
+        // The property that keeps a down Caddy from freezing the directory
+        // cache: this returns `()`, so there is nothing for `run_once` to
+        // fold into `failures`.
+        let mut backend = FakeProxyBackend { fail: true, ..Default::default() };
+        publish_to_proxy(Some(&mut backend), &directory(Some(naming())));
+        assert_eq!(backend.calls.lock().unwrap().len(), 1, "it must still have tried");
+    }
+
+    #[test]
+    fn services_reach_the_backend_as_vhosts() {
+        let mut backend = FakeProxyBackend::default();
+        publish_to_proxy(Some(&mut backend), &directory(Some(naming())));
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(calls[0].len(), 1);
+        assert_eq!(calls[0][0].host, "plex.int.example.com");
+    }
+
+    #[test]
+    fn a_coordinator_with_no_domain_configured_publishes_nothing() {
+        let mut backend = FakeProxyBackend::default();
+        publish_to_proxy(Some(&mut backend), &directory(None));
+        assert!(
+            backend.calls.lock().unwrap().is_empty(),
+            "without a domain there are no names to publish, so the proxy is left alone"
+        );
     }
 }

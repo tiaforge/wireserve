@@ -147,6 +147,27 @@ pub fn is_valid_reflexive_addr(s: &str) -> bool {
     host.parse::<std::net::Ipv4Addr>().is_ok() && matches!(port.parse::<u16>(), Ok(p) if p != 0)
 }
 
+/// Whether `s` is a usable DNS domain to name services under (PLAN.md M25),
+/// e.g. `int.example.com`.
+///
+/// Operator-supplied rather than coordinator-allocated, so this is a footgun
+/// guard more than a trust boundary — but it is also the one component of a
+/// generated reverse-proxy config that does not come from the validated
+/// directory, and a newline or a `{$ENV}` reaching a Caddyfile through it
+/// would be a config-injection all of its own. At least two labels, so a bare
+/// TLD cannot be set by accident, and short enough that `<service>.<domain>`
+/// still fits a 253-byte name.
+#[must_use]
+pub fn is_valid_hostname(s: &str) -> bool {
+    if s.is_empty() || s.len() > 253 || s.contains('\n') || s.contains('\r') {
+        return false;
+    }
+    // One trailing dot is tolerated, as it is for an endpoint's hostname.
+    let s = s.strip_suffix('.').unwrap_or(s);
+    let labels: Vec<&str> = s.split('.').collect();
+    labels.len() >= 2 && labels.iter().all(|l| is_valid_hostname_label(l))
+}
+
 /// Whether an `endpoint_addr`-shaped value (`host:port`, or
 /// `[v6]:port`) names a host reachable from outside the local network.
 ///
@@ -540,5 +561,47 @@ mod routable_endpoint_tests {
     #[test]
     fn rejects_anything_carrying_a_newline() {
         assert!(!is_globally_routable_endpoint("203.0.113.5:51820\nAllowedIPs = 0.0.0.0/0"));
+    }
+}
+
+#[cfg(test)]
+mod hostname_tests {
+    use super::is_valid_hostname;
+
+    #[test]
+    fn accepts_ordinary_domains() {
+        for s in ["int.example.com", "example.com", "a.b.c.example.com", "example.com."] {
+            assert!(is_valid_hostname(s), "expected {s:?} accepted");
+        }
+    }
+
+    #[test]
+    fn rejects_a_bare_label_so_a_tld_cannot_be_set_by_accident() {
+        assert!(!is_valid_hostname("example"));
+        assert!(!is_valid_hostname("localhost"));
+    }
+
+    #[test]
+    fn rejects_anything_that_could_reach_a_config_file_as_syntax() {
+        for s in [
+            "int.example.com\nEndpoint = evil",
+            "int.example.com\r",
+            "int.{$HOME}.com",
+            "int example.com",
+            "int.example.com { }",
+            "",
+            ".",
+            "..",
+            "-bad.example.com",
+            "bad-.example.com",
+        ] {
+            assert!(!is_valid_hostname(s), "expected {s:?} rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_an_over_long_name() {
+        let long = format!("{}.example.com", "a".repeat(250));
+        assert!(!is_valid_hostname(&long));
     }
 }

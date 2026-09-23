@@ -418,6 +418,35 @@ Instead, each poll cycle the agent writes a static, local lookup table:
   reintroduces the "resolver in the query path" problem this design exists
   to avoid.
 
+### 6.1 Real names, and the reverse proxy (M25)
+
+`.wg` solves naming for anything that runs the agent and for nothing else,
+which is the whole of the problem a phone has. M25 adds an optional
+mesh-wide domain (`WIRESERVE_SERVICE_DOMAIN`), and with it the suffix is
+**replaced** rather than supplemented: `<name>.int.example.com` instead of
+`<name>.wg`. Two working names would give an application two base URLs, and
+anything with a single configured one — `ROOT_URL`, `root_url`, an OIDC
+`redirect_uri` — then emits redirects and sets cookies that bounce between
+them. One service, one name.
+
+**Publishing TCP 443 is the opt-in**, deliberately an existing field rather
+than a new per-service attribute: it needs no schema change, and it is what
+keeps an SSH or Postgres service from acquiring a public hostname and a
+certificate nobody asked for. A service published on 443 resolves to the
+reverse proxy named by `WIRESERVE_SERVICE_PROXY`, from a node and from a
+phone alike, so one base URL is correct in both places. Everything else
+resolves to its own address and keeps the direct path, the real client
+address and the absence of a hop — it is simply not reachable by name from a
+device with no hosts file.
+
+This does not walk back §6. WireServe still never listens on 53, never
+touches `resolv.conf`, and never enters anyone's query path: the phone's name
+resolution is a single wildcard record in ordinary public DNS, and the agent
+generates a configuration file for a proxy the operator runs. The proxied
+path does give up the "service sees the real client" property of §-service
+addresses, which is exactly why it is opt-in and why the direct path is left
+untouched beside it.
+
 ## 7. Security requirements (v1, non-negotiable)
 
 These are treated as core requirements, not hardening to add later:
@@ -593,4 +622,4 @@ What it does, end to end:
   (§4.0), which is enough for a single operator but doesn't distinguish
   between multiple admins
 - STUN, relay/hairpin fallback for symmetric NAT
-- Reverse-proxy auto-publish integration
+- ~~Reverse-proxy auto-publish integration~~ — built in M25, see §6.1

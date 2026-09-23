@@ -66,7 +66,7 @@ fn service_state(s: &LocalServiceView) -> &'static str {
     }
 }
 
-fn service_row(s: &LocalServiceView) -> Vec<String> {
+fn service_row(s: &LocalServiceView, domain: Option<&str>) -> Vec<String> {
     let node = if s.local { format!("{} (this node)", clean(&s.node)) } else { clean(&s.node) };
     // A service without an address of its own (declared by an agent from
     // before service addresses) resolves to its node.
@@ -75,7 +75,11 @@ fn service_row(s: &LocalServiceView) -> Vec<String> {
         None => format!("{} (node)", clean(&s.ip4)),
     };
     let maps = if s.ports.is_empty() { vec![PortMap::identity(s.port, s.proto)] } else { s.ports.clone() };
-    vec![format!("{}.wg", clean(&s.name)), address, ports(&maps), node, service_state(s).into()]
+    let host = match domain {
+        Some(d) => format!("{}.{}", clean(&s.name), clean(d)),
+        None => format!("{}.wg", clean(&s.name)),
+    };
+    vec![host, address, ports(&maps), node, service_state(s).into()]
 }
 
 /// `4s ago`, `3m ago`, `5h ago`, `2d ago`.
@@ -170,7 +174,9 @@ pub fn render(view: &ListView, now: DateTime<Utc>) -> String {
     } else {
         let mut services: Vec<&LocalServiceView> = view.services.iter().collect();
         services.sort_by(|a, b| a.name.cmp(&b.name));
-        let rows: Vec<Vec<String>> = services.into_iter().map(service_row).collect();
+        let domain = view.service_domain.as_deref();
+        let rows: Vec<Vec<String>> =
+            services.into_iter().map(|s| service_row(s, domain)).collect();
         out.push_str(&table(&["SERVICE", "ADDRESS", "PORTS", "NODE", "STATE"], &rows));
     }
 
@@ -270,6 +276,7 @@ mod tests {
             instance: "default".into(),
             ifname: "wireserve0".into(),
             node: Some("lego2".into()),
+            service_domain: None,
             transit_capable: false,
             transit_carrying: vec![],
             transit_awaiting_approval: false,
