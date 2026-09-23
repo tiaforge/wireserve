@@ -49,8 +49,8 @@
 //! table. The pure rules for all of that are in `planner`; `planner_tests`
 //! pins them.
 //!
-//! Runs on one dedicated thread (so no locking), woken by `nft -j monitor`
-//! events (debounced), by every poll tick (the safety net), and by stop.
+//! Runs on one dedicated thread (so no locking), woken by the kernel's
+//! nftables events (debounced), by every poll tick (the safety net), and by stop.
 //! Every failure is logged, never propagated.
 //!
 //! **Everything here depends on our own table being in place**, because
@@ -142,10 +142,10 @@ impl HostInterop {
                 };
             }
         };
-        Self::start_with(ifname, nft.clone(), RealOps::new(nft).with_own_table(own_table), transit_capable)
+        Self::start_with(ifname, RealOps::new(nft).with_own_table(own_table), transit_capable)
     }
 
-    fn start_with(ifname: &str, nft: Nft, mut ops: RealOps, forward_wanted: bool) -> Self {
+    fn start_with(ifname: &str, mut ops: RealOps, forward_wanted: bool) -> Self {
         let mut told = HashSet::new();
         ops::reconcile(&mut ops, ifname, forward_wanted, &mut told);
 
@@ -154,7 +154,7 @@ impl HostInterop {
         let monitor_tx = tx.clone();
         let worker = std::thread::Builder::new()
             .name("host-interop".into())
-            .spawn(move || run(ops, &ifname, forward_wanted, &nft, &rx, &monitor_tx, told));
+            .spawn(move || run(ops, &ifname, forward_wanted, &rx, &monitor_tx, told));
         // `run` reconciles on monitor events, which it filters by this
         // interface (see `monitor::is_relevant`).
         match worker {
@@ -242,15 +242,14 @@ fn run(
     mut ops: RealOps,
     ifname: &str,
     mut forward_wanted: bool,
-    nft: &Nft,
     rx: &Receiver<Msg>,
     tx: &Sender<Msg>,
     mut told: HashSet<String>,
 ) {
-    let spawn_monitor = || match Monitor::spawn(nft, ifname, tx.clone(), || Msg::Changed, || Msg::MonitorExited) {
+    let spawn_monitor = || match Monitor::spawn(ifname, tx.clone(), || Msg::Changed, || Msg::MonitorExited) {
         Ok(m) => Some(m),
         Err(e) => {
-            tracing::warn!(error = %e, "could not start `nft monitor`; relying on the poll tick");
+            tracing::warn!(error = %e, "could not listen for nftables events; relying on the poll tick");
             None
         }
     };
@@ -263,7 +262,7 @@ fn run(
         match rx.recv_timeout(wait) {
             Ok(Msg::Changed) => debounce.event(Instant::now()),
             Ok(Msg::MonitorExited) => {
-                tracing::warn!("`nft monitor` exited; will restart it on the next poll tick");
+                tracing::warn!("the nftables event listener stopped; will restart it on the next poll tick");
                 monitor = None;
             }
             Ok(Msg::Tick { forward_wanted: now }) => {
@@ -351,7 +350,7 @@ mod tests {
         sh(&format!("printf '{NATIVE_DROP_ALL}' | nft -f -"));
         let nft = Nft::locate().unwrap();
         let (_backend, shared) = own_table("wg0");
-        let _interop = HostInterop::start_with("wg0", nft.clone(), RealOps::without_firewalld(nft).with_own_table(shared), false);
+        let _interop = HostInterop::start_with("wg0", RealOps::without_firewalld(nft).with_own_table(shared), false);
         assert_eq!(tags(&sh("nft list table inet filter")), 1);
 
         sh(&format!("printf 'flush ruleset\n{NATIVE_DROP_ALL}' | nft -f -"));
@@ -375,7 +374,7 @@ mod tests {
         sh(&format!("iptables-nft -P INPUT DROP; printf '{NATIVE_DROP_ALL}' | nft -f -"));
         let nft = Nft::locate().unwrap();
         let (_backend, _shared) = own_table("wg0");
-        let _interop = HostInterop::start_with("wg0", nft.clone(), RealOps::without_firewalld(nft), false);
+        let _interop = HostInterop::start_with("wg0", RealOps::without_firewalld(nft), false);
         assert_eq!(tags(&sh("nft list ruleset; iptables-nft -S INPUT")), 2);
 
         sh("nft flush chain inet wireserve.wg0 wireserve-in");
@@ -411,12 +410,7 @@ mod tests {
         let (_backend, shared) = own_table("wg0");
         // Started opted OUT, exactly as a daemon that came up before the
         // operator decided to carry transit.
-        let mut interop = HostInterop::start_with(
-            "wg0",
-            nft.clone(),
-            RealOps::without_firewalld(nft).with_own_table(shared),
-            false,
-        );
+        let mut interop = HostInterop::start_with("wg0", RealOps::without_firewalld(nft).with_own_table(shared), false);
         assert_eq!(forward_rules(), 0, "a node that never opted in opens nothing in FORWARD");
 
         // `wireserve-agent transit on` — no restart.
@@ -439,7 +433,7 @@ mod tests {
         assert_eq!(tags(&after), 0, "{after}");
     }
 
-    /// The whole runtime — worker thread, `nft monitor`, debounce, tick,
+    /// The whole runtime — worker thread, event listener, debounce, tick,
     /// stop — against a real kernel. Re-runs this test binary inside a
     /// fresh unprivileged network namespace (so nothing touches the host),
     /// with firewalld disabled (its D-Bus is not namespace-scoped).
@@ -456,7 +450,7 @@ mod tests {
 
         let nft = Nft::locate().unwrap();
         let (_backend, shared) = own_table("wg0");
-        let mut interop = HostInterop::start_with("wg0", nft.clone(), RealOps::without_firewalld(nft).with_own_table(shared), false);
+        let mut interop = HostInterop::start_with("wg0", RealOps::without_firewalld(nft).with_own_table(shared), false);
 
         // Synchronously in place when start() returns: native chain + iptables.
         let after_start = list();
@@ -509,8 +503,8 @@ mod tests {
         crate::lock::IfnameClaim::take("wireserve1").unwrap().unwrap().hold();
         let (_backend_a, shared_a) = own_table("wireserve0");
         let (_backend_b, shared_b) = own_table("wireserve1");
-        let mut a = HostInterop::start_with("wireserve0", nft.clone(), RealOps::without_firewalld(nft.clone()).with_own_table(shared_a), false);
-        let mut b = HostInterop::start_with("wireserve1", nft.clone(), RealOps::without_firewalld(nft).with_own_table(shared_b), false);
+        let mut a = HostInterop::start_with("wireserve0", RealOps::without_firewalld(nft.clone()).with_own_table(shared_a), false);
+        let mut b = HostInterop::start_with("wireserve1", RealOps::without_firewalld(nft).with_own_table(shared_b), false);
         assert_eq!((count("wireserve0"), count("wireserve1")), (2, 2));
 
         // Each one's monitor sees the other's inserts; let that settle, then

@@ -2330,3 +2330,54 @@ leak rather than a cost.
     came from a fixture built to match a guess about a format, and a
     fixture will always confirm the guess that shaped it. A claim about
     what another tool emits has to be measured against that tool.
+
+## The host firewall's event listener
+
+132. **Listening to the kernel instead of running `nft monitor`.** #130
+    left one cost that still grew with the host's other tools: the
+    `nft -j monitor` child fetches the whole ruleset cache — every element
+    of every set — at startup and holds it. 118 MB on a 100k-element host,
+    and neither `-t` nor narrowing it (`monitor rules`, `monitor ruleset`)
+    changed that; all four variants measured 117-118 MB. It was also the
+    last piece whose size was decided by how long crowdsec's blocklists
+    happen to be.
+
+    The kernel multicasts every nftables change on `NFNLGRP_NFTABLES`, so
+    `monitor` now binds that group itself. One socket, one 64 KB buffer,
+    and a filter that reads three things out of a message: the type (is it
+    a table, chain or rule change), one byte of family, and the table's
+    name. A blocklist reload is tens of thousands of messages dropped on
+    the type alone. Measured on the same host as above: **2 MB, unchanged
+    after a 50k-element reload** — against 118 MB, and against the JSON
+    rendering of every one of those events that used to be parsed.
+
+    Deliberate choices:
+    - **`ENOBUFS` reconciles.** A multicast socket can overflow during a
+      burst, and what was dropped is unknowable, so it counts as a change.
+      With the child this was invisible — nft's socket overflowed and we
+      simply never heard about it. Same for a message larger than the
+      buffer: treated as a change rather than parsed halfway.
+    - **A read timeout, not a second descriptor.** `Drop` sets a flag and
+      returns; the thread notices within 250 ms and closes the socket on
+      its way out. Nothing waits for it, because all it can do is send on a
+      channel whose receiver is going away.
+    - **Every length is checked against what is left** as the attribute
+      walk goes, so a truncated or lying message ends the walk instead of
+      reading past it. `garbage_is_ignored` feeds it every truncation of a
+      well-formed message.
+    - **The constants are UAPI** (`NFNLGRP_NFTABLES=7`,
+      `NFNL_SUBSYS_NFTABLES=10`, the six new/del message types, family
+      `NFPROTO_INET/IPV4/IPV6 = 1/2/10`, and table-name attribute 1 for
+      tables, chains and rules alike), read out of this machine's headers
+      rather than from memory — and then pinned where it counts:
+      `kernel_the_listener_sees_what_the_planner_needs` makes the same
+      changes the old test made against a real kernel and counts three
+      events, so a wrong group, subsystem, type, family byte or attribute
+      id fails the test rather than silently stopping the mesh's firewall
+      from healing itself.
+
+    What is unchanged: which events matter (`is_relevant` keeps the same
+    rules, including that only *our own* deny table's deletions concern
+    us), the 500 ms debounce, the poll tick as the safety net, and the
+    restart-on-next-tick when the listener dies. The agent no longer runs
+    any long-lived child.

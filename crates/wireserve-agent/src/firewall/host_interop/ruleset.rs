@@ -16,7 +16,7 @@
 //! and a set element costs far more as a parsed `Value` than as JSON
 //! text. Reading the document into `Vec<Value>` first and picking the
 //! three kinds out of it afterwards, as this did, meant every reconcile —
-//! one per poll tick, plus one per debounced `nft monitor` event — built
+//! one per poll tick, plus one per debounced kernel event — built
 //! and dropped a `Value` tree some thirty to fifty times the size of the
 //! ruleset. Dropping it does not give the memory back: those are millions
 //! of small allocations that glibc keeps in its arenas, so the agent's RSS
