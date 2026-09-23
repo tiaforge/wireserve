@@ -2868,3 +2868,336 @@ async fn revoke_removes_a_node_from_transit_consideration() {
         "a revoked node's stale report must not linger as a transit candidate: {a_body}"
     );
 }
+
+// ---- PLAN.md M24: gateway routing for static peers ----
+
+/// A gateway `gw` (approved), a `direct` node written into the phone's
+/// config, a `behind_nat` node that was not, and the phone itself.
+/// Returns the three agents' bearer tokens.
+async fn gateway_scenario(app: &TestApp) -> (String, String, String) {
+    let t = admin_create_node(&app.router, "gw").await;
+    let gw = register_node(&app.router, &t, "gw", 51820).await["bearer_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let t = admin_create_node(&app.router, "direct").await;
+    let direct = register_node(&app.router, &t, "direct", 51820).await["bearer_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let t = admin_create_node(&app.router, "behind-nat").await;
+    let behind = register_node(&app.router, &t, "behind-nat", 51820).await["bearer_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let req = json_request(
+        "POST",
+        "/admin/nodes",
+        Some(ADMIN),
+        json!({ "name": "phone", "kind": "static" }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let pt = body_json(resp).await["join_token"].as_str().unwrap().to_string();
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({ "join_token": pt, "pubkey": pubkey_for("phone"), "kind": "static" }),
+    );
+    app.router.clone().oneshot(req).await.unwrap();
+
+    assert_eq!(admin_post(&app.router, "/admin/nodes/gw/transit/approve").await, StatusCode::OK);
+    // Both halves, in the order an operator does them: `wireserve-agent
+    // transit on` makes the node offer, and it has to have polled at least
+    // once before it can be assigned — the agent opens the host firewall's
+    // forward hook from that same local flag, so assigning a gateway that
+    // is not offering would bake in a config nothing can make work.
+    poll_full(&app.router, &gw, json!({ "services": [], "transit_capable": true })).await;
+
+    let req = json_request(
+        "PUT",
+        "/admin/nodes/phone/gateway",
+        Some(ADMIN),
+        json!({ "gateway": "gw", "conf_peers": ["direct"] }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    (gw, direct, behind)
+}
+
+#[tokio::test]
+async fn a_node_absent_from_the_phones_config_routes_to_it_through_the_gateway() {
+    let app = test_app();
+    let (_gw, _direct, behind) = gateway_scenario(&app).await;
+
+    let (status, body) = poll_full(&app.router, &behind, json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        transit_via_for(&body, "phone").as_deref(),
+        Some(pubkey_for("gw").as_str()),
+        "the phone has no direct entry here and cannot be dialled, so the reply path \
+         must be folded onto the gateway's peer entry: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_node_written_into_the_phones_config_is_never_routed_through_the_gateway() {
+    let app = test_app();
+    let (_gw, direct, _behind) = gateway_scenario(&app).await;
+
+    let (_, body) = poll_full(&app.router, &direct, json!({})).await;
+    // This is the rule the whole feature turns on. `wg::desired_peers` drops
+    // a transited peer's own entry, and the phone's config holds a /32 for
+    // this node that outranks the gateway's covering route — WireGuard has no
+    // failover — so naming a gateway here would black-hole the pair rather
+    // than reroute it.
+    assert_eq!(transit_via_for(&body, "phone"), None, "{body}");
+}
+
+#[tokio::test]
+async fn the_gateway_itself_keeps_a_direct_entry_for_the_phone() {
+    let app = test_app();
+    let (gw, _direct, _behind) = gateway_scenario(&app).await;
+
+    let (_, body) = poll_full(&app.router, &gw, json!({})).await;
+    assert_eq!(
+        transit_via_for(&body, "phone"),
+        None,
+        "the gateway terminates the phone's tunnel; routing it via itself would \
+         delete the only peer entry that can: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_gateway_is_told_to_forward_between_the_phone_and_what_it_cannot_reach() {
+    let app = test_app();
+    let (gw, _direct, _behind) = gateway_scenario(&app).await;
+
+    let (_, body) = poll_full(&app.router, &gw, json!({})).await;
+    let carrying = body["transit_carrying"].as_array().cloned().unwrap_or_default();
+    let has = |x: &str, y: &str| {
+        carrying.iter().any(|p| {
+            (p["a"] == pubkey_for(x) && p["c"] == pubkey_for(y))
+                || (p["a"] == pubkey_for(y) && p["c"] == pubkey_for(x))
+        })
+    };
+    assert!(has("phone", "behind-nat"), "{body}");
+    assert!(
+        !has("phone", "direct"),
+        "the phone reaches this one directly, so the gateway has no business \
+         forwarding for the pair: {body}"
+    );
+}
+
+#[tokio::test]
+async fn two_phones_on_one_gateway_can_reach_each_other() {
+    // A second static peer has no endpoint, so it is never in anyone's
+    // config and always falls on the gateway side — the pair still needs a
+    // forwarding rule, and it is reachable from both ends so it must be
+    // emitted exactly once.
+    let app = test_app();
+    let (gw, _direct, _behind) = gateway_scenario(&app).await;
+
+    let req = json_request(
+        "POST",
+        "/admin/nodes",
+        Some(ADMIN),
+        json!({ "name": "tablet", "kind": "static" }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let t = body_json(resp).await["join_token"].as_str().unwrap().to_string();
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({ "join_token": t, "pubkey": pubkey_for("tablet"), "kind": "static" }),
+    );
+    app.router.clone().oneshot(req).await.unwrap();
+    let req = json_request(
+        "PUT",
+        "/admin/nodes/tablet/gateway",
+        Some(ADMIN),
+        json!({ "gateway": "gw", "conf_peers": [] }),
+    );
+    app.router.clone().oneshot(req).await.unwrap();
+
+    let (_, body) = poll_full(&app.router, &gw, json!({})).await;
+    let carrying = body["transit_carrying"].as_array().cloned().unwrap_or_default();
+    let matches = carrying
+        .iter()
+        .filter(|p| {
+            let (a, c) = (&p["a"], &p["c"]);
+            (*a == pubkey_for("phone") && *c == pubkey_for("tablet"))
+                || (*a == pubkey_for("tablet") && *c == pubkey_for("phone"))
+        })
+        .count();
+    assert_eq!(matches, 1, "exactly one pair, reachable from both ends: {body}");
+}
+
+#[tokio::test]
+async fn a_revoked_gateway_degrades_the_phone_to_direct_rather_than_erasing_it() {
+    let app = test_app();
+    let (_gw, _direct, behind) = gateway_scenario(&app).await;
+
+    assert_eq!(admin_post(&app.router, "/admin/nodes/gw/revoke").await, StatusCode::OK);
+
+    let (_, body) = poll_full(&app.router, &behind, json!({})).await;
+    // Not merely "no longer via gw": `wg::desired_peers` skips a transited
+    // peer in pass 1 and only re-adds it folded into the via peer in pass 2,
+    // so a transit_via naming a node no longer in the directory would leave
+    // the phone with no entry anywhere at all.
+    assert_eq!(transit_via_for(&body, "phone"), None, "{body}");
+    assert!(
+        body["peers"].as_array().unwrap().iter().any(|p| p["name"] == "phone"),
+        "the phone must still be in the directory: {body}"
+    );
+}
+
+#[tokio::test]
+async fn withdrawing_transit_approval_also_stops_the_node_acting_as_a_gateway() {
+    let app = test_app();
+    let (_gw, _direct, behind) = gateway_scenario(&app).await;
+
+    assert_eq!(admin_post(&app.router, "/admin/nodes/gw/transit/deny").await, StatusCode::OK);
+
+    let (_, body) = poll_full(&app.router, &behind, json!({})).await;
+    assert_eq!(
+        transit_via_for(&body, "phone"),
+        None,
+        "gateway forwarding is transit forwarding, gated on the same approval: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_gateway_must_be_approved_before_it_can_be_assigned() {
+    let app = test_app();
+    let t = admin_create_node(&app.router, "gw").await;
+    register_node(&app.router, &t, "gw", 51820).await;
+    let req = json_request(
+        "POST",
+        "/admin/nodes",
+        Some(ADMIN),
+        json!({ "name": "phone", "kind": "static" }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let pt = body_json(resp).await["join_token"].as_str().unwrap().to_string();
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({ "join_token": pt, "pubkey": pubkey_for("phone"), "kind": "static" }),
+    );
+    app.router.clone().oneshot(req).await.unwrap();
+
+    let req = json_request(
+        "PUT",
+        "/admin/nodes/phone/gateway",
+        Some(ADMIN),
+        json!({ "gateway": "gw", "conf_peers": [] }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn an_agent_node_cannot_be_given_a_gateway() {
+    let app = test_app();
+    let t = admin_create_node(&app.router, "n1").await;
+    register_node(&app.router, &t, "n1", 51820).await;
+    let req = json_request(
+        "PUT",
+        "/admin/nodes/n1/gateway",
+        Some(ADMIN),
+        json!({ "gateway": null, "conf_peers": [] }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn deleting_a_gateway_is_refused_while_a_device_still_routes_through_it() {
+    let app = test_app();
+    let (_gw, _direct, _behind) = gateway_scenario(&app).await;
+
+    assert_eq!(admin_post(&app.router, "/admin/nodes/gw/revoke").await, StatusCode::OK);
+    let req = raw_request("DELETE", "/admin/nodes/gw", Some(&format!("Bearer {ADMIN}")));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "the FK would null the reference silently, leaving the device with no \
+         path to anything it lacks a direct entry for and nothing saying so"
+    );
+}
+
+#[tokio::test]
+async fn a_refresh_keeps_the_phone_on_the_same_gateway() {
+    let app = test_app();
+    let (_gw, _direct, behind) = gateway_scenario(&app).await;
+
+    // What `export-config --refresh` does to the node record.
+    let req = json_request(
+        "POST",
+        "/admin/nodes/phone/rejoin",
+        Some(ADMIN),
+        json!({ "kind": "static" }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let t = body_json(resp).await["join_token"].as_str().unwrap().to_string();
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({ "join_token": t, "pubkey": pubkey_for("phone-rotated"), "kind": "static" }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (_, body) = poll_full(&app.router, &behind, json!({})).await;
+    assert_eq!(
+        transit_via_for(&body, "phone").as_deref(),
+        Some(pubkey_for("gw").as_str()),
+        "rotating the keypair is not a reason to re-home the device: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_gateway_that_never_switched_transit_on_is_refused_with_an_actionable_message() {
+    // Approval is the mesh admin's trust; the node's own `transit on` is what
+    // opens the host firewall's forward hook. Missing the second half fails
+    // invisibly from every other node, so it is caught here instead.
+    let app = test_app();
+    let t = admin_create_node(&app.router, "gw").await;
+    register_node(&app.router, &t, "gw", 51820).await;
+    assert_eq!(admin_post(&app.router, "/admin/nodes/gw/transit/approve").await, StatusCode::OK);
+
+    let req = json_request(
+        "POST",
+        "/admin/nodes",
+        Some(ADMIN),
+        json!({ "name": "phone", "kind": "static" }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let pt = body_json(resp).await["join_token"].as_str().unwrap().to_string();
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({ "join_token": pt, "pubkey": pubkey_for("phone"), "kind": "static" }),
+    );
+    app.router.clone().oneshot(req).await.unwrap();
+
+    let req = json_request(
+        "PUT",
+        "/admin/nodes/phone/gateway",
+        Some(ADMIN),
+        json!({ "gateway": "gw", "conf_peers": [] }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    let msg = body["error"].as_str().unwrap_or_default();
+    assert!(msg.contains("transit on"), "must say what to do: {body}");
+}

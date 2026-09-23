@@ -40,6 +40,27 @@ impl MeshRanges {
         })
     }
 
+    /// The v4 range in canonical `network/len` form, rebuilt from the
+    /// parsed value rather than echoed from the input.
+    ///
+    /// Anything rendered into a WireGuard `.conf` has to come back out of a
+    /// parser, never straight from a configured string — the same rule
+    /// `export-config`'s service addresses already follow. A mesh CIDR
+    /// reaches the coordinator from `WIRESERVE_NET_V4_CIDR` or the bootstrap
+    /// file, neither of which is structurally validated at load (the startup
+    /// checks only warn), so it is exactly the kind of value that could
+    /// otherwise carry an extra `.conf` directive into the file.
+    #[must_use]
+    pub fn v4_cidr(&self) -> String {
+        format!("{}/{}", Ipv4Addr::from(self.v4.0), self.v4.1)
+    }
+
+    /// The v6 range in canonical `network/len` form. See [`Self::v4_cidr`].
+    #[must_use]
+    pub fn v6_prefix(&self) -> String {
+        format!("{}/{}", Ipv6Addr::from(self.v6.0), self.v6.1)
+    }
+
     #[must_use]
     pub fn contains4(&self, addr: Ipv4Addr) -> bool {
         u32::from(addr) & mask32(self.v4.1) == self.v4.0
@@ -82,6 +103,21 @@ mod tests {
         let r = ranges("10.90.0.77/24", "fdb4:d481:7c21::9/64").unwrap();
         assert!(r.contains4("10.90.0.1".parse().unwrap()));
         assert!(r.contains6("fdb4:d481:7c21::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn canonical_forms_are_rebuilt_from_the_parsed_value_not_echoed() {
+        // Host bits are dropped, and nothing of the input string survives —
+        // which is the point: this is what gets written into a .conf.
+        let r = ranges("10.90.0.77/24", "fdb4:d481:7c21::9/64").unwrap();
+        assert_eq!(r.v4_cidr(), "10.90.0.0/24");
+        assert_eq!(r.v6_prefix(), "fdb4:d481:7c21::/64");
+    }
+
+    #[test]
+    fn a_range_carrying_conf_syntax_never_parses_so_never_renders() {
+        assert!(ranges("10.90.0.0/24\nAllowedIPs = 0.0.0.0/0", "fd00::/64").is_none());
+        assert!(ranges("10.90.0.0/24", "fd00::/64\nEndpoint = evil.example:1").is_none());
     }
 
     #[test]

@@ -9,7 +9,7 @@ source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
 **Currently working on:** nothing open — all milestones complete through
-M23 (opt-in single-hop transit, NAT-traversal step 3). 592 tests passing
+M24 (refreshable static peers and gateway routing). 698 tests passing
 across `cargo test --workspace`. Several container harnesses in
 `deploy/e2e/` pass on a real kernel: `run-e2e-test.sh` (mesh, firewall,
 interface guard), `run-nat-test.sh` (two NAT-ed sites) and
@@ -1796,3 +1796,186 @@ discovery instead, consistent with M21/M22).
 
 `deploy/e2e/run-transit-test.sh` (new, sibling to `run-nat-test.sh`) is
 written but **not yet run** — see "Currently working on" above.
+
+## M24 — refreshable static peers, and gateway routing for them
+
+Spec §9 accepted two consequences for v1 that turned out to be the sharpest
+remaining friction in the product, both of them about phones. The config is
+a snapshot, so a node added later is unroutable from the device until it is
+re-exported and reimported; and re-exporting was `revoke` → `delete-node` →
+`export-config`, which minted a new keypair *and* could renumber the device,
+because deleting the row frees its addresses back to the allocator.
+
+104. **A `.wg` DNS responder was designed, researched, and ruled out on
+    evidence before any of this was written.** The obvious third fix —
+    answer `<name>.wg` on a node and point phones at it with `DNS =` — is
+    not available with the official clients, and this is worth recording so
+    it is not re-proposed. `wireguard-apple` sets `dnsSettings.matchDomains
+    = [""]` unconditionally whenever `DNS =` holds any IP
+    (`PacketTunnelSettingsGenerator.swift`), which is Apple's sentinel for
+    "this resolver answers everything"; its parser has no tilde/split
+    handling. `wireguard-android` only calls `addDnsServer()` and
+    `addSearchDomain()` — `VpnService.Builder` exposes no match-domain API
+    at all, so no version of that app could do it. The tilde split-DNS patch
+    lives in a fork and a January 2022 mailing-list thread, unmerged four
+    years on. So a `.wg` resolver would capture *all* of the device's DNS,
+    and an authoritative-only server returning NXDOMAIN for everything else
+    would break the rest of its internet — a negative answer is a
+    *successful* transaction, so resolvers do not fall back, and listing a
+    second server does not rescue it. This vindicates §6's "resolver in the
+    query path" rejection rather than contradicting it: on a Linux host you
+    can at least scope a stub resolver to one domain, and on iOS/Android you
+    cannot. Names for phones are a reverse proxy plus one public wildcard
+    record, later, with no port 53 anywhere.
+
+105. **Spec §9's "WireGuard requires non-overlapping `AllowedIPs`" was
+    wrong, and it was the sentence ruling out this whole design shape.**
+    Verified on a real kernel in a netns rather than argued: *identical*
+    prefixes do collide (assign `10.1.0.5/32` to two peers and the later one
+    takes it, the first left with `(none)`), but prefixes of *different*
+    lengths coexist — cryptokey routing is a longest-prefix-match trie, so
+    `10.1.0.0/24` on one peer and `10.1.0.5/32` on another both survive. A
+    gateway peer holding the whole mesh range alongside per-node /32s is
+    therefore available. The spec is corrected in place.
+
+    The corollary is what the rest of this milestone turns on: **WireGuard
+    has no failover.** The longest match wins whether or not that peer is
+    reachable, so a /32 aimed at a dead path black-holes rather than falling
+    through to a covering route.
+
+106. **Gateway routing is the existing transit feature, not a second one.**
+    No `gateway on|off`, no `approve-gateway`, no new node flag for the
+    *carrier* side. A gateway forwards traffic it can read and could forge
+    either end of — the same trust surface `approve-transit` exists to gate
+    (#99, security review finding #1) — so it is gated on the same approval.
+    The forwarding rules ride on `PollResponse::transit_carrying`, which the
+    agent already turns into nft rules and already uses to drive
+    `ip_forward::set_enabled`, and reachability rides on
+    `PeerInfo::transit_via`, which `wg::desired_peers` pass 2 already folds
+    into the via peer's entry. **The entire mesh side needed zero agent
+    changes** — confirmed by reading `poll_loop.rs`'s
+    `TransitAssignments` construction (self-exclusion is its only filter),
+    not assumed.
+
+107. **The rule the feature lives or dies on: `transit_via` is set for
+    exactly the peers *absent* from the device's config.** `desired_peers`
+    pass 1 skips any peer carrying a transit assignment — it *deletes* that
+    peer's kernel entry rather than merely hinting a route. Combined with no
+    failover (#105), naming a peer that IS in the config makes that peer
+    drop the device while the device still dials it directly, since its /32
+    outranks the gateway's covering route. Every direct peer would become a
+    black hole, and the hybrid config would be strictly worse than routing
+    everything through the gateway. The first draft of this plan said "set
+    it for every requester except the gateway," which is exactly that bug;
+    it was caught in review before implementation.
+
+108. **Config membership is recorded at export time, in
+    `static_conf_peers`, not recomputed from live endpoint state.** The
+    `.conf` is a snapshot, so which peers it contains is a fact about a
+    moment. A live predicate drifts against the file actually on the device,
+    and the drift is not symmetric: a node that *loses* its endpoint after
+    export merely goes stale, which is what already happened before this
+    milestone — but a node that *gains* one would stop being routed through
+    the gateway while the device still has no direct entry for it, so the
+    forwarded packet is rejected on the crypto source filter at one end and
+    there is no path at the other. Broken both ways, silently. Persisting
+    the list costs one table and removes the whole class.
+
+109. **A dangling gateway erases the device from the mesh, so the gateway is
+    resolved against the live directory on every poll rather than trusted
+    from the stored id.** Pass 1 skips a transited peer and pass 2 bails
+    when the via peer is missing from the map, so a `transit_via` naming a
+    node no longer in the directory leaves the device with *no* entry
+    anywhere — not a degraded one. `ON DELETE SET NULL` does not cover this:
+    `revoke` keeps the row and drops out of `list_all_peers` instead. One
+    live check (present *and* still `transit_approved`) covers revoke,
+    `deny-transit` and a gateway that never re-registered, and degrades to
+    an ordinary direct entry. `delete-node` additionally 409s while devices
+    depend on it, mirroring its existing "revoke it first" guard; `revoke`
+    and `deny-transit` only warn, because neither may ever be blockable by a
+    routing dependency.
+
+110. **Eligibility is stricter than "has an endpoint," which is the subtle
+    half.** `is_valid_endpoint_addr` permits RFC1918 deliberately — an
+    endpoint is self-reported and a node on a home LAN legitimately
+    advertises `192.168.1.50:51820` to its neighbours there. A naive "has an
+    endpoint" gate would mint a /32 for it in a phone's config that
+    outranks the gateway's route and black-holes the moment the phone leaves
+    that LAN, which is precisely what the hybrid shape exists to avoid. New
+    `is_globally_routable_endpoint` rejects private, loopback, link-local,
+    unspecified, multicast, CGNAT (`100.64/10` — behind someone else's NAT,
+    spelled out because `Ipv4Addr::is_shared` is still unstable) and IPv6
+    unique-local; a hostname is taken at its word, since resolving it here
+    would only answer for this machine. Documentation ranges are
+    deliberately *not* rejected: unlike the rest they say nothing about
+    reachability, and they are what this project's tests use throughout to
+    mean "a public address."
+
+111. **`rejoin` grew a `kind` check, and it had to go before the mutation,
+    not at `/register`.** A rejoin nulls the pubkey and `list_all_peers`
+    filters on `pubkey IS NOT NULL`, so `export-config --refresh` aimed at
+    an agent node would kick a live node off every other node's directory
+    and *then* fail with the mismatch registration would have caught. The
+    admin CLI cannot pre-check it: `PeerInfo` carries no `kind`, and a
+    separate lookup would race the rejoin. `kind` is optional on
+    `RejoinRequest`, so a bare `rejoin` is unchanged. For the same reason
+    the whole export flow reads the directory and picks its gateway
+    *first* — everything that can fail happens before anything mutates.
+
+112. **No new wire field for the mesh range.** `RegisterResponse` already
+    carries `MeshInfo` so an agent can pin it (security review finding #4),
+    and the export flow already calls `/register`. `MeshRanges` gained
+    `v4_cidr()`/`v6_prefix()`, which rebuild canonical `network/len` strings
+    from the parsed value — the mesh range reaches the coordinator from an
+    env var or the bootstrap file with no structural validation (the startup
+    checks only warn), so it is exactly the kind of value that must come
+    back out of a parser before reaching a `.conf`. The same pass fixed
+    `render_conf` interpolating `ip4`/`ip6` verbatim, which the module's own
+    doc comment already claimed it did not do.
+
+113. **A pre-existing endpoint-selection bug was promoted to critical and
+    fixed.** `render_conf` took `endpoint_addr` verbatim while
+    `wg::choose_peer_endpoint` guards it with a bracketed-v6-literal check
+    plus `prefer_ipv6`. `endpoint_addr` is recorded family-blind, from
+    whichever family the node's poll arrived over. As one peer among many
+    that mis-picks one entry; as *the gateway* it is the entire config, and
+    a phone on v4-only cellular gets a dead file. The renderer now applies
+    the same rule.
+
+114. **The QR limit is terminal width, not QR capacity** — found while
+    sizing it, and it changes the answer. A code is `4·version + 17` modules
+    square plus a 4-module quiet zone, and half-block characters only halve
+    the *vertical* extent, so a config comfortably inside byte-mode capacity
+    (2953 bytes at version 40) would still need ~185 columns and scan off
+    nothing. `--qr` caps at 116 columns (~version 22) and refuses with the
+    byte count and a pointer to `--out` rather than printing something
+    unscannable. Colours are written explicitly per cell: bare block
+    characters inherit the terminal theme, so the same output would scan on
+    a light background and be inverted, hence unscannable, on a dark one.
+    `qrcodegen` was chosen over `qrcode` (last release 2021, and QR is a
+    frozen spec so that means complete rather than rotten) for having zero
+    transitive dependencies.
+
+115. **One gap found and left documented rather than fixed.** The agent
+    opens the *host* firewall's FORWARD hook from its own local
+    `transit_capable`, captured once at daemon start
+    (`HostInterop::start`), while the coordinator-driven forwarding path is
+    not gated on local opt-in at all. A node approved as a gateway but never
+    switched on with `wireserve-agent transit on` would accept the forward
+    in its own nftables table while ufw or firewalld still dropped it —
+    invisible from every other node. Rather than make `forward_wanted`
+    dynamic, `set-gateway` refuses a node that is not *currently* reporting
+    `transit_capable` (new `TransitState::is_offering`) and says exactly
+    which two commands to run. Nested transit is also not composed: if a
+    node reaches the gateway only via dynamic transit, pass 2's lookup misses
+    and the device is dropped from that node. It fails closed rather than
+    misrouting, and "the gateway must be directly reachable by every node"
+    is the documented precondition.
+
+Explicitly out of scope: `.wg` names for static peers (see #104 — a reverse
+proxy and one public wildcard record, later); adopt-your-own-pubkey for
+static peers; more than one gateway per device; agents routing through a
+gateway (only `kind=static` peers do).
+
+`deploy/e2e/run-gateway-test.sh` is written but **not yet run** — same
+rootful-Podman pattern and same caveat as `run-transit-test.sh`.

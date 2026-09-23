@@ -530,6 +530,28 @@ pub struct RejoinResponse {
     pub join_token_expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// `PUT /admin/nodes/{name}/gateway` (PLAN.md M24) — records how a static
+/// peer's exported `.conf` is shaped, so the coordinator can derive routing
+/// that matches it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetGatewayRequest {
+    /// The node this device routes through for anything not listed in
+    /// `conf_peers`. `None` clears the assignment, which is the pre-gateway
+    /// all-direct behaviour.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub gateway: Option<String>,
+    /// The peers written into the device's `.conf` as direct `[Peer]` blocks.
+    ///
+    /// Sent rather than recomputed because the `.conf` is a snapshot and this
+    /// describes that snapshot. Deriving it from live endpoint state later
+    /// would drift against the file actually on the device, and the drift is
+    /// not benign: a node that gains a routable endpoint after export would
+    /// stop being routed through the gateway while the device still has no
+    /// direct entry for it, breaking that path in both directions at once.
+    #[serde(default)]
+    pub conf_peers: Vec<String>,
+}
+
 // ---- §4.5.1 Admin: list peers ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -540,6 +562,18 @@ pub struct AdminPeersResponse {
     /// which nodes may relay is nothing the rest of the mesh needs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transit_approved: Vec<String>,
+    /// Names of the nodes whose own most recent poll offered to carry
+    /// traffic — the other half of the pair (PLAN.md M24).
+    ///
+    /// Both are needed to pick a gateway, and neither implies the other:
+    /// approval is the mesh admin's trust, this is whether the daemon is
+    /// actually set up to forward. A node approved but never switched on
+    /// with `wireserve-agent transit on` never opened its host firewall's
+    /// forward hook, so it would accept the forward in its own table while
+    /// ufw or firewalld dropped it. Reported here so that is caught before
+    /// anything is created rather than after.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transit_offering: Vec<String>,
 }
 
 #[cfg(test)]

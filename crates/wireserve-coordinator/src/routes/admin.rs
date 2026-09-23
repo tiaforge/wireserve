@@ -73,6 +73,20 @@ pub async fn revoke_node(
     if let Some(pubkey) = &node.pubkey {
         state.transit.forget(pubkey);
     }
+    // PLAN.md M24: warn, never refuse. Revoking is how a compromised node is
+    // cut off, so it must not be blockable by a routing dependency — and it
+    // degrades safely, because `/poll` resolves a gateway against the live
+    // directory and falls back to direct entries when it is gone.
+    let dependents = nodes::static_nodes_using_gateway(&conn, node.id)?;
+    if !dependents.is_empty() {
+        tracing::warn!(
+            event = "gateway_revoked_with_dependents",
+            node_name = %name,
+            dependents = %dependents.join(","),
+            "revoked node was the gateway for these devices; they now reach only \
+             the peers written directly into their config until re-exported"
+        );
+    }
     tracing::info!(event = "node_revoked", node_name = %name);
     Ok(())
 }
@@ -94,6 +108,21 @@ pub async fn delete_node(
         return Err(AppError::Conflict(
             "node is still active — revoke it first, then delete".into(),
         ));
+    }
+    // PLAN.md M24. The FK would set `gateway_node_id` back to NULL on its
+    // own, so nothing dangles — but the devices routing through this node
+    // would silently lose every path they do not hold a direct `[Peer]` for,
+    // and nothing would say so. Refusing is the same shape as the guard just
+    // above, and deleting a node is never the urgent operation: `revoke`
+    // already cut it off.
+    let dependents = nodes::static_nodes_using_gateway(&conn, node.id)?;
+    if !dependents.is_empty() {
+        return Err(AppError::Conflict(format!(
+            "node is the gateway for {}: re-export {} against another gateway first, \
+             or clear the assignment",
+            dependents.join(", "),
+            if dependents.len() == 1 { "it" } else { "them" },
+        )));
     }
     nodes::delete_node(&conn, node.id)?;
     tracing::info!(event = "node_deleted", node_name = %name);
@@ -344,6 +373,93 @@ pub async fn deny_service(
     }
 }
 
+/// `PUT /admin/nodes/{name}/gateway` (PLAN.md M24).
+///
+/// Records the shape of a static peer's exported `.conf`: which node it
+/// routes through, and which peers it holds direct `[Peer]` blocks for.
+/// `/poll` derives `transit_via` from exactly this, so the two can never
+/// disagree about a device's routing.
+pub async fn set_gateway(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path(name): Path<String>,
+    Json(body): Json<wireserve_types::SetGatewayRequest>,
+) -> Result<(), AppError> {
+    let mut conn = state.db.conn.lock().await;
+    let node = nodes::find_by_name(&conn, &name)?.ok_or(AppError::NotFound)?;
+    if node.kind != wireserve_types::NodeKind::Static {
+        return Err(AppError::BadRequest(
+            "only a kind=static node routes through a gateway; an agent reaches peers itself"
+                .into(),
+        ));
+    }
+
+    let gateway_id = match &body.gateway {
+        None => None,
+        Some(gateway_name) => {
+            let gw = nodes::find_by_name(&conn, gateway_name)?.ok_or_else(|| {
+                AppError::BadRequest(format!("no such node '{gateway_name}' to use as a gateway"))
+            })?;
+            if gw.id == node.id {
+                return Err(AppError::BadRequest(
+                    "a node cannot be its own gateway".into(),
+                ));
+            }
+            if gw.kind != wireserve_types::NodeKind::Agent {
+                return Err(AppError::BadRequest(format!(
+                    "'{gateway_name}' is kind=static and never polls, so it cannot forward for anyone"
+                )));
+            }
+            // Gateway forwarding is transit forwarding: the carrier sees the
+            // traffic in the clear and can send as either end. It is gated on
+            // the same approval rather than a second one of its own.
+            if !gw.transit_approved {
+                return Err(AppError::Conflict(format!(
+                    "'{gateway_name}' is not approved to carry traffic — run \
+                     `wireserve-admin approve-transit {gateway_name}` first"
+                )));
+            }
+            // Approval alone is not enough to make forwarding actually work.
+            // The agent opens the *host* firewall's FORWARD hook from its own
+            // `transit_capable`, captured once when the daemon starts — so a
+            // node approved here but never switched on there would accept the
+            // forward in its own nftables table while ufw or firewalld still
+            // dropped it. That failure is invisible from every other node, so
+            // it is worth refusing up front rather than baking a dead gateway
+            // into a config that cannot be changed without re-exporting.
+            let offering = gw
+                .pubkey
+                .as_deref()
+                .is_some_and(|pk| state.transit.is_offering(pk, state.config.online_threshold_secs));
+            if !offering {
+                return Err(AppError::Conflict(format!(
+                    "'{gateway_name}' is approved but is not currently offering to carry \
+                     traffic — run `wireserve-agent transit on` on it (and restart it, so it \
+                     reopens the host firewall's forward hook), then try again"
+                )));
+            }
+            Some(gw.id)
+        }
+    };
+
+    let mut conf_peer_ids = Vec::with_capacity(body.conf_peers.len());
+    for peer_name in &body.conf_peers {
+        let peer = nodes::find_by_name(&conn, peer_name)?.ok_or_else(|| {
+            AppError::BadRequest(format!("no such node '{peer_name}' in the config's peer list"))
+        })?;
+        conf_peer_ids.push(peer.id);
+    }
+
+    nodes::set_gateway(&mut conn, node.id, gateway_id, &conf_peer_ids)?;
+    tracing::info!(
+        event = "gateway_set",
+        node_name = %name,
+        gateway = body.gateway.as_deref().unwrap_or("-"),
+        direct_peers = conf_peer_ids.len(),
+    );
+    Ok(())
+}
+
 /// `POST /admin/nodes/{name}/transit/approve`.
 ///
 /// Lets a node carry transit traffic for other peers, from its next poll
@@ -388,6 +504,16 @@ pub async fn deny_transit(
 ) -> Result<(), AppError> {
     let conn = state.db.conn.lock().await;
     let node = nodes::find_by_name(&conn, &name)?.ok_or(AppError::NotFound)?;
+    let dependents = nodes::static_nodes_using_gateway(&conn, node.id)?;
+    if !dependents.is_empty() {
+        tracing::warn!(
+            event = "gateway_approval_withdrawn_with_dependents",
+            node_name = %name,
+            dependents = %dependents.join(","),
+            "node was the gateway for these devices; withdrawing approval also stops \
+             it forwarding for them from their next poll"
+        );
+    }
     nodes::set_transit_approved(&conn, node.id, false)?;
     if let Some(pubkey) = &node.pubkey {
         state.transit.withdraw_carrier(pubkey);
@@ -419,5 +545,14 @@ pub async fn list_peers(
         .filter(|n| n.transit_approved)
         .map(|n| n.name.clone())
         .collect();
-    Ok(Json(AdminPeersResponse { peers, transit_approved }))
+    let transit_offering = rows
+        .iter()
+        .filter(|n| {
+            n.pubkey
+                .as_deref()
+                .is_some_and(|pk| state.transit.is_offering(pk, state.config.online_threshold_secs))
+        })
+        .map(|n| n.name.clone())
+        .collect();
+    Ok(Json(AdminPeersResponse { peers, transit_approved, transit_offering }))
 }

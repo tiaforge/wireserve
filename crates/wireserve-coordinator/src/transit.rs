@@ -98,6 +98,27 @@ impl TransitState {
         }
     }
 
+    /// Whether this node is *currently* offering to carry traffic, from its
+    /// own most recent poll (PLAN.md M24).
+    ///
+    /// Distinct from the admin approval stored on the node row, and both are
+    /// needed: approval is the mesh admin's trust, this is whether the daemon
+    /// is actually set up to forward. The agent captures its own
+    /// `transit_capable` once at start and opens the *host* firewall's
+    /// FORWARD hook from it, so a node that was approved but never ran
+    /// `wireserve-agent transit on` accepts the forward in its own table
+    /// while ufw or firewalld still drops it — silently, and painfully hard
+    /// to debug from the other end.
+    #[must_use]
+    pub fn is_offering(&self, pubkey: &str, fresh_secs: i64) -> bool {
+        let now = chrono::Utc::now();
+        self.by_pubkey.lock().is_ok_and(|m| {
+            m.get(pubkey).is_some_and(|r| {
+                r.transit_capable && (now - r.reported_at).num_seconds() <= fresh_secs
+            })
+        })
+    }
+
     /// Drops a node's report — on revoke and rejoin, so it can never be
     /// selected as transit and never shows up as wanting anything
     /// afterward.

@@ -510,15 +510,34 @@ What it does, end to end:
                                             # earlier in this spec
    ```
 
-   Each peer gets its own `/32` + `/128`, not the mesh's full CIDR on one
-   block — WireGuard requires non-overlapping `AllowedIPs` across peers on
-   one interface, and a single "whole mesh" block would mean this peer is
-   acting as a router for the others, which isn't the goal here.
+   Each peer gets its own `/32` + `/128`, and by default not the mesh's
+   full CIDR on any block: a whole-mesh block means some node is acting as
+   a router for the others, which v1 did not want.
+
+   **Correction (M24).** This paragraph used to say WireGuard "requires
+   non-overlapping `AllowedIPs` across peers on one interface." That is
+   true only of *identical* prefixes — assign `10.1.0.5/32` to two peers
+   and the later one takes it, leaving the first with `(none)`. Prefixes of
+   *different* lengths coexist: cryptokey routing is a longest-prefix-match
+   trie, so a peer holding `10.1.0.0/24` and another holding `10.1.0.5/32`
+   both keep their entries, and the /32 wins for that one address.
+   Kernel-verified, not inferred. The router objection stands on its own
+   and is what M24's gateway makes deliberate and opt-in; the claim about
+   what WireGuard permits was simply wrong.
+
+   Note the corollary, which the gateway design turns on: WireGuard has no
+   failover. The longest matching prefix wins whether or not that peer is
+   reachable, so a /32 pointing at a dead path black-holes rather than
+   falling through to a covering route.
 
 5. Writes the file (or prints it) for the operator to transfer to the
-   device — by QR code for mobile, or just copying the file for
-   desktop/laptop clients, whichever's easiest; generating a QR code isn't
-   part of v1 scope, any external tool fed the `.conf` contents works fine.
+   device — or renders a QR code to the terminal with `--qr` (M24; v1
+   deferred this to any external tool fed the `.conf`). The limit there is
+   terminal *width*, not QR capacity: a code is `4·version + 17` modules
+   square plus a quiet zone, and half-blocks only halve the vertical
+   extent, so a config well inside the 2953-byte byte-mode ceiling would
+   still need ~185 columns and scan off nothing. `--qr` refuses past 116
+   columns and points at `--out`.
 
 **Consequences of this shape, stated plainly:**
 
@@ -530,9 +549,35 @@ What it does, end to end:
   peers don't run one. On Android/iOS specifically, the OS doesn't allow
   it at all. Either way, IP:port is the guaranteed baseline — exactly the
   "IP+port is enough" premise from the very first version of this design.
-- **Staleness is accepted for v1.** The config is a snapshot; new nodes
-  joining later don't appear on a static peer until `export-config` is
-  re-run and reimported. No live sync for static peers in v1.
+- **Staleness was accepted for v1, and is fixed in M24 by a gateway.**
+  The config is a snapshot: listing every peer individually means a node
+  joining later is unroutable from the device until `export-config` is
+  re-run and reimported. Assigning a gateway routes the whole mesh range
+  to one peer instead, so anything new is reachable without re-exporting.
+  Nodes that are reachable from anywhere keep their own direct entry.
+
+  Gateway forwarding is transit forwarding (M23) and is gated on the same
+  approval, for the same reason — the carrier sees the traffic in the
+  clear. There is no separate gateway flag.
+
+  Two things about this are load-bearing and easy to get wrong. The
+  coordinator must set `transit_via` on the device for **exactly** the
+  peers absent from its config: `wg::desired_peers` deletes a transited
+  peer's entry rather than merely hinting a route, so naming a peer that
+  *is* in the config makes that peer drop the device while the device
+  still dials it — a black hole, given no failover. And config membership
+  must be **recorded at export time**, not recomputed from live endpoint
+  state, because the file is a snapshot and the two would drift. The
+  direction that bites is a node that gains a routable endpoint after
+  export: recomputing would stop routing it through the gateway while the
+  device still has no direct entry for it, breaking that path both ways.
+
+- **Re-issuing a config keeps the device's name and address** (M24,
+  `--refresh`): `reissue_join_token` preserves `ip4`/`ip6` and `/register`
+  reuses them, so only the keypair changes. `rejoin` checks the node's
+  `kind` *before* mutating, since it nulls the pubkey and a mismatch
+  discovered at `/register` would already have dropped a live agent node
+  out of every other node's directory.
 - **Losing the device reuses revoke exactly as-is (§4.4).** A `kind:
   "static"` node is still just a row in `nodes` — `POST
   /admin/nodes/{name}/revoke` cuts it off the same way it would any

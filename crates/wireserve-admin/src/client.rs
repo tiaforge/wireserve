@@ -13,7 +13,7 @@ use reqwest::blocking::{Client, Response};
 use reqwest::StatusCode;
 use wireserve_types::{
     AdminPeersResponse, AdminServicesResponse, CreateNodeRequest, CreateNodeResponse,
-    DenyServiceRequest, ErrorBody, NodeKind, RegisterRequest, RegisterResponse, RejoinRequest,
+    DenyServiceRequest, ErrorBody, NodeKind, RegisterRequest, RegisterResponse, RejoinRequest, SetGatewayRequest,
     RejoinResponse,
 };
 
@@ -156,6 +156,28 @@ impl AdminClient {
             .json(&RejoinRequest { ttl_secs, kind: expect_kind })
             .send()?;
         Ok(Self::check_status(resp)?.json()?)
+    }
+
+    /// `PUT /admin/nodes/{name}/gateway` (PLAN.md M24) — records how a static
+    /// peer's `.conf` is shaped, so `/poll` can derive routing that matches
+    /// the file actually on the device.
+    pub fn set_gateway(
+        &self,
+        name: &str,
+        gateway: Option<&str>,
+        conf_peers: &[String],
+    ) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .put(self.url(&format!("/admin/nodes/{name}/gateway")))
+            .bearer_auth(&self.admin_token)
+            .json(&SetGatewayRequest {
+                gateway: gateway.map(ToString::to_string),
+                conf_peers: conf_peers.to_vec(),
+            })
+            .send()?;
+        Self::check_status(resp)?;
+        Ok(())
     }
 
     /// `GET /admin/services` — every declared service and its approval

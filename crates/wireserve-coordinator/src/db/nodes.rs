@@ -41,6 +41,10 @@ pub struct NodeRow {
     /// for other peers (`transit_approved_at IS NOT NULL`). The node's own
     /// `transit_capable` report counts for nothing without it.
     pub transit_approved: bool,
+    /// For a `kind=static` node, the node it routes through to reach
+    /// anything not written directly into its `.conf` (PLAN.md M24). `None`
+    /// for every agent node and for a static peer exported without one.
+    pub gateway_node_id: Option<i64>,
 }
 
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
@@ -64,6 +68,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
         revoked: row.get("revoked")?,
         last_seen: last_seen_str.and_then(|s| parse_dt(&s)),
         transit_approved: row.get::<_, Option<String>>("transit_approved_at")?.is_some(),
+        gateway_node_id: row.get("gateway_node_id")?,
     })
 }
 
@@ -360,6 +365,13 @@ pub fn revoke(conn: &Connection, node_id: i64) -> Result<(), DbError> {
 ///
 /// Transit approval goes too: it was granted to the identity being
 /// replaced.
+///
+/// `gateway_node_id` and the node's `static_conf_peers` rows deliberately
+/// stay (PLAN.md M24). They describe how the device is *addressed*, in the
+/// same category as `ip4`/`ip6` just above, not what it is allowed to do
+/// under a key that is being rotated — and `export-config --refresh` depends
+/// on that, since a refresh should not silently re-home a phone onto a
+/// different gateway.
 pub fn reissue_join_token(
     conn: &Connection,
     node_id: i64,
@@ -389,6 +401,62 @@ pub fn set_transit_approved(conn: &Connection, node_id: i64, approved: bool) -> 
         conn.execute("UPDATE nodes SET transit_approved_at = NULL WHERE id = ?1", [node_id])?;
     }
     Ok(())
+}
+
+/// Records which gateway a static peer routes through, and which peers were
+/// written into its `.conf` as direct `[Peer]` blocks, in one transaction
+/// (PLAN.md M24).
+///
+/// The two are written together because they are two halves of one fact: the
+/// conf's shape. `transit_via` is later derived from `conf_peer_ids` — it must
+/// name exactly the nodes *absent* from the conf — so a gateway recorded
+/// without its membership list, or vice versa, would misroute.
+pub fn set_gateway(
+    conn: &mut Connection,
+    static_node_id: i64,
+    gateway_node_id: Option<i64>,
+    conf_peer_ids: &[i64],
+) -> Result<(), DbError> {
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE nodes SET gateway_node_id = ?1 WHERE id = ?2",
+        rusqlite::params![gateway_node_id, static_node_id],
+    )?;
+    tx.execute(
+        "DELETE FROM static_conf_peers WHERE static_node_id = ?1",
+        [static_node_id],
+    )?;
+    for peer_id in conf_peer_ids {
+        tx.execute(
+            "INSERT INTO static_conf_peers (static_node_id, peer_node_id) VALUES (?1, ?2)",
+            rusqlite::params![static_node_id, peer_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Every `(static_node_id, peer_node_id)` pair recorded by [`set_gateway`].
+pub fn all_static_conf_peers(conn: &Connection) -> Result<Vec<(i64, i64)>, DbError> {
+    let mut stmt =
+        conn.prepare("SELECT static_node_id, peer_node_id FROM static_conf_peers")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The static nodes that route through `gateway_node_id`, by name. Used to
+/// refuse or warn on lifecycle operations that would strand them.
+pub fn static_nodes_using_gateway(
+    conn: &Connection,
+    gateway_node_id: i64,
+) -> Result<Vec<String>, DbError> {
+    let mut stmt = conn.prepare("SELECT name FROM nodes WHERE gateway_node_id = ?1 ORDER BY name")?;
+    let rows = stmt
+        .query_map([gateway_node_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// Clears a node's advertised `endpoint_addr`, leaving everything else

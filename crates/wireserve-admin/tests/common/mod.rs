@@ -267,6 +267,19 @@ async fn rejoin_node(
     }))
 }
 
+async fn set_gateway(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> Result<StatusCode, StatusCode> {
+    record(&state, "PUT", &format!("/admin/nodes/{name}/gateway"), &body);
+    if !admin_auth_ok(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(StatusCode::OK)
+}
+
 async fn list_peers(
     State(state): State<MockState>,
     headers: HeaderMap,
@@ -276,7 +289,7 @@ async fn list_peers(
         return Err(StatusCode::UNAUTHORIZED);
     }
     let peers = state.peers.lock().unwrap().clone();
-    Ok(Json(AdminPeersResponse { peers, transit_approved: vec![] }))
+    Ok(Json(AdminPeersResponse { peers, transit_approved: vec![], transit_offering: vec![] }))
 }
 
 async fn approve_transit(
@@ -330,6 +343,7 @@ fn admin_only_routes() -> Router<MockState> {
         )
         .route("/admin/nodes/{name}/transit/approve", post(approve_transit))
         .route("/admin/nodes/{name}/transit/deny", post(deny_transit))
+        .route("/admin/nodes/{name}/gateway", axum::routing::put(set_gateway))
         .route("/admin/peers", get(list_peers))
         .route("/admin/services", get(list_services))
         .route(

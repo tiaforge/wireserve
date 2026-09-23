@@ -97,6 +97,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0007_lan_addr.sql")),
         M::up(include_str!("../../migrations/0008_reflexive_addr.sql")),
         M::up(include_str!("../../migrations/0009_transit_approval.sql")),
+        M::up(include_str!("../../migrations/0010_static_peer_gateway.sql")),
     ])
 }
 
@@ -363,6 +364,61 @@ mod tests {
 
         let row = crate::db::nodes::find_by_name(&conn, "n1").unwrap().unwrap();
         assert!(!row.transit_approved);
+    }
+
+    #[test]
+    fn migration_gives_existing_static_peers_no_gateway() {
+        // Grandfathering, this time in the harmless direction: an existing
+        // .conf was rendered all-direct, so its owner must keep routing
+        // all-direct until it is re-exported. A gateway assigned on upgrade
+        // would name a peer the device's config has never heard of.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        migrations().to_version(&mut conn, 9).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (name, kind, pubkey, ip4, ip6, join_token_used) \
+             VALUES ('phone', 'static', 'pk1', '100.90.0.1', 'fd00:90::1', 1)",
+            [],
+        )
+        .unwrap();
+
+        migrations().to_latest(&mut conn).unwrap();
+
+        let row = crate::db::nodes::find_by_name(&conn, "phone").unwrap().unwrap();
+        assert!(row.gateway_node_id.is_none());
+        assert!(crate::db::nodes::all_static_conf_peers(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_a_gateway_clears_the_reference_rather_than_dangling() {
+        // ON DELETE SET NULL only fires with foreign keys enabled, which
+        // `Db::open` does per-connection — pin that it actually works, since
+        // a dangling gateway id would have the coordinator name a pubkey no
+        // longer in the directory.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        migrations().to_latest(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, name, kind, join_token_used) VALUES (1, 'gw', 'agent', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, name, kind, join_token_used, gateway_node_id) \
+             VALUES (2, 'phone', 'static', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO static_conf_peers VALUES (2, 1)", []).unwrap();
+
+        conn.execute("DELETE FROM nodes WHERE id = 1", []).unwrap();
+
+        let row = crate::db::nodes::find_by_name(&conn, "phone").unwrap().unwrap();
+        assert!(row.gateway_node_id.is_none(), "the reference must not dangle");
+        assert!(
+            crate::db::nodes::all_static_conf_peers(&conn).unwrap().is_empty(),
+            "the conf-membership row must cascade away with the peer"
+        );
     }
 
     #[test]

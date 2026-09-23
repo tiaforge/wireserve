@@ -321,12 +321,48 @@ podman exec wireserve-coordinator wireserve-admin export-config myphone \
     --out myphone.conf
 ```
 
-Import it into the official WireGuard app, by file or by feeding the
-contents to any QR-code generator. The file contains a private key, so it
-is written mode 600; move it, do not copy it. Such a peer gets a mesh
+Import it into the official WireGuard app, by file or with `--qr`, which
+prints a code to scan straight from the terminal. The file contains a
+private key, so it is written mode 600; move it, do not copy it. (So does
+the QR code — it will sit in your scrollback.) Such a peer gets a mesh
 address and reaches every service by its address (in `wireserve-admin
-list-services`) and port, but has no `.wg` name resolution, and it is a
-snapshot: re-export and reimport after new nodes or services appear.
+list-services`) and port, but has no `.wg` name resolution.
+
+**Give it a gateway so the config does not go stale.** Without one, the
+config is a snapshot: every node is listed individually, so anything that
+joins later is unreachable from the device until you export again. Point it
+at a node that can carry traffic for it and the whole mesh range is routed
+there instead, so new nodes and services just work:
+
+```sh
+wireserve-admin approve-transit vps1      # and `wireserve-agent transit on` on vps1
+wireserve-admin export-config myphone --gateway vps1 --qr
+```
+
+The gateway needs a publicly reachable endpoint — a phone on cellular has
+one `Endpoint =` line and no way to refresh it — and must be carrying
+traffic already, which is the same opt-in plus approval that
+[transit](#6-route-through-another-node-when-nat-blocks-a-direct-path) uses,
+for the same reason: it sees the traffic in the clear. With exactly one
+node eligible, `--gateway` can be left off.
+
+Nodes that *are* reachable from anywhere still get their own direct entry,
+so the device talks to them straight rather than through the gateway. Only
+what it cannot dial itself is routed onward.
+
+**Re-issuing a config** keeps the device's name and mesh address:
+
+```sh
+wireserve-admin export-config myphone --refresh --qr
+```
+
+Only the keypair changes. Delete the old tunnel on the device before
+importing the new one — the address is unchanged, so the stale config still
+looks valid, and two tunnels claiming one address is its own kind of
+confusing. This is destructive from its first call: the old key stops
+working immediately and the device is briefly absent from the mesh while
+the new one is redeemed. It refuses outright if the name belongs to a node
+that runs the agent.
 
 ### 5. When a machine is lost or compromised
 
@@ -417,7 +453,7 @@ anywhere that can reach it):
 | Command | What it does |
 | --- | --- |
 | `wireserve-admin create-node <name>` | create a node, print a join token |
-| `wireserve-admin export-config <name>` | create a static peer, print a `.conf` |
+| `wireserve-admin export-config <name> [--gateway <node>] [--refresh] [--qr]` | create (or re-issue) a static peer's `.conf` |
 | `wireserve-admin list-peers` | the full directory |
 | `wireserve-admin revoke <name>` | cut a node off, keep its name reserved |
 | `wireserve-admin rejoin <name>` | fresh join token, same name and address; the old key stops working at once |

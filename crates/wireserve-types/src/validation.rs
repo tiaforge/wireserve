@@ -147,6 +147,70 @@ pub fn is_valid_reflexive_addr(s: &str) -> bool {
     host.parse::<std::net::Ipv4Addr>().is_ok() && matches!(port.parse::<u16>(), Ok(p) if p != 0)
 }
 
+/// Whether an `endpoint_addr`-shaped value (`host:port`, or
+/// `[v6]:port`) names a host reachable from outside the local network.
+///
+/// This is deliberately stricter than [`is_valid_endpoint_addr`], which
+/// permits private addresses on purpose — an endpoint is self-reported, and a
+/// node on a home LAN legitimately advertises `192.168.1.50:51820` to its
+/// neighbours there. That is fine for peers on the same LAN and useless to a
+/// phone on cellular, so anything deciding whether a device can dial a node
+/// *from anywhere* has to ask this question instead (PLAN.md M24).
+///
+/// A hostname is taken at its word: an operator who configured
+/// `--endpoint-addr home.example.com:51820` meant it to resolve publicly, and
+/// resolving it here would only produce an answer valid from this machine.
+#[must_use]
+pub fn is_globally_routable_endpoint(s: &str) -> bool {
+    let Some(host) = endpoint_host(s) else {
+        return false;
+    };
+    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+        let o = v4.octets();
+        // `Ipv4Addr::is_shared` is still unstable, so 100.64.0.0/10 — the
+        // carrier-grade NAT range, where a node is behind someone else's NAT
+        // and cannot be dialled at all — is spelled out here.
+        let is_cgnat = o[0] == 100 && (64..128).contains(&o[1]);
+        return !v4.is_private()
+            && !v4.is_loopback()
+            && !v4.is_link_local()
+            && !v4.is_unspecified()
+            && !v4.is_broadcast()
+            && !v4.is_multicast()
+            && !is_cgnat;
+        // Documentation ranges (192.0.2/24, 198.51.100/24, 203.0.113/24) are
+        // deliberately NOT rejected. Unlike the ranges above they say nothing
+        // about reachability — nobody configures one as a real endpoint by
+        // accident — and they are what this project's tests use throughout to
+        // mean "a public address".
+    }
+    if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
+        let seg = v6.segments();
+        let is_unique_local = seg[0] & 0xfe00 == 0xfc00;
+        let is_link_local = seg[0] & 0xffc0 == 0xfe80;
+        return !v6.is_loopback()
+            && !v6.is_unspecified()
+            && !v6.is_multicast()
+            && !is_unique_local
+            && !is_link_local;
+    }
+    // A hostname, already shape-checked by `is_valid_endpoint_addr`.
+    true
+}
+
+/// The host part of an `endpoint_addr`, minus the port and any brackets.
+fn endpoint_host(s: &str) -> Option<&str> {
+    if s.contains('\n') || s.contains('\r') {
+        return None;
+    }
+    if let Some(rest) = s.strip_prefix('[') {
+        let (host, after) = rest.split_once(']')?;
+        return after.starts_with(':').then_some(host);
+    }
+    let (host, port) = s.rsplit_once(':')?;
+    (!host.is_empty() && !port.is_empty()).then_some(host)
+}
+
 /// Whether `url` is plain `http://` to a host that is not loopback — i.e.
 /// a bearer/join/admin token sent to it would cross a network in clear
 /// (security review S6; spec §7 assumes TLS termination in front of the
@@ -429,5 +493,52 @@ mod tests {
         ] {
             assert!(!is_valid_lan_addr(s), "expected {s:?} to be rejected");
         }
+    }
+}
+
+#[cfg(test)]
+mod routable_endpoint_tests {
+    use super::is_globally_routable_endpoint;
+
+    #[test]
+    fn accepts_public_literals_and_hostnames() {
+        for s in [
+            "203.0.113.5:51820",
+            "[2001:db8::1]:51820",
+            "duckdns.example.com:51820",
+            "home.example.com.:51820",
+        ] {
+            assert!(is_globally_routable_endpoint(s), "expected {s:?} routable");
+        }
+    }
+
+    #[test]
+    fn rejects_every_address_a_phone_off_the_lan_could_not_dial() {
+        for s in [
+            "192.168.1.50:51820",  // RFC1918 — the case this exists for
+            "10.0.0.4:51820",
+            "172.16.5.9:51820",
+            "127.0.0.1:51820",     // loopback
+            "169.254.3.4:51820",   // link-local
+            "0.0.0.0:51820",
+            "100.90.0.3:51820",    // CGNAT: behind someone else's NAT
+            "[fd12:3456::1]:51820", // unique-local
+            "[fe80::1]:51820",     // link-local
+            "[::1]:51820",
+        ] {
+            assert!(!is_globally_routable_endpoint(s), "expected {s:?} rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_values_rather_than_guessing() {
+        for s in ["", "no-port", "203.0.113.5", "[2001:db8::1]", ":51820", "host:"] {
+            assert!(!is_globally_routable_endpoint(s), "expected {s:?} rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_anything_carrying_a_newline() {
+        assert!(!is_globally_routable_endpoint("203.0.113.5:51820\nAllowedIPs = 0.0.0.0/0"));
     }
 }

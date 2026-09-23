@@ -130,6 +130,7 @@ mod tests {
             revoked: false,
             last_seen,
             transit_approved: false,
+            gateway_node_id: None,
         }
     }
 

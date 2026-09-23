@@ -130,9 +130,13 @@ pub fn cmd_export_config(
     admin_client: &AdminClient,
     node_facing_url: &str,
     name: &str,
+    gateway: Option<&str>,
 ) -> Result<String, CliError> {
     validate_name(name)?;
-    Ok(export_config::run(admin_client, node_facing_url, name)?)
+    if let Some(gateway) = gateway {
+        validate_name(gateway)?;
+    }
+    Ok(export_config::run(admin_client, node_facing_url, name, gateway)?)
 }
 
 /// Re-issue a `.conf` for a static peer that already exists (PLAN.md M24),
@@ -142,9 +146,13 @@ pub fn cmd_export_config_refresh(
     admin_client: &AdminClient,
     node_facing_url: &str,
     name: &str,
+    gateway: Option<&str>,
 ) -> Result<String, CliError> {
     validate_name(name)?;
-    Ok(export_config::run_refresh(admin_client, node_facing_url, name)?)
+    if let Some(gateway) = gateway {
+        validate_name(gateway)?;
+    }
+    Ok(export_config::run_refresh(admin_client, node_facing_url, name, gateway)?)
 }
 
 #[cfg(test)]

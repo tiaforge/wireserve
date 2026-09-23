@@ -234,8 +234,55 @@ pub async fn poll(
     // `GET /admin/peers` deliberately skips this and leaves it always
     // `None`: an admin isn't "a requester" polling on behalf of a
     // specific node, so there is no requester to compute it relative to.
-    for peer in &mut peers {
+    //
+    // Gateway routing for static peers (PLAN.md M24) is computed here too,
+    // and takes precedence. It is DB-driven and deliberately bypasses
+    // `either_wants`/`select`: a static peer never polls, so it can never
+    // file a `TransitState` report and the dynamic path can structurally
+    // never fire for one. The precedence is made explicit rather than left
+    // resting on that — the dynamic branch below assigns unconditionally,
+    // so an assignment made here must not be reachable by it.
+    let conf_peers: std::collections::HashSet<(i64, i64)> =
+        nodes::all_static_conf_peers(&conn)?.into_iter().collect();
+    let live_by_id: std::collections::HashMap<i64, &nodes::NodeRow> =
+        all_peers.iter().map(|n| (n.id, n)).collect();
+
+    // The gateway a node routes through, *if* it can still serve as one.
+    // `all_peers` is already filtered to registered, non-revoked nodes, so
+    // presence in `live_by_id` covers revoke and delete; approval is checked
+    // on top so `deny-transit` takes effect on the next poll rather than
+    // waiting for anything to be re-exported.
+    //
+    // Resolving this live, instead of trusting the stored id, is what keeps a
+    // withdrawn gateway from erasing the phone: `wg::desired_peers` drops a
+    // transited peer's entry in pass 1 and only re-adds it folded into the
+    // via peer in pass 2, so a `transit_via` naming a node that is no longer
+    // in the directory leaves the phone with no entry anywhere. Falling back
+    // to `None` here degrades to an ordinary direct entry instead.
+    let gateway_id_of = |n: &nodes::NodeRow| -> Option<i64> {
+        let gw = live_by_id.get(&n.gateway_node_id?)?;
+        gw.transit_approved.then_some(gw.id)
+    };
+
+    for (peer, row) in peers.iter_mut().zip(all_peers.iter()) {
         if peer.pubkey == self_pubkey {
+            continue;
+        }
+        if let Some(gw_id) = gateway_id_of(row) {
+            // The gateway itself terminates this peer's tunnel, so it keeps a
+            // direct entry and must never be told to route via itself.
+            if gw_id == node.id {
+                continue;
+            }
+            // Whoever was written into this device's `.conf` as a direct
+            // `[Peer]` also keeps a direct entry. Naming them here would make
+            // them drop the device while it still dials them — its /32 in the
+            // conf outranks the gateway's covering route, and WireGuard has
+            // no failover — which is a black hole, not a fallback.
+            if conf_peers.contains(&(row.id, node.id)) {
+                continue;
+            }
+            peer.transit_via = live_by_id.get(&gw_id).and_then(|g| g.pubkey.clone());
             continue;
         }
         if state.transit.either_wants(&self_pubkey, &peer.pubkey) {
@@ -268,6 +315,41 @@ pub async fn poll(
                 && state.transit.select(x, y, state.config.online_threshold_secs).as_deref() == Some(self_pubkey.as_str())
             {
                 transit_carrying.push(wireserve_types::TransitPair { a: x.to_string(), c: y.to_string() });
+            }
+        }
+    }
+
+    // This requester's gateway role (PLAN.md M24), on the same wire field as
+    // M23's dynamic pairs: for every static peer routing through it, forward
+    // between that peer and everything the peer does not reach directly.
+    //
+    // Iterating all peers rather than only agents is what covers phone↔phone
+    // — a second static peer has no endpoint, so it is never in anyone's conf
+    // and always falls into this set. Pairs are normalised and de-duplicated
+    // because that case is reachable from both ends.
+    if node.transit_approved {
+        let mut gateway_pairs: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        for client in all_peers.iter().filter(|n| gateway_id_of(n) == Some(node.id)) {
+            let Some(client_pk) = client.pubkey.as_deref() else { continue };
+            for other in &all_peers {
+                if other.id == client.id || other.id == node.id {
+                    continue;
+                }
+                if conf_peers.contains(&(client.id, other.id)) {
+                    continue;
+                }
+                let Some(other_pk) = other.pubkey.as_deref() else { continue };
+                gateway_pairs.insert(if client_pk < other_pk {
+                    (client_pk.to_string(), other_pk.to_string())
+                } else {
+                    (other_pk.to_string(), client_pk.to_string())
+                });
+            }
+        }
+        for (a, c) in gateway_pairs {
+            if !transit_carrying.iter().any(|p| (p.a == a && p.c == c) || (p.a == c && p.c == a)) {
+                transit_carrying.push(wireserve_types::TransitPair { a, c });
             }
         }
     }

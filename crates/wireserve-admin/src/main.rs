@@ -135,6 +135,15 @@ enum Command {
         /// a config too large to fit a terminal.
         #[arg(long)]
         qr: bool,
+        /// Route this device through the named node for anything not written
+        /// into its config directly, so adding nodes or services later needs
+        /// no re-export. The node must be approved to carry traffic
+        /// (`approve-transit`) and be reachable from outside the mesh.
+        ///
+        /// Picked automatically when exactly one node qualifies. The choice
+        /// is baked into the config, so changing it means re-exporting.
+        #[arg(long)]
+        gateway: Option<String>,
     },
 }
 
@@ -333,15 +342,23 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        Command::ExportConfig { name, out, refresh, qr } => {
+        Command::ExportConfig { name, out, refresh, qr, gateway } => {
             check_name(&name)?;
+            if let Some(gateway) = &gateway {
+                check_name(gateway)?;
+            }
             let client = build_client(&coordinator_url, &admin_token)?;
             let register_url = config::resolve_register_url_interactive(register_url.as_deref())?;
             warn_if_plaintext_to_remote_host(&register_url);
             let conf = if refresh {
-                wireserve_admin::cmd_export_config_refresh(&client, &register_url, &name)?
+                wireserve_admin::cmd_export_config_refresh(
+                    &client,
+                    &register_url,
+                    &name,
+                    gateway.as_deref(),
+                )?
             } else {
-                wireserve_admin::cmd_export_config(&client, &register_url, &name)?
+                wireserve_admin::cmd_export_config(&client, &register_url, &name, gateway.as_deref())?
             };
             // The QR is rendered before anything is written, so a config too
             // wide to scan fails without leaving a half-done export behind.

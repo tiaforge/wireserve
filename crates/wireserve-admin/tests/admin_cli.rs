@@ -33,7 +33,7 @@ fn export_config_end_to_end_and_private_key_never_leaves_process() {
     // the same router (unlike the real coordinator, which binds them on
     // two separate listeners — see PLAN.md decisions log), so the same
     // base URL is valid for both parameters here.
-    let conf = wireserve_admin::export_config::run(&client, mock.base_url.as_str(), "phone").unwrap();
+    let conf = wireserve_admin::export_config::run(&client, mock.base_url.as_str(), "phone", None).unwrap();
 
     assert!(conf.contains("[Interface]"));
     assert!(conf.contains("[Peer]"));
@@ -41,9 +41,18 @@ fn export_config_end_to_end_and_private_key_never_leaves_process() {
     assert!(conf.contains("AllowedIPs = 100.90.0.3/32, fd00:90::3/128"));
     assert!(conf.contains("Endpoint = duckdns.example.com:51820"));
 
-    // create-node, register, list-peers, list-services (for the service
-    // addresses each peer owns) — exactly four requests, no more.
-    assert_eq!(mock.request_count(), 4);
+    // list-peers, create-node, register, list-services (for the service
+    // addresses each peer owns), set-gateway — exactly five requests, no
+    // more. list-peers comes *first* so the gateway choice is validated
+    // before anything is created; set-gateway records how the config was
+    // shaped so /poll can derive routing that matches it.
+    assert_eq!(mock.request_count(), 5);
+    assert_eq!(
+        mock.paths().first().map(String::as_str),
+        Some("/admin/peers"),
+        "the directory must be read before anything is mutated: {:?}",
+        mock.paths()
+    );
 
     let private_key = conf
         .lines()
@@ -66,14 +75,21 @@ fn export_config_refresh_rejoins_instead_of_creating_and_keeps_the_same_call_cou
     let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
 
     let conf =
-        wireserve_admin::export_config::run_refresh(&client, mock.base_url.as_str(), "phone")
+        wireserve_admin::export_config::run_refresh(&client, mock.base_url.as_str(), "phone", None)
             .unwrap();
     assert!(conf.contains("[Interface]"));
 
-    // rejoin, register, list-peers, list-services — the same four as the
-    // create path, with rejoin standing in for create-node.
-    assert_eq!(mock.request_count(), 4);
+    // The same five as the create path, with rejoin standing in for
+    // create-node — and the directory read first, which matters more here:
+    // rejoin is destructive, so a gateway choice that cannot be satisfied
+    // must fail before the device's pubkey is nulled.
+    assert_eq!(mock.request_count(), 5);
     let paths = mock.paths();
+    assert_eq!(
+        paths.first().map(String::as_str),
+        Some("/admin/peers"),
+        "the directory must be read before the rejoin mutates anything: {paths:?}"
+    );
     assert!(
         paths.iter().any(|p| p == "/admin/nodes/:name/rejoin"),
         "refresh must rejoin the existing node: {paths:?}"
@@ -90,7 +106,7 @@ fn export_config_refresh_asserts_the_node_is_static_before_anything_is_mutated()
     let mock = MockCoordinator::start(TOKEN);
     let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
 
-    wireserve_admin::export_config::run_refresh(&client, mock.base_url.as_str(), "phone").unwrap();
+    wireserve_admin::export_config::run_refresh(&client, mock.base_url.as_str(), "phone", None).unwrap();
 
     // The `kind` must ride along on the rejoin request itself. The
     // coordinator checks it before `reissue_join_token`, which is the whole
@@ -111,7 +127,7 @@ fn a_private_key_never_leaves_the_process_on_the_refresh_path_either() {
     let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
 
     let conf =
-        wireserve_admin::export_config::run_refresh(&client, mock.base_url.as_str(), "phone")
+        wireserve_admin::export_config::run_refresh(&client, mock.base_url.as_str(), "phone", None)
             .unwrap();
     let private_key = conf
         .lines()
@@ -143,9 +159,9 @@ fn invalid_name_makes_zero_network_calls_for_every_name_taking_command() {
     assert!(wireserve_admin::cmd_deny_service(&client, "Bad_Name", "plex", None).is_err());
     assert!(wireserve_admin::cmd_deny_service(&client, "homeserver", "Bad_Service", None).is_err());
     assert!(wireserve_admin::cmd_approve_service(&client, "homeserver", "../../etc/passwd").is_err());
-    assert!(wireserve_admin::cmd_export_config(&client, mock.base_url.as_str(), "Bad_Name").is_err());
+    assert!(wireserve_admin::cmd_export_config(&client, mock.base_url.as_str(), "Bad_Name", None).is_err());
     assert!(
-        wireserve_admin::cmd_export_config_refresh(&client, mock.base_url.as_str(), "Bad_Name")
+        wireserve_admin::cmd_export_config_refresh(&client, mock.base_url.as_str(), "Bad_Name", None)
             .is_err()
     );
 
@@ -282,7 +298,7 @@ fn export_config_succeeds_against_two_genuinely_separate_listeners() {
     let register_mock = MockCoordinator::start_register_only(TOKEN);
     let client = AdminClient::new(admin_mock.base_url.as_str(), TOKEN);
 
-    let conf = wireserve_admin::export_config::run(&client, register_mock.base_url.as_str(), "phone")
+    let conf = wireserve_admin::export_config::run(&client, register_mock.base_url.as_str(), "phone", None)
         .expect("export-config must work when admin and register URLs point at different listeners");
     assert!(conf.contains("[Interface]"));
 }
@@ -294,7 +310,7 @@ fn export_config_fails_cleanly_if_register_url_points_at_the_admin_only_listener
 
     // Pointing register_url at a listener with no /register route must be
     // a clean error, not a panic and not a silently-wrong success.
-    let result = wireserve_admin::export_config::run(&client, admin_mock.base_url.as_str(), "phone");
+    let result = wireserve_admin::export_config::run(&client, admin_mock.base_url.as_str(), "phone", None);
     assert!(result.is_err());
 }
 
