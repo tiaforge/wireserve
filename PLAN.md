@@ -2253,3 +2253,43 @@ leak rather than a cost.
     input must skip as it reads. Parsing first and selecting afterwards is
     a cost proportional to the *host's* other tools, not to anything this
     agent does, and glibc turns that cost into a permanent one.
+
+130. **The bill moved to `nft`'s own processes, and `-t` pays most of it.**
+    After #128 and #129 the agent itself was 27.7 MB on that host, but the
+    operator sees the unit: `Memory: 57.5M (peak: 102.9M)`. A cgroup counts
+    the children, and this module runs two — `nft -j list ruleset` on every
+    poll tick, and the `nft -j monitor` that stays up.
+
+    Measured in a netns holding a 100k-element set (numbers are the child's
+    peak RSS):
+
+    | invocation | peak |
+    | --- | --- |
+    | `nft -j list ruleset` | 124 MB |
+    | `nft -t -j list ruleset` | 11 MB |
+    | `nft -j list chains` / `list tables` / `list chain <one>` | 10-11 MB |
+    | `nft -j monitor` (idle, any variant) | 118 MB |
+
+    `-t` leaves out set *elements* and nothing else — tables keep their
+    flags (checked: a dormant table still reports them), chains their hook
+    and type, rules their full expressions — which is exactly the line
+    between what `planner` reads and what it never did. So `observe` asks
+    for the terse listing, with one fallback: an `nft` that rejects `-t`
+    gets the plain listing immediately and from then on, because a host's
+    nft version is the host's business and failing to observe means failing
+    closed.
+
+    `kernel_a_hosts_set_elements_are_never_listed` pins it against a real
+    kernel on a geoip-shell-shaped host, and
+    `an_nft_without_terse_falls_back_once_and_stays_fallen_back` pins the
+    fallback against a fake `nft` that rejects the flag.
+
+    **Not fixed: `nft -j monitor` costs what it costs.** It builds the full
+    ruleset cache — every set element — at startup, and neither `-t` nor
+    narrowing it (`monitor rules`, `monitor ruleset`) changes that; all four
+    variants sat at 117-118 MB. It is the one child that stays resident, so
+    on such a host it is the agent's floor. Replacing it with a netlink
+    listener of our own (`NETLINK_NETFILTER`, `NFNLGRP_NFTABLES`, the
+    message type and a TLV walk for the table name — no cache, no JSON) is
+    the way out, and the crate already has `netlink-sys`; deliberately left
+    for a decision of its own rather than folded in here.

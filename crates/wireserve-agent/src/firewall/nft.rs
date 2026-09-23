@@ -74,6 +74,14 @@ impl Nft {
             .ok_or(NftError::NotFound)
     }
 
+    /// A binary at a known path, for tests that stand in for `nft` with a
+    /// script of their own.
+    #[cfg(test)]
+    #[must_use]
+    pub fn at(path: PathBuf) -> Self {
+        Self { path }
+    }
+
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path

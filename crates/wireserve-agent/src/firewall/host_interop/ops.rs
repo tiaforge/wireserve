@@ -23,12 +23,49 @@ pub struct RealOps {
     nft: Nft,
     firewalld: bool,
     own_table: Option<SharedRuleset>,
+    /// Whether this `nft` understands `-t` — see [`RealOps::list_ruleset`].
+    terse: bool,
 }
 
 impl RealOps {
     #[must_use]
     pub fn new(nft: Nft) -> Self {
-        Self { nft, firewalld: true, own_table: None }
+        Self { nft, firewalld: true, own_table: None, terse: true }
+    }
+
+    /// The ruleset, without the contents of anyone's sets.
+    ///
+    /// `-t` is the difference between a reconcile costing `nft` 11 MB and
+    /// costing it 124 MB on a host running crowdsec and geoip-shell,
+    /// measured on a 100k-element set — and a reconcile runs on every poll
+    /// tick. Terse leaves out set *elements* and nothing else: tables keep
+    /// their flags, chains their hooks, rules their full expressions, which
+    /// is everything `planner` reads (the elements never were: see
+    /// `ruleset`'s module doc for what parsing them used to cost this
+    /// process, which is a separate bill from what it costs `nft`).
+    ///
+    /// nft has had `-t` since 0.9.1, but a host's nft is the host's to
+    /// choose, so one that rejects it is not an error: the plain listing is
+    /// tried straight away and used from then on. Only a plain listing that
+    /// fails too is a failure to observe.
+    pub(super) fn list_ruleset(&mut self) -> Result<Vec<u8>, crate::firewall::nft::NftError> {
+        if !self.terse {
+            return self.nft.run(&["-j", "list", "ruleset"], None);
+        }
+        match self.nft.run(&["-t", "-j", "list", "ruleset"], None) {
+            Ok(out) => Ok(out),
+            Err(terse_failed) => {
+                let out = self.nft.run(&["-j", "list", "ruleset"], None)?;
+                // The retry worked, so `-t` was the problem — an nft too
+                // old for it, most likely. Stop asking.
+                self.terse = false;
+                tracing::warn!(
+                    error = %terse_failed,
+                    "this `nft` will not list the ruleset tersely; listing it with every set element instead"
+                );
+                Ok(out)
+            }
+        }
     }
 
     /// Lets a reconcile restore our own table from `own_table` (see
@@ -46,13 +83,13 @@ impl RealOps {
     #[cfg(test)]
     #[must_use]
     pub fn without_firewalld(nft: Nft) -> Self {
-        Self { nft, firewalld: false, own_table: None }
+        Self { nft, firewalld: false, own_table: None, terse: true }
     }
 }
 
 impl HostOps for RealOps {
     fn observe(&mut self, ifname: &str) -> Observed {
-        let nft = match self.nft.run(&["-j", "list", "ruleset"], None) {
+        let nft = match self.list_ruleset() {
             Ok(out) => match ruleset::parse(&out) {
                 Ok(view) => Some(view),
                 Err(e) => {
@@ -486,5 +523,105 @@ mod tests {
         });
         assert_eq!(live, BTreeSet::from(["alive".to_string(), "alive2".to_string()]));
         assert_eq!(*asked.borrow(), ["alive", "alive2", "dead"], "never asks about our own name");
+    }
+
+    /// A host whose `nft` predates `-t` must still be observable — and
+    /// must not pay for a rejected `-t` on every reconcile afterwards.
+    #[test]
+    fn an_nft_without_terse_falls_back_once_and_stays_fallen_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("args");
+        let fake = dir.path().join("nft");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"$@\" >> {log}\n\
+                 case \"$1\" in -t) echo \"nft: invalid option -- 't'\" >&2; exit 1;; esac\n\
+                 echo '{{\"nftables\":[]}}'\n",
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+        let mut ops = RealOps::without_firewalld(Nft::at(fake));
+        for _ in 0..3 {
+            let out = ops.list_ruleset().expect("the plain listing works");
+            assert_eq!(ruleset::parse(&out).unwrap(), NftView::default());
+        }
+        let asked: Vec<String> = std::fs::read_to_string(&log).unwrap().lines().map(str::to_string).collect();
+        assert_eq!(
+            asked,
+            [
+                "-t -j list ruleset", // tried once,
+                "-j list ruleset",    // fell back,
+                "-j list ruleset",    // and never asked again.
+                "-j list ruleset",
+            ]
+        );
+    }
+
+    /// Against a real kernel, on a host shaped like the one this was
+    /// found on: a table full of set elements must cost us nothing to
+    /// observe, and everything the planner reads must still be there.
+    ///
+    /// The bill this pins is `nft`'s own, not ours — a full
+    /// `list ruleset` on a 100k-element set peaked at 124 MB in the `nft`
+    /// child against 11 MB for the terse one, once per poll tick, and the
+    /// agent's cgroup is what the operator sees.
+    #[test]
+    fn kernel_a_hosts_set_elements_are_never_listed() {
+        if !crate::firewall::netns::reexec("firewall::host_interop::ops::tests::kernel_a_hosts_set_elements_are_never_listed") {
+            return;
+        }
+        let elements: Vec<String> = (0..20_000u32)
+            .map(|i| format!("{}.{}.{}.0/24", (i >> 16) & 255, (i >> 8) & 255, i & 255))
+            .collect();
+        // Through a file: a set this size is past the kernel's limit on
+        // the length of one argument.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("host.nft");
+        std::fs::write(
+            &config,
+            format!(
+                "table inet geoip-shell {{\n\
+                   set allow {{ type ipv4_addr; flags interval; elements = {{ {} }} }}\n\
+                   chain input {{ type filter hook input priority -141; policy accept; ip saddr @allow accept; }}\n\
+                 }}\n\
+                 table inet filter {{\n  chain input {{ type filter hook input priority 0; policy drop; }}\n}}\n",
+                elements.join(", ")
+            ),
+        )
+        .unwrap();
+
+        let nft = Nft::locate().unwrap();
+        nft.run(&["-f", config.to_str().unwrap()], None).expect("the host's ruleset loads");
+        let mut ops = RealOps::without_firewalld(nft.clone());
+        let terse = ops.list_ruleset().unwrap();
+        let full = nft.run(&["-j", "list", "ruleset"], None).unwrap();
+        assert!(
+            terse.len() * 20 < full.len(),
+            "terse listing is {} KB against a full one of {} KB — is `-t` being dropped?",
+            terse.len() / 1024,
+            full.len() / 1024
+        );
+        assert!(!String::from_utf8_lossy(&terse).contains("\"elem\""), "set contents came back anyway");
+
+        // Everything `planner` reads survives it: both tables, both base
+        // chains with their hooks and types, and the rules with their
+        // expressions.
+        let view = ruleset::parse(&terse).unwrap();
+        assert!(view.tables.iter().any(|t| t.name == "geoip-shell"));
+        let foreign = view
+            .chains
+            .iter()
+            .find(|c| c.chain.table == "filter" && c.chain.chain == "input")
+            .expect("the host's own input chain");
+        assert_eq!(foreign.hook.as_deref(), Some("input"));
+        assert_eq!(foreign.chain_type.as_deref(), Some("filter"));
+        let geoip = view.chains.iter().find(|c| c.chain.table == "geoip-shell").unwrap();
+        assert_eq!(geoip.rules.len(), 1, "a rule that matches on a set is still a rule we can see");
+        assert!(!geoip.rules[0].expr.is_empty());
     }
 }
