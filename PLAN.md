@@ -2225,10 +2225,14 @@ leak rather than a cost.
     peak — against 85 KB of ruleset that the reader actually keeps, so the
     ruleset was no longer what cost anything. The peak was one line.
 
+    **(Corrected by #131: nft does not in fact emit such lines — the
+    measurement below was made against a synthetic one. The change stands
+    as a CPU and robustness win; the memory claim here does not.)**
+
     `nft -j monitor` emits one JSON object per netlink message, and a bulk
-    element add is *one* message: geoip-shell loading a country set, or
-    crowdsec reloading a blocklist, arrives as a single line megabytes
-    long. `is_relevant` parsed each line with `serde_json::from_str::<Value>`
+    element add was believed to be *one* message: geoip-shell loading a
+    country set, or crowdsec reloading a blocklist, arriving as a single
+    line megabytes long. `is_relevant` parsed each line with `serde_json::from_str::<Value>`
     and then looked at two keys — so the most expensive line the agent ever
     sees was built in full in order to discover, from its second key, that
     it is an element event and ignored. Measured: one 4.2 MB line cost a
@@ -2293,3 +2297,36 @@ leak rather than a cost.
     message type and a TLV walk for the table name — no cache, no JSON) is
     the way out, and the crate already has `netlink-sys`; deliberately left
     for a decision of its own rather than folded in here.
+
+131. **Correction to #129: `nft -j monitor` does not emit huge lines.**
+    #129 said a bulk element add arrives as one line megabytes long, and
+    quoted 143 MB for a 4.2 MB line. The 143 MB is real but the line was
+    synthetic — one this author constructed, not one nft was ever observed
+    to print. Measured against a real kernel afterwards (nftables 1.1.6):
+
+    | what happened | what the monitor printed |
+    | --- | --- |
+    | 50k elements added to a plain set in one transaction | 50,000 lines, longest 117 B |
+    | 30k elements added to an `interval` set in one transaction | 30,000 lines, longest 140 B |
+    | a rule carrying a 30k-element anonymous set | 1 line, 249 B |
+
+    The kernel multicasts one message per element and nft renders one line
+    per message, so the volume is in the *count*, not the size. On the same
+    50k lines the old `Value`-based filter and the new streaming one both
+    peak at 18 MB — identical. The memory saving #129 claimed was not there
+    to save, and the drop the operator saw between those two measurements
+    (169 MB peak to 102.9 MB) is better explained by the unit's peak
+    counter resetting on restart and by what the `nft -j list ruleset`
+    child happened to do in each window — which #130 then removed outright.
+
+    What #129 did buy, measured on those same 50k lines: 25 ms of parsing
+    becomes 8 ms, and the filter stops caring how long a line is — a
+    property worth keeping precisely because the shape of nft's output is
+    not ours to guarantee. It stays, with its reasoning corrected rather
+    than its code.
+
+    The lesson is about the evidence, not the code: #128's numbers came
+    from the host's own `nft -j list ruleset` output and held up; #129's
+    came from a fixture built to match a guess about a format, and a
+    fixture will always confirm the guess that shaped it. A claim about
+    what another tool emits has to be measured against that tool.
