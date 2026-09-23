@@ -170,13 +170,34 @@ pub async fn rejoin_node(
     // Content-Type into a 400 on a route that used to accept it.
     body: Option<Json<RejoinRequest>>,
 ) -> Result<(StatusCode, Json<RejoinResponse>), AppError> {
+    let body = body.map(|Json(b)| b);
     let ttl = body
-        .and_then(|Json(b)| b.ttl_secs)
+        .as_ref()
+        .and_then(|b| b.ttl_secs)
         .unwrap_or(state.config.join_token_ttl_secs);
+    let expected_kind = body.as_ref().and_then(|b| b.kind);
     let expires_at = nodes::join_token_expiry(ttl);
 
     let conn = state.db.conn.lock().await;
     let node = nodes::find_by_name(&conn, &name)?.ok_or(AppError::NotFound)?;
+
+    // PLAN.md M24: checked here, before `reissue_join_token`, and not at
+    // `/register` where every other `kind` mismatch surfaces. A rejoin nulls
+    // the pubkey, and `list_all_peers` filters on `pubkey IS NOT NULL`, so by
+    // the time a mismatch reached registration this node would already be off
+    // every other node's directory. `export-config --refresh` pointed at an
+    // agent node by mistake would kick a live node off the mesh and only then
+    // report the error.
+    if let Some(expected) = expected_kind {
+        if expected != node.kind {
+            return Err(AppError::BadRequest(format!(
+                "kind mismatch: node '{}' is kind={}, but the request expects kind={}",
+                name,
+                node.kind.as_str(),
+                expected.as_str()
+            )));
+        }
+    }
 
     let join_token = tokengen::generate(JOIN_TOKEN_PREFIX);
     let hash = wireserve_types::hash_token(&join_token);

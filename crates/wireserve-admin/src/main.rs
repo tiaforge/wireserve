@@ -120,6 +120,21 @@ enum Command {
         name: String,
         #[arg(long)]
         out: Option<std::path::PathBuf>,
+        /// Re-issue the config for a device that already exists, keeping its
+        /// name and mesh address instead of creating a new node. Only the
+        /// keypair changes, so the device must reimport.
+        ///
+        /// Destructive from its first request: the old key stops working
+        /// immediately, and the node is briefly absent from the mesh while
+        /// the new one is redeemed. Refuses outright if the name belongs to
+        /// an agent node.
+        #[arg(long)]
+        refresh: bool,
+        /// Also print the config as a QR code to scan with the WireGuard app.
+        /// Refuses rather than print an unscannably wide code; use --out for
+        /// a config too large to fit a terminal.
+        #[arg(long)]
+        qr: bool,
     },
 }
 
@@ -318,15 +333,37 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        Command::ExportConfig { name, out } => {
+        Command::ExportConfig { name, out, refresh, qr } => {
             check_name(&name)?;
             let client = build_client(&coordinator_url, &admin_token)?;
             let register_url = config::resolve_register_url_interactive(register_url.as_deref())?;
             warn_if_plaintext_to_remote_host(&register_url);
-            let conf = wireserve_admin::cmd_export_config(&client, &register_url, &name)?;
+            let conf = if refresh {
+                wireserve_admin::cmd_export_config_refresh(&client, &register_url, &name)?
+            } else {
+                wireserve_admin::cmd_export_config(&client, &register_url, &name)?
+            };
+            // The QR is rendered before anything is written, so a config too
+            // wide to scan fails without leaving a half-done export behind.
+            let rendered_qr = if qr { Some(wireserve_admin::qr::render(&conf)?) } else { None };
             match out {
                 Some(path) => write_conf_file(&path, &conf)?,
                 None => print!("{conf}"),
+            }
+            if let Some(rendered) = rendered_qr {
+                // stderr: the config on stdout is the program's output and
+                // stays pipeable, the code is for a human looking at it.
+                eprintln!();
+                eprint!("{rendered}");
+                eprintln!("\nScan with the WireGuard app. This code contains the private key —");
+                eprintln!("it stays in your scrollback and in any screen recording.");
+            }
+            if refresh {
+                eprintln!(
+                    "\nDelete the old '{name}' tunnel on the device before importing this one: \n\
+                     the address is unchanged, so the stale config still looks valid and two \n\
+                     tunnels would claim the same address."
+                );
             }
         }
     }

@@ -946,6 +946,103 @@ async fn rejoin_then_reregister_keeps_the_same_address() {
     assert_eq!(r2["ip6"].as_str().unwrap(), original_ip6);
 }
 
+// PLAN.md M24: `--refresh` for static peers, and the guard that keeps it
+// from being aimed at an agent node.
+
+#[tokio::test]
+async fn rejoin_of_a_static_node_keeps_its_name_and_address() {
+    let app = test_app();
+    let req = json_request(
+        "POST",
+        "/admin/nodes",
+        Some(ADMIN),
+        json!({ "name": "phone", "kind": "static" }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let token = body_json(resp).await["join_token"].as_str().unwrap().to_string();
+
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({ "join_token": token, "pubkey": pubkey_for("phone"), "kind": "static" }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let first = body_json(resp).await;
+    let (ip4, ip6) = (
+        first["ip4"].as_str().unwrap().to_string(),
+        first["ip6"].as_str().unwrap().to_string(),
+    );
+
+    // The refresh: rejoin asserting kind=static, then redeem with a brand
+    // new keypair. This is what `export-config --refresh` does.
+    let req = json_request(
+        "POST",
+        "/admin/nodes/phone/rejoin",
+        Some(ADMIN),
+        json!({ "kind": "static" }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let token2 = body_json(resp).await["join_token"].as_str().unwrap().to_string();
+
+    let req = json_request(
+        "POST",
+        "/register",
+        None,
+        json!({ "join_token": token2, "pubkey": pubkey_for("phone-rotated"), "kind": "static" }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let second = body_json(resp).await;
+
+    assert_eq!(second["ip4"].as_str().unwrap(), ip4, "a refresh must not renumber the device");
+    assert_eq!(second["ip6"].as_str().unwrap(), ip6);
+}
+
+#[tokio::test]
+async fn rejoin_refuses_a_kind_mismatch_without_touching_the_node() {
+    let app = test_app();
+    let t = admin_create_node(&app.router, "homeserver").await;
+    register_node(&app.router, &t, "homeserver", 51820).await;
+
+    // `export-config --refresh homeserver` by mistake: the node is an agent.
+    let req = json_request(
+        "POST",
+        "/admin/nodes/homeserver/rejoin",
+        Some(ADMIN),
+        json!({ "kind": "static" }),
+    );
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // The whole point of checking before `reissue_join_token`: the node must
+    // still be registered and visible to every other peer. Catching this at
+    // /register instead would already have nulled its pubkey and dropped it
+    // out of `list_all_peers`.
+    let peers = admin_peers(&app.router).await;
+    assert_eq!(
+        peers["peers"].as_array().unwrap().len(),
+        1,
+        "a refused rejoin must leave the node on the mesh: {peers}"
+    );
+    assert_eq!(peers["peers"][0]["name"].as_str().unwrap(), "homeserver");
+}
+
+#[tokio::test]
+async fn a_rejoin_without_a_kind_still_works_on_either_kind() {
+    // Every caller written before the guard sends no `kind`, including the
+    // plain `wireserve-admin rejoin` command. That must keep working.
+    let app = test_app();
+    let t = admin_create_node(&app.router, "homeserver").await;
+    register_node(&app.router, &t, "homeserver", 51820).await;
+
+    let req = json_request("POST", "/admin/nodes/homeserver/rejoin", Some(ADMIN), json!({}));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
 // F7: spec §4.1/§4.5 both specify 201 for create-node and rejoin.
 
 #[tokio::test]

@@ -138,16 +138,22 @@ impl AdminClient {
     }
 
     /// `POST /admin/nodes/{name}/rejoin` (spec §4.5).
+    ///
+    /// `expect_kind` is checked by the coordinator *before* it mutates
+    /// anything (PLAN.md M24) — pass it whenever the caller knows what it is
+    /// aiming at, so a rejoin can never null a live agent node's pubkey on
+    /// the way to discovering it was the wrong kind.
     pub fn rejoin(
         &self,
         name: &str,
         ttl_secs: Option<u64>,
+        expect_kind: Option<NodeKind>,
     ) -> Result<RejoinResponse, ClientError> {
         let resp = self
             .http
             .post(self.url(&format!("/admin/nodes/{name}/rejoin")))
             .bearer_auth(&self.admin_token)
-            .json(&RejoinRequest { ttl_secs })
+            .json(&RejoinRequest { ttl_secs, kind: expect_kind })
             .send()?;
         Ok(Self::check_status(resp)?.json()?)
     }

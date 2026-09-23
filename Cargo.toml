@@ -35,6 +35,10 @@ defguard_wireguard_rs = "0.12"
 nftables = { version = "0.6", default-features = false }
 base64 = "0.23"
 rpassword = "7"
+# Pure-Rust, zero transitive dependencies (Nayuki's reference implementation).
+# Its last release predates this project, which here means the QR spec is
+# frozen and the crate is complete, not that it is unmaintained.
+qrcodegen = "1.8"
 libc = "0.2"
 # The versions defguard_wireguard_rs uses, for our own route handling (see
 # wireserve-agent/src/routes.rs); keep in step with it.

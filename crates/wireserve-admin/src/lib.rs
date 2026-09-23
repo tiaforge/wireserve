@@ -1,6 +1,7 @@
 pub mod client;
 pub mod config;
 pub mod export_config;
+pub mod qr;
 
 use client::{AdminClient, ClientError};
 use wireserve_types::{
@@ -71,7 +72,10 @@ pub fn cmd_rejoin(
     ttl_secs: Option<u64>,
 ) -> Result<RejoinResponse, CliError> {
     validate_name(name)?;
-    Ok(client.rejoin(name, ttl_secs)?)
+    // No kind expectation: a bare `rejoin` names the node explicitly and has
+    // always worked on either kind. Only `export-config --refresh` asserts a
+    // kind, because it is the caller that could aim at the wrong one.
+    Ok(client.rejoin(name, ttl_secs, None)?)
 }
 
 pub fn cmd_list_peers(client: &AdminClient) -> Result<AdminPeersResponse, CliError> {
@@ -129,6 +133,18 @@ pub fn cmd_export_config(
 ) -> Result<String, CliError> {
     validate_name(name)?;
     Ok(export_config::run(admin_client, node_facing_url, name)?)
+}
+
+/// Re-issue a `.conf` for a static peer that already exists (PLAN.md M24),
+/// keeping its name and mesh address. See [`export_config::run_refresh`] for
+/// what this mutates and when.
+pub fn cmd_export_config_refresh(
+    admin_client: &AdminClient,
+    node_facing_url: &str,
+    name: &str,
+) -> Result<String, CliError> {
+    validate_name(name)?;
+    Ok(export_config::run_refresh(admin_client, node_facing_url, name)?)
 }
 
 #[cfg(test)]

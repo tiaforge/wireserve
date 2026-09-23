@@ -15,6 +15,7 @@ reqwest.workspace = true
 defguard_wireguard_rs.workspace = true
 chrono.workspace = true
 rpassword.workspace = true
+qrcodegen.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

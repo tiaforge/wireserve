@@ -506,6 +506,20 @@ pub struct RejoinRequest {
     /// Same meaning as `CreateNodeRequest::ttl_secs`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ttl_secs: Option<u64>,
+    /// The kind the caller believes this node is, checked *before* the
+    /// rejoin mutates anything (PLAN.md M24). `None` skips the check, which
+    /// is what every caller written before this field did.
+    ///
+    /// Load-bearing for `export-config --refresh`: a rejoin nulls the node's
+    /// pubkey, which drops it out of `list_all_peers` and so off every other
+    /// node's directory on their next poll. Registration is where a `kind`
+    /// mismatch would otherwise be caught, and that is one round trip too
+    /// late — `--refresh` aimed at an agent node by mistake would kick a live
+    /// node off the mesh and only *then* fail. An admin CLI cannot pre-check
+    /// this itself: `PeerInfo` carries no `kind`, and a separate lookup would
+    /// race the rejoin regardless.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub kind: Option<NodeKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

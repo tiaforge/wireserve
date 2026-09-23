@@ -61,6 +61,71 @@ fn export_config_end_to_end_and_private_key_never_leaves_process() {
 }
 
 #[test]
+fn export_config_refresh_rejoins_instead_of_creating_and_keeps_the_same_call_count() {
+    let mock = MockCoordinator::start(TOKEN);
+    let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
+
+    let conf =
+        wireserve_admin::export_config::run_refresh(&client, mock.base_url.as_str(), "phone")
+            .unwrap();
+    assert!(conf.contains("[Interface]"));
+
+    // rejoin, register, list-peers, list-services — the same four as the
+    // create path, with rejoin standing in for create-node.
+    assert_eq!(mock.request_count(), 4);
+    let paths = mock.paths();
+    assert!(
+        paths.iter().any(|p| p == "/admin/nodes/:name/rejoin"),
+        "refresh must rejoin the existing node: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p == "/admin/nodes"),
+        "refresh must never create a node — that would mint a second one \
+         and burn the name: {paths:?}"
+    );
+}
+
+#[test]
+fn export_config_refresh_asserts_the_node_is_static_before_anything_is_mutated() {
+    let mock = MockCoordinator::start(TOKEN);
+    let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
+
+    wireserve_admin::export_config::run_refresh(&client, mock.base_url.as_str(), "phone").unwrap();
+
+    // The `kind` must ride along on the rejoin request itself. The
+    // coordinator checks it before `reissue_join_token`, which is the whole
+    // point: a rejoin nulls the pubkey, so discovering the mismatch at
+    // /register instead would already have dropped a live agent node off
+    // every other node's directory.
+    let rejoin_body = mock
+        .bodies()
+        .into_iter()
+        .find(|b| b.contains("kind"))
+        .expect("the rejoin request must carry a kind expectation");
+    assert!(rejoin_body.contains("static"), "{rejoin_body}");
+}
+
+#[test]
+fn a_private_key_never_leaves_the_process_on_the_refresh_path_either() {
+    let mock = MockCoordinator::start(TOKEN);
+    let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
+
+    let conf =
+        wireserve_admin::export_config::run_refresh(&client, mock.base_url.as_str(), "phone")
+            .unwrap();
+    let private_key = conf
+        .lines()
+        .find(|l| l.starts_with("PrivateKey = "))
+        .unwrap()
+        .trim_start_matches("PrivateKey = ")
+        .trim()
+        .to_string();
+    for body in mock.bodies() {
+        assert!(!body.contains(&private_key), "private key leaked: {body}");
+    }
+}
+
+#[test]
 fn invalid_name_makes_zero_network_calls_for_every_name_taking_command() {
     let mock = MockCoordinator::start(TOKEN);
     let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
@@ -79,6 +144,10 @@ fn invalid_name_makes_zero_network_calls_for_every_name_taking_command() {
     assert!(wireserve_admin::cmd_deny_service(&client, "homeserver", "Bad_Service", None).is_err());
     assert!(wireserve_admin::cmd_approve_service(&client, "homeserver", "../../etc/passwd").is_err());
     assert!(wireserve_admin::cmd_export_config(&client, mock.base_url.as_str(), "Bad_Name").is_err());
+    assert!(
+        wireserve_admin::cmd_export_config_refresh(&client, mock.base_url.as_str(), "Bad_Name")
+            .is_err()
+    );
 
     assert_eq!(
         mock.request_count(),

@@ -12,6 +12,10 @@ use crate::client::{self, AdminClient, ClientError};
 pub enum ExportConfigError {
     #[error(transparent)]
     Client(#[from] ClientError),
+    /// `--refresh` aimed at a name the coordinator does not know. Deliberately
+    /// not an auto-create: a typo would otherwise silently mint a new node.
+    #[error("no such node '{name}' — run export-config without --refresh to create it ({message})")]
+    NoSuchNode { name: String, message: String },
 }
 
 /// This node's own interface parameters for rendering: the private key
@@ -124,20 +128,55 @@ pub fn run(
     node_facing_url: &str,
     name: &str,
 ) -> Result<String, ExportConfigError> {
+    let created = admin_client.create_node(name, NodeKind::Static, None)?;
+    redeem_and_render(admin_client, node_facing_url, &created.join_token)
+}
+
+/// Re-issues a `.conf` for a static peer that already exists (PLAN.md M24),
+/// keeping its name and — because `reissue_join_token` leaves `ip4`/`ip6`
+/// alone and `/register` reuses a node's existing addresses — its mesh
+/// address. Only the keypair changes.
+///
+/// **Destructive from its first HTTP call.** `rejoin` nulls the node's
+/// pubkey, which drops it out of `/admin/peers` and so off every other
+/// node's directory on their next poll; `/register` puts it back. A failure
+/// in between leaves the node alive but unregistered, recoverable by running
+/// the same command again — not a name-burning failure. The `kind`
+/// expectation is checked by the coordinator *before* it mutates anything,
+/// so pointing this at an agent node by mistake is refused outright rather
+/// than kicking a live node off the mesh.
+pub fn run_refresh(
+    admin_client: &AdminClient,
+    node_facing_url: &str,
+    name: &str,
+) -> Result<String, ExportConfigError> {
+    let rejoined = match admin_client.rejoin(name, None, Some(NodeKind::Static)) {
+        Ok(r) => r,
+        Err(ClientError::Api { status, message }) if status == reqwest::StatusCode::NOT_FOUND => {
+            return Err(ExportConfigError::NoSuchNode {
+                name: name.to_string(),
+                message,
+            });
+        }
+        Err(e) => return Err(e.into()),
+    };
+    redeem_and_render(admin_client, node_facing_url, &rejoined.join_token)
+}
+
+/// The half both paths share: generate a keypair locally, redeem the token
+/// the caller already minted, then render against the current directory.
+fn redeem_and_render(
+    admin_client: &AdminClient,
+    node_facing_url: &str,
+    join_token: &str,
+) -> Result<String, ExportConfigError> {
     let private_key = Key::generate();
     let public_key = private_key.public_key();
-
-    // A short-lived token is right here for the same reason it is
-    // elsewhere, and cheaper still: this token is minted and redeemed
-    // within the same function, microseconds apart, and never leaves the
-    // process. `None` takes the coordinator's configured default rather
-    // than asking for special treatment.
-    let created = admin_client.create_node(name, NodeKind::Static, None)?;
 
     let reg = client::register(
         node_facing_url,
         &RegisterRequest {
-            join_token: created.join_token,
+            join_token: join_token.to_string(),
             pubkey: public_key.to_string(),
             kind: NodeKind::Static,
             listen_port: None,
