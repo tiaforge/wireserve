@@ -2172,3 +2172,50 @@ from `hetzner` itself, and turning ufw off on `hetzner` fixed it.
     and answered it with a check at assignment time. Both come from the same
     root: local opt-in and coordinator-driven behaviour are two halves that
     have to agree, and only one of them was live.
+
+## Host-firewall interop — the ruleset reader's memory
+
+Found on a real node, not by a test: `wireserve-agent` sat at 215 MB RSS on
+one host while every other node stayed at 10-30 MB. Restarting it and
+replacing the binary changed nothing, which is what made it look like a
+leak rather than a cost.
+
+128. **The reader parsed the whole ruleset to keep three kinds of object.**
+    `ruleset::parse` read `nft -j list ruleset` into `Document { nftables:
+    Vec<Value> }` and *then* picked out tables, chains and rules. The node
+    in question runs crowdsec and geoip-shell, whose blocklists and country
+    sets are hundreds of thousands of elements — 4.4 MB of the JSON — and
+    every one of them was parsed into a `serde_json::Value` (a `BTreeMap`
+    node per object, ~600 bytes for a one-entry map) and dropped again
+    unread.
+
+    Three things turned that into a permanent number. The document is read
+    on every reconcile, which is every poll tick plus every debounced `nft
+    monitor` event, and geoip-shell rebuilding its tables trips the monitor.
+    Freeing it gives nothing back: these are millions of small allocations
+    that glibc keeps in its arena free-lists, so RSS is a high-water mark
+    (`malloc_trim(0)` on the live process returned 350 MB of a 362 MB
+    measurement, which is how the diagnosis was confirmed — the memory was
+    dead, not held). And `HostInterop::start` reconciles synchronously
+    before the interface comes up, so a fresh process is back at the mark
+    within a second — hence a restart that never helped.
+
+    Fixed by never building the parts we discard: `Object`/`Objects`/
+    `Document` are hand-written `Deserialize` impls that stream the
+    `nftables` array and hand anything that is not a table, chain or rule
+    to `IgnoredAny`, which serde_json skips without allocating. The three
+    kinds we keep still go through `Value` and `from_value`, because that
+    is what makes an unrecognised *shape* skippable rather than fatal —
+    a failed `Deserialize` ends the document, a failed `from_value` ends
+    one object — and their cost is bounded by the host's rules, not its
+    sets.
+
+    Measured on a fixture shaped like that host (4.3 MB, set-heavy): 215 MB
+    before, ~6 MB after. What remains scales with rules, not elements —
+    about 5 KB per rule, nearly all of it the `expr: Vec<Value>` that
+    `planner`'s shape matching needs.
+
+    `set_elements_cost_nothing_to_skip` pins it with a thread-local
+    counting allocator: parsing a 2 MB set-heavy document must allocate
+    less than a quarter of its size. It allocates 9 KB; before this it
+    would have been tens of MB.
