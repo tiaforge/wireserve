@@ -315,8 +315,7 @@ fn add(view: &mut NftView, kind: Kind, body: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::cell::Cell;
+    use crate::test_alloc::allocated;
     use std::fmt::Write as _;
 
     /// A `nft -j list ruleset` document shaped like the hosts this reader
@@ -336,37 +335,6 @@ mod tests {
         s.push_str(r#"]}},{"chain":{"family":"inet","table":"geoip-shell","name":"input","handle":3,"type":"filter","hook":"input","prio":-141,"policy":"accept"}},"#);
         s.push_str(r#"{"rule":{"family":"inet","table":"geoip-shell","chain":"input","handle":4,"expr":[{"match":{"op":"==","left":{"meta":{"key":"iifname"}},"right":"eth0"}},{"accept":null}]}}]}"#);
         s.into_bytes()
-    }
-
-    /// Bytes handed out by the allocator on *this* thread, so tests running
-    /// in parallel don't see each other's work.
-    struct Counting;
-
-    thread_local! {
-        static USED: Cell<usize> = const { Cell::new(0) };
-    }
-
-    unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            // `try_with`, and a thread-local with no destructor, because
-            // this runs during thread teardown too.
-            let _ = USED.try_with(|u| u.set(u.get() + layout.size()));
-            unsafe { System.alloc(layout) }
-        }
-
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            unsafe { System.dealloc(ptr, layout) }
-        }
-    }
-
-    #[global_allocator]
-    static ALLOCATOR: Counting = Counting;
-
-    /// Total bytes `f` asked the allocator for.
-    fn allocated(f: impl FnOnce()) -> usize {
-        let before = USED.with(Cell::get);
-        f();
-        USED.with(Cell::get) - before
     }
 
     /// The bug this reader's streaming shape exists to prevent: reading the

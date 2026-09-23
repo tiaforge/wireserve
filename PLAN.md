@@ -2219,3 +2219,37 @@ leak rather than a cost.
     counting allocator: parsing a 2 MB set-heavy document must allocate
     less than a quarter of its size. It allocates 9 KB; before this it
     would have been tens of MB.
+
+129. **The same flaw in the monitor's filter, and there it was bigger.**
+    #128 took the agent on that host from 215 MB to 70 MB, with a 169 MB
+    peak — against 85 KB of ruleset that the reader actually keeps, so the
+    ruleset was no longer what cost anything. The peak was one line.
+
+    `nft -j monitor` emits one JSON object per netlink message, and a bulk
+    element add is *one* message: geoip-shell loading a country set, or
+    crowdsec reloading a blocklist, arrives as a single line megabytes
+    long. `is_relevant` parsed each line with `serde_json::from_str::<Value>`
+    and then looked at two keys — so the most expensive line the agent ever
+    sees was built in full in order to discover, from its second key, that
+    it is an element event and ignored. Measured: one 4.2 MB line cost a
+    143 MB peak; a 12.6 MB line, 427 MB.
+
+    That it is *ignored* is what hid it. Element churn never reaches the
+    debouncer, so nothing reconciles, nothing logs, and the only trace is a
+    high-water mark that outlives the burst — which is why this looked like
+    a plateau the agent settled at rather than a spike.
+
+    Fixed the same way as #128: `Event`/`Body` read the outer key and the
+    object kind and hand everything else to `IgnoredAny`, with the two
+    bodies we do read derived (serde's unknown-field path is `IgnoredAny`
+    too, so a rule's `expr` and an element event's `elem` cost nothing).
+    Ten 4.2 MB events in a row now peak at 6 MB — the line buffer itself —
+    and allocate 0 KB beyond two short keys.
+
+    `a_bulk_element_event_costs_nothing_to_ignore` pins it with the same
+    counting allocator, now `crate::test_alloc` so both readers share it.
+
+    Both fixes are the same lesson: a reader that discards most of its
+    input must skip as it reads. Parsing first and selecting afterwards is
+    a cost proportional to the *host's* other tools, not to anything this
+    agent does, and glibc turns that cost into a permanent one.

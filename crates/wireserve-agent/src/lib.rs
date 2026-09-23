@@ -16,5 +16,7 @@ pub mod register;
 #[cfg(target_os = "linux")]
 pub mod routes;
 pub mod state;
+#[cfg(test)]
+mod test_alloc;
 pub mod vip;
 pub mod wg;

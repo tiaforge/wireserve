@@ -9,13 +9,24 @@
 //! arriving in a burst are debounced into one reconcile. The poll tick
 //! remains the safety net for everything this can't see: legacy iptables
 //! (not nftables at all), a monitor process that died, lost events.
+//!
+//! Ignored *without being read*, which is why [`is_relevant`] streams the
+//! line rather than taking a `serde_json::Value` of it. One event is one
+//! netlink message, and a bulk element add is one message: geoip-shell
+//! loading a country set, or crowdsec reloading a blocklist, arrives as a
+//! single line megabytes long. Turning one such line into a `Value` cost a
+//! 143 MB peak here — to decide, from its second key, that the line is an
+//! element event and none of our business. `host_interop::ruleset` has the
+//! same shape for the same reason, and its module doc has the detail on why
+//! that peak then stays resident.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 
 use super::model::{is_own_table, Family};
 use crate::firewall::nft::Nft;
@@ -31,30 +42,124 @@ use crate::firewall::nft::Nft;
 /// reconciling in response to one another.
 #[must_use]
 pub fn is_relevant(line: &str, ifname: &str) -> bool {
-    let Ok(Value::Object(event)) = serde_json::from_str::<Value>(line) else {
+    let Ok(event) = serde_json::from_str::<Event>(line) else {
         return false;
     };
-    let Some(Value::Object(body)) = event.get("add").or_else(|| event.get("delete")) else {
-        return false;
-    };
-    let (object, table_key) = if let Some(o) = body.get("table") {
-        (o, "name")
-    } else if let Some(o) = body.get("chain") {
-        (o, "table")
-    } else if let Some(o) = body.get("rule") {
-        (o, "table")
-    } else {
+    let Some(object) = event.object else {
         return false; // sets, elements, flowtables, counters, …
     };
-    let family_ok = object
-        .get("family")
-        .and_then(Value::as_str)
-        .and_then(Family::parse)
-        .is_some();
-    let table = object.get(table_key).and_then(Value::as_str).unwrap_or_default();
+    if !object.family_ok {
+        return false;
+    }
     let our_deny_table_lost_something =
-        event.get("delete").is_some() && table == crate::firewall::nftables::table_name(ifname);
-    family_ok && (!is_own_table(table) || our_deny_table_lost_something)
+        event.deleted && object.table == crate::firewall::nftables::table_name(ifname);
+    !is_own_table(&object.table) || our_deny_table_lost_something
+}
+
+/// One monitor line, in the three things the filter above looks at.
+struct Event {
+    deleted: bool,
+    /// `None` for a change to an object kind we don't filter on.
+    object: Option<ObjectRef>,
+}
+
+/// Which table a change was in, and whether its family is one we handle.
+struct ObjectRef {
+    family_ok: bool,
+    table: String,
+}
+
+/// A table's own change names it in `name`; a chain's or a rule's names
+/// its table in `table`. Every other field — a rule's `expr`, an element
+/// event's `elem` — is skipped by serde as an unknown field, so none of it
+/// is ever built.
+#[derive(Deserialize)]
+struct TableBody {
+    family: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ChainOrRuleBody {
+    family: Option<String>,
+    table: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for Event {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(EventVisitor)
+    }
+}
+
+struct EventVisitor;
+
+impl<'de> Visitor<'de> for EventVisitor {
+    type Value = Event;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("an nft monitor event")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Event, A::Error> {
+        let mut event = Event { deleted: false, object: None };
+        let mut found = false;
+        while let Some(key) = map.next_key::<String>()? {
+            // `add` before `delete`, as reading the two keys in that order
+            // always did; nft sends one or the other, never both.
+            match key.as_str() {
+                "add" | "delete" if !found => {
+                    found = true;
+                    event.deleted = key == "delete";
+                    event.object = map.next_value_seed(Body)?;
+                }
+                _ => drop(map.next_value::<IgnoredAny>()?),
+            }
+        }
+        Ok(event)
+    }
+}
+
+/// The `{"<kind>": {…}}` an `add` or a `delete` carries.
+struct Body;
+
+impl<'de> DeserializeSeed<'de> for Body {
+    type Value = Option<ObjectRef>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Body {
+    type Value = Option<ObjectRef>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("the object an nft monitor event changed")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut object = None;
+        while let Some(kind) = map.next_key::<String>()? {
+            match kind.as_str() {
+                "table" if object.is_none() => {
+                    let t: TableBody = map.next_value()?;
+                    object = Some(ObjectRef {
+                        family_ok: t.family.as_deref().and_then(Family::parse).is_some(),
+                        table: t.name.unwrap_or_default(),
+                    });
+                }
+                "chain" | "rule" if object.is_none() => {
+                    let c: ChainOrRuleBody = map.next_value()?;
+                    object = Some(ObjectRef {
+                        family_ok: c.family.as_deref().and_then(Family::parse).is_some(),
+                        table: c.table.unwrap_or_default(),
+                    });
+                }
+                _ => drop(map.next_value::<IgnoredAny>()?),
+            }
+        }
+        Ok(object)
+    }
 }
 
 /// Collapses a burst of events into one action `delay` after the last.
@@ -155,6 +260,43 @@ mod tests {
     const OTHER_AGENT_GUARD_ADD: &str = r#"{"add": {"table": {"family": "inet", "name": "wireserve-interop.wireserve1", "handle": 4}}}"#;
     const LOOKALIKE_TABLE_ADD: &str = r#"{"add": {"table": {"family": "inet", "name": "wireservex", "handle": 5}}}"#;
     const BRIDGE_RULE: &str = r#"{"add": {"rule": {"family": "bridge", "table": "br", "chain": "input", "handle": 2, "expr": []}}}"#;
+
+    /// One `nft -j monitor` line for a bulk element add — geoip-shell
+    /// loading a country set, crowdsec reloading a blocklist. nft sends
+    /// one netlink message for the batch, so this arrives as one line.
+    fn bulk_element_event(elements: usize) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::from(
+            r#"{"add": {"element": {"family": "inet", "table": "geoip-shell", "name": "allow", "elem": ["#,
+        );
+        for i in 0..elements {
+            if i > 0 {
+                s.push(',');
+            }
+            let (a, b, c) = ((i >> 16) as u8, (i >> 8) as u8, i as u8);
+            write!(s, r#"{{"prefix":{{"addr":"{a}.{b}.{c}.0","len":24}}}}"#).unwrap();
+        }
+        s.push_str("]}}}");
+        s
+    }
+
+    /// The line this filter exists to throw away is the biggest one it
+    /// will ever see, and deciding to throw it away must not depend on
+    /// its size: the element array is skipped as the line is read, not
+    /// built and dropped (module doc).
+    #[test]
+    fn a_bulk_element_event_costs_nothing_to_ignore() {
+        let line = bulk_element_event(50_000);
+        let mut relevant = true;
+        let used = crate::test_alloc::allocated(|| relevant = is_relevant(&line, "wg0"));
+        assert!(!relevant, "an element event is none of our business");
+        assert!(
+            used < line.len() / 100,
+            "ignoring a {} KB element event allocated {} KB — the line is being materialised again",
+            line.len() / 1024,
+            used / 1024
+        );
+    }
 
     #[test]
     fn foreign_table_chain_and_rule_changes_are_relevant() {
