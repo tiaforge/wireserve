@@ -96,7 +96,9 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 enum Msg {
     Changed,
     MonitorExited,
-    Tick,
+    /// Carries the *current* opt-in, because it can change while the daemon
+    /// runs — see `run`.
+    Tick { forward_wanted: bool },
     Stop(Sender<()>),
 }
 
@@ -113,12 +115,18 @@ impl HostInterop {
     /// the handle is inert (the nftables backend would already have refused
     /// to start in that case).
     ///
-    /// `transit_capable` (PLAN.md M23) — set once at join time and never
-    /// changed for the life of a running agent, so it is safe to capture
-    /// once here rather than re-read every reconcile — is whether this
-    /// node's FORWARD hook is opened at all, alongside the INPUT hook this
-    /// module has always opened. A node that never opts into transit gets
-    /// exactly the footprint this module had before transit existed.
+    /// `transit_capable` (PLAN.md M23) is whether this node's FORWARD hook
+    /// is opened at all, alongside the INPUT hook this module has always
+    /// opened. A node that never opts into transit gets exactly the
+    /// footprint this module had before transit existed.
+    ///
+    /// It is the value at startup only. `wireserve-agent transit on` mutates
+    /// the running daemon (M23 #102), so it is re-sent on every tick and the
+    /// worker acts on the change — see `run`. This comment used to claim the
+    /// flag was "set once at join time and never changed for the life of a
+    /// running agent"; it never was, and believing it meant a node that
+    /// opted in without restarting carried transit in its own table while
+    /// ufw silently dropped every forwarded packet.
     ///
     /// `own_table` is the backend's last applied ruleset, which a
     /// reconcile restores when our table has gone missing.
@@ -194,9 +202,9 @@ pub fn remove_legacy() {
 }
 
 impl InteropHandle for HostInterop {
-    fn tick(&self) {
+    fn tick(&self, forward_wanted: bool) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(Msg::Tick);
+            let _ = tx.send(Msg::Tick { forward_wanted });
         }
     }
 
@@ -222,10 +230,18 @@ impl Drop for HostInterop {
     }
 }
 
+/// The worker loop.
+///
+/// `forward_wanted` is mutable and re-read from every tick, not captured:
+/// transit is a live toggle, so a node can start carrying traffic long after
+/// its daemon started. Opening the host firewall's FORWARD hook only at
+/// startup meant `transit on` took effect everywhere *except* ufw and
+/// firewalld — the node's own table accepted the forward, the host's dropped
+/// it, and the only symptom was a peer that could not be reached through it.
 fn run(
     mut ops: RealOps,
     ifname: &str,
-    forward_wanted: bool,
+    mut forward_wanted: bool,
     nft: &Nft,
     rx: &Receiver<Msg>,
     tx: &Sender<Msg>,
@@ -250,7 +266,14 @@ fn run(
                 tracing::warn!("`nft monitor` exited; will restart it on the next poll tick");
                 monitor = None;
             }
-            Ok(Msg::Tick) => {
+            Ok(Msg::Tick { forward_wanted: now }) => {
+                if now != forward_wanted {
+                    tracing::info!(
+                        forward_wanted = now,
+                        "transit opt-in changed; reopening the host firewall's forward hook"
+                    );
+                    forward_wanted = now;
+                }
                 if monitor.is_none() {
                     monitor = spawn_monitor();
                 }
@@ -361,6 +384,61 @@ mod tests {
         });
     }
 
+    /// Opting into transit on a *running* daemon must open the host
+    /// firewall's FORWARD hook, against a real kernel.
+    ///
+    /// The regression this pins: `transit_capable` was captured once at
+    /// startup on the belief that it "never changed for the life of a
+    /// running agent", while `transit on` had always mutated the running
+    /// daemon. A node that opted in without restarting therefore carried
+    /// transit in its own table while ufw's FORWARD DROP ate every packet,
+    /// and the only visible symptom was a peer unreachable through it.
+    #[test]
+    fn kernel_opting_into_transit_opens_the_forward_hook_without_a_restart() {
+        if !crate::firewall::netns::reexec(
+            "firewall::host_interop::tests::kernel_opting_into_transit_opens_the_forward_hook_without_a_restart",
+        ) {
+            return;
+        }
+
+        // A ufw-shaped host: FORWARD defaults to DROP, which is what silently
+        // ate transited packets on a node that ran `transit on` without
+        // restarting its daemon.
+        sh("iptables-nft -P INPUT DROP; iptables-nft -P FORWARD DROP; iptables-nft -A INPUT -i lo -j ACCEPT");
+        let forward_rules = || tags(&sh("iptables-nft -S FORWARD"));
+
+        let nft = Nft::locate().unwrap();
+        let (_backend, shared) = own_table("wg0");
+        // Started opted OUT, exactly as a daemon that came up before the
+        // operator decided to carry transit.
+        let mut interop = HostInterop::start_with(
+            "wg0",
+            nft.clone(),
+            RealOps::without_firewalld(nft).with_own_table(shared),
+            false,
+        );
+        assert_eq!(forward_rules(), 0, "a node that never opted in opens nothing in FORWARD");
+
+        // `wireserve-agent transit on` — no restart.
+        interop.tick(true);
+        wait_for("forward hook opened after opting in", Duration::from_secs(5), || {
+            forward_rules() == 1
+        });
+        let rule = sh("iptables-nft -S FORWARD");
+        assert!(rule.contains("-i wg0"), "{rule}");
+        assert!(rule.contains("-o wg0"), "pinned to both interfaces, never a general router: {rule}");
+
+        // And back off again, without a restart either.
+        interop.tick(false);
+        wait_for("forward hook closed after opting out", Duration::from_secs(5), || {
+            forward_rules() == 0
+        });
+
+        interop.stop();
+        let after = sh("iptables-nft -S INPUT; iptables-nft -S FORWARD");
+        assert_eq!(tags(&after), 0, "{after}");
+    }
+
     /// The whole runtime — worker thread, `nft monitor`, debounce, tick,
     /// stop — against a real kernel. Re-runs this test binary inside a
     /// fresh unprivileged network namespace (so nothing touches the host),
@@ -398,7 +476,9 @@ mod tests {
         });
 
         // The tick path works on its own too, and a settled state is left alone.
-        interop.tick();
+        // `false` matches the `start_with` above: this test is about restoring
+        // the INPUT footprint, not about changing the opt-in.
+        interop.tick(false);
         std::thread::sleep(Duration::from_millis(700));
         assert_eq!(tags(&list()), 2, "no duplicates after tick + events");
 
@@ -437,8 +517,8 @@ mod tests {
         // check nothing is being rewritten any more.
         std::thread::sleep(Duration::from_millis(1500));
         let settled = sh("nft -a list ruleset");
-        a.tick();
-        b.tick();
+        a.tick(true);
+        b.tick(true);
         std::thread::sleep(Duration::from_millis(1500));
         assert_eq!(sh("nft -a list ruleset"), settled, "rules were rewritten: the agents are fighting");
         assert_eq!((count("wireserve0"), count("wireserve1")), (2, 2));

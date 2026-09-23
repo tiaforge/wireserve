@@ -27,7 +27,10 @@ pub fn startup_sequence<B: FirewallBackend>(backend: &mut B) -> Result<(), B::Er
 /// The running host-firewall interop, as the daemon sees it.
 pub trait InteropHandle {
     /// Poll-tick safety net: reconcile now.
-    fn tick(&self);
+    ///
+    /// `forward_wanted` is passed every tick rather than captured at start,
+    /// because `wireserve-agent transit on` changes it on a running daemon.
+    fn tick(&self, forward_wanted: bool);
     /// Remove everything the interop added. Idempotent.
     fn stop(&mut self);
 }
@@ -36,7 +39,7 @@ pub trait InteropHandle {
 pub struct NoopInterop;
 
 impl InteropHandle for NoopInterop {
-    fn tick(&self) {}
+    fn tick(&self, _forward_wanted: bool) {}
     fn stop(&mut self) {}
 }
 
@@ -191,7 +194,7 @@ mod tests {
 
     struct LoggingInterop(Log);
     impl InteropHandle for LoggingInterop {
-        fn tick(&self) {}
+        fn tick(&self, _forward_wanted: bool) {}
         fn stop(&mut self) {
             self.0.borrow_mut().push("interop.stop");
         }

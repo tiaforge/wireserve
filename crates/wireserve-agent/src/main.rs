@@ -597,8 +597,11 @@ async fn cmd_daemon(
                 };
                 let result = poll_loop::run_once(&mut ctx, &shared_state).await;
                 // Safety net for host-firewall changes the interop's own
-                // change monitor can't see (legacy iptables, firewalld).
-                interop.tick();
+                // change monitor can't see (legacy iptables, firewalld) —
+                // and the place the transit opt-in is re-read, since
+                // `transit on` mutates a running daemon and the host
+                // firewall's FORWARD hook has to follow it.
+                interop.tick(shared_state.lock().await.transit_capable);
 
                 match &result {
                     Ok(_) => hosts_synced = true,

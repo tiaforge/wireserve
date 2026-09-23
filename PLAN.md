@@ -9,7 +9,7 @@ source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
 **Currently working on:** nothing open — all milestones complete through
-M25 (service FQDNs and auto-published vhosts). 726 tests passing
+M25 (service FQDNs and auto-published vhosts). 728 tests passing
 across `cargo test --workspace`. Several container harnesses in
 `deploy/e2e/` pass on a real kernel: `run-e2e-test.sh` (mesh, firewall,
 interface guard), `run-nat-test.sh` (two NAT-ed sites) and
@@ -2129,3 +2129,46 @@ different addresses); more than one proxy per mesh; non-HTTP services by name.
 `deploy/e2e/run-proxy-publish-test.sh` is **not yet written** — the unit and
 integration tests cover rendering, selection and the warn-only property, but
 nothing has yet driven a real Caddy with a real certificate.
+
+## M23 follow-up — the transit opt-in was only half live
+
+Found on a real mesh, not by a test: `lego2` could not reach a service on
+`minipc`, which it routes through `hetzner`; the same service was reachable
+from `hetzner` itself, and turning ufw off on `hetzner` fixed it.
+
+127. **Two decisions contradicted each other, and the host firewall lost.**
+    #102 made `transit on` a *live* IPC toggle — "mutates the running daemon
+    directly, takes effect next poll, no rejoin". `HostInterop::start` took
+    the opposite view in its own doc comment: `transit_capable` is "set once
+    at join time and never changed for the life of a running agent, so it is
+    safe to capture once here rather than re-read every reconcile". It never
+    was.
+
+    So opting in moved everything the *coordinator* drives — the node is
+    selected as a carrier, gets its `transit_carrying` pairs, writes accept
+    rules into its own `wireserve-fwd` chain, enables forwarding on the wg
+    interface — while the one thing driven by *local* state, opening the host
+    firewall's FORWARD hook, stayed shut until the daemon happened to
+    restart. ufw's `FORWARD DROP` then ate every forwarded packet. Nothing
+    logs, nothing fails, and the symptom appears on a third node: the pair
+    being carried simply cannot reach each other, and the carrier looks fine
+    because its own table really does accept the traffic.
+
+    Fixed by passing the current opt-in on every tick rather than capturing
+    it at startup: `Msg::Tick { forward_wanted }`, `InteropHandle::tick` takes
+    it, and the worker reconciles when it changes. Still gated on the opt-in
+    rather than on `transit_carrying` being non-empty, so the footprint stays
+    stable instead of flapping as pairs come and go, and a node that never
+    opts in still has exactly the footprint this module had before transit
+    existed.
+
+    `kernel_opting_into_transit_opens_the_forward_hook_without_a_restart`
+    pins it against a real kernel, on a ufw-shaped host with `FORWARD DROP`:
+    started opted out, nothing in FORWARD; `tick(true)`, the rule appears
+    pinned to `-i wg0 -o wg0`; `tick(false)`, it goes again.
+
+    This is the same class of gap as #115, which caught the *other* half at
+    plan time — a node approved as a gateway but never switched on locally —
+    and answered it with a check at assignment time. Both come from the same
+    root: local opt-in and coordinator-driven behaviour are two halves that
+    have to agree, and only one of them was live.
