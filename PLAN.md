@@ -1795,8 +1795,9 @@ pathfinding beyond one transit hop; automatic/mandatory transit selection
 NAT-type classification (still relies on tier grace-window/backoff
 discovery instead, consistent with M21/M22).
 
-`deploy/e2e/run-transit-test.sh` (new, sibling to `run-nat-test.sh`) is
-written but **not yet run** — see "Currently working on" above.
+`deploy/e2e/run-transit-test.sh` (new, sibling to `run-nat-test.sh`)
+**passes** as of 2026-09-25, once the harness let the agent write
+`/proc/sys/net` (see M27's closing note).
 
 ## M24 — refreshable static peers, and gateway routing for them
 
@@ -1978,8 +1979,8 @@ proxy and one public wildcard record, later); adopt-your-own-pubkey for
 static peers; more than one gateway per device; agents routing through a
 gateway (only `kind=static` peers do).
 
-`deploy/e2e/run-gateway-test.sh` is written but **not yet run** — same
-rootful-Podman pattern and same caveat as `run-transit-test.sh`.
+`deploy/e2e/run-gateway-test.sh` **passes** as of 2026-09-25, with the same
+harness fix as `run-transit-test.sh`.
 
 ## M25 — service FQDNs, and publishing them through a reverse proxy
 
@@ -2556,8 +2557,10 @@ on phones as well.
     `addr` and would serve the target port on the node itself. Known and
     accepted. `unserve` such services before downgrading.
 
-**Not yet run:** `deploy/e2e/run-lan-target-test.sh` (rootful Podman, needs
-`sudo`). Several routers (FRITZ!Box among them) refuse requests whose Host
+`deploy/e2e/run-lan-target-test.sh` **passes** as of 2026-09-25, after two
+harness fixes: the device's route now goes in from a helper, and the guard
+check is a one-way UDP probe, since a TCP connect failed with or without the
+guard. Several routers (FRITZ!Box among them) refuse requests whose Host
 header is not their own name, a DNS-rebinding defence. The generated vhost
 cannot carry a per-service `header_up`, so the README suggests a hand-written
 `handle` ahead of the generated `import`; untried against a real router.
