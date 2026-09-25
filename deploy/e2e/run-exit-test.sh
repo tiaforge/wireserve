@@ -243,10 +243,21 @@ podman run -d --name "$PHONE" --network "$SITE_P" \
 sleep 1
 podman exec "$PHONE" ip route replace default via "$ROUTER_P_LAN"
 podman exec "$PHONE" mkdir -p /etc/wireguard
-# wg-quick hands `DNS =` to resolvconf, which a container has no use for;
-# check 7 queries the resolver directly instead.
-grep -v '^DNS' "$OUT/phone-exit.conf" | podman exec -i "$PHONE" tee /etc/wireguard/wg0.conf >/dev/null
+# Two changes to how the file is brought up, neither to the file's peers:
+# - wg-quick hands `DNS =` to resolvconf, which a container has no use for;
+#   check 7 queries the resolver directly instead.
+# - For a default route wg-quick sets up fwmark policy routing and writes
+#   `src_valid_mark`, which podman refuses inside this container. A phone's
+#   VPN does the equivalent itself: everything into the tunnel, except the
+#   gateway's own endpoint. `Table = off` leaves routing to us, and those two
+#   routes are exactly that.
+grep -v '^DNS' "$OUT/phone-exit.conf" | sed 's/^\[Interface\]$/[Interface]\nTable = off/' \
+    | podman exec -i "$PHONE" tee /etc/wireguard/wg0.conf >/dev/null
 podman exec "$PHONE" wg-quick up wg0 || fail "the full-tunnel profile would not come up"
+podman exec "$PHONE" ip route replace "$GW_IP/32" via "$ROUTER_P_LAN"
+podman exec "$PHONE" ip route replace default dev wg0
+podman exec "$PHONE" ip -6 route replace default dev wg0 2>/dev/null \
+    || note "no IPv6 default route in this container; IPv6 capture is not exercised here"
 sleep 10
 PHONE_IP4=$(grep '^Address' "$OUT/phone.conf" | sed 's/Address = //; s#/32.*##')
 
