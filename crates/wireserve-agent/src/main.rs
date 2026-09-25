@@ -102,9 +102,12 @@ enum Command {
     },
     /// Queues a local service declaration, applied on the next poll.
     ///
-    /// Each PORT is `[PUBLIC:]TARGET[/tcp|/udp]`: `<name>.wg:PUBLIC`
-    /// reaches TARGET on this node (TCP unless given; a bare port maps to
-    /// itself). `serve web 80:5080`, `serve dns 53/udp 53/tcp 8080:8000`.
+    /// Each PORT is `[PUBLIC:][ADDRESS:]TARGET[/tcp|/udp]`:
+    /// `<name>.wg:PUBLIC` reaches TARGET on this node, or on ADDRESS when
+    /// given — an IPv4 address this node reaches, such as a router on its
+    /// LAN, which then sees the connection come from this node (TCP unless
+    /// given; a bare port maps to itself). `serve web 80:5080`,
+    /// `serve dns 53/udp 53/tcp 8080:8000`, `serve myrouter 443:192.168.178.1:80`.
     /// The older `serve <name> <port> [tcp|udp]` still works.
     Serve {
         name: String,
@@ -509,7 +512,7 @@ async fn cmd_daemon(
         &mut fw,
         &mut wg,
         |wg| wg.preflight(&private_key).map_err(Into::into),
-        || start_interop(&ifname, state.transit_capable, own_table),
+        || start_interop(&ifname, firewall::ForwardWanted::of(&state), own_table),
         |wg| {
             wg.bring_up(&private_key, ip4, ip6, listen_port)
                 .map_err(Into::<Box<dyn std::error::Error>>::into)
@@ -598,10 +601,11 @@ async fn cmd_daemon(
                 let result = poll_loop::run_once(&mut ctx, &shared_state).await;
                 // Safety net for host-firewall changes the interop's own
                 // change monitor can't see (legacy iptables, firewalld) —
-                // and the place the transit opt-in is re-read, since
-                // `transit on` mutates a running daemon and the host
-                // firewall's FORWARD hook has to follow it.
-                interop.tick(shared_state.lock().await.transit_capable);
+                // and the place the transit opt-in and target-address
+                // services are re-read, since `transit on` and `serve`
+                // mutate a running daemon and the host firewall's FORWARD
+                // hook has to follow them.
+                interop.tick(firewall::ForwardWanted::of(&*shared_state.lock().await));
 
                 match &result {
                     Ok(_) => hosts_synced = true,
@@ -742,6 +746,19 @@ async fn teardown_everything<F: FirewallBackend>(
     if let Err(e) = wireserve_agent::hosts::remove_block(hosts_path, hosts_label) {
         tracing::warn!(error = %e, "failed to remove managed hosts-file block during teardown");
     }
+    // Forwarding this agent turned on for service targets (PLAN.md M26)
+    // goes off before the table guarding it does, and is forgotten, so
+    // nothing is left forwarding unguarded.
+    {
+        let mut state = state.lock().await;
+        if !state.forwarding_owned.is_empty() {
+            firewall::ip_forward::release_egress(&state.forwarding_owned.iter().cloned().collect());
+            state.forwarding_owned.clear();
+            if let Err(e) = state.save(state_path) {
+                tracing::warn!(error = %e, "failed to record released forwarding during teardown");
+            }
+        }
+    }
     // The host firewall closes back first, then our own table goes: the
     // interface is never left open to the host firewalls' view while
     // nothing of ours default-denies it.
@@ -787,16 +804,22 @@ async fn cmd_serve(instance: &Instance, name: String, ports: &[String]) -> Resul
     let ports = parse_serve_ports(ports)?;
     wireserve_types::validate_service_ports(&ports)?;
     let first = ports[0];
-    let resp = client::call(
-        &instance.socket_path(),
-        &IpcRequest::Serve {
-            name,
-            port: first.target,
-            proto: first.proto,
-            ports,
-        },
-    )
-    .await?;
+    let forwards = ports.iter().any(|m| m.addr.is_some());
+    let req = if forwards {
+        IpcRequest::ServeForwarding { name, port: first.target, proto: first.proto, ports }
+    } else {
+        IpcRequest::Serve { name, port: first.target, proto: first.proto, ports }
+    };
+    let resp = client::call(&instance.socket_path(), &req).await?;
+    if forwards {
+        if let wireserve_agent::ipc::IpcResponse::Error { message } = &resp {
+            if message.contains("unknown variant") {
+                return Err("the running daemon predates target addresses in `serve`; restart it \
+                            (e.g. `systemctl restart wireserve-agent`) and try again"
+                    .into());
+            }
+        }
+    }
     // "ok" alone overstates what just happened: the declaration is queued
     // locally and only reaches the coordinator on the next poll, and if
     // that coordinator requires approval it will sit pending until an
@@ -871,14 +894,14 @@ fn print_response(resp: wireserve_agent::ipc::IpcResponse) {
 #[cfg(target_os = "linux")]
 fn start_interop(
     ifname: &str,
-    transit_capable: bool,
+    forward_wanted: firewall::ForwardWanted,
     own_table: firewall::nftables::SharedRuleset,
 ) -> firewall::host_interop::HostInterop {
-    firewall::host_interop::HostInterop::start(ifname, transit_capable, own_table)
+    firewall::host_interop::HostInterop::start(ifname, forward_wanted, own_table)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn start_interop(_ifname: &str, _transit_capable: bool, _own_table: ()) -> firewall::NoopInterop {
+fn start_interop(_ifname: &str, _forward_wanted: firewall::ForwardWanted, _own_table: ()) -> firewall::NoopInterop {
     firewall::NoopInterop
 }
 
@@ -894,7 +917,7 @@ impl FirewallBackend for NoopFirewall {
     fn apply(
         &mut self,
         _rules: &[wireserve_types::ServiceRule],
-        _transit: &[wireserve_types::TransitForward],
+        _forwarding: &wireserve_types::Forwarding,
     ) -> Result<(), Self::Error> {
         tracing::warn!("nftables backend not compiled in — firewall rules are NOT being applied");
         Ok(())
@@ -917,9 +940,9 @@ mod tests {
         assert_eq!(
             parse_serve_ports(&args(&["53/udp", "53/tcp", "8080:8000"])).unwrap(),
             vec![
-                PortMap { public: 53, target: 53, proto: Proto::Udp },
-                PortMap { public: 53, target: 53, proto: Proto::Tcp },
-                PortMap { public: 8080, target: 8000, proto: Proto::Tcp },
+                PortMap { public: 53, target: 53, proto: Proto::Udp, addr: None },
+                PortMap { public: 53, target: 53, proto: Proto::Tcp, addr: None },
+                PortMap { public: 8080, target: 8000, proto: Proto::Tcp, addr: None },
             ]
         );
         assert_eq!(parse_serve_ports(&args(&["80:5080"])).unwrap(), vec!["80:5080".parse().unwrap()]);

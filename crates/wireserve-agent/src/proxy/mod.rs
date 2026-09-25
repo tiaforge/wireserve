@@ -161,7 +161,7 @@ mod tests {
             proto,
             online: true,
             vip4: vip.map(Into::into),
-            ports: vec![PortMap { public, target: 8080, proto }],
+            ports: vec![PortMap { public, target: 8080, proto, addr: None }],
         }
     }
 

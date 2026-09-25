@@ -11,9 +11,12 @@ pub mod validation;
 pub use api::*;
 pub use mesh::{MeshInfo, MeshRanges};
 pub use naming::{ServiceNaming, TLS_PUBLIC_PORT};
-pub use firewall::{FirewallBackend, ServiceRule, TransitEndpoint, TransitForward};
+pub use firewall::{FirewallBackend, Forwarding, ServiceRule, TransitEndpoint, TransitForward};
 pub use node::{NodeKind, Proto};
-pub use ports::{validate_node_targets, validate_service_ports, PortMap, MAX_PORTS_PER_SERVICE};
+pub use ports::{
+    is_valid_target_addr, same_target, target_label, validate_node_targets, validate_service_ports, PortMap,
+    MAX_PORTS_PER_SERVICE,
+};
 pub use token::{hash_token, BEARER_TOKEN_PREFIX, JOIN_TOKEN_PREFIX};
 pub use validation::{
     is_globally_routable_endpoint, is_plaintext_http_to_remote_host, is_valid_dns_label,

@@ -21,7 +21,38 @@ use wireserve_types::FirewallBackend;
 /// satisfies that regardless of backend.
 pub fn startup_sequence<B: FirewallBackend>(backend: &mut B) -> Result<(), B::Error> {
     backend.teardown()?;
-    backend.apply(&[], &[])
+    backend.apply(&[], &wireserve_types::Forwarding::default())
+}
+
+/// Which forwarded traffic from and to the mesh interface the host's other
+/// firewalls must leave to our own table. Neither: `FORWARD` is left
+/// exactly as untouched as it was before either existed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ForwardWanted {
+    /// This node is transit-capable (PLAN.md M23): mesh → mesh.
+    pub transit: bool,
+    /// This node declares a service mapped onto another address (PLAN.md
+    /// M26): mesh → elsewhere and back, for flows our table marked only.
+    pub services: bool,
+}
+
+impl ForwardWanted {
+    #[must_use]
+    pub fn any(self) -> bool {
+        self.transit || self.services
+    }
+
+    /// What the daemon's state calls for right now.
+    #[must_use]
+    pub fn of(state: &crate::state::AgentState) -> Self {
+        Self {
+            transit: state.transit_capable,
+            services: state
+                .declared_services
+                .iter()
+                .any(|d| d.port_maps().iter().any(|m| m.addr.is_some())),
+        }
+    }
 }
 
 /// The running host-firewall interop, as the daemon sees it.
@@ -29,8 +60,9 @@ pub trait InteropHandle {
     /// Poll-tick safety net: reconcile now.
     ///
     /// `forward_wanted` is passed every tick rather than captured at start,
-    /// because `wireserve-agent transit on` changes it on a running daemon.
-    fn tick(&self, forward_wanted: bool);
+    /// because `wireserve-agent transit on` and `serve` change it on a
+    /// running daemon.
+    fn tick(&self, forward_wanted: ForwardWanted);
     /// Remove everything the interop added. Idempotent.
     fn stop(&mut self);
 }
@@ -39,7 +71,7 @@ pub trait InteropHandle {
 pub struct NoopInterop;
 
 impl InteropHandle for NoopInterop {
-    fn tick(&self, _forward_wanted: bool) {}
+    fn tick(&self, _forward_wanted: ForwardWanted) {}
     fn stop(&mut self) {}
 }
 
@@ -90,12 +122,12 @@ pub mod fake {
     //! startup-sequencing requirement can be verified without a real
     //! nftables backend (which needs root and a kernel netfilter hook).
 
-    use wireserve_types::{FirewallBackend, ServiceRule, TransitForward};
+    use wireserve_types::{FirewallBackend, Forwarding, ServiceRule};
 
     #[derive(Debug, Clone, PartialEq)]
     pub enum Call {
         Teardown,
-        Apply(Vec<ServiceRule>, Vec<TransitForward>),
+        Apply(Vec<ServiceRule>, Forwarding),
     }
 
     #[derive(Debug, thiserror::Error)]
@@ -110,8 +142,8 @@ pub mod fake {
     impl FirewallBackend for FakeFirewallBackend {
         type Error = FakeError;
 
-        fn apply(&mut self, rules: &[ServiceRule], transit: &[TransitForward]) -> Result<(), Self::Error> {
-            self.calls.push(Call::Apply(rules.to_vec(), transit.to_vec()));
+        fn apply(&mut self, rules: &[ServiceRule], forwarding: &Forwarding) -> Result<(), Self::Error> {
+            self.calls.push(Call::Apply(rules.to_vec(), forwarding.clone()));
             Ok(())
         }
 
@@ -126,13 +158,13 @@ pub mod fake {
 mod tests {
     use super::fake::{Call, FakeFirewallBackend};
     use super::startup_sequence;
-    use wireserve_types::{FirewallBackend, Proto, ServiceRule};
+    use wireserve_types::{FirewallBackend, Forwarding, Proto, ServiceRule};
 
     #[test]
     fn startup_sequence_tears_down_then_applies_empty_ruleset() {
         let mut backend = FakeFirewallBackend::default();
         startup_sequence(&mut backend).unwrap();
-        assert_eq!(backend.calls, vec![Call::Teardown, Call::Apply(vec![], vec![])]);
+        assert_eq!(backend.calls, vec![Call::Teardown, Call::Apply(vec![], Forwarding::default())]);
     }
 
     const NODE: std::net::Ipv4Addr = std::net::Ipv4Addr::new(100, 90, 0, 2);
@@ -149,7 +181,7 @@ mod tests {
                     node: NODE,
                     node6: None,
                 }],
-                &[],
+                &Forwarding::default(),
             )
             .unwrap();
 
@@ -157,7 +189,7 @@ mod tests {
             backend.calls,
             vec![
                 Call::Teardown,
-                Call::Apply(vec![], vec![]),
+                Call::Apply(vec![], Forwarding::default()),
                 Call::Apply(
                     vec![ServiceRule::Open {
                         proto: Proto::Tcp,
@@ -165,7 +197,7 @@ mod tests {
                         node: NODE,
                         node6: None,
                     }],
-                    vec![]
+                    Forwarding::default()
                 ),
             ]
         );
@@ -182,7 +214,7 @@ mod tests {
     struct LoggingBackend(Log);
     impl FirewallBackend for LoggingBackend {
         type Error = super::fake::FakeError;
-        fn apply(&mut self, _rules: &[ServiceRule], _transit: &[wireserve_types::TransitForward]) -> Result<(), Self::Error> {
+        fn apply(&mut self, _rules: &[ServiceRule], _forwarding: &Forwarding) -> Result<(), Self::Error> {
             self.0.borrow_mut().push("fw.apply");
             Ok(())
         }
@@ -194,7 +226,7 @@ mod tests {
 
     struct LoggingInterop(Log);
     impl InteropHandle for LoggingInterop {
-        fn tick(&self, _forward_wanted: bool) {}
+        fn tick(&self, _forward_wanted: super::ForwardWanted) {}
         fn stop(&mut self) {
             self.0.borrow_mut().push("interop.stop");
         }

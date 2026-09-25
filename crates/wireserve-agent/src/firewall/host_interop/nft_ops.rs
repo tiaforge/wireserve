@@ -5,12 +5,12 @@
 
 use std::borrow::Cow;
 
-use nftables::expr::{Expression, Meta, MetaKey, NamedExpression};
+use nftables::expr::{BinaryOperation, Expression, Meta, MetaKey, NamedExpression, CT};
 use nftables::schema::{Chain, NfCmd, NfListObject, NfObject, Nftables, Rule, Table};
 use nftables::stmt::{Accept, Counter, Drop, Match, Operator, Statement};
 use nftables::types::{NfChainPolicy, NfChainType, NfFamily, NfHook};
 
-use super::model::{guard_table, tag, ChainRef, Family, Hook, GUARD_CHAIN};
+use super::model::{guard_table, tag, ChainRef, Family, ForwardWanted, Opening, GUARD_CHAIN};
 
 fn nf_family(family: Family) -> NfFamily {
     match family {
@@ -30,11 +30,6 @@ fn iifname_is(ifname: &str) -> Statement<'static> {
     })
 }
 
-/// `oifname "<ifname>"` — added alongside `iifname` for `Forward` only.
-/// `INPUT` traffic is always "to this host" regardless of egress, but
-/// `FORWARD` must be pinned to both interfaces or it would open routing
-/// from the mesh to any other interface on the host, not just hairpin
-/// traffic back onto the mesh (PLAN.md M23's transit).
 fn oifname_is(ifname: &str) -> Statement<'static> {
     Statement::Match(Match {
         left: Expression::Named(NamedExpression::Meta(Meta {
@@ -45,16 +40,34 @@ fn oifname_is(ifname: &str) -> Statement<'static> {
     })
 }
 
-/// `insert rule <chain> iifname "<ifname>" [oifname "<ifname>"] counter
-/// accept comment "wireserve:<ifname>"` — `insert` without a position puts
-/// it at the head of the chain, ahead of that chain's own drops. The
-/// `oifname` match is added only for `Hook::Forward` — see `oifname_is`.
-#[must_use]
-pub fn insert_accept(chain: &ChainRef, ifname: &str, hook: Hook) -> Nftables<'static> {
-    let mut expr = vec![iifname_is(ifname)];
-    if hook == Hook::Forward {
-        expr.push(oifname_is(ifname));
+/// `ct mark & M == M`: a flow our own table marked as a service's.
+fn service_mark_is() -> Statement<'static> {
+    let mark = crate::firewall::nftables::SERVICE_MARK;
+    let ct_mark = Expression::Named(NamedExpression::CT(CT { key: "mark".into(), family: None, dir: None }));
+    Statement::Match(Match {
+        left: Expression::BinaryOperation(Box::new(BinaryOperation::AND(ct_mark, Expression::Number(mark)))),
+        right: Expression::Number(mark),
+        op: Operator::EQ,
+    })
+}
+
+/// The matches of `opening` — see [`Opening`] for why every `FORWARD`
+/// one is pinned to a second condition.
+fn opening_matches(ifname: &str, opening: Opening) -> Vec<Statement<'static>> {
+    match opening {
+        Opening::Input => vec![iifname_is(ifname)],
+        Opening::Hairpin => vec![iifname_is(ifname), oifname_is(ifname)],
+        Opening::ServiceRequest => vec![iifname_is(ifname), service_mark_is()],
+        Opening::ServiceReply => vec![oifname_is(ifname), service_mark_is()],
     }
+}
+
+/// `insert rule <chain> <opening's matches> counter accept comment
+/// "wireserve:<ifname>"` — `insert` without a position puts it at the head
+/// of the chain, ahead of that chain's own drops.
+#[must_use]
+pub fn insert_accept(chain: &ChainRef, ifname: &str, opening: Opening) -> Nftables<'static> {
+    let mut expr = opening_matches(ifname, opening);
     expr.push(Statement::Counter(Counter::Anonymous(None)));
     expr.push(Statement::Accept(None::<Accept>));
     Nftables {
@@ -106,16 +119,17 @@ fn delete_table_cmds(name: &str) -> Vec<NfObject<'static>> {
 }
 
 /// Atomically (re)creates `inet wireserve-interop.<ifname>` holding a
-/// forward-hook `iifname "<ifname>" drop`, plus — only when
-/// `forward_wanted` (this node is transit-capable, PLAN.md M23) — a
-/// hairpin exception added *ahead* of it: `iifname "<ifname>" oifname
-/// "<ifname>" accept`. A drop is final across every chain on the hook, so
-/// without the exception nothing — firewalld's `trusted` zone included —
-/// can let traffic from the mesh be forwarded to another interface; with
-/// it, only traffic routed back onto this same interface ever escapes
-/// that drop.
+/// forward-hook `iifname "<ifname>" drop`, plus exceptions added *ahead*
+/// of it: `iifname "<ifname>" oifname "<ifname>" accept` for transit
+/// (PLAN.md M23), and `iifname "<ifname>" ct mark & M == M accept` for a
+/// service's target address (PLAN.md M26). A drop is final across every
+/// chain on the hook, so without an exception nothing — firewalld's
+/// `trusted` zone included — can let traffic from the mesh be forwarded to
+/// another interface; with them, only traffic routed back onto this same
+/// interface, or a flow our own table rewrote to a declared target, ever
+/// escapes that drop.
 #[must_use]
-pub fn guard_create(ifname: &str, forward_wanted: bool) -> Nftables<'static> {
+pub fn guard_create(ifname: &str, forward: ForwardWanted) -> Nftables<'static> {
     let table = guard_table(ifname);
     let mut objects = delete_table_cmds(&table);
     objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Table(inet_table(&table)))));
@@ -129,12 +143,15 @@ pub fn guard_create(ifname: &str, forward_wanted: bool) -> Nftables<'static> {
         policy: Some(NfChainPolicy::Accept),
         ..Chain::default()
     }))));
-    if forward_wanted {
+    let exceptions = [(forward.transit, Opening::Hairpin), (forward.services, Opening::ServiceRequest)];
+    for (_, opening) in exceptions.into_iter().filter(|(wanted, _)| *wanted) {
+        let mut expr = opening_matches(ifname, opening);
+        expr.push(Statement::Accept(None::<Accept>));
         objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(Rule {
             family: NfFamily::INet,
             table: Cow::Owned(table.clone()),
             chain: GUARD_CHAIN.into(),
-            expr: vec![iifname_is(ifname), oifname_is(ifname), Statement::Accept(None::<Accept>)].into(),
+            expr: expr.into(),
             handle: None,
             index: None,
             comment: None,
@@ -169,6 +186,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const TRANSIT: ForwardWanted = ForwardWanted { transit: true, services: false };
+
     fn chain() -> ChainRef {
         ChainRef {
             family: Family::Inet,
@@ -180,7 +199,7 @@ mod tests {
     #[test]
     fn insert_accept_json_is_exact() {
         assert_eq!(
-            serde_json::to_value(insert_accept(&chain(), "wg0", Hook::Input)).unwrap(),
+            serde_json::to_value(insert_accept(&chain(), "wg0", Opening::Input)).unwrap(),
             json!({"nftables": [{"insert": {"rule": {
                 "family": "inet", "table": "filter", "chain": "input",
                 "expr": [
@@ -192,7 +211,7 @@ mod tests {
             }}}]})
         );
         assert_eq!(
-            serde_json::to_value(insert_accept(&chain(), "wg0", Hook::Forward)).unwrap(),
+            serde_json::to_value(insert_accept(&chain(), "wg0", Opening::Hairpin)).unwrap(),
             json!({"nftables": [{"insert": {"rule": {
                 "family": "inet", "table": "filter", "chain": "input",
                 "expr": [
@@ -220,7 +239,7 @@ mod tests {
     fn guard_json_is_exact_and_only_drops() {
         let t = json!({"family": "inet", "name": "wireserve-interop.wg0"});
         assert_eq!(
-            serde_json::to_value(guard_create("wg0", false)).unwrap(),
+            serde_json::to_value(guard_create("wg0", ForwardWanted::default())).unwrap(),
             json!({"nftables": [
                 {"add": {"table": t}},
                 {"delete": {"table": t}},
@@ -244,7 +263,7 @@ mod tests {
     #[test]
     fn guard_json_with_transit_adds_a_hairpin_exception_ahead_of_the_drop() {
         assert_eq!(
-            serde_json::to_value(guard_create("wg0", true)).unwrap(),
+            serde_json::to_value(guard_create("wg0", TRANSIT)).unwrap(),
             json!({"nftables": [
                 {"add": {"table": {"family": "inet", "name": "wireserve-interop.wg0"}}},
                 {"delete": {"table": {"family": "inet", "name": "wireserve-interop.wg0"}}},
@@ -282,8 +301,8 @@ mod tests {
             table inet filter {\n  chain input {\n    type filter hook input priority 0; policy drop;\n    iif lo accept\n  }\n}\nEOF\n";
         let script = format!(
             "{setup}{}{}nft -j list ruleset",
-            apply_script(&insert_accept(&chain(), "wg0", Hook::Input)),
-            apply_script(&guard_create("wg0", false)),
+            apply_script(&insert_accept(&chain(), "wg0", Opening::Input)),
+            apply_script(&guard_create("wg0", ForwardWanted::default())),
         );
         let Some(out) = crate::firewall::netns::run(&script) else {
             return;
@@ -291,7 +310,7 @@ mod tests {
         let view = ruleset::parse(out.as_bytes()).unwrap();
         let input = view.chains.iter().find(|c| c.chain == chain()).unwrap();
         assert_eq!(input.rules.len(), 2);
-        assert!(planner::is_accept_shape(&input.rules[0], "wg0", Hook::Input), "{:?}", input.rules[0]);
+        assert!(planner::is_accept_shape(&input.rules[0], "wg0", Opening::Input), "{:?}", input.rules[0]);
         assert_eq!(input.rules[0].comment.as_deref(), Some("wireserve:wg0"));
 
         let observed = Observed {
@@ -303,11 +322,11 @@ mod tests {
             },
             live: Default::default(),
         };
-        assert_eq!(planner::plan_reconcile(&observed, "wg0", false), vec![], "settled on real kernel output");
+        assert_eq!(planner::plan_reconcile(&observed, "wg0", ForwardWanted::default()), vec![], "settled on real kernel output");
 
         // Removal, using the handles the kernel reported.
         let removal = planner::plan_removal(&observed, "wg0");
-        let mut script = format!("{setup}{}{}", apply_script(&insert_accept(&chain(), "wg0", Hook::Input)), apply_script(&guard_create("wg0", false)));
+        let mut script = format!("{setup}{}{}", apply_script(&insert_accept(&chain(), "wg0", Opening::Input)), apply_script(&guard_create("wg0", ForwardWanted::default())));
         for action in &removal {
             match action {
                 Action::NftDelete { chain, handle } => script += &apply_script(&delete_rule(chain, *handle)),
@@ -341,7 +360,7 @@ mod tests {
     /// does above.
     #[test]
     fn kernel_transit_guard_round_trips_and_settles() {
-        let script = format!("{}nft -j list ruleset", apply_script(&guard_create("wg0", true)));
+        let script = format!("{}nft -j list ruleset", apply_script(&guard_create("wg0", TRANSIT)));
         let Some(out) = crate::firewall::netns::run(&script) else {
             return;
         };
@@ -352,8 +371,8 @@ mod tests {
             .find(|c| c.chain.chain == "forward-guard")
             .expect("guard chain present");
         assert_eq!(guard.rules.len(), 2, "{:?}", guard.rules);
-        assert!(planner::is_guard_shape(&guard.rules, "wg0", true), "{:?}", guard.rules);
-        assert!(!planner::is_guard_shape(&guard.rules, "wg0", false), "the false shape must not also match");
+        assert!(planner::is_guard_shape(&guard.rules, "wg0", TRANSIT), "{:?}", guard.rules);
+        assert!(!planner::is_guard_shape(&guard.rules, "wg0", ForwardWanted::default()), "the false shape must not also match");
 
         let observed = Observed {
             nft: Some(view),
@@ -364,6 +383,46 @@ mod tests {
             },
             live: Default::default(),
         };
-        assert_eq!(planner::plan_reconcile(&observed, "wg0", true), vec![], "settled on real kernel output");
+        assert_eq!(planner::plan_reconcile(&observed, "wg0", TRANSIT), vec![], "settled on real kernel output");
+    }
+
+    /// The service openings and guard (PLAN.md M26) against a real kernel:
+    /// what nft lists back for `ct mark & M == M` is what the planner
+    /// expects, so they settle instead of being replaced every reconcile.
+    #[test]
+    fn kernel_service_openings_round_trip_and_settle() {
+        let both = ForwardWanted { transit: true, services: true };
+        let forward = ChainRef { family: Family::Inet, table: "filter".into(), chain: "forward".into() };
+        let setup = "nft -f - <<'EOF'\n\
+            table inet filter {\n  chain input {\n    type filter hook input priority 0; policy drop;\n  }\n  \
+            chain forward {\n    type filter hook forward priority 0; policy drop;\n  }\n}\nEOF\n";
+        let mut script = setup.to_string();
+        script += &apply_script(&insert_accept(&chain(), "wg0", Opening::Input));
+        for opening in [Opening::Hairpin, Opening::ServiceRequest, Opening::ServiceReply] {
+            script += &apply_script(&insert_accept(&forward, "wg0", opening));
+        }
+        script += &apply_script(&guard_create("wg0", both));
+        script += "nft -j list ruleset";
+        let Some(out) = crate::firewall::netns::run(&script) else {
+            return;
+        };
+        let view = ruleset::parse(out.as_bytes()).unwrap();
+        let fwd = view.chains.iter().find(|c| c.chain == forward).unwrap();
+        assert_eq!(fwd.rules.len(), 3);
+        assert!(planner::is_accept_shape(&fwd.rules[0], "wg0", Opening::ServiceReply), "{:?}", fwd.rules[0]);
+        assert!(planner::is_accept_shape(&fwd.rules[1], "wg0", Opening::ServiceRequest), "{:?}", fwd.rules[1]);
+        let guard = view.chains.iter().find(|c| c.chain.chain == "forward-guard").unwrap();
+        assert!(planner::is_guard_shape(&guard.rules, "wg0", both), "{:?}", guard.rules);
+
+        let observed = Observed {
+            nft: Some(view),
+            iptables: vec![],
+            firewalld: FirewalldState::Running {
+                runtime_zone: Some("trusted".into()),
+                permanent_zone: None,
+            },
+            live: Default::default(),
+        };
+        assert_eq!(planner::plan_reconcile(&observed, "wg0", both), vec![], "settled on real kernel output");
     }
 }

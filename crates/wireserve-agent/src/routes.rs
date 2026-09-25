@@ -126,9 +126,47 @@ pub fn delete_link(ifname: &str) -> io::Result<()> {
     send(RouteNetlinkMessage::DelLink(message), NLM_F_REQUEST | NLM_F_ACK, &[libc::ENODEV])
 }
 
+/// The interface the kernel would send a packet for `addr` out of —
+/// `ip route get <addr>` — or `None` when `addr` is one of this host's own
+/// and is delivered locally. What a service mapped onto `addr` (PLAN.md
+/// M26) has its replies arrive on.
+pub fn egress_ifname(addr: std::net::Ipv4Addr) -> io::Result<Option<String>> {
+    let mut message = RouteMessage::default();
+    message.header.address_family = AddressFamily::Inet;
+    message.header.destination_prefix_length = 32;
+    message.attributes.push(RouteAttribute::Destination(RouteAddress::Inet(addr)));
+    let Some(route) = exchange(RouteNetlinkMessage::GetRoute(message), NLM_F_REQUEST, &[])? else {
+        return Err(io::Error::other(format!("no route to {addr}")));
+    };
+    match route.header.kind {
+        RouteType::Local => return Ok(None),
+        RouteType::Unicast => {}
+        other => return Err(io::Error::other(format!("{addr} is unreachable ({other:?} route)"))),
+    }
+    let Some(index) = route.attributes.iter().find_map(|a| match a {
+        RouteAttribute::Oif(i) => Some(*i),
+        _ => None,
+    }) else {
+        return Err(io::Error::other(format!("the route to {addr} names no interface")));
+    };
+    let mut name = [0 as libc::c_char; libc::IF_NAMESIZE];
+    // SAFETY: `name` is IF_NAMESIZE bytes, as the call requires.
+    if unsafe { libc::if_indextoname(index, name.as_mut_ptr()) }.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: on success the kernel wrote a NUL-terminated name into `name`.
+    let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
+    Ok(Some(name.to_string_lossy().into_owned()))
+}
+
 /// Sends one request and waits for the kernel's answer; an error whose
 /// code is in `done` counts as success.
 fn send(payload: RouteNetlinkMessage, flags: u16, done: &[i32]) -> io::Result<()> {
+    exchange(payload, flags, done).map(|_| ())
+}
+
+/// [`send`], returning the route the kernel answered with, if it did.
+fn exchange(payload: RouteNetlinkMessage, flags: u16, done: &[i32]) -> io::Result<Option<RouteMessage>> {
     let mut req = NetlinkMessage::from(payload);
     req.header.flags = flags;
     req.finalize();
@@ -148,13 +186,14 @@ fn send(payload: RouteNetlinkMessage, flags: u16, done: &[i32]) -> io::Result<()
             let response = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&recv_buf[offset..n])
                 .map_err(|e| io::Error::other(e.to_string()))?;
             match response.payload {
-                NetlinkPayload::Error(e) if e.code.is_none() => return Ok(()),
+                NetlinkPayload::Error(e) if e.code.is_none() => return Ok(None),
                 NetlinkPayload::Error(e) => {
                     let err = e.to_io();
                     let ok = err.raw_os_error().is_some_and(|code| done.contains(&code));
-                    return if ok { Ok(()) } else { Err(err) };
+                    return if ok { Ok(None) } else { Err(err) };
                 }
-                NetlinkPayload::Done(_) => return Ok(()),
+                NetlinkPayload::Done(_) => return Ok(None),
+                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(route)) => return Ok(Some(route)),
                 _ => {}
             }
             let len = response.header.length as usize;
@@ -221,5 +260,25 @@ mod tests {
         // Removing what is already gone is not an error.
         sync("wgt", &a, &set(&["10.0.0.2"])).unwrap();
         sync("wgt", &a, &set(&["10.0.0.2"])).unwrap();
+    }
+
+    /// Against a real kernel: `ip route get`'s answer, by interface name.
+    #[test]
+    fn kernel_egress_ifname_names_the_interface_a_target_is_reached_through() {
+        if !crate::firewall::netns::reexec(
+            "routes::tests::kernel_egress_ifname_names_the_interface_a_target_is_reached_through",
+        ) {
+            return;
+        }
+        let out = std::process::Command::new("sh")
+            .args(["-euc", "ip link set lo up && ip link add lan0 type dummy && ip link set lan0 up && \
+                           ip addr add 192.168.178.20/24 dev lan0"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let at = |a: &str| egress_ifname(a.parse().unwrap());
+        assert_eq!(at("192.168.178.1").unwrap().as_deref(), Some("lan0"));
+        assert_eq!(at("192.168.178.20").unwrap(), None, "the host's own address is delivered locally");
+        assert!(at("203.0.113.9").is_err(), "no default route in the namespace");
     }
 }

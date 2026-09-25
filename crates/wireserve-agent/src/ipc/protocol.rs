@@ -18,6 +18,17 @@ pub enum IpcRequest {
         #[serde(default)]
         ports: Vec<PortMap>,
     },
+    /// `Serve` for a declaration with at least one mapping onto another
+    /// address (PLAN.md M26), under its own op so that a daemon from before
+    /// target addresses refuses it as an unknown request instead of
+    /// dropping the address it doesn't know and mapping the port onto the
+    /// node itself — the router's port 80 turning into the node's own.
+    ServeForwarding {
+        name: String,
+        port: u16,
+        proto: Proto,
+        ports: Vec<PortMap>,
+    },
     Unserve { name: String },
     /// This node's live opt-in to carry transit traffic for other mesh
     /// peers (PLAN.md M23) — `wireserve-agent transit on|off`. Same shape

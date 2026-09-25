@@ -87,7 +87,7 @@ use std::time::{Duration, Instant};
 use self::monitor::{Debouncer, Monitor};
 use self::ops::RealOps;
 use super::nft::Nft;
-use super::InteropHandle;
+use super::{ForwardWanted, InteropHandle};
 
 const DEBOUNCE: Duration = Duration::from_millis(500);
 /// Upper bound on waiting for the worker to remove everything at stop.
@@ -98,7 +98,7 @@ enum Msg {
     MonitorExited,
     /// Carries the *current* opt-in, because it can change while the daemon
     /// runs — see `run`.
-    Tick { forward_wanted: bool },
+    Tick { forward_wanted: ForwardWanted },
     Stop(Sender<()>),
 }
 
@@ -131,7 +131,7 @@ impl HostInterop {
     /// `own_table` is the backend's last applied ruleset, which a
     /// reconcile restores when our table has gone missing.
     #[must_use]
-    pub fn start(ifname: &str, transit_capable: bool, own_table: super::nftables::SharedRuleset) -> Self {
+    pub fn start(ifname: &str, forward_wanted: ForwardWanted, own_table: super::nftables::SharedRuleset) -> Self {
         let nft = match Nft::locate() {
             Ok(nft) => nft,
             Err(e) => {
@@ -142,10 +142,10 @@ impl HostInterop {
                 };
             }
         };
-        Self::start_with(ifname, RealOps::new(nft).with_own_table(own_table), transit_capable)
+        Self::start_with(ifname, RealOps::new(nft).with_own_table(own_table), forward_wanted)
     }
 
-    fn start_with(ifname: &str, mut ops: RealOps, forward_wanted: bool) -> Self {
+    fn start_with(ifname: &str, mut ops: RealOps, forward_wanted: ForwardWanted) -> Self {
         let mut told = HashSet::new();
         ops::reconcile(&mut ops, ifname, forward_wanted, &mut told);
 
@@ -202,7 +202,7 @@ pub fn remove_legacy() {
 }
 
 impl InteropHandle for HostInterop {
-    fn tick(&self, forward_wanted: bool) {
+    fn tick(&self, forward_wanted: ForwardWanted) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(Msg::Tick { forward_wanted });
         }
@@ -234,14 +234,14 @@ impl Drop for HostInterop {
 ///
 /// `forward_wanted` is mutable and re-read from every tick, not captured:
 /// transit is a live toggle, so a node can start carrying traffic long after
-/// its daemon started. Opening the host firewall's FORWARD hook only at
+/// its daemon started, and so is `serve` with a target address. Opening the host firewall's FORWARD hook only at
 /// startup meant `transit on` took effect everywhere *except* ufw and
 /// firewalld — the node's own table accepted the forward, the host's dropped
 /// it, and the only symptom was a peer that could not be reached through it.
 fn run(
     mut ops: RealOps,
     ifname: &str,
-    mut forward_wanted: bool,
+    mut forward_wanted: ForwardWanted,
     rx: &Receiver<Msg>,
     tx: &Sender<Msg>,
     mut told: HashSet<String>,
@@ -268,8 +268,9 @@ fn run(
             Ok(Msg::Tick { forward_wanted: now }) => {
                 if now != forward_wanted {
                     tracing::info!(
-                        forward_wanted = now,
-                        "transit opt-in changed; reopening the host firewall's forward hook"
+                        transit = now.transit,
+                        services = now.services,
+                        "forwarding wanted changed; reopening the host firewall's forward hook"
                     );
                     forward_wanted = now;
                 }
@@ -329,7 +330,7 @@ mod tests {
     fn own_table(ifname: &str) -> (crate::firewall::nftables::NftablesBackend, super::super::nftables::SharedRuleset) {
         use wireserve_types::FirewallBackend;
         let mut backend = crate::firewall::nftables::NftablesBackend::new(ifname).unwrap();
-        backend.apply(&[], &[]).unwrap();
+        backend.apply(&[], &wireserve_types::Forwarding::default()).unwrap();
         let shared = backend.last_applied();
         (backend, shared)
     }
@@ -350,7 +351,7 @@ mod tests {
         sh(&format!("printf '{NATIVE_DROP_ALL}' | nft -f -"));
         let nft = Nft::locate().unwrap();
         let (_backend, shared) = own_table("wg0");
-        let _interop = HostInterop::start_with("wg0", RealOps::without_firewalld(nft).with_own_table(shared), false);
+        let _interop = HostInterop::start_with("wg0", RealOps::without_firewalld(nft).with_own_table(shared), ForwardWanted::default());
         assert_eq!(tags(&sh("nft list table inet filter")), 1);
 
         sh(&format!("printf 'flush ruleset\n{NATIVE_DROP_ALL}' | nft -f -"));
@@ -374,7 +375,7 @@ mod tests {
         sh(&format!("iptables-nft -P INPUT DROP; printf '{NATIVE_DROP_ALL}' | nft -f -"));
         let nft = Nft::locate().unwrap();
         let (_backend, _shared) = own_table("wg0");
-        let _interop = HostInterop::start_with("wg0", RealOps::without_firewalld(nft), false);
+        let _interop = HostInterop::start_with("wg0", RealOps::without_firewalld(nft), ForwardWanted::default());
         assert_eq!(tags(&sh("nft list ruleset; iptables-nft -S INPUT")), 2);
 
         sh("nft flush chain inet wireserve.wg0 wireserve-in");
@@ -410,11 +411,11 @@ mod tests {
         let (_backend, shared) = own_table("wg0");
         // Started opted OUT, exactly as a daemon that came up before the
         // operator decided to carry transit.
-        let mut interop = HostInterop::start_with("wg0", RealOps::without_firewalld(nft).with_own_table(shared), false);
+        let mut interop = HostInterop::start_with("wg0", RealOps::without_firewalld(nft).with_own_table(shared), ForwardWanted::default());
         assert_eq!(forward_rules(), 0, "a node that never opted in opens nothing in FORWARD");
 
         // `wireserve-agent transit on` — no restart.
-        interop.tick(true);
+        interop.tick(ForwardWanted { transit: true, services: false });
         wait_for("forward hook opened after opting in", Duration::from_secs(5), || {
             forward_rules() == 1
         });
@@ -423,7 +424,7 @@ mod tests {
         assert!(rule.contains("-o wg0"), "pinned to both interfaces, never a general router: {rule}");
 
         // And back off again, without a restart either.
-        interop.tick(false);
+        interop.tick(ForwardWanted::default());
         wait_for("forward hook closed after opting out", Duration::from_secs(5), || {
             forward_rules() == 0
         });
@@ -450,7 +451,7 @@ mod tests {
 
         let nft = Nft::locate().unwrap();
         let (_backend, shared) = own_table("wg0");
-        let mut interop = HostInterop::start_with("wg0", RealOps::without_firewalld(nft).with_own_table(shared), false);
+        let mut interop = HostInterop::start_with("wg0", RealOps::without_firewalld(nft).with_own_table(shared), ForwardWanted::default());
 
         // Synchronously in place when start() returns: native chain + iptables.
         let after_start = list();
@@ -472,7 +473,7 @@ mod tests {
         // The tick path works on its own too, and a settled state is left alone.
         // `false` matches the `start_with` above: this test is about restoring
         // the INPUT footprint, not about changing the opt-in.
-        interop.tick(false);
+        interop.tick(ForwardWanted::default());
         std::thread::sleep(Duration::from_millis(700));
         assert_eq!(tags(&list()), 2, "no duplicates after tick + events");
 
@@ -503,16 +504,16 @@ mod tests {
         crate::lock::IfnameClaim::take("wireserve1").unwrap().unwrap().hold();
         let (_backend_a, shared_a) = own_table("wireserve0");
         let (_backend_b, shared_b) = own_table("wireserve1");
-        let mut a = HostInterop::start_with("wireserve0", RealOps::without_firewalld(nft.clone()).with_own_table(shared_a), false);
-        let mut b = HostInterop::start_with("wireserve1", RealOps::without_firewalld(nft).with_own_table(shared_b), false);
+        let mut a = HostInterop::start_with("wireserve0", RealOps::without_firewalld(nft.clone()).with_own_table(shared_a), ForwardWanted::default());
+        let mut b = HostInterop::start_with("wireserve1", RealOps::without_firewalld(nft).with_own_table(shared_b), ForwardWanted::default());
         assert_eq!((count("wireserve0"), count("wireserve1")), (2, 2));
 
         // Each one's monitor sees the other's inserts; let that settle, then
         // check nothing is being rewritten any more.
         std::thread::sleep(Duration::from_millis(1500));
         let settled = sh("nft -a list ruleset");
-        a.tick(true);
-        b.tick(true);
+        a.tick(ForwardWanted { transit: true, services: false });
+        b.tick(ForwardWanted { transit: true, services: false });
         std::thread::sleep(Duration::from_millis(1500));
         assert_eq!(sh("nft -a list ruleset"), settled, "rules were rewritten: the agents are fighting");
         assert_eq!((count("wireserve0"), count("wireserve1")), (2, 2));

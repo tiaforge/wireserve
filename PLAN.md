@@ -9,8 +9,9 @@ source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
 **Currently working on:** nothing open — all milestones complete through
-M25 (service FQDNs and auto-published vhosts). 728 tests passing
-across `cargo test --workspace`. Several container harnesses in
+M26 (serving an address the node reaches, e.g. its LAN router). 770 tests
+passing across `cargo test --workspace`. **M26's `run-lan-target-test.sh`
+has NOT been run** (needs `sudo`). Several container harnesses in
 `deploy/e2e/` pass on a real kernel: `run-e2e-test.sh` (mesh, firewall,
 interface guard), `run-nat-test.sh` (two NAT-ed sites) and
 `run-proxy-test.sh` (TLS-terminating reverse proxy, the topology spec §7
@@ -2455,3 +2456,108 @@ recorded as direct.
       node's network, not its key.
     - An older coordinator omits the field, which the CLI reads as empty — the
       export then behaves exactly as before.
+
+## M26 — serving an address the node reaches
+
+Every service ran on the node that declared it. A router, a NAS or a printer
+cannot run an agent, so nothing on a node's LAN was reachable from the mesh.
+`serve myrouter 443:192.168.178.1:80` now makes `myrouter.wg:443` reach the
+router's port 80 through the node. It composes with M25 unchanged: the proxy
+sends plain HTTP to the service address on 443, so the router gets a TLS name
+on phones as well.
+
+137. **`[PUBLIC:][ADDRESS:]TARGET[/proto]`, and `PortMap.addr`.** One
+    optional IPv4 address per mapping, absent meaning the node itself. That
+    keeps every declaration, state file and wire message from before
+    meaning what it meant. `ServiceDecl.ports` is JSON in the database, so
+    no migration was needed. A dotted first part of a two-part form is an
+    address (`192.168.178.1:80` maps public 80 to it). Refused everywhere,
+    by the shared `is_valid_target_addr`: loopback (a rewritten packet
+    arriving from the mesh with a loopback destination is a martian),
+    multicast, broadcast and unspecified. Refused by the agent and the
+    coordinator, each against the mesh ranges it knows: anything inside the
+    mesh, since forwarding back into it is transit's job. Otherwise any
+    unicast address is allowed, public ones included, at the user's
+    request; admin approval is the gate.
+
+138. **IPv4 only, by necessity rather than choice.** A service's own address
+    is IPv4 (`vip4`), and the kernel cannot hand an IPv4 connection to an
+    IPv6 address (that would be NAT64). IPv6 targets need IPv6 service
+    addresses first, which would be M20 over again: allocation, AllowedIPs,
+    routes, hosts file, proxy upstreams and every rewrite chain in `ip6`.
+    Once that exists, IPv6 targets are cheap. `serve` refuses an IPv6 target
+    with that reason. Hostnames are refused too: rules are built from
+    literal addresses, and re-resolving on every poll would let DNS change
+    what the firewall forwards to.
+
+139. **The same M20 rewrite, a different destination, plus a masquerade.**
+    `svc-pre`/`svc-out` rewrite `vip:public` to `addr:target` in place of
+    `node:target`, and the kernel routes the rewritten packet out of the
+    host. A new `svc-masq` chain (nat, postrouting, srcnat) masquerades it:
+    the first packet of a flow still carries the rewrite's mark, and never
+    leaves on the mesh interface. The target has no route back into the
+    mesh, so it has to see the node's own address, and the client's address
+    is lost for this kind of mapping only. Conntrack undoes the SNAT on
+    replies, and `svc-rev-*` then match the target address as the source.
+    A second NAT mechanism (conntrack DNAT) was considered and rejected:
+    the rewrite already exists, is tested, and carries the mark that every
+    accept rule keys on. The target key of `validate_node_targets` became
+    `(addr, port, proto)`, since two sources are two sources.
+
+140. **Load-bearing: a remote mapping without a service address gets no
+    rule at all.** The pre-VIP fallback opens the *target port on the
+    node*, which for the router's port 80 would be the node's own port 80.
+    `service_rules` skips such a mapping with a warning, and likewise one
+    whose address is in the pinned mesh ranges or is the node's own.
+
+141. **Forwarding on the LAN side, owned and guarded.** IPv4 forwards a
+    packet only if the interface it *arrived on* forwards, and the replies
+    arrive on the LAN interface. So beyond the mesh interface's own flag
+    (now also on while any remote mapping exists), the agent turns on the
+    egress interface's flag (`routes::egress_ifname`, `ip route get` over
+    netlink). It does this only where the flag is off and
+    `conf/all/forwarding` is off. While it owns the flag, `wireserve-fwd`
+    drops everything forwarded from that interface that isn't one of our
+    marked flows (`Forwarding::guarded`, IPv4 only). The guard goes in
+    before the flag goes on, and the flag goes off before the guard goes.
+    If `all` turns on later (Docker or Podman starting, which rewrites
+    every interface's flag), ownership is dropped without a write, since a
+    guard would then break the runtime. Ownership lives in the state file
+    (`forwarding_owned`), so a crashed agent's successor still guards and
+    releases it, and stop turns it off. `FirewallBackend::apply` now takes
+    a `Forwarding` (transit pairs plus guarded interfaces), so the guard
+    and the rules are one transaction.
+
+142. **Host-firewall interop: two new FORWARD shapes, mark-scoped.**
+    `ForwardWanted { transit, services }` replaces the transit bool, and an
+    `Opening` enum replaces "one accept per hook". A node with a remote
+    mapping gets `iifname <wg> ct mark & M == M` (the request) and
+    `oifname <wg> ct mark & M == M` (the reply) in every foreign FORWARD
+    chain, including iptables `-m connmark --mark 0x1000000/0x1000000` for
+    Docker's FORWARD policy DROP. firewalld's guard gets the request shape
+    as an exception ahead of its drop. Neither opens routing from the mesh
+    as such: only flows our own table rewrote to a declared target carry
+    the mark. Kernel round trips pin that nft and `iptables -S` list both
+    back exactly as the planner expects, so they settle.
+
+143. **The target address reaches admins, not the mesh.** The coordinator
+    stores it and `wireserve-admin list-services` shows it (an approver should
+    see that a node exposes its LAN). The directory every node receives
+    leaves it out: peers need only the public face, and the owner acts on
+    its own declaration. The owner's `list` shows its declaration for that
+    reason. Approval stays per name, as in M18: a later change of target
+    address, like a change of target port, needs no re-approval.
+
+144. **Old daemons and downgrades.** A declaration with an address goes
+    over IPC as `serve_forwarding`, which a daemon from before M26 refuses
+    as an unknown op instead of dropping the address and mapping onto its
+    own port. The CLI then says to restart the daemon. What cannot be
+    caught is a *downgrade*: an older agent reading a state file ignores
+    `addr` and would serve the target port on the node itself. Known and
+    accepted. `unserve` such services before downgrading.
+
+**Not yet run:** `deploy/e2e/run-lan-target-test.sh` (rootful Podman, needs
+`sudo`). Several routers (FRITZ!Box among them) refuse requests whose Host
+header is not their own name, a DNS-rebinding defence. The generated vhost
+cannot carry a per-service `header_up`, so the README suggests a hand-written
+`handle` ahead of the generated `import`; untried against a real router.

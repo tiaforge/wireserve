@@ -79,6 +79,12 @@ pub struct AgentState {
     /// replaced by a later report.
     #[serde(default)]
     pub mesh: Option<wireserve_types::MeshInfo>,
+    /// Interfaces whose IPv4 forwarding this agent turned on, for replies
+    /// from services mapped onto other addresses (PLAN.md M26) — kept here
+    /// rather than in memory, so a restarted agent still guards them and
+    /// turns them back off. See `firewall::ip_forward`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwarding_owned: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

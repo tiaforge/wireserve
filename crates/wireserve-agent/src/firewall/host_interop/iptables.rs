@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::model::{tag, Hook, IpVersion, IptablesObservation, IptablesTarget, IptablesVariant, TAG_PREFIX};
+use super::model::{tag, Hook, IpVersion, IptablesObservation, IptablesTarget, IptablesVariant, Opening, TAG_PREFIX};
 
 const SEARCH_DIRS: &[&str] = &["/usr/sbin", "/sbin", "/usr/bin", "/bin"];
 
@@ -91,24 +91,44 @@ pub fn names_include_filter(names: &str) -> bool {
 
 // ---- argv builders (exact, pinned by tests) ----
 
-/// `-i <ifname>`, plus `-o <ifname>` too for `Forward` — `INPUT` traffic is
-/// always "to this host" regardless of egress, but `FORWARD` must be pinned
-/// to both interfaces or it would open routing from the mesh to any other
-/// interface on the host, not just hairpin traffic back onto the mesh.
-fn rule_spec(ifname: &str, hook: Hook) -> Vec<String> {
-    let mut spec = vec!["-i".to_string(), ifname.into()];
-    if hook == Hook::Forward {
-        spec.push("-o".into());
-        spec.push(ifname.into());
+/// The matches of `opening`, in the order and spelling `iptables -S`
+/// prints them back — see [`Opening`] for what each opens. `INPUT` traffic
+/// is always "to this host" regardless of egress, but every `FORWARD` one
+/// is pinned to a second condition, or it would open routing from the mesh
+/// to any other interface on the host.
+#[must_use]
+pub fn opening_spec(ifname: &str, opening: Opening) -> Vec<String> {
+    let mark = || {
+        let m = crate::firewall::nftables::SERVICE_MARK;
+        ["-m".to_string(), "connmark".into(), "--mark".into(), format!("{m:#x}/{m:#x}")]
+    };
+    let mut spec: Vec<String> = Vec::new();
+    match opening {
+        Opening::Input => spec.extend(["-i".into(), ifname.into()]),
+        Opening::Hairpin => spec.extend(["-i".into(), ifname.into(), "-o".into(), ifname.into()]),
+        Opening::ServiceRequest => {
+            spec.extend(["-i".into(), ifname.into()]);
+            spec.extend(mark());
+        }
+        Opening::ServiceReply => {
+            spec.extend(["-o".into(), ifname.into()]);
+            spec.extend(mark());
+        }
     }
+    spec
+}
+
+fn rule_spec(ifname: &str, opening: Opening) -> Vec<String> {
+    let mut spec = opening_spec(ifname, opening);
     spec.extend(["-m".into(), "comment".into(), "--comment".into(), tag(ifname), "-j".into(), "ACCEPT".into()]);
     spec
 }
 
 #[must_use]
-pub fn insert_args(ifname: &str, hook: Hook) -> Vec<String> {
-    let mut args: Vec<String> = ["-w", LOCK_WAIT_SECS, "-I", hook.iptables_chain(), "1"].map(Into::into).into();
-    args.extend(rule_spec(ifname, hook));
+pub fn insert_args(ifname: &str, opening: Opening) -> Vec<String> {
+    let mut args: Vec<String> =
+        ["-w", LOCK_WAIT_SECS, "-I", opening.hook().iptables_chain(), "1"].map(Into::into).into();
+    args.extend(rule_spec(ifname, opening));
     args
 }
 
@@ -273,23 +293,37 @@ mod tests {
     #[test]
     fn insert_args_are_exact_and_scoped_to_the_interface() {
         assert_eq!(
-            insert_args("wg0", Hook::Input),
+            insert_args("wg0", Opening::Input),
             [
                 "-w", "5", "-I", "INPUT", "1", "-i", "wg0", "-m", "comment", "--comment",
                 "wireserve:wg0", "-j", "ACCEPT"
             ]
         );
         assert_eq!(
-            insert_args("wg0", Hook::Forward),
+            insert_args("wg0", Opening::Hairpin),
             [
                 "-w", "5", "-I", "FORWARD", "1", "-i", "wg0", "-o", "wg0", "-m", "comment", "--comment",
                 "wireserve:wg0", "-j", "ACCEPT"
             ]
         );
-        for hook in [Hook::Input, Hook::Forward] {
+        assert_eq!(
+            insert_args("wg0", Opening::ServiceRequest),
+            [
+                "-w", "5", "-I", "FORWARD", "1", "-i", "wg0", "-m", "connmark", "--mark", "0x1000000/0x1000000",
+                "-m", "comment", "--comment", "wireserve:wg0", "-j", "ACCEPT"
+            ]
+        );
+        assert_eq!(
+            insert_args("wg0", Opening::ServiceReply),
+            [
+                "-w", "5", "-I", "FORWARD", "1", "-o", "wg0", "-m", "connmark", "--mark", "0x1000000/0x1000000",
+                "-m", "comment", "--comment", "wireserve:wg0", "-j", "ACCEPT"
+            ]
+        );
+        for opening in [Opening::Input, Opening::Hairpin, Opening::ServiceRequest, Opening::ServiceReply] {
             for ifname in ["wg0", "wireserve0", "a.b-c_d"] {
-                let args = insert_args(ifname, hook);
-                let i = args.iter().position(|a| a == "-i").unwrap();
+                let args = insert_args(ifname, opening);
+                let i = args.iter().position(|a| a == "-i" || a == "-o").unwrap();
                 assert_eq!(args[i + 1], ifname);
                 assert!(args.iter().all(|a| !a.contains('+')), "no iptables wildcard: {args:?}");
             }
@@ -374,7 +408,7 @@ mod tests {
         // or every reconcile would delete and re-insert it.
         assert_eq!(
             tagged_lines(UFW_LISTING, Hook::Input)[0],
-            super::super::planner::iptables_line("wg0", Hook::Input)
+            super::super::planner::iptables_line("wg0", Opening::Input)
         );
     }
 
@@ -416,9 +450,9 @@ mod tests {
         let script = format!(
             "{bin} -P INPUT DROP\n{bin} -A INPUT -i lo -j ACCEPT\n\
              {bin} {ins}\n{bin} {list}\necho ---\n{bin} {del}\n{bin} {list}",
-            ins = q(insert_args("wg0", Hook::Input)),
+            ins = q(insert_args("wg0", Opening::Input)),
             list = q(list_args(Hook::Input)),
-            del = q(delete_args(&super::super::planner::iptables_line("wg0", Hook::Input)).unwrap()),
+            del = q(delete_args(&super::super::planner::iptables_line("wg0", Opening::Input)).unwrap()),
         );
         let Some(out) = crate::firewall::netns::run(&script) else {
             return;
@@ -426,11 +460,38 @@ mod tests {
         let (before, after) = out.split_once("---\n").unwrap();
         assert_eq!(
             before.lines().nth(1),
-            Some(super::super::planner::iptables_line("wg0", Hook::Input).as_str()),
+            Some(super::super::planner::iptables_line("wg0", Opening::Input).as_str()),
             "inserted at the head of INPUT:\n{before}"
         );
         assert_eq!(tagged_lines(before, Hook::Input).len(), 1);
         assert!(tagged_lines(after, Hook::Input).is_empty(), "{after}");
         assert!(after.contains("-A INPUT -i lo -j ACCEPT"), "foreign rules untouched: {after}");
+    }
+
+    /// The service openings (PLAN.md M26): `iptables -S` must print the
+    /// connmark match exactly as `planner::iptables_line` spells it, or
+    /// every reconcile would delete and re-insert them.
+    #[test]
+    fn kernel_service_openings_list_back_as_the_planner_spells_them() {
+        let Some(t) = locate(IpVersion::V4, IptablesVariant::Nft) else {
+            eprintln!("SKIPPED: no iptables-nft");
+            return;
+        };
+        let bin = t.binary.display();
+        let q = |args: Vec<String>| args.iter().map(|a| format!("'{a}'")).collect::<Vec<_>>().join(" ");
+        let script = format!(
+            "{bin} -P FORWARD DROP\n{bin} {req}\n{bin} {reply}\n{bin} {list}",
+            req = q(insert_args("wg0", Opening::ServiceRequest)),
+            reply = q(insert_args("wg0", Opening::ServiceReply)),
+            list = q(list_args(Hook::Forward)),
+        );
+        let Some(out) = crate::firewall::netns::run(&script) else {
+            return;
+        };
+        let lines = tagged_lines(&out, Hook::Forward);
+        for opening in [Opening::ServiceRequest, Opening::ServiceReply] {
+            let want = super::super::planner::iptables_line("wg0", opening);
+            assert!(lines.contains(&want), "missing `{want}` in:\n{out}");
+        }
     }
 }

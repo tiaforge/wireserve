@@ -70,7 +70,14 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
             port: s.port,
             proto: s.proto,
             vip4: s.vip4.clone(),
-            ports: s.port_maps(),
+            // This node's own declaration, where it is one: the directory
+            // leaves a mapping's target address out (PLAN.md M26), and
+            // `443:80/tcp` would read as this node's own port 80.
+            ports: state
+                .declared_services
+                .iter()
+                .find(|d| d.name == s.name)
+                .map_or_else(|| s.port_maps(), ServiceDecl::port_maps),
             online: s.online,
             local: declared_names.contains(s.name.as_str()),
             // Always false in practice for a directory-derived entry,
@@ -126,7 +133,8 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
 /// shutdown (from `leave`) should be signalled after it's sent.
 async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
     match req {
-        IpcRequest::Serve { name, port, proto, ports } => {
+        IpcRequest::Serve { name, port, proto, ports }
+        | IpcRequest::ServeForwarding { name, port, proto, ports } => {
             if !wireserve_types::is_valid_dns_label(&name) {
                 return (
                     IpcResponse::error(format!("invalid service name: {name}")),
@@ -138,7 +146,24 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
                 return (IpcResponse::error(e), false);
             }
             let mut state = ctx.state.lock().await;
-            // A target port answers for one mapping per node; see
+            // A target address inside the mesh (PLAN.md M26) would be
+            // forwarding from the mesh back into it — transit, which has
+            // its own opt-in and its own rules. The node's own address is
+            // what the plain form already means.
+            let own = state.ip4.as_deref().and_then(|ip| ip.parse::<std::net::Ipv4Addr>().ok());
+            let ranges = state.mesh.as_ref().and_then(wireserve_types::MeshRanges::parse);
+            if let Some(m) = ports.iter().find(|m| {
+                m.addr.is_some_and(|a| Some(a) == own || ranges.is_some_and(|r| r.contains4(a)))
+            }) {
+                return (
+                    IpcResponse::error(format!(
+                        "{m}: the target address is inside the mesh; a service on this node is \
+                         `[PUBLIC:]TARGET` without an address, and another node serves its own"
+                    )),
+                    false,
+                );
+            }
+            // A target answers for one mapping per node; see
             // `validate_node_targets`. Checked for this declaration against
             // the ones it would sit beside (not its own old version), and
             // only for this one: a state file from before port mappings can
@@ -149,12 +174,11 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
             }
             for d in state.declared_services.iter().filter(|d| d.name != name) {
                 for theirs in d.port_maps() {
-                    if let Some(m) = ports.iter().find(|m| m.target == theirs.target && m.proto == theirs.proto) {
+                    if let Some(m) = ports.iter().find(|m| wireserve_types::same_target(m, &theirs)) {
                         return (
                             IpcResponse::error(format!(
-                                "target port {}/{} is already mapped by '{}'",
-                                m.target,
-                                m.proto.as_str(),
+                                "target {} is already mapped by '{}'",
+                                wireserve_types::target_label(m),
                                 d.name
                             )),
                             false,
@@ -554,6 +578,55 @@ mod tests {
         // Re-declaring a service may reuse its own old targets.
         assert!(matches!(dispatch(&ctx, serve_req("web", &["8081:5080"])).await.0, IpcResponse::Ok));
         assert_eq!(ctx.state.lock().await.declared_services.len(), 2);
+    }
+
+    fn forward_req(name: &str, ports: &[&str]) -> IpcRequest {
+        let IpcRequest::Serve { name, port, proto, ports } = serve_req(name, ports) else { unreachable!() };
+        IpcRequest::ServeForwarding { name, port, proto, ports }
+    }
+
+    #[tokio::test]
+    async fn serve_forwarding_stores_the_target_address() {
+        let (ctx, _dir, _rx) = test_ctx();
+        let (resp, _) = dispatch(&ctx, forward_req("myrouter", &["443:192.168.178.1:80"])).await;
+        assert!(matches!(resp, IpcResponse::Ok), "{resp:?}");
+        let state = ctx.state.lock().await;
+        assert_eq!(state.declared_services[0].port_maps()[0].to_string(), "443:192.168.178.1:80/tcp");
+    }
+
+    #[tokio::test]
+    async fn the_same_port_on_another_address_is_not_a_clash() {
+        let (ctx, _dir, _rx) = test_ctx();
+        assert!(matches!(dispatch(&ctx, serve_req("web", &["80"])).await.0, IpcResponse::Ok));
+        assert!(matches!(dispatch(&ctx, forward_req("myrouter", &["443:192.168.178.1:80"])).await.0, IpcResponse::Ok));
+        let (resp, _) = dispatch(&ctx, forward_req("admin", &["8443:192.168.178.1:80"])).await;
+        assert!(matches!(&resp, IpcResponse::Error { message } if message.contains("'myrouter'")), "{resp:?}");
+    }
+
+    #[tokio::test]
+    async fn serve_refuses_a_target_address_inside_the_mesh() {
+        let (ctx, _dir, _rx) = test_ctx();
+        {
+            let mut s = ctx.state.lock().await;
+            s.ip4 = Some("10.90.0.7".into());
+            s.mesh = Some(wireserve_types::MeshInfo {
+                net_v4_cidr: "10.90.0.0/24".into(),
+                net_v6_prefix: "fd00:90::/64".into(),
+            });
+        }
+        for target in ["443:10.90.0.7:80", "443:10.90.0.9:80"] {
+            let (resp, _) = dispatch(&ctx, forward_req("x", &[target])).await;
+            assert!(matches!(&resp, IpcResponse::Error { message } if message.contains("inside the mesh")), "{target}: {resp:?}");
+        }
+        assert!(ctx.state.lock().await.declared_services.is_empty());
+    }
+
+    #[test]
+    fn a_daemon_from_before_target_addresses_cannot_read_serve_forwarding() {
+        // Its request enum had no such op: it answers "bad request" rather
+        // than dropping the address and mapping onto its own port.
+        let text = serde_json::to_string(&forward_req("myrouter", &["443:192.168.178.1:80"])).unwrap();
+        assert!(text.contains(r#""op":"serve_forwarding""#), "{text}");
     }
 
     #[tokio::test]

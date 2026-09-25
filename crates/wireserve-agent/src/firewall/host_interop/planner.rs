@@ -7,13 +7,15 @@
 //! Safety properties, each pinned by a test below:
 //! - every INPUT-hook accept we add matches exactly `iifname == <ifname>`;
 //!   nothing is ever opened for outgoing traffic;
-//! - every FORWARD-hook object — an accept, or the guard's hairpin
-//!   exception — additionally requires `oifname == <ifname>`, so it only
-//!   ever opens hairpin traffic back onto this same interface, never
-//!   routing to another interface on the host, and only exists at all
-//!   when `forward_wanted` (this node is transit-capable, PLAN.md M23);
-//! - the guard's unconditional drop (no hairpin exception) is the only
-//!   forward-hook object ever created without `forward_wanted`, and only
+//! - every FORWARD-hook object — an accept, or one of the guard's
+//!   exceptions — additionally requires `oifname == <ifname>` (hairpin
+//!   traffic back onto this same interface, for a transit-capable node,
+//!   PLAN.md M23) or a flow our own table marked as a service's (for a
+//!   node forwarding to a service's target address, PLAN.md M26), so it
+//!   never opens routing from the mesh to another interface as such, and
+//!   only exists at all when `ForwardWanted` asks for it;
+//! - the guard's unconditional drop (no exception) is the only
+//!   forward-hook object ever created without `ForwardWanted`, and only
 //!   exists while firewalld trust is in place;
 //! - repeated planning on the resulting state yields no actions (it
 //!   settles instead of churning on its own writes);
@@ -27,10 +29,11 @@ use std::collections::BTreeSet;
 
 use super::iptables::line_tag;
 use super::model::{
-    guard_table, is_own_table, tag, tag_owner, Action, ChainInfo, Family, FirewalldState, Hook,
-    IpVersion, IptablesObservation, IptablesVariant, NftView, Observed, RuleInfo,
+    guard_table, is_own_table, tag, tag_owner, Action, ChainInfo, Family, FirewalldState, ForwardWanted,
+    Hook, IpVersion, IptablesObservation, IptablesVariant, NftView, Observed, Opening, RuleInfo,
     FIREWALLD_TABLE, GUARD_CHAIN, IPTABLES_TABLES, LEGACY_GUARD_TABLE, TAG_PREFIX,
 };
+use crate::firewall::nftables::SERVICE_MARK;
 
 const TRUSTED: &str = "trusted";
 
@@ -44,26 +47,34 @@ fn oifname_match(ifname: &str) -> Value {
     json!({"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": ifname}})
 }
 
-/// Is `rule` exactly `iifname "<ifname>" [oifname "<ifname>"] counter
-/// accept` (counter values ignored) — the `oifname` match required only for
-/// `Hook::Forward`? A tagged rule of any other shape — edited by hand, or
-/// written by a future version of this code — is replaced rather than
-/// trusted.
+/// `ct mark & M == M` as nft's JSON renders it: a flow our own table
+/// marked as a service's.
+fn service_mark_match() -> Value {
+    json!({"match": {"op": "==", "left": {"&": [{"ct": {"key": "mark"}}, SERVICE_MARK]}, "right": SERVICE_MARK}})
+}
+
+/// The matches of `opening`'s accept, as nft's JSON renders them.
 #[must_use]
-pub fn is_accept_shape(rule: &RuleInfo, ifname: &str, hook: Hook) -> bool {
-    match hook {
-        Hook::Input => matches!(rule.expr.as_slice(),
-            [iif, counter, verdict]
-                if *iif == iifname_match(ifname)
-                    && counter.get("counter").is_some()
-                    && *verdict == json!({"accept": null})),
-        Hook::Forward => matches!(rule.expr.as_slice(),
-            [iif, oif, counter, verdict]
-                if *iif == iifname_match(ifname)
-                    && *oif == oifname_match(ifname)
-                    && counter.get("counter").is_some()
-                    && *verdict == json!({"accept": null})),
+pub fn opening_matches(ifname: &str, opening: Opening) -> Vec<Value> {
+    match opening {
+        Opening::Input => vec![iifname_match(ifname)],
+        Opening::Hairpin => vec![iifname_match(ifname), oifname_match(ifname)],
+        Opening::ServiceRequest => vec![iifname_match(ifname), service_mark_match()],
+        Opening::ServiceReply => vec![oifname_match(ifname), service_mark_match()],
     }
+}
+
+/// Is `rule` exactly `<opening's matches> counter accept` (counter values
+/// ignored)? A tagged rule of any other shape — edited by hand, or written
+/// by a future version of this code — is replaced rather than trusted.
+#[must_use]
+pub fn is_accept_shape(rule: &RuleInfo, ifname: &str, opening: Opening) -> bool {
+    let matches = opening_matches(ifname, opening);
+    let n = matches.len();
+    rule.expr.len() == n + 2
+        && rule.expr[..n] == matches[..]
+        && rule.expr[n].get("counter").is_some()
+        && rule.expr[n + 1] == json!({"accept": null})
 }
 
 /// Whether `ifname`'s own deny table (`inet wireserve.<ifname>`) is in
@@ -99,31 +110,41 @@ pub fn is_guard_drop_shape(rule: &RuleInfo, ifname: &str) -> bool {
         [iif, verdict] if *iif == iifname_match(ifname) && *verdict == json!({"drop": null}))
 }
 
-/// Is `rule` exactly the guard's hairpin exception, `iifname "<ifname>"
-/// oifname "<ifname>" accept`?
+/// The guard's exceptions for `forward`, in order: the matches of each
+/// `<matches> accept` ahead of the drop.
 #[must_use]
-pub fn is_guard_hairpin_shape(rule: &RuleInfo, ifname: &str) -> bool {
-    matches!(rule.expr.as_slice(),
-        [iif, oif, verdict]
-            if *iif == iifname_match(ifname) && *oif == oifname_match(ifname) && *verdict == json!({"accept": null}))
+pub fn guard_exceptions(ifname: &str, forward: ForwardWanted) -> Vec<Vec<Value>> {
+    let mut out = Vec::new();
+    if forward.transit {
+        out.push(opening_matches(ifname, Opening::Hairpin));
+    }
+    if forward.services {
+        out.push(opening_matches(ifname, Opening::ServiceRequest));
+    }
+    out
 }
 
-/// Are `rules` exactly the guard's rules for `forward_wanted`? Without
-/// transit, unchanged from before it existed: one rule,
-/// `iifname "<ifname>" drop`, final across every chain on the hook. With
-/// transit (PLAN.md M23), a hairpin exception goes *ahead* of that same
-/// drop — `iifname "<ifname>" oifname "<ifname>" accept`, then the drop —
-/// so only traffic routed back onto this same interface ever escapes it;
-/// forwarding to any other interface on the host stays exactly as blocked
-/// as it always was, even though firewalld's `trusted` zone would
-/// otherwise allow it host-wide.
+/// Are `rules` exactly the guard's rules for `forward`? With neither,
+/// unchanged from before either existed: one rule, `iifname "<ifname>"
+/// drop`, final across every chain on the hook. Exceptions go *ahead* of
+/// that same drop — the hairpin one for transit (PLAN.md M23), so traffic
+/// routed back onto this same interface escapes it, and the service one
+/// (PLAN.md M26), so a flow our own table rewrote to a declared target
+/// does; any other forwarding to another interface on the host stays
+/// exactly as blocked as it always was, even though firewalld's `trusted`
+/// zone would otherwise allow it host-wide.
 #[must_use]
-pub fn is_guard_shape(rules: &[RuleInfo], ifname: &str, forward_wanted: bool) -> bool {
-    match (rules, forward_wanted) {
-        ([drop], false) => is_guard_drop_shape(drop, ifname),
-        ([accept, drop], true) => is_guard_hairpin_shape(accept, ifname) && is_guard_drop_shape(drop, ifname),
-        _ => false,
-    }
+pub fn is_guard_shape(rules: &[RuleInfo], ifname: &str, forward: ForwardWanted) -> bool {
+    let exceptions = guard_exceptions(ifname, forward);
+    let Some((drop, accepts)) = rules.split_last() else {
+        return false;
+    };
+    accepts.len() == exceptions.len()
+        && is_guard_drop_shape(drop, ifname)
+        && accepts.iter().zip(&exceptions).all(|(rule, matches)| {
+            let n = matches.len();
+            rule.expr.len() == n + 1 && rule.expr[..n] == matches[..] && rule.expr[n] == json!({"accept": null})
+        })
 }
 
 fn is_ours(rule: &RuleInfo) -> bool {
@@ -163,10 +184,11 @@ enum Route {
     Skip,
 }
 
-/// `forward_wanted` — this node is transit-capable (PLAN.md M23) — is what
-/// makes a `forward`-hook chain routable at all; without it, `FORWARD` is
-/// left exactly as untouched as it was before transit existed.
-fn route(view: &NftView, chain: &ChainInfo, iptables: &[IptablesObservation], forward_wanted: bool) -> Route {
+/// `forward` — this node is transit-capable (PLAN.md M23), or forwards to
+/// a service's target address (PLAN.md M26) — is what makes a
+/// `forward`-hook chain routable at all; without it, `FORWARD` is left
+/// exactly as untouched as it was before either existed.
+fn route(view: &NftView, chain: &ChainInfo, iptables: &[IptablesObservation], forward: ForwardWanted) -> Route {
     let c = &chain.chain;
     if is_own_table(&c.table) || c.table == FIREWALLD_TABLE {
         return Route::Skip;
@@ -183,7 +205,7 @@ fn route(view: &NftView, chain: &ChainInfo, iptables: &[IptablesObservation], fo
     }
     let hook = match chain.hook.as_deref() {
         Some("input") => Hook::Input,
-        Some("forward") if forward_wanted => Hook::Forward,
+        Some("forward") if forward.any() => Hook::Forward,
         _ => return Route::Skip,
     };
     if let Some(version) = version_of(c.family) {
@@ -218,19 +240,19 @@ fn route(view: &NftView, chain: &ChainInfo, iptables: &[IptablesObservation], fo
 /// iptables ruleset in use) hold exactly one correct accept for `ifname`,
 /// remove every other rule carrying our tag except a running agent's, keep
 /// firewalld trust and the forward guard in step, and — only when
-/// `forward_wanted` (this node is transit-capable, PLAN.md M23) — do the
-/// same for every foreign FORWARD-hook filter chain too, with a narrower
-/// `iifname == oifname ==` shape so nothing but hairpin traffic back onto
-/// this same interface is ever opened.
+/// `forward` asks for it — do the same for every foreign FORWARD-hook
+/// filter chain too, with the narrower shapes of [`Opening`] so nothing
+/// but hairpin traffic back onto this same interface, or a service flow
+/// our own table marked, is ever opened.
 #[must_use]
-pub fn plan_reconcile(observed: &Observed, ifname: &str, forward_wanted: bool) -> Vec<Action> {
+pub fn plan_reconcile(observed: &Observed, ifname: &str, forward: ForwardWanted) -> Vec<Action> {
     let mut actions = Vec::new();
 
     if let Some(view) = &observed.nft {
         for chain in &view.chains {
             let foreign = !is_own_table(&chain.chain.table);
-            match route(view, chain, &observed.iptables, forward_wanted) {
-                Route::Nft(hook) => plan_nft_chain(chain, ifname, hook, &observed.live, &mut actions),
+            match route(view, chain, &observed.iptables, forward) {
+                Route::Nft(hook) => plan_nft_chain(chain, ifname, hook, forward, &observed.live, &mut actions),
                 // Not ours to fill, but a tagged rule that ended up there
                 // (an older version, a changed chain type) still goes.
                 Route::Iptables | Route::Skip if foreign => {
@@ -242,32 +264,43 @@ pub fn plan_reconcile(observed: &Observed, ifname: &str, forward_wanted: bool) -
     }
 
     for obs in &observed.iptables {
-        plan_iptables(obs, ifname, observed.nft.as_ref(), forward_wanted, &observed.live, &mut actions);
+        plan_iptables(obs, ifname, observed.nft.as_ref(), forward, &observed.live, &mut actions);
     }
 
-    plan_firewalld(observed, ifname, forward_wanted, &mut actions);
+    plan_firewalld(observed, ifname, forward, &mut actions);
     actions
 }
 
-fn plan_nft_chain(chain: &ChainInfo, ifname: &str, hook: Hook, live: &BTreeSet<String>, actions: &mut Vec<Action>) {
-    let wanted = tag(ifname);
-    let mut kept = false;
+/// Keeps exactly one correct rule per wanted opening, deletes every other
+/// removable one of ours, inserts what is missing.
+fn plan_nft_chain(
+    chain: &ChainInfo,
+    ifname: &str,
+    hook: Hook,
+    forward: ForwardWanted,
+    live: &BTreeSet<String>,
+    actions: &mut Vec<Action>,
+) {
+    let tagged = tag(ifname);
+    let wanted = Opening::wanted(hook, forward);
+    let mut kept: Vec<Opening> = Vec::new();
     for rule in chain.rules.iter().filter(|r| is_ours(r) && rule_removable(r, ifname, live)) {
-        let correct = rule.comment.as_deref() == Some(wanted.as_str()) && is_accept_shape(rule, ifname, hook);
-        if correct && !kept {
-            kept = true;
-        } else {
-            actions.push(Action::NftDelete {
+        let correct = (rule.comment.as_deref() == Some(tagged.as_str()))
+            .then(|| wanted.iter().copied().find(|o| !kept.contains(o) && is_accept_shape(rule, ifname, *o)))
+            .flatten();
+        match correct {
+            Some(opening) => kept.push(opening),
+            None => actions.push(Action::NftDelete {
                 chain: chain.chain.clone(),
                 handle: rule.handle,
-            });
+            }),
         }
     }
-    if !kept {
+    for opening in wanted.into_iter().filter(|o| !kept.contains(o)) {
         actions.push(Action::NftInsert {
             chain: chain.chain.clone(),
             ifname: ifname.to_string(),
-            hook,
+            opening,
         });
     }
 }
@@ -283,24 +316,24 @@ fn delete_removable(chain: &ChainInfo, ifname: &str, live: &BTreeSet<String>, ac
 
 /// The exact line `iptables -S INPUT`/`-S FORWARD` prints for our rule.
 #[must_use]
-pub fn iptables_line(ifname: &str, hook: Hook) -> String {
-    let oif = if hook == Hook::Forward { format!(" -o {ifname}") } else { String::new() };
-    format!("-A {} -i {ifname}{oif} -m comment --comment \"{}\" -j ACCEPT", hook.iptables_chain(), tag(ifname))
+pub fn iptables_line(ifname: &str, opening: Opening) -> String {
+    let matches = super::iptables::opening_spec(ifname, opening).join(" ");
+    format!("-A {} {matches} -m comment --comment \"{}\" -j ACCEPT", opening.hook().iptables_chain(), tag(ifname))
 }
 
-/// Whether this iptables ruleset needs our rule at all. `Hook::Forward`
-/// additionally needs `forward_wanted` (this node is transit-capable,
-/// PLAN.md M23) — but this only gates *inserting*: `plan_iptables` still
-/// scans (and removes from) a `Hook::Forward` observation's tagged lines
-/// even when it doesn't apply, so a rule left behind by an earlier,
-/// transit-capable run is still found and removed after transit is turned
-/// back off, the same as the nft side already does. For iptables-nft the
+/// Whether this iptables ruleset needs our rules at all. `Hook::Forward`
+/// additionally needs `forward` to ask for something (PLAN.md M23, M26) —
+/// but this only gates *inserting*: `plan_iptables` still scans (and
+/// removes from) a `Hook::Forward` observation's tagged lines even when it
+/// doesn't apply, so a rule left behind by an earlier run that wanted it is
+/// still found and removed once nothing does, the same as the nft side
+/// already does. For iptables-nft the
 /// table must already exist (visible in nft as `ip`/`ip6 filter` with the
 /// matching `INPUT`/`FORWARD` chain) — we never create a filter table just
 /// to open it. A legacy observation only exists when the legacy `filter`
 /// table is loaded, so it always applies.
-fn iptables_applies(obs: &IptablesObservation, nft: Option<&NftView>, forward_wanted: bool) -> bool {
-    if obs.hook == Hook::Forward && !forward_wanted {
+fn iptables_applies(obs: &IptablesObservation, nft: Option<&NftView>, forward: ForwardWanted) -> bool {
+    if obs.hook == Hook::Forward && !forward.any() {
         return false;
     }
     match obs.target.variant {
@@ -323,31 +356,29 @@ fn plan_iptables(
     obs: &IptablesObservation,
     ifname: &str,
     nft: Option<&NftView>,
-    forward_wanted: bool,
+    forward: ForwardWanted,
     live: &BTreeSet<String>,
     actions: &mut Vec<Action>,
 ) {
     let Some(lines) = &obs.tagged_lines else {
         return;
     };
-    let applies = iptables_applies(obs, nft, forward_wanted);
-    let wanted = iptables_line(ifname, obs.hook);
-    let mut kept = false;
+    let wanted = if iptables_applies(obs, nft, forward) { Opening::wanted(obs.hook, forward) } else { Vec::new() };
+    let mut kept: Vec<Opening> = Vec::new();
     for line in lines.iter().filter(|l| iptables_line_removable(l, ifname, live)) {
-        if applies && *line == wanted && !kept {
-            kept = true;
-        } else {
-            actions.push(Action::IptablesDelete {
+        match wanted.iter().copied().find(|o| !kept.contains(o) && *line == iptables_line(ifname, *o)) {
+            Some(opening) => kept.push(opening),
+            None => actions.push(Action::IptablesDelete {
                 target: obs.target.clone(),
                 line: line.clone(),
-            });
+            }),
         }
     }
-    if applies && !kept {
+    for opening in wanted.into_iter().filter(|o| !kept.contains(o)) {
         actions.push(Action::IptablesInsert {
             target: obs.target.clone(),
             ifname: ifname.to_string(),
-            hook: obs.hook,
+            opening,
         });
     }
 }
@@ -357,7 +388,7 @@ fn iptables_line_removable(line: &str, ifname: &str, live: &BTreeSet<String>) ->
     removable(tag.as_deref().and_then(tag_owner), ifname, live)
 }
 
-fn guard_state(nft: Option<&NftView>, ifname: &str, forward_wanted: bool) -> GuardState {
+fn guard_state(nft: Option<&NftView>, ifname: &str, forward: ForwardWanted) -> GuardState {
     let Some(view) = nft else {
         return GuardState::Unknown;
     };
@@ -370,7 +401,7 @@ fn guard_state(nft: Option<&NftView>, ifname: &str, forward_wanted: bool) -> Gua
         .iter()
         .any(|t| t.family == Family::Inet && t.name == table);
     match chain {
-        Some(c) if c.hook.as_deref() == Some("forward") && is_guard_shape(&c.rules, ifname, forward_wanted) => {
+        Some(c) if c.hook.as_deref() == Some("forward") && is_guard_shape(&c.rules, ifname, forward) => {
             GuardState::Correct
         }
         _ if table_exists => GuardState::Wrong,
@@ -386,12 +417,11 @@ enum GuardState {
     Unknown,
 }
 
-/// `forward_wanted` (this node is transit-capable, PLAN.md M23) only ever
-/// changes the guard's own *shape* (see `is_guard_shape`) — whether the
-/// guard exists at all is still purely about firewalld's own state, same
-/// as before transit existed.
-fn plan_firewalld(observed: &Observed, ifname: &str, forward_wanted: bool, actions: &mut Vec<Action>) {
-    let guard = guard_state(observed.nft.as_ref(), ifname, forward_wanted);
+/// `forward` (PLAN.md M23, M26) only ever changes the guard's own *shape*
+/// (see `is_guard_shape`) — whether the guard exists at all is still
+/// purely about firewalld's own state, same as before either existed.
+fn plan_firewalld(observed: &Observed, ifname: &str, forward: ForwardWanted, actions: &mut Vec<Action>) {
+    let guard = guard_state(observed.nft.as_ref(), ifname, forward);
     if guard == GuardState::Unknown {
         // The ruleset couldn't be read, so whether the forward guard is in
         // place can't be verified — and trust without the guard would open
@@ -422,7 +452,7 @@ fn plan_firewalld(observed: &Observed, ifname: &str, forward_wanted: bool, actio
     match (want_guard, guard) {
         (true, GuardState::Absent | GuardState::Wrong) => actions.push(Action::GuardCreate {
             ifname: ifname.to_string(),
-            forward_wanted,
+            forward,
         }),
         (false, GuardState::Correct | GuardState::Wrong) => actions.push(Action::GuardDelete {
             table: guard_table(ifname),
@@ -586,14 +616,11 @@ pub(crate) fn simulate(observed: &Observed, actions: &[Action]) -> Observed {
         .max(10_000);
     for action in actions {
         match action {
-            Action::NftInsert { chain, ifname, hook } => {
+            Action::NftInsert { chain, ifname, opening } => {
                 let view = out.nft.as_mut().unwrap();
                 let c = view.chains.iter_mut().find(|c| &c.chain == chain).unwrap();
                 next_handle += 1;
-                let mut expr = vec![iifname_match(ifname)];
-                if *hook == Hook::Forward {
-                    expr.push(oifname_match(ifname));
-                }
+                let mut expr = opening_matches(ifname, *opening);
                 expr.push(json!({"counter": {"packets": 0, "bytes": 0}}));
                 expr.push(json!({"accept": null}));
                 c.rules.insert(
@@ -610,9 +637,9 @@ pub(crate) fn simulate(observed: &Observed, actions: &[Action]) -> Observed {
                 let c = view.chains.iter_mut().find(|c| &c.chain == chain).unwrap();
                 c.rules.retain(|r| r.handle != *handle);
             }
-            Action::IptablesInsert { target, ifname, hook } => {
-                let o = out.iptables.iter_mut().find(|o| &o.target == target && &o.hook == hook).unwrap();
-                o.tagged_lines.as_mut().unwrap().insert(0, iptables_line(ifname, *hook));
+            Action::IptablesInsert { target, ifname, opening } => {
+                let o = out.iptables.iter_mut().find(|o| &o.target == target && o.hook == opening.hook()).unwrap();
+                o.tagged_lines.as_mut().unwrap().insert(0, iptables_line(ifname, *opening));
             }
             Action::IptablesDelete { target, line } => {
                 // Matched by which observation actually holds `line`, not
@@ -637,7 +664,7 @@ pub(crate) fn simulate(observed: &Observed, actions: &[Action]) -> Observed {
                     *runtime_zone = None;
                 }
             }
-            Action::GuardCreate { ifname, forward_wanted } => {
+            Action::GuardCreate { ifname, forward } => {
                 let table = guard_table(ifname);
                 let view = out.nft.as_mut().unwrap();
                 view.tables.retain(|t| t.name != table);
@@ -648,12 +675,13 @@ pub(crate) fn simulate(observed: &Observed, actions: &[Action]) -> Observed {
                     flags: vec![],
                 });
                 let mut rules = Vec::new();
-                if *forward_wanted {
+                for mut expr in guard_exceptions(ifname, *forward) {
                     next_handle += 1;
+                    expr.push(json!({"accept": null}));
                     rules.push(RuleInfo {
                         handle: next_handle,
                         comment: None,
-                        expr: vec![iifname_match(ifname), oifname_match(ifname), json!({"accept": null})],
+                        expr,
                     });
                 }
                 next_handle += 1;

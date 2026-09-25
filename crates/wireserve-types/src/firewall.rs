@@ -16,6 +16,11 @@ pub enum ServiceRule {
     /// target port: a peer connecting straight to `node:map.target` (or
     /// `vip:map.target`) is still refused. The client's own address is
     /// kept end to end — the service sees who is really connecting.
+    ///
+    /// With `map.addr` set (PLAN.md M26) the target is that address
+    /// instead of `node`, and the node forwards to it: the request leaves
+    /// with the node's own address as its source, since whatever answers
+    /// there has no route back into the mesh.
     Mapped {
         vip: Ipv4Addr,
         node: Ipv4Addr,
@@ -63,16 +68,40 @@ pub struct TransitForward {
     pub far: TransitEndpoint,
 }
 
+impl ServiceRule {
+    /// For a mapping onto another address (PLAN.md M26): that address.
+    #[must_use]
+    pub fn remote_target(&self) -> Option<Ipv4Addr> {
+        match self {
+            Self::Mapped { map, .. } => map.addr,
+            Self::Open { .. } => None,
+        }
+    }
+}
+
+/// What this node forwards, beyond delivering to itself: applied in the
+/// same transaction as the service rules, so the two never disagree about
+/// which cycle they reflect.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Forwarding {
+    /// Active transit pairs (PLAN.md M23) — empty whenever this node
+    /// currently carries none, whether or not it has opted in.
+    pub transit: Vec<TransitForward>,
+    /// Interfaces whose IPv4 forwarding this agent turned on so replies
+    /// from a service's target address can reach the mesh (PLAN.md M26).
+    /// Nothing else may be forwarded from them: before the agent turned
+    /// the switch on, nothing was.
+    pub guarded: Vec<String>,
+}
+
 /// Replaces the current WireGuard-interface ruleset with exactly the given
 /// rules, default-denying everything else on that interface.
 pub trait FirewallBackend {
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Replace the current ruleset with exactly these rules, plus exactly
-    /// these active transit forwarding pairs (PLAN.md M23) — empty
-    /// whenever this node currently carries none, whether or not it has
-    /// opted in.
-    fn apply(&mut self, rules: &[ServiceRule], transit: &[TransitForward]) -> Result<(), Self::Error>;
+    /// Replace the current ruleset with exactly these rules and exactly
+    /// this forwarding.
+    fn apply(&mut self, rules: &[ServiceRule], forwarding: &Forwarding) -> Result<(), Self::Error>;
 
     /// Tear down whatever this backend has applied, returning the interface
     /// to having no firewall state of ours on it.

@@ -634,7 +634,7 @@ mod naming_tests {
             proto: Proto::Tcp,
             online: true,
             vip4: Some(vip.into()),
-            ports: vec![PortMap { public, target: 9999, proto: Proto::Tcp }],
+            ports: vec![PortMap { public, target: 9999, proto: Proto::Tcp, addr: None }],
         }
     }
 
@@ -684,7 +684,7 @@ mod naming_tests {
     #[test]
     fn a_udp_443_service_is_not_treated_as_tls() {
         let mut s = svc("dns", "100.90.0.60", 443);
-        s.ports = vec![PortMap { public: 443, target: 443, proto: Proto::Udp }];
+        s.ports = vec![PortMap { public: 443, target: 443, proto: Proto::Udp, addr: None }];
         let services = [s, svc("web", "100.90.0.2", 443)];
         let cfg = naming("int.example.com", Some("web"));
         let out = render_block(&services, Naming::new(Some(&cfg), &services));

@@ -2587,6 +2587,46 @@ async fn poll_rejects_a_malformed_port_mapping() {
     }
 }
 
+#[tokio::test]
+async fn a_target_address_is_stored_shown_to_admins_and_kept_from_the_mesh() {
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "owner").await;
+    let t2 = admin_create_node(&app.router, "client").await;
+    let owner = register_node(&app.router, &t1, "pk1", 51820).await;
+    let client = register_node(&app.router, &t2, "pk2", 51821).await;
+    let router_svc = json!([{"name": "myrouter", "port": 80, "proto": "tcp",
+        "ports": [{"public": 443, "target": 80, "proto": "tcp", "addr": "192.168.178.1"}]}]);
+    let (status, body) = poll_with(&app.router, owner["bearer_token"].as_str().unwrap(), router_svc).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, body) = poll_with(&app.router, client["bearer_token"].as_str().unwrap(), json!([])).await;
+    let svc = &body["services"][0];
+    assert_eq!(svc["ports"], json!([{"public": 443, "target": 80, "proto": "tcp"}]));
+    assert!(!body.to_string().contains("192.168.178.1"), "{body}");
+
+    let req = raw_request("GET", "/admin/services", Some(&format!("Bearer {ADMIN}")));
+    let body = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
+    assert_eq!(body["services"][0]["ports"][0]["addr"], "192.168.178.1", "{body}");
+}
+
+#[tokio::test]
+async fn poll_rejects_a_target_address_inside_the_mesh_or_that_cannot_answer() {
+    let app = test_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "pk1", 51820).await;
+    let bearer = r1["bearer_token"].as_str().unwrap();
+    for addr in ["100.90.0.1", "100.90.0.77", "127.0.0.1", "224.0.0.1", "0.0.0.0"] {
+        let ports = json!([{"public": 443, "target": 80, "proto": "tcp", "addr": addr}]);
+        let (status, body) = poll_with(
+            &app.router,
+            bearer,
+            json!([{"name": "x", "port": 80, "proto": "tcp", "ports": ports}]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{addr}: {body}");
+    }
+}
+
 // ---- Opt-in transit selection (PLAN.md M23) ----
 
 async fn poll_full(router: &Router, bearer: &str, body: Value) -> (StatusCode, Value) {

@@ -11,6 +11,11 @@ use super::model::*;
 use super::planner::*;
 use super::ruleset;
 
+const NONE: ForwardWanted = ForwardWanted { transit: false, services: false };
+const TRANSIT: ForwardWanted = ForwardWanted { transit: true, services: false };
+const SERVICES: ForwardWanted = ForwardWanted { transit: false, services: true };
+const BOTH: ForwardWanted = ForwardWanted { transit: true, services: true };
+
 const STRATO_LIKE: &[u8] = include_bytes!("../../../tests/fixtures/nft/strato_like.json");
 const NATIVE: &[u8] = include_bytes!("../../../tests/fixtures/nft/native.json");
 const FIREWALLD_LIKE: &[u8] = include_bytes!("../../../tests/fixtures/nft/firewalld_like.json");
@@ -90,7 +95,7 @@ fn strato() -> Observed {
 
 /// Plans, applies the plan as the kernel would, and returns the result.
 fn converge(obs: &Observed, ifname: &str) -> Observed {
-    simulate(obs, &plan_reconcile(obs, ifname, false))
+    simulate(obs, &plan_reconcile(obs, ifname, NONE))
 }
 
 // ---------------------------------------------------------------------
@@ -110,7 +115,7 @@ fn every_insert_is_for_exactly_the_configured_interface() {
                 runtime_zone: None,
                 permanent_zone: None,
             };
-            for action in plan_reconcile(&obs, ifname, false) {
+            for action in plan_reconcile(&obs, ifname, NONE) {
                 match action {
                     Action::NftInsert { ifname: i, .. }
                     | Action::IptablesInsert { ifname: i, .. }
@@ -130,7 +135,7 @@ fn every_insert_is_for_exactly_the_configured_interface() {
 fn inserts_only_ever_target_input_hook_filter_chains() {
     for fixture in [STRATO_LIKE, NATIVE, FIREWALLD_LIKE] {
         let v = view(fixture);
-        for chain in nft_inserts(&plan_reconcile(&observed(v.clone()), "wg0", false)) {
+        for chain in nft_inserts(&plan_reconcile(&observed(v.clone()), "wg0", NONE)) {
             let info = v.chains.iter().find(|c| c.chain == chain).unwrap();
             assert_eq!(info.hook.as_deref(), Some("input"), "{chain:?}");
             assert_eq!(info.chain_type.as_deref(), Some("filter"), "{chain:?}");
@@ -149,23 +154,23 @@ fn accept_shape_requires_the_exact_interface() {
             json!({"accept": null}),
         ],
     };
-    assert!(is_accept_shape(&rule("wg0"), "wg0", Hook::Input));
-    assert!(!is_accept_shape(&rule("wg1"), "wg0", Hook::Input));
-    assert!(!is_accept_shape(&rule("wg*"), "wg0", Hook::Input));
+    assert!(is_accept_shape(&rule("wg0"), "wg0", Opening::Input));
+    assert!(!is_accept_shape(&rule("wg1"), "wg0", Opening::Input));
+    assert!(!is_accept_shape(&rule("wg*"), "wg0", Opening::Input));
 
     // Anything broader than `iifname == <if> counter accept` is not ours
     // to keep, even with our tag on it.
     let mut unscoped = rule("wg0");
     unscoped.expr.remove(0);
-    assert!(!is_accept_shape(&unscoped, "wg0", Hook::Input));
+    assert!(!is_accept_shape(&unscoped, "wg0", Opening::Input));
     let mut not_equal = rule("wg0");
     not_equal.expr[0] = json!({"match": {"op": "!=", "left": {"meta": {"key": "iifname"}}, "right": "wg0"}});
-    assert!(!is_accept_shape(&not_equal, "wg0", Hook::Input));
+    assert!(!is_accept_shape(&not_equal, "wg0", Opening::Input));
 
     // Forward requires the oifname match too — iifname alone is an INPUT
     // shape, not a valid Forward one (it would open routing to any other
     // interface, not just hairpin back onto this one).
-    assert!(!is_accept_shape(&rule("wg0"), "wg0", Hook::Forward));
+    assert!(!is_accept_shape(&rule("wg0"), "wg0", Opening::Hairpin));
     let fwd_rule = RuleInfo {
         handle: 1,
         comment: Some(tag("wg0")),
@@ -176,13 +181,13 @@ fn accept_shape_requires_the_exact_interface() {
             json!({"accept": null}),
         ],
     };
-    assert!(is_accept_shape(&fwd_rule, "wg0", Hook::Forward));
+    assert!(is_accept_shape(&fwd_rule, "wg0", Opening::Hairpin));
 }
 
 #[test]
 fn iptables_line_is_exact_and_interface_scoped() {
     assert_eq!(
-        iptables_line("wg0", Hook::Input),
+        iptables_line("wg0", Opening::Input),
         "-A INPUT -i wg0 -m comment --comment \"wireserve:wg0\" -j ACCEPT"
     );
 }
@@ -194,11 +199,11 @@ fn forward_guard_only_drops_and_only_exists_with_firewalld_trust() {
         runtime_zone: None,
         permanent_zone: None,
     };
-    let actions = plan_reconcile(&obs, "wg0", false);
+    let actions = plan_reconcile(&obs, "wg0", NONE);
     assert!(actions.contains(&Action::FirewalldTrust { ifname: "wg0".into() }));
     assert!(actions.contains(&Action::GuardCreate {
         ifname: "wg0".into(),
-        forward_wanted: false
+        forward: NONE
     }));
 
     let after = simulate(&obs, &actions);
@@ -210,15 +215,15 @@ fn forward_guard_only_drops_and_only_exists_with_firewalld_trust() {
         .iter()
         .find(|c| c.chain.table == guard_table("wg0"))
         .unwrap();
-    assert!(is_guard_shape(&guard.rules, "wg0", false));
+    assert!(is_guard_shape(&guard.rules, "wg0", NONE));
 
     // Without firewalld there is no guard, and a leftover one is removed.
     let mut gone = after.clone();
     gone.firewalld = FirewalldState::Unavailable;
-    assert!(plan_reconcile(&gone, "wg0", false).contains(&Action::GuardDelete {
+    assert!(plan_reconcile(&gone, "wg0", NONE).contains(&Action::GuardDelete {
         table: "wireserve-interop.wg0".into()
     }));
-    assert!(!plan_reconcile(&observed(view(NATIVE)), "wg0", false)
+    assert!(!plan_reconcile(&observed(view(NATIVE)), "wg0", NONE)
         .iter()
         .any(|a| matches!(a, Action::GuardCreate { .. })));
 }
@@ -236,10 +241,10 @@ fn firewalld_guard_gets_a_hairpin_exception_when_transit_capable() {
         runtime_zone: None,
         permanent_zone: None,
     };
-    let actions = plan_reconcile(&obs, "wg0", true);
+    let actions = plan_reconcile(&obs, "wg0", TRANSIT);
     assert!(actions.contains(&Action::GuardCreate {
         ifname: "wg0".into(),
-        forward_wanted: true
+        forward: TRANSIT
     }));
 
     let after = simulate(&obs, &actions);
@@ -251,9 +256,9 @@ fn firewalld_guard_gets_a_hairpin_exception_when_transit_capable() {
         .iter()
         .find(|c| c.chain.table == guard_table("wg0"))
         .unwrap();
-    assert!(is_guard_shape(&guard.rules, "wg0", true));
+    assert!(is_guard_shape(&guard.rules, "wg0", TRANSIT));
     assert_eq!(guard.rules.len(), 2, "the hairpin exception sits ahead of the still-present drop");
-    assert_eq!(plan_reconcile(&after, "wg0", true), vec![], "settled");
+    assert_eq!(plan_reconcile(&after, "wg0", TRANSIT), vec![], "settled");
 }
 
 #[test]
@@ -266,22 +271,22 @@ fn firewalld_guard_shape_is_corrected_when_transit_capable_changes() {
         runtime_zone: None,
         permanent_zone: None,
     };
-    let with_transit = simulate(&obs, &plan_reconcile(&obs, "wg0", true));
-    let actions = plan_reconcile(&with_transit, "wg0", false);
+    let with_transit = simulate(&obs, &plan_reconcile(&obs, "wg0", TRANSIT));
+    let actions = plan_reconcile(&with_transit, "wg0", NONE);
     assert!(
         actions.contains(&Action::GuardCreate {
             ifname: "wg0".into(),
-            forward_wanted: false
+            forward: NONE
         }),
         "{actions:#?}"
     );
 
-    let without_transit = simulate(&obs, &plan_reconcile(&obs, "wg0", false));
-    let actions = plan_reconcile(&without_transit, "wg0", true);
+    let without_transit = simulate(&obs, &plan_reconcile(&obs, "wg0", NONE));
+    let actions = plan_reconcile(&without_transit, "wg0", TRANSIT);
     assert!(
         actions.contains(&Action::GuardCreate {
             ifname: "wg0".into(),
-            forward_wanted: true
+            forward: TRANSIT
         }),
         "{actions:#?}"
     );
@@ -293,7 +298,7 @@ fn firewalld_guard_shape_is_corrected_when_transit_capable_changes() {
 
 #[test]
 fn native_inet_filter_input_gets_an_nft_insert() {
-    let actions = plan_reconcile(&observed(view(NATIVE)), "wg0", false);
+    let actions = plan_reconcile(&observed(view(NATIVE)), "wg0", NONE);
     assert!(nft_inserts(&actions).contains(&chain_ref(Family::Inet, "filter", "input")));
 }
 
@@ -303,7 +308,7 @@ fn native_table_named_filter_with_lowercase_input_goes_through_nft() {
     // iptables-nft (which always says INPUT) — even when iptables works.
     let mut obs = observed(view(NATIVE));
     obs.iptables = vec![ipt(IpVersion::V4, IptablesVariant::Nft, &[])];
-    let actions = plan_reconcile(&obs, "wg0", false);
+    let actions = plan_reconcile(&obs, "wg0", NONE);
     assert!(nft_inserts(&actions).contains(&chain_ref(Family::Ip, "filter", "input")));
     // …and iptables-nft gets nothing: there is no iptables `INPUT` chain.
     assert!(!actions.iter().any(|a| matches!(a, Action::IptablesInsert { .. })));
@@ -311,7 +316,7 @@ fn native_table_named_filter_with_lowercase_input_goes_through_nft() {
 
 #[test]
 fn skipped_chains_are_never_touched() {
-    let actions = plan_reconcile(&observed(view(NATIVE)), "wg0", false);
+    let actions = plan_reconcile(&observed(view(NATIVE)), "wg0", NONE);
     let inserted = nft_inserts(&actions);
     for skipped in [
         chain_ref(Family::Inet, "filter", "forward"),
@@ -328,9 +333,9 @@ fn skipped_chains_are_never_touched() {
 
 #[test]
 fn our_own_tables_and_firewalld_are_never_inserted_into() {
-    let actions = plan_reconcile(&observed(view(FIREWALLD_LIKE)), "wg0", false);
+    let actions = plan_reconcile(&observed(view(FIREWALLD_LIKE)), "wg0", NONE);
     assert!(nft_inserts(&actions).is_empty(), "{actions:?}");
-    let actions = plan_reconcile(&strato(), "wg0", false);
+    let actions = plan_reconcile(&strato(), "wg0", NONE);
     assert!(!nft_inserts(&actions).iter().any(|c| is_own_table(&c.table)));
 }
 
@@ -342,13 +347,13 @@ fn owner_flagged_tables_are_skipped() {
             t.flags = vec!["owner".into(), "persist".into()];
         }
     }
-    let inserted = nft_inserts(&plan_reconcile(&observed(v), "wg0", false));
+    let inserted = nft_inserts(&plan_reconcile(&observed(v), "wg0", NONE));
     assert!(!inserted.contains(&chain_ref(Family::Inet, "filter", "input")));
 }
 
 #[test]
 fn strato_like_host_gets_exactly_the_expected_plan() {
-    let actions = plan_reconcile(&strato(), "wg0", false);
+    let actions = plan_reconcile(&strato(), "wg0", NONE);
     assert_eq!(
         nft_inserts(&actions),
         vec![
@@ -416,22 +421,22 @@ fn forward_hook_is_left_completely_alone_without_transit_capable() {
     // packet, because nothing ever asked it to let this interface's
     // hairpin traffic through. Without `forward_wanted`, that must stay
     // true — same footprint as before transit existed.
-    let actions = plan_reconcile(&ufw_forward(), "wg0", false);
+    let actions = plan_reconcile(&ufw_forward(), "wg0", NONE);
     assert!(!actions.iter().any(|a| matches!(a,
-        Action::NftInsert { hook: Hook::Forward, .. } | Action::IptablesInsert { hook: Hook::Forward, .. }
+        Action::NftInsert { opening: Opening::Hairpin, .. } | Action::IptablesInsert { opening: Opening::Hairpin, .. }
     )));
 }
 
 #[test]
 fn forward_hook_gets_a_narrow_hairpin_only_insert_when_transit_capable() {
-    let actions = plan_reconcile(&ufw_forward(), "wg0", true);
+    let actions = plan_reconcile(&ufw_forward(), "wg0", TRANSIT);
     let fwd_inserts: Vec<_> = actions
         .iter()
         .filter_map(|a| match a {
             Action::IptablesInsert {
                 target,
                 ifname,
-                hook: Hook::Forward,
+                opening: Opening::Hairpin,
             } => Some((target.version, ifname.as_str())),
             _ => None,
         })
@@ -445,7 +450,7 @@ fn forward_hook_gets_a_narrow_hairpin_only_insert_when_transit_capable() {
     // replacement.
     let input_inserts = actions
         .iter()
-        .filter(|a| matches!(a, Action::IptablesInsert { hook: Hook::Input, .. }))
+        .filter(|a| matches!(a, Action::IptablesInsert { opening: Opening::Input, .. }))
         .count();
     assert_eq!(input_inserts, 2);
 }
@@ -453,8 +458,8 @@ fn forward_hook_gets_a_narrow_hairpin_only_insert_when_transit_capable() {
 #[test]
 fn forward_reconcile_settles_and_removal_takes_it_back_out() {
     let obs = ufw_forward();
-    let installed = simulate(&obs, &plan_reconcile(&obs, "wg0", true));
-    assert_eq!(plan_reconcile(&installed, "wg0", true), vec![], "second pass is a no-op");
+    let installed = simulate(&obs, &plan_reconcile(&obs, "wg0", TRANSIT));
+    assert_eq!(plan_reconcile(&installed, "wg0", TRANSIT), vec![], "second pass is a no-op");
 
     let removal = plan_removal(&installed, "wg0");
     assert!(removal.iter().any(|a| matches!(a, Action::IptablesDelete { line, .. } if line.contains("FORWARD"))));
@@ -470,21 +475,21 @@ fn a_stray_forward_rule_is_removed_even_when_no_longer_transit_capable() {
     // `plan_reconcile`'s nft-side removal loop runs over every foreign
     // chain regardless of hook, independent of `forward_wanted`.
     let obs = ufw_forward();
-    let installed = simulate(&obs, &plan_reconcile(&obs, "wg0", true));
-    let actions = plan_reconcile(&installed, "wg0", false);
+    let installed = simulate(&obs, &plan_reconcile(&obs, "wg0", TRANSIT));
+    let actions = plan_reconcile(&installed, "wg0", NONE);
     assert_eq!(
         actions.iter().filter(|a| matches!(a, Action::IptablesDelete { line, .. } if line.contains("FORWARD"))).count(),
         2,
         "one per family: {actions:#?}"
     );
-    assert!(!actions.iter().any(|a| matches!(a, Action::IptablesInsert { hook: Hook::Forward, .. })));
+    assert!(!actions.iter().any(|a| matches!(a, Action::IptablesInsert { opening: Opening::Hairpin, .. })));
 }
 
 #[test]
 fn iptables_nft_filter_without_a_working_binary_falls_back_to_nft() {
     let mut obs = strato();
     obs.iptables = vec![]; // no iptables binary at all
-    let inserted = nft_inserts(&plan_reconcile(&obs, "wg0", false));
+    let inserted = nft_inserts(&plan_reconcile(&obs, "wg0", NONE));
     assert!(inserted.contains(&chain_ref(Family::Ip, "filter", "INPUT")));
     assert!(inserted.contains(&chain_ref(Family::Ip6, "filter", "INPUT")));
 
@@ -494,7 +499,7 @@ fn iptables_nft_filter_without_a_working_binary_falls_back_to_nft() {
         hook: Hook::Input,
         tagged_lines: None,
     }];
-    let inserted = nft_inserts(&plan_reconcile(&obs, "wg0", false));
+    let inserted = nft_inserts(&plan_reconcile(&obs, "wg0", NONE));
     assert!(inserted.contains(&chain_ref(Family::Ip, "filter", "INPUT")));
 }
 
@@ -503,14 +508,14 @@ fn iptables_nft_is_not_used_when_there_is_no_filter_table() {
     // Never create iptables' filter table just to open it.
     let mut obs = observed(view(FIREWALLD_LIKE));
     obs.iptables = vec![ipt(IpVersion::V4, IptablesVariant::Nft, &[])];
-    assert!(plan_reconcile(&obs, "wg0", false).is_empty());
+    assert!(plan_reconcile(&obs, "wg0", NONE).is_empty());
 }
 
 #[test]
 fn legacy_and_nft_iptables_are_handled_independently() {
     let mut obs = strato();
     obs.iptables.push(ipt(IpVersion::V4, IptablesVariant::Legacy, &[]));
-    let variants: Vec<_> = plan_reconcile(&obs, "wg0", false)
+    let variants: Vec<_> = plan_reconcile(&obs, "wg0", NONE)
         .into_iter()
         .filter_map(|a| match a {
             Action::IptablesInsert { target, .. } => Some((target.version, target.variant)),
@@ -540,7 +545,7 @@ fn reconcile_settles_after_one_pass() {
         permanent_zone: None,
     };
     let once = converge(&obs, "wg0");
-    assert_eq!(plan_reconcile(&once, "wg0", false), vec![], "second pass must be a no-op");
+    assert_eq!(plan_reconcile(&once, "wg0", NONE), vec![], "second pass must be a no-op");
 }
 
 #[test]
@@ -565,7 +570,7 @@ fn stale_duplicate_and_misshapen_tags_are_replaced() {
             expr: vec![json!({"accept": null})], // right tag, unscoped shape
         });
     }
-    let actions = plan_reconcile(&obs, "wg0", false);
+    let actions = plan_reconcile(&obs, "wg0", NONE);
     let deleted: Vec<u64> = actions
         .iter()
         .filter_map(|a| match a {
@@ -577,7 +582,7 @@ fn stale_duplicate_and_misshapen_tags_are_replaced() {
     assert!(deleted.contains(&777) && deleted.contains(&778));
     assert!(nft_inserts(&actions).contains(&input));
     let settled = simulate(&obs, &actions);
-    assert_eq!(plan_reconcile(&settled, "wg0", false), vec![]);
+    assert_eq!(plan_reconcile(&settled, "wg0", NONE), vec![]);
 }
 
 #[test]
@@ -598,7 +603,7 @@ fn duplicate_correct_rules_collapse_to_one() {
     dup.handle = 4242;
     chain.rules.push(dup);
     assert_eq!(
-        plan_reconcile(&obs, "wg0", false),
+        plan_reconcile(&obs, "wg0", NONE),
         [Action::NftDelete {
             chain: input,
             handle: 4242
@@ -622,7 +627,7 @@ fn a_correct_rule_further_down_the_chain_is_left_alone() {
         .unwrap();
     chain.rules.rotate_left(1);
     assert!(chain.rules.last().unwrap().comment.is_some());
-    assert_eq!(plan_reconcile(&obs, "wg0", false), vec![]);
+    assert_eq!(plan_reconcile(&obs, "wg0", NONE), vec![]);
 }
 
 #[test]
@@ -631,9 +636,9 @@ fn a_reloaded_chain_gets_its_rule_back() {
     // restart: the chain comes back without our rule.
     let obs = converge(&strato(), "wg0");
     let reloaded = strato(); // fresh, as if every foreign table was rebuilt
-    let actions = plan_reconcile(&reloaded, "wg0", false);
+    let actions = plan_reconcile(&reloaded, "wg0", NONE);
     assert_eq!(nft_inserts(&actions).len(), 3);
-    assert_eq!(plan_reconcile(&obs, "wg0", false), vec![]);
+    assert_eq!(plan_reconcile(&obs, "wg0", NONE), vec![]);
 }
 
 #[test]
@@ -644,11 +649,11 @@ fn iptables_stale_and_duplicate_lines_are_replaced() {
         IptablesVariant::Nft,
         &[
             "-A INPUT -i wg1 -m comment --comment \"wireserve:wg1\" -j ACCEPT",
-            &iptables_line("wg0", Hook::Input),
-            &iptables_line("wg0", Hook::Input),
+            &iptables_line("wg0", Opening::Input),
+            &iptables_line("wg0", Opening::Input),
         ],
     )];
-    let actions = plan_reconcile(&obs, "wg0", false);
+    let actions = plan_reconcile(&obs, "wg0", NONE);
     let deletes: Vec<&str> = actions
         .iter()
         .filter_map(|a| match a {
@@ -660,7 +665,7 @@ fn iptables_stale_and_duplicate_lines_are_replaced() {
         deletes,
         [
             "-A INPUT -i wg1 -m comment --comment \"wireserve:wg1\" -j ACCEPT",
-            iptables_line("wg0", Hook::Input).as_str()
+            iptables_line("wg0", Opening::Input).as_str()
         ]
     );
     assert!(!actions.iter().any(|a| matches!(a, Action::IptablesInsert { .. })));
@@ -674,7 +679,7 @@ fn firewalld_operator_choices_are_respected() {
             runtime_zone: runtime.map(Into::into),
             permanent_zone: permanent.map(Into::into),
         };
-        plan_reconcile(&obs, "wg0", false)
+        plan_reconcile(&obs, "wg0", NONE)
     };
     // Unassigned → guard, then trust (runtime) — in that order, so
     // forwarding from the mesh is never open between the two.
@@ -683,7 +688,7 @@ fn firewalld_operator_choices_are_respected() {
         [
             Action::GuardCreate {
                 ifname: "wg0".into(),
-                forward_wanted: false
+                forward: NONE
             },
             Action::FirewalldTrust { ifname: "wg0".into() }
         ]
@@ -693,7 +698,7 @@ fn firewalld_operator_choices_are_respected() {
         running(Some("trusted"), None),
         [Action::GuardCreate {
             ifname: "wg0".into(),
-            forward_wanted: false
+            forward: NONE
         }]
     );
     // Anything an operator chose is left exactly as it is, with no guard.
@@ -715,7 +720,7 @@ fn no_firewalld_trust_when_the_ruleset_is_unreadable() {
         },
         live: Default::default(),
     };
-    assert_eq!(plan_reconcile(&obs, "wg0", false), []);
+    assert_eq!(plan_reconcile(&obs, "wg0", NONE), []);
 }
 
 // ---------------------------------------------------------------------
@@ -879,8 +884,8 @@ fn two_running_agents_settle_side_by_side() {
     assert_eq!(tag_count(&both, "wireserve1"), per_agent);
 
     // Neither has anything left to do: no ping-pong between the two.
-    assert_eq!(plan_reconcile(&seen_by(&both, &["wireserve1"]), "wireserve0", false), vec![]);
-    assert_eq!(plan_reconcile(&seen_by(&both, &["wireserve0"]), "wireserve1", false), vec![]);
+    assert_eq!(plan_reconcile(&seen_by(&both, &["wireserve1"]), "wireserve0", NONE), vec![]);
+    assert_eq!(plan_reconcile(&seen_by(&both, &["wireserve0"]), "wireserve1", NONE), vec![]);
 }
 
 #[test]
@@ -899,7 +904,7 @@ fn a_dead_agents_rules_are_cleaned_up_by_a_running_one() {
     let a = converge(&seen_by(&busy_host(), &["wireserve1"]), "wireserve0");
     let both = converge(&seen_by(&a, &["wireserve0"]), "wireserve1");
 
-    let actions = plan_reconcile(&seen_by(&both, &[]), "wireserve0", false);
+    let actions = plan_reconcile(&seen_by(&both, &[]), "wireserve0", NONE);
     assert!(nft_inserts(&actions).is_empty(), "{actions:?}");
     let after = simulate(&both, &actions);
     assert_eq!(tag_count(&after, "wireserve1"), 0);
@@ -924,10 +929,10 @@ fn each_agent_keeps_its_own_forward_guard() {
 
     // B, with firewalld reporting its own interface as unassigned, creates
     // its own guard and never deletes A's.
-    let b_actions = plan_reconcile(&firewalld(&seen_by(&a, &["wireserve0"])), "wireserve1", false);
+    let b_actions = plan_reconcile(&firewalld(&seen_by(&a, &["wireserve0"])), "wireserve1", NONE);
     assert!(b_actions.contains(&Action::GuardCreate {
         ifname: "wireserve1".into(),
-        forward_wanted: false
+        forward: NONE
     }));
     assert!(!b_actions.iter().any(|x| matches!(x, Action::GuardDelete { .. })), "{b_actions:?}");
     let both = simulate(&a, &b_actions);
@@ -983,4 +988,120 @@ fn legacy_guard_and_its_trust_are_removed_once() {
     assert_eq!(plan_legacy_removal(&obs, false), [delete]);
     // Nothing legacy, nothing to do.
     assert_eq!(plan_legacy_removal(&observed(view(FIREWALLD_LIKE)), false), []);
+}
+
+// ---------------------------------------------------------------------
+// Services mapped onto other addresses (PLAN.md M26)
+// ---------------------------------------------------------------------
+
+fn fwd_openings(actions: &[Action]) -> Vec<(IpVersion, Opening)> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::IptablesInsert { target, opening, .. } if opening.hook() == Hook::Forward => {
+                Some((target.version, *opening))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_service_target_opens_the_forward_hook_for_marked_flows_only() {
+    let actions = plan_reconcile(&ufw_forward(), "wg0", SERVICES);
+    assert_eq!(
+        fwd_openings(&actions),
+        [
+            (IpVersion::V4, Opening::ServiceRequest),
+            (IpVersion::V4, Opening::ServiceReply),
+            (IpVersion::V6, Opening::ServiceRequest),
+            (IpVersion::V6, Opening::ServiceReply),
+        ],
+        "no hairpin without transit: {actions:#?}"
+    );
+    let line = iptables_line("wg0", Opening::ServiceRequest);
+    assert_eq!(
+        line,
+        "-A FORWARD -i wg0 -m connmark --mark 0x1000000/0x1000000 -m comment --comment \"wireserve:wg0\" -j ACCEPT"
+    );
+}
+
+#[test]
+fn transit_and_services_together_get_all_three_forward_openings_and_settle() {
+    let obs = ufw_forward();
+    let actions = plan_reconcile(&obs, "wg0", BOTH);
+    assert_eq!(fwd_openings(&actions).len(), 6, "{actions:#?}");
+    let installed = simulate(&obs, &actions);
+    assert_eq!(plan_reconcile(&installed, "wg0", BOTH), vec![], "settled");
+
+    // Dropping services keeps the hairpin, and only removes theirs.
+    let actions = plan_reconcile(&installed, "wg0", TRANSIT);
+    let deleted: Vec<&str> = actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::IptablesDelete { line, .. } => Some(line.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deleted.len(), 4, "{actions:#?}");
+    assert!(deleted.iter().all(|l| l.contains("connmark")), "{deleted:?}");
+    assert!(!actions.iter().any(|a| matches!(a, Action::IptablesInsert { .. })));
+
+    let removal = simulate(&installed, &plan_removal(&installed, "wg0"));
+    assert_eq!(removal, obs, "removal restores the exact prior state");
+}
+
+#[test]
+fn native_forward_chains_get_the_service_openings_too() {
+    let mut obs = ufw_forward();
+    obs.iptables.clear(); // no iptables binary: NetBird's native fallback
+    let actions = plan_reconcile(&obs, "wg0", SERVICES);
+    let fwd: Vec<Opening> = actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::NftInsert { chain, opening, .. } if chain.chain == "FORWARD" => Some(*opening),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fwd, [Opening::ServiceRequest, Opening::ServiceReply, Opening::ServiceRequest, Opening::ServiceReply]);
+    let installed = simulate(&obs, &actions);
+    assert_eq!(plan_reconcile(&installed, "wg0", SERVICES), vec![], "settled");
+}
+
+#[test]
+fn a_rule_of_one_opening_is_not_taken_for_another() {
+    let rule = |expr: Vec<serde_json::Value>| RuleInfo { handle: 1, comment: Some(tag("wg0")), expr };
+    let counted = |opening| {
+        let mut e = opening_matches("wg0", opening);
+        e.push(json!({"counter": {"packets": 0, "bytes": 0}}));
+        e.push(json!({"accept": null}));
+        rule(e)
+    };
+    let all = [Opening::Input, Opening::Hairpin, Opening::ServiceRequest, Opening::ServiceReply];
+    for a in all {
+        for b in all {
+            assert_eq!(is_accept_shape(&counted(a), "wg0", b), a == b, "{a:?} as {b:?}");
+        }
+    }
+}
+
+#[test]
+fn firewalld_guard_gets_a_service_exception_ahead_of_the_drop() {
+    let mut obs = observed(view(NATIVE));
+    obs.firewalld = FirewalldState::Running {
+        runtime_zone: None,
+        permanent_zone: None,
+    };
+    for forward in [SERVICES, BOTH] {
+        let actions = plan_reconcile(&obs, "wg0", forward);
+        assert!(actions.contains(&Action::GuardCreate { ifname: "wg0".into(), forward }), "{actions:#?}");
+        let after = simulate(&obs, &actions);
+        let guard = after.nft.as_ref().unwrap().chains.iter().find(|c| c.chain.table == guard_table("wg0")).unwrap();
+        assert!(is_guard_shape(&guard.rules, "wg0", forward));
+        assert_eq!(guard.rules.len(), if forward.transit { 3 } else { 2 });
+        for other in [NONE, TRANSIT, SERVICES, BOTH].into_iter().filter(|o| *o != forward) {
+            assert!(!is_guard_shape(&guard.rules, "wg0", other), "{forward:?} guard taken for {other:?}");
+        }
+        assert_eq!(plan_reconcile(&after, "wg0", forward), vec![], "settled");
+    }
 }

@@ -39,6 +39,12 @@ pub fn peer_info(node: &NodeRow, online_threshold_secs: i64) -> PeerInfo {
     }
 }
 
+/// A service as every node's directory carries it. A mapping's target
+/// address (PLAN.md M26) is left out: a peer reaches the service on its own
+/// address and public port and needs nothing else, and the owner acts only
+/// on its own declaration — so the only thing fanning it out would do is
+/// tell the whole mesh what the owner's LAN looks like. Admins still see it
+/// (`admin_service_info`).
 pub fn service_info(service: &ServiceRow, node: &NodeRow, online_threshold_secs: i64) -> ServiceInfo {
     ServiceInfo {
         name: service.name.clone(),
@@ -48,7 +54,7 @@ pub fn service_info(service: &ServiceRow, node: &NodeRow, online_threshold_secs:
         proto: service.proto,
         online: is_recent(node.last_seen, online_threshold_secs),
         vip4: service.vip4.clone(),
-        ports: service.ports.clone(),
+        ports: service.ports.iter().map(|m| wireserve_types::PortMap { addr: None, ..*m }).collect(),
     }
 }
 
@@ -173,5 +179,26 @@ mod tests {
         };
         let info = service_info(&svc, &n, 180);
         assert!(info.online);
+    }
+
+    #[test]
+    fn a_target_address_reaches_admins_but_never_the_mesh() {
+        let n = node(Some(Utc::now()));
+        let svc = ServiceRow {
+            node_id: 1,
+            name: "myrouter".into(),
+            port: 80,
+            proto: wireserve_types::Proto::Tcp,
+            vip4: Some("10.9.0.50".into()),
+            ports: vec!["443:192.168.178.1:80".parse().unwrap()],
+            declared_at: None,
+            approved_at: Some(Utc::now()),
+            denied_at: None,
+            denied_reason: None,
+        };
+        let fanned = service_info(&svc, &n, 180);
+        assert_eq!(fanned.ports[0].addr, None);
+        assert_eq!((fanned.ports[0].public, fanned.ports[0].target), (443, 80));
+        assert_eq!(admin_service_info(&svc, &n).ports[0].to_string(), "443:192.168.178.1:80/tcp");
     }
 }

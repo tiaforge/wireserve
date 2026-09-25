@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 
-use super::model::{tag_owner, Action, FirewalldState, IptablesObservation, NftView, Observed};
+use super::model::{tag_owner, Action, FirewalldState, IptablesObservation, NftView, Observed, ForwardWanted};
 use super::{firewalld, iptables, nft_ops, planner, ruleset};
 use crate::firewall::nft::Nft;
 use crate::firewall::nftables::SharedRuleset;
@@ -124,12 +124,12 @@ impl HostOps for RealOps {
     fn execute(&mut self, action: &Action) -> Result<(), String> {
         let nft = |batch| self.nft.apply(&batch).map_err(|e| e.to_string());
         match action {
-            Action::NftInsert { chain, ifname, hook } => nft(nft_ops::insert_accept(chain, ifname, *hook)),
+            Action::NftInsert { chain, ifname, opening } => nft(nft_ops::insert_accept(chain, ifname, *opening)),
             Action::NftDelete { chain, handle } => nft(nft_ops::delete_rule(chain, *handle)),
-            Action::GuardCreate { ifname, forward_wanted } => nft(nft_ops::guard_create(ifname, *forward_wanted)),
+            Action::GuardCreate { ifname, forward } => nft(nft_ops::guard_create(ifname, *forward)),
             Action::GuardDelete { table } => nft(nft_ops::guard_delete(table)),
-            Action::IptablesInsert { target, ifname, hook } => {
-                iptables::run(target, &iptables::insert_args(ifname, *hook)).map(|_| ())
+            Action::IptablesInsert { target, ifname, opening } => {
+                iptables::run(target, &iptables::insert_args(ifname, *opening)).map(|_| ())
             }
             Action::IptablesDelete { target, line } => {
                 iptables::run(target, &iptables::delete_args(line)?).map(|_| ())
@@ -224,7 +224,7 @@ pub fn execute_all(ops: &mut impl HostOps, actions: &[Action]) -> usize {
 /// backend's last ruleset first; if that isn't possible, this plans the
 /// same removal as [`remove`], so every other firewall goes back to
 /// blocking the interface until the table is back.
-pub fn reconcile(ops: &mut impl HostOps, ifname: &str, forward_wanted: bool, told: &mut HashSet<String>) -> usize {
+pub fn reconcile(ops: &mut impl HostOps, ifname: &str, forward_wanted: ForwardWanted, told: &mut HashSet<String>) -> usize {
     let mut observed = ops.observe(ifname);
     for notice in planner::notices(&observed, ifname) {
         if told.insert(notice.clone()) {
@@ -379,7 +379,7 @@ mod tests {
         let mut ops = fake(vec![]);
         ops.observed.firewalld = firewalld_running();
         ops.observed.nft = Some(own_table_view());
-        reconcile(&mut ops, "wg0", false, &mut HashSet::new());
+        reconcile(&mut ops, "wg0", ForwardWanted::default(), &mut HashSet::new());
         assert_eq!(ops.restores, 0, "nothing to restore");
         assert!(ops.executed.contains(&Action::FirewalldTrust { ifname: "wg0".into() }), "{:?}", ops.executed);
     }
@@ -392,7 +392,7 @@ mod tests {
         let mut ops = fake(vec![]);
         ops.observed.firewalld = FirewalldState::Running { runtime_zone: Some("trusted".into()), permanent_zone: None };
         ops.observed.nft = Some(NftView::default());
-        reconcile(&mut ops, "wg0", false, &mut HashSet::new());
+        reconcile(&mut ops, "wg0", ForwardWanted::default(), &mut HashSet::new());
         assert_eq!(ops.restores, 1);
         assert!(
             !ops.executed.iter().any(|a| matches!(a, Action::FirewalldTrust { .. } | Action::NftInsert { .. } | Action::IptablesInsert { .. })),
@@ -411,7 +411,7 @@ mod tests {
         let mut restored = ops.observed.clone();
         restored.nft = Some(own_table_view());
         ops.after_restore = Some(restored);
-        reconcile(&mut ops, "wg0", false, &mut HashSet::new());
+        reconcile(&mut ops, "wg0", ForwardWanted::default(), &mut HashSet::new());
         assert_eq!(ops.restores, 1);
         assert!(ops.executed.contains(&Action::FirewalldTrust { ifname: "wg0".into() }), "{:?}", ops.executed);
     }
@@ -423,7 +423,7 @@ mod tests {
         let mut ops = fake(vec![]);
         ops.observed.firewalld = firewalld_running();
         ops.observed.nft = Some(view);
-        reconcile(&mut ops, "wg0", false, &mut HashSet::new());
+        reconcile(&mut ops, "wg0", ForwardWanted::default(), &mut HashSet::new());
         assert_eq!(ops.restores, 1);
         assert!(!ops.executed.contains(&Action::FirewalldTrust { ifname: "wg0".into() }));
     }
@@ -433,12 +433,12 @@ mod tests {
         let a = Action::NftInsert {
             chain: chain("a"),
             ifname: "wg0".into(),
-            hook: crate::firewall::host_interop::model::Hook::Input,
+            opening: crate::firewall::host_interop::model::Opening::Input,
         };
         let b = Action::NftInsert {
             chain: chain("b"),
             ifname: "wg0".into(),
-            hook: crate::firewall::host_interop::model::Hook::Input,
+            opening: crate::firewall::host_interop::model::Opening::Input,
         };
         let mut ops = fake(vec![a.clone()]);
         assert_eq!(execute_all(&mut ops, &[a.clone(), b.clone()]), 1);
@@ -447,7 +447,7 @@ mod tests {
 
     #[test]
     fn no_firewalld_trust_without_the_forward_guard() {
-        let guard = Action::GuardCreate { ifname: "wg0".into(), forward_wanted: false };
+        let guard = Action::GuardCreate { ifname: "wg0".into(), forward: ForwardWanted::default() };
         let trust = Action::FirewalldTrust { ifname: "wg0".into() };
         let mut ops = fake(vec![guard.clone()]);
         assert_eq!(execute_all(&mut ops, &[guard.clone(), trust]), 2);
@@ -474,15 +474,15 @@ mod tests {
         };
         // No nft view: the forward guard can't be verified, so firewalld
         // is not touched either.
-        assert_eq!(reconcile(&mut ops, "wg0", false, &mut HashSet::new()), 0);
+        assert_eq!(reconcile(&mut ops, "wg0", ForwardWanted::default(), &mut HashSet::new()), 0);
         assert!(ops.executed.is_empty());
 
         ops.observed.nft = Some(own_table_view());
-        assert_eq!(reconcile(&mut ops, "wg0", false, &mut HashSet::new()), 2);
+        assert_eq!(reconcile(&mut ops, "wg0", ForwardWanted::default(), &mut HashSet::new()), 2);
         assert_eq!(
             ops.executed,
             [
-                Action::GuardCreate { ifname: "wg0".into(), forward_wanted: false },
+                Action::GuardCreate { ifname: "wg0".into(), forward: ForwardWanted::default() },
                 Action::FirewalldTrust { ifname: "wg0".into() }
             ]
         );
@@ -544,6 +544,16 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        // Another test thread forking while the script was open for writing
+        // holds a copy of that descriptor until its child execs, and until
+        // then exec'ing the script fails with ETXTBSY — which the code under
+        // test rightly reads as "this nft cannot do -t". Wait that out here
+        // so the first real call is the one the test is about.
+        while let Err(e) = std::process::Command::new(&fake).arg("warmup").output() {
+            assert_eq!(e.raw_os_error(), Some(libc::ETXTBSY), "{e}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::remove_file(&log).unwrap();
 
         let mut ops = RealOps::without_firewalld(Nft::at(fake));
         for _ in 0..3 {

@@ -84,6 +84,56 @@ impl Hook {
     }
 }
 
+pub use crate::firewall::ForwardWanted;
+
+/// The shape of one accept this module puts into a foreign chain. Each is
+/// pinned to the mesh interface on one side, and every `FORWARD` one to
+/// something narrower on the other: this same interface, or a flow our own
+/// table marked as a service's (`nftables::SERVICE_MARK`) — never routing
+/// from the mesh to the host's other networks as such.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Opening {
+    /// `iifname <if>` on `INPUT`: declared services reach this host.
+    Input,
+    /// `iifname <if> oifname <if>` on `FORWARD`: transit, mesh → mesh
+    /// (PLAN.md M23).
+    Hairpin,
+    /// `iifname <if> ct mark & M == M` on `FORWARD`: a request to a
+    /// service mapped onto another address, leaving for it (PLAN.md M26).
+    ServiceRequest,
+    /// `oifname <if> ct mark & M == M` on `FORWARD`: its reply, coming
+    /// back into the mesh.
+    ServiceReply,
+}
+
+impl Opening {
+    #[must_use]
+    pub fn hook(self) -> Hook {
+        match self {
+            Self::Input => Hook::Input,
+            Self::Hairpin | Self::ServiceRequest | Self::ServiceReply => Hook::Forward,
+        }
+    }
+
+    /// Every opening a chain on `hook` should hold.
+    #[must_use]
+    pub fn wanted(hook: Hook, forward: ForwardWanted) -> Vec<Self> {
+        match hook {
+            Hook::Input => vec![Self::Input],
+            Hook::Forward => {
+                let mut out = Vec::new();
+                if forward.transit {
+                    out.push(Self::Hairpin);
+                }
+                if forward.services {
+                    out.extend([Self::ServiceRequest, Self::ServiceReply]);
+                }
+                out
+            }
+        }
+    }
+}
+
 /// firewalld's own table. firewalld (nftables backend) creates it with the
 /// `owner` flag, so writes into it fail with EPERM; firewalld is handled
 /// through its zones instead.
@@ -231,13 +281,13 @@ pub struct Observed {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Action {
-    /// Head-insert `iifname "<ifname>" [oifname "<ifname>"] counter accept
-    /// comment "wireserve:<ifname>"` — the `oifname` match only for `Forward`.
-    NftInsert { chain: ChainRef, ifname: String, hook: Hook },
+    /// Head-insert `<opening's matches> counter accept comment
+    /// "wireserve:<ifname>"` — see [`Opening`].
+    NftInsert { chain: ChainRef, ifname: String, opening: Opening },
     NftDelete { chain: ChainRef, handle: u64 },
-    /// `-I <INPUT|FORWARD> 1 -i <ifname> [-o <ifname>] -m comment --comment
+    /// `-I <INPUT|FORWARD> 1 <opening's matches> -m comment --comment
     /// wireserve:<ifname> -j ACCEPT`.
-    IptablesInsert { target: IptablesTarget, ifname: String, hook: Hook },
+    IptablesInsert { target: IptablesTarget, ifname: String, opening: Opening },
     /// `-D` with the exact spec of one tagged line from `-S INPUT`/`-S FORWARD`.
     IptablesDelete { target: IptablesTarget, line: String },
     /// `firewall-cmd --zone=trusted --change-interface=<ifname>` (runtime only).
@@ -245,17 +295,19 @@ pub enum Action {
     /// `firewall-cmd --zone=trusted --remove-interface=<ifname>` (runtime only).
     FirewalldUntrust { ifname: String },
     /// (Re)create table `inet wireserve-interop.<ifname>` with a forward-hook
-    /// chain holding `iifname "<ifname>" drop`, plus — only when
-    /// `forward_wanted` (this node is transit-capable, PLAN.md M23) — a
-    /// hairpin exception ahead of it: `iifname "<ifname>" oifname
-    /// "<ifname>" accept`. firewalld's zone target applies to forwarded
+    /// chain holding `iifname "<ifname>" drop`, plus exceptions ahead of
+    /// it: a hairpin one, `iifname "<ifname>" oifname "<ifname>" accept`,
+    /// for a transit-capable node (PLAN.md M23), and `iifname "<ifname>"
+    /// ct mark & M == M accept` for one forwarding to a service's target
+    /// address (PLAN.md M26). firewalld's zone target applies to forwarded
     /// traffic too, so trusting the interface would otherwise let mesh
     /// peers route through this host into its other networks. A drop is
-    /// final across all chains, so without the exception this keeps
-    /// forwarding from the mesh exactly as blocked as it was before
-    /// transit existed; with it, only traffic routed back onto this same
-    /// interface ever escapes the drop.
-    GuardCreate { ifname: String, forward_wanted: bool },
+    /// final across all chains, so without the exceptions this keeps
+    /// forwarding from the mesh exactly as blocked as it was before either
+    /// existed; with them, only traffic routed back onto this same
+    /// interface, or a flow our own table rewrote to a declared target,
+    /// ever escapes the drop.
+    GuardCreate { ifname: String, forward: ForwardWanted },
     /// Delete a guard table, given by its full name (the legacy
     /// fixed-name one included).
     GuardDelete { table: String },

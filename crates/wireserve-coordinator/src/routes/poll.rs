@@ -69,6 +69,15 @@ pub async fn poll(
         if let Err(e) = wireserve_types::validate_service_ports(&decl.port_maps()) {
             return Err(AppError::BadRequest(format!("service '{}': {e}", decl.name)));
         }
+        // A target address inside the mesh (PLAN.md M26) — the agent's
+        // `serve` refuses it too, against the ranges it pinned from here.
+        let ranges = wireserve_types::MeshRanges::parse(&state.config.mesh_info());
+        if let Some(m) = decl.ports.iter().find(|m| m.addr.is_some_and(|a| ranges.is_some_and(|r| r.contains4(a)))) {
+            return Err(AppError::BadRequest(format!(
+                "service '{}': {m} forwards to an address inside the mesh",
+                decl.name
+            )));
+        }
     }
     // S2 (security review): endpoint_addr is redistributed verbatim to
     // every other node's /poll response and into rendered .conf files —

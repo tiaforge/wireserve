@@ -244,12 +244,14 @@ hosts file.
 wireserve-agent serve openobserve 80:5080          # openobserve.wg:80 -> :5080
 wireserve-agent serve mydns 53/udp 53/tcp 8080:8000 # several ports, TCP and UDP
 wireserve-agent serve plex 32400                    # a bare port maps to itself
+wireserve-agent serve myrouter 443:192.168.178.1:80 # a device on this node's LAN, see below
 wireserve-agent list                    # what this node sees right now (--json for scripts)
 wireserve-agent unserve plex
 ```
 
-Each `PORT` is `[PUBLIC:]TARGET[/tcp|/udp]` (TCP unless given). Names are
-unique across the whole mesh, first come first served.
+Each `PORT` is `[PUBLIC:][ADDRESS:]TARGET[/tcp|/udp]` (TCP unless given;
+without an address, the target is on this node). Names are unique across the
+whole mesh, first come first served.
 
 `list` reads the daemon's cache of the last poll, no network call:
 
@@ -310,6 +312,48 @@ Upgrade every agent: an agent from before service addresses still resolves
 new services to their node's address, where their ports are now closed.
 Its own declarations keep working the old way (node address, same port)
 until it is upgraded.
+
+#### Devices on the node's network
+
+A mapping can name an IPv4 address the node reaches, such as a router,
+NAS or printer that can't run an agent itself:
+
+```sh
+wireserve-agent serve myrouter 443:192.168.178.1:80   # myrouter.wg:443 -> the router's :80
+```
+
+The node forwards `myrouter.wg:443` to `192.168.178.1:80`, and the device
+sees every connection come from the node's own LAN address. It has no route
+back into the mesh, so unlike a service on the node, **the client's address
+is not preserved**. Everything else works the same: approval, the name, only
+the published port answering, and (on 443) a reverse-proxy vhost for
+phones. What an admin approves includes the address:
+`wireserve-admin list-services` shows `443:192.168.178.1:80/tcp`. The rest
+of the mesh only ever sees `443:80/tcp`.
+
+- **IPv4 only**, and a literal address, not a hostname. A service's own
+  address is IPv4, and the kernel can't forward an IPv4 connection to an
+  IPv6 one.
+- Not loopback, and nothing inside the mesh range. A service on this node
+  is the form without an address; one on another node is that node's to
+  serve.
+- **Forwarding.** Replies arrive on the interface facing the device, and
+  Linux only forwards what arrives on an interface with forwarding on. If
+  that interface's `net.ipv4.conf.<if>.forwarding` is off and the host
+  doesn't forward globally, the agent turns it on. While it does, its own
+  table drops anything else forwarded from that interface, so the host
+  doesn't become a router for its LAN. It turns forwarding off again on
+  stop. A host that already forwards (a router, or a Docker or Podman host)
+  is left as it is.
+- **Routers that check the Host header.** Many (a FRITZ!Box among them)
+  answer only to their own name, as a defence against DNS rebinding, and
+  refuse `myrouter.wg`. The generated proxy vhost passes the client's name
+  through. For such a device, write its `handle` yourself ahead of the
+  generated `import`, with `reverse_proxy <its service address>:443` and
+  `header_up Host fritz.box` (not yet tried against a real router).
+- Before downgrading an agent to a version from before target addresses,
+  `unserve` such services: an older agent would read `443:192.168.178.1:80`
+  as its own port 80.
 
 ### 4. Add a phone or laptop
 
@@ -548,7 +592,7 @@ On a node, talking to the local daemon over a Unix socket:
 | --- | --- |
 | `wireserve-agent install <url> [--instance name]` | installs the binary + systemd unit, then joins — one command, needs root |
 | `wireserve-agent join [url] [token]` | one-time bootstrap, generates the keypair — prompts for either if omitted |
-| `wireserve-agent serve <name> <[public:]target[/tcp\|/udp]>...` | publish a service on its own address |
+| `wireserve-agent serve <name> <[public:][address:]target[/tcp\|/udp]>...` | publish a service on its own address — on this node, or on an address it reaches |
 | `wireserve-agent daemon --proxy caddy` | publish this mesh's 443 services as vhosts on the reverse proxy running here |
 | `wireserve-agent unserve <name>` | withdraw one |
 | `wireserve-agent transit on\|off` | opt in/out of carrying traffic for two other nodes that can't reach each other directly (also needs `approve-transit`) |
@@ -724,7 +768,14 @@ decides what is actually reachable:
 
 All of it is scoped to exactly the mesh interface, and only to traffic
 addressed to this host: nothing is opened on any other interface, and
-nothing is opened for forwarded or outgoing traffic. The agent keeps it in
+nothing is opened for outgoing traffic. Forwarded traffic is opened in two
+narrow cases only. A transit-capable node gets
+`iifname "wireserve0" oifname "wireserve0"` (mesh back into the mesh). A
+node serving a device on its network gets `iifname "wireserve0"` and
+`oifname "wireserve0"`, each with `ct mark & 0x01000000 == 0x01000000`
+(iptables: `-m connmark --mark 0x1000000/0x1000000`), which matches only
+connections the agent's own table rewrote to a declared target. The
+firewalld guard gets the same exceptions ahead of its drop. The agent keeps it in
 place when another tool reloads (`ufw reload`, `firewall-cmd --reload`,
 `nft -f`), usually within a second, and removes all of it on stop or
 `leave`. To see what it added:

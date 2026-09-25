@@ -11,9 +11,9 @@ use nftables::expr::{
     BinaryOperation, CTDir, Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, SetItem, CT,
 };
 use nftables::schema::{Chain, NfCmd, NfListObject, NfObject, Nftables, Rule, Table};
-use nftables::stmt::{Accept, Drop, Mangle, Match, Operator, Statement};
+use nftables::stmt::{Accept, Drop, Mangle, Match, Operator, Statement, NAT};
 use nftables::types::{NfChainPolicy, NfChainType, NfFamily, NfHook};
-use wireserve_types::{FirewallBackend, PortMap, Proto, ServiceRule, TransitEndpoint, TransitForward};
+use wireserve_types::{FirewallBackend, Forwarding, PortMap, Proto, ServiceRule, TransitEndpoint, TransitForward};
 
 use super::nft::{Nft, NftError};
 
@@ -31,6 +31,7 @@ const MARK_PRE_CHAIN: &str = "svc-mark-pre";
 const MARK_OUT_CHAIN: &str = "svc-mark-out";
 const REV_POST_CHAIN: &str = "svc-rev-post";
 const REV_IN_CHAIN: &str = "svc-rev-in";
+const MASQ_CHAIN: &str = "svc-masq";
 
 /// Before conntrack (-200): the rewrite must happen before a connection
 /// is ever tracked, so that the tracked connection is the rewritten one.
@@ -39,6 +40,8 @@ const PRIO_RAW: i32 = -300;
 const PRIO_MANGLE: i32 = -150;
 /// After source NAT (100), where a container runtime restores its reply.
 const PRIO_AFTER_NAT: i32 = 300;
+/// Source NAT itself.
+const PRIO_SRCNAT: i32 = 100;
 
 /// The packet and conntrack mark bit that says "this flow came in through
 /// a service address". One bit, always set and tested under a mask, so
@@ -256,19 +259,29 @@ fn add_mark(key: Expression<'static>) -> Statement<'static> {
     )
 }
 
+/// `<key> & MARK != MARK`: not one of ours.
+fn lacks_mark(key: Expression<'static>) -> Statement<'static> {
+    Statement::Match(Match {
+        left: Expression::BinaryOperation(Box::new(BinaryOperation::AND(key, Expression::Number(SERVICE_MARK)))),
+        right: Expression::Number(SERVICE_MARK),
+        op: Operator::NEQ,
+    })
+}
+
 fn dport_is(proto: Proto, port: u16) -> Statement<'static> {
     is(payload(l4(proto), "dport"), Expression::Number(u32::from(port)))
 }
 
 /// Marks a packet bound for a service's public port on its address and
-/// rewrites it to the target port on the node's own address, all before
-/// conntrack has seen it. Shared by the packets arriving from the mesh
-/// and the node's own (see `apply_batch`).
-fn forward_rewrite(vip: Ipv4Addr, node: Ipv4Addr, map: &PortMap) -> Vec<Statement<'static>> {
+/// rewrites it to the target port on `dest` — the node's own address, or
+/// the mapping's target address — all before conntrack has seen it.
+/// Shared by the packets arriving from the mesh and the node's own (see
+/// `apply_batch`).
+fn forward_rewrite(vip: Ipv4Addr, dest: Ipv4Addr, map: &PortMap) -> Vec<Statement<'static>> {
     vec![
         is(payload("ip", "daddr"), addr(vip)),
         dport_is(map.proto, map.public),
-        set(payload("ip", "daddr"), addr(node)),
+        set(payload("ip", "daddr"), addr(dest)),
         set(payload(l4(map.proto), "dport"), Expression::Number(u32::from(map.target))),
         add_mark(meta(MetaKey::Mark)),
     ]
@@ -277,11 +290,11 @@ fn forward_rewrite(vip: Ipv4Addr, node: Ipv4Addr, map: &PortMap) -> Vec<Statemen
 /// The way back: a reply leaving the target port of a marked flow gets
 /// the service's address and public port again, so the client sees the
 /// answer come from where it sent the request.
-fn reverse_rewrite(vip: Ipv4Addr, node: Ipv4Addr, map: &PortMap) -> Vec<Statement<'static>> {
+fn reverse_rewrite(vip: Ipv4Addr, dest: Ipv4Addr, map: &PortMap) -> Vec<Statement<'static>> {
     vec![
         is(ct("direction", None), Expression::String("reply".into())),
         has_mark(ct("mark", None)),
-        is(payload("ip", "saddr"), addr(node)),
+        is(payload("ip", "saddr"), addr(dest)),
         is(payload(l4(map.proto), "sport"), Expression::Number(u32::from(map.target))),
         set(payload("ip", "saddr"), addr(vip)),
         set(payload(l4(map.proto), "sport"), Expression::Number(u32::from(map.public))),
@@ -328,6 +341,26 @@ fn transit_forward_rules(t: &str, ifname: &str, pair: &TransitForward) -> Vec<Nf
         }
     }
     out
+}
+
+/// A mapping onto another address (PLAN.md M26) leaves the node for that
+/// address with the node's own address as its source: whatever answers
+/// there — a router, a printer — has no route back into the mesh, and would
+/// send its reply for a mesh client to its own default gateway instead.
+/// Only the first packet of a flow passes a NAT chain, and that packet
+/// still carries the mark the rewrite set. Never onto the mesh interface.
+fn masquerade(ifname: &str, dest: Ipv4Addr, map: &PortMap) -> Vec<Statement<'static>> {
+    vec![
+        has_mark(meta(MetaKey::Mark)),
+        is(payload("ip", "daddr"), addr(dest)),
+        dport_is(map.proto, map.target),
+        Statement::Match(Match {
+            left: meta(MetaKey::Oifname),
+            right: Expression::String(Cow::Owned(ifname.to_string())),
+            op: Operator::NEQ,
+        }),
+        Statement::Masquerade(None::<NAT>),
+    ]
 }
 
 fn chain(table: &str, name: &'static str, kind: NfChainType, hook: NfHook, prio: i32) -> NfObject<'static> {
@@ -390,16 +423,27 @@ fn rule(table: &str, chain: &'static str, expr: Vec<Statement<'static>>) -> NfOb
 /// Rewriting headers needs the host's own user namespace: since the
 /// "disable payload mangling in userns" hardening the kernel refuses it
 /// with EPERM anywhere else (see `NftablesError::RewriteRefused`).
-pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], transit: &[TransitForward]) -> Nftables<'static> {
+///
+/// A mapping onto another address (PLAN.md M26) goes through the same
+/// rewrite, with that address in place of the node's: the kernel then
+/// routes the rewritten request out of the host, `svc-masq` gives it the
+/// node's own source address, conntrack undoes that on the reply, and the
+/// reply rewrite matches the target address as its source. Forwarding on
+/// the interface the reply arrives on may have been turned on by the agent
+/// for this alone (`Forwarding::guarded`); the forward chain then drops
+/// everything arriving there that is not part of one of our flows.
+pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forwarding) -> Nftables<'static> {
     let name = table_name(ifname);
     let t = name.as_str();
     let mut objects: Vec<NfObject<'static>> = delete_table_cmds(t).into();
     objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Table(table(t)))));
 
+    // (service address, where it goes — the node or the mapping's own
+    // target address, the mapping)
     let mapped: Vec<(Ipv4Addr, Ipv4Addr, PortMap)> = rules
         .iter()
         .filter_map(|r| match *r {
-            ServiceRule::Mapped { vip, node, map } => Some((vip, node, map)),
+            ServiceRule::Mapped { vip, node, map } => Some((vip, map.addr.unwrap_or(node), map)),
             ServiceRule::Open { .. } => None,
         })
         .collect();
@@ -452,6 +496,20 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], transit: &[Transi
     // above never sees it. Without this chain every container port on the
     // node was reachable from the whole mesh, declared or not.
     objects.push(chain(t, FORWARD_CHAIN, NfChainType::Filter, NfHook::Forward, 0));
+    // The interfaces whose forwarding this agent turned on (PLAN.md M26):
+    // replies from a service's target address are the only thing it was
+    // turned on for. Scoped to IPv4, the only switch the agent flips; a
+    // flow of ours carries the mark in both directions, and so do ICMP
+    // errors about it, which conntrack ties to the same flow. Never the
+    // mesh interface itself, which would stop transit.
+    for lan in forwarding.guarded.iter().filter(|g| g.as_str() != ifname) {
+        objects.push(rule(t, FORWARD_CHAIN, vec![
+            iifname_is(lan),
+            is(meta(MetaKey::Nfproto), Expression::String("ipv4".into())),
+            lacks_mark(ct("mark", None)),
+            Statement::Drop(None::<Drop>),
+        ]));
+    }
     objects.push(rule(t, FORWARD_CHAIN, vec![iifname_is(ifname), established_or_related(), accept()]));
     for &(proto, port, node, node6) in &open {
         // After the runtime's DNAT the packet's own address and port are
@@ -493,7 +551,7 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], transit: &[Transi
     // family that actually has addresses on both ends (up to four for a
     // fully dual-stack pair), narrowly scoped to exactly this pair's own
     // addresses — never a blanket forward-everything rule.
-    for pair in transit {
+    for pair in &forwarding.transit {
         objects.extend(transit_forward_rules(t, ifname, pair));
     }
     objects.push(rule(t, FORWARD_CHAIN, vec![iifname_is(ifname), Statement::Drop(None::<Drop>)]));
@@ -509,9 +567,9 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], transit: &[Transi
 
     // ---- service addresses ----
     objects.push(chain(t, PRE_CHAIN, NfChainType::Filter, NfHook::Prerouting, PRIO_RAW));
-    for (vip, node, map) in &mapped {
+    for (vip, dest, map) in &mapped {
         let mut expr = vec![iifname_is(ifname)];
-        expr.extend(forward_rewrite(*vip, *node, map));
+        expr.extend(forward_rewrite(*vip, *dest, map));
         objects.push(rule(t, PRE_CHAIN, expr));
     }
     // The node's own clients. A `route` chain, so the kernel routes the
@@ -519,8 +577,8 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], transit: &[Transi
     // mesh interface (see `routes`, which routes this node's own service
     // addresses there) and is now local.
     objects.push(chain(t, OUT_CHAIN, NfChainType::Route, NfHook::Output, PRIO_RAW));
-    for (vip, node, map) in &mapped {
-        objects.push(rule(t, OUT_CHAIN, forward_rewrite(*vip, *node, map)));
+    for (vip, dest, map) in &mapped {
+        objects.push(rule(t, OUT_CHAIN, forward_rewrite(*vip, *dest, map)));
     }
     // Conntrack exists from here on: carry the packet's mark onto its flow,
     // where the filter and the reply rewrite can see it for every packet
@@ -538,8 +596,21 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], transit: &[Transi
     // clients that came back from a container.
     for (name, hook) in [(REV_POST_CHAIN, NfHook::Postrouting), (REV_IN_CHAIN, NfHook::Input)] {
         objects.push(chain(t, name, NfChainType::Filter, hook, PRIO_AFTER_NAT));
-        for (vip, node, map) in &mapped {
-            objects.push(rule(t, name, reverse_rewrite(*vip, *node, map)));
+        for (vip, dest, map) in &mapped {
+            objects.push(rule(t, name, reverse_rewrite(*vip, *dest, map)));
+        }
+    }
+    let remote: Vec<_> = rules
+        .iter()
+        .filter_map(|r| match *r {
+            ServiceRule::Mapped { map, .. } => map.addr.map(|dest| (dest, map)),
+            ServiceRule::Open { .. } => None,
+        })
+        .collect();
+    if !remote.is_empty() {
+        objects.push(chain(t, MASQ_CHAIN, NfChainType::NAT, NfHook::Postrouting, PRIO_SRCNAT));
+        for (dest, map) in &remote {
+            objects.push(rule(t, MASQ_CHAIN, masquerade(ifname, *dest, map)));
         }
     }
 
@@ -574,8 +645,8 @@ impl FirewallBackend for NftablesBackend {
     /// rules and transit forwarding pairs (PLAN.md M23) apply together, in
     /// the same transaction, so a mid-cycle failure can never leave them
     /// disagreeing about which cycle they reflect.
-    fn apply(&mut self, rules: &[ServiceRule], transit: &[TransitForward]) -> Result<(), Self::Error> {
-        let batch = apply_batch(&self.ifname, rules, transit);
+    fn apply(&mut self, rules: &[ServiceRule], forwarding: &Forwarding) -> Result<(), Self::Error> {
+        let batch = apply_batch(&self.ifname, rules, forwarding);
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         match self.nft.apply(&batch) {
             Ok(()) => {
@@ -609,6 +680,10 @@ mod tests {
 
     const NODE: Ipv4Addr = Ipv4Addr::new(100, 90, 0, 2);
     const VIP: Ipv4Addr = Ipv4Addr::new(100, 90, 0, 50);
+
+    fn fwd(transit: &[TransitForward]) -> Forwarding {
+        Forwarding { transit: transit.to_vec(), guarded: vec![] }
+    }
 
     fn as_json(batch: &Nftables<'_>) -> Value {
         serde_json::to_value(batch).unwrap()
@@ -694,7 +769,7 @@ mod tests {
         let mut expected = prelude();
         expected.push(rule_json(json!([iif("wg0"), {"drop": null}])));
         expected.extend(forward(vec![]));
-        assert_eq!(as_json(&apply_batch("wg0", &[], &[])), json!({ "nftables": expected }));
+        assert_eq!(as_json(&apply_batch("wg0", &[], &fwd(&[]))), json!({ "nftables": expected }));
     }
 
     #[test]
@@ -734,7 +809,7 @@ mod tests {
                 {"accept": null}
             ])),
         ]));
-        assert_eq!(as_json(&apply_batch("wg0", &rules, &[])), json!({ "nftables": expected }));
+        assert_eq!(as_json(&apply_batch("wg0", &rules, &fwd(&[]))), json!({ "nftables": expected }));
     }
 
     #[test]
@@ -752,7 +827,7 @@ mod tests {
             rule_in("wireserve-fwd", json!([iif("wg0"), l4, ct_original_daddr_is("ip", &node), proto_dst, {"accept": null}])),
             rule_in("wireserve-fwd", json!([iif("wg0"), l4, ct_original_daddr_is("ip6", NODE6), proto_dst, {"accept": null}])),
         ]));
-        assert_eq!(as_json(&apply_batch("wg0", &rules, &[])), json!({ "nftables": expected }));
+        assert_eq!(as_json(&apply_batch("wg0", &rules, &fwd(&[]))), json!({ "nftables": expected }));
     }
 
     fn endpoint4(ip: &str, vips: &[&str]) -> TransitEndpoint {
@@ -781,7 +856,7 @@ mod tests {
                 {"accept": null}
             ])),
         ]));
-        assert_eq!(as_json(&apply_batch("wg0", &[], &[pair])), json!({ "nftables": expected }));
+        assert_eq!(as_json(&apply_batch("wg0", &[], &fwd(&[pair]))), json!({ "nftables": expected }));
     }
 
     #[test]
@@ -790,7 +865,7 @@ mod tests {
             near: TransitEndpoint { ip4: None, ip6: Some("fd00:90::10".parse().unwrap()), vips: vec![] },
             far: TransitEndpoint { ip4: None, ip6: Some("fd00:90::20".parse().unwrap()), vips: vec![] },
         };
-        let batch = as_json(&apply_batch("wg0", &[], &[pair])).to_string();
+        let batch = as_json(&apply_batch("wg0", &[], &fwd(&[pair]))).to_string();
         assert!(batch.contains("\"protocol\":\"ip6\""), "{batch}");
         assert!(!batch.contains("\"protocol\":\"ip\""), "{batch}");
     }
@@ -807,17 +882,17 @@ mod tests {
             near: endpoint4("100.90.0.10", &[]),
             far: TransitEndpoint { ip4: Some("100.90.0.20".parse().unwrap()), ip6: Some("fd00:90::20".parse().unwrap()), vips: vec![] },
         };
-        let batch = as_json(&apply_batch("wg0", &[], &[pair])).to_string();
+        let batch = as_json(&apply_batch("wg0", &[], &fwd(&[pair]))).to_string();
         assert!(!batch.contains("ip6"), "{batch}");
     }
 
     #[test]
     fn no_transit_pairs_is_byte_for_byte_unchanged_from_before_the_feature() {
-        assert_eq!(apply_batch("wg0", &[], &[]), apply_batch("wg0", &[], &[]));
+        assert_eq!(apply_batch("wg0", &[], &fwd(&[])), apply_batch("wg0", &[], &fwd(&[])));
         let mut expected = prelude();
         expected.push(rule_json(json!([iif("wg0"), {"drop": null}])));
         expected.extend(forward(vec![]));
-        assert_eq!(as_json(&apply_batch("wg0", &[], &[])), json!({ "nftables": expected }));
+        assert_eq!(as_json(&apply_batch("wg0", &[], &fwd(&[]))), json!({ "nftables": expected }));
     }
 
     fn has_mark(key: Value) -> Value {
@@ -834,7 +909,7 @@ mod tests {
 
     #[test]
     fn a_mapped_service_gets_the_rewrite_in_both_directions() {
-        let batch = as_json(&apply_batch("wg0", &[mapped("80:5080")], &[]));
+        let batch = as_json(&apply_batch("wg0", &[mapped("80:5080")], &fwd(&[])));
         let objects = batch["nftables"].as_array().unwrap();
         let rules_of = |chain: &str| -> Vec<Value> {
             objects
@@ -910,9 +985,88 @@ mod tests {
         assert!(!fwd.iter().any(|r| r.to_string().contains("5080")), "{fwd:?}");
     }
 
+    fn rules_in(batch: &Value, chain: &str) -> Vec<Value> {
+        batch["nftables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o.pointer("/add/rule"))
+            .filter(|r| r["chain"] == chain)
+            .map(|r| r["expr"].clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_mapping_onto_another_address_rewrites_to_it_and_masquerades() {
+        let batch = as_json(&apply_batch("wg0", &[mapped("443:192.168.178.1:80"), mapped("8080:5080")], &fwd(&[])));
+        let meta_mark = json!({"meta": {"key": "mark"}});
+        assert_eq!(
+            rules_in(&batch, "svc-pre")[0],
+            json!([
+                iif("wg0"),
+                {"match": {"op": "==", "left": field("ip", "daddr"), "right": "100.90.0.50"}},
+                {"match": {"op": "==", "left": field("tcp", "dport"), "right": 443}},
+                mangle(field("ip", "daddr"), json!("192.168.178.1")),
+                mangle(field("tcp", "dport"), json!(80)),
+                mangle(meta_mark.clone(), json!({"|": [meta_mark, SERVICE_MARK]})),
+            ])
+        );
+        // The node-local mapping beside it still goes to the node.
+        assert!(rules_in(&batch, "svc-pre")[1].to_string().contains(r#""value":"100.90.0.2""#));
+        assert!(rules_in(&batch, "svc-rev-post")[0]
+            .to_string()
+            .contains(r#"{"match":{"left":{"payload":{"field":"saddr","protocol":"ip"}},"op":"==","right":"192.168.178.1"}}"#));
+
+        // Only the remote one is masqueraded, only its first packet (still
+        // marked), and never out of the mesh interface.
+        assert_eq!(
+            rules_in(&batch, "svc-masq"),
+            [json!([
+                has_mark(json!({"meta": {"key": "mark"}})),
+                {"match": {"op": "==", "left": field("ip", "daddr"), "right": "192.168.178.1"}},
+                {"match": {"op": "==", "left": field("tcp", "dport"), "right": 80}},
+                {"match": {"op": "!=", "left": {"meta": {"key": "oifname"}}, "right": "wg0"}},
+                {"masquerade": null},
+            ])]
+        );
+        let chain = batch["nftables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o.pointer("/add/chain"))
+            .find(|c| c["name"] == "svc-masq")
+            .unwrap();
+        assert_eq!((&chain["type"], &chain["hook"], &chain["prio"]), (&json!("nat"), &json!("postrouting"), &json!(100)));
+    }
+
+    #[test]
+    fn only_a_mapping_onto_another_address_gets_a_masquerade_chain() {
+        let batch = as_json(&apply_batch("wg0", &[mapped("80:5080")], &fwd(&[]))).to_string();
+        assert!(!batch.contains("svc-masq") && !batch.contains("masquerade"), "{batch}");
+    }
+
+    #[test]
+    fn a_guarded_interface_forwards_only_our_own_flows() {
+        let forwarding = Forwarding { transit: vec![], guarded: vec!["eth0".into(), "wg0".into()] };
+        let batch = as_json(&apply_batch("wg0", &[mapped("443:192.168.178.1:80")], &forwarding));
+        let fwd_rules = rules_in(&batch, "wireserve-fwd");
+        assert_eq!(
+            fwd_rules[0],
+            json!([
+                iif("eth0"),
+                {"match": {"op": "==", "left": {"meta": {"key": "nfproto"}}, "right": "ipv4"}},
+                {"match": {"op": "!=", "left": {"&": [{"ct": {"key": "mark"}}, SERVICE_MARK]}, "right": SERVICE_MARK}},
+                {"drop": null},
+            ])
+        );
+        // Never the mesh interface: that would drop every transit flow.
+        assert_eq!(fwd_rules[1], json!([iif("wg0"), established(), {"accept": null}]));
+        assert!(!fwd_rules.iter().any(|r| r[0] == iif("wg0") && r.to_string().contains(r#""op":"!=""#)));
+    }
+
     #[test]
     fn without_a_mapped_service_there_are_no_rewrite_chains() {
-        let batch = as_json(&apply_batch("wg0", &[open(Proto::Tcp, 22)], &[])).to_string();
+        let batch = as_json(&apply_batch("wg0", &[open(Proto::Tcp, 22)], &fwd(&[]))).to_string();
         assert!(!batch.contains("svc-") && !batch.contains("mangle"), "{batch}");
     }
 
@@ -924,7 +1078,7 @@ mod tests {
         // flow, one of our own marked flows, or name its destination.
         let open6 = ServiceRule::Open { proto: Proto::Udp, port: 53, node: NODE, node6: Some(NODE6.parse().unwrap()) };
         let pair = TransitForward { near: endpoint4("100.90.0.10", &[]), far: endpoint4("100.90.0.20", &[]) };
-        let batch = as_json(&apply_batch("wg0", &[open(Proto::Tcp, 22), open6, mapped("80:5080")], &[pair]));
+        let batch = as_json(&apply_batch("wg0", &[open(Proto::Tcp, 22), open6, mapped("80:5080")], &fwd(&[pair])));
         let forward: Vec<&Value> = batch["nftables"]
             .as_array()
             .unwrap()
@@ -954,9 +1108,9 @@ mod tests {
         // arrive on it, and replies leave on whatever interface. They're
         // scoped instead to what only this agent produces — its own
         // service address as destination, or its own mark.
-        let rules = [open(Proto::Tcp, 22), mapped("80:5080"), mapped("53:5353/udp")];
+        let rules = [open(Proto::Tcp, 22), mapped("80:5080"), mapped("53:5353/udp"), mapped("443:192.168.178.1:80")];
         for ifname in ["wg0", "wireserve0", "wg-mesh.1"] {
-            let batch = as_json(&apply_batch(ifname, &rules, &[]));
+            let batch = as_json(&apply_batch(ifname, &rules, &fwd(&[])));
             let rules: Vec<&Value> = batch["nftables"]
                 .as_array()
                 .unwrap()
@@ -968,6 +1122,7 @@ mod tests {
                 let text = r["expr"].to_string();
                 let ok = match r["chain"].as_str().unwrap() {
                     "wireserve-in" | "wireserve-fwd" | "svc-pre" => *first == iif(ifname),
+                    "svc-masq" => text.contains(&format!(r#""&":[{{"meta":{{"key":"mark"}}}},{SERVICE_MARK}]"#)),
                     "svc-out" => text.starts_with(r#"[{"match":{"left":{"payload":{"field":"daddr","protocol":"ip"}},"op":"==","right":"100.90.0.50"}}"#),
                     "svc-mark-pre" | "svc-mark-out" | "svc-rev-post" | "svc-rev-in" => {
                         text.contains(&format!(r#""&":[{{"meta":{{"key":"mark"}}}},{SERVICE_MARK}]"#))
@@ -984,7 +1139,8 @@ mod tests {
     fn the_mark_is_only_ever_or_ed_in_and_tested_under_its_mask() {
         // Other software uses the packet and conntrack marks too; this
         // agent must never overwrite or compare their bits.
-        let batch = as_json(&apply_batch("wg0", &[mapped("80:5080")], &[]));
+        let forwarding = Forwarding { transit: vec![], guarded: vec!["eth0".into()] };
+        let batch = as_json(&apply_batch("wg0", &[mapped("80:5080"), mapped("443:192.168.178.1:80")], &forwarding));
         for r in batch["nftables"].as_array().unwrap().iter().filter_map(|o| o.pointer("/add/rule")) {
             for stmt in r["expr"].as_array().unwrap() {
                 let text = stmt.to_string();
@@ -1033,7 +1189,7 @@ mod tests {
 
     #[test]
     fn kernel_accepts_apply_and_renders_the_expected_ruleset() {
-        let script = nft_script(&[apply_batch("wg0", &[open(Proto::Tcp, 32400)], &[])]) + "nft list table inet wireserve.wg0";
+        let script = nft_script(&[apply_batch("wg0", &[open(Proto::Tcp, 32400)], &fwd(&[]))]) + "nft list table inet wireserve.wg0";
         let Some(listing) = crate::firewall::netns::run(&script) else {
             return;
         };
@@ -1061,7 +1217,7 @@ mod tests {
     #[test]
     fn kernel_accepts_an_open_service_scoped_to_both_mesh_addresses() {
         let rules = [ServiceRule::Open { proto: Proto::Udp, port: 53, node: NODE, node6: Some(NODE6.parse().unwrap()) }];
-        let script = nft_script(&[apply_batch("wg0", &rules, &[])]) + "nft list table inet wireserve.wg0";
+        let script = nft_script(&[apply_batch("wg0", &rules, &fwd(&[]))]) + "nft list table inet wireserve.wg0";
         let Some(listing) = crate::firewall::netns::run(&script) else {
             return;
         };
@@ -1082,7 +1238,7 @@ mod tests {
             near: endpoint4("100.90.0.10", &["100.90.0.50"]),
             far: endpoint4("100.90.0.20", &[]),
         };
-        let script = nft_script(&[apply_batch("wg0", &[], &[pair])]) + "nft list table inet wireserve.wg0";
+        let script = nft_script(&[apply_batch("wg0", &[], &fwd(&[pair]))]) + "nft list table inet wireserve.wg0";
         let Some(listing) = crate::firewall::netns::run(&script) else {
             return;
         };
@@ -1115,8 +1271,9 @@ mod tests {
     /// root (`sudo -E cargo test`, or CI) the whole listing is checked.
     #[test]
     fn kernel_accepts_the_service_address_chains() {
-        let rules = [mapped("80:5080"), mapped("53:5353/udp")];
-        let batch = serde_json::to_string(&apply_batch("wg0", &rules, &[])).unwrap();
+        let rules = [mapped("80:5080"), mapped("53:5353/udp"), mapped("443:192.168.178.1:80")];
+        let forwarding = Forwarding { transit: vec![], guarded: vec!["eth0".into()] };
+        let batch = serde_json::to_string(&apply_batch("wg0", &rules, &forwarding)).unwrap();
         let script = format!("nft -j -f - <<'JSON' || true\n{batch}\nJSON\nnft list ruleset");
         let Some((listing, stderr)) = crate::firewall::netns::run_capturing(&script) else {
             return;
@@ -1145,12 +1302,51 @@ mod tests {
         has(&format!("iifname \"wg0\" ct mark & {m} == {m} accept"));
         has(&format!("ct direction reply ct mark & {m} == {m} ip saddr 100.90.0.2 tcp sport 5080 ip saddr set 100.90.0.50 tcp sport set 80"));
         has(&format!("ct direction reply ct mark & {m} == {m} ip saddr 100.90.0.2 udp sport 5353 ip saddr set 100.90.0.50 udp sport set 53"));
+        has(&format!("iifname \"wg0\" ip daddr 100.90.0.50 tcp dport 443 ip daddr set 192.168.178.1 tcp dport set 80 meta mark set meta mark | {m}"));
+        has(&format!("ct direction reply ct mark & {m} == {m} ip saddr 192.168.178.1 tcp sport 80 ip saddr set 100.90.0.50 tcp sport set 443"));
+        has("type nat hook postrouting priority srcnat; policy accept;");
+        has(&format!("meta mark & {m} == {m} ip daddr 192.168.178.1 tcp dport 80 oifname != \"wg0\" masquerade"));
+        has(&format!("iifname \"eth0\" meta nfproto ipv4 ct mark & {m} != {m} drop"));
+    }
+
+    /// The masquerade and the guard rewrite nothing, so unlike the chains
+    /// above the kernel takes them in an unprivileged namespace too.
+    #[test]
+    fn kernel_accepts_the_masquerade_and_the_guard() {
+        let rules = [mapped("443:192.168.178.1:80")];
+        let forwarding = Forwarding { transit: vec![], guarded: vec!["eth0".into()] };
+        let mut batch = apply_batch("wg0", &rules, &forwarding);
+        // Drop the rewriting chains' rules, which need the host's user
+        // namespace; what is left must all be accepted.
+        batch.objects = batch
+            .objects
+            .iter()
+            .filter(|o| {
+                let text = serde_json::to_string(o).unwrap();
+                !(text.contains("\"rule\"") && text.contains("mangle"))
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        let script = nft_script(&[batch]) + "nft list table inet wireserve.wg0";
+        let Some(listing) = crate::firewall::netns::run(&script) else {
+            return;
+        };
+        let lines = normalised_lines(&listing);
+        let m = format!("0x{SERVICE_MARK:08x}");
+        for want in [
+            "type nat hook postrouting priority srcnat; policy accept;".to_string(),
+            format!("meta mark & {m} == {m} ip daddr 192.168.178.1 tcp dport 80 oifname != \"wg0\" masquerade"),
+            format!("iifname \"eth0\" meta nfproto ipv4 ct mark & {m} != {m} drop"),
+        ] {
+            assert!(lines.contains(&want), "missing `{want}` in:\n{listing}");
+        }
     }
 
     #[test]
     fn kernel_apply_twice_replaces_rather_than_accumulates() {
         let tcp = |port| open(Proto::Tcp, port);
-        let script = nft_script(&[apply_batch("wg0", &[tcp(1)], &[]), apply_batch("wg0", &[tcp(2)], &[])])
+        let script = nft_script(&[apply_batch("wg0", &[tcp(1)], &fwd(&[])), apply_batch("wg0", &[tcp(2)], &fwd(&[]))])
             + "nft list table inet wireserve.wg0";
         let Some(listing) = crate::firewall::netns::run(&script) else {
             return;
@@ -1167,7 +1363,7 @@ mod tests {
         // after apply must leave nothing behind.
         let script = nft_script(&[
             teardown_batch("wireserve.wg0"),
-            apply_batch("wg0", &[], &[]),
+            apply_batch("wg0", &[], &fwd(&[])),
             teardown_batch("wireserve.wg0"),
         ])
             + "nft list ruleset";
@@ -1180,7 +1376,7 @@ mod tests {
     #[test]
     fn every_interface_gets_its_own_table() {
         for ifname in ["wg0", "wireserve1"] {
-            let batch = as_json(&apply_batch(ifname, &[mapped("80:5080")], &[]));
+            let batch = as_json(&apply_batch(ifname, &[mapped("80:5080")], &fwd(&[])));
             for object in batch["nftables"].as_array().unwrap() {
                 let body = object.get("add").or_else(|| object.get("delete")).unwrap();
                 let table = match body.get("table") {
@@ -1196,9 +1392,9 @@ mod tests {
     fn kernel_two_interfaces_keep_separate_tables() {
         let tcp = |port| open(Proto::Tcp, port);
         let script = nft_script(&[
-            apply_batch("wireserve0", &[tcp(1)], &[]),
-            apply_batch("wireserve1", &[tcp(2)], &[]),
-            apply_batch("wireserve0", &[tcp(3)], &[]),
+            apply_batch("wireserve0", &[tcp(1)], &fwd(&[])),
+            apply_batch("wireserve1", &[tcp(2)], &fwd(&[])),
+            apply_batch("wireserve0", &[tcp(3)], &fwd(&[])),
             teardown_batch("wireserve.wireserve0"),
         ]) + "nft list ruleset";
         let Some(listing) = crate::firewall::netns::run(&script) else {
