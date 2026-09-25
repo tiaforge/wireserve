@@ -14,7 +14,7 @@ use reqwest::StatusCode;
 use wireserve_types::{
     AdminPeersResponse, AdminServicesResponse, CreateNodeRequest, CreateNodeResponse,
     DenyServiceRequest, ErrorBody, NodeKind, RegisterRequest, RegisterResponse, RejoinRequest, SetGatewayRequest,
-    RejoinResponse,
+    RejoinResponse, SetViaGatewayRequest, SetViaGatewayResponse,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -178,6 +178,18 @@ impl AdminClient {
             .send()?;
         Self::check_status(resp)?;
         Ok(())
+    }
+
+    /// `PUT /admin/nodes/{name}/via-gateway` (PLAN.md #134) — whether devices
+    /// exported with a gateway reach this node through it.
+    pub fn set_via_gateway(&self, name: &str, enabled: bool) -> Result<SetViaGatewayResponse, ClientError> {
+        let resp = self
+            .http
+            .put(self.url(&format!("/admin/nodes/{name}/via-gateway")))
+            .bearer_auth(&self.admin_token)
+            .json(&SetViaGatewayRequest { enabled })
+            .send()?;
+        Ok(Self::check_status(resp)?.json()?)
     }
 
     /// `GET /admin/services` — every declared service and its approval

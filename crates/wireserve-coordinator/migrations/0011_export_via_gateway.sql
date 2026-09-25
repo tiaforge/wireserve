@@ -1,0 +1,16 @@
+-- Nodes a static peer must reach through its gateway (PLAN.md M24 follow-up).
+--
+-- Set by an admin (`wireserve-admin via-gateway <node> on|off`) for a node
+-- that advertises a publicly routable endpoint but accepts no inbound
+-- WireGuard — a home router that firewalls IPv6, a v4 address with no port
+-- forward. `export-config` would otherwise write such a node into a phone's
+-- .conf as a direct `[Peer]`, and WireGuard has no failover: that /32 wins
+-- over the gateway's covering route whether or not the node answers.
+--
+-- Read by `export-config` and nothing else. It never reaches `PeerInfo`, so
+-- agents, `/poll`'s routing and transit selection do not know it exists; the
+-- routing follows from the `static_conf_peers` membership the export records.
+--
+-- Kept across revoke and rejoin, like `gateway_node_id`: it describes the
+-- node's network, not the key it holds.
+ALTER TABLE nodes ADD COLUMN export_via_gateway INTEGER NOT NULL DEFAULT 0;

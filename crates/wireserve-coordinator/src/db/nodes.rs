@@ -45,6 +45,12 @@ pub struct NodeRow {
     /// anything not written directly into its `.conf` (PLAN.md M24). `None`
     /// for every agent node and for a static peer exported without one.
     pub gateway_node_id: Option<i64>,
+    /// An admin's statement that nothing outside the mesh can dial this node,
+    /// whatever endpoint it advertises (PLAN.md #134). Read by `export-config`
+    /// only: a device exported with a gateway reaches this node through it
+    /// instead of holding a direct `[Peer]` for it. Deliberately absent from
+    /// `PeerInfo`, so no agent ever sees it.
+    pub export_via_gateway: bool,
 }
 
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
@@ -69,6 +75,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
         last_seen: last_seen_str.and_then(|s| parse_dt(&s)),
         transit_approved: row.get::<_, Option<String>>("transit_approved_at")?.is_some(),
         gateway_node_id: row.get("gateway_node_id")?,
+        export_via_gateway: row.get("export_via_gateway")?,
     })
 }
 
@@ -434,6 +441,50 @@ pub fn set_gateway(
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Sets or clears [`NodeRow::export_via_gateway`]. Idempotent.
+///
+/// Left alone by `revoke` and `reissue_join_token`: whether the node can be
+/// dialled from outside is a fact about its network, not about its key.
+pub fn set_export_via_gateway(conn: &Connection, node_id: i64, enabled: bool) -> Result<(), DbError> {
+    conn.execute(
+        "UPDATE nodes SET export_via_gateway = ?1 WHERE id = ?2",
+        rusqlite::params![enabled, node_id],
+    )?;
+    Ok(())
+}
+
+/// The static peers whose `.conf` a refresh would change after
+/// [`set_export_via_gateway`] flips to `enabled` for `node_id`, by name.
+///
+/// Turning it on affects every device with a gateway that holds `node_id` as
+/// a direct `[Peer]` (a device without a gateway has no other way to reach it,
+/// so its export keeps the direct entry). Turning it off affects every device that routes through a
+/// gateway and does *not* hold one, since its next export would add it — but
+/// only the first group is broken meanwhile; the second keeps working through
+/// the gateway until it is refreshed.
+pub fn static_nodes_affected_by_via_gateway(
+    conn: &Connection,
+    node_id: i64,
+    enabled: bool,
+) -> Result<Vec<String>, DbError> {
+    let sql = if enabled {
+        "SELECT n.name FROM nodes n \
+         JOIN static_conf_peers c ON c.static_node_id = n.id \
+         WHERE c.peer_node_id = ?1 AND n.gateway_node_id IS NOT NULL ORDER BY n.name"
+    } else {
+        "SELECT n.name FROM nodes n \
+         WHERE n.kind = 'static' AND n.gateway_node_id IS NOT NULL AND n.gateway_node_id != ?1 \
+         AND NOT EXISTS (SELECT 1 FROM static_conf_peers c \
+                         WHERE c.static_node_id = n.id AND c.peer_node_id = ?1) \
+         ORDER BY n.name"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt
+        .query_map([node_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// Every `(static_node_id, peer_node_id)` pair recorded by [`set_gateway`].
@@ -943,6 +994,53 @@ mod tests {
         revoke(&conn, id).unwrap();
 
         assert!(!find_by_id(&conn, id).unwrap().unwrap().transit_approved);
+    }
+
+    #[tokio::test]
+    async fn export_via_gateway_is_off_by_default_and_survives_revoke_and_rejoin() {
+        let db = test_db();
+        let conn = db.conn.lock().await;
+        let id = create_node(&conn, "n1", NodeKind::Agent, "joinhash1", None).unwrap();
+        register(&conn, id, "pk1", "bearer1");
+        assert!(!find_by_id(&conn, id).unwrap().unwrap().export_via_gateway);
+
+        set_export_via_gateway(&conn, id, true).unwrap();
+        set_export_via_gateway(&conn, id, true).unwrap();
+        assert!(find_by_id(&conn, id).unwrap().unwrap().export_via_gateway);
+
+        // Whether the node can be dialled from outside is about its network,
+        // not its key: neither a new key nor a revoke changes that.
+        reissue_join_token(&conn, id, "joinhash2", None).unwrap();
+        assert!(find_by_id(&conn, id).unwrap().unwrap().export_via_gateway);
+        revoke(&conn, id).unwrap();
+        assert!(find_by_id(&conn, id).unwrap().unwrap().export_via_gateway);
+
+        set_export_via_gateway(&conn, id, false).unwrap();
+        set_export_via_gateway(&conn, id, false).unwrap();
+        assert!(!find_by_id(&conn, id).unwrap().unwrap().export_via_gateway);
+    }
+
+    #[tokio::test]
+    async fn via_gateway_names_the_devices_a_refresh_would_change() {
+        let db = test_db();
+        let mut conn = db.conn.lock().await;
+        let gw = create_node(&conn, "gw", NodeKind::Agent, "h-gw", None).unwrap();
+        let home = create_node(&conn, "home", NodeKind::Agent, "h-home", None).unwrap();
+        let dials = create_node(&conn, "dials-home", NodeKind::Static, "h-p1", None).unwrap();
+        let routed = create_node(&conn, "routed", NodeKind::Static, "h-p2", None).unwrap();
+        let no_gw = create_node(&conn, "no-gateway", NodeKind::Static, "h-p3", None).unwrap();
+        set_gateway(&mut conn, dials, Some(gw), &[home]).unwrap();
+        set_gateway(&mut conn, routed, Some(gw), &[]).unwrap();
+        set_gateway(&mut conn, no_gw, None, &[gw, home]).unwrap();
+
+        // On: only a device that both dials `home` and has a gateway to fall
+        // back on. The gateway-less one keeps its direct entry regardless.
+        assert_eq!(static_nodes_affected_by_via_gateway(&conn, home, true).unwrap(), vec!["dials-home"]);
+        // Off: devices that reach `home` through a gateway today and would
+        // get a direct entry on their next export.
+        assert_eq!(static_nodes_affected_by_via_gateway(&conn, home, false).unwrap(), vec!["routed"]);
+        // A device's own gateway is never a direct entry to add or remove.
+        assert!(static_nodes_affected_by_via_gateway(&conn, gw, false).unwrap().is_empty());
     }
 
     #[tokio::test]

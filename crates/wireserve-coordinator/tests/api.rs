@@ -3203,3 +3203,84 @@ async fn a_gateway_that_never_switched_transit_on_is_refused_with_an_actionable_
     let msg = body["error"].as_str().unwrap_or_default();
     assert!(msg.contains("transit on"), "must say what to do: {body}");
 }
+
+async fn set_via_gateway(router: &Router, node: &str, enabled: bool) -> (StatusCode, Value) {
+    let req = json_request(
+        "PUT",
+        &format!("/admin/nodes/{node}/via-gateway"),
+        Some(ADMIN),
+        json!({ "enabled": enabled }),
+    );
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, body_json(resp).await)
+}
+
+async fn via_gateway_listed(router: &Router) -> Value {
+    let req = json_request("GET", "/admin/peers", Some(ADMIN), json!({}));
+    let resp = router.clone().oneshot(req).await.unwrap();
+    body_json(resp).await["via_gateway"].clone()
+}
+
+#[tokio::test]
+async fn via_gateway_names_the_devices_that_still_dial_the_node_directly() {
+    let app = test_app();
+    let (_gw, direct, _behind) = gateway_scenario(&app).await;
+
+    let (status, body) = set_via_gateway(&app.router, "direct", true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["affected_devices"], json!(["phone"]), "{body}");
+    assert_eq!(via_gateway_listed(&app.router).await, json!(["direct"]));
+
+    // The flag shapes the next export and nothing else: until the phone is
+    // re-exported its config still holds `direct`, so routing must not move.
+    let (_, poll) = poll_full(&app.router, &direct, json!({})).await;
+    assert_eq!(transit_via_for(&poll, "phone"), None, "{poll}");
+
+    // What the refreshed export records: `direct` left out of the conf.
+    let req = json_request(
+        "PUT",
+        "/admin/nodes/phone/gateway",
+        Some(ADMIN),
+        json!({ "gateway": "gw", "conf_peers": [] }),
+    );
+    assert_eq!(app.router.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    let (_, poll) = poll_full(&app.router, &direct, json!({})).await;
+    assert_eq!(transit_via_for(&poll, "phone").as_deref(), Some(pubkey_for("gw").as_str()), "{poll}");
+}
+
+#[tokio::test]
+async fn turning_via_gateway_off_names_the_devices_a_refresh_would_make_direct() {
+    let app = test_app();
+    gateway_scenario(&app).await;
+    set_via_gateway(&app.router, "behind-nat", true).await;
+
+    let (status, body) = set_via_gateway(&app.router, "behind-nat", false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["affected_devices"], json!(["phone"]), "{body}");
+    assert_eq!(via_gateway_listed(&app.router).await, Value::Null, "an empty list is omitted");
+}
+
+#[tokio::test]
+async fn via_gateway_on_a_devices_own_gateway_names_that_device() {
+    // The device dials its gateway directly by necessity, so this says its
+    // config is already broken; the flag is still recorded.
+    let app = test_app();
+    gateway_scenario(&app).await;
+
+    let (status, body) = set_via_gateway(&app.router, "gw", true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["affected_devices"], json!(["phone"]), "{body}");
+    assert_eq!(via_gateway_listed(&app.router).await, json!(["gw"]));
+}
+
+#[tokio::test]
+async fn via_gateway_is_refused_where_it_cannot_mean_anything() {
+    let app = test_app();
+    gateway_scenario(&app).await;
+
+    let (status, _) = set_via_gateway(&app.router, "nope", true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = set_via_gateway(&app.router, "phone", true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "nothing dials a static peer");
+}

@@ -98,6 +98,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0008_reflexive_addr.sql")),
         M::up(include_str!("../../migrations/0009_transit_approval.sql")),
         M::up(include_str!("../../migrations/0010_static_peer_gateway.sql")),
+        M::up(include_str!("../../migrations/0011_export_via_gateway.sql")),
     ])
 }
 
@@ -387,6 +388,27 @@ mod tests {
         let row = crate::db::nodes::find_by_name(&conn, "phone").unwrap().unwrap();
         assert!(row.gateway_node_id.is_none());
         assert!(crate::db::nodes::all_static_conf_peers(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn migration_leaves_every_existing_node_dialable_directly() {
+        // An existing .conf was rendered with this node as a direct peer if it
+        // had a routable endpoint; the upgrade must not change what the next
+        // export writes until an admin says so.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        migrations().to_version(&mut conn, 10).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (name, kind, pubkey, ip4, ip6, join_token_used) \
+             VALUES ('n1', 'agent', 'pk1', '100.90.0.1', 'fd00:90::1', 1)",
+            [],
+        )
+        .unwrap();
+
+        migrations().to_latest(&mut conn).unwrap();
+
+        let row = crate::db::nodes::find_by_name(&conn, "n1").unwrap().unwrap();
+        assert!(!row.export_via_gateway);
     }
 
     #[test]

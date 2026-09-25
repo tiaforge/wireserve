@@ -223,6 +223,27 @@ fn transit_approval_targets_the_named_node() {
 }
 
 #[test]
+fn via_gateway_targets_the_named_node_and_returns_the_devices_to_refresh() {
+    let mock = MockCoordinator::start(TOKEN);
+    let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
+
+    let on = wireserve_admin::cmd_set_via_gateway(&client, "minipc", true).unwrap();
+    wireserve_admin::cmd_set_via_gateway(&client, "minipc", false).unwrap();
+    assert!(wireserve_admin::cmd_set_via_gateway(&client, "../peers", true).is_err());
+
+    assert_eq!(on.affected_devices, vec!["phone".to_string()]);
+    assert_eq!(
+        mock.paths(),
+        vec![
+            "/admin/nodes/minipc/via-gateway".to_string(),
+            "/admin/nodes/minipc/via-gateway".to_string(),
+        ]
+    );
+    assert!(mock.bodies()[0].contains("\"enabled\":true"), "{:?}", mock.bodies());
+    assert!(mock.bodies()[1].contains("\"enabled\":false"), "{:?}", mock.bodies());
+}
+
+#[test]
 fn deny_service_sends_the_reason_in_the_body() {
     let mock = MockCoordinator::start(TOKEN);
     let client = AdminClient::new(mock.base_url.as_str(), TOKEN);

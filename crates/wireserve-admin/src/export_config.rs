@@ -35,6 +35,12 @@ pub enum ExportConfigError {
     )]
     GatewayNotReachable { name: String },
     #[error(
+        "'{name}' is marked as not dialable from outside the mesh (`wireserve-admin via-gateway \
+         {name} on`), and a device must dial its gateway directly. Pick another gateway, or \
+         clear the mark with `wireserve-admin via-gateway {name} off` if it is reachable now."
+    )]
+    GatewayNotDialable { name: String },
+    #[error(
         "several nodes could be the gateway ({names}) — name one with --gateway, since the \
          choice is baked into the config and cannot be changed without re-exporting"
     )]
@@ -91,6 +97,12 @@ pub struct RenderedConf {
 pub struct Gateway<'a> {
     pub peer: &'a PeerInfo,
     pub ranges: wireserve_types::MeshRanges,
+    /// Nodes an admin marked as not dialable from outside
+    /// (`wireserve-admin via-gateway`, PLAN.md #134). Reached through the
+    /// gateway whatever endpoint they advertise. Meaningless without a
+    /// gateway — there is no other way to reach them then — which is why it
+    /// lives here rather than beside `peers`.
+    pub via_gateway: &'a [String],
 }
 
 #[must_use]
@@ -137,6 +149,10 @@ pub fn render_conf(
             // /32 that outranks the gateway's covering route and black-holes
             // the moment the device leaves that LAN.
             (Some(e), Some(_)) if !wireserve_types::is_globally_routable_endpoint(e) => continue,
+            // An endpoint that is routable on paper but that the node's own
+            // router refuses inbound — the admin said so, since nothing here
+            // can tell. Same black hole as the arm above, from the other side.
+            (Some(_), Some(g)) if g.via_gateway.iter().any(|n| n == &peer.name) => continue,
             // No endpoint and a gateway: reached through the gateway instead.
             (None, Some(_)) => continue,
             _ => {}
@@ -250,6 +266,26 @@ fn contains_newline(s: &str) -> bool {
     s.contains('\n') || s.contains('\r')
 }
 
+/// Tells the operator, on stderr so the `.conf` on stdout stays clean, what
+/// `via-gateway` did to this export — or that it could not do anything.
+fn report_via_gateway(via_gateway: &[String], peers: &[PeerInfo], gateway: Option<&Gateway<'_>>) {
+    let flagged = peers.iter().filter(|p| via_gateway.iter().any(|n| n == &p.name));
+    for peer in flagged {
+        let name = &peer.name;
+        match gateway {
+            Some(g) => eprintln!(
+                "{name}: reached through gateway '{}' (via-gateway is on)",
+                g.peer.name
+            ),
+            None => eprintln!(
+                "warning: {name} is marked via-gateway, but this config has no gateway, so it \
+                 keeps a direct entry the device may not be able to dial; export with \
+                 --gateway <node> to route it"
+            ),
+        }
+    }
+}
+
 /// Picks the node a device should route through, from the current directory.
 ///
 /// Gateway forwarding *is* transit forwarding — the carrier sees the traffic
@@ -261,11 +297,14 @@ fn select_gateway<'a>(
     peers: &'a [PeerInfo],
     transit_approved: &[String],
     transit_offering: &[String],
+    via_gateway: &[String],
     requested: Option<&str>,
 ) -> Result<Option<&'a PeerInfo>, ExportConfigError> {
+    let dialable = |p: &PeerInfo| !via_gateway.iter().any(|n| n == &p.name);
     let eligible = |p: &PeerInfo| {
         transit_approved.iter().any(|n| n == &p.name)
             && transit_offering.iter().any(|n| n == &p.name)
+            && dialable(p)
             && choose_endpoint(p).is_some_and(|e| wireserve_types::is_globally_routable_endpoint(&e))
     };
 
@@ -284,6 +323,9 @@ fn select_gateway<'a>(
         }
         if !transit_offering.iter().any(|n| n == name) {
             return Err(ExportConfigError::GatewayNotOffering { name: name.to_string() });
+        }
+        if !dialable(peer) {
+            return Err(ExportConfigError::GatewayNotDialable { name: name.to_string() });
         }
         if !eligible(peer) {
             return Err(ExportConfigError::GatewayNotReachable { name: name.to_string() });
@@ -324,6 +366,7 @@ pub fn run(
         &directory.peers,
         &directory.transit_approved,
         &directory.transit_offering,
+        &directory.via_gateway,
         gateway,
     )?;
     let created = admin_client.create_node(name, NodeKind::Static, None)?;
@@ -357,6 +400,7 @@ pub fn run_refresh(
         &directory.peers,
         &directory.transit_approved,
         &directory.transit_offering,
+        &directory.via_gateway,
         gateway,
     )?;
     let rejoined = match admin_client.rejoin(name, None, Some(NodeKind::Static)) {
@@ -410,7 +454,7 @@ fn finish(
     // reaches only what it lists.
     let ranges = reg.mesh.as_ref().and_then(wireserve_types::MeshRanges::parse);
     let gateway = match (gateway, ranges) {
-        (Some(peer), Some(ranges)) => Some(Gateway { peer, ranges }),
+        (Some(peer), Some(ranges)) => Some(Gateway { peer, ranges, via_gateway: &directory.via_gateway }),
         (Some(peer), None) => {
             eprintln!(
                 "warning: the coordinator did not report a usable mesh range, so '{}' cannot be \
@@ -431,6 +475,7 @@ fn finish(
     };
 
     let rendered = render_conf(&iface, &directory.peers, &services.services, gateway.as_ref());
+    report_via_gateway(&directory.via_gateway, &directory.peers, gateway.as_ref());
 
     // Recorded, not recomputed: `/poll` sets `transit_via` for exactly the
     // peers absent from this list, and it has to match the file that is about
@@ -709,7 +754,7 @@ mod gateway_tests {
             &iface(),
             std::slice::from_ref(&gw),
             &[],
-            Some(&Gateway { peer: &gw, ranges: ranges() }),
+            Some(&Gateway { peer: &gw, ranges: ranges(), via_gateway: &[] }),
         );
         assert_eq!(
             out.text.matches("[Peer]").count(),
@@ -743,7 +788,7 @@ mod gateway_tests {
             &iface(),
             &[gw.clone(), public, lan_only, no_endpoint],
             &[],
-            Some(&Gateway { peer: &gw, ranges: ranges() }),
+            Some(&Gateway { peer: &gw, ranges: ranges(), via_gateway: &[] }),
         );
 
         assert_eq!(out.direct_peers, vec!["vps2".to_string()]);
@@ -774,7 +819,7 @@ mod gateway_tests {
         // entry; as the gateway it is the whole config.
         let mut gw = peer("vps", 2, Some("[2001:db8::1]:51820"));
         gw.endpoint_addr_v4 = Some("203.0.113.9:51820".into());
-        let out = render_conf(&iface(), &[gw.clone()], &[], Some(&Gateway { peer: &gw, ranges: ranges() }));
+        let out = render_conf(&iface(), &[gw.clone()], &[], Some(&Gateway { peer: &gw, ranges: ranges(), via_gateway: &[] }));
         assert!(out.text.contains("Endpoint = 203.0.113.9:51820"), "{}", out.text);
         assert!(!out.text.contains("2001:db8::1"), "{}", out.text);
     }
@@ -782,7 +827,7 @@ mod gateway_tests {
     #[test]
     fn a_v6_only_peer_keeps_its_v6_endpoint() {
         let gw = peer("vps", 2, Some("[2001:db8::1]:51820"));
-        let out = render_conf(&iface(), std::slice::from_ref(&gw), &[], Some(&Gateway { peer: &gw, ranges: ranges() }));
+        let out = render_conf(&iface(), std::slice::from_ref(&gw), &[], Some(&Gateway { peer: &gw, ranges: ranges(), via_gateway: &[] }));
         assert!(out.text.contains("Endpoint = [2001:db8::1]:51820"), "{}", out.text);
     }
 
@@ -802,14 +847,14 @@ mod gateway_tests {
     fn selecting_a_gateway_refuses_a_node_that_cannot_be_dialled_from_outside() {
         let lan_only = peer("homeserver", 4, Some("192.168.1.50:51820"));
         let approved = vec!["homeserver".to_string()];
-        let err = select_gateway(&[lan_only], &approved, &approved, Some("homeserver")).unwrap_err();
+        let err = select_gateway(&[lan_only], &approved, &approved, &[], Some("homeserver")).unwrap_err();
         assert!(matches!(err, ExportConfigError::GatewayNotReachable { .. }), "{err}");
     }
 
     #[test]
     fn selecting_a_gateway_refuses_an_unapproved_node() {
         let p = peer("vps", 2, Some("vps.example.com:51820"));
-        let err = select_gateway(&[p], &[], &[], Some("vps")).unwrap_err();
+        let err = select_gateway(&[p], &[], &[], &[], Some("vps")).unwrap_err();
         assert!(matches!(err, ExportConfigError::GatewayNotApproved { .. }), "{err}");
     }
 
@@ -821,13 +866,13 @@ mod gateway_tests {
         let approved = vec!["vps".to_string(), "vps2".to_string(), "homeserver".to_string()];
 
         let just_one = [a.clone(), lan.clone()];
-        let one = select_gateway(&just_one, &approved, &approved, None).unwrap();
+        let one = select_gateway(&just_one, &approved, &approved, &[], None).unwrap();
         assert_eq!(one.map(|p| p.name.as_str()), Some("vps"));
 
         // Ambiguity is an error, not a coin flip: the choice is baked into
         // the config and cannot be changed without re-exporting.
         let two = [a, b, lan];
-        let err = select_gateway(&two, &approved, &approved, None).unwrap_err();
+        let err = select_gateway(&two, &approved, &approved, &[], None).unwrap_err();
         assert!(matches!(err, ExportConfigError::AmbiguousGateway { .. }), "{err}");
     }
 
@@ -839,13 +884,79 @@ mod gateway_tests {
         // would leave a node created with no config to show for it.
         let p = peer("vps", 2, Some("vps.example.com:51820"));
         let approved = vec!["vps".to_string()];
-        let err = select_gateway(&[p], &approved, &[], Some("vps")).unwrap_err();
+        let err = select_gateway(&[p], &approved, &[], &[], Some("vps")).unwrap_err();
         assert!(matches!(err, ExportConfigError::GatewayNotOffering { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_node_marked_via_gateway_is_reached_through_the_gateway_despite_a_public_endpoint() {
+        // minipc's case: a real, globally routable v6 endpoint that the home
+        // router drops inbound. Written in as a direct /32 it would outrank
+        // the gateway's range and black-hole every service on it.
+        let gw = peer("vps", 2, Some("vps.example.com:51820"));
+        let home = peer("minipc", 9, Some("[2001:db8::9]:51820"));
+        let flagged = vec!["minipc".to_string()];
+        let services = [AdminServiceInfo {
+            name: "ssh".into(),
+            node: "minipc".into(),
+            ip4: String::new(),
+            port: 22,
+            proto: wireserve_types::Proto::Tcp,
+            vip4: Some("10.90.0.11".into()),
+            ports: vec![],
+            state: ServiceApprovalState::Approved,
+            declared_at: None,
+            approved_at: None,
+            denied_at: None,
+            denied_reason: None,
+        }];
+
+        let out = render_conf(
+            &iface(),
+            &[gw.clone(), home],
+            &services,
+            Some(&Gateway { peer: &gw, ranges: ranges(), via_gateway: &flagged }),
+        );
+
+        assert!(out.direct_peers.is_empty(), "{:?}", out.direct_peers);
+        assert_eq!(out.text.matches("[Peer]").count(), 1, "{}", out.text);
+        assert!(!out.text.contains("2001:db8::9"), "{}", out.text);
+        assert!(
+            !out.text.contains("10.90.0.11/32"),
+            "the service address falls under the gateway's range, so services declared \
+             after the export are reachable too:\n{}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn without_a_gateway_a_node_marked_via_gateway_keeps_its_direct_entry() {
+        // Nothing else could carry it, so dropping it would make it
+        // unreachable rather than rerouted.
+        let home = peer("minipc", 9, Some("[2001:db8::9]:51820"));
+        let out = render_conf(&iface(), &[home], &[], None);
+        assert_eq!(out.direct_peers, vec!["minipc".to_string()]);
+    }
+
+    #[test]
+    fn a_node_marked_via_gateway_is_never_picked_as_the_gateway() {
+        // A device dials its gateway by its one `Endpoint =` line.
+        let a = peer("vps", 2, Some("vps.example.com:51820"));
+        let home = peer("minipc", 9, Some("203.0.113.9:51820"));
+        let approved = vec!["vps".to_string(), "minipc".to_string()];
+        let flagged = vec!["minipc".to_string()];
+
+        let both = [a, home];
+        let one = select_gateway(&both, &approved, &approved, &flagged, None).unwrap();
+        assert_eq!(one.map(|p| p.name.as_str()), Some("vps"), "not ambiguous: minipc is out");
+
+        let err = select_gateway(&both, &approved, &approved, &flagged, Some("minipc")).unwrap_err();
+        assert!(matches!(err, ExportConfigError::GatewayNotDialable { .. }), "{err}");
     }
 
     #[test]
     fn no_eligible_node_is_not_an_error_it_is_the_old_all_direct_behaviour() {
         let lan = peer("homeserver", 4, Some("192.168.1.50:51820"));
-        assert!(select_gateway(&[lan], &[], &[], None).unwrap().is_none());
+        assert!(select_gateway(&[lan], &[], &[], &[], None).unwrap().is_none());
     }
 }

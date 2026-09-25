@@ -2408,3 +2408,50 @@ leak rather than a cost.
     with the host's other firewalls. The ruleset reader skips what it does
     not keep, the listing leaves set contents in the kernel, and the event
     listener reads three fields out of a message it usually drops.
+
+## M24 follow-up — nodes a phone cannot dial
+
+Found on the real mesh: `minipc` advertises a globally routable IPv6
+endpoint, but the home router drops inbound WireGuard. `export-config
+--gateway` wrote it into the phone's `.conf` as a direct `[Peer]`, and since
+WireGuard has no failover that /32 black-holed the node and every service on
+it. A service declared after the export fared no better: its VIP fell under
+the gateway's range, but the gateway refused to forward because the pair was
+recorded as direct.
+
+134. **An admin says which nodes cannot be dialled, and only the export
+    listens.** `wireserve-admin via-gateway <node> on|off` sets
+    `nodes.export_via_gateway`. With a gateway in the config, a flagged node
+    gets no direct entry, is absent from the recorded `conf_peers`, and
+    `/poll`'s existing M24 derivation does the rest — the node is told to
+    reach the device via the gateway, the gateway is told to forward the
+    pair, VIPs included. No routing code changed. Nothing detects this
+    automatically because nothing can: WireGuard does not report which side
+    initiated a handshake, and a phone's config is frozen at export anyway.
+
+135. **Stored on the node, not per export, and not on `PeerInfo`.** A flag on
+    the export command would be lost by the next `--refresh` that forgot it,
+    which silently restores the black hole. "Nothing outside can dial this
+    node" is a fact about the node and true for every device, so it lives on
+    the node row and every export re-reads it. It travels to the admin CLI in
+    `AdminPeersResponse.via_gateway`, beside `transit_approved`, and never in
+    `PeerInfo`: agents route among themselves and must not act on it.
+    Admin-set rather than self-reported by the node, because the only thing
+    it changes is the next export, which is itself an admin action.
+
+136. **What it deliberately does and does not do.**
+    - It changes nothing already on a device. The route answers with the
+      devices whose config a refresh would change: turning it on names those
+      holding the node as a direct peer (they stay broken until refreshed)
+      and those using it as their gateway; turning it off names those
+      reaching it through a gateway (they keep working until refreshed).
+    - A flagged node is never auto-selected as a gateway and an explicit
+      `--gateway` naming one is refused, since a device dials its gateway by
+      its one `Endpoint =` line.
+    - Without a gateway it does nothing but warn: there is no other path, so
+      dropping the direct entry would make the node unreachable, not
+      rerouted.
+    - It survives revoke and rejoin, like `gateway_node_id`: it describes the
+      node's network, not its key.
+    - An older coordinator omits the field, which the CLI reads as empty — the
+      export then behaves exactly as before.

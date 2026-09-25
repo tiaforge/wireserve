@@ -350,6 +350,28 @@ Nodes that *are* reachable from anywhere still get their own direct entry,
 so the device talks to them straight rather than through the gateway. Only
 what it cannot dial itself is routed onward.
 
+**A node with a public address its router will not let in.** An endpoint
+can be globally routable on paper and still be undialable: a home router
+that firewalls inbound IPv6, a public IPv4 with no port forward. The export
+cannot tell, and WireGuard has no failover — a direct entry for such a node
+outranks the gateway's range and drops everything sent to it, its services
+included. Tell the coordinator once:
+
+```sh
+wireserve-admin via-gateway minipc on       # `off` undoes it
+wireserve-admin export-config myphone --refresh --qr
+```
+
+From then on every export with a gateway reaches `minipc` through it, and a
+service `minipc` declares later is reachable from the phone without
+re-exporting. This affects **only** configs made by `export-config` for
+phones and other static devices; how agents reach each other is untouched.
+It changes nothing already on a device either: the command lists the
+devices whose config needs `--refresh`. Such a node is never picked as a
+gateway, and the gateway itself must still reach it directly, as above.
+Upgrade the coordinator before the admin CLI — an older coordinator does
+not know the flag, and the export then keeps the node direct.
+
 **Re-issuing a config** keeps the device's name and mesh address:
 
 ```sh
@@ -542,6 +564,7 @@ anywhere that can reach it):
 | `wireserve-admin create-node <name>` | create a node, print a join token |
 | `wireserve-admin export-config <name> [--gateway <node>] [--refresh] [--qr]` | create (or re-issue) a static peer's `.conf` |
 | `wireserve-admin list-peers` | the full directory |
+| `wireserve-admin via-gateway <name> on\|off` | exported phones reach this node through their gateway, not directly |
 | `wireserve-admin revoke <name>` | cut a node off, keep its name reserved |
 | `wireserve-admin rejoin <name>` | fresh join token, same name and address; the old key stops working at once |
 | `wireserve-admin delete-node <name>` | remove the record, free the name |

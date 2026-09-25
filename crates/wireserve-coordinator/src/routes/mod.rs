@@ -61,6 +61,10 @@ pub fn admin_router(state: AppState) -> Router {
             "/admin/nodes/{name}/gateway",
             axum::routing::put(admin::set_gateway),
         )
+        .route(
+            "/admin/nodes/{name}/via-gateway",
+            axum::routing::put(admin::set_via_gateway),
+        )
         .route("/admin/peers", get(admin::list_peers))
         .route("/admin/services", get(admin::list_services))
         .route(

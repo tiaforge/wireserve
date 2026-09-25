@@ -522,6 +522,55 @@ pub async fn deny_transit(
     Ok(())
 }
 
+/// `PUT /admin/nodes/{name}/via-gateway` (PLAN.md #134).
+///
+/// Marks a node as not dialable from outside the mesh, or clears that. Read
+/// by `export-config` only: a device exported with a gateway then reaches the
+/// node through the gateway instead of holding a direct `[Peer]` for it. No
+/// agent, and nothing in `/poll`, reads it — the routing follows from the
+/// conf membership the export records, exactly as for a node with no public
+/// endpoint at all.
+///
+/// Nothing already on a device changes: the response names the devices whose
+/// config the next refresh would change.
+pub async fn set_via_gateway(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path(name): Path<String>,
+    Json(body): Json<wireserve_types::SetViaGatewayRequest>,
+) -> Result<Json<wireserve_types::SetViaGatewayResponse>, AppError> {
+    let conn = state.db.conn.lock().await;
+    let node = nodes::find_by_name(&conn, &name)?.ok_or(AppError::NotFound)?;
+    if node.kind == wireserve_types::NodeKind::Static {
+        return Err(AppError::BadRequest(
+            "a kind=static node has no endpoint and is never dialled by another device".into(),
+        ));
+    }
+    nodes::set_export_via_gateway(&conn, node.id, body.enabled)?;
+    let mut affected = nodes::static_nodes_affected_by_via_gateway(&conn, node.id, body.enabled)?;
+    if body.enabled {
+        // A device dials its gateway by the one `Endpoint =` line it has, so a
+        // gateway nobody can dial is already broken for those devices. The
+        // flag is still the truth about the node, so it is recorded — and
+        // those devices are named, since they need another gateway.
+        let dependents = nodes::static_nodes_using_gateway(&conn, node.id)?;
+        if !dependents.is_empty() {
+            tracing::warn!(
+                event = "via_gateway_set_on_a_gateway",
+                node_name = %name,
+                dependents = %dependents.join(","),
+                "node is the gateway for these devices, which must dial it directly; \
+                 re-export them with another gateway"
+            );
+        }
+        affected.extend(dependents);
+        affected.sort();
+        affected.dedup();
+    }
+    tracing::info!(event = "via_gateway_set", node_name = %name, enabled = body.enabled);
+    Ok(Json(wireserve_types::SetViaGatewayResponse { affected_devices: affected }))
+}
+
 /// `GET /admin/peers` (spec §4.5.1).
 ///
 /// Every entry's `transit_via` (PLAN.md M23) is always `None` here —
@@ -554,5 +603,10 @@ pub async fn list_peers(
         })
         .map(|n| n.name.clone())
         .collect();
-    Ok(Json(AdminPeersResponse { peers, transit_approved, transit_offering }))
+    let via_gateway = rows
+        .iter()
+        .filter(|n| n.export_via_gateway)
+        .map(|n| n.name.clone())
+        .collect();
+    Ok(Json(AdminPeersResponse { peers, transit_approved, transit_offering, via_gateway }))
 }

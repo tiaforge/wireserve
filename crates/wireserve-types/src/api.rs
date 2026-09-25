@@ -562,6 +562,21 @@ pub struct SetGatewayRequest {
     pub conf_peers: Vec<String>,
 }
 
+/// `PUT /admin/nodes/{name}/via-gateway` (PLAN.md #134) — whether devices
+/// exported with a gateway must reach this node through it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetViaGatewayRequest {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SetViaGatewayResponse {
+    /// Static peers whose `.conf` a refresh would change. The flag only
+    /// shapes the next export; nothing already on a device changes by itself.
+    #[serde(default)]
+    pub affected_devices: Vec<String>,
+}
+
 // ---- §4.5.1 Admin: list peers ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -584,6 +599,14 @@ pub struct AdminPeersResponse {
     /// anything is created rather than after.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transit_offering: Vec<String>,
+    /// Names of the nodes an admin marked as not dialable from outside the
+    /// mesh (`wireserve-admin via-gateway`). Only `export-config` reads it:
+    /// a device exported with a gateway reaches these through the gateway
+    /// rather than holding a direct `[Peer]`. Admin-only like the two above,
+    /// and for the same reason it is not on `PeerInfo` — agents route among
+    /// themselves and never act on it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub via_gateway: Vec<String>,
 }
 
 #[cfg(test)]

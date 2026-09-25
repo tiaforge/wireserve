@@ -126,6 +126,15 @@ pub fn cmd_deny_transit(client: &AdminClient, name: &str) -> Result<(), CliError
     Ok(client.deny_transit(name)?)
 }
 
+pub fn cmd_set_via_gateway(
+    client: &AdminClient,
+    name: &str,
+    enabled: bool,
+) -> Result<wireserve_types::SetViaGatewayResponse, CliError> {
+    validate_name(name)?;
+    Ok(client.set_via_gateway(name, enabled)?)
+}
+
 pub fn cmd_export_config(
     admin_client: &AdminClient,
     node_facing_url: &str,

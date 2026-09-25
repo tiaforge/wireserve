@@ -114,6 +114,16 @@ enum Command {
     /// for new carrier choices at once; the pairs it carried move off it
     /// on their next poll.
     DenyTransit { name: String },
+    /// Mark a node as not dialable from outside the mesh (`on`), or clear
+    /// that (`off`). For a node that advertises a public endpoint but whose
+    /// router drops inbound WireGuard.
+    ///
+    /// Only `export-config` reads this: a phone or other static device
+    /// exported with a gateway then reaches the node through the gateway
+    /// instead of dialling it directly. How agents reach each other is
+    /// unaffected. Existing configs change only when re-exported with
+    /// `--refresh`; the devices that need it are listed.
+    ViaGateway { name: String, state: OnOff },
     /// Generate a WireGuard .conf for an agent-less consumer-only device
     /// (spec §9).
     ExportConfig {
@@ -145,6 +155,12 @@ enum Command {
         #[arg(long)]
         gateway: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum OnOff {
+    On,
+    Off,
 }
 
 /// Prints the join token's deadline immediately under the token itself.
@@ -302,18 +318,50 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             wireserve_admin::cmd_deny_transit(&client, &name)?;
             println!("node '{name}' may no longer carry transit traffic");
         }
+        Command::ViaGateway { name, state } => {
+            check_name(&name)?;
+            let enabled = state == OnOff::On;
+            let client = build_client(&coordinator_url, &admin_token)?;
+            let resp = wireserve_admin::cmd_set_via_gateway(&client, &name, enabled)?;
+            if enabled {
+                println!("devices exported with a gateway will reach '{name}' through it");
+            } else {
+                println!("devices exported with a gateway will dial '{name}' directly again");
+            }
+            if !resp.affected_devices.is_empty() {
+                if enabled {
+                    println!(
+                        "  these devices still dial '{name}' directly (or use it as their \
+                         gateway) until re-exported:"
+                    );
+                } else {
+                    println!(
+                        "  these devices keep reaching '{name}' through their gateway, which \
+                         still works, until re-exported:"
+                    );
+                }
+                for device in &resp.affected_devices {
+                    println!(
+                        "    {}: wireserve-admin export-config {} --refresh",
+                        sanitize_for_terminal(device),
+                        sanitize_for_terminal(device)
+                    );
+                }
+            }
+        }
         Command::ListPeers => {
             let client = build_client(&coordinator_url, &admin_token)?;
             let resp = wireserve_admin::cmd_list_peers(&client)?;
             for p in resp.peers {
                 let transit = if resp.transit_approved.contains(&p.name) { "approved" } else { "-" };
+                let via_gateway = if resp.via_gateway.contains(&p.name) { "yes" } else { "-" };
                 // S2 defense in depth: a peer field containing a newline
                 // could otherwise spoof extra lines of terminal output —
                 // same "don't trust the coordinator's validation as the
                 // only line of defense" reasoning as export_config's
                 // renderer.
                 println!(
-                    "{}\t{}\t{}\t{}\tendpoint={}\tv4={}\tv6={}\tlan={}\treflexive={}\ttransit={}",
+                    "{}\t{}\t{}\t{}\tendpoint={}\tv4={}\tv6={}\tlan={}\treflexive={}\ttransit={}\tvia_gateway={}",
                     sanitize_for_terminal(&p.name),
                     sanitize_for_terminal(&p.pubkey),
                     sanitize_for_terminal(&p.ip4),
@@ -338,7 +386,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         .as_deref()
                         .map(sanitize_for_terminal)
                         .unwrap_or_else(|| "-".to_string()),
-                    transit
+                    transit,
+                    via_gateway
                 );
             }
         }
