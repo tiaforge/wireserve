@@ -33,7 +33,7 @@ fn export_config_end_to_end_and_private_key_never_leaves_process() {
     // the same router (unlike the real coordinator, which binds them on
     // two separate listeners — see PLAN.md decisions log), so the same
     // base URL is valid for both parameters here.
-    let conf = wireserve_admin::export_config::run(&client, mock.base_url.as_str(), "phone", None).unwrap();
+    let conf = wireserve_admin::export_config::run(&client, mock.base_url.as_str(), "phone", None, None).unwrap().conf;
 
     assert!(conf.contains("[Interface]"));
     assert!(conf.contains("[Peer]"));
@@ -75,8 +75,9 @@ fn export_config_refresh_rejoins_instead_of_creating_and_keeps_the_same_call_cou
     let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
 
     let conf =
-        wireserve_admin::export_config::run_refresh(&client, mock.base_url.as_str(), "phone", None)
-            .unwrap();
+        wireserve_admin::export_config::run_refresh(&client, mock.base_url.as_str(), "phone", None, None)
+            .unwrap()
+            .conf;
     assert!(conf.contains("[Interface]"));
 
     // The same five as the create path, with rejoin standing in for
@@ -106,7 +107,7 @@ fn export_config_refresh_asserts_the_node_is_static_before_anything_is_mutated()
     let mock = MockCoordinator::start(TOKEN);
     let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
 
-    wireserve_admin::export_config::run_refresh(&client, mock.base_url.as_str(), "phone", None).unwrap();
+    wireserve_admin::export_config::run_refresh(&client, mock.base_url.as_str(), "phone", None, None).unwrap();
 
     // The `kind` must ride along on the rejoin request itself. The
     // coordinator checks it before `reissue_join_token`, which is the whole
@@ -127,8 +128,9 @@ fn a_private_key_never_leaves_the_process_on_the_refresh_path_either() {
     let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
 
     let conf =
-        wireserve_admin::export_config::run_refresh(&client, mock.base_url.as_str(), "phone", None)
-            .unwrap();
+        wireserve_admin::export_config::run_refresh(&client, mock.base_url.as_str(), "phone", None, None)
+            .unwrap()
+            .conf;
     let private_key = conf
         .lines()
         .find(|l| l.starts_with("PrivateKey = "))
@@ -159,9 +161,9 @@ fn invalid_name_makes_zero_network_calls_for_every_name_taking_command() {
     assert!(wireserve_admin::cmd_deny_service(&client, "Bad_Name", "plex", None).is_err());
     assert!(wireserve_admin::cmd_deny_service(&client, "homeserver", "Bad_Service", None).is_err());
     assert!(wireserve_admin::cmd_approve_service(&client, "homeserver", "../../etc/passwd").is_err());
-    assert!(wireserve_admin::cmd_export_config(&client, mock.base_url.as_str(), "Bad_Name", None).is_err());
+    assert!(wireserve_admin::cmd_export_config(&client, mock.base_url.as_str(), "Bad_Name", None, None).is_err());
     assert!(
-        wireserve_admin::cmd_export_config_refresh(&client, mock.base_url.as_str(), "Bad_Name", None)
+        wireserve_admin::cmd_export_config_refresh(&client, mock.base_url.as_str(), "Bad_Name", None, None)
             .is_err()
     );
 
@@ -319,8 +321,9 @@ fn export_config_succeeds_against_two_genuinely_separate_listeners() {
     let register_mock = MockCoordinator::start_register_only(TOKEN);
     let client = AdminClient::new(admin_mock.base_url.as_str(), TOKEN);
 
-    let conf = wireserve_admin::export_config::run(&client, register_mock.base_url.as_str(), "phone", None)
-        .expect("export-config must work when admin and register URLs point at different listeners");
+    let conf = wireserve_admin::export_config::run(&client, register_mock.base_url.as_str(), "phone", None, None)
+        .expect("export-config must work when admin and register URLs point at different listeners")
+        .conf;
     assert!(conf.contains("[Interface]"));
 }
 
@@ -331,7 +334,7 @@ fn export_config_fails_cleanly_if_register_url_points_at_the_admin_only_listener
 
     // Pointing register_url at a listener with no /register route must be
     // a clean error, not a panic and not a silently-wrong success.
-    let result = wireserve_admin::export_config::run(&client, admin_mock.base_url.as_str(), "phone", None);
+    let result = wireserve_admin::export_config::run(&client, admin_mock.base_url.as_str(), "phone", None, None);
     assert!(result.is_err());
 }
 

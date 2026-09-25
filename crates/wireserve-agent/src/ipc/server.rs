@@ -37,6 +37,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
             denied_services: vec![],
             transit_carrying: vec![],
             transit_awaiting_approval: false,
+            exit_clients: vec![],
             mesh: None,
             naming: None,
         });
@@ -121,6 +122,8 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
         // Only meaningful while opted in: the directory can be one poll
         // older than a `transit off` issued since.
         transit_awaiting_approval: state.transit_capable && directory.transit_awaiting_approval,
+        exit_capable: state.exit_capable,
+        exit_clients: directory.exit_clients.clone(),
         service_domain: directory.naming.as_ref().map(|n| n.domain.clone()),
         peers: directory.peers,
         tunnel: vec![],
@@ -239,6 +242,14 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
                 Err(e) => (IpcResponse::error(e.to_string()), false),
             }
         }
+        IpcRequest::ExitCapable { enabled } => {
+            let mut state = ctx.state.lock().await;
+            state.exit_capable = enabled;
+            match state.save(&ctx.state_path) {
+                Ok(()) => (IpcResponse::Ok, false),
+                Err(e) => (IpcResponse::error(e.to_string()), false),
+            }
+        }
         IpcRequest::List => {
             let mut view = {
                 let state = ctx.state.lock().await;
@@ -250,7 +261,7 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
                 Ok(Err(e)) => tracing::debug!(error = %e, "could not read the interface for `list`"),
                 Err(e) => tracing::debug!(error = %e, "interface read for `list` panicked"),
             }
-            (IpcResponse::List(view), false)
+            (IpcResponse::List(Box::new(view)), false)
         }
         IpcRequest::Leave => (IpcResponse::Ok, true),
     }

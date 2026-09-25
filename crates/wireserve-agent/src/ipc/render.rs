@@ -219,6 +219,19 @@ pub fn render(view: &ListView, now: DateTime<Utc>) -> String {
             out.push_str(&format!(", carrying: {}\n", pairs.join(", ")));
         }
     }
+
+    // Exit (PLAN.md M27): silent unless opted in, like transit above.
+    if view.exit_capable {
+        out.push_str("Exit: on");
+        if !view.transit_capable {
+            out.push_str(", but an exit is a gateway first — also run `wireserve-agent transit on`\n");
+        } else if view.exit_clients.is_empty() {
+            out.push_str(", no device uses this node as its exit yet\n");
+        } else {
+            let names: Vec<String> = view.exit_clients.iter().map(|pk| peer_name(view, pk)).collect();
+            out.push_str(&format!(", for: {}\n", names.join(", ")));
+        }
+    }
     out
 }
 
@@ -280,6 +293,8 @@ mod tests {
             transit_capable: false,
             transit_carrying: vec![],
             transit_awaiting_approval: false,
+            exit_capable: false,
+            exit_clients: vec![],
             // The coordinator recorded strato's IPv6 candidate; WireGuard
             // is really talking to its IPv4 one.
             peers: vec![
@@ -372,6 +387,33 @@ Not published:
         let view = ListView { transit_capable: true, transit_awaiting_approval: true, ..Default::default() };
         let out = render(&view, now());
         assert!(out.contains("Transit: on, waiting for an admin to approve this node as a carrier"), "{out}");
+    }
+
+    #[test]
+    fn exit_status_is_silent_when_off() {
+        let out = render(&ListView { transit_capable: true, ..Default::default() }, now());
+        assert!(!out.contains("Exit:"), "{out}");
+    }
+
+    #[test]
+    fn exit_on_without_transit_says_what_is_missing() {
+        let out = render(&ListView { exit_capable: true, ..Default::default() }, now());
+        assert!(out.contains("Exit: on, but an exit is a gateway first"), "{out}");
+    }
+
+    #[test]
+    fn exit_clients_are_shown_by_name() {
+        let view = ListView {
+            transit_capable: true,
+            exit_capable: true,
+            exit_clients: vec!["pk-a".into()],
+            peers: vec![peer("a", "10.1.0.1", None, true)],
+            ..Default::default()
+        };
+        let out = render(&view, now());
+        assert!(out.contains("Exit: on, for: a"), "{out}");
+        let idle = render(&ListView { transit_capable: true, exit_capable: true, ..Default::default() }, now());
+        assert!(idle.contains("Exit: on, no device uses this node as its exit yet"), "{idle}");
     }
 
     #[test]

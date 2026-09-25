@@ -154,6 +154,20 @@ enum Command {
         /// is baked into the config, so changing it means re-exporting.
         #[arg(long)]
         gateway: Option<String>,
+        /// Also write a full-tunnel profile, with the same key and address:
+        /// switched on in the WireGuard app, it sends all of the device's
+        /// traffic out through its gateway, for public Wi-Fi or a home
+        /// connection abroad. IPv4 only; the device's IPv6 is dropped rather
+        /// than leaked around the tunnel. The gateway must run
+        /// `wireserve-agent exit on`. Needs --dns, and --out or --qr, since
+        /// there are two files.
+        #[arg(long, requires = "dns")]
+        exit: bool,
+        /// The resolver the full-tunnel profile uses: an approved service by
+        /// name (a Pi-hole you `serve` on 53, say, which then also answers
+        /// the mesh's own names), or an IPv4 address such as 9.9.9.9.
+        #[arg(long, requires = "exit", value_name = "SERVICE|IPV4")]
+        dns: Option<String>,
     },
 }
 
@@ -355,13 +369,22 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             for p in resp.peers {
                 let transit = if resp.transit_approved.contains(&p.name) { "approved" } else { "-" };
                 let via_gateway = if resp.via_gateway.contains(&p.name) { "yes" } else { "-" };
+                // "offering" for a node that runs `exit on`, "yes" for a
+                // device whose last export has the full-tunnel profile.
+                let exit = if resp.exit_devices.contains(&p.name) {
+                    "yes"
+                } else if resp.exit_offering.contains(&p.name) {
+                    "offering"
+                } else {
+                    "-"
+                };
                 // S2 defense in depth: a peer field containing a newline
                 // could otherwise spoof extra lines of terminal output —
                 // same "don't trust the coordinator's validation as the
                 // only line of defense" reasoning as export_config's
                 // renderer.
                 println!(
-                    "{}\t{}\t{}\t{}\tendpoint={}\tv4={}\tv6={}\tlan={}\treflexive={}\ttransit={}\tvia_gateway={}",
+                    "{}\t{}\t{}\t{}\tendpoint={}\tv4={}\tv6={}\tlan={}\treflexive={}\ttransit={}\tvia_gateway={}\texit={}",
                     sanitize_for_terminal(&p.name),
                     sanitize_for_terminal(&p.pubkey),
                     sanitize_for_terminal(&p.ip4),
@@ -387,42 +410,75 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         .map(sanitize_for_terminal)
                         .unwrap_or_else(|| "-".to_string()),
                     transit,
-                    via_gateway
+                    via_gateway,
+                    exit
                 );
             }
         }
-        Command::ExportConfig { name, out, refresh, qr, gateway } => {
+        Command::ExportConfig { name, out, refresh, qr, gateway, exit, dns } => {
             check_name(&name)?;
             if let Some(gateway) = &gateway {
                 check_name(gateway)?;
             }
+            // Before any request: two profiles cannot both go to stdout.
+            if exit && out.is_none() && !qr {
+                return Err("--exit writes a second profile; pass --out <file> (the full-tunnel one \
+                            goes beside it as <file>-exit.conf) or --qr"
+                    .into());
+            }
+            let exit_dns = dns.as_deref().filter(|_| exit);
             let client = build_client(&coordinator_url, &admin_token)?;
             let register_url = config::resolve_register_url_interactive(register_url.as_deref())?;
             warn_if_plaintext_to_remote_host(&register_url);
-            let conf = if refresh {
+            let exported = if refresh {
                 wireserve_admin::cmd_export_config_refresh(
                     &client,
                     &register_url,
                     &name,
                     gateway.as_deref(),
+                    exit_dns,
                 )?
             } else {
-                wireserve_admin::cmd_export_config(&client, &register_url, &name, gateway.as_deref())?
+                wireserve_admin::cmd_export_config(&client, &register_url, &name, gateway.as_deref(), exit_dns)?
             };
-            // The QR is rendered before anything is written, so a config too
-            // wide to scan fails without leaving a half-done export behind.
-            let rendered_qr = if qr { Some(wireserve_admin::qr::render(&conf)?) } else { None };
-            match out {
-                Some(path) => write_conf_file(&path, &conf)?,
+            let conf = &exported.conf;
+            // The QRs are rendered before anything is written, so a config
+            // too wide to scan fails without leaving a half-done export behind.
+            let rendered_qr = if qr { Some(wireserve_admin::qr::render(conf)?) } else { None };
+            let rendered_exit_qr = match (&exported.exit_conf, qr) {
+                (Some(exit_conf), true) => Some(wireserve_admin::qr::render(exit_conf)?),
+                _ => None,
+            };
+            match &out {
+                Some(path) => {
+                    write_conf_file(path, conf)?;
+                    if let Some(exit_conf) = &exported.exit_conf {
+                        let exit_path = exit_conf_path(path);
+                        write_conf_file(&exit_path, exit_conf)?;
+                        eprintln!("wrote the full-tunnel profile to {}", exit_path.display());
+                    }
+                }
                 None => print!("{conf}"),
             }
-            if let Some(rendered) = rendered_qr {
+            for (label, rendered) in [("", rendered_qr), (" (full tunnel)", rendered_exit_qr)] {
+                let Some(rendered) = rendered else { continue };
                 // stderr: the config on stdout is the program's output and
                 // stays pipeable, the code is for a human looking at it.
                 eprintln!();
                 eprint!("{rendered}");
-                eprintln!("\nScan with the WireGuard app. This code contains the private key —");
+                eprintln!("\nScan with the WireGuard app{label}. This code contains the private key —");
                 eprintln!("it stays in your scrollback and in any screen recording.");
+            }
+            if exit && exported.exit_conf.is_none() {
+                eprintln!(
+                    "warning: no full-tunnel profile was written — the export fell back to a \
+                     config without a gateway, see above"
+                );
+            } else if exit {
+                eprintln!(
+                    "\nImport both on the device and switch on the -exit one for public Wi-Fi or \
+                     to browse from home; the WireGuard app runs only one tunnel at a time."
+                );
             }
             if refresh {
                 eprintln!(
@@ -498,6 +554,18 @@ fn write_conf_file(path: &std::path::Path, contents: &str) -> std::io::Result<()
 #[cfg(not(unix))]
 fn write_conf_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     std::fs::write(path, contents)
+}
+
+/// `foo.conf` → `foo-exit.conf`; a name without an extension just gains
+/// `-exit`. The WireGuard apps name an imported tunnel after its file, so
+/// the two profiles arrive as `<name>` and `<name>-exit`.
+fn exit_conf_path(path: &std::path::Path) -> std::path::PathBuf {
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = match path.extension() {
+        Some(ext) => format!("{stem}-exit.{}", ext.to_string_lossy()),
+        None => format!("{stem}-exit"),
+    };
+    path.with_file_name(name)
 }
 
 fn build_client(

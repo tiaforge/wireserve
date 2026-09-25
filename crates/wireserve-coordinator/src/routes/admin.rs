@@ -450,12 +450,36 @@ pub async fn set_gateway(
         conf_peer_ids.push(peer.id);
     }
 
-    nodes::set_gateway(&mut conn, node.id, gateway_id, &conf_peer_ids)?;
+    // The device's half of the exit consent is this export; the gateway's
+    // half is its own `exit on`, checked here as well as by the CLI so an
+    // older CLI or a hand-made request cannot record a profile nothing
+    // forwards (PLAN.md M27).
+    if body.exit {
+        let Some(gateway_name) = &body.gateway else {
+            return Err(AppError::BadRequest(
+                "a full-tunnel profile routes through the device's gateway; name one".into(),
+            ));
+        };
+        let gw = nodes::find_by_name(&conn, gateway_name)?.ok_or(AppError::NotFound)?;
+        let offering = gw
+            .pubkey
+            .as_deref()
+            .is_some_and(|pk| state.transit.is_offering_exit(pk, state.config.online_threshold_secs));
+        if !offering {
+            return Err(AppError::Conflict(format!(
+                "'{gateway_name}' is not offering to be an exit — run `wireserve-agent exit on` \
+                 on it, then try again"
+            )));
+        }
+    }
+
+    nodes::set_gateway(&mut conn, node.id, gateway_id, &conf_peer_ids, body.exit)?;
     tracing::info!(
         event = "gateway_set",
         node_name = %name,
         gateway = body.gateway.as_deref().unwrap_or("-"),
         direct_peers = conf_peer_ids.len(),
+        exit = body.exit,
     );
     Ok(())
 }
@@ -608,5 +632,26 @@ pub async fn list_peers(
         .filter(|n| n.export_via_gateway)
         .map(|n| n.name.clone())
         .collect();
-    Ok(Json(AdminPeersResponse { peers, transit_approved, transit_offering, via_gateway }))
+    let exit_offering = rows
+        .iter()
+        .filter(|n| {
+            n.pubkey
+                .as_deref()
+                .is_some_and(|pk| state.transit.is_offering_exit(pk, state.config.online_threshold_secs))
+        })
+        .map(|n| n.name.clone())
+        .collect();
+    let exit_devices = rows
+        .iter()
+        .filter(|n| n.exit_enabled && n.gateway_node_id.is_some())
+        .map(|n| n.name.clone())
+        .collect();
+    Ok(Json(AdminPeersResponse {
+        peers,
+        transit_approved,
+        transit_offering,
+        via_gateway,
+        exit_offering,
+        exit_devices,
+    }))
 }

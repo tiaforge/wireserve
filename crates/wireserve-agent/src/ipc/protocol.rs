@@ -35,6 +35,9 @@ pub enum IpcRequest {
     /// as `Serve`/`Unserve`: mutates the running daemon's state directly,
     /// takes effect next poll, no rejoin.
     TransitCapable { enabled: bool },
+    /// This node's live opt-in to be an exit (PLAN.md M27) —
+    /// `wireserve-agent exit on|off`. Same shape as `TransitCapable`.
+    ExitCapable { enabled: bool },
     List,
     Leave,
 }
@@ -93,6 +96,14 @@ pub struct ListView {
     /// see `wireserve_types::PollResponse::transit_awaiting_approval`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub transit_awaiting_approval: bool,
+    /// This node's own opt-in to be an exit (PLAN.md M27) — see
+    /// `state::AgentState::exit_capable`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exit_capable: bool,
+    /// The devices this node is the exit for, by pubkey, as of the last
+    /// poll — see `wireserve_types::PollResponse::exit_clients`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exit_clients: Vec<String>,
     /// The domain services are named under (PLAN.md M25), so `list` shows
     /// the same name the hosts file writes. Absent means `.wg`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -131,7 +142,9 @@ pub struct TunnelPeer {
 pub enum IpcResponse {
     Ok,
     Error { message: String },
-    List(ListView),
+    /// Boxed: the listing is far larger than the other two answers, and
+    /// serialises exactly as it did unboxed.
+    List(Box<ListView>),
 }
 
 impl IpcResponse {

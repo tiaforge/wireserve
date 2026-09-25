@@ -89,8 +89,9 @@ pub use crate::firewall::ForwardWanted;
 /// The shape of one accept this module puts into a foreign chain. Each is
 /// pinned to the mesh interface on one side, and every `FORWARD` one to
 /// something narrower on the other: this same interface, or a flow our own
-/// table marked as a service's (`nftables::SERVICE_MARK`) — never routing
-/// from the mesh to the host's other networks as such.
+/// table marked as a service's (`nftables::SERVICE_MARK`) or an exit's
+/// (`nftables::EXIT_MARK`) — never routing from the mesh to the host's
+/// other networks as such.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Opening {
     /// `iifname <if>` on `INPUT`: declared services reach this host.
@@ -104,6 +105,11 @@ pub enum Opening {
     /// `oifname <if> ct mark & M == M` on `FORWARD`: its reply, coming
     /// back into the mesh.
     ServiceReply,
+    /// `iifname <if> ct mark & E == E` on `FORWARD`: an exit client's flow
+    /// to the internet, which our table marked (PLAN.md M27).
+    ExitRequest,
+    /// `oifname <if> ct mark & E == E` on `FORWARD`: its reply.
+    ExitReply,
 }
 
 impl Opening {
@@ -111,7 +117,9 @@ impl Opening {
     pub fn hook(self) -> Hook {
         match self {
             Self::Input => Hook::Input,
-            Self::Hairpin | Self::ServiceRequest | Self::ServiceReply => Hook::Forward,
+            Self::Hairpin | Self::ServiceRequest | Self::ServiceReply | Self::ExitRequest | Self::ExitReply => {
+                Hook::Forward
+            }
         }
     }
 
@@ -127,6 +135,9 @@ impl Opening {
                 }
                 if forward.services {
                     out.extend([Self::ServiceRequest, Self::ServiceReply]);
+                }
+                if forward.exit {
+                    out.extend([Self::ExitRequest, Self::ExitReply]);
                 }
                 out
             }

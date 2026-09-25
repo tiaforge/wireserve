@@ -66,6 +66,15 @@ pub struct AgentState {
     /// `RegisterRequest::transit_capable` always does at join time.
     #[serde(default)]
     pub transit_capable: bool,
+    /// This node's own live opt-in to be the exit for the devices that use
+    /// it as their gateway (PLAN.md M27), set by `wireserve-agent exit
+    /// on|off`. Separate from `transit_capable`: sending a device's
+    /// traffic to the internet under this host's own address is a
+    /// different decision from forwarding between mesh members. Off by
+    /// default, and nothing is forwarded to the internet while it is off,
+    /// whatever the coordinator says.
+    #[serde(default)]
+    pub exit_capable: bool,
     /// Set by `join --allow-plaintext-http`: the operator accepted talking
     /// to a non-loopback coordinator over plain `http://`. Kept so the
     /// daemon, which refuses such a URL otherwise (security review

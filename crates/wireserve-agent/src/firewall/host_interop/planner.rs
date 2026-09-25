@@ -33,7 +33,7 @@ use super::model::{
     Hook, IpVersion, IptablesObservation, IptablesVariant, NftView, Observed, Opening, RuleInfo,
     FIREWALLD_TABLE, GUARD_CHAIN, IPTABLES_TABLES, LEGACY_GUARD_TABLE, TAG_PREFIX,
 };
-use crate::firewall::nftables::SERVICE_MARK;
+use crate::firewall::nftables::{EXIT_MARK, SERVICE_MARK};
 
 const TRUSTED: &str = "trusted";
 
@@ -48,9 +48,9 @@ fn oifname_match(ifname: &str) -> Value {
 }
 
 /// `ct mark & M == M` as nft's JSON renders it: a flow our own table
-/// marked as a service's.
-fn service_mark_match() -> Value {
-    json!({"match": {"op": "==", "left": {"&": [{"ct": {"key": "mark"}}, SERVICE_MARK]}, "right": SERVICE_MARK}})
+/// marked with `bit` — a service's, or an exit's.
+fn mark_match(bit: u32) -> Value {
+    json!({"match": {"op": "==", "left": {"&": [{"ct": {"key": "mark"}}, bit]}, "right": bit}})
 }
 
 /// The matches of `opening`'s accept, as nft's JSON renders them.
@@ -59,8 +59,10 @@ pub fn opening_matches(ifname: &str, opening: Opening) -> Vec<Value> {
     match opening {
         Opening::Input => vec![iifname_match(ifname)],
         Opening::Hairpin => vec![iifname_match(ifname), oifname_match(ifname)],
-        Opening::ServiceRequest => vec![iifname_match(ifname), service_mark_match()],
-        Opening::ServiceReply => vec![oifname_match(ifname), service_mark_match()],
+        Opening::ServiceRequest => vec![iifname_match(ifname), mark_match(SERVICE_MARK)],
+        Opening::ServiceReply => vec![oifname_match(ifname), mark_match(SERVICE_MARK)],
+        Opening::ExitRequest => vec![iifname_match(ifname), mark_match(EXIT_MARK)],
+        Opening::ExitReply => vec![oifname_match(ifname), mark_match(EXIT_MARK)],
     }
 }
 
@@ -120,6 +122,9 @@ pub fn guard_exceptions(ifname: &str, forward: ForwardWanted) -> Vec<Vec<Value>>
     }
     if forward.services {
         out.push(opening_matches(ifname, Opening::ServiceRequest));
+    }
+    if forward.exit {
+        out.push(opening_matches(ifname, Opening::ExitRequest));
     }
     out
 }

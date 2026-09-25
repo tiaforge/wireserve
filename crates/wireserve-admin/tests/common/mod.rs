@@ -289,7 +289,14 @@ async fn list_peers(
         return Err(StatusCode::UNAUTHORIZED);
     }
     let peers = state.peers.lock().unwrap().clone();
-    Ok(Json(AdminPeersResponse { peers, transit_approved: vec![], transit_offering: vec![], via_gateway: vec![] }))
+    Ok(Json(AdminPeersResponse {
+        peers,
+        transit_approved: vec![],
+        transit_offering: vec![],
+        via_gateway: vec![],
+        exit_offering: vec![],
+        exit_devices: vec![],
+    }))
 }
 
 async fn approve_transit(

@@ -140,6 +140,9 @@ pub async fn poll(
     let transit_capable = req.transit_capable && node.transit_approved;
     let transit_awaiting_approval = req.transit_capable && !node.transit_approved;
     state.transit.report(&self_pubkey, transit_capable, &transit_reachable, &transit_wanted);
+    // Recorded as offered, approved or not: the export checks the transit
+    // approval itself, and names whichever half is missing (PLAN.md M27).
+    state.transit.report_exit(&self_pubkey, req.exit_capable);
 
     // Same observed-source-address fallback as `/register` (spec §4.2),
     // re-applied on every poll rather than frozen at join time — see
@@ -363,6 +366,19 @@ pub async fn poll(
         }
     }
 
+    // This requester's exit role (PLAN.md M27): the devices routing through
+    // it whose last export included the full-tunnel profile. Derived through
+    // `gateway_id_of`, so a gateway that stops qualifying — revoked, deleted,
+    // transit approval withdrawn — loses its exit clients on the same poll
+    // it loses its gateway clients, and a revoked device leaves `all_peers`.
+    // Whether the node itself still offers is its own business: the agent
+    // acts on this only while `exit on`.
+    let exit_clients: Vec<String> = all_peers
+        .iter()
+        .filter(|n| n.exit_enabled && gateway_id_of(n) == Some(node.id))
+        .filter_map(|n| n.pubkey.clone())
+        .collect();
+
     let peers_by_id: std::collections::HashMap<i64, &nodes::NodeRow> =
         all_peers.iter().map(|n| (n.id, n)).collect();
     let services = all_services
@@ -381,6 +397,7 @@ pub async fn poll(
         denied_services: outcome.denied.iter().map(directory::denied_service).collect(),
         transit_carrying,
         transit_awaiting_approval,
+        exit_clients,
         mesh: Some(state.config.mesh_info()),
         naming: state.config.service_naming(),
     }))

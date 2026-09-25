@@ -258,6 +258,14 @@ pub struct PollRequest {
     /// (`wireserve-agent transit on/off`) rather than a one-time fact.
     #[serde(default)]
     pub transit_capable: bool,
+    /// This node's own live opt-in to be an exit for the devices that use
+    /// it as their gateway (PLAN.md M27, `wireserve-agent exit on/off`).
+    /// Separate from `transit_capable`: forwarding between mesh members
+    /// is one consent, sending a device's traffic to the internet under
+    /// this node's own public address is another. Absent when false, so
+    /// a coordinator that predates it sees nothing new.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exit_capable: bool,
     /// Pubkeys this node currently sees a fresh kernel handshake with —
     /// its own ground truth for "I actually reach this peer right now"
     /// (PLAN.md M23). Only meaningful, and only populated, when
@@ -434,6 +442,13 @@ pub struct PollResponse {
     /// anything; absent from the JSON when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub transit_awaiting_approval: bool,
+    /// Pubkeys of the devices THIS node is the exit for (PLAN.md M27):
+    /// static peers routing through it as their gateway whose exported
+    /// config included the full-tunnel profile. Each is also in `peers`,
+    /// which is where its address comes from. Sent whether or not this node
+    /// has opted in with `exit on`; the agent acts on it only if it has.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exit_clients: Vec<String>,
     /// The coordinator's mesh ranges. A node that joined before
     /// registration carried them pins them from here, once; after that a
     /// different value is only ever reported, never adopted — see
@@ -560,6 +575,14 @@ pub struct SetGatewayRequest {
     /// direct entry for it, breaking that path in both directions at once.
     #[serde(default)]
     pub conf_peers: Vec<String>,
+    /// The export also rendered a full-tunnel profile (PLAN.md M27), so the
+    /// gateway must send this device's internet traffic onwards. Recorded
+    /// per export like `conf_peers`, since it describes the files handed
+    /// out: a refresh without `--exit` clears it. Absent when false; a
+    /// coordinator that predates it ignores it, which the admin CLI rules
+    /// out beforehand by requiring the gateway in `exit_offering`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exit: bool,
 }
 
 /// `PUT /admin/nodes/{name}/via-gateway` (PLAN.md #134) — whether devices
@@ -607,6 +630,17 @@ pub struct AdminPeersResponse {
     /// themselves and never act on it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub via_gateway: Vec<String>,
+    /// Names of the nodes whose most recent poll offered to be an exit
+    /// (`wireserve-agent exit on`, PLAN.md M27), approved for transit or
+    /// not — the export checks both. Empty from a coordinator that predates
+    /// exits, which makes `export-config --exit` refuse rather than write a
+    /// profile nothing would forward.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exit_offering: Vec<String>,
+    /// Names of the static peers whose last export included the
+    /// full-tunnel profile.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exit_devices: Vec<String>,
 }
 
 #[cfg(test)]
@@ -649,6 +683,7 @@ mod tests {
             denied_services: vec![],
             transit_carrying: vec![],
             transit_awaiting_approval: false,
+            exit_clients: vec![],
             mesh: None,
             naming: None,
         };
@@ -732,6 +767,7 @@ mod tests {
             denied_services: vec![],
             transit_carrying: vec![],
             transit_awaiting_approval: false,
+            exit_clients: vec![],
             mesh: None,
             naming: None,
         };

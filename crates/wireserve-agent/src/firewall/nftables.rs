@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use nftables::expr::{
-    BinaryOperation, CTDir, Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, SetItem, CT,
+    BinaryOperation, CTDir, Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, Prefix, SetItem, CT,
 };
 use nftables::schema::{Chain, NfCmd, NfListObject, NfObject, Nftables, Rule, Table};
 use nftables::stmt::{Accept, Drop, Mangle, Match, Operator, Statement, NAT};
@@ -32,6 +32,8 @@ const MARK_OUT_CHAIN: &str = "svc-mark-out";
 const REV_POST_CHAIN: &str = "svc-rev-post";
 const REV_IN_CHAIN: &str = "svc-rev-in";
 const MASQ_CHAIN: &str = "svc-masq";
+const EXIT_MARK_CHAIN: &str = "exit-mark";
+const EXIT_MASQ_CHAIN: &str = "exit-masq";
 
 /// Before conntrack (-200): the rewrite must happen before a connection
 /// is ever tracked, so that the tracked connection is the rewritten one.
@@ -50,6 +52,14 @@ const PRIO_SRCNAT: i32 = 100;
 /// `0xf00`. Several agents on one host share it safely: every rule that
 /// acts on it also matches its own interface or its own node address.
 pub const SERVICE_MARK: u32 = 0x0100_0000;
+
+/// The conntrack mark bit that says "this flow is an exit client's, headed
+/// for the internet" (PLAN.md M27). Its own bit rather than
+/// [`SERVICE_MARK`]: a service may map onto a public address (M26), and the
+/// reply rewrite for it matches that address and port under the service
+/// bit, so an exit flow to the same address and port sharing the bit would
+/// have its replies rewritten to look like they came from the service.
+pub const EXIT_MARK: u32 = 0x0200_0000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NftablesError {
@@ -266,6 +276,92 @@ fn lacks_mark(key: Expression<'static>) -> Statement<'static> {
         right: Expression::Number(SERVICE_MARK),
         op: Operator::NEQ,
     })
+}
+
+/// `<key> & BIT == BIT`, for a bit other than the service mark.
+fn has_bit(key: Expression<'static>, bit: u32) -> Statement<'static> {
+    is(
+        Expression::BinaryOperation(Box::new(BinaryOperation::AND(key, Expression::Number(bit)))),
+        Expression::Number(bit),
+    )
+}
+
+/// `<key> set <key> | BIT`, for a bit other than the service mark.
+fn add_bit(key: Expression<'static>, bit: u32) -> Statement<'static> {
+    set(
+        key.clone(),
+        Expression::BinaryOperation(Box::new(BinaryOperation::OR(vec![key, Expression::Number(bit)]))),
+    )
+}
+
+/// `<key> & BITS == 0`: none of these bits. What the guard drops on.
+fn lacks_bits(key: Expression<'static>, bits: u32) -> Statement<'static> {
+    is(
+        Expression::BinaryOperation(Box::new(BinaryOperation::AND(key, Expression::Number(bits)))),
+        Expression::Number(0),
+    )
+}
+
+fn oifname_is_not(ifname: &str) -> Statement<'static> {
+    Statement::Match(Match {
+        left: meta(MetaKey::Oifname),
+        right: Expression::String(Cow::Owned(ifname.to_string())),
+        op: Operator::NEQ,
+    })
+}
+
+fn prefix(ip: Ipv4Addr, len: u32) -> Expression<'static> {
+    Expression::Named(NamedExpression::Prefix(Prefix { addr: Box::new(addr(ip)), len }))
+}
+
+/// The exit's own chains (PLAN.md M27), or nothing. A new flow from one of
+/// the exit clients to anywhere outside `NOT_THE_INTERNET_V4` and the mesh is
+/// marked with [`EXIT_MARK`] once conntrack exists, and masqueraded on its
+/// way out of any interface but the mesh's.
+///
+/// Marked in prerouting rather than in our forward chain because the mark
+/// is what the host's *other* firewalls are opened for (host interop's exit
+/// openings), and their FORWARD chains run at the same priority as ours, in
+/// no promised order. A flow a service address already rewrote carries the
+/// service bit and is left to that path.
+fn exit_chains(t: &str, ifname: &str, forwarding: &Forwarding) -> Vec<NfObject<'static>> {
+    let Some((mesh, mesh_len)) = forwarding.mesh_v4 else {
+        return Vec::new();
+    };
+    if forwarding.exit.is_empty() {
+        return Vec::new();
+    }
+    let not_internet: Vec<SetItem<'static>> = wireserve_types::NOT_THE_INTERNET_V4
+        .iter()
+        .copied()
+        .chain(std::iter::once((mesh, mesh_len)))
+        .map(|(ip, len)| SetItem::Element(prefix(ip, u32::from(len))))
+        .collect();
+    vec![
+        chain(t, EXIT_MARK_CHAIN, NfChainType::Filter, NfHook::Prerouting, PRIO_MANGLE),
+        rule(t, EXIT_MARK_CHAIN, vec![
+            iifname_is(ifname),
+            in_list(payload("ip", "saddr"), forwarding.exit.iter().map(|a| addr(*a)).collect()),
+            Statement::Match(Match {
+                left: ct("state", None),
+                right: Expression::List(vec![Expression::String("new".into())]),
+                op: Operator::IN,
+            }),
+            lacks_mark(meta(MetaKey::Mark)),
+            Statement::Match(Match {
+                left: payload("ip", "daddr"),
+                right: Expression::Named(NamedExpression::Set(not_internet)),
+                op: Operator::NEQ,
+            }),
+            add_bit(ct("mark", None), EXIT_MARK),
+        ]),
+        chain(t, EXIT_MASQ_CHAIN, NfChainType::NAT, NfHook::Postrouting, PRIO_SRCNAT),
+        rule(t, EXIT_MASQ_CHAIN, vec![
+            has_bit(ct("mark", None), EXIT_MARK),
+            oifname_is_not(ifname),
+            Statement::Masquerade(None::<NAT>),
+        ]),
+    ]
 }
 
 fn dport_is(proto: Proto, port: u16) -> Statement<'static> {
@@ -502,11 +598,14 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
     // flow of ours carries the mark in both directions, and so do ICMP
     // errors about it, which conntrack ties to the same flow. Never the
     // mesh interface itself, which would stop transit.
+    //
+    // An exit's replies (PLAN.md M27) arrive the same way, under their own
+    // bit, so the guard lets through flows carrying either.
     for lan in forwarding.guarded.iter().filter(|g| g.as_str() != ifname) {
         objects.push(rule(t, FORWARD_CHAIN, vec![
             iifname_is(lan),
             is(meta(MetaKey::Nfproto), Expression::String("ipv4".into())),
-            lacks_mark(ct("mark", None)),
+            lacks_bits(ct("mark", None), SERVICE_MARK | EXIT_MARK),
             Statement::Drop(None::<Drop>),
         ]));
     }
@@ -554,7 +653,20 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
     for pair in &forwarding.transit {
         objects.extend(transit_forward_rules(t, ifname, pair));
     }
+    // An exit client's new flow to the internet (PLAN.md M27), marked in
+    // `exit-mark`. Anything else from it — its gateway's LAN, IPv6 on a host
+    // that forwards it — meets the drop below.
+    let exit = exit_chains(t, ifname, forwarding);
+    if !exit.is_empty() {
+        objects.push(rule(t, FORWARD_CHAIN, vec![
+            iifname_is(ifname),
+            oifname_is_not(ifname),
+            has_bit(ct("mark", None), EXIT_MARK),
+            accept(),
+        ]));
+    }
     objects.push(rule(t, FORWARD_CHAIN, vec![iifname_is(ifname), Statement::Drop(None::<Drop>)]));
+    objects.extend(exit);
 
     // The chains below are the service-address rewrite machinery
     // (PLAN.md M20) — transit needs none of it (a transited connection is
@@ -682,7 +794,7 @@ mod tests {
     const VIP: Ipv4Addr = Ipv4Addr::new(100, 90, 0, 50);
 
     fn fwd(transit: &[TransitForward]) -> Forwarding {
-        Forwarding { transit: transit.to_vec(), guarded: vec![] }
+        Forwarding { transit: transit.to_vec(), ..Forwarding::default() }
     }
 
     fn as_json(batch: &Nftables<'_>) -> Value {
@@ -1047,7 +1159,7 @@ mod tests {
 
     #[test]
     fn a_guarded_interface_forwards_only_our_own_flows() {
-        let forwarding = Forwarding { transit: vec![], guarded: vec!["eth0".into(), "wg0".into()] };
+        let forwarding = Forwarding { guarded: vec!["eth0".into(), "wg0".into()], ..Forwarding::default() };
         let batch = as_json(&apply_batch("wg0", &[mapped("443:192.168.178.1:80")], &forwarding));
         let fwd_rules = rules_in(&batch, "wireserve-fwd");
         assert_eq!(
@@ -1055,7 +1167,9 @@ mod tests {
             json!([
                 iif("eth0"),
                 {"match": {"op": "==", "left": {"meta": {"key": "nfproto"}}, "right": "ipv4"}},
-                {"match": {"op": "!=", "left": {"&": [{"ct": {"key": "mark"}}, SERVICE_MARK]}, "right": SERVICE_MARK}},
+                // Neither ours nor an exit's (PLAN.md M27): replies to both
+                // arrive on an interface the agent owns.
+                {"match": {"op": "==", "left": {"&": [{"ct": {"key": "mark"}}, SERVICE_MARK | EXIT_MARK]}, "right": 0}},
                 {"drop": null},
             ])
         );
@@ -1110,7 +1224,7 @@ mod tests {
         // service address as destination, or its own mark.
         let rules = [open(Proto::Tcp, 22), mapped("80:5080"), mapped("53:5353/udp"), mapped("443:192.168.178.1:80")];
         for ifname in ["wg0", "wireserve0", "wg-mesh.1"] {
-            let batch = as_json(&apply_batch(ifname, &rules, &fwd(&[])));
+            let batch = as_json(&apply_batch(ifname, &rules, &exit_fwd(&[CLIENT])));
             let rules: Vec<&Value> = batch["nftables"]
                 .as_array()
                 .unwrap()
@@ -1121,7 +1235,8 @@ mod tests {
                 let first = &r["expr"][0];
                 let text = r["expr"].to_string();
                 let ok = match r["chain"].as_str().unwrap() {
-                    "wireserve-in" | "wireserve-fwd" | "svc-pre" => *first == iif(ifname),
+                    "wireserve-in" | "wireserve-fwd" | "svc-pre" | "exit-mark" => *first == iif(ifname),
+                    "exit-masq" => text.contains(&format!(r#""&":[{{"ct":{{"key":"mark"}}}},{EXIT_MARK}]"#)),
                     "svc-masq" => text.contains(&format!(r#""&":[{{"meta":{{"key":"mark"}}}},{SERVICE_MARK}]"#)),
                     "svc-out" => text.starts_with(r#"[{"match":{"left":{"payload":{"field":"daddr","protocol":"ip"}},"op":"==","right":"100.90.0.50"}}"#),
                     "svc-mark-pre" | "svc-mark-out" | "svc-rev-post" | "svc-rev-in" => {
@@ -1139,7 +1254,7 @@ mod tests {
     fn the_mark_is_only_ever_or_ed_in_and_tested_under_its_mask() {
         // Other software uses the packet and conntrack marks too; this
         // agent must never overwrite or compare their bits.
-        let forwarding = Forwarding { transit: vec![], guarded: vec!["eth0".into()] };
+        let forwarding = Forwarding { guarded: vec!["eth0".into()], ..exit_fwd(&[CLIENT]) };
         let batch = as_json(&apply_batch("wg0", &[mapped("80:5080"), mapped("443:192.168.178.1:80")], &forwarding));
         for r in batch["nftables"].as_array().unwrap().iter().filter_map(|o| o.pointer("/add/rule")) {
             for stmt in r["expr"].as_array().unwrap() {
@@ -1151,6 +1266,95 @@ mod tests {
                 let or_set = stmt.pointer("/mangle/value/|").is_some();
                 assert!(masked_test || or_set, "mark used without its mask: {stmt}");
             }
+        }
+    }
+
+    // ---- exit (PLAN.md M27) ----
+
+    const CLIENT: Ipv4Addr = Ipv4Addr::new(100, 90, 0, 9);
+
+    fn exit_fwd(clients: &[Ipv4Addr]) -> Forwarding {
+        Forwarding {
+            exit: clients.to_vec(),
+            mesh_v4: Some((Ipv4Addr::new(100, 90, 0, 0), 24)),
+            ..Forwarding::default()
+        }
+    }
+
+    fn chain_names(batch: &Value) -> Vec<String> {
+        batch["nftables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o.pointer("/add/chain/name").and_then(Value::as_str).map(String::from))
+            .collect()
+    }
+
+    #[test]
+    fn an_exit_marks_new_internet_flows_from_its_clients_and_masquerades_them() {
+        // No service at all: the exit must not ride on the service chains'
+        // early return.
+        let batch = as_json(&apply_batch("wg0", &[], &exit_fwd(&[CLIENT])));
+        let ct_mark = json!({"ct": {"key": "mark"}});
+        let mut not_internet: Vec<Value> = wireserve_types::NOT_THE_INTERNET_V4
+            .iter()
+            .map(|(ip, len)| json!({"prefix": {"addr": ip.to_string(), "len": len}}))
+            .collect();
+        not_internet.push(json!({"prefix": {"addr": "100.90.0.0", "len": 24}}));
+        assert_eq!(
+            rules_in(&batch, "exit-mark"),
+            vec![json!([
+                iif("wg0"),
+                in_addrs("ip", "saddr", &["100.90.0.9"]),
+                {"match": {"op": "in", "left": {"ct": {"key": "state"}}, "right": ["new"]}},
+                {"match": {"op": "!=", "left": {"&": [{"meta": {"key": "mark"}}, SERVICE_MARK]}, "right": SERVICE_MARK}},
+                {"match": {"op": "!=", "left": field("ip", "daddr"), "right": {"set": not_internet}}},
+                mangle(ct_mark.clone(), json!({"|": [ct_mark, EXIT_MARK]})),
+            ])]
+        );
+        assert_eq!(
+            rules_in(&batch, "exit-masq"),
+            vec![json!([
+                {"match": {"op": "==", "left": {"&": [{"ct": {"key": "mark"}}, EXIT_MARK]}, "right": EXIT_MARK}},
+                {"match": {"op": "!=", "left": {"meta": {"key": "oifname"}}, "right": "wg0"}},
+                {"masquerade": null},
+            ])]
+        );
+        // Accepted just ahead of the interface's final drop, never after it.
+        let fwd_rules = rules_in(&batch, "wireserve-fwd");
+        let n = fwd_rules.len();
+        assert_eq!(fwd_rules[n - 1], json!([iif("wg0"), {"drop": null}]));
+        assert_eq!(
+            fwd_rules[n - 2],
+            json!([
+                iif("wg0"),
+                {"match": {"op": "!=", "left": {"meta": {"key": "oifname"}}, "right": "wg0"}},
+                {"match": {"op": "==", "left": {"&": [{"ct": {"key": "mark"}}, EXIT_MARK]}, "right": EXIT_MARK}},
+                {"accept": null},
+            ])
+        );
+        let chains = chain_names(&batch);
+        let pos = |n: &str| chains.iter().position(|c| c == n).unwrap();
+        assert!(pos("exit-mark") > pos("wireserve-fwd"));
+        let chain = |name: &str| {
+            batch["nftables"].as_array().unwrap().iter().find_map(|o| o.pointer("/add/chain").filter(|c| c["name"] == name)).unwrap().clone()
+        };
+        let mark = chain("exit-mark");
+        assert_eq!((&mark["type"], &mark["hook"], &mark["prio"]), (&json!("filter"), &json!("prerouting"), &json!(-150)));
+        let masq = chain("exit-masq");
+        assert_eq!((&masq["type"], &masq["hook"], &masq["prio"]), (&json!("nat"), &json!("postrouting"), &json!(100)));
+    }
+
+    #[test]
+    fn no_exit_clients_or_no_mesh_range_means_no_exit_rules_at_all() {
+        for forwarding in [
+            exit_fwd(&[]),
+            Forwarding { mesh_v4: None, ..exit_fwd(&[CLIENT]) },
+        ] {
+            let batch = as_json(&apply_batch("wg0", &[mapped("80:5080")], &forwarding));
+            let text = batch.to_string();
+            assert!(!text.contains("exit-") && !text.contains(&EXIT_MARK.to_string()), "{text}");
+            assert_eq!(batch, as_json(&apply_batch("wg0", &[mapped("80:5080")], &Forwarding::default())));
         }
     }
 
@@ -1272,7 +1476,7 @@ mod tests {
     #[test]
     fn kernel_accepts_the_service_address_chains() {
         let rules = [mapped("80:5080"), mapped("53:5353/udp"), mapped("443:192.168.178.1:80")];
-        let forwarding = Forwarding { transit: vec![], guarded: vec!["eth0".into()] };
+        let forwarding = Forwarding { guarded: vec!["eth0".into()], ..Forwarding::default() };
         let batch = serde_json::to_string(&apply_batch("wg0", &rules, &forwarding)).unwrap();
         let script = format!("nft -j -f - <<'JSON' || true\n{batch}\nJSON\nnft list ruleset");
         let Some((listing, stderr)) = crate::firewall::netns::run_capturing(&script) else {
@@ -1314,7 +1518,7 @@ mod tests {
     #[test]
     fn kernel_accepts_the_masquerade_and_the_guard() {
         let rules = [mapped("443:192.168.178.1:80")];
-        let forwarding = Forwarding { transit: vec![], guarded: vec!["eth0".into()] };
+        let forwarding = Forwarding { guarded: vec!["eth0".into()], ..Forwarding::default() };
         let mut batch = apply_batch("wg0", &rules, &forwarding);
         // Drop the rewriting chains' rules, which need the host's user
         // namespace; what is left must all be accepted.
@@ -1337,10 +1541,80 @@ mod tests {
         for want in [
             "type nat hook postrouting priority srcnat; policy accept;".to_string(),
             format!("meta mark & {m} == {m} ip daddr 192.168.178.1 tcp dport 80 oifname != \"wg0\" masquerade"),
-            format!("iifname \"eth0\" meta nfproto ipv4 ct mark & {m} != {m} drop"),
+            format!("iifname \"eth0\" meta nfproto ipv4 ct mark & 0x{:08x} == 0x00000000 drop", SERVICE_MARK | EXIT_MARK),
         ] {
             assert!(lines.contains(&want), "missing `{want}` in:\n{listing}");
         }
+    }
+
+    /// The exit against real packets (PLAN.md M27). This namespace is the
+    /// gateway; a veth named `wg0` stands in for the mesh interface, since
+    /// every rule keys on the name and none on WireGuard itself. Around it:
+    /// the client, an "internet" host with no route back into the mesh, and
+    /// a LAN host that does have one.
+    ///
+    /// - the client reaches the internet host, which it can only do
+    ///   masqueraded, since that host cannot route to a mesh address;
+    /// - it does not reach the LAN host, although forwarding and routing
+    ///   would carry it there: private destinations are not the internet;
+    /// - the internet host cannot open a connection into the mesh through
+    ///   the guarded interface, even with a route to it.
+    #[test]
+    fn kernel_an_exit_forwards_its_clients_to_the_internet_and_nowhere_else() {
+        if !crate::firewall::netns::reexec(
+            "firewall::nftables::tests::kernel_an_exit_forwards_its_clients_to_the_internet_and_nowhere_else",
+        ) {
+            return;
+        }
+        let mut hosts = Vec::new();
+        for _ in 0..3 {
+            hosts.push(std::process::Command::new("unshare").args(["-n", "sleep", "60"]).spawn().unwrap());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (client, internet, lan) = (hosts[0].id(), hosts[1].id(), hosts[2].id());
+        let setup = format!(
+            "ip link set lo up
+             ip link add wg0 type veth peer name c0 && ip link set c0 netns {client}
+             ip link add eth0 type veth peer name i0 && ip link set i0 netns {internet}
+             ip link add lan0 type veth peer name l0 && ip link set l0 netns {lan}
+             ip addr add 100.90.0.1/24 dev wg0 && ip link set wg0 up
+             ip addr add 203.0.113.1/24 dev eth0 && ip link set eth0 up
+             ip addr add 192.168.1.1/24 dev lan0 && ip link set lan0 up
+             nsenter -t {client} -n sh -euc 'ip link set lo up; ip addr add 100.90.0.9/24 dev c0; ip link set c0 up; ip route add default via 100.90.0.1'
+             nsenter -t {internet} -n sh -euc 'ip link set lo up; ip addr add 203.0.113.2/24 dev i0; ip link set i0 up'
+             nsenter -t {lan} -n sh -euc 'ip link set lo up; ip addr add 192.168.1.2/24 dev l0; ip link set l0 up; ip route add 100.90.0.0/24 via 192.168.1.1'
+             echo 0 > /proc/sys/net/ipv4/conf/all/forwarding
+             for i in wg0 eth0 lan0; do echo 1 > /proc/sys/net/ipv4/conf/$i/forwarding; done"
+        );
+        let out = std::process::Command::new("sh").args(["-euc", &setup]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        let forwarding = Forwarding { guarded: vec!["eth0".into()], ..exit_fwd(&[CLIENT]) };
+        let script = nft_script(&[apply_batch("wg0", &[], &forwarding)]);
+        let out = std::process::Command::new("sh").args(["-euc", &script]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        let ping = |from: u32, to: &str| {
+            std::process::Command::new("nsenter")
+                .args(["-t", &from.to_string(), "-n", "ping", "-c3", "-i0.2", "-W1", to])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        let to_internet = ping(client, "203.0.113.2");
+        let to_lan = ping(client, "192.168.1.2");
+        let _ = std::process::Command::new("nsenter")
+            .args(["-t", &internet.to_string(), "-n", "ip", "route", "add", "100.90.0.0/24", "via", "203.0.113.1"])
+            .status();
+        let into_mesh = ping(internet, "100.90.0.9");
+        for mut h in hosts {
+            let _ = h.kill();
+            let _ = h.wait();
+        }
+        assert!(to_internet, "the client must reach the internet host, masqueraded");
+        assert!(!to_lan, "an exit must not forward to a private address");
+        assert!(!into_mesh, "the guarded interface must not let anything new into the mesh");
     }
 
     #[test]

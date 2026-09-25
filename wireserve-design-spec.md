@@ -447,6 +447,18 @@ path does give up the "service sees the real client" property of §-service
 addresses, which is exactly why it is opt-in and why the direct path is left
 untouched beside it.
 
+### 6.2 A resolver in a full tunnel (M27)
+
+A phone's `DNS =` line captures every query the phone makes (PLAN.md #104),
+which is why the mesh profile of §9 has none. The full-tunnel profile of
+§9 changes that premise rather than contradicting it: every packet already
+goes through the gateway, so every query going to one resolver is the point,
+not a side effect. That resolver is the operator's own — a Pi-hole or
+AdGuard Home published as an ordinary service, or a public one — and
+WireServe still never listens on 53 or runs one. A resolver that runs on a
+node reads that node's `/etc/hosts`, so it answers every service's name,
+including the non-HTTP ones §6.1 leaves nameless on a phone.
+
 ## 7. Security requirements (v1, non-negotiable)
 
 These are treated as core requirements, not hardening to add later:
@@ -600,6 +612,20 @@ What it does, end to end:
   direction that bites is a node that gains a routable endpoint after
   export: recomputing would stop routing it through the gateway while the
   device still has no direct entry for it, breaking that path both ways.
+
+- **A full-tunnel profile, with the gateway as the exit** (M27,
+  `--exit`). Rendered in the same export as the mesh profile — one keypair,
+  since a second export would rotate it — with the gateway's `AllowedIPs`
+  widened to `0.0.0.0/0, ::/0` and a `DNS =` line (§6.2). The direct peers
+  keep their /32s, which outrank the default route, so the mesh stays as
+  direct as before. Two consents, like transit: the gateway's own `exit on`,
+  and the admin's export, recorded per export like config membership since
+  it describes the files on the device. The gateway forwards only new flows
+  from its exit clients to public IPv4 destinations, marks them with a
+  conntrack bit of their own, masquerades them, and guards the egress
+  interface's forwarding switch the way a LAN target's is guarded. IPv6 is
+  captured, so nothing leaks around the tunnel, and dropped: forwarding it
+  would need NAT66 and a per-interface switch only Linux 6.17 has.
 
 - **Re-issuing a config keeps the device's name and address** (M24,
   `--refresh`): `reissue_join_token` preserves `ip4`/`ip6` and `/register`

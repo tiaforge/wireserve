@@ -99,6 +99,9 @@ impl PollError {
 /// one means.
 pub struct TransitSelfReport {
     pub capable: bool,
+    /// `exit on` (PLAN.md M27) — reported alongside, since it is the same
+    /// kind of live, local opt-in.
+    pub exit_capable: bool,
     pub reachable: Vec<String>,
     pub wanted: Vec<String>,
 }
@@ -124,6 +127,7 @@ pub fn build_poll_request(
         lan_addr,
         reflexive_addr,
         transit_capable: transit.capable,
+        exit_capable: transit.exit_capable,
         transit_reachable: transit.reachable,
         transit_wanted: transit.wanted,
         services: declared.to_vec(),
@@ -279,6 +283,47 @@ fn egress_interfaces(rules: &[ServiceRule], mesh_ifname: &str) -> BTreeSet<Strin
 #[cfg(not(target_os = "linux"))]
 fn egress_interfaces(_rules: &[ServiceRule], _mesh_ifname: &str) -> BTreeSet<String> {
     BTreeSet::new()
+}
+
+/// The interface this host reaches the internet through, for an exit
+/// (PLAN.md M27): where the replies to its clients' traffic arrive. A route
+/// lookup only — nothing is sent to the address. A real global one rather
+/// than a documentation range, which a host may route to a blackhole.
+#[cfg(target_os = "linux")]
+fn internet_egress(mesh_ifname: &str) -> Option<String> {
+    const ANY_GLOBAL: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
+    match crate::routes::egress_ifname(ANY_GLOBAL) {
+        Ok(Some(name)) if name != mesh_ifname => Some(name),
+        Ok(_) => {
+            tracing::warn!("this node's default route leads into the mesh; not acting as an exit");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "this node has no route to the internet; not acting as an exit");
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn internet_egress(_mesh_ifname: &str) -> Option<String> {
+    None
+}
+
+/// The mesh IPv4 addresses of the devices this node is the exit for, from
+/// the pubkeys the coordinator named and the directory's own entries for
+/// them. A pubkey not in the directory is skipped: its address is exactly
+/// what the forwarding rule matches, so there is nothing to guess.
+fn exit_client_addrs(directory: &PollResponse) -> Vec<Ipv4Addr> {
+    let mut out: Vec<Ipv4Addr> = directory
+        .exit_clients
+        .iter()
+        .filter_map(|pk| directory.peers.iter().find(|p| &p.pubkey == pk))
+        .filter_map(|p| p.ip4.parse().ok())
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 fn own_vip(name: &str, node: Ipv4Addr, directory: &PollResponse) -> Option<Ipv4Addr> {
@@ -462,7 +507,7 @@ where
     F::Error: std::fmt::Display,
 {
     // Snapshot exactly what this cycle sends, then release the lock.
-    let (bearer, self_pubkey, declared, endpoint_addr, listen_port, node_ip, node_ip6, transit_capable) = {
+    let (bearer, self_pubkey, declared, endpoint_addr, listen_port, node_ip, node_ip6, transit_capable, exit_capable) = {
         let s = state.lock().await;
         (
             s.bearer_token.clone().ok_or(PollError::NotRegistered)?,
@@ -473,6 +518,7 @@ where
             s.ip4.as_deref().and_then(|ip| ip.parse::<Ipv4Addr>().ok()),
             s.ip6.as_deref().and_then(|ip| ip.parse::<Ipv6Addr>().ok()),
             s.transit_capable,
+            s.exit_capable,
         )
     };
 
@@ -534,7 +580,12 @@ where
         &dual,
         lan_addr,
         ctx.own_reflexive_addr.map(String::from),
-        TransitSelfReport { capable: transit_capable, reachable: transit_reachable, wanted: transit_wanted },
+        TransitSelfReport {
+            capable: transit_capable,
+            exit_capable,
+            reachable: transit_reachable,
+            wanted: transit_wanted,
+        },
     );
     let url = format!("{}/poll", ctx.coordinator_url.trim_end_matches('/'));
     let resp = ctx
@@ -636,6 +687,15 @@ where
     // fire on this node's own response).
     let transit_forwards =
         crate::wg::transit_forwards(&directory.peers, &directory.services, &directory.transit_carrying);
+    // The devices this node is the exit for (PLAN.md M27). Only while this
+    // node itself opted in — the coordinator's list is the device side of
+    // the consent, never the whole of it — and only with a pinned mesh
+    // range, without which the mesh itself would look like the internet.
+    let exit = if exit_capable && mesh_ranges.is_some() {
+        exit_client_addrs(&directory)
+    } else {
+        Vec::new()
+    };
     let (failures, owned_egress_now) = tokio::task::block_in_place(|| {
         let mut failures = Vec::new();
 
@@ -688,10 +748,20 @@ where
         //    replaced (inside `begin_egress`), and a new one turned on only
         //    once the ruleset guarding it is in place — never forwarding
         //    unguarded in between.
-        let plan = crate::firewall::ip_forward::begin_egress(&egress_interfaces(&rules, &ifname), &owned_egress);
+        //
+        //    An exit (PLAN.md M27) is one more egress: replies from the
+        //    internet arrive on the default route's interface, which goes
+        //    through the same owned, guarded switch.
+        let mut egress = egress_interfaces(&rules, &ifname);
+        if !exit.is_empty() {
+            egress.extend(internet_egress(&ifname));
+        }
+        let plan = crate::firewall::ip_forward::begin_egress(&egress, &owned_egress);
         let forwarding = wireserve_types::Forwarding {
             transit: transit_forwards.clone(),
             guarded: plan.guard.iter().cloned().collect(),
+            exit: exit.clone(),
+            mesh_v4: mesh_ranges.as_ref().map(wireserve_types::MeshRanges::v4),
         };
         let owned_now = match ctx.firewall.apply(&rules, &forwarding) {
             Ok(()) => {
@@ -712,7 +782,10 @@ where
         // `ip_forward` module doc for why this is scoped to `ifname` and
         // never the host's global/`all` forwarding switches.
         let forwards_services = rules.iter().any(|r| r.remote_target().is_some());
-        crate::firewall::ip_forward::set_enabled(&ifname, !transit_forwards.is_empty() || forwards_services);
+        crate::firewall::ip_forward::set_enabled(
+            &ifname,
+            !transit_forwards.is_empty() || forwards_services || !exit.is_empty(),
+        );
 
         // 4. rewrite the hosts-file managed block from the full directory.
         // Step 4b (PLAN.md M25): publish services to this node's reverse
@@ -764,6 +837,23 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn exit_clients_resolve_to_their_mesh_addresses_and_nothing_else() {
+        let directory: PollResponse = serde_json::from_value(serde_json::json!({
+            "peers": [
+                {"name": "phone", "pubkey": "pk-phone", "ip4": "100.90.0.9", "ip6": "fd00:90::9"},
+                {"name": "tablet", "pubkey": "pk-tablet", "ip4": "100.90.0.8", "ip6": "fd00:90::8"},
+                {"name": "odd", "pubkey": "pk-odd", "ip4": "not an address", "ip6": ""},
+            ],
+            "services": [],
+            // Twice, one unknown, one unparsable: none of it may widen the
+            // rule beyond the addresses the directory itself holds.
+            "exit_clients": ["pk-phone", "pk-phone", "pk-unknown", "pk-odd"],
+        }))
+        .unwrap();
+        assert_eq!(exit_client_addrs(&directory), vec![Ipv4Addr::new(100, 90, 0, 9)]);
+    }
     use super::*;
     use wireserve_types::{MeshInfo, PortMap, Proto, ServiceInfo};
 
@@ -830,6 +920,7 @@ mod tests {
             Some("203.0.113.5:55123".into()),
             TransitSelfReport {
                 capable: true,
+                exit_capable: true,
                 reachable: vec!["reachable-pk".into()],
                 wanted: vec!["wanted-pk".into()],
             },
@@ -841,6 +932,7 @@ mod tests {
         assert_eq!(req.lan_addr.as_deref(), Some("192.168.1.5"));
         assert_eq!(req.reflexive_addr.as_deref(), Some("203.0.113.5:55123"));
         assert!(req.transit_capable);
+        assert!(req.exit_capable);
         assert_eq!(req.transit_reachable, vec!["reachable-pk".to_string()]);
         assert_eq!(req.transit_wanted, vec!["wanted-pk".to_string()]);
     }
@@ -1058,6 +1150,7 @@ mod tests {
                 .collect(),
             transit_carrying: vec![],
             transit_awaiting_approval: false,
+            exit_clients: vec![],
             mesh: None,
         }
     }
@@ -1286,6 +1379,7 @@ mod proxy_step_tests {
             denied_services: vec![],
             transit_carrying: vec![],
             transit_awaiting_approval: false,
+            exit_clients: vec![],
             mesh: None,
         }
     }

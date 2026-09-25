@@ -98,21 +98,27 @@ pub fn names_include_filter(names: &str) -> bool {
 /// to any other interface on the host.
 #[must_use]
 pub fn opening_spec(ifname: &str, opening: Opening) -> Vec<String> {
-    let mark = || {
-        let m = crate::firewall::nftables::SERVICE_MARK;
-        ["-m".to_string(), "connmark".into(), "--mark".into(), format!("{m:#x}/{m:#x}")]
-    };
+    let mark = |m: u32| ["-m".to_string(), "connmark".into(), "--mark".into(), format!("{m:#x}/{m:#x}")];
+    let (service, exit) = (crate::firewall::nftables::SERVICE_MARK, crate::firewall::nftables::EXIT_MARK);
     let mut spec: Vec<String> = Vec::new();
     match opening {
         Opening::Input => spec.extend(["-i".into(), ifname.into()]),
         Opening::Hairpin => spec.extend(["-i".into(), ifname.into(), "-o".into(), ifname.into()]),
         Opening::ServiceRequest => {
             spec.extend(["-i".into(), ifname.into()]);
-            spec.extend(mark());
+            spec.extend(mark(service));
         }
         Opening::ServiceReply => {
             spec.extend(["-o".into(), ifname.into()]);
-            spec.extend(mark());
+            spec.extend(mark(service));
+        }
+        Opening::ExitRequest => {
+            spec.extend(["-i".into(), ifname.into()]);
+            spec.extend(mark(exit));
+        }
+        Opening::ExitReply => {
+            spec.extend(["-o".into(), ifname.into()]);
+            spec.extend(mark(exit));
         }
     }
     spec
@@ -320,7 +326,21 @@ mod tests {
                 "-m", "comment", "--comment", "wireserve:wg0", "-j", "ACCEPT"
             ]
         );
-        for opening in [Opening::Input, Opening::Hairpin, Opening::ServiceRequest, Opening::ServiceReply] {
+        assert_eq!(
+            insert_args("wg0", Opening::ExitRequest),
+            [
+                "-w", "5", "-I", "FORWARD", "1", "-i", "wg0", "-m", "connmark", "--mark", "0x2000000/0x2000000",
+                "-m", "comment", "--comment", "wireserve:wg0", "-j", "ACCEPT"
+            ]
+        );
+        for opening in [
+            Opening::Input,
+            Opening::Hairpin,
+            Opening::ServiceRequest,
+            Opening::ServiceReply,
+            Opening::ExitRequest,
+            Opening::ExitReply,
+        ] {
             for ifname in ["wg0", "wireserve0", "a.b-c_d"] {
                 let args = insert_args(ifname, opening);
                 let i = args.iter().position(|a| a == "-i" || a == "-o").unwrap();
@@ -480,16 +500,18 @@ mod tests {
         let bin = t.binary.display();
         let q = |args: Vec<String>| args.iter().map(|a| format!("'{a}'")).collect::<Vec<_>>().join(" ");
         let script = format!(
-            "{bin} -P FORWARD DROP\n{bin} {req}\n{bin} {reply}\n{bin} {list}",
+            "{bin} -P FORWARD DROP\n{bin} {req}\n{bin} {reply}\n{bin} {exit_req}\n{bin} {exit_reply}\n{bin} {list}",
             req = q(insert_args("wg0", Opening::ServiceRequest)),
             reply = q(insert_args("wg0", Opening::ServiceReply)),
+            exit_req = q(insert_args("wg0", Opening::ExitRequest)),
+            exit_reply = q(insert_args("wg0", Opening::ExitReply)),
             list = q(list_args(Hook::Forward)),
         );
         let Some(out) = crate::firewall::netns::run(&script) else {
             return;
         };
         let lines = tagged_lines(&out, Hook::Forward);
-        for opening in [Opening::ServiceRequest, Opening::ServiceReply] {
+        for opening in [Opening::ServiceRequest, Opening::ServiceReply, Opening::ExitRequest, Opening::ExitReply] {
             let want = super::super::planner::iptables_line("wg0", opening);
             assert!(lines.contains(&want), "missing `{want}` in:\n{out}");
         }

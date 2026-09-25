@@ -11,10 +11,12 @@ use super::model::*;
 use super::planner::*;
 use super::ruleset;
 
-const NONE: ForwardWanted = ForwardWanted { transit: false, services: false };
-const TRANSIT: ForwardWanted = ForwardWanted { transit: true, services: false };
-const SERVICES: ForwardWanted = ForwardWanted { transit: false, services: true };
-const BOTH: ForwardWanted = ForwardWanted { transit: true, services: true };
+const NONE: ForwardWanted = ForwardWanted { transit: false, services: false, exit: false };
+const TRANSIT: ForwardWanted = ForwardWanted { transit: true, services: false, exit: false };
+const SERVICES: ForwardWanted = ForwardWanted { transit: false, services: true, exit: false };
+const BOTH: ForwardWanted = ForwardWanted { transit: true, services: true, exit: false };
+const EXIT: ForwardWanted = ForwardWanted { transit: true, services: false, exit: true };
+const ALL: ForwardWanted = ForwardWanted { transit: true, services: true, exit: true };
 
 const STRATO_LIKE: &[u8] = include_bytes!("../../../tests/fixtures/nft/strato_like.json");
 const NATIVE: &[u8] = include_bytes!("../../../tests/fixtures/nft/native.json");
@@ -1027,6 +1029,42 @@ fn a_service_target_opens_the_forward_hook_for_marked_flows_only() {
 }
 
 #[test]
+fn an_exit_opens_the_forward_hook_for_its_own_marked_flows_and_settles() {
+    let obs = ufw_forward();
+    let actions = plan_reconcile(&obs, "wg0", EXIT);
+    assert_eq!(
+        fwd_openings(&actions),
+        [
+            (IpVersion::V4, Opening::Hairpin),
+            (IpVersion::V4, Opening::ExitRequest),
+            (IpVersion::V4, Opening::ExitReply),
+            (IpVersion::V6, Opening::Hairpin),
+            (IpVersion::V6, Opening::ExitRequest),
+            (IpVersion::V6, Opening::ExitReply),
+        ],
+        "{actions:#?}"
+    );
+    assert_eq!(
+        iptables_line("wg0", Opening::ExitRequest),
+        "-A FORWARD -i wg0 -m connmark --mark 0x2000000/0x2000000 -m comment --comment \"wireserve:wg0\" -j ACCEPT"
+    );
+    let installed = simulate(&obs, &actions);
+    assert_eq!(plan_reconcile(&installed, "wg0", EXIT), vec![], "settled");
+
+    // `exit off`: only the exit's own openings go.
+    let actions = plan_reconcile(&installed, "wg0", TRANSIT);
+    let deleted: Vec<&str> = actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::IptablesDelete { line, .. } => Some(line.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deleted.len(), 4, "{actions:#?}");
+    assert!(deleted.iter().all(|l| l.contains("0x2000000/0x2000000")), "{deleted:?}");
+}
+
+#[test]
 fn transit_and_services_together_get_all_three_forward_openings_and_settle() {
     let obs = ufw_forward();
     let actions = plan_reconcile(&obs, "wg0", BOTH);
@@ -1077,7 +1115,14 @@ fn a_rule_of_one_opening_is_not_taken_for_another() {
         e.push(json!({"accept": null}));
         rule(e)
     };
-    let all = [Opening::Input, Opening::Hairpin, Opening::ServiceRequest, Opening::ServiceReply];
+    let all = [
+        Opening::Input,
+        Opening::Hairpin,
+        Opening::ServiceRequest,
+        Opening::ServiceReply,
+        Opening::ExitRequest,
+        Opening::ExitReply,
+    ];
     for a in all {
         for b in all {
             assert_eq!(is_accept_shape(&counted(a), "wg0", b), a == b, "{a:?} as {b:?}");
@@ -1092,14 +1137,14 @@ fn firewalld_guard_gets_a_service_exception_ahead_of_the_drop() {
         runtime_zone: None,
         permanent_zone: None,
     };
-    for forward in [SERVICES, BOTH] {
+    for forward in [SERVICES, BOTH, EXIT, ALL] {
         let actions = plan_reconcile(&obs, "wg0", forward);
         assert!(actions.contains(&Action::GuardCreate { ifname: "wg0".into(), forward }), "{actions:#?}");
         let after = simulate(&obs, &actions);
         let guard = after.nft.as_ref().unwrap().chains.iter().find(|c| c.chain.table == guard_table("wg0")).unwrap();
         assert!(is_guard_shape(&guard.rules, "wg0", forward));
-        assert_eq!(guard.rules.len(), if forward.transit { 3 } else { 2 });
-        for other in [NONE, TRANSIT, SERVICES, BOTH].into_iter().filter(|o| *o != forward) {
+        assert_eq!(guard.rules.len(), 1 + [forward.transit, forward.services, forward.exit].iter().filter(|b| **b).count());
+        for other in [NONE, TRANSIT, SERVICES, BOTH, EXIT, ALL].into_iter().filter(|o| *o != forward) {
             assert!(!is_guard_shape(&guard.rules, "wg0", other), "{forward:?} guard taken for {other:?}");
         }
         assert_eq!(plan_reconcile(&after, "wg0", forward), vec![], "settled");

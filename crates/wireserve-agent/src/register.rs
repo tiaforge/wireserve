@@ -189,6 +189,7 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
         ifname: params.ifname,
         ifname_pinned: params.ifname_pinned,
         transit_capable: false,
+        exit_capable: false,
         allow_plaintext_http: params.allow_plaintext_http,
         mesh: None,
         forwarding_owned: Vec::new(),

@@ -138,6 +138,7 @@ mod tests {
             transit_approved: false,
             gateway_node_id: None,
             export_via_gateway: false,
+            exit_enabled: false,
         }
     }
 

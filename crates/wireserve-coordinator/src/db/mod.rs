@@ -99,6 +99,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0009_transit_approval.sql")),
         M::up(include_str!("../../migrations/0010_static_peer_gateway.sql")),
         M::up(include_str!("../../migrations/0011_export_via_gateway.sql")),
+        M::up(include_str!("../../migrations/0012_static_peer_exit.sql")),
     ])
 }
 

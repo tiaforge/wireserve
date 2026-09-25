@@ -11,7 +11,9 @@ pub mod validation;
 pub use api::*;
 pub use mesh::{MeshInfo, MeshRanges};
 pub use naming::{ServiceNaming, TLS_PUBLIC_PORT};
-pub use firewall::{FirewallBackend, Forwarding, ServiceRule, TransitEndpoint, TransitForward};
+pub use firewall::{
+    is_internet_v4, FirewallBackend, Forwarding, ServiceRule, TransitEndpoint, TransitForward, NOT_THE_INTERNET_V4,
+};
 pub use node::{NodeKind, Proto};
 pub use ports::{
     is_valid_target_addr, same_target, target_label, validate_node_targets, validate_service_ports, PortMap,

@@ -92,6 +92,16 @@ pub struct Forwarding {
     /// Nothing else may be forwarded from them: before the agent turned
     /// the switch on, nothing was.
     pub guarded: Vec<String>,
+    /// Devices this node is the exit for (PLAN.md M27), by mesh IPv4
+    /// address: their new flows to the internet are forwarded out of the
+    /// host and masqueraded. Empty unless this node opted in with
+    /// `exit on`.
+    pub exit: Vec<std::net::Ipv4Addr>,
+    /// The mesh's own IPv4 range, which an exit never forwards to — that
+    /// is transit's job, with its own rules. Only read when `exit` is
+    /// non-empty; `None` there means no exit rules at all, since without
+    /// it the mesh itself would count as "the internet".
+    pub mesh_v4: Option<(std::net::Ipv4Addr, u8)>,
 }
 
 /// Replaces the current WireGuard-interface ruleset with exactly the given
@@ -106,4 +116,59 @@ pub trait FirewallBackend {
     /// Tear down whatever this backend has applied, returning the interface
     /// to having no firewall state of ours on it.
     fn teardown(&mut self) -> Result<(), Self::Error>;
+}
+
+/// Where an exit never forwards to (PLAN.md M27): every IPv4 range that is
+/// not the public internet. The gateway's own table refuses these as
+/// destinations, and `export-config` refuses them as the full-tunnel
+/// profile's resolver, so the two can never disagree about what an exit
+/// reaches. Private ranges are here on purpose: an exit client reaching the
+/// gateway's LAN would bypass the per-service approval a LAN target needs
+/// (M26). Documentation ranges are not: they say nothing about
+/// reachability, and they are what this project's tests use to mean "a
+/// public address".
+pub const NOT_THE_INTERNET_V4: [(std::net::Ipv4Addr, u8); 11] = {
+    use std::net::Ipv4Addr as A;
+    [
+        (A::new(0, 0, 0, 0), 8),
+        (A::new(10, 0, 0, 0), 8),
+        (A::new(100, 64, 0, 0), 10),
+        (A::new(127, 0, 0, 0), 8),
+        (A::new(169, 254, 0, 0), 16),
+        (A::new(172, 16, 0, 0), 12),
+        (A::new(192, 0, 0, 0), 24),
+        (A::new(192, 168, 0, 0), 16),
+        (A::new(198, 18, 0, 0), 15),
+        (A::new(224, 0, 0, 0), 4),
+        (A::new(240, 0, 0, 0), 4),
+    ]
+};
+
+/// Whether an exit forwards to `ip`: outside every range in
+/// [`NOT_THE_INTERNET_V4`].
+#[must_use]
+pub fn is_internet_v4(ip: std::net::Ipv4Addr) -> bool {
+    NOT_THE_INTERNET_V4.iter().all(|&(net, len)| {
+        let mask = if len == 0 { 0 } else { u32::MAX << (32 - u32::from(len)) };
+        u32::from(ip) & mask != u32::from(net)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_internet_is_what_is_left_over() {
+        for public in ["1.1.1.1", "9.9.9.9", "203.0.113.1", "8.8.4.4", "100.128.0.1", "198.20.0.1"] {
+            assert!(is_internet_v4(public.parse().unwrap()), "{public}");
+        }
+        for not in [
+            "0.1.2.3", "10.0.0.1", "100.64.0.1", "100.127.255.1", "127.0.0.1", "169.254.1.1", "172.16.0.1",
+            "172.31.255.255", "192.0.0.8", "192.168.0.1", "198.18.0.1", "198.19.255.1", "224.0.0.1",
+            "240.0.0.1", "255.255.255.255",
+        ] {
+            assert!(!is_internet_v4(not.parse().unwrap()), "{not}");
+        }
+    }
 }

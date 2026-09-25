@@ -61,6 +61,13 @@ impl MeshRanges {
         format!("{}/{}", Ipv6Addr::from(self.v6.0), self.v6.1)
     }
 
+    /// The v4 range as network address and prefix length.
+    #[must_use]
+    pub fn v4(&self) -> (Ipv4Addr, u8) {
+        // `parse` refuses a length over 32, so this cannot truncate.
+        (Ipv4Addr::from(self.v4.0), self.v4.1 as u8)
+    }
+
     #[must_use]
     pub fn contains4(&self, addr: Ipv4Addr) -> bool {
         u32::from(addr) & mask32(self.v4.1) == self.v4.0

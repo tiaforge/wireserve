@@ -1,0 +1,13 @@
+-- Full-tunnel profiles for static peers (PLAN.md M27).
+--
+-- Set when `export-config --exit` rendered a second profile that sends all of
+-- the device's traffic to its gateway, and cleared by an export without it.
+-- Recorded per export for the same reason as `static_conf_peers`: it describes
+-- the files handed to the device, not a live preference, and the gateway has
+-- to forward exactly what those files send it.
+--
+-- Read by `/poll` for the gateway alone, which learns its exit clients from
+-- it. Meaningless without `gateway_node_id`: the export refuses `--exit`
+-- without a gateway, and a gateway that stops qualifying drops its clients
+-- with it.
+ALTER TABLE nodes ADD COLUMN exit_enabled INTEGER NOT NULL DEFAULT 0;

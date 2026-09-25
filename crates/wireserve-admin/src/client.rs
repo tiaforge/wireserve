@@ -166,6 +166,7 @@ impl AdminClient {
         name: &str,
         gateway: Option<&str>,
         conf_peers: &[String],
+        exit: bool,
     ) -> Result<(), ClientError> {
         let resp = self
             .http
@@ -174,6 +175,7 @@ impl AdminClient {
             .json(&SetGatewayRequest {
                 gateway: gateway.map(ToString::to_string),
                 conf_peers: conf_peers.to_vec(),
+                exit,
             })
             .send()?;
         Self::check_status(resp)?;

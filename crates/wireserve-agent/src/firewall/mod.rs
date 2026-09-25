@@ -34,12 +34,15 @@ pub struct ForwardWanted {
     /// This node declares a service mapped onto another address (PLAN.md
     /// M26): mesh → elsewhere and back, for flows our table marked only.
     pub services: bool,
+    /// This node is an exit (PLAN.md M27): mesh → internet and back, for
+    /// flows our table marked with the exit bit only.
+    pub exit: bool,
 }
 
 impl ForwardWanted {
     #[must_use]
     pub fn any(self) -> bool {
-        self.transit || self.services
+        self.transit || self.services || self.exit
     }
 
     /// What the daemon's state calls for right now.
@@ -51,6 +54,7 @@ impl ForwardWanted {
                 .declared_services
                 .iter()
                 .any(|d| d.port_maps().iter().any(|m| m.addr.is_some())),
+            exit: state.exit_capable,
         }
     }
 }

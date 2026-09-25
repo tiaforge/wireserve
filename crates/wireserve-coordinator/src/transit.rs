@@ -26,6 +26,10 @@ struct NodeTransitReport {
 #[derive(Default)]
 pub struct TransitState {
     by_pubkey: Mutex<HashMap<String, NodeTransitReport>>,
+    /// When each node last offered to be an exit (PLAN.md M27, `exit on`),
+    /// by pubkey. Kept apart from the transit report because nothing about
+    /// selection reads it: only the export's eligibility check does.
+    exit_offered_at: Mutex<HashMap<String, DateTime<Utc>>>,
 }
 
 impl TransitState {
@@ -119,18 +123,56 @@ impl TransitState {
         })
     }
 
+    /// Records this poll's exit opt-in (PLAN.md M27). Replaced every poll,
+    /// like [`Self::report`], so switching it off takes effect at once.
+    pub fn report_exit(&self, pubkey: &str, exit_capable: bool) {
+        let mut offered = self.exit_offered_at.lock().expect("transit state mutex poisoned");
+        if exit_capable {
+            offered.insert(pubkey.to_string(), Utc::now());
+        } else {
+            offered.remove(pubkey);
+        }
+    }
+
+    /// Whether this node's own most recent poll offered to be an exit —
+    /// the node's half of the consent, checked before an export bakes it
+    /// into a device's full-tunnel profile.
+    #[must_use]
+    pub fn is_offering_exit(&self, pubkey: &str, fresh_secs: i64) -> bool {
+        let now = Utc::now();
+        self.exit_offered_at
+            .lock()
+            .is_ok_and(|m| m.get(pubkey).is_some_and(|at| (now - *at).num_seconds() <= fresh_secs))
+    }
+
     /// Drops a node's report — on revoke and rejoin, so it can never be
     /// selected as transit and never shows up as wanting anything
     /// afterward.
     pub fn forget(&self, pubkey: &str) {
         let mut by_pubkey = self.by_pubkey.lock().expect("transit state mutex poisoned");
         by_pubkey.remove(pubkey);
+        drop(by_pubkey);
+        self.exit_offered_at.lock().expect("transit state mutex poisoned").remove(pubkey);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_exit_offer_holds_until_withdrawn_or_forgotten() {
+        let s = TransitState::default();
+        assert!(!s.is_offering_exit("b", 30));
+        s.report_exit("b", true);
+        assert!(s.is_offering_exit("b", 30));
+        assert!(!s.is_offering_exit("b", -1), "a stale offer counts for nothing");
+        s.report_exit("b", false);
+        assert!(!s.is_offering_exit("b", 30));
+        s.report_exit("b", true);
+        s.forget("b");
+        assert!(!s.is_offering_exit("b", 30));
+    }
 
     #[test]
     fn select_picks_a_capable_fresh_node_reaching_both() {

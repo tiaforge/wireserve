@@ -516,6 +516,81 @@ public resolvers generally do not filter, which is why the symptom is often
 `100.64.0.0/10` is not on the strip list, but do not reach for it — see the
 mesh-range warning further down, since Tailscale allocates that entire `/10`.
 
+### 4c. Send all of a phone's traffic through the gateway
+
+For public Wi-Fi, or to browse from home while away, a device exported with
+a gateway can also get a **full-tunnel profile**: same key, same address,
+but everything goes to the gateway, which sends it on to the internet under
+its own address. The gateway opts in first, as it did for transit, because
+the traffic leaves under *its* public IP:
+
+```sh
+wireserve-agent exit on                           # on the gateway, besides `transit on`
+wireserve-admin export-config myphone --gateway vps1 --exit --dns 9.9.9.9 --qr
+```
+
+That prints two codes; import both. The WireGuard app runs one tunnel at a
+time, so switching on `myphone-exit` is the exit switch. With `--out
+myphone.conf` the second one is written beside it as `myphone-exit.conf`.
+`--refresh` without `--exit` withdraws it.
+
+- **IPv4 only.** The full tunnel captures the device's IPv6 as well, so none
+  of it leaks around the tunnel on someone else's network, and the gateway
+  drops it. Phones fall back to IPv4 on their own, since the only IPv6
+  address the tunnel gives them is a private one.
+- **The internet, not the gateway's LAN.** Private and other non-public
+  destinations are refused, so the exit never reaches around the per-service
+  approval a device on a LAN needs. To reach one, [serve it](#devices-on-the-nodes-network).
+- **`--dns` is required.** Without it, the phone keeps asking the café's
+  resolver, at a private address the gateway will not forward to.
+
+#### A home resolver, which also names the mesh
+
+`--dns` takes an approved service by name, so the full-tunnel profile can use
+your own resolver: ad blocking on the go, and **names for every service,
+not just HTTP ones**. A resolver that runs on a node reads that node's
+`/etc/hosts`, where the agent writes every service's name:
+
+```sh
+wireserve-agent serve dns 53:53/udp 53:53/tcp     # on the node running the resolver
+wireserve-admin approve-service homeserver dns
+wireserve-admin export-config myphone --gateway vps1 --exit --dns dns --refresh --qr
+```
+
+`ssh backup.wg` and `jellyfin.wg:8096` then work from the phone while the
+full tunnel is on. A domain set with `WIRESERVE_SERVICE_DOMAIN` works the same
+way, and a resolver answering the mesh's names itself is not affected by
+[rebinding protection](#if-the-name-resolves-on-one-network-but-not-another).
+
+- **The resolver must pick up changes to `/etc/hosts`.** AdGuard Home
+  (`dns.hostsfile_enabled`) does. dnsmasq, and so Pi-hole, read it at start
+  and on `SIGHUP` only, so a service added later has no name until they
+  reload. A path unit fixes that:
+
+  ```ini
+  # /etc/systemd/system/wireserve-hosts.path
+  [Path]
+  PathChanged=/etc/hosts
+  [Install]
+  WantedBy=multi-user.target
+
+  # /etc/systemd/system/wireserve-hosts.service
+  [Service]
+  Type=oneshot
+  ExecStart=/usr/local/bin/pihole reloaddns   # or: /usr/bin/pkill -HUP dnsmasq
+  ```
+
+- **A resolver in a container does not see the host's names.** The agent
+  replaces `/etc/hosts` atomically, and a single bind-mounted file keeps
+  showing the old copy. Run it on the host, or give up the names.
+- **Let it answer the mesh, and nothing else.** Queries arrive on the node's
+  mesh address from the phones' mesh addresses. Pi-hole's "allow only local
+  requests" may refuse them, but "permit all origins" on a node with a public
+  interface is an open resolver: bind to the mesh address instead.
+- A resolver on a LAN appliance works through a
+  [LAN mapping](#devices-on-the-nodes-network) (`serve dns
+  53:192.168.1.2:53/udp`), but it has no names of the mesh's own.
+
 ### 5. When a machine is lost or compromised
 
 ```sh
@@ -596,6 +671,7 @@ On a node, talking to the local daemon over a Unix socket:
 | `wireserve-agent daemon --proxy caddy` | publish this mesh's 443 services as vhosts on the reverse proxy running here |
 | `wireserve-agent unserve <name>` | withdraw one |
 | `wireserve-agent transit on\|off` | opt in/out of carrying traffic for two other nodes that can't reach each other directly (also needs `approve-transit`) |
+| `wireserve-agent exit on\|off` | opt in/out of sending the internet traffic of devices exported with `--exit` through this node (also needs `transit on` and approval) |
 | `wireserve-agent list [--json]` | services (name, address, ports, owner, state), peers (with each one's route — direct or via a carrier) and anything not published, from the last poll |
 | `wireserve-agent leave` | tear down interface, firewall, hosts block |
 
@@ -606,7 +682,7 @@ anywhere that can reach it):
 | Command | What it does |
 | --- | --- |
 | `wireserve-admin create-node <name>` | create a node, print a join token |
-| `wireserve-admin export-config <name> [--gateway <node>] [--refresh] [--qr]` | create (or re-issue) a static peer's `.conf` |
+| `wireserve-admin export-config <name> [--gateway <node>] [--exit --dns <svc\|ip>] [--refresh] [--qr]` | create (or re-issue) a static peer's `.conf`, plus a full-tunnel profile with `--exit` |
 | `wireserve-admin list-peers` | the full directory |
 | `wireserve-admin via-gateway <name> on\|off` | exported phones reach this node through their gateway, not directly |
 | `wireserve-admin revoke <name>` | cut a node off, keep its name reserved |

@@ -51,6 +51,9 @@ pub struct NodeRow {
     /// instead of holding a direct `[Peer]` for it. Deliberately absent from
     /// `PeerInfo`, so no agent ever sees it.
     pub export_via_gateway: bool,
+    /// For a `kind=static` node: its last export included the full-tunnel
+    /// profile, so its gateway is its exit (PLAN.md M27).
+    pub exit_enabled: bool,
 }
 
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
@@ -76,6 +79,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
         transit_approved: row.get::<_, Option<String>>("transit_approved_at")?.is_some(),
         gateway_node_id: row.get("gateway_node_id")?,
         export_via_gateway: row.get("export_via_gateway")?,
+        exit_enabled: row.get("exit_enabled")?,
     })
 }
 
@@ -417,17 +421,20 @@ pub fn set_transit_approved(conn: &Connection, node_id: i64, approved: bool) -> 
 /// The two are written together because they are two halves of one fact: the
 /// conf's shape. `transit_via` is later derived from `conf_peer_ids` — it must
 /// name exactly the nodes *absent* from the conf — so a gateway recorded
-/// without its membership list, or vice versa, would misroute.
+/// without its membership list, or vice versa, would misroute. Whether the
+/// export included a full-tunnel profile (PLAN.md M27) is the third half of
+/// the same fact, and is written with them.
 pub fn set_gateway(
     conn: &mut Connection,
     static_node_id: i64,
     gateway_node_id: Option<i64>,
     conf_peer_ids: &[i64],
+    exit: bool,
 ) -> Result<(), DbError> {
     let tx = conn.transaction()?;
     tx.execute(
-        "UPDATE nodes SET gateway_node_id = ?1 WHERE id = ?2",
-        rusqlite::params![gateway_node_id, static_node_id],
+        "UPDATE nodes SET gateway_node_id = ?1, exit_enabled = ?2 WHERE id = ?3",
+        rusqlite::params![gateway_node_id, exit && gateway_node_id.is_some(), static_node_id],
     )?;
     tx.execute(
         "DELETE FROM static_conf_peers WHERE static_node_id = ?1",
@@ -1029,9 +1036,9 @@ mod tests {
         let dials = create_node(&conn, "dials-home", NodeKind::Static, "h-p1", None).unwrap();
         let routed = create_node(&conn, "routed", NodeKind::Static, "h-p2", None).unwrap();
         let no_gw = create_node(&conn, "no-gateway", NodeKind::Static, "h-p3", None).unwrap();
-        set_gateway(&mut conn, dials, Some(gw), &[home]).unwrap();
-        set_gateway(&mut conn, routed, Some(gw), &[]).unwrap();
-        set_gateway(&mut conn, no_gw, None, &[gw, home]).unwrap();
+        set_gateway(&mut conn, dials, Some(gw), &[home], false).unwrap();
+        set_gateway(&mut conn, routed, Some(gw), &[], false).unwrap();
+        set_gateway(&mut conn, no_gw, None, &[gw, home], false).unwrap();
 
         // On: only a device that both dials `home` and has a gateway to fall
         // back on. The gateway-less one keeps its direct entry regardless.

@@ -2584,3 +2584,92 @@ cannot carry a per-service `header_up`, so the README suggests a hand-written
     `transit on` says so on such a kernel. The kernel test forwards a real
     packet between two namespaces rather than checking which files were
     written, which is how the old test passed while the feature did nothing.
+
+146. **Two consents, and no new admin verb.** The gateway opts in locally
+    with `wireserve-agent exit on`, reported every poll as `exit_capable`
+    and tracked in memory beside the transit report
+    (`TransitState::report_exit`), like `transit on`. The device side is
+    the admin's `export-config --exit`, which already is a per-device admin
+    action, so an `approve-exit` would only repeat it. Exit is not implied
+    by transit approval: forwarding between mesh members is one decision,
+    sending a device's internet traffic out under the node's own public IP
+    (abuse complaints, a VPS provider's terms) is another. An exit is a
+    gateway first, so transit approval and `transit on` are still needed.
+
+147. **Recorded per export, and derived through the gateway.**
+    `nodes.exit_enabled` is written by the same `set_gateway` call as
+    `gateway_node_id` and `static_conf_peers`, because it describes the same
+    files (#108): a `--refresh` without `--exit` clears it. The export
+    records what it actually rendered, so a gateway dropped for want of a
+    mesh range records no exit. `/poll` sends a gateway its
+    `exit_clients` (pubkeys) through `gateway_id_of`, so revoke, delete and
+    `deny-transit` end the exit on the same poll that ends the gateway, with
+    no code of their own. The agent acts on the list only while `exit on`;
+    the coordinator's list is never the whole consent.
+
+148. **Its own mark bit, `EXIT_MARK = 0x0200_0000`.** M26 allows public
+    target addresses, and `svc-rev-*` rewrites replies matching a target
+    address and port under `SERVICE_MARK`. An exit flow to the same address
+    and port sharing that bit would have its replies rewritten to look like
+    they came from the service. The adjacent bit is free of every user
+    listed at `SERVICE_MARK`.
+
+149. **Marked in prerouting, for the internet only.** `exit-mark` (filter,
+    prerouting, -150) marks a *new* flow from an exit client whose
+    destination is outside `NOT_THE_INTERNET_V4` and the mesh range. The
+    mark has to exist before any FORWARD chain runs, because it is what the
+    host's other firewalls are opened for (`Opening::ExitRequest`,
+    `ExitReply`, iptables `connmark 0x2000000`, a firewalld guard
+    exception), and their chains run at the same priority as ours in no
+    promised order. Private destinations are refused on purpose: reaching
+    the gateway's LAN through an exit would bypass the per-service approval
+    a LAN target needs. The range list lives in `wireserve-types` and the
+    export's resolver check uses the same list, so the two cannot disagree.
+    A flow a service address already rewrote carries the service bit and is
+    left to that path. `exit-masq` masquerades marked flows leaving by any
+    interface but the mesh's.
+
+150. **The egress is the default route, through the M26 machinery.** The
+    replies arrive on the interface the host reaches the internet by, found
+    with the same netlink route lookup as a LAN target's
+    (`routes::egress_ifname` on a global address), and it goes through the
+    same owned, guarded forwarding switch: guard before switch, Docker's
+    `all=1` hand-off, ownership in the state file. The guard now drops
+    what carries neither bit.
+
+151. **IPv4 only, with IPv6 captured.** The full-tunnel profile routes
+    `::/0` into the tunnel so none of the device's IPv6 leaves around it,
+    and the gateway drops it (the final `iifname <wg> drop`, or the kernel
+    before that on a host that does not forward IPv6). Forwarding it would
+    need NAT66, an IPv6 guard, and `force_forwarding`, which only Linux 6.17
+    has (#145). Phones rarely notice: the tunnel's only IPv6 address is a
+    ULA, which RFC 6724 ranks below IPv4 for a global destination. Adding it
+    later changes only the gateway; the profile already captures IPv6.
+
+152. **One keypair, two profiles.** A second export would rotate the key, so
+    the full-tunnel profile is rendered in the same run from the same
+    `[Interface]` and the same direct peers, differing only in the `DNS =`
+    line and the gateway's `AllowedIPs = 0.0.0.0/0, ::/0`. The direct peers'
+    /32s outrank the default route, so the mesh stays exactly as direct.
+    `--exit` needs `--out` (the second file goes beside it as
+    `<file>-exit.conf`) or `--qr` (two labelled codes, both rendered before
+    anything is written).
+
+153. **`--dns` is required, and resolving it happens before any mutation.**
+    Without a resolver, a phone in a full tunnel keeps asking the café's, at
+    a private address the gateway refuses. A name is an approved service,
+    written as its address (with a warning if nothing is published on
+    53/udp); a literal must be a mesh address the directory knows or a
+    public one. A private address outside the mesh is refused with the
+    `serve` line that would reach it. The resolver learning the mesh's names
+    is documentation, not code, at the user's choice: a resolver on a node
+    reads its `/etc/hosts`. Found while writing that up: AdGuard Home
+    follows changes to the file, dnsmasq and so Pi-hole re-read it only on
+    `SIGHUP`, so the README gives a systemd path unit that reloads them. A
+    resolver in a container sees no names, since the agent replaces the file
+    atomically and a single bind-mounted file keeps the old one.
+
+**Not yet run:** `deploy/e2e/run-exit-test.sh` (rootful Podman, needs `sudo`).
+The real-kernel test in `nftables.rs` sends real packets through the gateway's
+rules in namespaces, including the masquerade, the private-range refusal and
+the guard, but not over WireGuard, and not with a real phone.

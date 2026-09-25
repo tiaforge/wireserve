@@ -3324,3 +3324,115 @@ async fn via_gateway_is_refused_where_it_cannot_mean_anything() {
     let (status, _) = set_via_gateway(&app.router, "phone", true).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "nothing dials a static peer");
 }
+
+// ---- PLAN.md M27: exit profiles for static peers ----
+
+async fn put_gateway(router: &Router, node: &str, body: Value) -> (StatusCode, Value) {
+    let req = json_request("PUT", &format!("/admin/nodes/{node}/gateway"), Some(ADMIN), body);
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = if status == StatusCode::OK { json!(null) } else { body_json(resp).await };
+    (status, body)
+}
+
+fn exit_clients(body: &Value) -> Vec<String> {
+    body["exit_clients"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+/// The M24 scenario, with the gateway also offering to be an exit and the
+/// phone re-exported with the full-tunnel profile.
+async fn exit_scenario(app: &TestApp) -> (String, String, String) {
+    let (gw, direct, behind) = gateway_scenario(app).await;
+    poll_full(&app.router, &gw, json!({ "services": [], "transit_capable": true, "exit_capable": true })).await;
+    let (status, body) =
+        put_gateway(&app.router, "phone", json!({ "gateway": "gw", "conf_peers": ["direct"], "exit": true })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    (gw, direct, behind)
+}
+
+#[tokio::test]
+async fn the_gateway_is_told_which_devices_it_is_the_exit_for_and_nobody_else_is() {
+    let app = test_app();
+    let (gw, direct, behind) = exit_scenario(&app).await;
+
+    let (_, body) = poll_full(&app.router, &gw, json!({ "transit_capable": true, "exit_capable": true })).await;
+    assert_eq!(exit_clients(&body), vec![pubkey_for("phone")], "{body}");
+    for other in [&direct, &behind] {
+        let (_, body) = poll_full(&app.router, other, json!({})).await;
+        assert!(exit_clients(&body).is_empty(), "only the device's own gateway is its exit: {body}");
+    }
+
+    let peers = admin_peers(&app.router).await;
+    assert_eq!(peers["exit_offering"], json!(["gw"]), "{peers}");
+    assert_eq!(peers["exit_devices"], json!(["phone"]), "{peers}");
+}
+
+#[tokio::test]
+async fn a_device_exported_without_the_exit_profile_is_no_exit_client() {
+    let app = test_app();
+    let (gw, _direct, _behind) = gateway_scenario(&app).await;
+    poll_full(&app.router, &gw, json!({ "transit_capable": true, "exit_capable": true })).await;
+
+    let (_, body) = poll_full(&app.router, &gw, json!({ "transit_capable": true, "exit_capable": true })).await;
+    assert!(exit_clients(&body).is_empty(), "an offer alone forwards nothing for anyone: {body}");
+}
+
+#[tokio::test]
+async fn an_exit_profile_is_refused_while_the_gateway_does_not_offer_one() {
+    // The gateway's half of the consent is its own `exit on`. Without it the
+    // profile would send a phone's internet traffic somewhere that drops it.
+    let app = test_app();
+    let (_gw, _direct, _behind) = gateway_scenario(&app).await;
+
+    let (status, body) =
+        put_gateway(&app.router, "phone", json!({ "gateway": "gw", "conf_peers": [], "exit": true })).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"].as_str().unwrap_or_default().contains("exit on"), "must say what to do: {body}");
+}
+
+#[tokio::test]
+async fn an_exit_profile_needs_a_gateway() {
+    let app = test_app();
+    let (gw, _direct, _behind) = gateway_scenario(&app).await;
+    poll_full(&app.router, &gw, json!({ "transit_capable": true, "exit_capable": true })).await;
+
+    let (status, body) = put_gateway(&app.router, "phone", json!({ "conf_peers": [], "exit": true })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn a_refresh_without_the_exit_profile_withdraws_it() {
+    // Recorded per export: it describes the files on the device, and the new
+    // files no longer send anything to the internet.
+    let app = test_app();
+    let (gw, _direct, _behind) = exit_scenario(&app).await;
+
+    let (status, _) = put_gateway(&app.router, "phone", json!({ "gateway": "gw", "conf_peers": ["direct"] })).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = poll_full(&app.router, &gw, json!({ "transit_capable": true, "exit_capable": true })).await;
+    assert!(exit_clients(&body).is_empty(), "{body}");
+    assert!(admin_peers(&app.router).await.get("exit_devices").is_none());
+}
+
+#[tokio::test]
+async fn withdrawing_transit_approval_also_ends_the_exit() {
+    let app = test_app();
+    let (gw, _direct, _behind) = exit_scenario(&app).await;
+
+    assert_eq!(admin_post(&app.router, "/admin/nodes/gw/transit/deny").await, StatusCode::OK);
+    let (_, body) = poll_full(&app.router, &gw, json!({ "transit_capable": true, "exit_capable": true })).await;
+    assert!(exit_clients(&body).is_empty(), "an exit is a gateway first: {body}");
+}
+
+#[tokio::test]
+async fn a_revoked_device_is_no_longer_an_exit_client() {
+    let app = test_app();
+    let (gw, _direct, _behind) = exit_scenario(&app).await;
+
+    assert_eq!(admin_post(&app.router, "/admin/nodes/phone/revoke").await, StatusCode::OK);
+    let (_, body) = poll_full(&app.router, &gw, json!({ "transit_capable": true, "exit_capable": true })).await;
+    assert!(exit_clients(&body).is_empty(), "{body}");
+}

@@ -127,6 +127,17 @@ enum Command {
         #[command(subcommand)]
         action: TransitAction,
     },
+    /// Opts this node in or out of being the exit for the devices that use
+    /// it as their gateway (PLAN.md M27): their full-tunnel profile sends
+    /// all of their internet traffic here, and it leaves under this host's
+    /// own public address. Off by default. Only half the consent: a device
+    /// uses it only once an admin exports it with
+    /// `wireserve-admin export-config --exit`, and the node must already be
+    /// a gateway (`transit on`, approved).
+    Exit {
+        #[command(subcommand)]
+        action: TransitAction,
+    },
     /// Shows this node's services, peers and anything not published, from
     /// the daemon's cache of the last poll — no network call.
     List {
@@ -208,6 +219,7 @@ async fn main() {
         Command::Serve { name, ports } => cmd_serve(&instance, name, &ports).await,
         Command::Unserve { name } => cmd_unserve(&instance, name).await,
         Command::Transit { action } => cmd_transit(&instance, action).await,
+        Command::Exit { action } => cmd_exit(&instance, action).await,
         Command::List { json } => cmd_list(&instance, json).await,
         Command::Leave => cmd_leave(&instance).await,
     };
@@ -860,6 +872,25 @@ async fn cmd_transit(instance: &Instance, action: TransitAction) -> Result<(), B
             }
         } else {
             println!("ok — transit disabled; takes effect on the next poll");
+        }
+        return Ok(());
+    }
+    print_response(resp);
+    Ok(())
+}
+
+async fn cmd_exit(instance: &Instance, action: TransitAction) -> Result<(), Box<dyn std::error::Error>> {
+    let enabled = matches!(action, TransitAction::On);
+    let resp = client::call(&instance.socket_path(), &IpcRequest::ExitCapable { enabled }).await?;
+    if matches!(resp, wireserve_agent::ipc::IpcResponse::Ok) {
+        if enabled {
+            println!(
+                "ok — exit enabled; devices exported with `wireserve-admin export-config --exit` \
+                 through this node will send their internet traffic out from here, under this \
+                 host's own address, from the next poll. IPv4 only: their IPv6 is dropped here."
+            );
+        } else {
+            println!("ok — exit disabled; takes effect on the next poll");
         }
         return Ok(());
     }
