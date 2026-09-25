@@ -165,6 +165,14 @@ below); `wireserve-admin create-node --instance work` fills that flag into
 the printed command for you. `install` needs Linux/systemd — Quadlet/podman
 deployments install by hand, per `deploy/quadlet/`.
 
+**Run the agent on the host, not in a container, on any node that forwards**:
+a transit carrier, a phone's gateway or exit, or a node serving a device on
+its LAN. Those need the agent to switch on forwarding for its own interfaces
+in `/proc/sys/net`, which Podman and Docker mount read-only. A containerised
+agent logs a warning and forwards nothing, and from the other end that looks
+like a dead route. A node that only serves its own ports, and never
+forwards, runs fine in the container.
+
 The coordinator URL must be `https://` (or `http://` to loopback): the join
 token, the node's bearer token and the peer directory all travel over it,
 and the directory decides which keys the node trusts. For a coordinator

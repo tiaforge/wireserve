@@ -13,6 +13,15 @@
 #   podman run --rm -it --network host --cap-add NET_ADMIN --device /dev/net/tun \
 #     -v wireserve-agent-state:/var/lib/wireserve localhost/wireserve-agent:latest \
 #     --instance work join <coordinator-url>
+#
+# Not for a node that forwards: a transit carrier, a phone's gateway or exit,
+# or a node serving a device on its LAN. Those write per-interface
+# forwarding switches in /proc/sys/net, which Podman mounts read-only here, so
+# the agent only warns and forwards nothing. Install such a node on the host
+# with `wireserve-agent install` instead. (Unmasking /proc/sys would make it
+# work, but in a rootful container it also hands the container's root the
+# host's non-network sysctls, which this unit's "never --privileged" stance
+# exists to avoid.)
 
 [Unit]
 Description=WireServe agent, instance %i (Podman Quadlet)
