@@ -34,7 +34,13 @@
 # destinations, and every podman default is private, so an internet host on
 # one would be refused for the right reason and prove nothing.
 #
-# Rootful Podman, same reasoning as run-gateway-test.sh.
+# Rootful Podman, same reasoning as run-gateway-test.sh. Every container the
+# agent runs in gets `--security-opt unmask=/proc/sys`: podman mounts
+# /proc/sys read-only otherwise, and the agent's own forwarding switches are
+# half of what an exit is. The net.* keys it writes are this container's
+# own namespace's. In a rootful container the unmask very likely makes the
+# host's non-namespaced keys (kernel.*, vm.*) writable to its root as well —
+# fine for a throwaway harness running our own code, not a deployment setting.
 #
 # Usage: sudo ./deploy/e2e/run-exit-test.sh
 # Exit code 0 = every check passed.
@@ -74,15 +80,16 @@ trap cleanup EXIT
 cleanup
 OUT=$(mktemp -d)
 
+# NET_RAW for ping and tcpdump, which podman no longer grants by default.
 in_netns() {
     local target=$1; shift
     podman run --rm --name "wireserve-exit-helper-$$-$RANDOM" \
-        --network "container:$target" --cap-add=NET_ADMIN "$DEBUG_IMG" "$@"
+        --network "container:$target" --cap-add=NET_ADMIN --cap-add=NET_RAW "$DEBUG_IMG" "$@"
 }
 in_netns_bg() {
     local target=$1; shift
     podman run -d --name "wireserve-exit-helper-$$-$RANDOM" \
-        --network "container:$target" --cap-add=NET_ADMIN "$@" >/dev/null
+        --network "container:$target" --cap-add=NET_ADMIN --cap-add=NET_RAW "$@" >/dev/null
 }
 ip_on() {
     podman inspect "$1" --format "{{(index .NetworkSettings.Networks \"$2\").IPAddress}}"
@@ -137,7 +144,7 @@ log "starting the gateway (inet + its own LAN) and a node behind it"
 # Global IPv4 forwarding off, as on a VPS: the agent has to own and guard the
 # egress switch itself, which is what makes check 6 mean something.
 podman run -d --name "$GW" --network "$INET" --network "$GW_LAN" \
-    --cap-add=NET_ADMIN --device /dev/net/tun --sysctl net.ipv4.ip_forward=0 \
+    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun --sysctl net.ipv4.ip_forward=0 \
     --entrypoint sleep wireserve-agent:exit-test infinity >/dev/null
 sleep 1
 GW_IP=$(ip_on "$GW" "$INET")
@@ -145,13 +152,15 @@ GW_LAN_IP=$(ip_on "$GW" "$GW_LAN")
 # Internal networks have no default route; an exit finds its egress by one.
 GW_INET_IF=$(in_netns "$GW" sh -c "ip -o -4 addr show | awk '/ $GW_IP\\//{print \$2}'")
 in_netns "$GW" ip route replace default dev "$GW_INET_IF" >/dev/null
+podman exec "$GW" sh -c "cat /proc/sys/net/ipv4/conf/$GW_INET_IF/forwarding > /proc/sys/net/ipv4/conf/$GW_INET_IF/forwarding" \
+    || fail "/proc/sys/net is not writable in the gateway container, so the agent could not turn forwarding on"
 # Docker's posture: FORWARD policy DROP, which interop has to open for the
 # exit's own flows only.
 in_netns "$GW" iptables -P FORWARD DROP
 echo "gw: $GW_IP (egress $GW_INET_IF), lan $GW_LAN_IP"
 
 podman run -d --name "$HOME_AGENT" --network "$INET" \
-    --cap-add=NET_ADMIN --device /dev/net/tun \
+    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
     --entrypoint sleep wireserve-agent:exit-test infinity >/dev/null
 sleep 1
 
@@ -237,7 +246,7 @@ pass "same key; everything on the gateway and a resolver in the second profile o
 
 log "bringing the phone up on the full-tunnel profile"
 podman run -d --name "$PHONE" --network "$SITE_P" \
-    --cap-add=NET_ADMIN --device /dev/net/tun \
+    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
     --sysctl net.ipv4.conf.all.src_valid_mark=1 --sysctl net.ipv6.conf.all.disable_ipv6=0 \
     "$DEBUG_IMG" sleep infinity >/dev/null
 sleep 1

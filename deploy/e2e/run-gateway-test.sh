@@ -139,7 +139,7 @@ pass "homeserver and the phone are each behind NAT with nothing forwarded in"
 
 log "starting the gateway agent directly on the inet segment"
 podman run -d --name "$GW" --network "$INET" \
-    --cap-add=NET_ADMIN --device /dev/net/tun \
+    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
     --entrypoint sleep wireserve-agent:gw-test infinity >/dev/null
 sleep 1
 GW_IP=$(ip_on "$GW" "$INET")
@@ -155,7 +155,7 @@ echo "gw: $GW_IP, advertised as $GW_HOST:$WG_PORT (will be the gateway)"
 
 log "starting the homeserver agent behind NAT"
 podman run -d --name "$HOME_AGENT" --network "$SITE_H" \
-    --cap-add=NET_ADMIN --device /dev/net/tun --add-host "$GW_HOST:$GW_IP" \
+    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun --add-host "$GW_HOST:$GW_IP" \
     --entrypoint sleep wireserve-agent:gw-test infinity >/dev/null
 sleep 1
 in_netns "$HOME_AGENT" ip route replace default via "$ROUTER_H_LAN" >/dev/null
@@ -218,7 +218,7 @@ pass "exactly one [Peer] block — the gateway, rendered once"
 
 log "bringing the phone up as a plain WireGuard client, no agent"
 podman run -d --name "$PHONE" --network "$SITE_P" \
-    --cap-add=NET_ADMIN --device /dev/net/tun --add-host "$GW_HOST:$GW_IP" \
+    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun --add-host "$GW_HOST:$GW_IP" \
     "$DEBUG_IMG" sleep infinity >/dev/null
 sleep 1
 podman exec "$PHONE" ip route replace default via "$ROUTER_P_LAN"
