@@ -198,12 +198,25 @@ log "5/7: forwarding on the lan interface alone, and guarded"
 pass "$LAN_IF and wireserve0 forward; the global switch is untouched"
 in_netns "$OWNER" nft list table inet wireserve.wireserve0 | grep -q "iifname \"$LAN_IF\" meta nfproto ipv4 ct mark" \
     || fail "no guard for $LAN_IF in the agent's table"
-# The device tries to use the owner as a router to the inet segment. With
-# the flag on and no guard, this would reach the coordinator.
-podman exec "$DEVICE" ip route add "$COORD_IP/32" via "$OWNER_LAN"
-if podman exec "$DEVICE" timeout 6 bash -c "exec 3<>/dev/tcp/$COORD_IP/47820" 2>/dev/null; then
-    fail "the device reached the coordinator through the owner — the lan is being routed"
+# The device tries to use the owner as a router to the inet segment. One-way
+# UDP, recorded where it lands: a TCP connect would fail even without the
+# guard, since the reply would arrive on the owner's inet interface, whose
+# forwarding is off — so it would pass for the wrong reason. The request
+# direction depends on $LAN_IF's flag (on, checked above) and the guard alone.
+# The device runs without NET_ADMIN, so its route goes in from a helper.
+in_netns "$DEVICE" ip route add "$COORD_IP/32" via "$OWNER_LAN"
+PROBE=wireserve-lan-helper-probe-$$
+podman run -d --name "$PROBE" --network "container:$COORD" "$DEBUG_IMG" \
+    socat -u UDP-RECV:47999 STDOUT >/dev/null
+sleep 1
+for _ in 1 2 3; do
+    podman exec "$DEVICE" bash -c "echo routed-through-owner > /dev/udp/$COORD_IP/47999" || true
+    sleep 1
+done
+if podman logs "$PROBE" 2>/dev/null | grep -q routed-through-owner; then
+    fail "the device's packet reached the coordinator through the owner — the lan is being routed"
 fi
+podman rm -f "$PROBE" >/dev/null
 pass "nothing but the service's own flows is forwarded from $LAN_IF"
 
 log "6/7: the rest of the mesh never learns the device's address"
