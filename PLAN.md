@@ -2709,3 +2709,7 @@ which made the mesh check pass by a detour. Not yet tried with a real phone.
     `--exit` and `--mesh-dns` saying which, and refuses to stand alone. The
     exit's `--exit --dns` means what it did. `ExportOptions` replaces the
     growing argument list of `export_config::run`.
+
+`run-exit-test.sh` step 10 (a device on the plain mesh profile resolving a
+service through the served resolver, and a public resolver refused for that
+profile) **passes** as of 2026-09-25, with the rest of the suite.
