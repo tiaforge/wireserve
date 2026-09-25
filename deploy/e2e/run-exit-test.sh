@@ -261,8 +261,34 @@ podman exec "$PHONE" ip -6 route replace default dev wg0 2>/dev/null \
 sleep 10
 PHONE_IP4=$(grep '^Address' "$OUT/phone.conf" | sed 's/Address = //; s#/32.*##')
 
+# What the gateway looks like when an exit check fails, and where one retry's
+# packets go: in on the mesh, out on the egress, back, or nowhere.
+exit_diagnostics() {
+    note "gateway agent's view:"
+    podman exec "$GW" wireserve-agent list --json \
+        | python3 -c "import json,sys; d=json.load(sys.stdin); print({k: d.get(k) for k in ('transit_capable','exit_capable','exit_clients')})" || true
+    note "gateway sysctls:"
+    in_netns "$GW" sh -c 'for f in all wireserve0 '"$GW_INET_IF"'; do echo "$f ipv4 forwarding=$(cat /proc/sys/net/ipv4/conf/$f/forwarding) rp_filter=$(cat /proc/sys/net/ipv4/conf/$f/rp_filter)"; done' || true
+    note "gateway routes:"; in_netns "$GW" ip -4 route || true
+    note "gateway route to the internet host:"; in_netns "$GW" ip route get "$WEB_IP" || true
+    note "gateway iptables FORWARD:"; in_netns "$GW" iptables -S FORWARD || true
+    note "gateway nft ruleset:"; in_netns "$GW" nft list ruleset || true
+    note "gateway wg:"; in_netns "$GW" wg show wireserve0 || true
+    note "phone wg and routes:"; podman exec "$PHONE" wg show wg0 || true; podman exec "$PHONE" ip -4 route || true
+    note "one retry, captured on the gateway's mesh and egress interfaces:"
+    in_netns_bg "$GW" "$DEBUG_IMG" sh -c "timeout 12 tcpdump -lni wireserve0 -c 20 'tcp port 8080 or icmp' > /tmp/wg.txt 2>&1; cat /tmp/wg.txt"
+    in_netns_bg "$GW" "$DEBUG_IMG" sh -c "timeout 12 tcpdump -lni $GW_INET_IF -c 20 'tcp port 8080 or icmp' > /tmp/eg.txt 2>&1; cat /tmp/eg.txt"
+    sleep 2
+    tcp_line "$PHONE" "$WEB_IP" 8080 || true
+    sleep 12
+    for c in $(podman ps -aq --filter "name=wireserve-exit-helper" 2>/dev/null); do
+        podman logs "$c" 2>/dev/null | sed 's/^/  /'
+    done
+}
+
 log "3/9: the internet, masqueraded"
-SEEN=$(tcp_line "$PHONE" "$WEB_IP" 8080) || fail "the phone cannot reach the internet host through the exit"
+SEEN=$(tcp_line "$PHONE" "$WEB_IP" 8080) \
+    || { exit_diagnostics; fail "the phone cannot reach the internet host through the exit"; }
 [ "$SEEN" = "$GW_IP" ] || fail "the internet host saw '$SEEN', not the gateway's $GW_IP"
 pass "the internet host saw the gateway's address ($SEEN), not the phone's $PHONE_IP4"
 
