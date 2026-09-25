@@ -252,21 +252,15 @@ podman run -d --name "$PHONE" --network "$SITE_P" \
 sleep 1
 podman exec "$PHONE" ip route replace default via "$ROUTER_P_LAN"
 podman exec "$PHONE" mkdir -p /etc/wireguard
-# Two changes to how the file is brought up, neither to the file's peers:
-# - wg-quick hands `DNS =` to resolvconf, which a container has no use for;
-#   check 7 queries the resolver directly instead.
-# - For a default route wg-quick sets up fwmark policy routing and writes
-#   `src_valid_mark`, which podman refuses inside this container. A phone's
-#   VPN does the equivalent itself: everything into the tunnel, except the
-#   gateway's own endpoint. `Table = off` leaves routing to us, and those two
-#   routes are exactly that.
-grep -v '^DNS' "$OUT/phone-exit.conf" | sed 's/^\[Interface\]$/[Interface]\nTable = off/' \
-    | podman exec -i "$PHONE" tee /etc/wireguard/wg0.conf >/dev/null
+# wg-quick hands `DNS =` to resolvconf, which a container has no use for;
+# check 7 queries the resolver directly instead. Everything else is wg-quick's
+# own full-tunnel routing: a fwmark keeps WireGuard's own packets — to every
+# peer's endpoint, not just the gateway's — out of the tunnel, which is what
+# the phone apps do by exempting their sockets. Anything less and the
+# direct peer's handshakes ride out through the exit, so the mesh would only
+# seem to work for as long as the exit does.
+grep -v '^DNS' "$OUT/phone-exit.conf" | podman exec -i "$PHONE" tee /etc/wireguard/wg0.conf >/dev/null
 podman exec "$PHONE" wg-quick up wg0 || fail "the full-tunnel profile would not come up"
-podman exec "$PHONE" ip route replace "$GW_IP/32" via "$ROUTER_P_LAN"
-podman exec "$PHONE" ip route replace default dev wg0
-podman exec "$PHONE" ip -6 route replace default dev wg0 2>/dev/null \
-    || note "no IPv6 default route in this container; IPv6 capture is not exercised here"
 sleep 10
 PHONE_IP4=$(grep '^Address' "$OUT/phone.conf" | sed 's/Address = //; s#/32.*##')
 
@@ -304,7 +298,15 @@ pass "the internet host saw the gateway's address ($SEEN), not the phone's $PHON
 log "4/9: the mesh still works in the full tunnel"
 podman exec "$PHONE" timeout 15 bash -c "exec 3<>/dev/tcp/$SVC_HOME/12345" \
     || fail "the phone lost the mesh in the full tunnel"
-pass "svc-home reachable"
+# Directly, not through the exit: every peer in the file has handshaken with
+# the phone itself. (The exit forwards to public addresses, so a home node on
+# one would also be reachable the long way round — and stop being so the
+# moment the exit went away.)
+if podman exec "$PHONE" wg show wg0 latest-handshakes | awk '$2 == 0 {bad=1} END {exit !bad}'; then
+    podman exec "$PHONE" wg show wg0
+    fail "a direct peer never handshook with the phone — its traffic is going through the exit"
+fi
+pass "svc-home reachable, over the phone's own direct peer entry"
 
 log "5/9: the gateway's LAN is not the internet"
 if tcp_line "$PHONE" "$LAN_IP" 8080 >/dev/null 2>&1; then
