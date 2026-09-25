@@ -21,10 +21,16 @@ pub enum ServiceRule {
     /// instead of `node`, and the node forwards to it: the request leaves
     /// with the node's own address as its source, since whatever answers
     /// there has no route back into the mesh.
+    ///
+    /// With `only_from` set (PLAN.md M29), only a request from that mesh
+    /// address is rewritten: the service sits behind the proxy's sign-in,
+    /// and the proxy is the one client that may reach it. From anywhere
+    /// else `vip:map.public` leads nowhere.
     Mapped {
         vip: Ipv4Addr,
         node: Ipv4Addr,
         map: PortMap,
+        only_from: Option<Ipv4Addr>,
     },
     /// `port` opened on the node's own mesh address(es), as before service
     /// addresses existed. Only used while the coordinator hands out no

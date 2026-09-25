@@ -1394,6 +1394,7 @@ mod tests {
 
     fn service(name: &str, node: &str, vip4: Option<&str>) -> ServiceInfo {
         ServiceInfo {
+            auth: false,
             name: name.into(),
             node: node.into(),
             ip4: String::new(),

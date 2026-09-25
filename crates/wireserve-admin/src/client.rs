@@ -14,7 +14,7 @@ use reqwest::StatusCode;
 use wireserve_types::{
     AdminPeersResponse, AdminServicesResponse, CreateNodeRequest, CreateNodeResponse,
     DenyServiceRequest, ErrorBody, NodeKind, RegisterRequest, RegisterResponse, RejoinRequest, SetGatewayRequest,
-    RejoinResponse, SetViaGatewayRequest, SetViaGatewayResponse,
+    RejoinResponse, SetServiceAuthRequest, SetViaGatewayRequest, SetViaGatewayResponse,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -214,6 +214,19 @@ impl AdminClient {
             .http
             .post(self.url(&format!("/admin/nodes/{node}/services/{service}/approve")))
             .bearer_auth(&self.admin_token)
+            .send()?;
+        Self::check_status(resp)?;
+        Ok(())
+    }
+
+    /// `PUT /admin/services/{name}/auth` (PLAN.md M29) — publish a service
+    /// behind the proxy's sign-in, or stop.
+    pub fn set_service_auth(&self, service: &str, enabled: bool) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .put(self.url(&format!("/admin/services/{service}/auth")))
+            .bearer_auth(&self.admin_token)
+            .json(&SetServiceAuthRequest { enabled })
             .send()?;
         Self::check_status(resp)?;
         Ok(())

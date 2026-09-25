@@ -68,6 +68,10 @@ pub fn admin_router(state: AppState) -> Router {
         .route("/admin/peers", get(admin::list_peers))
         .route("/admin/services", get(admin::list_services))
         .route(
+            "/admin/services/{name}/auth",
+            axum::routing::put(admin::set_service_auth),
+        )
+        .route(
             "/admin/nodes/{name}/services/{service}/approve",
             post(admin::approve_service),
         )

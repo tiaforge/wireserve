@@ -2713,3 +2713,61 @@ which made the mesh check pass by a detour. Not yet tried with a real phone.
 `run-exit-test.sh` step 10 (a device on the plain mesh profile resolving a
 service through the served resolver, and a public resolver refused for that
 profile) **passes** as of 2026-09-25, with the rest of the suite.
+
+## M29 — a sign-in in front of chosen services
+
+157. **The proxy is where identity belongs, and the mesh is what makes it
+    hold.** M25 already fronts every 443 service with one Caddy holding one
+    wildcard certificate, so `forward_auth` there gives per-person access —
+    a passkey at Pocket ID through authward, say — to exactly the services
+    that are web apps. Per-device service ACLs were considered and declined
+    by the user; this answers the case they were for ("my partner's phone
+    reaches Jellyfin, nothing else") at the level people reason about.
+    Headscale cannot do the equivalent: it issues no HTTPS for `serve`.
+
+158. **Proxy-only is not optional, and it is the whole feature.** forward_auth
+    providers (authward's deployment guide says so outright) trust that every
+    backend is reachable only through the proxy; otherwise a client skips
+    the sign-in and sends its own `X-Auth-User`. Before M29 every mesh member
+    reached `service:443` directly. So for a marked service the owning node's
+    `svc-pre` rewrite gains `ip saddr <proxy node>` on **every** mapping, not
+    just 443: another mapping to the same backend is another door. A request
+    from anyone else is never rewritten, so it is addressed to the service
+    address, which nothing answers. The node's own clients (`svc-out`) are
+    not limited, which is also how a proxy on the same node reaches it. The
+    one source-restricted rule in the design, deliberately not a general
+    access list. A marked service whose proxy is not in the directory, or
+    which has no service address (whose fallback opens the node's port to
+    everyone), is not opened at all: fail closed.
+
+159. **The operator's snippets, not an identity provider in WireServe.** A
+    marked service's generated `handle` imports `wireserve_auth` ahead of
+    `reverse_proxy`; once anything is marked, every service's upstream
+    imports `wireserve_upstream`. Both are defined in the operator's
+    Caddyfile — for authward, its `forward_auth` block and the two
+    `header_up Cookie` lines stripping its session cookie. The upstream one
+    goes on every vhost because the sign-in cookie is scoped to the whole
+    domain and reaches unmarked services too. Neither is emitted while
+    nothing is marked, so a Caddyfile from before M29 keeps validating.
+    Verified with `caddy validate` on 2.11.4 against the shipped example.
+
+160. **Marks belong to names, in their own table.** A `services` row is
+    deleted on withdraw and re-created on re-declare — instantly, with
+    approval off — so a mark on the row would silently drop across that
+    round trip and reopen the service. `service_auth(name)` is removed only
+    by an admin, and marking a name nothing declares is allowed and inert
+    (the next declarer is protected: the safe direction to be early in).
+    `approve-service --auth` sets the mark before approving, so the service
+    never appears unprotected in between.
+
+161. **Refused until both agents understand it.** Each half fails open on an
+    agent that ignores the mark: an old owning node leaves the direct path
+    open, an old proxy publishes the service with no sign-in while the owner
+    admits only that proxy. So agents now send `capabilities` on every poll
+    (`service-auth`, tracked in memory beside the transit report), and
+    `PUT /admin/services/{name}/auth` refuses to mark until the owning node
+    and the proxy's node have reported it within the online threshold. It
+    also refuses without a service domain and proxy, for a service not on
+    TCP 443 with an address of its own, and for the proxy itself. Turning a
+    mark off is never refused. What it cannot catch is a later downgrade;
+    the README says not to.

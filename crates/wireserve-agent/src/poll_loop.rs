@@ -131,6 +131,7 @@ pub fn build_poll_request(
         transit_reachable: transit.reachable,
         transit_wanted: transit.wanted,
         services: declared.to_vec(),
+        capabilities: vec![wireserve_types::CAP_SERVICE_AUTH.to_string()],
     }
 }
 
@@ -214,8 +215,30 @@ pub fn service_rules(
 ) -> Vec<ServiceRule> {
     let mut rules = Vec::new();
     let mut targets: Vec<wireserve_types::PortMap> = Vec::new();
+    let proxy = proxy_source(directory);
     for d in declared {
         let vip = node_ip.and_then(|node| own_vip(&d.name, node, directory));
+        // Behind the proxy's sign-in (PLAN.md M29): only the proxy may reach
+        // it, or the sign-in is a door in a wall that isn't there. The mark
+        // can only narrow what this node's own declaration opens, never widen
+        // it, so taking it from the coordinator keeps the rule stated in
+        // `run_once` step 3. Without the proxy's address, or without a
+        // service address to restrict, the service is not opened at all.
+        let only_from = if node_ip.is_some_and(|node| marked_for_auth(&d.name, node, directory)) {
+            match (proxy, vip) {
+                (Some(proxy), Some(_)) => Some(proxy),
+                _ => {
+                    tracing::warn!(
+                        service = %d.name,
+                        "service is marked for sign-in but the proxy's address or its own is \
+                         unknown; not opening it at all rather than opening it to everyone"
+                    );
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         for map in d.port_maps() {
             if let Some(addr) = map.addr {
                 let refusal = if vip.is_none() {
@@ -241,7 +264,7 @@ pub fn service_rules(
                         continue;
                     }
                     targets.push(map);
-                    ServiceRule::Mapped { vip, node, map }
+                    ServiceRule::Mapped { vip, node, map, only_from }
                 }
                 (None, Some(node)) => ServiceRule::Open {
                     proto: map.proto,
@@ -324,6 +347,21 @@ fn exit_client_addrs(directory: &PollResponse) -> Vec<Ipv4Addr> {
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// Whether this node's own service `name` is marked for sign-in (PLAN.md
+/// M29), per the directory's entry for it.
+fn marked_for_auth(name: &str, node: Ipv4Addr, directory: &PollResponse) -> bool {
+    let node = node.to_string();
+    directory.services.iter().any(|s| s.name == name && s.ip4 == node && s.auth)
+}
+
+/// The mesh address the proxy's requests come from: the node owning the
+/// service the mesh names as its proxy. `None` without one, or with one not
+/// (yet) in the directory.
+fn proxy_source(directory: &PollResponse) -> Option<Ipv4Addr> {
+    let proxy = directory.naming.as_ref()?.proxy_service.as_deref()?;
+    directory.services.iter().find(|s| s.name == proxy)?.ip4.parse().ok()
 }
 
 fn own_vip(name: &str, node: Ipv4Addr, directory: &PollResponse) -> Option<Ipv4Addr> {
@@ -946,6 +984,7 @@ mod tests {
 
     fn published(name: &str, owner: Ipv4Addr, vip4: Option<Ipv4Addr>) -> ServiceInfo {
         ServiceInfo {
+            auth: false,
             name: name.into(),
             node: "n".into(),
             ip4: owner.to_string(),
@@ -978,9 +1017,9 @@ mod tests {
         assert_eq!(
             rules,
             vec![
-                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("53/udp") },
-                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("53/tcp") },
-                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("8080:8000") },
+                ServiceRule::Mapped { vip: VIP, node: NODE, only_from: None, map: pm("53/udp") },
+                ServiceRule::Mapped { vip: VIP, node: NODE, only_from: None, map: pm("53/tcp") },
+                ServiceRule::Mapped { vip: VIP, node: NODE, only_from: None, map: pm("8080:8000") },
             ]
         );
     }
@@ -1028,7 +1067,7 @@ mod tests {
         dir.pending_services[0].vip4 = Some(VIP.to_string());
         assert_eq!(
             service_rules(&declared, Some(NODE), None, &dir, None),
-            vec![ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("80:5080") }]
+            vec![ServiceRule::Mapped { vip: VIP, node: NODE, only_from: None, map: pm("80:5080") }]
         );
     }
 
@@ -1040,7 +1079,75 @@ mod tests {
         let mut entry = published("web", NODE, Some(VIP));
         entry.ports = vec![pm("22:22"), pm("80:22")];
         let rules = service_rules(&declared, Some(NODE), None, &with_services(vec![entry]), None);
-        assert_eq!(rules, vec![ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("80:5080") }]);
+        assert_eq!(rules, vec![ServiceRule::Mapped { vip: VIP, node: NODE, only_from: None, map: pm("80:5080") }]);
+    }
+
+    // ---- behind the proxy's sign-in (PLAN.md M29) ----
+
+    const PROXY_NODE: Ipv4Addr = Ipv4Addr::new(10, 9, 0, 7);
+
+    fn with_proxy(mut services: Vec<ServiceInfo>, proxy: bool) -> PollResponse {
+        if proxy {
+            services.push(published("web", PROXY_NODE, Some(Ipv4Addr::new(10, 9, 0, 60))));
+        }
+        let mut dir = with_services(services);
+        dir.naming = Some(wireserve_types::ServiceNaming {
+            domain: "int.example.com".into(),
+            proxy_service: Some("web".into()),
+        });
+        dir
+    }
+
+    fn marked(name: &str, vip: Option<Ipv4Addr>) -> ServiceInfo {
+        let mut s = published(name, NODE, vip);
+        s.auth = true;
+        s
+    }
+
+    #[test]
+    fn a_marked_service_admits_the_proxy_alone_on_every_mapping() {
+        // The second mapping would otherwise be a way round the sign-in.
+        let declared = vec![ServiceDecl::new("jellyfin", vec![pm("443:8096"), pm("8920")])];
+        let rules = service_rules(&declared, Some(NODE), None, &with_proxy(vec![marked("jellyfin", Some(VIP))], true), None);
+        assert_eq!(
+            rules,
+            vec![
+                ServiceRule::Mapped { vip: VIP, node: NODE, only_from: Some(PROXY_NODE), map: pm("443:8096") },
+                ServiceRule::Mapped { vip: VIP, node: NODE, only_from: Some(PROXY_NODE), map: pm("8920") },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_marked_service_is_not_opened_at_all_rather_than_opened_to_everyone() {
+        let declared = vec![ServiceDecl::new("jellyfin", vec![pm("443:8096")])];
+        // No proxy in the directory: nobody to admit.
+        let rules = service_rules(&declared, Some(NODE), None, &with_proxy(vec![marked("jellyfin", Some(VIP))], false), None);
+        assert!(rules.is_empty(), "{rules:?}");
+        // No address of its own: the fallback would open the node's port to
+        // the whole mesh, which is exactly what the mark forbids.
+        let rules = service_rules(&declared, Some(NODE), None, &with_proxy(vec![marked("jellyfin", None)], true), None);
+        assert!(rules.is_empty(), "{rules:?}");
+    }
+
+    #[test]
+    fn an_unmarked_service_is_untouched_by_the_proxy_being_there() {
+        let declared = vec![ServiceDecl::new("prom", vec![pm("80:9090")])];
+        let rules = service_rules(&declared, Some(NODE), None, &with_proxy(vec![published("prom", NODE, Some(VIP))], true), None);
+        assert_eq!(rules, vec![ServiceRule::Mapped { vip: VIP, node: NODE, only_from: None, map: pm("80:9090") }]);
+    }
+
+    #[test]
+    fn polls_say_this_agent_understands_the_mark() {
+        let req = build_poll_request(
+            &[],
+            None,
+            &crate::probe::DualProbeResult::default(),
+            None,
+            None,
+            TransitSelfReport { capable: false, exit_capable: false, reachable: vec![], wanted: vec![] },
+        );
+        assert_eq!(req.capabilities, vec![wireserve_types::CAP_SERVICE_AUTH.to_string()]);
     }
 
     #[test]
@@ -1062,7 +1169,7 @@ mod tests {
         let dir = with_services(vec![published("plex", NODE, Some(VIP)), published("media", NODE, Some(other))]);
         assert_eq!(
             service_rules(&declared, Some(NODE), None, &dir, None),
-            vec![ServiceRule::Mapped { vip: VIP, node: NODE, map: PortMap::identity(32400, Proto::Tcp) }]
+            vec![ServiceRule::Mapped { vip: VIP, node: NODE, only_from: None, map: PortMap::identity(32400, Proto::Tcp) }]
         );
     }
 
@@ -1073,8 +1180,8 @@ mod tests {
         assert_eq!(
             rules,
             vec![
-                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("443:192.168.178.1:80") },
-                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("8080") },
+                ServiceRule::Mapped { vip: VIP, node: NODE, only_from: None, map: pm("443:192.168.178.1:80") },
+                ServiceRule::Mapped { vip: VIP, node: NODE, only_from: None, map: pm("8080") },
             ]
         );
         assert_eq!(rules[0].remote_target(), Some(Ipv4Addr::new(192, 168, 178, 1)));
@@ -1366,6 +1473,7 @@ mod proxy_step_tests {
             naming,
             peers: vec![],
             services: vec![ServiceInfo {
+                auth: false,
                 name: "plex".into(),
                 node: "n".into(),
                 ip4: "10.9.0.3".into(),

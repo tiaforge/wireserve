@@ -188,6 +188,19 @@ pub const MAX_TRANSIT_REACHABLE_PER_POLL: usize = 64;
 /// [`MAX_TRANSIT_REACHABLE_PER_POLL`].
 pub const MAX_TRANSIT_WANTED_PER_POLL: usize = 64;
 
+/// What an agent tells the coordinator it can do, beyond what every agent
+/// that polls can. Checked by admin actions whose effect is unsafe on an
+/// agent that would silently ignore it.
+///
+/// `service-auth` (PLAN.md M29): this agent restricts a service marked for
+/// sign-in to the proxy's address, and, as the proxy, puts the sign-in in
+/// front of it. An agent without either half would leave a marked service
+/// open, one way or the other.
+pub const CAP_SERVICE_AUTH: &str = "service-auth";
+
+/// At most this many capability strings are read from one poll.
+pub const MAX_CAPABILITIES_PER_POLL: usize = 16;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceDecl {
     pub name: String,
@@ -224,7 +237,10 @@ impl ServiceDecl {
     }
 }
 
-fn effective_ports(ports: &[PortMap], port: u16, proto: Proto) -> Vec<PortMap> {
+/// The mappings a declaration stands for: `ports`, or the identity mapping of
+/// the single `port`/`proto` a declaration from before port mappings carries.
+#[must_use]
+pub fn effective_ports(ports: &[PortMap], port: u16, proto: Proto) -> Vec<PortMap> {
     if ports.is_empty() {
         vec![PortMap::identity(port, proto)]
     } else {
@@ -282,6 +298,11 @@ pub struct PollRequest {
     pub transit_wanted: Vec<String>,
     #[serde(default)]
     pub services: Vec<ServiceDecl>,
+    /// What this agent can do — see [`CAP_SERVICE_AUTH`]. Absent from an
+    /// agent that predates it, which is exactly the one that must not be
+    /// trusted with a service marked for sign-in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -353,6 +374,12 @@ pub struct ServiceInfo {
     /// [`ServiceInfo::port_maps`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<PortMap>,
+    /// Published behind the proxy's sign-in (PLAN.md M29): the proxy puts
+    /// forward_auth in front of it, and the owning node accepts it from the
+    /// proxy's address only, so the sign-in cannot be walked around. Absent
+    /// when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auth: bool,
 }
 
 impl ServiceInfo {
@@ -511,6 +538,11 @@ pub struct AdminServiceInfo {
     pub denied_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub denied_reason: Option<String>,
+    /// Marked for sign-in at the proxy (PLAN.md M29). The mark belongs to
+    /// the name, not the declaration, so it survives a withdraw and
+    /// re-declare.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auth: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -583,6 +615,13 @@ pub struct SetGatewayRequest {
     /// out beforehand by requiring the gateway in `exit_offering`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exit: bool,
+}
+
+/// `PUT /admin/services/{name}/auth` (PLAN.md M29) — whether a service is
+/// published behind the proxy's sign-in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetServiceAuthRequest {
+    pub enabled: bool,
 }
 
 /// `PUT /admin/nodes/{name}/via-gateway` (PLAN.md #134) — whether devices
@@ -754,6 +793,7 @@ mod tests {
                 transit_via: None,
             }],
             services: vec![ServiceInfo {
+                auth: false,
                 name: "plex".into(),
                 node: "homeserver".into(),
                 ip4: "100.90.0.3".into(),

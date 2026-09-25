@@ -498,6 +498,54 @@ Two things to get right:
   github.com/caddy-dns/cloudflare`). DNS-01 itself is fine for a name the
   internet cannot reach — it only needs the `_acme-challenge` TXT record.
 
+#### A sign-in in front of chosen services
+
+With names in place, a service can also sit behind a sign-in at the proxy —
+per person, with your own identity provider, rather than "anything on the
+mesh gets in". Any `forward_auth` provider works; the example is written for
+[authward](https://git.tia.sh/tia/authward) in front of Pocket ID.
+
+```sh
+wireserve-admin approve-service homeserver jellyfin --auth   # new services
+wireserve-admin service-auth grafana on                      # existing ones
+```
+
+Two things happen from the next poll:
+
+- the proxy puts your `wireserve_auth` snippet in front of the service — for
+  authward, its `forward_auth` block;
+- the service's **own node admits nobody but the proxy**, on every one of
+  its mappings. Without that, anyone on the mesh could skip the sign-in by
+  dialling the service address directly, and set whatever identity headers
+  they liked. That is authward's trust boundary, enforced by the mesh.
+
+The two snippets, and a handler for authward's own pages, are in
+`deploy/proxy/Caddyfile.services.example`; they are needed once anything is
+marked, and never before. The mark belongs to the service **name**: it
+survives the service being withdrawn and declared again, and can be set
+before anything declares it. `list-services` shows it.
+
+Worth knowing before you mark something:
+
+- **Native apps can't do a browser sign-in.** The Jellyfin, Immich and Home
+  Assistant apps, or anything speaking CalDAV/CardDAV, fail behind it. That
+  is why it is per service. authward's API tokens and `bypass_paths` are the
+  way through for those.
+- **Only services published on TCP 443** can be marked — the others are not
+  behind the proxy at all — and the proxy itself cannot be.
+- **Close the owner's LAN yourself.** The mesh admits only the proxy; a
+  backend listening on every interface is still reachable from its own
+  network. Bind it to the node's mesh address.
+- **Every HTTP service under the domain gets the sign-in cookie**, which is
+  scoped to the whole domain. The generated config strips it from
+  everything behind the proxy; a service reached on another port is not
+  behind it and keeps receiving it, so publish HTTP services on 443 once
+  sign-in is in use.
+- **Upgrade before marking.** The coordinator refuses the mark until the
+  service's node and the proxy's node both report that they understand it,
+  because either one ignoring it leaves the service open. Don't downgrade
+  either one while a service is marked.
+
 #### If the name resolves on one network but not another
 
 This is almost always **DNS rebinding protection**, and it is worth knowing
@@ -716,7 +764,8 @@ anywhere that can reach it):
 | `wireserve-admin delete-node <name>` | remove the record, free the name |
 | `wireserve-admin clear-endpoint <name>` | drop a stale advertised endpoint |
 | `wireserve-admin list-services [--pending]` | declared services and their approval state |
-| `wireserve-admin approve-service <node> <svc>` | let a declaration reach the mesh |
+| `wireserve-admin approve-service <node> <svc> [--auth]` | let a declaration reach the mesh, behind the proxy's sign-in with `--auth` |
+| `wireserve-admin service-auth <svc> on\|off` | publish a service behind the proxy's sign-in, admitting only the proxy |
 | `wireserve-admin deny-service <node> <svc>` | refuse one, or withdraw an approval |
 | `wireserve-admin approve-transit <name>` | let a node that opted in carry traffic for others |
 | `wireserve-admin deny-transit <name>` | withdraw that |

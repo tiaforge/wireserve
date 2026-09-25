@@ -143,6 +143,14 @@ pub async fn poll(
     // Recorded as offered, approved or not: the export checks the transit
     // approval itself, and names whichever half is missing (PLAN.md M27).
     state.transit.report_exit(&self_pubkey, req.exit_capable);
+    let capabilities: Vec<String> = req
+        .capabilities
+        .iter()
+        .take(wireserve_types::MAX_CAPABILITIES_PER_POLL)
+        .filter(|c| c.len() <= 64)
+        .cloned()
+        .collect();
+    state.transit.report_capabilities(&self_pubkey, &capabilities);
 
     // Same observed-source-address fallback as `/register` (spec §4.2),
     // re-applied on every poll rather than frozen at join time — see
@@ -381,12 +389,15 @@ pub async fn poll(
 
     let peers_by_id: std::collections::HashMap<i64, &nodes::NodeRow> =
         all_peers.iter().map(|n| (n.id, n)).collect();
+    let auth = services::auth_names(&conn)?;
     let services = all_services
         .iter()
         .filter_map(|s| {
             peers_by_id
                 .get(&s.node_id)
-                .map(|owner| directory::service_info(s, owner, state.config.online_threshold_secs))
+                .map(|owner| {
+                    directory::service_info(s, owner, state.config.online_threshold_secs, auth.contains(&s.name))
+                })
         })
         .collect();
 

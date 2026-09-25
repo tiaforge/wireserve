@@ -261,6 +261,7 @@ pub async fn list_services(
 ) -> Result<Json<AdminServicesResponse>, AppError> {
     let conn = state.db.conn.lock().await;
     let rows = services::list_all_for_admin(&conn)?;
+    let auth = services::auth_names(&conn)?;
     let owners: std::collections::HashMap<i64, nodes::NodeRow> = nodes::list_all_peers(&conn)?
         .into_iter()
         .map(|n| (n.id, n))
@@ -270,10 +271,93 @@ pub async fn list_services(
         .filter_map(|s| {
             owners
                 .get(&s.node_id)
-                .map(|owner| crate::directory::admin_service_info(s, owner))
+                .map(|owner| crate::directory::admin_service_info(s, owner, auth.contains(&s.name)))
         })
         .collect();
     Ok(Json(AdminServicesResponse { services: out }))
+}
+
+/// `PUT /admin/services/{name}/auth` (PLAN.md M29): publish a service behind
+/// the proxy's sign-in, or stop.
+///
+/// Turning it on is where everything that could leave a marked service open
+/// is checked, because every one of them fails *open*: the mesh must name
+/// services and have a proxy; the service must be one the proxy publishes
+/// (TCP 443, an address of its own) and not the proxy itself; and both the
+/// owning node and the proxy's node must say they understand the mark. An
+/// older owning agent would ignore it and leave the service reachable
+/// directly; an older proxy would publish it with no sign-in while the owner
+/// admitted nothing but that proxy.
+///
+/// Turning it off is never refused. Nor is marking a name nothing declares:
+/// it waits, and whoever declares it is published behind the sign-in.
+pub async fn set_service_auth(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path(name): Path<String>,
+    Json(body): Json<wireserve_types::SetServiceAuthRequest>,
+) -> Result<(), AppError> {
+    if !wireserve_types::is_valid_dns_label(&name) {
+        return Err(AppError::BadRequest(format!("invalid service name: {name}")));
+    }
+    let conn = state.db.conn.lock().await;
+    if body.enabled {
+        let naming = state.config.service_naming().ok_or_else(|| {
+            AppError::Conflict(
+                "sign-in is put in front of a service by the mesh's reverse proxy, and this mesh \
+                 has none — set WIRESERVE_SERVICE_DOMAIN and WIRESERVE_SERVICE_PROXY first"
+                    .into(),
+            )
+        })?;
+        let proxy_name = naming.proxy_service.clone().ok_or_else(|| {
+            AppError::Conflict("this mesh has a service domain but no WIRESERVE_SERVICE_PROXY".into())
+        })?;
+        if proxy_name == name {
+            return Err(AppError::BadRequest(
+                "the proxy itself cannot sit behind its own sign-in".into(),
+            ));
+        }
+        let fresh = state.config.online_threshold_secs;
+        let capable = |node_id: i64| -> Result<bool, AppError> {
+            let node = nodes::find_by_id(&conn, node_id)?;
+            Ok(node.and_then(|n| n.pubkey).is_some_and(|pk| {
+                state.transit.has_capability(&pk, wireserve_types::CAP_SERVICE_AUTH, fresh)
+            }))
+        };
+        if let Some(service) = services::find_by_name(&conn, &name)? {
+            let proxied = service.vip4.is_some()
+                && wireserve_types::effective_ports(&service.ports, service.port, service.proto)
+                    .iter()
+                    .any(|m| m.public == wireserve_types::TLS_PUBLIC_PORT && m.proto == wireserve_types::Proto::Tcp);
+            if !proxied {
+                return Err(AppError::Conflict(format!(
+                    "'{name}' is not published on TCP 443 with an address of its own, so the proxy \
+                     does not front it and has nothing to put a sign-in in front of"
+                )));
+            }
+            if !capable(service.node_id)? {
+                return Err(AppError::Conflict(format!(
+                    "the node declaring '{name}' has not reported that it can restrict a service to \
+                     the proxy — upgrade its agent (and let it poll once) first"
+                )));
+            }
+        }
+        let proxy = services::find_by_name(&conn, &proxy_name)?.filter(services::ServiceRow::is_approved);
+        let proxy_capable = match proxy {
+            Some(p) => capable(p.node_id)?,
+            None => false,
+        };
+        if !proxy_capable {
+            return Err(AppError::Conflict(format!(
+                "the proxy ('{proxy_name}') is not published, or its node has not reported that it \
+                 can put a sign-in in front of a service — upgrade that agent (and let it poll \
+                 once) first"
+            )));
+        }
+    }
+    services::set_auth(&conn, &name, body.enabled)?;
+    tracing::info!(event = "service_auth_set", service = %name, enabled = body.enabled);
+    Ok(())
 }
 
 /// Shared shape for the two approval endpoints: validate the service

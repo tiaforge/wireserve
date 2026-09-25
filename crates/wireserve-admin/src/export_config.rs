@@ -738,6 +738,7 @@ mod tests {
 
     fn service(node: &str, vip4: Option<&str>, state: ServiceApprovalState) -> AdminServiceInfo {
         AdminServiceInfo {
+            auth: false,
             name: "web".into(),
             node: node.into(),
             ip4: String::new(),
@@ -1110,6 +1111,7 @@ mod gateway_tests {
         let home = peer("minipc", 9, Some("[2001:db8::9]:51820"));
         let flagged = vec!["minipc".to_string()];
         let services = [AdminServiceInfo {
+            auth: false,
             name: "ssh".into(),
             node: "minipc".into(),
             ip4: String::new(),
@@ -1216,6 +1218,7 @@ mod exit_tests {
 
     fn dns_service(name: &str, vip: &str, ports: &[&str], state: ServiceApprovalState) -> AdminServiceInfo {
         AdminServiceInfo {
+            auth: false,
             name: name.into(),
             node: "home".into(),
             ip4: String::new(),

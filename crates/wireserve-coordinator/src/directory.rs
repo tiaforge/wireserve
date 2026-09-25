@@ -45,7 +45,7 @@ pub fn peer_info(node: &NodeRow, online_threshold_secs: i64) -> PeerInfo {
 /// on its own declaration — so the only thing fanning it out would do is
 /// tell the whole mesh what the owner's LAN looks like. Admins still see it
 /// (`admin_service_info`).
-pub fn service_info(service: &ServiceRow, node: &NodeRow, online_threshold_secs: i64) -> ServiceInfo {
+pub fn service_info(service: &ServiceRow, node: &NodeRow, online_threshold_secs: i64, auth: bool) -> ServiceInfo {
     ServiceInfo {
         name: service.name.clone(),
         node: node.name.clone(),
@@ -55,6 +55,7 @@ pub fn service_info(service: &ServiceRow, node: &NodeRow, online_threshold_secs:
         online: is_recent(node.last_seen, online_threshold_secs),
         vip4: service.vip4.clone(),
         ports: service.ports.iter().map(|m| wireserve_types::PortMap { addr: None, ..*m }).collect(),
+        auth,
     }
 }
 
@@ -95,7 +96,7 @@ pub fn denied_service(service: &ServiceRow) -> DeniedService {
 }
 
 #[must_use]
-pub fn admin_service_info(service: &ServiceRow, owner: &NodeRow) -> AdminServiceInfo {
+pub fn admin_service_info(service: &ServiceRow, owner: &NodeRow, auth: bool) -> AdminServiceInfo {
     AdminServiceInfo {
         name: service.name.clone(),
         node: owner.name.clone(),
@@ -109,6 +110,7 @@ pub fn admin_service_info(service: &ServiceRow, owner: &NodeRow) -> AdminService
         approved_at: service.approved_at,
         denied_at: service.denied_at,
         denied_reason: service.denied_reason.clone(),
+        auth,
     }
 }
 
@@ -178,7 +180,7 @@ mod tests {
             denied_at: None,
             denied_reason: None,
         };
-        let info = service_info(&svc, &n, 180);
+        let info = service_info(&svc, &n, 180, false);
         assert!(info.online);
     }
 
@@ -197,9 +199,9 @@ mod tests {
             denied_at: None,
             denied_reason: None,
         };
-        let fanned = service_info(&svc, &n, 180);
+        let fanned = service_info(&svc, &n, 180, false);
         assert_eq!(fanned.ports[0].addr, None);
         assert_eq!((fanned.ports[0].public, fanned.ports[0].target), (443, 80));
-        assert_eq!(admin_service_info(&svc, &n).ports[0].to_string(), "443:192.168.178.1:80/tcp");
+        assert_eq!(admin_service_info(&svc, &n, false).ports[0].to_string(), "443:192.168.178.1:80/tcp");
     }
 }

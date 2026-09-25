@@ -31,6 +31,10 @@ pub struct VHost {
     /// The published port on that address — always [`TLS_PUBLIC_PORT`] today,
     /// carried explicitly so the renderer never hardcodes it.
     pub port: u16,
+    /// Behind the sign-in the operator configures on this proxy (PLAN.md
+    /// M29). The service's own node admits nobody but this proxy, so this
+    /// is the only way in.
+    pub auth: bool,
 }
 
 /// Writes a proxy's configuration from a set of vhosts.
@@ -104,7 +108,7 @@ pub fn vhosts(services: &[ServiceInfo], naming: &ServiceNaming) -> Vec<VHost> {
                 tracing::warn!(service = %s.name.escape_debug(), "published name is too long");
                 return None;
             }
-            Some(VHost { host, upstream, port: TLS_PUBLIC_PORT })
+            Some(VHost { host, upstream, port: TLS_PUBLIC_PORT, auth: s.auth })
         })
         .collect();
     out.sort();
@@ -154,6 +158,7 @@ mod tests {
 
     fn svc(name: &str, vip: Option<&str>, public: u16, proto: Proto) -> ServiceInfo {
         ServiceInfo {
+            auth: false,
             name: name.into(),
             node: "n".into(),
             ip4: "10.0.0.1".into(),

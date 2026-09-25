@@ -3436,3 +3436,128 @@ async fn a_revoked_device_is_no_longer_an_exit_client() {
     let (_, body) = poll_full(&app.router, &gw, json!({ "transit_capable": true, "exit_capable": true })).await;
     assert!(exit_clients(&body).is_empty(), "{body}");
 }
+
+// ---- PLAN.md M29: services behind the proxy's sign-in ----
+
+fn named_app() -> TestApp {
+    let mut config = test_config("");
+    config.service_domain = Some("int.example.com".into());
+    config.service_proxy = Some("web".into());
+    app_with_config(config)
+}
+
+fn svc(name: &str, public: u16, target: u16) -> Value {
+    json!({"name": name, "port": target, "proto": "tcp",
+           "ports": [{"public": public, "target": target, "proto": "tcp"}]})
+}
+
+async fn poll_caps(router: &Router, bearer: &str, services: Value, capable: bool) -> Value {
+    let caps: Vec<&str> = if capable { vec![wireserve_types::CAP_SERVICE_AUTH] } else { vec![] };
+    poll_full(router, bearer, json!({ "services": services, "capabilities": caps })).await.1
+}
+
+async fn set_auth(router: &Router, name: &str, enabled: bool) -> (StatusCode, Value) {
+    let req = json_request("PUT", &format!("/admin/services/{name}/auth"), Some(ADMIN), json!({ "enabled": enabled }));
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = if status == StatusCode::OK { json!(null) } else { body_json(resp).await };
+    (status, body)
+}
+
+/// A proxy node publishing `web` on 443 and a home node publishing
+/// `jellyfin` on 443; `capable` says which of them report the capability.
+/// Returns (proxy bearer, home bearer, an unrelated observer's bearer).
+async fn auth_scenario(app: &TestApp, proxy_capable: bool, home_capable: bool) -> (String, String, String) {
+    let bearer = |r: Value| r["bearer_token"].as_str().unwrap().to_string();
+    let t = admin_create_node(&app.router, "px").await;
+    let px = bearer(register_node(&app.router, &t, "px", 51820).await);
+    let t = admin_create_node(&app.router, "home").await;
+    let home = bearer(register_node(&app.router, &t, "home", 51820).await);
+    let t = admin_create_node(&app.router, "watcher").await;
+    let watcher = bearer(register_node(&app.router, &t, "watcher", 51820).await);
+    poll_caps(&app.router, &px, json!([svc("web", 443, 8443)]), proxy_capable).await;
+    poll_caps(&app.router, &home, json!([svc("jellyfin", 443, 8096), svc("prom", 80, 9090)]), home_capable).await;
+    (px, home, watcher)
+}
+
+fn directory_entry<'a>(body: &'a Value, name: &str) -> &'a Value {
+    body["services"].as_array().unwrap().iter().find(|s| s["name"] == name).unwrap()
+}
+
+#[tokio::test]
+async fn a_marked_service_reaches_every_node_marked_and_the_admin_sees_it() {
+    let app = named_app();
+    let (_px, _home, watcher) = auth_scenario(&app, true, true).await;
+
+    assert_eq!(set_auth(&app.router, "jellyfin", true).await.0, StatusCode::OK);
+    let (_, body) = poll_full(&app.router, &watcher, json!({})).await;
+    assert_eq!(directory_entry(&body, "jellyfin")["auth"], json!(true), "{body}");
+    assert!(directory_entry(&body, "prom").get("auth").is_none(), "absent when false: {body}");
+
+    let req = json_request("GET", "/admin/services", Some(ADMIN), json!({}));
+    let listed = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
+    let jf = listed["services"].as_array().unwrap().iter().find(|s| s["name"] == "jellyfin").unwrap().clone();
+    assert_eq!(jf["auth"], json!(true), "{listed}");
+
+    // Turning it off is never refused.
+    assert_eq!(set_auth(&app.router, "jellyfin", false).await.0, StatusCode::OK);
+    let (_, body) = poll_full(&app.router, &watcher, json!({})).await;
+    assert!(directory_entry(&body, "jellyfin").get("auth").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn the_mark_survives_a_withdraw_and_redeclare() {
+    // With approval off, a withdrawn and re-declared service is back at
+    // once; a mark stored on the row would have gone with it, and the
+    // service would be back open.
+    let app = named_app();
+    let (_px, home, watcher) = auth_scenario(&app, true, true).await;
+    assert_eq!(set_auth(&app.router, "jellyfin", true).await.0, StatusCode::OK);
+
+    poll_caps(&app.router, &home, json!([svc("prom", 80, 9090)]), true).await;
+    poll_caps(&app.router, &home, json!([svc("jellyfin", 443, 8096), svc("prom", 80, 9090)]), true).await;
+    let (_, body) = poll_full(&app.router, &watcher, json!({})).await;
+    assert_eq!(directory_entry(&body, "jellyfin")["auth"], json!(true), "{body}");
+}
+
+#[tokio::test]
+async fn marking_is_refused_wherever_it_would_leave_the_service_open() {
+    // Without a proxy there is nothing to put a sign-in in front of.
+    let app = test_app();
+    let (status, body) = set_auth(&app.router, "jellyfin", true).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("WIRESERVE_SERVICE_DOMAIN"), "{body}");
+
+    let app = named_app();
+    let _ = auth_scenario(&app, true, true).await;
+    let (status, _) = set_auth(&app.router, "web", true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "the proxy cannot sit behind itself");
+    let (status, body) = set_auth(&app.router, "prom", true).await;
+    assert_eq!(status, StatusCode::CONFLICT, "not proxied, so no sign-in can front it: {body}");
+
+    // An owning agent that would ignore the mark leaves the direct path open.
+    let app = named_app();
+    let _ = auth_scenario(&app, true, false).await;
+    let (status, body) = set_auth(&app.router, "jellyfin", true).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("declaring"), "{body}");
+
+    // A proxy that would ignore it publishes the service with no sign-in.
+    let app = named_app();
+    let _ = auth_scenario(&app, false, true).await;
+    let (status, body) = set_auth(&app.router, "jellyfin", true).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("proxy"), "{body}");
+}
+
+#[tokio::test]
+async fn a_name_nobody_declares_can_be_marked_ahead_of_time() {
+    // Whoever declares it next is published behind the sign-in — the safe
+    // direction to be early in.
+    let app = named_app();
+    let (_px, home, watcher) = auth_scenario(&app, true, true).await;
+    assert_eq!(set_auth(&app.router, "immich", true).await.0, StatusCode::OK);
+    poll_caps(&app.router, &home, json!([svc("jellyfin", 443, 8096), svc("immich", 443, 2283)]), true).await;
+    let (_, body) = poll_full(&app.router, &watcher, json!({})).await;
+    assert_eq!(directory_entry(&body, "immich")["auth"], json!(true), "{body}");
+}

@@ -30,7 +30,13 @@ pub struct TransitState {
     /// by pubkey. Kept apart from the transit report because nothing about
     /// selection reads it: only the export's eligibility check does.
     exit_offered_at: Mutex<HashMap<String, DateTime<Utc>>>,
+    /// What each node last said it can do (`PollRequest::capabilities`),
+    /// and when. Same lifetime and staleness rule as the rest of this.
+    capabilities: Mutex<HashMap<String, CapabilityReport>>,
 }
+
+/// One node's last capability report, and when it came.
+type CapabilityReport = (HashSet<String>, DateTime<Utc>);
 
 impl TransitState {
     /// Replaces this node's report wholesale — never merged, so a node
@@ -145,6 +151,27 @@ impl TransitState {
             .is_ok_and(|m| m.get(pubkey).is_some_and(|at| (now - *at).num_seconds() <= fresh_secs))
     }
 
+    /// Records this poll's capabilities, replacing the last ones.
+    pub fn report_capabilities(&self, pubkey: &str, capabilities: &[String]) {
+        self.capabilities.lock().expect("transit state mutex poisoned").insert(
+            pubkey.to_string(),
+            (capabilities.iter().cloned().collect(), Utc::now()),
+        );
+    }
+
+    /// Whether this node's own most recent poll, no older than
+    /// `fresh_secs`, said it can do `capability`. A node that has not
+    /// polled since the coordinator started does not count: an admin action
+    /// gated on this waits one poll rather than trusting nothing.
+    #[must_use]
+    pub fn has_capability(&self, pubkey: &str, capability: &str, fresh_secs: i64) -> bool {
+        let now = Utc::now();
+        self.capabilities.lock().is_ok_and(|m| {
+            m.get(pubkey)
+                .is_some_and(|(caps, at)| caps.contains(capability) && (now - *at).num_seconds() <= fresh_secs)
+        })
+    }
+
     /// Drops a node's report — on revoke and rejoin, so it can never be
     /// selected as transit and never shows up as wanting anything
     /// afterward.
@@ -153,6 +180,7 @@ impl TransitState {
         by_pubkey.remove(pubkey);
         drop(by_pubkey);
         self.exit_offered_at.lock().expect("transit state mutex poisoned").remove(pubkey);
+        self.capabilities.lock().expect("transit state mutex poisoned").remove(pubkey);
     }
 }
 

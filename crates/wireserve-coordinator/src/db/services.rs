@@ -357,6 +357,32 @@ pub enum DenyOutcome {
 }
 
 /// The row currently holding `name`, whoever owns it. One place so
+/// The names marked for sign-in at the proxy (PLAN.md M29), declared or not.
+pub fn auth_names(conn: &Connection) -> Result<std::collections::HashSet<String>, DbError> {
+    let mut stmt = conn.prepare("SELECT name FROM service_auth")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Marks or unmarks `name` for sign-in. Idempotent; marking again keeps the
+/// original timestamp.
+pub fn set_auth(conn: &Connection, name: &str, enabled: bool) -> Result<(), DbError> {
+    if enabled {
+        conn.execute(
+            "INSERT INTO service_auth (name, marked_at) VALUES (?1, ?2) ON CONFLICT(name) DO NOTHING",
+            rusqlite::params![name, super::nodes::now_str()],
+        )?;
+    } else {
+        conn.execute("DELETE FROM service_auth WHERE name = ?1", [name])?;
+    }
+    Ok(())
+}
+
+/// The row declaring `name`, whoever owns it.
+pub fn find_by_name(conn: &Connection, name: &str) -> Result<Option<ServiceRow>, DbError> {
+    row_for_name(conn, name)
+}
+
 /// `approve` and `deny` agree on what "declared by someone else" means.
 fn row_for_name(conn: &Connection, name: &str) -> Result<Option<ServiceRow>, DbError> {
     conn.query_row("SELECT * FROM services WHERE name = ?1", [name], map_row)

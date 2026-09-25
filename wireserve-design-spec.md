@@ -447,6 +447,19 @@ path does give up the "service sees the real client" property of §-service
 addresses, which is exactly why it is opt-in and why the direct path is left
 untouched beside it.
 
+**A sign-in in front of chosen services (M29).** An admin can mark a 443
+service so the proxy puts the operator's own `forward_auth` snippet in front
+of it. The mark is only as good as the rule that the backend is unreachable
+except through the proxy — the trust boundary forward_auth providers
+document — so the owning node's rewrite for every mapping of a marked
+service admits the proxy node's mesh address alone. That is the one
+source-restricted rule in the design and deliberately not a general access
+list. WireServe names no identity provider: it emits two snippet imports the
+operator defines. Marks are stored per name, outside the service rows, so a
+withdraw and re-declare cannot quietly drop one, and the coordinator refuses
+a mark until both the owning and the proxy node report the capability,
+since either one ignoring it fails open.
+
 ### 6.2 A resolver in a full tunnel (M27)
 
 A phone's `DNS =` line captures every query the phone makes (PLAN.md #104),
