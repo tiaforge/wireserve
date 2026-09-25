@@ -2561,3 +2561,26 @@ on phones as well.
 header is not their own name, a DNS-rebinding defence. The generated vhost
 cannot carry a per-service `header_up`, so the README suggests a hand-written
 `handle` ahead of the generated `import`; untried against a real router.
+
+## M27 — an exit node for phones, and a home resolver for it
+
+145. **IPv6 transit never forwarded, found while planning this milestone.**
+    `ip_forward::set_enabled` wrote `ipv6/conf/<wg>/forwarding`, but IPv6's
+    per-interface `forwarding` only picks host or router behaviour (router
+    advertisements, IsRouter). Whether a packet is forwarded is decided by
+    `all.forwarding`, or since Linux 6.17 by `force_forwarding` on the
+    interface the packet *arrives* on. Verified in netns before changing
+    anything: per-interface `forwarding=1` on both sides forwards nothing,
+    `force_forwarding` on the ingress side alone forwards one direction only,
+    and writing `all.forwarding` 1→0 resets `force_forwarding` everywhere. So
+    M23 transit and M24 gateway routing carried IPv6 only on hosts that
+    forward globally (Docker, Podman). Small in practice, since service
+    addresses are IPv4 and the firewall drops ICMP to nodes, but wrong. Now
+    `force_forwarding` on the mesh interface, which is both ingress and egress
+    for transit, re-asserted every cycle against that reset. On an older
+    kernel nothing is written and the daemon warns once. `all.forwarding` is
+    still never touched: it would make every interface a router and stop the
+    host accepting router advertisements, which can cost it its IPv6 route.
+    `transit on` says so on such a kernel. The kernel test forwards a real
+    packet between two namespaces rather than checking which files were
+    written, which is how the old test passed while the feature did nothing.

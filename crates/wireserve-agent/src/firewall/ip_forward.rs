@@ -1,9 +1,26 @@
 //! Interface-scoped IPv4/IPv6 forwarding for opt-in transit (PLAN.md M23).
 //!
-//! Deliberately writes the wg interface's own per-interface forwarding
-//! flag (`/proc/sys/net/{ipv4,ipv6}/conf/<ifname>/forwarding`), **never**
-//! the host's global/`all` switches (`net.ipv4.ip_forward`,
-//! `net.ipv6.conf.all.forwarding`). The `wireserve-fwd` FORWARD chain's
+//! Deliberately writes the wg interface's own per-interface switches —
+//! `/proc/sys/net/ipv4/conf/<ifname>/forwarding` and
+//! `/proc/sys/net/ipv6/conf/<ifname>/force_forwarding` — **never** the
+//! host's global/`all` switches (`net.ipv4.ip_forward`,
+//! `net.ipv6.conf.all.forwarding`).
+//!
+//! **The two families differ, and the IPv6 half was wrong until M27.**
+//! IPv4 forwards a packet when the interface it arrived on has
+//! `forwarding` set. IPv6's per-interface `forwarding` only picks host or
+//! router behaviour (router advertisements, the IsRouter flag); whether a
+//! packet is forwarded at all is decided by `all.forwarding`, or, since
+//! Linux 6.17, by `force_forwarding` on the interface it arrived on. This
+//! module used to write IPv6's `forwarding`, so IPv6 transit only ever
+//! worked on hosts that forwarded globally anyway (Docker, Podman) —
+//! verified on a real kernel, see the test at the bottom. On an older
+//! kernel there is no per-interface IPv6 switch at all, and turning on
+//! `all.forwarding` would make every interface a router and stop the host
+//! accepting router advertisements, which can cost it its own IPv6
+//! route. So there IPv6 transit is left off, with a warning, and IPv4
+//! transit is unaffected. For transit the packet arrives on and leaves by
+//! the mesh interface, so that one interface's flag is all it needs. The `wireserve-fwd` FORWARD chain's
 //! own base policy is deliberately `accept` for every interface but this
 //! one's own `iifname`-matched rules (see `nftables.rs`'s `apply_batch`
 //! doc comment for why — a past live-deployment bug taught this project
@@ -52,22 +69,66 @@ static ENABLED_BY_US: AtomicBool = AtomicBool::new(false);
 /// least one active transit pair; a node that opted in but was never
 /// selected never has this called with `true`, so its host's forwarding
 /// posture is never touched at all.
+///
+/// Written every cycle while enabled, not once: writing `all.forwarding`
+/// (as anything toggling Docker's or a VPN's forwarding does) resets every
+/// interface's `force_forwarding`, so a one-time write would silently stop
+/// IPv6 transit the next time that happened.
 #[cfg(target_os = "linux")]
 pub fn set_enabled(ifname: &str, enabled: bool) {
     if enabled {
         write_flag("ipv4", ifname, true);
-        write_flag("ipv6", ifname, true);
+        write_v6_flag(ifname, true);
         ENABLED_BY_US.store(true, Ordering::Relaxed);
     } else if ENABLED_BY_US.swap(false, Ordering::Relaxed) {
         write_flag("ipv4", ifname, false);
-        write_flag("ipv6", ifname, false);
+        write_v6_flag(ifname, false);
+    }
+}
+
+/// Whether this kernel can forward IPv6 on one interface alone
+/// (`force_forwarding`, Linux 6.17). Read from `conf/all`, which has it
+/// whenever any interface does.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn ipv6_per_interface_supported() -> bool {
+    std::path::Path::new("/proc/sys/net/ipv6/conf/all/force_forwarding").exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn ipv6_per_interface_supported() -> bool {
+    false
+}
+
+/// Said once per daemon run, not every cycle.
+#[cfg(target_os = "linux")]
+static WARNED_NO_V6: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+fn write_v6_flag(ifname: &str, on: bool) {
+    if ipv6_per_interface_supported() {
+        write_sysctl(&format!("/proc/sys/net/ipv6/conf/{ifname}/force_forwarding"), on);
+    } else if on
+        && read_flag("/proc/sys/net/ipv6/conf/all/forwarding") != Some(true)
+        && !WARNED_NO_V6.swap(true, Ordering::Relaxed)
+    {
+        tracing::warn!(
+            "this kernel cannot forward IPv6 on one interface alone (force_forwarding needs \
+             Linux 6.17), so this node carries IPv4 transit only; IPv6 between the peers it \
+             carries will not get through"
+        );
     }
 }
 
 #[cfg(target_os = "linux")]
 fn write_flag(family: &str, ifname: &str, on: bool) {
-    let path = format!("/proc/sys/net/{family}/conf/{ifname}/forwarding");
-    if let Err(e) = std::fs::write(&path, if on { b"1".as_slice() } else { b"0".as_slice() }) {
+    write_sysctl(&format!("/proc/sys/net/{family}/conf/{ifname}/forwarding"), on);
+}
+
+#[cfg(target_os = "linux")]
+fn write_sysctl(path: &str, on: bool) {
+    if let Err(e) = std::fs::write(path, if on { b"1".as_slice() } else { b"0".as_slice() }) {
         tracing::warn!(path = %path, error = %e, "could not set interface-scoped forwarding");
     }
 }
@@ -351,7 +412,7 @@ mod tests {
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 
         let wgtest_v4 = "/proc/sys/net/ipv4/conf/wgtest/forwarding";
-        let wgtest_v6 = "/proc/sys/net/ipv6/conf/wgtest/forwarding";
+        let wgtest_v6 = "/proc/sys/net/ipv6/conf/wgtest/force_forwarding";
         let other_v4 = "/proc/sys/net/ipv4/conf/other/forwarding";
         let all_v4 = "/proc/sys/net/ipv4/conf/all/forwarding";
         std::fs::write(other_v4, b"0").unwrap();
@@ -359,7 +420,9 @@ mod tests {
 
         set_enabled("wgtest", true);
         assert_eq!(read(wgtest_v4), "1");
-        assert_eq!(read(wgtest_v6), "1");
+        if ipv6_per_interface_supported() {
+            assert_eq!(read(wgtest_v6), "1");
+        }
         assert_eq!(read(other_v4), "0", "an unrelated interface must never be turned into a router as a side effect");
         assert_eq!(read(all_v4), all_baseline, "the global switch must never be written, whatever it started at");
 
@@ -372,5 +435,82 @@ mod tests {
         set_enabled("wgtest", false);
         assert_eq!(read(wgtest_v4), "0");
         assert_eq!(read(all_v4), all_baseline, "still never written, even on the disable path");
+    }
+
+    /// What the flags are *for*: an IPv6 packet actually crossing a router
+    /// namespace, between two peer namespaces on either side of it.
+    ///
+    /// Pins the bug this module had until M27 — IPv6's per-interface
+    /// `forwarding` set on both sides forwards nothing while
+    /// `all.forwarding` is off — and that `force_forwarding`, which is read
+    /// on the interface a packet *arrives* on, is what does. Transit
+    /// arrives on and leaves by the mesh interface, so one interface's flag
+    /// covers both directions there; two veths need one each.
+    #[test]
+    fn kernel_ipv6_forwards_only_with_force_forwarding() {
+        if !ipv6_per_interface_supported() {
+            eprintln!("SKIPPED: this kernel has no force_forwarding (Linux 6.17+)");
+            return;
+        }
+        if !crate::firewall::netns::reexec(
+            "firewall::ip_forward::tests::kernel_ipv6_forwards_only_with_force_forwarding",
+        ) {
+            return;
+        }
+        // Two peer namespaces, held open by a sleeping child each, with
+        // this namespace routing between them.
+        let mut peers = Vec::new();
+        for _ in 0..2 {
+            peers.push(
+                std::process::Command::new("unshare")
+                    .args(["-n", "sleep", "60"])
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (a, c) = (peers[0].id(), peers[1].id());
+        let script = format!(
+            "ip link set lo up
+             ip link add r-a type veth peer name a-r && ip link set a-r netns {a}
+             ip link add r-c type veth peer name c-r && ip link set c-r netns {c}
+             ip link set r-a up && ip link set r-c up
+             ip -6 addr add fd00:a::1/64 dev r-a nodad && ip -6 addr add fd00:c::1/64 dev r-c nodad
+             nsenter -t {a} -n sh -euc 'ip link set lo up; ip link set a-r up; ip -6 addr add fd00:a::2/64 dev a-r nodad; ip -6 route add default via fd00:a::1'
+             nsenter -t {c} -n sh -euc 'ip link set lo up; ip link set c-r up; ip -6 addr add fd00:c::2/64 dev c-r nodad; ip -6 route add default via fd00:c::1'
+             echo 0 > /proc/sys/net/ipv6/conf/all/forwarding"
+        );
+        let out = std::process::Command::new("sh").args(["-euc", &script]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        // Any reply of three: the first packet after a flag changes can be
+        // lost to neighbour discovery.
+        let crosses = || {
+            std::process::Command::new("nsenter")
+                .args(["-t", &a.to_string(), "-n", "ping", "-6", "-c3", "-i0.2", "-W1", "fd00:c::2"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        let write = |path: &str, v: &[u8]| std::fs::write(path, v).unwrap();
+
+        write("/proc/sys/net/ipv6/conf/r-a/forwarding", b"1");
+        write("/proc/sys/net/ipv6/conf/r-c/forwarding", b"1");
+        let with_forwarding = crosses();
+        write("/proc/sys/net/ipv6/conf/r-a/forwarding", b"0");
+        write("/proc/sys/net/ipv6/conf/r-c/forwarding", b"0");
+
+        set_enabled("r-a", true);
+        set_enabled("r-c", true);
+        let with_ours = crosses();
+        let all_after = read("/proc/sys/net/ipv6/conf/all/forwarding");
+
+        for mut p in peers {
+            let _ = p.kill();
+            let _ = p.wait();
+        }
+        assert!(!with_forwarding, "per-interface `forwarding` alone must not forward IPv6 — if it now does, the module doc is out of date");
+        assert!(with_ours, "set_enabled must make IPv6 cross the router");
+        assert_eq!(all_after, "0", "the global switch must never be written");
     }
 }

@@ -852,6 +852,12 @@ async fn cmd_transit(instance: &Instance, action: TransitAction) -> Result<(), B
                 "ok — transit enabled; this node carries traffic only once an admin approves \
                  it (`wireserve-admin approve-transit <node>`), from the next poll after that"
             );
+            if !firewall::ip_forward::ipv6_per_interface_supported() {
+                println!(
+                    "note: this kernel cannot forward IPv6 on one interface alone \
+                     (force_forwarding needs Linux 6.17), so this node carries IPv4 only"
+                );
+            }
         } else {
             println!("ok — transit disabled; takes effect on the next poll");
         }

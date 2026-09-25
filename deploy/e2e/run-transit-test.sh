@@ -297,6 +297,15 @@ AGENT1_ALL_FWD=$(in_netns "$AGENT1" cat /proc/sys/net/ipv4/conf/all/forwarding 2
 [ "$AGENT1_ALL_FWD" = "$AGENT1_ALL_BASELINE" ] \
     || fail "agent1's GLOBAL forwarding switch changed (baseline '$AGENT1_ALL_BASELINE', now '$AGENT1_ALL_FWD') — this is exactly the open-router regression the interface-scoped design exists to avoid"
 pass "agent1 forwards on its wg interface alone; the host-wide switch was never touched (baseline '$AGENT1_ALL_BASELINE', unchanged)"
+# IPv6 (PLAN.md M27 phase 0): per-interface `forwarding` never forwarded
+# IPv6; `force_forwarding` (Linux 6.17) does, and only where the kernel has it.
+if in_netns "$AGENT1" test -e /proc/sys/net/ipv6/conf/wireserve0/force_forwarding; then
+    AGENT1_WG_FWD6=$(in_netns "$AGENT1" cat /proc/sys/net/ipv6/conf/wireserve0/force_forwarding)
+    [ "$AGENT1_WG_FWD6" = "1" ] || fail "agent1's wireserve0 force_forwarding is not 1 (got '$AGENT1_WG_FWD6') — IPv6 transit would be dropped"
+    pass "agent1 forwards IPv6 on its wg interface alone (force_forwarding)"
+else
+    note "this kernel has no force_forwarding; IPv6 transit is expected to be IPv4-only here"
+fi
 for entry in "$AGENT2:$AGENT2_WG_BASELINE" "$AGENT4:$AGENT4_WG_BASELINE"; do
     a=${entry%%:*}
     baseline=${entry#*:}

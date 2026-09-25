@@ -296,6 +296,11 @@ GW_ALL_FWD=$(in_netns "$GW" cat /proc/sys/net/ipv4/conf/all/forwarding 2>/dev/nu
 [ "$GW_ALL_FWD" = "$GW_ALL_BASELINE" ] \
     || fail "the gateway's GLOBAL forwarding switch changed (baseline '$GW_ALL_BASELINE', now '$GW_ALL_FWD') — the open-router regression"
 pass "the gateway forwards on its wg interface alone (global switch unchanged at '$GW_ALL_BASELINE')"
+if in_netns "$GW" test -e /proc/sys/net/ipv6/conf/wireserve0/force_forwarding; then
+    GW_WG_FWD6=$(in_netns "$GW" cat /proc/sys/net/ipv6/conf/wireserve0/force_forwarding)
+    [ "$GW_WG_FWD6" = "1" ] || fail "the gateway's wireserve0 force_forwarding is not 1 (got '$GW_WG_FWD6')"
+    pass "the gateway forwards IPv6 on its wg interface alone (force_forwarding)"
+fi
 HOME_WG_FWD=$(in_netns "$HOME_AGENT" cat /proc/sys/net/ipv4/conf/wireserve0/forwarding 2>/dev/null || echo "?")
 [ "$HOME_WG_FWD" = "$HOME_WG_BASELINE" ] \
     || fail "homeserver never opted in, but its forwarding flag moved from '$HOME_WG_BASELINE' to '$HOME_WG_FWD'"
