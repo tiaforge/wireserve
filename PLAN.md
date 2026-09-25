@@ -2680,3 +2680,32 @@ unmask=/proc/sys` in the four harnesses that forward, and documented as "run
 forwarding nodes on the host", not changed in the quadlets); and a
 hand-rolled phone route sent a direct peer's handshakes out through the exit,
 which made the mesh check pass by a detour. Not yet tried with a real phone.
+
+## M28 — names on a phone without the full tunnel
+
+154. **The mesh profile can name a resolver too, opt-in (`--mesh-dns`).** #104
+    ruled out a `DNS =` line in the mesh profile because the phone apps
+    cannot scope it: it captures every query while the tunnel is up. That
+    rules out a resolver answering only the mesh's names, whose negative
+    answers break the rest of the phone's DNS. It does not rule out a full
+    resolver on the mesh — a served Pi-hole or AdGuard Home, the same one M27
+    names for the exit — which answers everything and names every service,
+    non-HTTP ones included. That is MagicDNS's own shape. The cost is
+    availability: while the tunnel is on, the phone's DNS depends on that
+    resolver. So it is never a default, and the export says so on stderr.
+
+155. **The resolver must be on the mesh.** The mesh profile's `AllowedIPs`
+    carry the mesh and nothing else, so a public resolver would be asked
+    outside the tunnel, name nothing on the mesh, and still take over the
+    phone's DNS. `resolve_dns` now also reports whether the address is the
+    mesh's (a node's address or an approved service's), and `--mesh-dns`
+    refuses anything else. No gateway is needed: without one, the resolver's
+    owner is a direct peer like every other.
+
+156. **No coordinator or agent change.** The resolver is an ordinary service
+    address: reached directly when its owner is in the config, and through
+    the gateway's existing M24 forwarding otherwise. `--dns` no longer
+    implies `--exit`; it names a resolver for whichever profile asks, with
+    `--exit` and `--mesh-dns` saying which, and refuses to stand alone. The
+    exit's `--exit --dns` means what it did. `ExportOptions` replaces the
+    growing argument list of `export_config::run`.

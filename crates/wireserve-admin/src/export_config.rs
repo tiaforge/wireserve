@@ -52,6 +52,11 @@ pub enum ExportConfigError {
     ExitNotOffering { name: String },
     #[error("{0}")]
     BadDns(String),
+    /// `--dns` without a profile to put it in, or a profile that needs one
+    /// without it. The CLI's own argument rules catch both first; this is
+    /// for a caller of the library.
+    #[error("{0}")]
+    DnsUsage(&'static str),
     #[error(
         "several nodes could be the gateway ({names}) — name one with --gateway, since the \
          choice is baked into the config and cannot be changed without re-exporting"
@@ -67,6 +72,10 @@ pub struct InterfaceParams {
     pub ip4: String,
     pub ip6: String,
     pub own_pubkey: String,
+    /// The mesh profile's own `DNS =` line (PLAN.md M28, `--mesh-dns`).
+    /// `None` keeps it without one, as every export before it was: the line
+    /// captures all of the device's DNS while the tunnel is up (#104).
+    pub dns: Option<std::net::Ipv4Addr>,
 }
 
 /// Renders a full WireGuard `.conf`: this node's own `[Interface]` block,
@@ -184,7 +193,11 @@ pub fn render_conf(
     }
 
     let peers_text = out;
-    let mut text = format!("{head}{peers_text}");
+    let mut text = head.clone();
+    if let Some(dns) = iface.dns {
+        text.push_str(&format!("DNS = {dns}\n"));
+    }
+    text.push_str(&peers_text);
     let mut exit_text = None;
     if let Some(gateway) = gateway {
         // Everything not listed above is reached through here. The mesh range
@@ -244,18 +257,22 @@ pub struct Exported {
 /// a public one the exit forwards to. A private address outside the mesh —
 /// a Pi-hole on the gateway's LAN, say — is exactly what the exit refuses
 /// to forward to, so it is refused here with the way to reach it instead.
+///
+/// Also says whether the address is the mesh's own, which the mesh profile
+/// needs (M28): it carries nothing but the mesh, so any other resolver would
+/// be asked outside the tunnel.
 fn resolve_dns(
     spec: &str,
     peers: &[PeerInfo],
     services: &[AdminServiceInfo],
-) -> Result<std::net::Ipv4Addr, ExportConfigError> {
+) -> Result<(std::net::Ipv4Addr, bool), ExportConfigError> {
     if let Ok(ip) = spec.parse::<std::net::Ipv4Addr>() {
         let in_mesh = peers.iter().any(|p| p.ip4 == spec)
             || services
                 .iter()
                 .any(|s| s.state == ServiceApprovalState::Approved && s.vip4.as_deref() == Some(spec));
         if in_mesh || wireserve_types::is_internet_v4(ip) {
-            return Ok(ip);
+            return Ok((ip, in_mesh));
         }
         return Err(ExportConfigError::BadDns(format!(
             "{ip} is neither a mesh address nor a public one, and the exit forwards to neither \
@@ -288,7 +305,7 @@ fn resolve_dns(
              to {vip} will go unanswered — `serve {spec} 53:53/udp 53:53/tcp` on its node"
         );
     }
-    Ok(vip)
+    Ok((vip, true))
 }
 
 /// One ordinary `[Peer]` block, with the peer's own host prefixes and the
@@ -461,8 +478,7 @@ pub fn run(
     admin_client: &AdminClient,
     node_facing_url: &str,
     name: &str,
-    gateway: Option<&str>,
-    exit_dns: Option<&str>,
+    opts: &ExportOptions<'_>,
 ) -> Result<Exported, ExportConfigError> {
     let directory = admin_client.list_peers()?;
     let chosen = select_gateway(
@@ -470,31 +486,87 @@ pub fn run(
         &directory.transit_approved,
         &directory.transit_offering,
         &directory.via_gateway,
-        gateway,
+        opts.gateway,
     )?;
-    let exit = check_exit(admin_client, &directory, chosen, exit_dns)?;
+    let dns = check_dns(admin_client, &directory, chosen, opts)?;
     let created = admin_client.create_node(name, NodeKind::Static, None)?;
-    finish(admin_client, node_facing_url, name, &created.join_token, &directory, chosen, exit)
+    finish(admin_client, node_facing_url, name, &created.join_token, &directory, chosen, dns)
 }
 
-/// The full-tunnel half of an export (PLAN.md M27), checked before anything
-/// is created or rejoined: a gateway, that gateway's own `exit on`, and a
-/// resolver the tunnel can reach. `None` when no exit was asked for.
-fn check_exit(
+/// How an export is shaped beyond its name.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ExportOptions<'a> {
+    /// `--gateway`; `None` picks the one eligible node, if exactly one is.
+    pub gateway: Option<&'a str>,
+    /// `--dns`: an approved service by name, or an IPv4 address.
+    pub dns: Option<&'a str>,
+    /// `--exit`: also render the full-tunnel profile (PLAN.md M27).
+    pub exit: bool,
+    /// `--mesh-dns`: put the resolver into the mesh profile too (M28).
+    pub mesh_dns: bool,
+}
+
+/// Where each profile sends DNS, resolved from [`ExportOptions`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Resolvers {
+    exit: Option<std::net::Ipv4Addr>,
+    mesh: Option<std::net::Ipv4Addr>,
+}
+
+/// The resolver half of an export, checked before anything is created or
+/// rejoined: for the full-tunnel profile (M27) a gateway, that gateway's
+/// own `exit on`, and a resolver the tunnel can reach; for the mesh profile
+/// (M28) a resolver on the mesh itself.
+fn check_dns(
     admin_client: &AdminClient,
     directory: &wireserve_types::AdminPeersResponse,
     gateway: Option<&PeerInfo>,
-    exit_dns: Option<&str>,
-) -> Result<Option<std::net::Ipv4Addr>, ExportConfigError> {
-    let Some(dns) = exit_dns else {
-        return Ok(None);
+    opts: &ExportOptions<'_>,
+) -> Result<Resolvers, ExportConfigError> {
+    let Some(spec) = opts.dns else {
+        if opts.exit {
+            return Err(ExportConfigError::DnsUsage("--exit needs --dns: the full tunnel has to name a resolver"));
+        }
+        if opts.mesh_dns {
+            return Err(ExportConfigError::DnsUsage("--mesh-dns needs --dns to say which resolver"));
+        }
+        return Ok(Resolvers::default());
     };
-    let gateway = gateway.ok_or(ExportConfigError::ExitNeedsGateway)?;
-    if !directory.exit_offering.iter().any(|n| n == &gateway.name) {
-        return Err(ExportConfigError::ExitNotOffering { name: gateway.name.clone() });
+    if !opts.exit && !opts.mesh_dns {
+        return Err(ExportConfigError::DnsUsage(
+            "--dns needs --exit (for the full-tunnel profile) or --mesh-dns (for the mesh profile)",
+        ));
+    }
+    if opts.exit {
+        let gateway = gateway.ok_or(ExportConfigError::ExitNeedsGateway)?;
+        if !directory.exit_offering.iter().any(|n| n == &gateway.name) {
+            return Err(ExportConfigError::ExitNotOffering { name: gateway.name.clone() });
+        }
     }
     let services = admin_client.list_services()?;
-    resolve_dns(dns, &directory.peers, &services.services).map(Some)
+    resolve_profiles(spec, opts, &directory.peers, &services.services)
+}
+
+/// [`check_dns`] once the directory and services are in hand. Pure, so the
+/// rules are testable without a coordinator.
+fn resolve_profiles(
+    spec: &str,
+    opts: &ExportOptions<'_>,
+    peers: &[PeerInfo],
+    services: &[AdminServiceInfo],
+) -> Result<Resolvers, ExportConfigError> {
+    let (addr, in_mesh) = resolve_dns(spec, peers, services)?;
+    if opts.mesh_dns && !in_mesh {
+        return Err(ExportConfigError::BadDns(format!(
+            "{addr} is not on the mesh, and the mesh profile carries nothing but the mesh: the \
+             device would ask it outside the tunnel, where it can name nothing here — serve a \
+             resolver on a node and pass its name"
+        )));
+    }
+    Ok(Resolvers {
+        exit: opts.exit.then_some(addr),
+        mesh: opts.mesh_dns.then_some(addr),
+    })
 }
 
 /// Re-issues a `.conf` for a static peer that already exists (PLAN.md M24),
@@ -517,8 +589,7 @@ pub fn run_refresh(
     admin_client: &AdminClient,
     node_facing_url: &str,
     name: &str,
-    gateway: Option<&str>,
-    exit_dns: Option<&str>,
+    opts: &ExportOptions<'_>,
 ) -> Result<Exported, ExportConfigError> {
     let directory = admin_client.list_peers()?;
     let chosen = select_gateway(
@@ -526,9 +597,9 @@ pub fn run_refresh(
         &directory.transit_approved,
         &directory.transit_offering,
         &directory.via_gateway,
-        gateway,
+        opts.gateway,
     )?;
-    let exit = check_exit(admin_client, &directory, chosen, exit_dns)?;
+    let dns = check_dns(admin_client, &directory, chosen, opts)?;
     let rejoined = match admin_client.rejoin(name, None, Some(NodeKind::Static)) {
         Ok(r) => r,
         Err(ClientError::Api { status, message }) if status == reqwest::StatusCode::NOT_FOUND => {
@@ -539,7 +610,7 @@ pub fn run_refresh(
         }
         Err(e) => return Err(e.into()),
     };
-    finish(admin_client, node_facing_url, name, &rejoined.join_token, &directory, chosen, exit)
+    finish(admin_client, node_facing_url, name, &rejoined.join_token, &directory, chosen, dns)
 }
 
 /// The half both paths share, after the token exists: generate a keypair
@@ -551,7 +622,7 @@ fn finish(
     join_token: &str,
     directory: &wireserve_types::AdminPeersResponse,
     gateway: Option<&PeerInfo>,
-    exit_dns: Option<std::net::Ipv4Addr>,
+    dns: Resolvers,
 ) -> Result<Exported, ExportConfigError> {
     let private_key = Key::generate();
     let public_key = private_key.public_key();
@@ -581,7 +652,7 @@ fn finish(
     // reaches only what it lists.
     let ranges = reg.mesh.as_ref().and_then(wireserve_types::MeshRanges::parse);
     let gateway = match (gateway, ranges) {
-        (Some(peer), Some(ranges)) => Some(Gateway { peer, ranges, via_gateway: &directory.via_gateway, exit_dns }),
+        (Some(peer), Some(ranges)) => Some(Gateway { peer, ranges, via_gateway: &directory.via_gateway, exit_dns: dns.exit }),
         (Some(peer), None) => {
             eprintln!(
                 "warning: the coordinator did not report a usable mesh range, so '{}' cannot be \
@@ -599,7 +670,15 @@ fn finish(
         ip4: reg.ip4,
         ip6: reg.ip6,
         own_pubkey: public_key.to_string(),
+        dns: dns.mesh,
     };
+    if let Some(resolver) = dns.mesh {
+        eprintln!(
+            "note: while the mesh tunnel is on, ALL of the device's DNS goes to {resolver}, not \
+             only the mesh's names — if that resolver is down, so is the device's DNS until the \
+             tunnel is switched off"
+        );
+    }
 
     let rendered = render_conf(&iface, &directory.peers, &services.services, gateway.as_ref());
     report_via_gateway(&directory.via_gateway, &directory.peers, gateway.as_ref());
@@ -653,6 +732,7 @@ mod tests {
             ip4: "100.90.0.7".into(),
             ip6: "fd00:90::7".into(),
             own_pubkey: "ownpubkeybase64==".into(),
+            dns: None,
         }
     }
 
@@ -860,6 +940,7 @@ mod gateway_tests {
             ip4: "10.90.0.7".into(),
             ip6: "fdb4:d481:7c21::7".into(),
             own_pubkey: "ownpubkeybase64==".into(),
+            dns: None,
         }
     }
 
@@ -1121,6 +1202,7 @@ mod exit_tests {
             ip4: "10.90.0.7".into(),
             ip6: "fdb4:d481:7c21::7".into(),
             own_pubkey: "ownpubkeybase64==".into(),
+            dns: None,
         }
     }
 
@@ -1201,7 +1283,7 @@ mod exit_tests {
             dns_service("pending", "10.90.0.51", &["53:53/udp"], ServiceApprovalState::Pending),
             dns_service("mute", "10.90.0.52", &["80:8080"], ServiceApprovalState::Approved),
         ];
-        assert_eq!(resolve_dns("pihole", &[], &services).unwrap(), Ipv4Addr::new(10, 90, 0, 50));
+        assert_eq!(resolve_dns("pihole", &[], &services).unwrap(), (Ipv4Addr::new(10, 90, 0, 50), true));
         assert!(
             matches!(resolve_dns("pending", &[], &services), Err(ExportConfigError::BadDns(_))),
             "an unapproved service has no address anyone routes to"
@@ -1209,7 +1291,7 @@ mod exit_tests {
         assert!(matches!(resolve_dns("nosuch", &[], &services), Err(ExportConfigError::BadDns(_))));
         // Nothing on 53/udp is a warning, not a refusal: the port may be
         // added before the device ever switches the tunnel on.
-        assert_eq!(resolve_dns("mute", &[], &services).unwrap(), Ipv4Addr::new(10, 90, 0, 52));
+        assert_eq!(resolve_dns("mute", &[], &services).unwrap(), (Ipv4Addr::new(10, 90, 0, 52), true));
     }
 
     #[test]
@@ -1231,5 +1313,84 @@ mod exit_tests {
                 other => panic!("{bad}: {:?}", other.map_err(|e| e.to_string())),
             }
         }
+    }
+
+    // ---- the mesh profile's resolver (PLAN.md M28) ----
+
+    fn opts(exit: bool, mesh_dns: bool) -> ExportOptions<'static> {
+        ExportOptions { gateway: None, dns: None, exit, mesh_dns }
+    }
+
+    #[test]
+    fn the_mesh_profile_names_a_resolver_only_when_asked() {
+        let gw = peer("vps", 2, Some("vps.example.com:51820"));
+        let mut with = iface();
+        with.dns = Some(Ipv4Addr::new(10, 90, 0, 50));
+        let gateway = Gateway { peer: &gw, ranges: ranges(), via_gateway: &[], exit_dns: Some(Ipv4Addr::new(9, 9, 9, 9)) };
+        let out = render_conf(&with, std::slice::from_ref(&gw), &[], Some(&gateway));
+        assert!(
+            out.text.contains("Address = 10.90.0.7/32, fdb4:d481:7c21::7/128\nDNS = 10.90.0.50\n\n[Peer]"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains("AllowedIPs = 10.90.0.0/24, fdb4:d481:7c21::/64\n"), "still the mesh only: {}", out.text);
+        let exit = out.exit_text.unwrap();
+        assert_eq!(exit.matches("DNS =").count(), 1, "each profile names its own resolver once: {exit}");
+        assert!(exit.contains("DNS = 9.9.9.9\n"), "{exit}");
+
+        // Without a gateway too: the resolver's owner is then a direct peer.
+        let owner = peer("home", 4, None);
+        let out = render_conf(&with, std::slice::from_ref(&owner), &[], None);
+        assert!(out.text.contains("DNS = 10.90.0.50\n"), "{}", out.text);
+
+        let out = render_conf(&iface(), std::slice::from_ref(&gw), &[], None);
+        assert!(!out.text.contains("DNS ="), "{}", out.text);
+    }
+
+    #[test]
+    fn each_profile_gets_the_resolver_only_when_asked_for() {
+        let services = [dns_service("pihole", "10.90.0.50", &["53:53/udp"], ServiceApprovalState::Approved)];
+        let r = resolve_profiles("pihole", &opts(false, true), &[], &services).unwrap();
+        assert_eq!(r, Resolvers { exit: None, mesh: Some(Ipv4Addr::new(10, 90, 0, 50)) });
+        let r = resolve_profiles("pihole", &opts(true, true), &[], &services).unwrap();
+        assert_eq!(r.exit, r.mesh);
+        let r = resolve_profiles("9.9.9.9", &opts(true, false), &[], &services).unwrap();
+        assert_eq!(r, Resolvers { exit: Some(Ipv4Addr::new(9, 9, 9, 9)), mesh: None });
+    }
+
+    #[test]
+    fn the_mesh_profile_refuses_a_resolver_off_the_mesh() {
+        // It carries nothing but the mesh: a public resolver would be asked
+        // outside the tunnel and name nothing — and quietly change where the
+        // device's DNS goes, for no gain.
+        let peers = [peer("home", 4, None)];
+        match resolve_profiles("9.9.9.9", &opts(true, true), &peers, &[]) {
+            Err(ExportConfigError::BadDns(msg)) => assert!(msg.contains("not on the mesh"), "{msg}"),
+            other => panic!("{:?}", other.map_err(|e| e.to_string())),
+        }
+        assert_eq!(
+            resolve_profiles("10.90.0.4", &opts(false, true), &peers, &[]).unwrap().mesh,
+            Some(Ipv4Addr::new(10, 90, 0, 4)),
+            "a node's own mesh address is on the mesh"
+        );
+    }
+
+    #[test]
+    fn a_resolver_needs_a_profile_and_a_profile_that_needs_one_gets_one() {
+        // Decided before any request: the client points nowhere.
+        let client = AdminClient::new("http://127.0.0.1:9", "t");
+        let directory = wireserve_types::AdminPeersResponse {
+            peers: vec![],
+            transit_approved: vec![],
+            transit_offering: vec![],
+            via_gateway: vec![],
+            exit_offering: vec![],
+            exit_devices: vec![],
+        };
+        let usage = |o: ExportOptions<'_>| matches!(check_dns(&client, &directory, None, &o), Err(ExportConfigError::DnsUsage(_)));
+        assert!(usage(ExportOptions { dns: Some("pihole"), ..Default::default() }));
+        assert!(usage(ExportOptions { exit: true, ..Default::default() }));
+        assert!(usage(ExportOptions { mesh_dns: true, ..Default::default() }));
+        assert_eq!(check_dns(&client, &directory, None, &ExportOptions::default()).unwrap(), Resolvers::default());
     }
 }

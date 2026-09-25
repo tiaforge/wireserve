@@ -459,6 +459,15 @@ WireServe still never listens on 53 or runs one. A resolver that runs on a
 node reads that node's `/etc/hosts`, so it answers every service's name,
 including the non-HTTP ones §6.1 leaves nameless on a phone.
 
+M28 lets the *mesh* profile name the same resolver, opt-in (`--mesh-dns`).
+What #104 ruled out was a resolver answering only the mesh's names, which
+would break everything else once it captured all of the phone's DNS. A full
+resolver on the mesh answers everything, so capturing it all is correct — the
+shape MagicDNS has too. The cost is that the phone's DNS depends on that
+resolver while the tunnel is up, which is why it is the operator's choice
+and never a default, and why the resolver must be on the mesh: the mesh
+profile routes nothing else, so any other would be asked outside the tunnel.
+
 ## 7. Security requirements (v1, non-negotiable)
 
 These are treated as core requirements, not hardening to add later:

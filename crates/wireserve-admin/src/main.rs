@@ -163,11 +163,19 @@ enum Command {
         /// there are two files.
         #[arg(long, requires = "dns")]
         exit: bool,
-        /// The resolver the full-tunnel profile uses: an approved service by
-        /// name (a Pi-hole you `serve` on 53, say, which then also answers
-        /// the mesh's own names), or an IPv4 address such as 9.9.9.9.
-        #[arg(long, requires = "exit", value_name = "SERVICE|IPV4")]
+        /// The resolver to name: an approved service by name (a Pi-hole you
+        /// `serve` on 53, say, which then also answers the mesh's own names),
+        /// or an IPv4 address such as 9.9.9.9. Goes into the full-tunnel
+        /// profile with --exit, into the mesh profile with --mesh-dns.
+        #[arg(long, value_name = "SERVICE|IPV4")]
         dns: Option<String>,
+        /// Put the --dns resolver into the mesh profile as well, so every
+        /// service has a name on the device, not only the HTTP ones. The
+        /// resolver must be on the mesh and must answer everything: while
+        /// this tunnel is on, ALL of the device's DNS goes to it, and if it
+        /// is down the device has no DNS until the tunnel is switched off.
+        #[arg(long, requires = "dns")]
+        mesh_dns: bool,
     },
 }
 
@@ -415,7 +423,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        Command::ExportConfig { name, out, refresh, qr, gateway, exit, dns } => {
+        Command::ExportConfig { name, out, refresh, qr, gateway, exit, dns, mesh_dns } => {
             check_name(&name)?;
             if let Some(gateway) = &gateway {
                 check_name(gateway)?;
@@ -426,20 +434,24 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             goes beside it as <file>-exit.conf) or --qr"
                     .into());
             }
-            let exit_dns = dns.as_deref().filter(|_| exit);
+            if dns.is_some() && !exit && !mesh_dns {
+                return Err("--dns needs --exit (the full-tunnel profile) or --mesh-dns (the mesh \
+                            profile), to say which profile it goes into"
+                    .into());
+            }
+            let opts = wireserve_admin::export_config::ExportOptions {
+                gateway: gateway.as_deref(),
+                dns: dns.as_deref(),
+                exit,
+                mesh_dns,
+            };
             let client = build_client(&coordinator_url, &admin_token)?;
             let register_url = config::resolve_register_url_interactive(register_url.as_deref())?;
             warn_if_plaintext_to_remote_host(&register_url);
             let exported = if refresh {
-                wireserve_admin::cmd_export_config_refresh(
-                    &client,
-                    &register_url,
-                    &name,
-                    gateway.as_deref(),
-                    exit_dns,
-                )?
+                wireserve_admin::cmd_export_config_refresh(&client, &register_url, &name, &opts)?
             } else {
-                wireserve_admin::cmd_export_config(&client, &register_url, &name, gateway.as_deref(), exit_dns)?
+                wireserve_admin::cmd_export_config(&client, &register_url, &name, &opts)?
             };
             let conf = &exported.conf;
             // The QRs are rendered before anything is written, so a config

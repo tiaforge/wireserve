@@ -19,7 +19,10 @@
 #      service address, answers a service's name from the phone;
 #   8. all of that with a FORWARD policy of DROP in the gateway's iptables,
 #      Docker-style, so host-firewall interop has to open the exit's flows;
-#   9. `exit off` stops it again.
+#   9. `exit off` stops it again;
+#  10. without the full tunnel, a device exported with `--mesh-dns` names
+#      services through the same resolver, and a public one is refused for
+#      that profile (PLAN.md M28).
 #
 #     ( inet 203.0.113.0/24 )───────────────┬──────────────┐
 #          │              │                 │              │
@@ -58,6 +61,7 @@ HOME_AGENT=wireserve-exit-home
 WEB=wireserve-exit-internet
 LAN_HOST=wireserve-exit-lan
 PHONE=wireserve-exit-phone
+TABLET=wireserve-exit-tablet
 DEBUG_IMG=wireserve-e2e-debug-tools
 ADMIN_TOKEN=exit-test-admin-token
 WG_PORT=51820
@@ -69,7 +73,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 note() { echo "NOTE: $*"; }
 
 cleanup() {
-    podman rm -f "$COORD" "$ROUTER_P" "$GW" "$HOME_AGENT" "$WEB" "$LAN_HOST" "$PHONE" >/dev/null 2>&1 || true
+    podman rm -f "$COORD" "$ROUTER_P" "$GW" "$HOME_AGENT" "$WEB" "$LAN_HOST" "$PHONE" "$TABLET" >/dev/null 2>&1 || true
     for c in $(podman ps -aq --filter "name=wireserve-exit-helper" 2>/dev/null); do
         podman rm -f "$c" >/dev/null 2>&1 || true
     done
@@ -345,6 +349,30 @@ fi
 podman exec "$PHONE" timeout 15 bash -c "exec 3<>/dev/tcp/$SVC_HOME/12345" \
     || fail "\`exit off\` broke the mesh too"
 pass "the internet is gone, the mesh stays"
+
+log "10/10: names without the full tunnel (--mesh-dns)"
+if admin export-config tablet --gateway node-gw --dns 9.9.9.9 --mesh-dns --out /tmp/tablet.conf \
+    --register-url "http://127.0.0.1:47820" >"$OUT/mesh-refused.log" 2>&1; then
+    fail "a public resolver was accepted for the mesh profile, which would ask it outside the tunnel"
+fi
+grep -q "not on the mesh" "$OUT/mesh-refused.log" || { cat "$OUT/mesh-refused.log"; fail "the refusal does not say why"; }
+admin export-config tablet --gateway node-gw --dns dns --mesh-dns --out /tmp/tablet.conf \
+    --register-url "http://127.0.0.1:47820" || fail "export-config --mesh-dns failed"
+podman cp "$COORD:/tmp/tablet.conf" "$OUT/tablet.conf"
+grep -qx "DNS = $DNS_VIP" "$OUT/tablet.conf" || fail "the mesh profile does not name the resolver"
+grep -q "0.0.0.0/0" "$OUT/tablet.conf" && fail "--mesh-dns must not widen the mesh profile"
+podman run -d --name "$TABLET" --network "$SITE_P" \
+    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
+    "$DEBUG_IMG" sleep infinity >/dev/null
+sleep 1
+podman exec "$TABLET" ip route replace default via "$ROUTER_P_LAN"
+podman exec "$TABLET" mkdir -p /etc/wireguard
+grep -v '^DNS' "$OUT/tablet.conf" | podman exec -i "$TABLET" tee /etc/wireguard/wg0.conf >/dev/null
+podman exec "$TABLET" wg-quick up wg0 || fail "the mesh profile would not come up"
+sleep 5
+ANSWER=$(podman exec "$TABLET" dig +short +time=3 +tries=2 "@$DNS_VIP" svc-home.wg) || true
+[ "$ANSWER" = "$SVC_HOME" ] || fail "through the mesh profile the resolver answered '$ANSWER' for svc-home.wg, expected $SVC_HOME"
+pass "svc-home.wg -> $ANSWER over the plain mesh profile; a public resolver is refused for it"
 
 echo
 echo "=== EXIT TEST COMPLETE ==="

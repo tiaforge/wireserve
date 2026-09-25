@@ -599,6 +599,24 @@ way, and a resolver answering the mesh's names itself is not affected by
   [LAN mapping](#devices-on-the-nodes-network) (`serve dns
   53:192.168.1.2:53/udp`), but it has no names of the mesh's own.
 
+#### The same names without the full tunnel
+
+The mesh profile can name the resolver too, so every service has a name on
+the phone whether or not the full tunnel is on:
+
+```sh
+wireserve-admin export-config myphone --gateway vps1 --dns dns --mesh-dns --refresh --qr
+# with the exit as well:  ... --exit --dns dns --mesh-dns ...
+```
+
+This is a trade-off, which is why it is opt-in. The phone apps cannot send
+only the mesh's names to a resolver: a `DNS =` line takes **all** of the
+device's DNS while the tunnel is on. So the resolver has to answer
+everything, as a Pi-hole or AdGuard Home does, and if it goes down, so does
+the phone's DNS until you switch the tunnel off. It must also be on the mesh
+(a service, or a node's own address): the mesh profile carries nothing else,
+so a public resolver would be asked outside the tunnel and name nothing.
+
 ### 5. When a machine is lost or compromised
 
 ```sh
@@ -690,7 +708,7 @@ anywhere that can reach it):
 | Command | What it does |
 | --- | --- |
 | `wireserve-admin create-node <name>` | create a node, print a join token |
-| `wireserve-admin export-config <name> [--gateway <node>] [--exit --dns <svc\|ip>] [--refresh] [--qr]` | create (or re-issue) a static peer's `.conf`, plus a full-tunnel profile with `--exit` |
+| `wireserve-admin export-config <name> [--gateway <node>] [--dns <svc\|ip> [--exit] [--mesh-dns]] [--refresh] [--qr]` | create (or re-issue) a static peer's `.conf`; `--exit` adds a full-tunnel profile, `--mesh-dns` names the resolver in the mesh profile too |
 | `wireserve-admin list-peers` | the full directory |
 | `wireserve-admin via-gateway <name> on\|off` | exported phones reach this node through their gateway, not directly |
 | `wireserve-admin revoke <name>` | cut a node off, keep its name reserved |
