@@ -2669,7 +2669,11 @@ cannot carry a per-service `header_up`, so the README suggests a hand-written
     resolver in a container sees no names, since the agent replaces the file
     atomically and a single bind-mounted file keeps the old one.
 
-**Not yet run:** `deploy/e2e/run-exit-test.sh` (rootful Podman, needs `sudo`).
-The real-kernel test in `nftables.rs` sends real packets through the gateway's
-rules in namespaces, including the masquerade, the private-range refusal and
-the guard, but not over WireGuard, and not with a real phone.
+`deploy/e2e/run-exit-test.sh` **passes** (2026-09-25), all nine checks. Getting
+there found three harness gaps, none in the exit: the debug image lacked
+`sysctl` for wg-quick; podman mounts `/proc/sys` read-only, so the agent's
+forwarding writes failed and nothing forwarded (fixed with `--security-opt
+unmask=/proc/sys` in the four harnesses that forward, and documented as "run
+forwarding nodes on the host", not changed in the quadlets); and a
+hand-rolled phone route sent a direct peer's handshakes out through the exit,
+which made the mesh check pass by a detour. Not yet tried with a real phone.
