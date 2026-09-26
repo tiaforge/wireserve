@@ -281,19 +281,46 @@ async fn cmd_join(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn std
 /// `daemon-reload`, the join itself, then `enable --now`. A failure at
 /// any step after the installs leaves them in place, so re-running
 /// `install` picks up where it left off.
+///
+/// On a node that has already joined, with no URL or token given, it is an
+/// upgrade instead: same installs, no join, every running agent restarted.
 async fn cmd_install(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Refused before anything is installed, not after.
     if let Some(url) = &args.coordinator_url {
         register::check_coordinator_transport(url, args.allow_plaintext_http)?;
     }
     wireserve_agent::install::require_root()?;
+    // A corrupt state file is an error here, not "not registered yet": that
+    // would go on to ask for a token and replace an identity.
+    let registered = AgentState::load(&instance.state_path())?.bearer_token.is_some();
+    let join_args_given =
+        args.coordinator_url.is_some() || args.join_token.is_some() || args.join_token_file.is_some();
+    let upgrade = wireserve_agent::install::is_upgrade(registered, join_args_given);
     wireserve_agent::install::install_self()?;
     // Before the daemon starts: it looks the group up once, when it binds.
     let group = wireserve_agent::install::ensure_socket_group()?;
     let unit = wireserve_agent::install::install_unit(instance)?;
+    if upgrade {
+        wireserve_agent::install::refresh_other_unit(instance)?;
+    }
     wireserve_agent::install::systemctl_daemon_reload()?;
-    cmd_join(instance, args).await?;
-    wireserve_agent::install::systemctl_enable_now(&unit)?;
+    if upgrade {
+        // Every running agent, not only this instance's: they share the
+        // binary that was just replaced. Restarting is safe by design — the
+        // firewall is torn down and re-applied deny-first on every start.
+        let mut restarted = wireserve_agent::install::active_agent_units()?;
+        if !restarted.contains(&format!("{unit}.service")) {
+            wireserve_agent::install::systemctl_enable_now(&unit)?;
+        }
+        for running in &restarted {
+            wireserve_agent::install::systemctl_restart(running)?;
+        }
+        restarted.sort();
+        println!("upgraded; restarted: {}", if restarted.is_empty() { "nothing was running".to_string() } else { restarted.join(", ") });
+    } else {
+        cmd_join(instance, args).await?;
+        wireserve_agent::install::systemctl_enable_now(&unit)?;
+    }
     let instance_flag = if instance.is_default() { String::new() } else { format!(" --instance {}", instance.name()) };
     println!();
     println!("{unit} is running — `wireserve{instance_flag} list` shows its services and peers");
@@ -306,7 +333,9 @@ async fn cmd_install(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn 
         println!();
         println!("To use it without sudo, join the `{group}` group and log in again:");
         println!("  sudo usermod -aG {group} {}", who.as_deref().unwrap_or("$USER"));
-        println!("If {unit} was already running, `sudo systemctl restart {unit}` makes it share its socket with that group.");
+        if !upgrade {
+            println!("If {unit} was already running, `sudo systemctl restart {unit}` makes it share its socket with that group.");
+        }
     }
     Ok(())
 }

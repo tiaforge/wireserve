@@ -2830,3 +2830,17 @@ profile) **passes** as of 2026-09-25, with the rest of the suite.
     `run-multi-instance-test.sh` gained a step that restarts one instance
     with a group and checks a supplementary-group member succeeds and an
     outsider gets the message (needs root; not run when this was written).
+
+167. **`install` on a joined node is the upgrade.** The update used to be
+    scp, `install -m 0755`, hand-copied unit files and a restart, and
+    `install` could not do it because it re-joins. Now, when the instance
+    already has a bearer token and the caller passed no URL or token,
+    `install` skips the join, refreshes the binary and both unit kinds (the
+    binary is shared, so a stale template would break instances this run
+    was not asked about), and restarts every active `wireserve-agent*` unit;
+    a URL or token still means a re-join. A corrupt state file is an error,
+    not "unregistered" (which would go on to replace the identity). Left
+    for later, on the user's word: the same for the coordinator (it has no
+    CLI to carry it), a `deploy/push.sh` wrapper, and nodes pulling the
+    binary from the coordinator (declined for now: it would let the
+    coordinator make every node run code as root).

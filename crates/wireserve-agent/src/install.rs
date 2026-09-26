@@ -10,6 +10,12 @@
 //! drift from the binary that installed it, which a separate install
 //! script reading those files at runtime couldn't guarantee.
 //!
+//! Run again on a node that has already joined, and given no join arguments,
+//! it upgrades instead: the same binary and unit installs, no join, and a
+//! restart of every running agent so none keeps executing the old binary.
+//! That makes `scp wireserve host:/tmp/ && ssh host sudo /tmp/wireserve install`
+//! the whole update.
+//!
 //! It also creates the `wireserve` group whose members may use the daemon
 //! without sudo (see `ipc::server::serve`), but never adds anyone to it.
 //!
@@ -139,6 +145,66 @@ fn systemctl(args: &[&str]) -> Result<(), InstallError> {
     }
 }
 
+/// Install is an upgrade — no join — when this instance already holds an
+/// identity and the caller passed nothing to join with. Any join argument
+/// means they want a (re-)join, which is what it always did.
+pub fn is_upgrade(registered: bool, join_args_given: bool) -> bool {
+    registered && !join_args_given
+}
+
+/// Rewrites the *other* kind of agent unit too, if it is on disk. The
+/// binary is shared by every instance, and a template unit left pointing at
+/// an old path or missing a capability would break instances this run was
+/// not asked about, the next time one restarts.
+pub fn refresh_other_unit(instance: &Instance) -> Result<(), InstallError> {
+    let (content, dest) = if instance.is_default() {
+        (UNIT_TEMPLATE, UNIT_TEMPLATE_DEST)
+    } else {
+        (UNIT_DEFAULT, UNIT_DEFAULT_DEST)
+    };
+    if std::path::Path::new(dest).exists() {
+        crate::fsutil::atomic_write(std::path::Path::new(dest), content.as_bytes(), 0o644)
+            .map_err(|e| InstallError::InstallUnit(dest, e))?;
+    }
+    Ok(())
+}
+
+/// The agent units systemd is running right now, as full unit names
+/// (`wireserve-agent.service`, `wireserve-agent@work.service`).
+pub fn active_agent_units() -> Result<Vec<String>, InstallError> {
+    let args = ["list-units", "--plain", "--no-legend", "--no-pager", "--state=active", "wireserve-agent*.service"];
+    let output = std::process::Command::new("systemctl")
+        .args(args)
+        .output()
+        .map_err(|e| InstallError::SystemctlSpawn(args.join(" "), e))?;
+    if !output.status.success() {
+        return Err(InstallError::Systemctl(
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    Ok(parse_active_units(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// First column of `systemctl list-units --plain --no-legend`, kept only
+/// when it is an agent unit — the glob also matches nothing else today, but
+/// a restart is not something to do on a pattern's say-so.
+fn parse_active_units(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|name| {
+            *name == "wireserve-agent.service"
+                || (name.starts_with("wireserve-agent@") && name.ends_with(".service"))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+pub fn systemctl_restart(unit: &str) -> Result<(), InstallError> {
+    systemctl(&["restart", unit])
+}
+
 pub fn systemctl_daemon_reload() -> Result<(), InstallError> {
     systemctl(&["daemon-reload"])
 }
@@ -166,6 +232,27 @@ mod tests {
         assert_eq!(content, UNIT_TEMPLATE);
         assert_eq!(dest, "/etc/systemd/system/wireserve-agent@.service");
         assert_eq!(name, "wireserve-agent@work");
+    }
+
+    #[test]
+    fn install_upgrades_only_a_registered_node_given_nothing_to_join_with() {
+        assert!(is_upgrade(true, false));
+        assert!(!is_upgrade(true, true), "a URL or token means a re-join");
+        assert!(!is_upgrade(false, false), "nothing to upgrade on a fresh node");
+        assert!(!is_upgrade(false, true));
+    }
+
+    #[test]
+    fn active_units_are_read_from_the_listing_and_only_agent_units_kept() {
+        let listing = "wireserve-agent.service loaded active running WireServe agent\n\
+                       wireserve-agent@work.service loaded active running WireServe agent (work)\n\
+                       wireserve-agent-extra.service loaded active running something else\n\
+                       \n";
+        assert_eq!(
+            parse_active_units(listing),
+            vec!["wireserve-agent.service".to_string(), "wireserve-agent@work.service".to_string()]
+        );
+        assert!(parse_active_units("").is_empty());
     }
 
     #[test]

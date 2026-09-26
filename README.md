@@ -236,24 +236,32 @@ would trust to run that node.
 A containerised agent does not see the host's groups, so its socket stays
 root-only (`podman exec`/`docker exec` runs as root anyway).
 
-#### Upgrading a node from `wireserve-agent`
+#### Upgrading a node
 
-The command used to be `wireserve-agent`; it is `wireserve` now. The systemd
-unit is still `wireserve-agent`. On a node that already runs:
+Build, copy the binary over, and run its `install` on the node:
 
 ```sh
-sudo install -m 0755 target/release/wireserve /usr/local/bin/wireserve
-sudo install -m 0644 deploy/systemd/wireserve-agent.service deploy/systemd/wireserve-agent@.service /etc/systemd/system/
-sudo groupadd --system wireserve
-sudo systemctl daemon-reload && sudo systemctl restart wireserve-agent   # or wireserve-agent@<instance>
+cargo build --release --workspace
+scp target/release/wireserve you@node:/tmp/
+ssh -t you@node sudo /tmp/wireserve install
 ```
 
-(`install` would also do this, but it joins again, which a node that
-already joined does not want.) The rewritten unit starts the new binary and
-carries the `CAP_CHOWN` the group sharing needs; a daemon that has the group
-but not that capability logs a warning and keeps a root-only socket. Nothing
-deletes the old `/usr/local/bin/wireserve-agent`: it is left as it is, unused
-once the unit points at the new binary, and yours to remove.
+On a node that has already joined, `install` given no URL or token is an
+upgrade, not a join: it installs the binary, rewrites the systemd unit files
+(the default unit, and the `@` template if one is on disk), reloads systemd,
+and restarts every running `wireserve-agent*` unit, so no agent keeps running
+the old binary. The node keeps its identity and its declared services; the
+mesh drops out for the few seconds the daemon takes to restart, and its
+firewall is rebuilt deny-first as on any start. Pass a URL or a token and it
+joins again, as before. Upgrade the coordinator (copy `wireserve-coordinator`
+and `wireserve-admin` to `/usr/local/bin/` and restart it) before the agents;
+the notes elsewhere in this file say where a feature needs that.
+
+Coming from the days when the command was `wireserve-agent`: the same
+upgrade does it. The systemd unit is still called `wireserve-agent`, the
+old `/usr/local/bin/wireserve-agent` is left where it is — unused once the
+unit points at the new binary, and yours to remove — and the `wireserve`
+group is created (see above).
 
 ### 3. Publish a service
 
@@ -795,7 +803,7 @@ members of the `wireserve` group have (see "Using it without sudo"):
 
 | Command | What it does |
 | --- | --- |
-| `wireserve install <url> [--instance name]` | installs the binary + systemd unit, then joins — one command, needs root |
+| `wireserve install [url] [--instance name]` | installs the binary + systemd unit, then joins — one command, needs root. On a node that already joined, with no URL or token: upgrades and restarts the agents instead |
 | `wireserve join [url] [token]` | one-time bootstrap, generates the keypair — prompts for either if omitted |
 | `wireserve serve <name> <[public:][address:]target[/tcp\|/udp]>...` | publish a service on its own address — on this node, or on an address it reaches |
 | `wireserve daemon --proxy caddy` | publish this mesh's 443 services as vhosts on the reverse proxy running here |
