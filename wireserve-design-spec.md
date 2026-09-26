@@ -444,13 +444,25 @@ certificate nobody asked for. A service published on 443 resolves to the
 reverse proxy named by `WIRESERVE_SERVICE_PROXY`, from a node and from a
 phone alike, so one base URL is correct in both places. Everything else
 resolves to its own address and keeps the direct path, the real client
-address and the absence of a hop — it is simply not reachable by name from a
-device with no hosts file.
+address and the absence of a hop — without public records it is not
+reachable by name from a device with no hosts file.
 
 This does not walk back §6. WireServe still never listens on 53, never
 touches `resolv.conf`, and never enters anyone's query path: the phone's name
-resolution is a single wildcard record in ordinary public DNS, and the agent
-generates a configuration file for a proxy the operator runs. The proxied
+resolution is ordinary public DNS, and the agent generates a configuration
+file for a proxy the operator runs.
+
+**Public records, written by the coordinator (M32).** With a DNS provider
+configured (`WIRESERVE_DNS_PROVIDER`: RFC 2136, Cloudflare, deSEC, Hetzner or
+Porkbun), the coordinator keeps one A record per approved service, pointing
+wherever that name resolves on a node — the rule is one function in
+`wireserve-types`, used by the agents' hosts files and the coordinator
+alike, so the two cannot disagree. It is a reconcile loop, never part of a
+request: a provider outage costs a warning and a retry. It deletes only
+records listed in its own `dns_records` table and replaces a clashing record
+at a service's name, so the service domain is the coordinator's to manage.
+A changed address is written only after it has held for 20 seconds. The
+credential lives in `coordinator.env`, never in the database. The proxied
 path does give up the "service sees the real client" property of §-service
 addresses, which is exactly why it is opt-in and why the direct path is left
 untouched beside it.

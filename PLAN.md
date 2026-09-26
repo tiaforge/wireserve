@@ -2922,3 +2922,83 @@ profile) **passes** as of 2026-09-25, with the rest of the suite.
     the env file byte-identical, and a pre-M31 install (unit from 9a43d33,
     running as `wireserve`) moving to the new user with its database and
     admin key. Passes (2026-09-26).
+
+## M32 — the coordinator writes the service names into public DNS
+
+First of three milestones moving TLS to each service's own node, the way
+`tailscale serve` does but on the operator's own domain and with stock
+WireGuard phones (plan: M32 records, M33 per-node termination, M34 sign-in
+built in and the central proxy removed). M32 stands on its own: every
+approved service gets a public name, so a phone resolves services that are
+not on 443 — the gap #117 stated plainly — and the hand-made wildcard
+record is no longer needed.
+
+175. **One rule for where a name points, shared by both ends.** `Naming`
+    moved out of the agent's `hosts.rs` into `wireserve-types` as
+    `ServiceNames` (with `publishes_tls` and `own_address`, which the proxy
+    had its own copy of). The hosts file and the coordinator's records call
+    the same function, so a name cannot resolve one way on a node and
+    another on a phone. It is pure; the agent wraps it to keep the warning
+    about a configured proxy missing from the directory.
+
+176. **`dns-update`, with a curated five.** Stalwart's crate covers ~70
+    providers but has no generic configuration — each takes different
+    credentials through its own constructor — so every provider is a
+    hand-written mapping. RFC 2136 with TSIG (BIND, Knot, PowerDNS: the one
+    the e2e test exercises), Cloudflare, deSEC, Hetzner and Porkbun; adding
+    one is an enum variant, its `Field`s and a match arm. Its default
+    aws-lc-rs feature is the provider reqwest already brings in; `ring`
+    would have dragged in native-tls. Credentials are `WIRESERVE_DNS_*` in
+    `coordinator.env` — the database still holds only hashed secrets — and
+    `Debug` never prints them. HMAC-MD5 is not accepted.
+
+177. **The coordinator owns the service names under the domain, and only
+    those it wrote.** A-record writes replace the whole RRset
+    (`set_rrset`), so a clashing record at a service's name is overwritten;
+    configuring a provider is the statement that the coordinator manages
+    those names, and the wizard and README say so. Deletes are bounded by
+    the new `dns_records` table: a name leaves DNS only while a row says
+    this coordinator put it there, so a fresh or restored database deletes
+    nothing, and a wildcard or any other record in the zone is never
+    touched. The table has no record type column yet; ACME challenges
+    (M33) get their own.
+
+178. **A reconcile loop, never a request.** The coordinator's first
+    background task, spawned beside the reflexive responder. Each pass
+    builds the directory exactly as `/poll` does (`services_directory`,
+    now shared), computes the wanted records, drops the database lock, and
+    writes the difference. It runs every minute and when poked — every
+    poll, approve, deny, revoke, delete, rejoin and auth mark pokes it —
+    with at least five seconds between passes. Provider failures back off
+    60s, 120s, … to 15 minutes, are logged, and show in `list-services` as
+    `dns=error: …`; a failed write is not recorded, so it is retried. The
+    poll path never waits on a provider.
+
+179. **A changed address waits 20 seconds; new and withdrawn names do
+    not.** A proxy briefly missing from the directory swings every 443 name
+    to its own address (`ServiceNames::new`), and a written swing lives
+    in caches for a TTL (default 300s). So an address change is written
+    only once it has held for `DEBOUNCE`; a swing back inside that window
+    cancels it, and a different new target restarts the wait. A new name
+    has nothing cached to protect and is written at once.
+
+180. **The wizard checks the credential before installing.** After the
+    service domain it asks whether the coordinator should write the
+    records, which provider, and that provider's fields — secrets read
+    without echo, and Enter keeping the current one. Not at a terminal,
+    `--dns-provider` takes credentials from the environment variables of
+    the same names, never from flags, which would put them in `ps`. Then
+    it writes and removes a `_wireserve-check.<domain>` TXT record through
+    the provider; a refusal stops the install with nothing changed
+    (`--skip-dns-check` skips it). Switching provider or `--no-dns` clears
+    every credential key the new setting does not read.
+
+181. **Tested against a real BIND.** `run-dns-test.sh` runs the coordinator
+    beside BIND 9.20 taking RFC 2136 updates under a TSIG key (rootless
+    podman; no WireGuard involved), with nodes as plain `/register` and
+    `/poll` calls. It checks: nothing for a pending service; approved ones
+    at their own address, a 443 one at the proxy's; a stale hand-made record
+    at a service's name replaced; `dns=published`; a withdrawn service and a
+    revoked node's services removed; the operator's own record untouched;
+    and a restart with everything written leaving the zone serial alone.
+    Passes (2026-09-26).

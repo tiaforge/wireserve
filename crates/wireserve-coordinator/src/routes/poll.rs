@@ -218,6 +218,10 @@ pub async fn poll(
         services::ApprovalMode::AutoApprove
     };
     let outcome = services::upsert_for_node(&mut conn, node.id, desired, mode, &state.config.net_v4_cidr)?;
+    // A declaration, withdrawal or address change on any poll moves the
+    // public names; the loop spaces its passes, so poking every time is
+    // cheaper than working out whether anything changed.
+    state.poke_dns();
 
     for name in desired_names.difference(&previous_names) {
         tracing::info!(event = "service_declared", node_name = %node.name, service = %name);
@@ -387,19 +391,9 @@ pub async fn poll(
         .filter_map(|n| n.pubkey.clone())
         .collect();
 
-    let peers_by_id: std::collections::HashMap<i64, &nodes::NodeRow> =
-        all_peers.iter().map(|n| (n.id, n)).collect();
     let auth = services::auth_names(&conn)?;
-    let services = all_services
-        .iter()
-        .filter_map(|s| {
-            peers_by_id
-                .get(&s.node_id)
-                .map(|owner| {
-                    directory::service_info(s, owner, state.config.online_threshold_secs, auth.contains(&s.name))
-                })
-        })
-        .collect();
+    let services =
+        directory::services_directory(&all_services, &all_peers, &auth, state.config.online_threshold_secs);
 
     Ok(Json(PollResponse {
         peers,

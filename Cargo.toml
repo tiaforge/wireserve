@@ -30,6 +30,9 @@ axum = { version = "0.8", features = ["macros"] }
 tower = "0.5"
 rusqlite = { version = "0.40", features = ["bundled"] }
 rusqlite_migration = "2"
+# Public DNS records for services (PLAN.md M32). Default features: the
+# aws-lc-rs provider, the same one reqwest's rustls already brings in.
+dns-update = "0.5"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "rustls-native-certs", "blocking"] }
 defguard_wireguard_rs = "0.12"
 nftables = { version = "0.6", default-features = false }

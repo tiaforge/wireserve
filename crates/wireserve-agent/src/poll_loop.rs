@@ -839,7 +839,7 @@ where
         // compares against what is on disk rather than what it last wrote.
         publish_to_proxy(ctx.proxy.as_deref_mut(), &directory);
 
-        let naming = crate::hosts::Naming::new(directory.naming.as_ref(), &directory.services);
+        let naming = crate::hosts::naming(directory.naming.as_ref(), &directory.services);
         if let Err(e) =
             crate::hosts::sync(ctx.hosts_path, ctx.hosts_label, &directory.services, naming)
         {

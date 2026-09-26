@@ -311,8 +311,19 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     s.ports.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
                 };
+                // Only present when the coordinator publishes records
+                // (PLAN.md M32); the provider's error text is sanitized like
+                // everything else that came off the wire.
+                let dns = match &s.dns {
+                    None => String::new(),
+                    Some(wireserve_types::DnsRecordState::Published) => "\tdns=published".to_string(),
+                    Some(wireserve_types::DnsRecordState::Pending) => "\tdns=pending".to_string(),
+                    Some(wireserve_types::DnsRecordState::Error(e)) => {
+                        format!("\tdns=error: {}", sanitize_for_terminal(e))
+                    }
+                };
                 println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\tsign-in={}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\tsign-in={}{dns}",
                     sanitize_for_terminal(&s.name),
                     sanitize_for_terminal(&s.node),
                     state,

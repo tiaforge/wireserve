@@ -14,7 +14,7 @@ use axum::Router;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use wireserve_coordinator::{build_state, db::Db, routes, AppState, Config};
+use wireserve_coordinator::{build_state_with_dns, db::Db, routes, AppState, Config};
 
 const PEER_IP: &str = "203.0.113.10";
 
@@ -28,6 +28,7 @@ fn test_config(db_path: &str) -> Config {
         net_v6_prefix: "fd00:90::/64".to_string(),
         service_domain: None,
         service_proxy: None,
+        dns: None,
         online_threshold_secs: 180,
         rate_limit_max: 1000,
         rate_limit_window_secs: 60,
@@ -56,12 +57,16 @@ struct TestApp {
 }
 
 fn app_with_config(config: Config) -> TestApp {
+    app_with_dns(config, None)
+}
+
+fn app_with_dns(config: Config, dns: Option<std::sync::Arc<dyn wireserve_coordinator::dns::provider::DnsWriter>>) -> TestApp {
     let db_file = tempfile::NamedTempFile::new().unwrap();
     let db_path = db_file.path().to_str().unwrap().to_string();
     let mut config = config;
     config.db_path = db_path.clone();
     let db = Db::open(&db_path).unwrap();
-    let state = build_state(config, db);
+    let state = build_state_with_dns(config, db, dns);
     let router = routes::node_router(state.clone()).merge(routes::admin_router(state.clone()));
     TestApp {
         router,
@@ -3613,4 +3618,161 @@ async fn a_name_nobody_declares_can_be_marked_ahead_of_time() {
     poll_caps(&app.router, &home, json!([svc("jellyfin", 443, 8096), svc("immich", 443, 2283)]), true).await;
     let (_, body) = poll_full(&app.router, &watcher, json!({})).await;
     assert_eq!(directory_entry(&body, "immich")["auth"], json!(true), "{body}");
+}
+
+// ---- PLAN.md M32: the service names in public DNS ----
+
+mod dns_records {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use wireserve_coordinator::dns::provider::{DnsWriter, WriteFuture};
+    use wireserve_coordinator::dns::sync;
+
+    /// Records every call; fails them all while `down` is set.
+    #[derive(Default)]
+    struct FakeDns {
+        calls: Mutex<Vec<String>>,
+        down: AtomicBool,
+    }
+
+    impl FakeDns {
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut *self.calls.lock().unwrap())
+        }
+        fn call(&self, what: String) -> WriteFuture<'_> {
+            let down = self.down.load(Ordering::SeqCst);
+            self.calls.lock().unwrap().push(what);
+            Box::pin(async move { if down { Err("provider down".to_string()) } else { Ok(()) } })
+        }
+    }
+
+    impl DnsWriter for FakeDns {
+        fn set_a<'a>(&'a self, fqdn: &'a str, addr: std::net::Ipv4Addr) -> WriteFuture<'a> {
+            self.call(format!("set {fqdn} {addr}"))
+        }
+        fn delete_a<'a>(&'a self, fqdn: &'a str) -> WriteFuture<'a> {
+            self.call(format!("delete {fqdn}"))
+        }
+        fn add_txt<'a>(&'a self, fqdn: &'a str, value: &'a str) -> WriteFuture<'a> {
+            self.call(format!("add-txt {fqdn} {value}"))
+        }
+        fn remove_txt<'a>(&'a self, fqdn: &'a str, value: &'a str) -> WriteFuture<'a> {
+            self.call(format!("remove-txt {fqdn} {value}"))
+        }
+    }
+
+    fn app(fake: &Arc<FakeDns>) -> TestApp {
+        let mut config = test_config("");
+        config.service_domain = Some("int.example.com".into());
+        config.service_proxy = Some("web".into());
+        app_with_dns(config, Some(fake.clone() as Arc<dyn DnsWriter>))
+    }
+
+    async fn pass(app: &TestApp) -> sync::PassOutcome {
+        let dns = app.state.dns.clone().expect("a writer was configured");
+        sync::pass(&app.state, &dns, &mut Default::default()).await
+    }
+
+    async fn node(app: &TestApp, name: &str) -> String {
+        let t = admin_create_node(&app.router, name).await;
+        register_node(&app.router, &t, name, 51820).await["bearer_token"].as_str().unwrap().to_string()
+    }
+
+    fn vip(body: &Value, name: &str) -> String {
+        directory_entry(body, name)["vip4"].as_str().unwrap().to_string()
+    }
+
+    async fn admin_dns(app: &TestApp, name: &str) -> Value {
+        let req = json_request("GET", "/admin/services", Some(ADMIN), json!({}));
+        let listed = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
+        listed["services"].as_array().unwrap().iter().find(|s| s["name"] == name).unwrap()["dns"].clone()
+    }
+
+    #[tokio::test]
+    async fn every_service_gets_the_name_the_hosts_file_gives_it() {
+        let fake = Arc::new(FakeDns::default());
+        let app = app(&fake);
+        let px = node(&app, "px").await;
+        let home = node(&app, "home").await;
+        poll_with(&app.router, &px, json!([svc("web", 443, 8443)])).await;
+        let (_, body) = poll_with(&app.router, &home, json!([svc("jellyfin", 443, 8096), svc("prom", 80, 9090)])).await;
+
+        assert!(!pass(&app).await.failed);
+        let mut calls = fake.take();
+        calls.sort();
+        let web = vip(&body, "web");
+        assert_eq!(
+            calls,
+            vec![
+                format!("set jellyfin.int.example.com {web}"),
+                format!("set prom.int.example.com {}", vip(&body, "prom")),
+                format!("set web.int.example.com {web}"),
+            ],
+            "443 names point at the proxy, others at their own address"
+        );
+        assert_eq!(admin_dns(&app, "prom").await, json!({"state": "published"}));
+
+        // A second pass has nothing left to do.
+        pass(&app).await;
+        assert!(fake.take().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_withdrawn_or_revoked_service_leaves_dns() {
+        let fake = Arc::new(FakeDns::default());
+        let app = app(&fake);
+        let home = node(&app, "home").await;
+        let other = node(&app, "other").await;
+        poll_with(&app.router, &home, json!([svc("prom", 80, 9090), svc("graf", 80, 3000)])).await;
+        poll_with(&app.router, &other, json!([svc("git", 80, 3000)])).await;
+        pass(&app).await;
+        fake.take();
+
+        poll_with(&app.router, &home, json!([svc("prom", 80, 9090)])).await;
+        pass(&app).await;
+        assert_eq!(fake.take(), vec!["delete graf.int.example.com".to_string()]);
+
+        let req = json_request("POST", "/admin/nodes/other/revoke", Some(ADMIN), json!({}));
+        assert_eq!(app.router.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+        pass(&app).await;
+        assert_eq!(fake.take(), vec!["delete git.int.example.com".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn names_the_coordinator_did_not_write_are_never_deleted() {
+        let fake = Arc::new(FakeDns::default());
+        let app = app(&fake);
+        // Nothing declared and nothing recorded: whatever the zone holds is
+        // the operator's, and a pass must not touch it.
+        pass(&app).await;
+        assert!(fake.take().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_provider_failure_is_reported_and_retried() {
+        let fake = Arc::new(FakeDns::default());
+        let app = app(&fake);
+        let home = node(&app, "home").await;
+        poll_with(&app.router, &home, json!([svc("prom", 80, 9090)])).await;
+
+        fake.down.store(true, Ordering::SeqCst);
+        assert!(pass(&app).await.failed);
+        fake.take();
+        assert_eq!(admin_dns(&app, "prom").await, json!({"state": "error", "error": "provider down"}));
+
+        // Not recorded as written, so the next pass tries again.
+        fake.down.store(false, Ordering::SeqCst);
+        assert!(!pass(&app).await.failed);
+        assert_eq!(fake.take().len(), 1);
+        assert_eq!(admin_dns(&app, "prom").await, json!({"state": "published"}));
+    }
+
+    #[tokio::test]
+    async fn no_provider_means_no_dns_field() {
+        let app = named_app();
+        let home = node(&app, "home").await;
+        poll_with(&app.router, &home, json!([svc("prom", 80, 9090)])).await;
+        assert_eq!(admin_dns(&app, "prom").await, Value::Null);
+    }
 }

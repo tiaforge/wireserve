@@ -30,6 +30,42 @@ pub enum WebServer {
 pub struct Naming {
     pub domain: String,
     pub proxy_service: String,
+    /// The provider the coordinator publishes the names through (PLAN.md
+    /// M32), or `None` to leave DNS to the operator.
+    pub dns: Option<DnsAnswer>,
+}
+
+/// A DNS provider and the settings it needs, as `WIRESERVE_DNS_*` keys.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DnsAnswer {
+    pub provider: String,
+    pub fields: Vec<(&'static str, String)>,
+}
+
+// Credentials never reach a log or a panic message.
+impl std::fmt::Debug for DnsAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DnsAnswer").field("provider", &self.provider).finish_non_exhaustive()
+    }
+}
+
+impl DnsAnswer {
+    /// Checks the answer the way the coordinator will at startup, so a
+    /// setting it would refuse is caught before anything is installed.
+    pub fn check(&self, domain: &str) -> Result<crate::dns::DnsConfig, String> {
+        let lookup = |key: &str| {
+            if key == "WIRESERVE_DNS_PROVIDER" {
+                return Some(self.provider.clone());
+            }
+            self.fields.iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone())
+        };
+        match crate::dns::config::from_lookup(lookup, Some(domain)) {
+            Ok(Some(cfg)) => Ok(cfg),
+            Ok(None) => Err("no DNS provider given".into()),
+            Err(crate::config::ConfigError::Invalid(key, why)) => Err(format!("{key} {why}")),
+            Err(e) => Err(e.to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +90,8 @@ pub struct Given {
     /// `Some(None)` is `--no-domain`.
     pub domain: Option<Option<String>>,
     pub proxy_service: Option<String>,
+    /// `Some(None)` is `--no-dns`.
+    pub dns_provider: Option<Option<String>>,
     /// `Some(None)` is `--no-admin-user`.
     pub admin_user: Option<Option<String>>,
 }
@@ -78,11 +116,22 @@ impl Current {
             Some(proxy_ip) if !addr.ip().is_loopback() => WebServer::Elsewhere { listen_ip: addr.ip(), proxy_ip },
             _ => WebServer::Here,
         });
+        let dns = envfile::get(text, "WIRESERVE_DNS_PROVIDER")
+            .map(|p| p.trim().to_ascii_lowercase())
+            .filter(|p| crate::dns::config::PROVIDERS.contains(&p.as_str()))
+            .map(|provider| DnsAnswer {
+                fields: crate::dns::config::fields(&provider)
+                    .iter()
+                    .filter_map(|f| Some((f.key, envfile::get(text, f.key).filter(|v| !v.is_empty())?)))
+                    .collect(),
+                provider,
+            });
         let naming = envfile::get(text, "WIRESERVE_SERVICE_DOMAIN").filter(|d| !d.is_empty()).map(|domain| Naming {
             domain,
             proxy_service: envfile::get(text, "WIRESERVE_SERVICE_PROXY")
                 .filter(|p| !p.is_empty())
                 .unwrap_or_else(|| DEFAULT_PROXY_SERVICE.to_string()),
+            dns,
         });
         Self {
             public_url: envfile::get(text, "WIRESERVE_PUBLIC_URL").filter(|u| !u.is_empty()),
@@ -123,7 +172,19 @@ impl Answers {
             Some(n) => (Change::Set(n.domain.clone()), Change::Set(n.proxy_service.clone())),
             None => (Change::Clear, Change::Clear),
         };
-        vec![
+        // Turning DNS off, or switching provider, clears every credential
+        // the new setting does not use: a token nothing reads any more is
+        // still a live token sitting in a file.
+        let dns = self.naming.as_ref().and_then(|n| n.dns.as_ref());
+        let mut dns_changes = vec![(
+            "WIRESERVE_DNS_PROVIDER",
+            dns.map_or(Change::Clear, |d| Change::Set(d.provider.clone())),
+        )];
+        for key in crate::dns::config::CREDENTIAL_KEYS {
+            let value = dns.and_then(|d| d.fields.iter().find(|(k, _)| *k == key));
+            dns_changes.push((key, value.map_or(Change::Clear, |(_, v)| Change::Set(v.clone()))));
+        }
+        let mut changes = vec![
             ("WIRESERVE_PUBLIC_URL", Change::Set(self.public_url.clone())),
             ("WIRESERVE_LISTEN_ADDR", Change::Set(self.listen_addr().to_string())),
             ("WIRESERVE_ADMIN_LISTEN_ADDR", Change::Set(self.admin_addr().to_string())),
@@ -132,7 +193,9 @@ impl Answers {
             ("WIRESERVE_REQUIRE_SERVICE_APPROVAL", Change::Set(self.approval.to_string())),
             ("WIRESERVE_SERVICE_DOMAIN", domain),
             ("WIRESERVE_SERVICE_PROXY", proxy),
-        ]
+        ];
+        changes.extend(dns_changes);
+        changes
     }
 
     /// The one-screen summary shown before anything is installed.
@@ -158,10 +221,19 @@ impl Answers {
             if self.approval { "on — new services wait for you" } else { "off — new services are shared at once" }
         ));
         match &self.naming {
-            Some(n) => s.push_str(&format!(
-                "  Service names:        <name>.{} through the `{}` service\n",
-                n.domain, n.proxy_service
-            )),
+            Some(n) => {
+                s.push_str(&format!(
+                    "  Service names:        <name>.{} through the `{}` service\n",
+                    n.domain, n.proxy_service
+                ));
+                match &n.dns {
+                    Some(d) => s.push_str(&format!(
+                        "  DNS records:          written by the coordinator through {}\n",
+                        d.provider
+                    )),
+                    None => s.push_str("  DNS records:          yours to create (a wildcard record)\n"),
+                }
+            }
             None => s.push_str("  Service names:        <name>.wg\n"),
         }
         s.push_str(&format!(
@@ -274,6 +346,15 @@ pub fn check_domain(raw: &str) -> Result<String, String> {
     }
 }
 
+pub fn check_dns_provider(raw: &str) -> Result<String, String> {
+    let p = raw.trim().to_ascii_lowercase();
+    if crate::dns::config::PROVIDERS.contains(&p.as_str()) {
+        Ok(p)
+    } else {
+        Err(format!("pick one of {}", crate::dns::config::PROVIDERS.join(", ")))
+    }
+}
+
 pub fn check_proxy_service(raw: &str) -> Result<String, String> {
     let p = raw.trim().to_lowercase();
     if wireserve_types::is_valid_dns_label(&p) {
@@ -291,6 +372,10 @@ pub fn check_proxy_service(raw: &str) -> Result<String, String> {
 /// whether a local user of that name exists.
 pub struct Asker<'a> {
     pub interactive: bool,
+    /// Reads a `WIRESERVE_DNS_*` credential from the environment: how a
+    /// run that is not at a terminal is given one without putting a secret
+    /// on the command line.
+    pub env: &'a dyn Fn(&str) -> Option<String>,
     pub given: Given,
     pub current: Current,
     /// Who ran sudo — the default admin user.
@@ -482,22 +567,28 @@ impl Asker<'_> {
             Some(Some(raw)) => {
                 let domain = check_domain(raw).map_err(|e| AskError::Invalid(format!("--domain: {e}")))?;
                 let proxy_service = proxy_given.unwrap_or_else(|| proxy_default.to_string());
-                return Ok(Some(Naming { domain, proxy_service }));
+                let dns = self.dns(&domain)?;
+                return Ok(Some(Naming { domain, proxy_service, dns }));
             }
             None => {}
         }
         if !self.interactive {
-            return Ok(self.current.naming.clone().map(|n| Naming {
-                proxy_service: proxy_given.unwrap_or(n.proxy_service),
-                ..n
-            }));
+            return self
+                .current
+                .naming
+                .clone()
+                .map(|n| {
+                    let dns = self.dns(&n.domain)?;
+                    Ok(Naming { proxy_service: proxy_given.unwrap_or(n.proxy_service), dns, ..n })
+                })
+                .transpose();
         }
         explain(&[
             "Services are normally named <name>.wg, which only works on machines",
             "running WireServe. With a domain you control, they become",
-            "<name>.home.example.com instead, which also works from a phone. You'll",
-            "need a wildcard DNS record and a web proxy on one of your machines;",
-            "the README's \"Give services real names\" section walks through it.",
+            "<name>.home.example.com instead, which also works from a phone. The",
+            "names need public DNS records, which the coordinator can write for",
+            "you; the README's \"Give services real names\" section walks through it.",
         ]);
         if !ask_yes_no("Use a domain for your services?", self.current.naming.is_some()) {
             return Ok(None);
@@ -521,7 +612,77 @@ impl Asker<'_> {
                 ask_until("Proxy service name", Some(proxy_default), check_proxy_service)?
             }
         };
-        Ok(Some(Naming { domain, proxy_service }))
+        let dns = self.dns(&domain)?;
+        Ok(Some(Naming { domain, proxy_service, dns }))
+    }
+
+    /// The DNS provider for `domain` (PLAN.md M32): `--dns-provider` /
+    /// `--no-dns` first, then the question, then the current setting. A
+    /// credential comes from its `WIRESERVE_DNS_*` environment variable,
+    /// then the question (hidden, for a secret), then the current setting.
+    fn dns(&self, domain: &str) -> Result<Option<DnsAnswer>, AskError> {
+        let current = self.current.naming.as_ref().and_then(|n| n.dns.clone());
+        let provider = match &self.given.dns_provider {
+            Some(None) => return Ok(None),
+            Some(Some(p)) => Some(check_dns_provider(p).map_err(|e| AskError::Invalid(format!("--dns-provider: {e}")))?),
+            None if !self.interactive => match &current {
+                Some(c) => Some(c.provider.clone()),
+                None => return Ok(None),
+            },
+            None => None,
+        };
+        let provider = match provider {
+            Some(p) => p,
+            None => {
+                explain(&[
+                    "The coordinator can keep one DNS record per service up to date for",
+                    &format!("you, like plex.{domain}, through your DNS provider's API. It then"),
+                    &format!("manages service names under {domain}: a record with the same"),
+                    "name as a service is replaced, and nothing else in the zone is",
+                    "touched. Without it, you add one wildcard record yourself.",
+                ]);
+                if !ask_yes_no("Let the coordinator write the DNS records?", current.is_some()) {
+                    return Ok(None);
+                }
+                eprintln!();
+                ask_until(
+                    &format!("DNS provider ({})", crate::dns::config::PROVIDERS.join(", ")),
+                    current.as_ref().map(|c| c.provider.as_str()),
+                    check_dns_provider,
+                )?
+            }
+        };
+        loop {
+            let mut fields = Vec::new();
+            for f in crate::dns::config::fields(&provider) {
+                let kept = current
+                    .as_ref()
+                    .filter(|c| c.provider == provider)
+                    .and_then(|c| c.fields.iter().find(|(k, _)| *k == f.key))
+                    .map(|(_, v)| v.clone());
+                let value = if let Some(v) = (self.env)(f.key).filter(|v| !v.trim().is_empty()) {
+                    Some(v.trim().to_string())
+                } else if !self.interactive {
+                    kept.or_else(|| f.default.map(str::to_string))
+                } else if f.secret {
+                    ask_secret(f.label, kept)?
+                } else {
+                    Some(ask_until(f.label, kept.as_deref().or(f.default), |raw| Ok::<_, String>(raw.trim().to_string()))?)
+                };
+                match value {
+                    Some(v) => fields.push((f.key, v)),
+                    None => {
+                        return Err(AskError::Missing { question: "a DNS provider credential", flag: f.key });
+                    }
+                }
+            }
+            let answer = DnsAnswer { provider: provider.clone(), fields };
+            match answer.check(domain) {
+                Ok(_) => return Ok(Some(answer)),
+                Err(e) if self.interactive => eprintln!("  {e}; let's try that again"),
+                Err(e) => return Err(AskError::Invalid(e)),
+            }
+        }
     }
 
     fn admin_user(&self) -> Result<Option<String>, AskError> {
@@ -617,6 +778,22 @@ fn ask_until<T>(
     }
 }
 
+/// Asks for a secret without echoing it. Enter keeps `current`, which is
+/// never shown.
+fn ask_secret(label: &str, current: Option<String>) -> Result<Option<String>, AskError> {
+    loop {
+        let prompt = if current.is_some() { format!("{label} [keep current]: ") } else { format!("{label}: ") };
+        let answer = rpassword::prompt_password(prompt).map_err(|_| AskError::Declined)?;
+        let answer = answer.trim();
+        if !answer.is_empty() {
+            return Ok(Some(answer.to_string()));
+        }
+        if current.is_some() {
+            return Ok(current);
+        }
+    }
+}
+
 fn ask_yes_no(label: &str, default: bool) -> bool {
     loop {
         eprint!("{label} {} ", if default { "[Y/n]" } else { "[y/N]" });
@@ -683,7 +860,7 @@ mod tests {
         let c = a.env_changes();
         assert_eq!(change(&c, "WIRESERVE_SERVICE_DOMAIN"), &Change::Clear);
         assert_eq!(change(&c, "WIRESERVE_SERVICE_PROXY"), &Change::Clear);
-        a.naming = Some(Naming { domain: "int.example.com".into(), proxy_service: "web".into() });
+        a.naming = Some(Naming { domain: "int.example.com".into(), proxy_service: "web".into(), dns: None });
         let c = a.env_changes();
         assert_eq!(change(&c, "WIRESERVE_SERVICE_DOMAIN"), &Change::Set("int.example.com".into()));
         assert_eq!(change(&c, "WIRESERVE_SERVICE_PROXY"), &Change::Set("web".into()));
@@ -697,7 +874,7 @@ mod tests {
             listen_ip: "10.0.0.5".parse().unwrap(),
             proxy_ip: "10.0.0.6".parse().unwrap(),
         };
-        a.naming = Some(Naming { domain: "int.example.com".into(), proxy_service: "gate".into() });
+        a.naming = Some(Naming { domain: "int.example.com".into(), proxy_service: "gate".into(), dns: None });
         let text = envfile::apply("", &a.env_changes());
         let current = Current::from_env_file(&text);
         assert_eq!(
@@ -757,8 +934,13 @@ mod tests {
     }
 
     fn asker<'a>(given: Given, current: Current) -> Asker<'a> {
+        asker_env(given, current, &|_| None)
+    }
+
+    fn asker_env<'a>(given: Given, current: Current, env: &'a dyn Fn(&str) -> Option<String>) -> Asker<'a> {
         Asker {
             interactive: false,
+            env,
             given,
             current,
             sudo_user: Some("tia".into()),
@@ -795,7 +977,7 @@ mod tests {
             web_server: Some(WebServer::Here),
             port: Some(48000),
             approval: Some(false),
-            naming: Some(Naming { domain: "int.test".into(), proxy_service: "gate".into() }),
+            naming: Some(Naming { domain: "int.test".into(), proxy_service: "gate".into(), dns: None }),
         };
         let a = asker(Given { approval: Some(true), ..Given::default() }, current).ask_all().unwrap();
         assert_eq!(a.public_url, "https://old.test");
@@ -825,11 +1007,11 @@ mod tests {
             ..Given::default()
         };
         let a = asker(given, Current::default()).ask_all().unwrap();
-        assert_eq!(a.naming, Some(Naming { domain: "int.test".into(), proxy_service: "web".into() }));
+        assert_eq!(a.naming, Some(Naming { domain: "int.test".into(), proxy_service: "web".into(), dns: None }));
 
         let current = Current {
             public_url: Some("https://mesh.test".into()),
-            naming: Some(Naming { domain: "int.test".into(), proxy_service: "web".into() }),
+            naming: Some(Naming { domain: "int.test".into(), proxy_service: "web".into(), dns: None }),
             ..Current::default()
         };
         let a = asker(Given { domain: Some(None), ..Given::default() }, current).ask_all().unwrap();
@@ -845,5 +1027,69 @@ mod tests {
         assert_eq!(a.ask_all().unwrap().admin_user, None);
         let a = asker(Given { admin_user: Some(Some("nobody-here".into())), ..base() }, Current::default());
         assert!(a.ask_all().is_err());
+    }
+
+    // ---- PLAN.md M32: the DNS provider ----
+
+    fn dns_given() -> Given {
+        Given {
+            public_url: Some("https://mesh.test".into()),
+            domain: Some(Some("int.test".into())),
+            dns_provider: Some(Some("Cloudflare".into())),
+            ..Given::default()
+        }
+    }
+
+    #[test]
+    fn a_provider_flag_takes_its_credential_from_the_environment() {
+        let env = |k: &str| (k == "WIRESERVE_DNS_API_TOKEN").then(|| "cf-token".to_string());
+        let a = asker_env(dns_given(), Current::default(), &env).ask_all().unwrap();
+        let dns = a.naming.as_ref().unwrap().dns.clone().unwrap();
+        assert_eq!(dns.provider, "cloudflare");
+        let c = a.env_changes();
+        assert_eq!(change(&c, "WIRESERVE_DNS_PROVIDER"), &Change::Set("cloudflare".into()));
+        assert_eq!(change(&c, "WIRESERVE_DNS_API_TOKEN"), &Change::Set("cf-token".into()));
+        assert_eq!(change(&c, "WIRESERVE_DNS_TSIG_SECRET"), &Change::Clear, "other providers' keys are cleared");
+    }
+
+    #[test]
+    fn a_provider_flag_without_its_credential_is_refused() {
+        let err = asker(dns_given(), Current::default()).ask_all().unwrap_err();
+        assert!(matches!(err, AskError::Missing { flag: "WIRESERVE_DNS_API_TOKEN", .. }), "{err}");
+    }
+
+    #[test]
+    fn a_bad_credential_is_refused_before_anything_is_installed() {
+        let given = Given { dns_provider: Some(Some("rfc2136".into())), ..dns_given() };
+        let env = |k: &str| match k {
+            "WIRESERVE_DNS_SERVER" => Some("10.0.0.53:53".to_string()),
+            "WIRESERVE_DNS_TSIG_KEY_NAME" => Some("k".to_string()),
+            "WIRESERVE_DNS_TSIG_SECRET" => Some("not base64!".to_string()),
+            _ => None,
+        };
+        let err = asker_env(given, Current::default(), &env).ask_all().unwrap_err();
+        assert!(err.to_string().contains("WIRESERVE_DNS_TSIG_SECRET"), "{err}");
+    }
+
+    #[test]
+    fn a_rerun_keeps_the_provider_and_no_dns_clears_every_credential() {
+        let file = "WIRESERVE_PUBLIC_URL=https://mesh.test\nWIRESERVE_SERVICE_DOMAIN=int.test\n\
+                    WIRESERVE_DNS_PROVIDER=hetzner\nWIRESERVE_DNS_API_TOKEN=hz-token\n";
+        let current = Current::from_env_file(file);
+        let kept = asker(Given::default(), current.clone()).ask_all().unwrap();
+        let dns = kept.naming.unwrap().dns.unwrap();
+        assert_eq!((dns.provider.as_str(), dns.fields.clone()), ("hetzner", vec![("WIRESERVE_DNS_API_TOKEN", "hz-token".into())]));
+
+        let off = asker(Given { dns_provider: Some(None), ..Given::default() }, current).ask_all().unwrap();
+        assert_eq!(off.naming.as_ref().unwrap().dns, None);
+        let c = off.env_changes();
+        assert_eq!(change(&c, "WIRESERVE_DNS_PROVIDER"), &Change::Clear);
+        assert_eq!(change(&c, "WIRESERVE_DNS_API_TOKEN"), &Change::Clear);
+    }
+
+    #[test]
+    fn the_dns_answer_never_prints_its_credentials() {
+        let d = DnsAnswer { provider: "cloudflare".into(), fields: vec![("WIRESERVE_DNS_API_TOKEN", "cf-live".into())] };
+        assert!(!format!("{d:?}").contains("cf-live"));
     }
 }

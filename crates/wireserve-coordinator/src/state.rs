@@ -14,4 +14,16 @@ pub struct AppState {
     /// `transit::TransitState`'s module doc for why this lives in memory
     /// rather than the database.
     pub transit: Arc<TransitState>,
+    /// The public DNS sync (PLAN.md M32), when a provider is configured.
+    pub dns: Option<Arc<crate::dns::Dns>>,
+}
+
+impl AppState {
+    /// Tells the DNS sync the directory may have changed. Cheap and safe to
+    /// call from any handler: pokes coalesce, and the loop spaces its passes.
+    pub fn poke_dns(&self) {
+        if let Some(dns) = &self.dns {
+            dns.wake.notify_one();
+        }
+    }
 }

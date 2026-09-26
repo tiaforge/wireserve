@@ -22,10 +22,12 @@ rusqlite.workspace = true
 rusqlite_migration.workspace = true
 clap.workspace = true
 libc.workspace = true
+dns-update.workspace = true
+rpassword.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-base64.workspace = true
 # Only the integration tests drive the routers directly via
 # `tower::ServiceExt::oneshot`; the binary itself never uses tower.
 tower.workspace = true

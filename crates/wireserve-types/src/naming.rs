@@ -11,7 +11,11 @@
 //! working name is not a convenience, it is a source of sessions and redirects
 //! that bounce between the two. One service, one name.
 
+use std::net::Ipv4Addr;
+
 use serde::{Deserialize, Serialize};
+
+use crate::{Proto, ServiceInfo};
 
 /// The suffix services are named under, and which service fronts the ones
 /// published on 443.
@@ -46,3 +50,91 @@ pub struct ServiceNaming {
 /// the owning node's rewrite maps it to whatever the service really listens
 /// on, so there is no second TLS hop.
 pub const TLS_PUBLIC_PORT: u16 = 443;
+
+/// Whether this service publishes [`TLS_PUBLIC_PORT`] over TCP.
+#[must_use]
+pub fn publishes_tls(s: &ServiceInfo) -> bool {
+    s.port_maps().iter().any(|m| m.public == TLS_PUBLIC_PORT && m.proto == Proto::Tcp)
+}
+
+/// A service's own address: the one the coordinator gave it, else its
+/// owning node's. Unparsed, as it came off the wire.
+#[must_use]
+pub fn own_address(s: &ServiceInfo) -> &str {
+    s.vip4.as_deref().unwrap_or(&s.ip4)
+}
+
+/// What every service is called this cycle and where that name points.
+///
+/// The one place this is decided (PLAN.md M32): each agent's hosts file
+/// and the coordinator's public DNS records both come from it, so a name
+/// cannot resolve one way on a node and another way on a phone.
+///
+/// Resolved once from the coordinator's `naming` and the directory itself,
+/// rather than threaded field by field: deciding a service's address needs
+/// the proxy's address, and that is only knowable by looking the proxy
+/// service up in the same directory.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ServiceNames<'a> {
+    /// The domain services are named under. `None` keeps `<name>.wg`.
+    domain: Option<&'a str>,
+    /// The address of the service fronting everything published on 443.
+    proxy: Option<Ipv4Addr>,
+}
+
+impl<'a> ServiceNames<'a> {
+    /// Reads the coordinator's setting against the current directory.
+    ///
+    /// A configured proxy that is missing, unapproved or malformed leaves
+    /// [`Self::proxy`] as `None`, which costs 443 services their proxied
+    /// path but not their names — they fall back to resolving directly,
+    /// which is what they did before a domain was set.
+    #[must_use]
+    pub fn new(naming: Option<&'a ServiceNaming>, services: &[ServiceInfo]) -> Self {
+        let Some(naming) = naming else {
+            return Self::default();
+        };
+        let proxy = naming.proxy_service.as_deref().and_then(|want| {
+            services
+                .iter()
+                .find(|s| s.name == want)
+                .and_then(|s| own_address(s).parse::<Ipv4Addr>().ok())
+        });
+        Self { domain: Some(&naming.domain), proxy }
+    }
+
+    /// The proxy's address, when one is configured and in the directory.
+    #[must_use]
+    pub fn proxy(&self) -> Option<Ipv4Addr> {
+        self.proxy
+    }
+
+    /// `<name>.wg`, or `<name>.<domain>` once a domain is set. The suffix is
+    /// replaced rather than added to: an app has one configured base URL, so
+    /// a second working name produces redirects and sessions that bounce
+    /// between the two.
+    #[must_use]
+    pub fn host_name(&self, s: &ServiceInfo) -> String {
+        match self.domain {
+            Some(domain) => format!("{}.{domain}", s.name),
+            None => format!("{}.wg", s.name),
+        }
+    }
+
+    /// Where that name points: the proxy for a service published on 443, its
+    /// own address otherwise. `None` for an address that does not parse.
+    ///
+    /// Publishing 443 is the signal that a service wants to be served under
+    /// its name with TLS, so its name has to resolve to the same place from a
+    /// node as it does from a phone — otherwise the scheme differs by where
+    /// you are standing, and one configured base URL cannot be right in both.
+    /// Everything else keeps the direct path, and with it the real client
+    /// address and no extra hop.
+    #[must_use]
+    pub fn address(&self, s: &ServiceInfo) -> Option<Ipv4Addr> {
+        match (self.proxy, publishes_tls(s)) {
+            (Some(proxy), true) => Some(proxy),
+            _ => own_address(s).parse().ok(),
+        }
+    }
+}

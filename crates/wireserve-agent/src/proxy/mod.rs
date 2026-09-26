@@ -19,6 +19,7 @@ pub mod caddy;
 
 use std::net::Ipv4Addr;
 
+use wireserve_types::naming::publishes_tls;
 use wireserve_types::{ServiceInfo, ServiceNaming, TLS_PUBLIC_PORT};
 
 /// One published name and where it forwards.
@@ -114,12 +115,6 @@ pub fn vhosts(services: &[ServiceInfo], naming: &ServiceNaming) -> Vec<VHost> {
     out.sort();
     out.dedup();
     out
-}
-
-fn publishes_tls(s: &ServiceInfo) -> bool {
-    s.port_maps()
-        .iter()
-        .any(|m| m.public == TLS_PUBLIC_PORT && m.proto == wireserve_types::Proto::Tcp)
 }
 
 #[cfg(test)]

@@ -739,6 +739,7 @@ mod tests {
     fn service(node: &str, vip4: Option<&str>, state: ServiceApprovalState) -> AdminServiceInfo {
         AdminServiceInfo {
             auth: false,
+            dns: None,
             name: "web".into(),
             node: node.into(),
             ip4: String::new(),
@@ -1112,6 +1113,7 @@ mod gateway_tests {
         let flagged = vec!["minipc".to_string()];
         let services = [AdminServiceInfo {
             auth: false,
+            dns: None,
             name: "ssh".into(),
             node: "minipc".into(),
             ip4: String::new(),
@@ -1219,6 +1221,7 @@ mod exit_tests {
     fn dns_service(name: &str, vip: &str, ports: &[&str], state: ServiceApprovalState) -> AdminServiceInfo {
         AdminServiceInfo {
             auth: false,
+            dns: None,
             name: name.into(),
             node: "home".into(),
             ip4: String::new(),

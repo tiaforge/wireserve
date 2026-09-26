@@ -14,6 +14,9 @@ pub struct Config {
     /// The service that fronts everything published on 443. Meaningless
     /// without `service_domain`.
     pub service_proxy: Option<String>,
+    /// Where the service names are published as public DNS records
+    /// (PLAN.md M32). `None` leaves DNS to the operator, as before.
+    pub dns: Option<crate::dns::DnsConfig>,
     pub online_threshold_secs: i64,
     pub rate_limit_max: u32,
     pub rate_limit_window_secs: u64,
@@ -193,6 +196,7 @@ impl Config {
             }
             Err(_) => None,
         };
+        let dns = crate::dns::config::from_lookup(|k| std::env::var(k).ok(), service_domain.as_deref())?;
 
         Ok(Loaded {
             config: Self {
@@ -204,6 +208,7 @@ impl Config {
                 net_v6_prefix,
                 service_domain,
                 service_proxy,
+                dns,
                 online_threshold_secs,
                 rate_limit_max,
                 rate_limit_window_secs,

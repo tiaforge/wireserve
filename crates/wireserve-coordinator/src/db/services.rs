@@ -356,7 +356,6 @@ pub enum DenyOutcome {
     NotDeclared,
 }
 
-/// The row currently holding `name`, whoever owns it. One place so
 /// The names marked for sign-in at the proxy (PLAN.md M29), declared or not.
 pub fn auth_names(conn: &Connection) -> Result<std::collections::HashSet<String>, DbError> {
     let mut stmt = conn.prepare("SELECT name FROM service_auth")?;

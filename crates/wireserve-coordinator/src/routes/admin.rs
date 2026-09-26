@@ -88,6 +88,7 @@ pub async fn revoke_node(
         );
     }
     tracing::info!(event = "node_revoked", node_name = %name);
+    state.poke_dns();
     Ok(())
 }
 
@@ -126,6 +127,7 @@ pub async fn delete_node(
     }
     nodes::delete_node(&conn, node.id)?;
     tracing::info!(event = "node_deleted", node_name = %name);
+    state.poke_dns();
     Ok(())
 }
 
@@ -238,6 +240,7 @@ pub async fn rejoin_node(
     }
 
     tracing::info!(event = "node_rejoined", node_name = %name, join_token_ttl_secs = ttl);
+    state.poke_dns();
 
     Ok((
         StatusCode::CREATED,
@@ -271,7 +274,13 @@ pub async fn list_services(
         .filter_map(|s| {
             owners
                 .get(&s.node_id)
-                .map(|owner| crate::directory::admin_service_info(s, owner, auth.contains(&s.name)))
+                .map(|owner| {
+                    let mut info = crate::directory::admin_service_info(s, owner, auth.contains(&s.name));
+                    if s.is_approved() {
+                        info.dns = state.dns.as_ref().and_then(|d| d.state_of(&s.name));
+                    }
+                    info
+                })
         })
         .collect();
     Ok(Json(AdminServicesResponse { services: out }))
@@ -357,6 +366,7 @@ pub async fn set_service_auth(
     }
     services::set_auth(&conn, &name, body.enabled)?;
     tracing::info!(event = "service_auth_set", service = %name, enabled = body.enabled);
+    state.poke_dns();
     Ok(())
 }
 
@@ -396,6 +406,7 @@ pub async fn approve_service(
     match services::approve(&conn, node_id, &service)? {
         services::ApproveOutcome::Approved => {
             tracing::info!(event = "service_approved", node_name = %name, service = %service);
+            state.poke_dns();
             Ok(())
         }
         services::ApproveOutcome::AlreadyApproved => Ok(()),
@@ -443,6 +454,7 @@ pub async fn deny_service(
                 service = %service,
                 reason = ?reason,
             );
+            state.poke_dns();
             Ok(())
         }
         services::DenyOutcome::AlreadyDenied => Ok(()),

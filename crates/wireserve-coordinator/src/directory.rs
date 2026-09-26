@@ -59,6 +59,27 @@ pub fn service_info(service: &ServiceRow, node: &NodeRow, online_threshold_secs:
     }
 }
 
+/// The services every node's directory carries: each approved row whose
+/// owner is a live peer, shaped by [`service_info`]. Shared by `/poll` and
+/// the DNS sync (PLAN.md M32), so the names a phone resolves are built from
+/// exactly the directory the nodes see.
+pub fn services_directory(
+    services: &[ServiceRow],
+    peers: &[NodeRow],
+    auth: &std::collections::HashSet<String>,
+    online_threshold_secs: i64,
+) -> Vec<ServiceInfo> {
+    let peers_by_id: std::collections::HashMap<i64, &NodeRow> = peers.iter().map(|n| (n.id, n)).collect();
+    services
+        .iter()
+        .filter_map(|s| {
+            peers_by_id
+                .get(&s.node_id)
+                .map(|owner| service_info(s, owner, online_threshold_secs, auth.contains(&s.name)))
+        })
+        .collect()
+}
+
 /// Derived, never stored: `denied_at` is only meaningful while
 /// `approved_at` is NULL, so approval wins if a row somehow carries both.
 /// No writer produces that state, but `ALTER TABLE` cannot add the
@@ -111,6 +132,7 @@ pub fn admin_service_info(service: &ServiceRow, owner: &NodeRow, auth: bool) -> 
         denied_at: service.denied_at,
         denied_reason: service.denied_reason.clone(),
         auth,
+        dns: None,
     }
 }
 

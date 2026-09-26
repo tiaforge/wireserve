@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use wireserve_coordinator::{build_state, config, db::Db, rate_limit, reflexive, routes, Config};
+use wireserve_coordinator::{build_state_with_dns, config, dns, db::Db, rate_limit, reflexive, routes, Config};
 
 /// Initialises logging with `info` as the floor rather than tracing's own
 /// default.
@@ -89,7 +89,18 @@ async fn serve() {
     let net_v6_prefix = config.net_v6_prefix.clone();
     let reflexive_rate_limit_max = config.reflexive_rate_limit_max;
     let reflexive_rate_limit_window_secs = config.reflexive_rate_limit_window_secs;
-    let state = build_state(config, db);
+    let dns_writer = config.dns.as_ref().map(|cfg| {
+        let provider = dns::provider::Provider::connect(cfg).unwrap_or_else(|err| {
+            eprintln!("configuration error: {err}");
+            std::process::exit(1);
+        });
+        tracing::info!(provider = cfg.provider.name(), zone = %cfg.zone, "publishing service names to public DNS");
+        std::sync::Arc::new(provider) as std::sync::Arc<dyn dns::provider::DnsWriter>
+    });
+    let state = build_state_with_dns(config, db, dns_writer);
+    if let Some(dns) = state.dns.clone() {
+        tokio::spawn(dns::sync::run(state.clone(), dns));
+    }
 
     let node_app = routes::node_router(state.clone())
         .into_make_service_with_connect_info::<SocketAddr>();
@@ -275,6 +286,7 @@ mod tests {
             net_v4_cidr: "10.1.2.0/24".into(),
             net_v6_prefix: "fdab:cdef:1234::/64".into(),
             service_domain: None,
+            dns: None,
             service_proxy: None,
             online_threshold_secs: 180,
             rate_limit_max: 10,

@@ -1,3 +1,4 @@
+pub mod dns_records;
 pub mod nodes;
 pub mod services;
 
@@ -101,6 +102,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0011_export_via_gateway.sql")),
         M::up(include_str!("../../migrations/0012_static_peer_exit.sql")),
         M::up(include_str!("../../migrations/0013_service_auth.sql")),
+        M::up(include_str!("../../migrations/0014_dns_records.sql")),
     ])
 }
 

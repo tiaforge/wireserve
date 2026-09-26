@@ -571,14 +571,14 @@ wireserve serve prom 80:9090     # prom.int.example.com, direct
 | Published on | Resolves to | From a node | From a phone |
 | --- | --- | --- | --- |
 | 443 | the proxy | via the proxy, HTTPS | via the proxy, HTTPS |
-| anything else | its own address | direct, plain HTTP | 404 at the proxy |
+| anything else | its own address | direct, plain HTTP | direct with [DNS records](#let-the-coordinator-write-the-dns-records), else 404 at the proxy |
 
 A 443 service resolves to the same place with the same scheme wherever you
 ask, which is what makes one configured base URL correct everywhere. Anything
 else keeps the direct path, and with it the real client address and no extra
-hop — it simply is not reachable *by name* from a phone. Publish it on 443 if
-you want the name; reach it at `address:port` if you do not. Nothing that is
-not HTTP ever gets a hostname or a certificate it did not ask for.
+hop. A phone reaches it by name only when the coordinator writes the DNS
+records (below); with a hand-made wildcard record it lands on the proxy
+instead. Nothing that is not HTTP ever gets a certificate it did not ask for.
 
 On the proxy node, publish the proxy itself and run the agent with it:
 
@@ -595,14 +595,61 @@ changes, ever.
 
 Two things to get right:
 
-- **Point the wildcard DNS record at the proxy's *service* address**, the one
-  `wireserve list` shows — not at the node's mesh address. The firewall
-  opens `service:443` and deliberately refuses `node:443`, so a record aimed
-  at the node is dropped by that node's own firewall.
+- **Let the coordinator write the DNS records** (next section), or point a
+  wildcard record at the proxy's *service* address, the one `wireserve list`
+  shows — not at the node's mesh address. The firewall opens `service:443`
+  and deliberately refuses `node:443`, so a record aimed at the node is
+  dropped by that node's own firewall.
 - **Caddy needs a custom build** for the wildcard certificate: the stock
   binary ships no DNS provider module (`xcaddy build --with
   github.com/caddy-dns/cloudflare`). DNS-01 itself is fine for a name the
   internet cannot reach — it only needs the `_acme-challenge` TXT record.
+
+#### Let the coordinator write the DNS records
+
+Instead of a wildcard record, the coordinator can keep one record per
+service up to date through your DNS provider's API: `plex.int.example.com`
+pointing wherever `plex.int.example.com` resolves on a node, written when
+the service is approved, moved when its address changes, removed when it is
+withdrawn or its node revoked. That is what gives a phone the names of
+services that are not on 443.
+
+```sh
+# on the coordinator, next to WIRESERVE_SERVICE_DOMAIN
+WIRESERVE_DNS_PROVIDER=cloudflare      # or rfc2136, desec, hetzner, porkbun
+WIRESERVE_DNS_API_TOKEN=...            # a token that may edit the zone
+```
+
+`wireserve-coordinator install --reconfigure` asks for these, and before
+saving writes and removes a throwaway `_wireserve-check` TXT record, so a
+wrong token shows up there rather than as names that never appear.
+
+| Provider | Settings |
+| --- | --- |
+| `rfc2136` | `WIRESERVE_DNS_SERVER` (`host:port`), `WIRESERVE_DNS_TSIG_KEY_NAME`, `WIRESERVE_DNS_TSIG_SECRET` (base64), `WIRESERVE_DNS_TSIG_ALGORITHM` (default `hmac-sha256`) — BIND, Knot, PowerDNS |
+| `cloudflare`, `desec`, `hetzner` | `WIRESERVE_DNS_API_TOKEN` |
+| `porkbun` | `WIRESERVE_DNS_API_TOKEN` (the API key), `WIRESERVE_DNS_API_SECRET` |
+
+`WIRESERVE_DNS_ZONE` names the zone when it is a parent of the service domain
+(default: the domain itself); `WIRESERVE_DNS_TTL` defaults to 300 seconds.
+
+What to know first:
+
+- **The coordinator manages service names under the domain.** A record with
+  the same name as a service is replaced. It deletes only records it wrote
+  itself, and never touches anything else in the zone — a wildcard record
+  you made earlier stays, and is simply overridden by each service's own.
+- **Keep the domain to itself.** Most providers' tokens cover a whole zone,
+  so a token for `example.com` could also change its mail records. A zone of
+  its own (a subdomain delegated to its own zone, or a spare domain) keeps
+  the token that small.
+- **The records publish your mesh addresses and service names.** They are
+  private addresses and unreachable from outside the mesh, but anyone can
+  read them.
+- **An address change waits 20 seconds** before it is written, so a proxy
+  that drops out of the directory for a moment does not swing every name.
+  `wireserve-admin list-services` shows each record as `dns=published`,
+  `dns=pending` or the provider's error.
 
 #### A sign-in in front of chosen services
 
@@ -659,8 +706,8 @@ before it costs you an evening. Resolvers strip private addresses out of
 answers from public DNS by default; the usual list is `127/8`, `10/8`,
 `172.16/12`, `192.168/16`, `169.254/16`, `fd00::/8` and `fe80::/10`. The
 coordinator generates a `10.x.x.0/24` mesh and an `fd..::/64` prefix, so
-**both families are on that list** and the wildcard record is silently
-dropped — no error, just a name that does not resolve.
+**both families are on that list** and the records are silently dropped —
+no error, just a name that does not resolve.
 
 OpenWrt's dnsmasq enables this by default, as do pfSense, NextDNS and AdGuard.
 The usual offender is your own router, and every one of them has a per-domain

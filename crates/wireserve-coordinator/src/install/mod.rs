@@ -67,6 +67,35 @@ pub enum InstallError {
     Failed(String),
 }
 
+/// Writes and removes one throwaway TXT record through the provider, so a
+/// wrong token or a zone it cannot write is found now, while nothing is
+/// installed, and not later as names that never appear.
+fn check_dns_provider(dns: &questions::DnsAnswer, domain: &str) -> Result<(), InstallError> {
+    let cfg = dns.check(domain).map_err(InstallError::Failed)?;
+    let provider = crate::dns::provider::Provider::connect(&cfg).map_err(InstallError::Failed)?;
+    let name = format!("_wireserve-check.{domain}");
+    let value = crate::tokengen::generate("wireserve-check-");
+    eprintln!("Checking the DNS provider by writing a test record at {name} …");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| failed("starting the DNS check", e))?;
+    runtime.block_on(async {
+        use crate::dns::provider::DnsWriter as _;
+        provider.add_txt(&name, &value).await.map_err(|e| {
+            InstallError::Failed(format!(
+                "the {} provider refused a test record in {}: {e}. Nothing was installed; check the \
+                 credentials and that they may edit that zone (or pass --skip-dns-check)",
+                dns.provider, cfg.zone
+            ))
+        })?;
+        if let Err(e) = provider.remove_txt(&name, &value).await {
+            eprintln!("note: the test record {name} could not be removed ({e}); delete it by hand");
+        }
+        Ok(())
+    })
+}
+
 fn failed(what: impl std::fmt::Display, e: impl std::fmt::Display) -> InstallError {
     InstallError::Failed(format!("{what}: {e}"))
 }
@@ -111,6 +140,19 @@ pub struct InstallArgs {
     /// With --domain: the service your web proxy is published as (default web).
     #[arg(long, value_name = "NAME")]
     pub proxy_service: Option<String>,
+    /// Let the coordinator write each service's public DNS record through
+    /// this provider (rfc2136, cloudflare, desec, hetzner, porkbun). Its
+    /// credentials are read from the WIRESERVE_DNS_* environment variables,
+    /// or asked for at a terminal.
+    #[arg(long, value_name = "PROVIDER", conflicts_with = "no_dns")]
+    pub dns_provider: Option<String>,
+    /// Leave DNS records to you.
+    #[arg(long)]
+    pub no_dns: bool,
+    /// Don't write and remove a test record through the DNS provider before
+    /// installing.
+    #[arg(long)]
+    pub skip_dns_check: bool,
     /// Save the admin key for this local user (default: whoever ran sudo).
     #[arg(long, value_name = "USER", conflicts_with = "no_admin_user")]
     pub admin_user: Option<String>,
@@ -146,6 +188,7 @@ impl InstallArgs {
             },
             domain: if self.no_domain { Some(None) } else { self.domain.clone().map(Some) },
             proxy_service: self.proxy_service.clone(),
+            dns_provider: if self.no_dns { Some(None) } else { self.dns_provider.clone().map(Some) },
             admin_user: if self.no_admin_user { Some(None) } else { self.admin_user.clone().map(Some) },
         }
     }
@@ -162,6 +205,8 @@ impl InstallArgs {
             (self.domain.is_some(), "--domain"),
             (self.no_domain, "--no-domain"),
             (self.proxy_service.is_some(), "--proxy-service"),
+            (self.dns_provider.is_some(), "--dns-provider"),
+            (self.no_dns, "--no-dns"),
             (self.admin_user.is_some(), "--admin-user"),
             (self.no_admin_user, "--no-admin-user"),
         ]
@@ -214,6 +259,7 @@ pub fn run(args: InstallArgs) -> Result<(), InstallError> {
     } else {
         let asker = Asker {
             interactive,
+            env: &|key| std::env::var(key).ok(),
             given: args.given(),
             current: env_before.as_deref().map(Current::from_env_file).unwrap_or_default(),
             sudo_user: std::env::var("SUDO_USER").ok().filter(|u| !u.is_empty() && u != "root"),
@@ -224,6 +270,13 @@ pub fn run(args: InstallArgs) -> Result<(), InstallError> {
         let answers = asker.ask_all()?;
         if interactive && !args.yes {
             questions::confirm(&answers, &service_user)?;
+        }
+        if !args.skip_dns_check {
+            if let Some(n) = &answers.naming {
+                if let Some(dns) = &n.dns {
+                    check_dns_provider(dns, &n.domain)?;
+                }
+            }
         }
         Some(answers)
     };

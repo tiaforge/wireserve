@@ -543,6 +543,23 @@ pub struct AdminServiceInfo {
     /// re-declare.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auth: bool,
+    /// Where the service's public DNS record stands (PLAN.md M32). Absent
+    /// when the coordinator publishes no records, or this service has no
+    /// public name.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub dns: Option<DnsRecordState>,
+}
+
+/// Where one public DNS record stands (PLAN.md M32).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "state", content = "error")]
+pub enum DnsRecordState {
+    Published,
+    /// Not written yet: a new name before the next pass, or a changed
+    /// address that has not held long enough to be written.
+    Pending,
+    /// The provider refused the last attempt.
+    Error(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

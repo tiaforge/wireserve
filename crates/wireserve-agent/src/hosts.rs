@@ -15,7 +15,8 @@
 use std::net::Ipv4Addr;
 use std::path::Path;
 
-use wireserve_types::{ServiceInfo, ServiceNaming, TLS_PUBLIC_PORT};
+use wireserve_types::naming::own_address;
+use wireserve_types::{ServiceInfo, ServiceNames, ServiceNaming};
 
 use crate::fsutil::atomic_write;
 
@@ -29,82 +30,25 @@ fn markers(label: Option<&str>) -> (String, String) {
     }
 }
 
-/// How services are named this cycle (PLAN.md M25).
-///
-/// Resolved once per sync from the coordinator's `naming` and the directory
-/// itself, rather than threaded field by field: deciding a service's address
-/// needs the proxy's address, and that is only knowable by looking the proxy
-/// service up in the same directory.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Naming<'a> {
-    /// The domain services are named under. `None` keeps `<name>.wg`.
-    domain: Option<&'a str>,
-    /// The address of the service fronting everything published on 443.
-    proxy: Option<Ipv4Addr>,
-}
+/// How services are named this cycle (PLAN.md M25): the shared rule in
+/// [`ServiceNames`], which the coordinator's DNS records follow too.
+pub type Naming<'a> = ServiceNames<'a>;
 
-impl<'a> Naming<'a> {
-    /// Reads the coordinator's setting against the current directory.
-    ///
-    /// A configured proxy that is missing, unapproved or malformed leaves
-    /// `proxy` as `None`, which costs 443 services their proxied path but not
-    /// their names — they fall back to resolving directly, which is what they
-    /// did before a domain was set.
-    #[must_use]
-    pub fn new(naming: Option<&'a ServiceNaming>, services: &[ServiceInfo]) -> Self {
-        let Some(naming) = naming else {
-            return Self::default();
-        };
-        let proxy = naming.proxy_service.as_deref().and_then(|want| {
-            let found = services
-                .iter()
-                .find(|s| s.name == want)
-                .and_then(|s| address(s).parse::<Ipv4Addr>().ok());
-            if found.is_none() {
-                tracing::warn!(
-                    proxy_service = %want.escape_debug(),
-                    "configured service proxy is not in the directory yet; services \
-                     published on 443 will resolve directly until it is"
-                );
-            }
-            found
-        });
-        Self { domain: Some(&naming.domain), proxy }
-    }
-
-    /// `<name>.wg`, or `<name>.<domain>` once a domain is set. The suffix is
-    /// replaced rather than added to: an app has one configured base URL, so
-    /// a second working name produces redirects and sessions that bounce
-    /// between the two.
-    fn host_name(&self, s: &ServiceInfo) -> String {
-        match self.domain {
-            Some(domain) => format!("{}.{domain}", s.name),
-            None => format!("{}.wg", s.name),
+/// [`ServiceNames::new`], warning when a configured proxy is not in the
+/// directory yet — the rule itself is pure and cannot log.
+#[must_use]
+pub fn naming<'a>(naming: Option<&'a ServiceNaming>, services: &[ServiceInfo]) -> Naming<'a> {
+    let names = ServiceNames::new(naming, services);
+    if let Some(want) = naming.and_then(|n| n.proxy_service.as_deref()) {
+        if names.proxy().is_none() {
+            tracing::warn!(
+                proxy_service = %want.escape_debug(),
+                "configured service proxy is not in the directory yet; services \
+                 published on 443 will resolve directly until it is"
+            );
         }
     }
-
-    /// Where that name points: the proxy for a service published on 443, its
-    /// own address otherwise.
-    ///
-    /// Publishing 443 is the signal that a service wants to be served under
-    /// its name with TLS, so its name has to resolve to the same place from a
-    /// node as it does from a phone — otherwise the scheme differs by where
-    /// you are standing, and one configured base URL cannot be right in both.
-    /// Everything else keeps the direct path, and with it the real client
-    /// address and no extra hop.
-    fn address(&self, s: &ServiceInfo) -> String {
-        match (self.proxy, publishes_tls(s)) {
-            (Some(proxy), true) => proxy.to_string(),
-            _ => address(s).to_string(),
-        }
-    }
-}
-
-/// Whether this service publishes [`TLS_PUBLIC_PORT`] over TCP.
-fn publishes_tls(s: &ServiceInfo) -> bool {
-    s.port_maps()
-        .iter()
-        .any(|m| m.public == TLS_PUBLIC_PORT && m.proto == wireserve_types::Proto::Tcp)
+    names
 }
 
 /// Renders the managed block's body (without markers) for the given
@@ -114,7 +58,7 @@ fn render_block(services: &[ServiceInfo], naming: Naming<'_>) -> String {
     let mut lines: Vec<String> = services
         .iter()
         .filter(|s| is_safe_entry(s))
-        .map(|s| format!("{} {}", naming.address(s), naming.host_name(s)))
+        .filter_map(|s| Some(format!("{} {}", naming.address(s)?, naming.host_name(s))))
         .collect();
     lines.sort();
     lines.join("\n")
@@ -129,7 +73,7 @@ fn render_block(services: &[ServiceInfo], naming: Naming<'_>) -> String {
 /// a loud warning rather than trusting the wire.
 fn is_safe_entry(s: &ServiceInfo) -> bool {
     let ok = wireserve_types::is_valid_dns_label(&s.name)
-        && address(s).parse::<std::net::Ipv4Addr>().is_ok();
+        && own_address(s).parse::<Ipv4Addr>().is_ok();
     if !ok {
         tracing::warn!(
             service = %s.name.escape_debug(),
@@ -138,12 +82,6 @@ fn is_safe_entry(s: &ServiceInfo) -> bool {
         );
     }
     ok
-}
-
-/// What `<name>.wg` resolves to: the service's own address when it has
-/// one, else its owning node's.
-fn address(s: &ServiceInfo) -> &str {
-    s.vip4.as_deref().unwrap_or(&s.ip4)
 }
 
 /// The byte span of this label's block: from the start of its begin line
@@ -640,14 +578,14 @@ mod naming_tests {
         }
     }
 
-    fn naming(domain: &str, proxy: Option<&str>) -> ServiceNaming {
+    fn cfg_for(domain: &str, proxy: Option<&str>) -> ServiceNaming {
         ServiceNaming { domain: domain.into(), proxy_service: proxy.map(Into::into) }
     }
 
     #[test]
     fn without_a_domain_nothing_changes() {
         let services = [svc("plex", "100.90.0.50", 443), svc("prom", "100.90.0.51", 80)];
-        let n = Naming::new(None, &services);
+        let n = naming(None, &services);
         assert_eq!(
             render_block(&services, n),
             "100.90.0.50 plex.wg\n100.90.0.51 prom.wg",
@@ -658,8 +596,8 @@ mod naming_tests {
     #[test]
     fn a_domain_replaces_the_suffix_rather_than_adding_a_second_name() {
         let services = [svc("prom", "100.90.0.51", 80)];
-        let cfg = naming("int.example.com", None);
-        let out = render_block(&services, Naming::new(Some(&cfg), &services));
+        let cfg = cfg_for("int.example.com", None);
+        let out = render_block(&services, naming(Some(&cfg), &services));
         assert_eq!(out, "100.90.0.51 prom.int.example.com");
         assert!(
             !out.contains(".wg"),
@@ -674,8 +612,8 @@ mod naming_tests {
             svc("prom", "100.90.0.51", 80),
             svc("web", "100.90.0.2", 443),
         ];
-        let cfg = naming("int.example.com", Some("web"));
-        let out = render_block(&services, Naming::new(Some(&cfg), &services));
+        let cfg = cfg_for("int.example.com", Some("web"));
+        let out = render_block(&services, naming(Some(&cfg), &services));
         // plex is fronted by the proxy; prom keeps the direct path.
         assert!(out.contains("100.90.0.2 plex.int.example.com"), "{out}");
         assert!(out.contains("100.90.0.51 prom.int.example.com"), "{out}");
@@ -688,16 +626,16 @@ mod naming_tests {
         let mut s = svc("dns", "100.90.0.60", 443);
         s.ports = vec![PortMap { public: 443, target: 443, proto: Proto::Udp, addr: None }];
         let services = [s, svc("web", "100.90.0.2", 443)];
-        let cfg = naming("int.example.com", Some("web"));
-        let out = render_block(&services, Naming::new(Some(&cfg), &services));
+        let cfg = cfg_for("int.example.com", Some("web"));
+        let out = render_block(&services, naming(Some(&cfg), &services));
         assert!(out.contains("100.90.0.60 dns.int.example.com"), "{out}");
     }
 
     #[test]
     fn a_missing_proxy_service_costs_the_proxied_path_but_not_the_name() {
         let services = [svc("plex", "100.90.0.50", 443)];
-        let cfg = naming("int.example.com", Some("web"));
-        let out = render_block(&services, Naming::new(Some(&cfg), &services));
+        let cfg = cfg_for("int.example.com", Some("web"));
+        let out = render_block(&services, naming(Some(&cfg), &services));
         assert_eq!(
             out, "100.90.0.50 plex.int.example.com",
             "an unconfigured or unapproved proxy must degrade to direct, not break names"
@@ -712,8 +650,8 @@ mod naming_tests {
         let mut s = svc("plex", "100.90.0.50", 443);
         s.ports = vec![];
         let services = [s, svc("web", "100.90.0.2", 443)];
-        let cfg = naming("int.example.com", Some("web"));
-        let out = render_block(&services, Naming::new(Some(&cfg), &services));
+        let cfg = cfg_for("int.example.com", Some("web"));
+        let out = render_block(&services, naming(Some(&cfg), &services));
         assert!(out.contains("100.90.0.2 plex.int.example.com"), "{out}");
     }
 }
