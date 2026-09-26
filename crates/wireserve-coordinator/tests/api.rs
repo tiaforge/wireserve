@@ -32,6 +32,7 @@ fn test_config(db_path: &str) -> Config {
         rate_limit_max: 1000,
         rate_limit_window_secs: 60,
         trust_proxy_headers: false,
+        trusted_proxy: None,
         join_token_ttl_secs: 1800,
         // Effectively disabled for most tests: the delay is real wall
         // time, and every existing test that exercises a failure path
@@ -1563,6 +1564,58 @@ async fn proxy_misconfiguration_still_suppresses_a_useless_endpoint() {
     assert!(
         row.endpoint_addr.is_none(),
         "the proxy's own address must never be recorded as a node's endpoint"
+    );
+}
+
+/// Registers `name` with an `X-Forwarded-For` of `forwarded`, arriving from
+/// `peer`, and returns the endpoint the coordinator recorded for it.
+async fn endpoint_registered_via(config: Config, name: &str, peer: &str, forwarded: &str) -> Option<String> {
+    let app = app_with_config(config);
+    let token = admin_create_node(&app.router, name).await;
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/register")
+        .header("content-type", "application/json")
+        .header("x-forwarded-for", forwarded)
+        .body(Body::from(
+            json!({ "join_token": token, "pubkey": pubkey_for(name), "listen_port": 51820 })
+                .to_string(),
+        ))
+        .unwrap();
+    let peer: SocketAddr = peer.parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(peer));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let conn = app.state.db.conn.lock().await;
+    wireserve_coordinator::db::nodes::find_by_name(&conn, name).unwrap().unwrap().endpoint_addr
+}
+
+#[tokio::test]
+async fn a_named_proxy_is_believed_and_nobody_else_is() {
+    // PLAN.md M31: with the proxy on another machine the listener is on a
+    // LAN address, and anyone on that LAN can reach it directly.
+    let mut config = test_config("");
+    config.trusted_proxy = Some("10.0.0.9".parse().unwrap());
+
+    assert_eq!(
+        endpoint_registered_via(config.clone(), "n1", "10.0.0.9:40000", "203.0.113.7").await.as_deref(),
+        Some("203.0.113.7:51820"),
+        "the named proxy says where the node really is"
+    );
+    assert_eq!(
+        endpoint_registered_via(config, "n2", "10.0.0.50:40000", "203.0.113.7").await.as_deref(),
+        Some("10.0.0.50:51820"),
+        "a direct LAN client is taken at its own address, whatever header it sends"
+    );
+}
+
+#[tokio::test]
+async fn a_named_proxy_matches_an_ipv4_peer_seen_on_a_dual_stack_listener() {
+    let mut config = test_config("");
+    config.trusted_proxy = Some("10.0.0.9".parse().unwrap());
+    assert_eq!(
+        endpoint_registered_via(config, "n1", "[::ffff:10.0.0.9]:40000", "203.0.113.7").await.as_deref(),
+        Some("203.0.113.7:51820")
     );
 }
 

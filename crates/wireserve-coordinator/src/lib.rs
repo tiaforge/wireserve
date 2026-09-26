@@ -5,6 +5,7 @@ pub mod config;
 pub mod db;
 pub mod directory;
 pub mod error;
+pub mod install;
 pub mod ipam;
 pub mod rate_limit;
 pub mod reflexive;

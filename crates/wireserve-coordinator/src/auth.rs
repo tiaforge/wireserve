@@ -71,7 +71,7 @@ fn source_ip(state: &AppState, parts: &Parts) -> Option<IpAddr> {
     Some(crate::client_ip::resolve(
         &parts.headers,
         connect_ip,
-        state.config.trust_proxy_headers,
+        state.config.trusts_forwarded_from(connect_ip),
     ))
 }
 

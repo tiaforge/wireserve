@@ -24,6 +24,13 @@ pub struct Config {
     /// exclusively through a proxy that sets this header, since otherwise
     /// a client could forge it to evade rate limiting entirely.
     pub trust_proxy_headers: bool,
+    /// The one address `X-Forwarded-For` is believed from (PLAN.md M31).
+    /// Set, it replaces `trust_proxy_headers` with a narrower rule: the
+    /// header counts when the TCP peer is this proxy and is ignored from
+    /// anyone else. That is what a proxy on another machine needs — the
+    /// listener is then on a LAN address, where any device could otherwise
+    /// connect directly and name its own source address.
+    pub trusted_proxy: Option<IpAddr>,
     /// How long a freshly-issued join token stays redeemable, in seconds.
     /// `0` disables expiry entirely.
     ///
@@ -138,6 +145,13 @@ impl Config {
         let rate_limit_max = env_parse_or("WIRESERVE_RATE_LIMIT_MAX", 10)?;
         let rate_limit_window_secs = env_parse_or("WIRESERVE_RATE_LIMIT_WINDOW_SECS", 60)?;
         let trust_proxy_headers = env_parse_or("WIRESERVE_TRUST_PROXY_HEADERS", false)?;
+        let trusted_proxy = match std::env::var("WIRESERVE_TRUSTED_PROXY") {
+            Ok(p) if p.trim().is_empty() => None,
+            Ok(p) => Some(p.trim().parse::<IpAddr>().map_err(|_| {
+                ConfigError::Invalid("WIRESERVE_TRUSTED_PROXY", format!("{p:?} is not an IP address"))
+            })?),
+            Err(_) => None,
+        };
         let join_token_ttl_secs = env_parse_or("WIRESERVE_JOIN_TOKEN_TTL_SECS", 1800u64)?;
         let global_auth_failure_max = env_parse_or("WIRESERVE_GLOBAL_AUTH_FAILURE_MAX", 20u32)?;
         let global_auth_failure_window_secs =
@@ -194,6 +208,7 @@ impl Config {
                 rate_limit_max,
                 rate_limit_window_secs,
                 trust_proxy_headers,
+                trusted_proxy,
                 join_token_ttl_secs,
                 global_auth_failure_max,
                 global_auth_failure_window_secs,
@@ -215,6 +230,20 @@ impl Config {
         wireserve_types::MeshInfo {
             net_v4_cidr: self.net_v4_cidr.clone(),
             net_v6_prefix: self.net_v6_prefix.clone(),
+        }
+    }
+}
+
+impl Config {
+    /// Whether a request that arrived from `peer` may name its client in
+    /// `X-Forwarded-For`. With `trusted_proxy` set, only that address may;
+    /// otherwise `trust_proxy_headers` decides for every peer alike.
+    #[must_use]
+    pub fn trusts_forwarded_from(&self, peer: IpAddr) -> bool {
+        match self.trusted_proxy {
+            // A dual-stack listener reports an IPv4 peer as ::ffff:a.b.c.d.
+            Some(proxy) => proxy.to_canonical() == peer.to_canonical(),
+            None => self.trust_proxy_headers,
         }
     }
 }

@@ -20,8 +20,52 @@ fn init_logging() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(
+    name = "wireserve-coordinator",
+    version,
+    about = "The WireServe coordinator. With no command, runs the server."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Sets the coordinator up on this machine: asks a few questions,
+    /// installs this binary (and the wireserve-admin next to it), creates
+    /// the wireserve-coordinator user, and starts the service. On a machine
+    /// where it is already installed, upgrades it instead. Needs root.
+    Install(wireserve_coordinator::install::InstallArgs),
+    /// Used by `install`, as the admin user, to save wireserve-admin's
+    /// settings in their home.
+    #[command(hide = true)]
+    SaveAdminConfig,
+}
+
+fn main() {
+    match Cli::parse().command {
+        None => serve(),
+        Some(Command::Install(args)) => {
+            if let Err(err) = wireserve_coordinator::install::run(args) {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::SaveAdminConfig) => {
+            if let Err(err) = wireserve_coordinator::install::admin_config::save_from_env() {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 #[tokio::main]
-async fn main() {
+async fn serve() {
     init_logging();
 
     let loaded = Config::load().unwrap_or_else(|err| {
@@ -124,6 +168,9 @@ async fn main() {
         proxy_target(listen_addr)
     );
     eprintln!("  (it must terminate TLS — the coordinator itself never speaks TLS, §7)");
+    if let Some(url) = std::env::var("WIRESERVE_PUBLIC_URL").ok().filter(|u| !u.is_empty()) {
+        eprintln!("  Machines reach it at:         {url}");
+    }
     eprintln!();
     eprintln!(
         "  Reflexive UDP responder (NAT-traversal step 2) is on port {} too — but that \
@@ -233,6 +280,7 @@ mod tests {
             rate_limit_max: 10,
             rate_limit_window_secs: 60,
             trust_proxy_headers: false,
+            trusted_proxy: None,
             join_token_ttl_secs: 1800,
             global_auth_failure_max: 20,
             global_auth_failure_window_secs: 60,

@@ -36,11 +36,58 @@ TLS. You don't need to invent a secret or pick a mesh IP range up front —
 the coordinator generates and persists both for you on first start if you
 leave them unset.
 
-**Bare metal**, using the shipped systemd unit:
+**Bare metal**: build (or copy over) `wireserve-coordinator` and
+`wireserve-admin`, keep them side by side in one directory, and run:
 
 ```sh
 cargo build --release --workspace
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin wireserve
+sudo ./target/release/wireserve-coordinator install
+```
+
+It asks six questions in plain language, each with a short explanation and
+a sensible default:
+
+1. the web address your machines reach the coordinator at (`https://…`);
+2. whether the HTTPS web server (reverse proxy) runs on this machine — and,
+   if not, which addresses the two machines talk over;
+3. the internal port the web server passes requests to (47820): TCP stays
+   closed to the internet, UDP may be forwarded for NAT help;
+4. whether new services wait for your approval (yes);
+5. whether services get names under a domain you own, and which service is
+   your web proxy (`web`, e.g. `wireserve serve web 443:8443`);
+6. which local user gets the admin key saved, so `wireserve-admin` needs no
+   flags (whoever ran sudo).
+
+Then it creates the `wireserve-coordinator` user and group, installs both
+binaries to `/usr/local/bin`, writes `/etc/wireserve/coordinator.env`,
+generates the admin key and mesh ranges, starts the service, and prints what
+is left by hand: a ready-to-paste Caddy block, the firewall rules, and (with a
+domain) the DNS record. Every question also has a flag (`install --help`), and
+without a terminal it never asks — `--public-url` is the only one without a
+default:
+
+```sh
+sudo ./wireserve-coordinator install --public-url https://mesh.example.com --yes
+```
+
+Run it again on a machine where it is installed and it **upgrades** instead:
+both binaries and the unit replaced and the service restarted, no questions,
+`coordinator.env` untouched. That makes `scp wireserve-coordinator
+wireserve-admin host:/tmp/ && ssh host sudo /tmp/wireserve-coordinator
+install` the whole update. `install --reconfigure` asks the questions again
+with the current settings as defaults, and changes only those keys in
+`coordinator.env` — a key you drop is commented out, never deleted.
+
+The coordinator runs as its own `wireserve-coordinator` user. Earlier
+versions ran it as `wireserve`, which on a host that also runs an agent is the
+group allowed to drive the agent daemon (see "Using it without sudo"); an
+upgrade moves it over, and systemd hands the state directory to the new user.
+The old `wireserve` user is left alone — keep its group if an agent runs there.
+
+**By hand**, if you'd rather not run the installer:
+
+```sh
+sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin wireserve-coordinator
 sudo install -m 0755 target/release/wireserve-coordinator target/release/wireserve-admin /usr/local/bin/
 sudo cp deploy/systemd/wireserve-coordinator.service /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -50,13 +97,8 @@ sudo systemctl enable --now wireserve-coordinator
 No `/etc/wireserve/coordinator.env` is required for this — the unit's
 `StateDirectory=` gives the coordinator `/var/lib/wireserve-coordinator` to work with,
 and it generates its own admin token and mesh ranges there on first start.
-Get the admin token it generated:
-
-```sh
-sudo grep WIRESERVE_ADMIN_TOKEN /var/lib/wireserve-coordinator/coordinator-secrets.env
-```
-
-and save it once so `wireserve-admin` never needs a flag or env var again:
+Save the admin token it generated once, so `wireserve-admin` never needs a
+flag or env var again:
 
 ```sh
 mkdir -p ~/.config/wireserve-admin
@@ -80,7 +122,9 @@ ready-to-use `Caddyfile.example` (auto-TLS via Let's Encrypt, about five
 lines) and `nginx.conf.example`. This is the one piece the coordinator
 deliberately never does itself — see spec §7 for why. The coordinator
 listens on loopback only unless you set `WIRESERVE_LISTEN_ADDR`, so a
-proxy on a different host needs that set to an address it can reach.
+proxy on a different host needs that set to an address it can reach — and
+`WIRESERVE_TRUSTED_PROXY` set to the proxy's address, so the coordinator
+believes the client addresses it forwards and nobody else's.
 
 An existing install that predates the coordinator's own state directory
 used `/var/lib/wireserve`, which it shared with the agent. The unit moves
@@ -812,6 +856,13 @@ members of the `wireserve` group have (see "Using it without sudo"):
 | `wireserve exit on\|off` | opt in/out of sending the internet traffic of devices exported with `--exit` through this node (also needs `transit on` and approval) |
 | `wireserve list [--json]` | services (name, address, ports, owner, state), peers (with each one's route — direct or via a carrier) and anything not published, from the last poll |
 | `wireserve leave` | tear down interface, firewall, hosts block |
+
+On the coordinator host, as root:
+
+| Command | What it does |
+| --- | --- |
+| `wireserve-coordinator install` | asks a few questions, then installs both binaries, the `wireserve-coordinator` user and the unit, and starts it. On a host where it is installed: upgrades and restarts instead |
+| `wireserve-coordinator install --reconfigure` | asks again, with the current settings as defaults |
 
 Against the admin port (loopback-only by default; run from the coordinator
 host, or point `--coordinator-url`/`WIRESERVE_COORDINATOR_URL` at it from

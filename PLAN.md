@@ -2844,3 +2844,81 @@ profile) **passes** as of 2026-09-25, with the rest of the suite.
     CLI to carry it), a `deploy/push.sh` wrapper, and nodes pulling the
     binary from the coordinator (declined for now: it would let the
     coordinator make every node run code as root).
+
+## M31 — `wireserve-coordinator install`, and a user of its own
+
+168. **The coordinator installs itself, like a node does.** Setting one up
+    was six README commands and a `grep | cut >` to hand the admin key to
+    `wireserve-admin`, and every non-default setting meant reading
+    `coordinator.env.example`. `wireserve-coordinator install` (clap added;
+    no subcommand still runs the server, so `ExecStart=` and the images are
+    unchanged) creates the user, installs itself and the `wireserve-admin`
+    lying next to it, writes the env file, generates the admin key and mesh
+    ranges, starts the unit and saves the admin key for one user. Like the
+    agent's, the unit is `include_str!`'d. With the unit already present it
+    upgrades instead: binaries and unit replaced, restarted if running, no
+    questions, env file untouched — and a setting flag there is refused with
+    a pointer to `--reconfigure` rather than silently ignored.
+
+169. **Six questions, in plain words.** Web address; whether the web
+    server (reverse proxy) runs here; the internal port (TCP closed to the
+    internet, UDP optionally forwarded for M22); service approval; a
+    service domain and the proxy service's name; who gets the admin key.
+    Each says what it is for first and offers a default (the current
+    setting on `--reconfigure`); a bad answer re-asks. Mesh ranges, token
+    lifetime, rate limits and log level are not asked: their defaults are
+    right for a first install. Every question has a flag, and without a
+    terminal nothing is asked (`--public-url` is the only required one), so
+    it scripts and tests. The admin port is always the node port + 1 on
+    loopback. The public URL is stored as `WIRESERVE_PUBLIC_URL`, printed at
+    startup and offered back on `--reconfigure`.
+
+170. **Only asked-about keys change.** A fresh env file starts from the
+    documented example. An edit replaces a key's line in place or appends it
+    under one heading; a key being cleared (no domain any more) is commented
+    out, not removed; every other line comes back byte for byte.
+
+171. **Its own user, `wireserve-coordinator`.** The unit ran as
+    `wireserve`, whose group has been, since M30, the one allowed to drive
+    the root agent daemon — so on a host running both, the coordinator
+    could. The unit now names `wireserve-coordinator`; `--user` picks
+    another through a drop-in, keeping the shipped unit byte-identical. On
+    upgrade, systemd's `StateDirectory=` chowns the directory to the new
+    user by itself; the `ExecStartPre=` migration now chowns with
+    `--reference` to that directory instead of naming a user. The old
+    `wireserve` user is left, with a note, and no `userdel` is suggested:
+    it would take the agent's socket group with it.
+
+172. **The admin key is written by the admin user's own process.** Their
+    home is theirs to arrange, links included, and root following a link
+    planted there writes where it points. `install` re-executes itself as
+    that user (`save-admin-config`, hidden; std drops supplementary groups
+    with `setgroups(0)` before `setuid`) with the values in the environment
+    under `wireserve-admin`'s own variable names. A different key already
+    saved there is replaced only on a yes at a terminal; without one it is
+    left and the replacing command printed. The key is generated before the
+    first start (`bootstrap::resolve_with`, reading the env file rather than
+    sudo's environment) so there is no waiting on the service — except when
+    an old `/var/lib/wireserve` database is about to be moved in with its
+    own secrets, when `install` waits for them instead.
+
+173. **`WIRESERVE_TRUSTED_PROXY`.** A proxy on another machine means a
+    listener on a LAN address, and `WIRESERVE_TRUST_PROXY_HEADERS` believed
+    `X-Forwarded-For` from any peer — anyone on that LAN could name their
+    own source. Leaving it off is worse: every node looks like the proxy,
+    so the endpoint fallback yields nothing and all nodes share a
+    rate-limit bucket. The new setting believes the header only when the TCP
+    peer is that address (v4-mapped peers normalised); everyone else is
+    taken at their own address. `install` sets it for a remote web server,
+    and `TRUST_PROXY_HEADERS=true` for a local one, where only local
+    processes reach the loopback listener.
+
+174. **Tested in systemd containers.** `run-coordinator-install-test.sh`
+    boots an Arch container (it must run binaries built on this host) under
+    rootless podman, with `SYS_ADMIN` inside the user namespace for the
+    unit's sandbox. It checks: a fresh flags-only install, `wireserve-admin`
+    working with no flags for the admin user, `--reconfigure` keeping a
+    hand-added line and commenting out a dropped domain, an upgrade leaving
+    the env file byte-identical, and a pre-M31 install (unit from 9a43d33,
+    running as `wireserve`) moving to the new user with its database and
+    admin key. Passes (2026-09-26).

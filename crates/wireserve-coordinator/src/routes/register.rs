@@ -75,7 +75,11 @@ pub async fn register(
     // code ten lines down did the reverse; the bound is the global
     // failed-auth delay applied on the failure path, not this.
     let client =
-        crate::client_ip::resolve_client(&headers, peer_addr.ip(), state.config.trust_proxy_headers);
+        crate::client_ip::resolve_client(
+        &headers,
+        peer_addr.ip(),
+        state.config.trusts_forwarded_from(peer_addr.ip()),
+    );
     let observed_ip = client.ip;
     let blocked = state.rate_limiter.is_blocked(observed_ip);
 
@@ -191,7 +195,7 @@ pub async fn register(
             req.endpoint_addr.as_deref(),
             &client,
             req.listen_port,
-            state.config.trust_proxy_headers,
+            state.config.trusts_forwarded_from(peer_addr.ip()),
         );
         (
             endpoint,

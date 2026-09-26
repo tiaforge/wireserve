@@ -179,14 +179,14 @@ pub async fn poll(
         let client = crate::client_ip::resolve_client(
             &headers,
             peer_addr.ip(),
-            state.config.trust_proxy_headers,
+            state.config.trusts_forwarded_from(peer_addr.ip()),
         );
         let listen_port = node.listen_port.and_then(|p| u16::try_from(p).ok());
         crate::client_ip::endpoint_fallback(
             None,
             &client,
             listen_port,
-            state.config.trust_proxy_headers,
+            state.config.trusts_forwarded_from(peer_addr.ip()),
         )
     };
 

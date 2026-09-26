@@ -30,7 +30,11 @@ pub async fn probe(
     headers: HeaderMap,
 ) -> Json<wireserve_types::ProbeResponse> {
     let client =
-        crate::client_ip::resolve_client(&headers, peer_addr.ip(), state.config.trust_proxy_headers);
+        crate::client_ip::resolve_client(
+        &headers,
+        peer_addr.ip(),
+        state.config.trusts_forwarded_from(peer_addr.ip()),
+    );
     Json(wireserve_types::ProbeResponse {
         addr: client.ip.to_string(),
         reflexive_port: Some(state.config.listen_addr.port()),

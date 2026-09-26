@@ -19,6 +19,8 @@ wireserve.example.com {
 # coordinator.env once this proxy is the *only* way to reach the
 # node-facing listener — with a directly reachable listener, turning that
 # on lets a client forge its own source address and evade rate limiting.
+# With Caddy on another machine, set WIRESERVE_TRUSTED_PROXY=<its address>
+# instead: the header is then believed from that address only.
 #
 # The reflexive-address UDP responder (NAT-traversal step 2) rides the
 # same port number, 47820, but is intentionally OUTSIDE what this proxy

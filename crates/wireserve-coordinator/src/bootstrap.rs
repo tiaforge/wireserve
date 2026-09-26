@@ -47,13 +47,25 @@ pub struct Bootstrapped {
 /// persisting whichever of the three are missing from both the
 /// environment and any prior run.
 pub fn resolve(state_dir: &Path) -> Result<Bootstrapped, BootstrapError> {
+    resolve_with(state_dir, |key| std::env::var(key).ok())
+}
+
+/// [`resolve`], with the "explicit value" of each key looked up by `lookup`
+/// instead of the process environment. `wireserve-coordinator install`
+/// generates the values before the first start, as root, and must see what
+/// the service will see — the env file — not whatever its own sudo session
+/// carries.
+pub fn resolve_with(
+    state_dir: &Path,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Bootstrapped, BootstrapError> {
     let path = state_dir.join("coordinator-secrets.env");
     let mut persisted = read_persisted(&path)?;
     let mut generated = Vec::new();
     let mut to_append = Vec::new();
 
     let mut resolve_one = |key: &'static str, generate: fn() -> String| -> String {
-        if let Ok(v) = std::env::var(key) {
+        if let Some(v) = lookup(key) {
             if !v.is_empty() {
                 return v;
             }

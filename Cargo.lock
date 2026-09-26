@@ -2903,6 +2903,8 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "chrono",
+ "clap",
+ "libc",
  "rand",
  "rusqlite",
  "rusqlite_migration",

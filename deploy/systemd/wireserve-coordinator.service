@@ -6,13 +6,22 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=wireserve
-Group=wireserve
+# Its own user, never `wireserve`: on a host that also runs an agent,
+# `wireserve` is the group allowed to drive the root agent daemon over its
+# socket (PLAN.md M30), and a coordinator running in it could do the same.
+# `wireserve-coordinator install` creates this user; by hand:
+#   sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin wireserve-coordinator
+# A different user goes in a drop-in (`install --user` writes one), so
+# this file stays exactly what ships.
+User=wireserve-coordinator
+Group=wireserve-coordinator
 
 # Secrets and per-deployment config (WIRESERVE_ADMIN_TOKEN,
 # WIRESERVE_LISTEN_ADDR, WIRESERVE_ADMIN_LISTEN_ADDR, WIRESERVE_DB_PATH,
 # WIRESERVE_NET_V4_CIDR, WIRESERVE_NET_V6_PREFIX, ...) live outside the
-# unit file, mode 600, owned by the wireserve user. This file is entirely
+# unit file, mode 600, owned by root (systemd reads it before dropping
+# privileges). `wireserve-coordinator install` writes it from a few
+# questions. This file is entirely
 # optional (note the leading `-`): the admin token and both mesh ranges
 # are auto-generated and persisted on first start if left unset, and
 # WIRESERVE_DB_PATH resolves against $STATE_DIRECTORY (which
@@ -49,7 +58,7 @@ EnvironmentFile=-/etc/wireserve/coordinator.env
 # recursively chowns a StateDirectory= to the unit's User= whenever the
 # owner doesn't match, so while both units named the same directory,
 # starting this one handed the agent's WireGuard private key and bearer
-# token to the unprivileged `wireserve` user. Runs as root (`+`) because
+# token to the unprivileged coordinator user. Runs as root (`+`) because
 # the old directory may be root-owned by then; does nothing once the new
 # directory has a database, when there is nothing to move, or when
 # WIRESERVE_DB_PATH is set explicitly (that database is left where the
@@ -70,7 +79,7 @@ ExecStartPre=+/bin/sh -c '\
     for f in $$files; do \
         if [ -f "$$old/$$f" ]; then \
             mv "$$old/$$f" "$$new/$$f" && [ ! -L "$$new/$$f" ] && chmod 600 "$$new/$$f" \
-                && chown -h wireserve:wireserve "$$new/$$f" || exit 1; \
+                && chown -h --reference="$$new" "$$new/$$f" || exit 1; \
         fi; \
     done; \
     echo "moved the coordinator database from $$old to $$new"'
