@@ -153,8 +153,9 @@ pub async fn pass(state: &AppState, dns: &Dns, moving: &mut BTreeMap<String, (Ip
         let peers = nodes::list_all_peers(&conn)?;
         let approved = services::list_approved(&conn)?;
         let auth = services::auth_names(&conn)?;
+        let tls_ready = crate::db::tls::ready(&conn)?;
         let directory =
-            crate::directory::services_directory(&approved, &peers, &auth, state.config.online_threshold_secs);
+            crate::directory::services_directory(&approved, &peers, &state.directory_context(&auth, &tls_ready));
         Ok::<_, crate::db::DbError>((desired(&directory, state.config.service_naming().as_ref()), dns_records::all(&conn)?))
     };
     // The lock is dropped here: nothing below holds it across a provider
@@ -202,6 +203,10 @@ pub async fn pass(state: &AppState, dns: &Dns, moving: &mut BTreeMap<String, (Ip
         }
     }
 
+    if !reap_challenges(state, dns).await {
+        errors.insert("_acme-challenge".into(), "a challenge record could not be removed".into());
+    }
+
     let status: BTreeMap<String, RecordState> = want
         .iter()
         .map(|(fqdn, w)| {
@@ -218,6 +223,34 @@ pub async fn pass(state: &AppState, dns: &Dns, moving: &mut BTreeMap<String, (Ip
     *dns.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = status;
 
     PassOutcome { failed: !errors.is_empty(), next_due: todo.next_due }
+}
+
+/// Removes the ACME challenge records whose time is up (PLAN.md M33): the
+/// ones a node withdrew, and the ones a node left behind. `false` when a
+/// removal failed; its row stays, and the next pass tries again.
+async fn reap_challenges(state: &AppState, dns: &Dns) -> bool {
+    let now = chrono::Utc::now();
+    let due: Vec<crate::db::tls::Challenge> = match crate::db::tls::challenges(&*state.db.conn.lock().await) {
+        Ok(all) => all.into_iter().filter(|c| c.expires_at <= now).collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "DNS sync could not read the ACME challenges");
+            return false;
+        }
+    };
+    let mut ok = true;
+    for c in due {
+        if c.written {
+            if let Err(e) = dns.writer.remove_txt(&c.fqdn, &c.value).await {
+                tracing::warn!(fqdn = %c.fqdn, error = %e, "could not remove an ACME challenge record");
+                ok = false;
+                continue;
+            }
+        }
+        if let Err(e) = crate::db::tls::delete_challenge(&*state.db.conn.lock().await, &c.fqdn, &c.value) {
+            tracing::warn!(fqdn = %c.fqdn, error = %e, "ACME challenge removed but still recorded");
+        }
+    }
+    ok
 }
 
 /// Runs forever. Spawned once at startup when a provider is configured.
@@ -255,6 +288,7 @@ mod tests {
     fn svc(name: &str, vip: &str, public: u16) -> ServiceInfo {
         ServiceInfo {
             auth: false,
+            terminated: false,
             name: name.into(),
             node: "n".into(),
             ip4: "10.77.0.2".into(),
@@ -267,7 +301,7 @@ mod tests {
     }
 
     fn naming(proxy: Option<&str>) -> ServiceNaming {
-        ServiceNaming { domain: "Int.Example.com".into(), proxy_service: proxy.map(Into::into) }
+        ServiceNaming { domain: "Int.Example.com".into(), proxy_service: proxy.map(Into::into), acme: None }
     }
 
     fn ip(s: &str) -> Ipv4Addr {

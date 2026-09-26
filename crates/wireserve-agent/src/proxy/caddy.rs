@@ -240,7 +240,13 @@ pub fn render(vhosts: &[VHost]) -> String {
             out.push_str(&format!("\timport {AUTH_SNIPPET}\n"));
         }
         out.push_str(&format!("\treverse_proxy {}:{} {{\n", v.upstream, v.port));
-        out.push_str("\t\ttransport http\n");
+        if v.tls {
+            // Its own node terminates TLS there (PLAN.md M33), with a
+            // publicly trusted certificate for exactly this name.
+            out.push_str(&format!("\t\ttransport http {{\n\t\t\ttls\n\t\t\ttls_server_name {}\n\t\t}}\n", v.host));
+        } else {
+            out.push_str("\t\ttransport http\n");
+        }
         if any_auth {
             out.push_str(&format!("\t\timport {UPSTREAM_SNIPPET}\n"));
         }
@@ -273,7 +279,19 @@ mod tests {
             upstream: ip.parse::<Ipv4Addr>().unwrap(),
             port: 443,
             auth: false,
+            tls: false,
         }
+    }
+
+    #[test]
+    fn a_service_its_own_node_terminates_is_reached_over_verified_tls() {
+        let mut v = vh("plex", "10.0.0.50");
+        v.tls = true;
+        let out = render(&[v]);
+        assert!(
+            out.contains("\t\ttransport http {\n\t\t\ttls\n\t\t\ttls_server_name plex.int.example.com\n\t\t}\n"),
+            "{out}"
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 wireserve-types.workspace = true
+wireserve-tls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true

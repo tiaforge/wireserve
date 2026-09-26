@@ -272,6 +272,7 @@ mod tests {
     fn svc(name: &str, ip4: &str) -> ServiceInfo {
         ServiceInfo {
             auth: false,
+            terminated: false,
             name: name.into(),
             node: "somenode".into(),
             ip4: ip4.into(),
@@ -567,6 +568,7 @@ mod naming_tests {
     fn svc(name: &str, vip: &str, public: u16) -> ServiceInfo {
         ServiceInfo {
             auth: false,
+            terminated: false,
             name: name.into(),
             node: "somenode".into(),
             ip4: "100.90.0.3".into(),
@@ -579,7 +581,7 @@ mod naming_tests {
     }
 
     fn cfg_for(domain: &str, proxy: Option<&str>) -> ServiceNaming {
-        ServiceNaming { domain: domain.into(), proxy_service: proxy.map(Into::into) }
+        ServiceNaming { domain: domain.into(), proxy_service: proxy.map(Into::into), acme: None }
     }
 
     #[test]

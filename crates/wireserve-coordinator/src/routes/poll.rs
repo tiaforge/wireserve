@@ -218,6 +218,17 @@ pub async fn poll(
         services::ApprovalMode::AutoApprove
     };
     let outcome = services::upsert_for_node(&mut conn, node.id, desired, mode, &state.config.net_v4_cidr)?;
+    // Which of its services this node serves with TLS right now (PLAN.md
+    // M33). Replaced wholesale, so a name left out stops being terminated
+    // on this very poll; only names the node owns are kept.
+    let tls_ready: Vec<String> = req
+        .tls_ready
+        .iter()
+        .take(wireserve_types::MAX_TLS_READY_PER_POLL)
+        .filter(|n| wireserve_types::is_valid_dns_label(n))
+        .cloned()
+        .collect();
+    crate::db::tls::set_ready(&mut conn, node.id, &tls_ready)?;
     // A declaration, withdrawal or address change on any poll moves the
     // public names; the loop spaces its passes, so poking every time is
     // cheaper than working out whether anything changed.
@@ -392,8 +403,8 @@ pub async fn poll(
         .collect();
 
     let auth = services::auth_names(&conn)?;
-    let services =
-        directory::services_directory(&all_services, &all_peers, &auth, state.config.online_threshold_secs);
+    let tls_ready = crate::db::tls::ready(&conn)?;
+    let services = directory::services_directory(&all_services, &all_peers, &state.directory_context(&auth, &tls_ready));
 
     Ok(Json(PollResponse {
         peers,

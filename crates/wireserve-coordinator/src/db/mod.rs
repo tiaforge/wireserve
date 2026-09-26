@@ -1,5 +1,6 @@
 pub mod dns_records;
 pub mod nodes;
+pub mod tls;
 pub mod services;
 
 use std::path::Path;
@@ -103,6 +104,8 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0012_static_peer_exit.sql")),
         M::up(include_str!("../../migrations/0013_service_auth.sql")),
         M::up(include_str!("../../migrations/0014_dns_records.sql")),
+        M::up(include_str!("../../migrations/0015_tls_ready.sql")),
+        M::up(include_str!("../../migrations/0016_acme_challenges.sql")),
     ])
 }
 

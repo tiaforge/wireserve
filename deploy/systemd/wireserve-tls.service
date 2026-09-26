@@ -1,0 +1,58 @@
+# The TLS terminator (PLAN.md M33): serves this node's services published
+# on TCP 443 with HTTPS, each on its own service address, with a
+# certificate it gets itself (the coordinator publishes the DNS-01
+# challenge record for it). `wireserve install` installs and enables it
+# beside wireserve-agent.service.
+#
+# Its own user and a tight sandbox, on purpose: it parses TLS and HTTP from
+# the whole mesh, and none of that belongs in the root daemon that holds
+# the WireGuard key and edits the firewall. It talks to the agent over
+# /run/wireserve-tls/tls.sock, which answers nothing but a check-in and a
+# challenge request, and binds port 443 on the service addresses the agent
+# routes to this host — the one privilege it has.
+#
+# PartOf: it stops and restarts with the agent, whose socket it needs.
+
+[Unit]
+Description=WireServe TLS terminator
+Documentation=file:///usr/share/doc/wireserve/wireserve-design-spec.md
+After=wireserve-agent.service
+PartOf=wireserve-agent.service
+
+[Service]
+Type=simple
+User=wireserve-tls
+Group=wireserve-tls
+EnvironmentFile=-/etc/wireserve/tls.env
+ExecStart=/usr/local/bin/wireserve tls-serve
+Restart=on-failure
+RestartSec=5s
+
+# Certificates, their keys and the ACME account key. Its own, 0700.
+StateDirectory=wireserve-tls
+StateDirectoryMode=0700
+
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+
+[Install]
+WantedBy=wireserve-agent.service

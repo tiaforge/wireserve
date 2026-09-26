@@ -49,6 +49,12 @@ pub enum ServiceRule {
         node: Ipv4Addr,
         node6: Option<Ipv6Addr>,
     },
+    /// `vip:map.public` answered by this node's own TLS terminator
+    /// (PLAN.md M33), which listens on that address itself: the request is
+    /// let in unrewritten, and nothing of `map.target` is opened — the
+    /// terminator reaches the backend locally. `map` is kept so the target
+    /// stays reserved against every other mapping on the node.
+    Terminated { vip: Ipv4Addr, map: PortMap },
 }
 
 /// One side of an active [`TransitForward`] pairing (PLAN.md M23): every
@@ -80,7 +86,9 @@ impl ServiceRule {
     pub fn remote_target(&self) -> Option<Ipv4Addr> {
         match self {
             Self::Mapped { map, .. } => map.addr,
-            Self::Open { .. } => None,
+            // The terminator connects to a remote target itself, as an
+            // ordinary local process: nothing is forwarded for it.
+            Self::Open { .. } | Self::Terminated { .. } => None,
         }
     }
 }

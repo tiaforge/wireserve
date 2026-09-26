@@ -226,6 +226,9 @@ pub async fn register(
             bearer_token_hash: &bearer_hash,
         },
     )?;
+    // A new key vouches for nothing yet (PLAN.md M33): its terminator
+    // reports afresh on its first poll.
+    crate::db::tls::clear_node(&conn, node.id)?;
 
     tracing::info!(
         event = "node_registered",

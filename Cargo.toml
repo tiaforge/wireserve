@@ -5,6 +5,7 @@ members = [
     "crates/wireserve-coordinator",
     "crates/wireserve-agent",
     "crates/wireserve-admin",
+    "crates/wireserve-tls",
 ]
 
 [workspace.package]
@@ -14,6 +15,7 @@ license = "MIT"
 
 [workspace.dependencies]
 wireserve-types = { path = "crates/wireserve-types" }
+wireserve-tls = { path = "crates/wireserve-tls" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

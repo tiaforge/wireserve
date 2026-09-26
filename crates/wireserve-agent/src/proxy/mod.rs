@@ -36,6 +36,11 @@ pub struct VHost {
     /// M29). The service's own node admits nobody but this proxy, so this
     /// is the only way in.
     pub auth: bool,
+    /// Served with TLS by its own node (PLAN.md M33): the proxy then talks
+    /// TLS to it, verified against the service's name, instead of plain
+    /// HTTP. Only nodes that predate termination still reach it here —
+    /// every other resolves its name to the service's own address.
+    pub tls: bool,
 }
 
 /// Writes a proxy's configuration from a set of vhosts.
@@ -109,7 +114,7 @@ pub fn vhosts(services: &[ServiceInfo], naming: &ServiceNaming) -> Vec<VHost> {
                 tracing::warn!(service = %s.name.escape_debug(), "published name is too long");
                 return None;
             }
-            Some(VHost { host, upstream, port: TLS_PUBLIC_PORT, auth: s.auth })
+            Some(VHost { host, upstream, port: TLS_PUBLIC_PORT, auth: s.auth, tls: s.terminated })
         })
         .collect();
     out.sort();
@@ -154,6 +159,7 @@ mod tests {
     fn svc(name: &str, vip: Option<&str>, public: u16, proto: Proto) -> ServiceInfo {
         ServiceInfo {
             auth: false,
+            terminated: false,
             name: name.into(),
             node: "n".into(),
             ip4: "10.0.0.1".into(),
@@ -166,7 +172,7 @@ mod tests {
     }
 
     fn naming(proxy: Option<&str>) -> ServiceNaming {
-        ServiceNaming { domain: "int.example.com".into(), proxy_service: proxy.map(Into::into) }
+        ServiceNaming { domain: "int.example.com".into(), proxy_service: proxy.map(Into::into), acme: None }
     }
 
     #[test]

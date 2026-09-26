@@ -29,6 +29,7 @@ fn test_config(db_path: &str) -> Config {
         service_domain: None,
         service_proxy: None,
         dns: None,
+        acme: wireserve_coordinator::config::acme_from_lookup(|_| None).unwrap(),
         online_threshold_secs: 180,
         rate_limit_max: 1000,
         rate_limit_window_secs: 60,
@@ -3774,5 +3775,109 @@ mod dns_records {
         let home = node(&app, "home").await;
         poll_with(&app.router, &home, json!([svc("prom", 80, 9090)])).await;
         assert_eq!(admin_dns(&app, "prom").await, Value::Null);
+    }
+
+    // ---- PLAN.md M33: terminated on the owner, and its challenges ----
+
+    const DIGEST: &str = "LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0";
+
+    async fn poll_ready(app: &TestApp, bearer: &str, services: Value, ready: &[&str]) -> Value {
+        poll_full(&app.router, bearer, json!({ "services": services, "tls_ready": ready })).await.1
+    }
+
+    async fn challenge(app: &TestApp, bearer: &str, method: &str, fqdn: &str, value: &str) -> StatusCode {
+        let req = json_request(method, "/tls/challenge", Some(bearer), json!({ "fqdn": fqdn, "value": value }));
+        app.router.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn a_ready_service_is_terminated_and_its_name_moves_to_its_own_address() {
+        let fake = Arc::new(FakeDns::default());
+        let app = app(&fake);
+        let px = node(&app, "px").await;
+        let home = node(&app, "home").await;
+        poll_with(&app.router, &px, json!([svc("web", 443, 8443)])).await;
+        let body = poll_ready(&app, &home, json!([svc("plex", 443, 32400)]), &[]).await;
+        assert!(directory_entry(&body, "plex").get("terminated").is_none(), "{body}");
+        pass(&app).await;
+        let web = vip(&body, "web");
+        assert_eq!(fake.take(), vec![format!("set plex.int.example.com {web}"), format!("set web.int.example.com {web}")]);
+
+        let body = poll_ready(&app, &home, json!([svc("plex", 443, 32400)]), &["plex", "web"]).await;
+        assert_eq!(directory_entry(&body, "plex")["terminated"], json!(true), "{body}");
+        assert!(directory_entry(&body, "web").get("terminated").is_none(), "a node vouches only for its own");
+        // The name moves — after the debounce, since it had an address.
+        let dns = app.state.dns.clone().unwrap();
+        let mut moving = Default::default();
+        sync::pass(&app.state, &dns, &mut moving).await;
+        assert!(fake.take().is_empty(), "held by the debounce");
+
+        // A poll that leaves it out stops it at once.
+        let body = poll_ready(&app, &home, json!([svc("plex", 443, 32400)]), &[]).await;
+        assert!(directory_entry(&body, "plex").get("terminated").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_proxy_and_marked_services_never_terminate() {
+        let fake = Arc::new(FakeDns::default());
+        let app = app(&fake);
+        let px = node(&app, "px").await;
+        let body = poll_ready(&app, &px, json!([svc("web", 443, 8443)]), &["web"]).await;
+        assert!(directory_entry(&body, "web").get("terminated").is_none(), "the proxy: {body}");
+    }
+
+    #[tokio::test]
+    async fn challenges_only_for_a_nodes_own_eligible_names() {
+        let fake = Arc::new(FakeDns::default());
+        let app = app(&fake);
+        let px = node(&app, "px").await;
+        let home = node(&app, "home").await;
+        poll_with(&app.router, &px, json!([svc("web", 443, 8443)])).await;
+        poll_with(&app.router, &home, json!([svc("plex", 443, 32400), svc("prom", 80, 9090)])).await;
+
+        assert_eq!(challenge(&app, &home, "POST", "plex.int.example.com", DIGEST).await, StatusCode::CREATED);
+        assert_eq!(fake.take(), vec![format!("add-txt _acme-challenge.plex.int.example.com {DIGEST}")]);
+        assert_eq!(challenge(&app, &home, "POST", "plex.int.example.com", DIGEST).await, StatusCode::OK, "idempotent");
+        assert!(fake.take().is_empty());
+
+        for (who, fqdn, value, want) in [
+            (&px, "plex.int.example.com", DIGEST, StatusCode::FORBIDDEN),   // not its service
+            (&home, "prom.int.example.com", DIGEST, StatusCode::FORBIDDEN), // not on 443
+            (&px, "web.int.example.com", DIGEST, StatusCode::FORBIDDEN),    // the proxy
+            (&home, "plex.other.com", DIGEST, StatusCode::FORBIDDEN),       // not our domain
+            (&home, "x.plex.int.example.com", DIGEST, StatusCode::FORBIDDEN),
+            (&home, "plex.int.example.com", "not-a-digest", StatusCode::BAD_REQUEST),
+        ] {
+            assert_eq!(challenge(&app, who, "POST", fqdn, value).await, want, "{fqdn} {value}");
+        }
+        assert!(fake.take().is_empty(), "nothing refused reached the provider");
+        assert_eq!(challenge(&app, "brt_wrong", "POST", "plex.int.example.com", DIGEST).await, StatusCode::UNAUTHORIZED);
+
+        // Withdrawn: the sync loop removes it.
+        assert_eq!(challenge(&app, &home, "DELETE", "plex.int.example.com", DIGEST).await, StatusCode::NO_CONTENT);
+        pass(&app).await;
+        let calls = fake.take();
+        assert!(calls.contains(&format!("remove-txt _acme-challenge.plex.int.example.com {DIGEST}")), "{calls:?}");
+    }
+
+    #[tokio::test]
+    async fn without_a_provider_there_are_no_challenges() {
+        let app = named_app();
+        let home = node(&app, "home").await;
+        poll_with(&app.router, &home, json!([svc("plex", 443, 32400)])).await;
+        assert_eq!(challenge(&app, &home, "POST", "plex.int.example.com", DIGEST).await, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn revoking_forgets_what_a_node_vouched_for() {
+        let fake = Arc::new(FakeDns::default());
+        let app = app(&fake);
+        let home = node(&app, "home").await;
+        let watcher = node(&app, "watcher").await;
+        poll_ready(&app, &home, json!([svc("plex", 443, 32400)]), &["plex"]).await;
+        let req = json_request("POST", "/admin/nodes/home/rejoin", Some(ADMIN), json!({}));
+        assert!(app.router.clone().oneshot(req).await.unwrap().status().is_success());
+        let (_, body) = poll_full(&app.router, &watcher, json!({})).await;
+        assert!(body["services"].as_array().unwrap().iter().all(|s| s.get("terminated").is_none()), "{body}");
     }
 }

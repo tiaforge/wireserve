@@ -19,10 +19,10 @@
 
 use std::collections::BTreeSet;
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use netlink_packet_core::{
-    NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REQUEST,
+    NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST,
 };
 use netlink_packet_route::link::LinkMessage;
 use netlink_packet_route::route::{
@@ -107,6 +107,110 @@ fn request(message: RouteMessage, add: bool) -> io::Result<()> {
     }
 }
 
+/// The kernel's `local` table, where the host's own addresses live.
+const RT_TABLE_LOCAL: u8 = 255;
+
+/// The routing protocol number our local routes carry (PLAN.md M33). The
+/// only mark a later route dump can recognise them by — after a crash, the
+/// agent has no other record of which local routes are its own. Outside
+/// the range `/etc/iproute2/rt_protos` assigns.
+pub const LOCAL_ROUTE_PROTO: u8 = 0xf7;
+
+/// `local <vip> dev lo table local proto 0xf7 src <prefsrc>`: makes a
+/// service address one of this host's own, so the TLS terminator bound to
+/// it (PLAN.md M33) receives what the mesh sends there.
+///
+/// `prefsrc` is the node's own mesh address. Without it the kernel picks
+/// the destination itself as the source for a local client, and the
+/// terminator — and the service's other, rewritten ports — would see the
+/// service address as the caller instead of the node.
+fn local_route_message(lo: u32, vip: Ipv4Addr, prefsrc: Ipv4Addr) -> RouteMessage {
+    let mut message = RouteMessage::default();
+    message.header = RouteHeader {
+        address_family: AddressFamily::Inet,
+        destination_prefix_length: 32,
+        table: RT_TABLE_LOCAL,
+        scope: RouteScope::Host,
+        kind: RouteType::Local,
+        protocol: RouteProtocol::Other(LOCAL_ROUTE_PROTO),
+        ..Default::default()
+    };
+    message.attributes.push(RouteAttribute::Oif(lo));
+    message.attributes.push(RouteAttribute::Destination(RouteAddress::Inet(vip)));
+    message.attributes.push(RouteAttribute::PrefSource(RouteAddress::Inet(prefsrc)));
+    message
+}
+
+/// Makes the local routes go from `old` to `new`: removals, then additions,
+/// every one tried; the first error is returned after the rest ran. The
+/// addresses that ended up routed are returned either way, so the caller's
+/// record matches the kernel.
+pub fn sync_local(old: &BTreeSet<Ipv4Addr>, new: &BTreeSet<Ipv4Addr>, prefsrc: Ipv4Addr) -> (BTreeSet<Ipv4Addr>, io::Result<()>) {
+    let lo = match interface_index("lo") {
+        Ok(i) => i,
+        Err(e) => return (old.clone(), Err(e)),
+    };
+    let mut routed = old.clone();
+    let mut first_err = None;
+    for vip in old.difference(new) {
+        match request(local_route_message(lo, *vip, prefsrc), false) {
+            Ok(()) => {
+                routed.remove(vip);
+            }
+            Err(e) => {
+                tracing::warn!(%vip, error = %e, "could not remove a service address's local route");
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    for vip in new {
+        match request(local_route_message(lo, *vip, prefsrc), true) {
+            Ok(()) => {
+                routed.insert(*vip);
+            }
+            Err(e) => {
+                tracing::warn!(%vip, error = %e, "could not route a service address to this host");
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    (routed, first_err.map_or(Ok(()), Err))
+}
+
+/// Every local route carrying [`LOCAL_ROUTE_PROTO`], whoever added it.
+pub fn own_local_routes() -> io::Result<Vec<Ipv4Addr>> {
+    let mut message = RouteMessage::default();
+    message.header.address_family = AddressFamily::Inet;
+    message.header.table = RT_TABLE_LOCAL;
+    let routes = dump(RouteNetlinkMessage::GetRoute(message))?;
+    Ok(routes
+        .into_iter()
+        .filter(|r| r.header.table == RT_TABLE_LOCAL && r.header.protocol == RouteProtocol::Other(LOCAL_ROUTE_PROTO))
+        .filter_map(|r| {
+            r.attributes.iter().find_map(|a| match a {
+                RouteAttribute::Destination(RouteAddress::Inet(v)) => Some(*v),
+                _ => None,
+            })
+        })
+        .collect())
+}
+
+/// Removes our local routes to `vips` whatever their preferred source —
+/// the sweep after a crash, when that is not known.
+pub fn remove_local(vips: &[Ipv4Addr]) -> io::Result<()> {
+    let lo = interface_index("lo")?;
+    let mut first_err = None;
+    for vip in vips {
+        let mut message = local_route_message(lo, *vip, Ipv4Addr::UNSPECIFIED);
+        message.attributes.retain(|a| !matches!(a, RouteAttribute::PrefSource(_)));
+        if let Err(e) = request(message, false) {
+            tracing::warn!(%vip, error = %e, "could not remove a stale local route");
+            first_err.get_or_insert(e);
+        }
+    }
+    first_err.map_or(Ok(()), Err)
+}
+
 /// Deletes the interface `ifname`; one already gone counts as done.
 ///
 /// Instead of defguard's `remove_interface`, which also "clears the DNS
@@ -157,6 +261,42 @@ pub fn egress_ifname(addr: std::net::Ipv4Addr) -> io::Result<Option<String>> {
     // SAFETY: on success the kernel wrote a NUL-terminated name into `name`.
     let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
     Ok(Some(name.to_string_lossy().into_owned()))
+}
+
+/// Every route a dump request answers with.
+fn dump(payload: RouteNetlinkMessage) -> io::Result<Vec<RouteMessage>> {
+    let mut req = NetlinkMessage::from(payload);
+    req.header.flags = NLM_F_REQUEST | NLM_F_DUMP;
+    req.finalize();
+    let mut buf = vec![0u8; req.buffer_len()];
+    req.serialize(&mut buf);
+
+    let socket = Socket::new(NETLINK_ROUTE)?;
+    socket.connect(&SocketAddr::new(0, 0))?;
+    if socket.send(&buf, 0)? != buf.len() {
+        return Err(io::Error::other("short netlink send"));
+    }
+    let mut out = Vec::new();
+    let mut recv_buf = vec![0u8; 32768];
+    loop {
+        let n = socket.recv(&mut &mut recv_buf[..], 0)?;
+        let mut offset = 0;
+        while offset < n {
+            let response = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&recv_buf[offset..n])
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            match response.payload {
+                NetlinkPayload::Done(_) => return Ok(out),
+                NetlinkPayload::Error(e) if e.code.is_some() => return Err(e.to_io()),
+                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(route)) => out.push(route),
+                _ => {}
+            }
+            let len = response.header.length as usize;
+            if len == 0 {
+                break;
+            }
+            offset += len;
+        }
+    }
 }
 
 /// Sends one request and waits for the kernel's answer; an error whose
@@ -260,6 +400,44 @@ mod tests {
         // Removing what is already gone is not an error.
         sync("wgt", &a, &set(&["10.0.0.2"])).unwrap();
         sync("wgt", &a, &set(&["10.0.0.2"])).unwrap();
+    }
+
+    /// Against a real kernel: a service address becomes local with the
+    /// node's address as its source, is found again by protocol, and goes.
+    #[test]
+    fn kernel_local_routes_are_added_found_and_removed() {
+        if !crate::firewall::netns::reexec("routes::tests::kernel_local_routes_are_added_found_and_removed") {
+            return;
+        }
+        let sh = |script: &str| {
+            let out = std::process::Command::new("sh").args(["-euc", script]).output().unwrap();
+            assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap()
+        };
+        sh("ip link set lo up && ip link add wgt type dummy && ip link set wgt up && ip addr add 10.77.0.2/32 dev wgt");
+        let node: Ipv4Addr = "10.77.0.2".parse().unwrap();
+        let vips: BTreeSet<Ipv4Addr> = ["10.77.0.10", "10.77.0.11"].iter().map(|a| a.parse().unwrap()).collect();
+
+        let (routed, r) = sync_local(&BTreeSet::new(), &vips, node);
+        r.unwrap();
+        assert_eq!(routed, vips);
+        let (_, again) = sync_local(&routed, &vips, node);
+        again.unwrap();
+        let table = sh("ip -4 route show table local");
+        assert!(table.contains("local 10.77.0.10 dev lo proto 247 scope host src 10.77.0.2"), "{table}");
+        assert!(sh("ip -4 route get 10.77.0.11").starts_with("local 10.77.0.11"));
+
+        let mut found = own_local_routes().unwrap();
+        found.sort();
+        assert_eq!(found, Vec::from_iter(vips.iter().copied()), "the host's own addresses are not ours");
+
+        let one: BTreeSet<Ipv4Addr> = ["10.77.0.10".parse().unwrap()].into();
+        let (routed, r) = sync_local(&vips, &one, node);
+        r.unwrap();
+        assert_eq!(routed, one);
+        remove_local(&[ "10.77.0.10".parse().unwrap()]).unwrap();
+        assert!(own_local_routes().unwrap().is_empty());
+        remove_local(&["10.77.0.10".parse().unwrap()]).unwrap();
     }
 
     /// Against a real kernel: `ip route get`'s answer, by interface name.

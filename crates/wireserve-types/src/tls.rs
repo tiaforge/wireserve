@@ -1,0 +1,110 @@
+//! What the agent and its TLS terminator say to each other (PLAN.md M33),
+//! over a socket of their own — never the agent's main one, which can also
+//! `serve`, `unserve` and `leave`.
+//!
+//! Newline-delimited JSON, one request and one response per connection,
+//! like the main socket. Two requests only: the terminator checks in and
+//! gets its configuration, and it asks for an ACME challenge record to be
+//! published or withdrawn. An unknown `op` is refused, so a newer
+//! terminator never gets a half-understood answer from an older agent.
+
+use std::net::{Ipv4Addr, SocketAddr};
+
+use serde::{Deserialize, Serialize};
+
+use crate::naming::AcmeSettings;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TlsRequest {
+    /// "I serve exactly these services right now; what should I serve?"
+    CheckIn { serving: Vec<String> },
+    /// Publish (`present`) or withdraw one `_acme-challenge` TXT value for
+    /// one of this node's own service names.
+    Challenge { fqdn: String, value: String, present: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum TlsResponse {
+    Config(Box<TlsConfig>),
+    Ok,
+    /// The coordinator predates the challenge endpoint: nothing to retry.
+    Unsupported,
+    Error { message: String },
+}
+
+/// Everything the terminator needs, rebuilt by the agent on every check-in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TlsConfig {
+    /// `None` while the coordinator publishes no DNS records: no
+    /// certificate is obtainable, so nothing is served.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acme: Option<AcmeSettings>,
+    /// The services to get certificates for and serve.
+    #[serde(default)]
+    pub services: Vec<TlsService>,
+    /// Who is calling, by mesh address: every peer's, and this node's own.
+    #[serde(default)]
+    pub callers: Vec<Caller>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TlsService {
+    pub name: String,
+    /// The certificate's name, `<name>.<domain>`.
+    pub fqdn: String,
+    /// Where to listen: the service's own address, port 443.
+    pub vip: Ipv4Addr,
+    /// Where to send the requests, in plain HTTP: the service's target.
+    pub upstream: SocketAddr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Caller {
+    pub addr: Ipv4Addr,
+    pub node: String,
+}
+
+/// The header naming the calling node (PLAN.md M33). Always set by the
+/// terminator, from the connection's own source address; a copy arriving
+/// with the request is removed first, so a backend can trust it as far as it
+/// trusts the mesh.
+pub const NODE_HEADER: &str = "x-wireserve-node";
+
+/// The DNS name an ACME DNS-01 challenge for `fqdn` is published at.
+#[must_use]
+pub fn challenge_name(fqdn: &str) -> String {
+    format!("_acme-challenge.{fqdn}")
+}
+
+/// Whether `value` looks like a DNS-01 key authorization digest: 43
+/// characters of unpadded base64url (a SHA-256 hash). Everything else is
+/// refused before it gets near a DNS record.
+#[must_use]
+pub fn is_challenge_value(value: &str) -> bool {
+    value.len() == 43 && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requests_round_trip_and_unknown_ones_are_refused() {
+        let req = TlsRequest::CheckIn { serving: vec!["plex".into()] };
+        let text = serde_json::to_string(&req).unwrap();
+        assert_eq!(text, r#"{"op":"check_in","serving":["plex"]}"#);
+        assert_eq!(serde_json::from_str::<TlsRequest>(&text).unwrap(), req);
+        assert!(serde_json::from_str::<TlsRequest>(r#"{"op":"leave"}"#).is_err());
+        assert!(serde_json::from_str::<TlsRequest>(r#"{"op":"serve","name":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn challenge_values_are_digests_and_nothing_else() {
+        assert!(is_challenge_value("LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0"));
+        assert!(!is_challenge_value("short"));
+        assert!(!is_challenge_value("LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEu\"0"));
+        assert!(!is_challenge_value("LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0="));
+    }
+}

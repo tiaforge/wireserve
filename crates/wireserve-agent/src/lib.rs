@@ -16,6 +16,7 @@ pub mod register;
 #[cfg(target_os = "linux")]
 pub mod routes;
 pub mod state;
+pub mod tls_link;
 #[cfg(test)]
 mod test_alloc;
 pub mod vip;

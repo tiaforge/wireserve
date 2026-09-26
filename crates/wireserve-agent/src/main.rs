@@ -148,6 +148,22 @@ enum Command {
     },
     /// Tears down the interface, firewall, and hosts-file block.
     Leave,
+    /// Runs this node's TLS terminator (PLAN.md M33): serves each of its
+    /// services published on TCP 443 with TLS on the service's own address,
+    /// with a certificate it obtains itself. Run by the `wireserve-tls`
+    /// unit, as its own unprivileged user, beside the daemon.
+    TlsServe {
+        /// Where certificates and the ACME account are kept. Defaults to
+        /// the unit's state directory.
+        #[arg(long, value_name = "DIR", env = "STATE_DIRECTORY")]
+        state_dir: Option<std::path::PathBuf>,
+        /// Trust this CA for the ACME server itself — a test CA such as
+        /// Pebble. Never needed for Let's Encrypt.
+        #[arg(long, value_name = "PEM", env = "WIRESERVE_ACME_CA_FILE", hide = true)]
+        acme_ca_file: Option<std::path::PathBuf>,
+        #[arg(long, default_value_t = 5, hide = true)]
+        check_in_secs: u64,
+    },
 }
 
 /// Which reverse proxy this node runs. One variant today; the backend sits
@@ -216,6 +232,21 @@ async fn main() {
                 proxy.map(|kind| ProxyConfig { kind, conf: proxy_conf, main_config: proxy_main_config }),
             )
             .await
+        }
+        Command::TlsServe { state_dir, acme_ca_file, check_in_secs } => {
+            // systemd may list several colon-separated state directories;
+            // the unit names exactly one.
+            let state_dir = state_dir
+                .and_then(|d| d.to_str().and_then(|s| s.split(':').next()).map(std::path::PathBuf::from))
+                .unwrap_or_else(|| instance.tls_state_dir());
+            wireserve_tls::run(wireserve_tls::Options {
+                socket: instance.tls_socket_path(),
+                state_dir,
+                ca_file: acme_ca_file,
+                check_in_every: Duration::from_secs(check_in_secs.max(1)),
+            })
+            .await
+            .map_err(Into::into)
         }
         Command::Serve { name, ports } => cmd_serve(&instance, name, &ports).await,
         Command::Unserve { name } => cmd_unserve(&instance, name).await,
@@ -299,7 +330,11 @@ async fn cmd_install(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn 
     wireserve_agent::install::install_self()?;
     // Before the daemon starts: it looks the group up once, when it binds.
     let group = wireserve_agent::install::ensure_socket_group()?;
+    // The TLS terminator (PLAN.md M33): its user before the daemon binds
+    // the socket it hands to that user's group.
+    wireserve_agent::install::ensure_tls_user()?;
     let unit = wireserve_agent::install::install_unit(instance)?;
+    let tls_unit = wireserve_agent::install::install_tls_unit(instance)?;
     if upgrade {
         wireserve_agent::install::refresh_other_unit(instance)?;
     }
@@ -321,6 +356,10 @@ async fn cmd_install(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn 
         cmd_join(instance, args).await?;
         wireserve_agent::install::systemctl_enable_now(&unit)?;
     }
+    // Started with the agent from now on (`WantedBy=`), and stopped and
+    // restarted with it (`PartOf=`). A node with nothing to serve over TLS
+    // runs it idle: it checks in and waits.
+    wireserve_agent::install::systemctl_enable_now(&tls_unit)?;
     let instance_flag = if instance.is_default() { String::new() } else { format!(" --instance {}", instance.name()) };
     println!();
     println!("{unit} is running — `wireserve{instance_flag} list` shows its services and peers");
@@ -581,7 +620,35 @@ async fn cmd_daemon(
     // boundaries, which still silently dropped any `serve`/`unserve`
     // issued while a poll request was in flight (the copy-back after the
     // poll overwrote it).
+    // A crashed run leaves its terminator's local routes behind (PLAN.md
+    // M33): the kernel keeps them, and nothing else records them. Swept
+    // before the first poll, which adds back whatever is still wanted.
+    #[cfg(target_os = "linux")]
+    sweep_local_routes(&mut state, &state_path);
+
     let shared_state = Arc::new(Mutex::new(state));
+    // A bounded timeout so a hung coordinator connection can never pin the
+    // poll loop (and with it `leave`, which is handled by the same
+    // `select!`) indefinitely.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    // The TLS terminator's own socket (PLAN.md M33).
+    let tls_link = Arc::new(wireserve_agent::tls_link::TlsLink::default());
+    let tls_socket_path = instance.tls_socket_path();
+    {
+        let ctx = wireserve_agent::ipc::tls::TlsContext {
+            state: shared_state.clone(),
+            link: tls_link.clone(),
+            client: client.clone(),
+        };
+        let path = tls_socket_path.clone();
+        tokio::spawn(async move {
+            if let Err(e) = wireserve_agent::ipc::tls::serve(ctx, &path).await {
+                tracing::error!(error = %e, "TLS terminator socket exited");
+            }
+        });
+    }
     let ipc_ctx = AgentContext {
         state: shared_state.clone(),
         state_path: state_path.clone(),
@@ -597,12 +664,6 @@ async fn cmd_daemon(
         }
     });
 
-    // A bounded timeout so a hung coordinator connection can never pin the
-    // poll loop (and with it `leave`, which is handled by the same
-    // `select!`) indefinitely.
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
     let hosts_path = paths::hosts_path();
     let mut interval = tokio::time::interval(Duration::from_secs(poll_interval_secs));
 
@@ -652,6 +713,7 @@ async fn cmd_daemon(
                     endpoint_tracker: &mut endpoint_tracker,
                     own_reflexive_addr: own_reflexive_addr.as_deref(),
                     proxy: proxy.as_mut().map(|p| p.as_mut() as &mut dyn wireserve_agent::proxy::ProxyBackend),
+                    tls: Some(&tls_link),
                 };
                 let result = poll_loop::run_once(&mut ctx, &shared_state).await;
                 // Safety net for host-firewall changes the interop's own
@@ -730,6 +792,32 @@ async fn cmd_daemon(
     }
 
     Ok(())
+}
+
+/// Removes the terminator's local routes (PLAN.md M33) a previous run left
+/// behind: the ones recorded in the state file, plus any carrying our
+/// protocol number inside this instance's own mesh range — a run that
+/// crashed between adding a route and saving the state file recorded
+/// nothing. Another instance's routes lie in its own range and are left.
+#[cfg(target_os = "linux")]
+fn sweep_local_routes(state: &mut AgentState, state_path: &std::path::Path) {
+    let range = state.mesh.as_ref().and_then(wireserve_types::MeshRanges::parse);
+    let mut stale: Vec<std::net::Ipv4Addr> = state.local_routes.clone();
+    match wireserve_agent::routes::own_local_routes() {
+        Ok(found) => stale.extend(found.into_iter().filter(|a| range.as_ref().is_some_and(|r| r.contains4(*a)))),
+        Err(e) => tracing::warn!(error = %e, "could not list local routes to sweep"),
+    }
+    stale.sort_unstable();
+    stale.dedup();
+    if stale.is_empty() {
+        return;
+    }
+    tracing::info!(routes = ?stale, "removing local routes a previous run left behind");
+    let _ = wireserve_agent::routes::remove_local(&stale);
+    state.local_routes.clear();
+    if let Err(e) = state.save(state_path) {
+        tracing::warn!(error = %e, "failed to record the swept local routes");
+    }
 }
 
 /// Tears down this node's own interfaces (by private key) under any name
@@ -820,6 +908,19 @@ async fn teardown_everything<F: FirewallBackend>(
     interop.stop();
     if let Err(e) = fw.teardown() {
         tracing::warn!(error = %e, "failed to tear down firewall rules during teardown");
+    }
+    // The terminator's service addresses stop being this host's own
+    // (PLAN.md M33) — after the firewall, which marked traffic for them.
+    #[cfg(target_os = "linux")]
+    {
+        let mut state = state.lock().await;
+        if !state.local_routes.is_empty() {
+            let _ = wireserve_agent::routes::remove_local(&state.local_routes);
+            state.local_routes.clear();
+            if let Err(e) = state.save(state_path) {
+                tracing::warn!(error = %e, "failed to record removed local routes during teardown");
+            }
+        }
     }
     if let Err(e) = wg.teardown() {
         tracing::warn!(error = %e, "failed to remove WireGuard interface during teardown");

@@ -193,6 +193,7 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
         allow_plaintext_http: params.allow_plaintext_http,
         mesh: None,
         forwarding_owned: Vec::new(),
+        local_routes: Vec::new(),
     };
     let mut state = state;
     if let Some(offered) = reg.mesh.filter(|m| crate::mesh::pinnable(m, state.ip4.as_deref(), state.ip6.as_deref())) {

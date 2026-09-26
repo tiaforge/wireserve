@@ -73,6 +73,8 @@ pub async fn revoke_node(
     if let Some(pubkey) = &node.pubkey {
         state.transit.forget(pubkey);
     }
+    // Nor its word that it serves anything with TLS (PLAN.md M33).
+    crate::db::tls::clear_node(&conn, node.id)?;
     // PLAN.md M24: warn, never refuse. Revoking is how a compromised node is
     // cut off, so it must not be blockable by a routing dependency — and it
     // degrades safely, because `/poll` resolves a gateway against the live
@@ -233,6 +235,7 @@ pub async fn rejoin_node(
     let join_token = tokengen::generate(JOIN_TOKEN_PREFIX);
     let hash = wireserve_types::hash_token(&join_token);
     nodes::reissue_join_token(&conn, node.id, &hash, expires_at.as_deref())?;
+    crate::db::tls::clear_node(&conn, node.id)?;
     // Same as revoke: the old key must not linger as a carrier or as a
     // node wanting transit help until its report goes stale.
     if let Some(pubkey) = &node.pubkey {

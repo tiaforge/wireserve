@@ -94,6 +94,12 @@ pub struct AgentState {
     /// turns them back off. See `firewall::ip_forward`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forwarding_owned: Vec<String>,
+    /// Service addresses this agent routed to the host itself, for its TLS
+    /// terminator (PLAN.md M33) — kept here, like `forwarding_owned`, so
+    /// every stop removes them. A crash is covered separately: the routes
+    /// carry `routes::LOCAL_ROUTE_PROTO`, and startup sweeps them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_routes: Vec<std::net::Ipv4Addr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -35,6 +35,11 @@ const BIN_DEST: &str = "/usr/local/bin/wireserve";
 const OLD_BIN_DEST: &str = "/usr/local/bin/wireserve-agent";
 const UNIT_DEFAULT_DEST: &str = "/etc/systemd/system/wireserve-agent.service";
 const UNIT_TEMPLATE_DEST: &str = "/etc/systemd/system/wireserve-agent@.service";
+/// The TLS terminator's units (PLAN.md M33), installed beside the agent's.
+const TLS_UNIT_DEFAULT: &str = include_str!("../../../deploy/systemd/wireserve-tls.service");
+const TLS_UNIT_TEMPLATE: &str = include_str!("../../../deploy/systemd/wireserve-tls@.service");
+const TLS_UNIT_DEFAULT_DEST: &str = "/etc/systemd/system/wireserve-tls.service";
+const TLS_UNIT_TEMPLATE_DEST: &str = "/etc/systemd/system/wireserve-tls@.service";
 
 #[derive(Debug, thiserror::Error)]
 pub enum InstallError {
@@ -46,6 +51,8 @@ pub enum InstallError {
     InstallBinary(&'static str, std::io::Error),
     #[error("could not create the `{0}` group: {1}")]
     Group(String, String),
+    #[error("could not create the `{0}` user: {1}")]
+    User(String, String),
     #[error("could not install the systemd unit to {0}: {1}")]
     InstallUnit(&'static str, std::io::Error),
     #[error("could not run `systemctl {0}`: {1}")]
@@ -120,6 +127,57 @@ pub fn ensure_socket_group() -> Result<Option<String>, InstallError> {
     } else {
         Err(InstallError::Group(name, String::from_utf8_lossy(&output.stderr).trim().to_string()))
     }
+}
+
+/// Creates the TLS terminator's system user (and its group, of the same
+/// name), if it does not exist yet (PLAN.md M33). The daemon hands the
+/// terminator's socket to that group; the terminator runs as that user.
+pub fn ensure_tls_user() -> Result<String, InstallError> {
+    let name = crate::ipc::tls::tls_group_name().unwrap_or_else(|| crate::ipc::tls::DEFAULT_TLS_GROUP.to_string());
+    if crate::ipc::server::group_exists(&name) && user_exists(&name) {
+        return Ok(name);
+    }
+    let output = std::process::Command::new("useradd")
+        .args(["--system", "--user-group", "--no-create-home", "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin", &name])
+        .output()
+        .map_err(|e| InstallError::User(name.clone(), e.to_string()))?;
+    if output.status.success() {
+        Ok(name)
+    } else {
+        Err(InstallError::User(name, String::from_utf8_lossy(&output.stderr).trim().to_string()))
+    }
+}
+
+fn user_exists(name: &str) -> bool {
+    std::process::Command::new("id").args(["-u", name]).output().is_ok_and(|o| o.status.success())
+}
+
+/// The terminator's unit content, install path and unit name for
+/// `instance`. Pure, like [`unit_for`].
+fn tls_unit_for(instance: &Instance) -> (&'static str, &'static str, String) {
+    if instance.is_default() {
+        (TLS_UNIT_DEFAULT, TLS_UNIT_DEFAULT_DEST, "wireserve-tls".to_string())
+    } else {
+        (TLS_UNIT_TEMPLATE, TLS_UNIT_TEMPLATE_DEST, format!("wireserve-tls@{}", instance.name()))
+    }
+}
+
+/// Writes the terminator's unit for `instance`, and the other kind too if it
+/// is already on disk; returns the unit name to enable.
+pub fn install_tls_unit(instance: &Instance) -> Result<String, InstallError> {
+    let (content, dest, unit_name) = tls_unit_for(instance);
+    crate::fsutil::atomic_write(std::path::Path::new(dest), content.as_bytes(), 0o644)
+        .map_err(|e| InstallError::InstallUnit(dest, e))?;
+    let (other, other_dest) = if instance.is_default() {
+        (TLS_UNIT_TEMPLATE, TLS_UNIT_TEMPLATE_DEST)
+    } else {
+        (TLS_UNIT_DEFAULT, TLS_UNIT_DEFAULT_DEST)
+    };
+    if std::path::Path::new(other_dest).exists() {
+        crate::fsutil::atomic_write(std::path::Path::new(other_dest), other.as_bytes(), 0o644)
+            .map_err(|e| InstallError::InstallUnit(other_dest, e))?;
+    }
+    Ok(unit_name)
 }
 
 /// Writes the systemd unit for `instance` and returns the unit name
@@ -253,6 +311,23 @@ mod tests {
             vec!["wireserve-agent.service".to_string(), "wireserve-agent@work.service".to_string()]
         );
         assert!(parse_active_units("").is_empty());
+    }
+
+    #[test]
+    fn the_terminator_runs_beside_its_own_agent_as_its_own_user() {
+        let (content, dest, name) = tls_unit_for(&Instance::default());
+        assert_eq!((dest, name.as_str()), ("/etc/systemd/system/wireserve-tls.service", "wireserve-tls"));
+        assert!(content.contains(&format!("ExecStart={BIN_DEST} tls-serve")));
+        assert!(content.contains("PartOf=wireserve-agent.service") && content.contains("WantedBy=wireserve-agent.service"));
+        assert!(content.contains("User=wireserve-tls") && content.contains("CapabilityBoundingSet=CAP_NET_BIND_SERVICE\n"));
+
+        let (content, _, name) = tls_unit_for(&Instance::new("work").unwrap());
+        assert_eq!(name, "wireserve-tls@work");
+        assert!(content.contains(&format!("ExecStart={BIN_DEST} --instance %i tls-serve")));
+        assert!(content.contains("PartOf=wireserve-agent@%i.service"));
+        // The agent makes the directory the terminator's socket lives in.
+        assert!(UNIT_DEFAULT.contains("RuntimeDirectory=wireserve wireserve-tls\n"));
+        assert!(UNIT_TEMPLATE.contains("RuntimeDirectory=wireserve-%i wireserve-tls-%i\n"));
     }
 
     #[test]

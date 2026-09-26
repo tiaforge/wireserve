@@ -1,0 +1,48 @@
+# The TLS terminator for a named agent instance: `wireserve-tls@work` runs
+# `wireserve --instance work tls-serve` beside `wireserve-agent@work`. See
+# wireserve-tls.service for what it is and why it is sandboxed this way;
+# keep the two in step.
+
+[Unit]
+Description=WireServe TLS terminator (instance %i)
+Documentation=file:///usr/share/doc/wireserve/wireserve-design-spec.md
+After=wireserve-agent@%i.service
+PartOf=wireserve-agent@%i.service
+
+[Service]
+Type=simple
+User=wireserve-tls
+Group=wireserve-tls
+EnvironmentFile=-/etc/wireserve/tls.env
+EnvironmentFile=-/etc/wireserve/tls-%i.env
+ExecStart=/usr/local/bin/wireserve --instance %i tls-serve
+Restart=on-failure
+RestartSec=5s
+
+StateDirectory=wireserve-tls/%i
+StateDirectoryMode=0700
+
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+
+[Install]
+WantedBy=wireserve-agent@%i.service

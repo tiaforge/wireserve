@@ -302,6 +302,14 @@ fn lacks_bits(key: Expression<'static>, bits: u32) -> Statement<'static> {
     )
 }
 
+fn iifname_is_not(ifname: &str) -> Statement<'static> {
+    Statement::Match(Match {
+        left: meta(MetaKey::Iifname),
+        right: Expression::String(Cow::Owned(ifname.to_string())),
+        op: Operator::NEQ,
+    })
+}
+
 fn oifname_is_not(ifname: &str) -> Statement<'static> {
     Statement::Match(Match {
         left: meta(MetaKey::Oifname),
@@ -379,6 +387,21 @@ fn forward_rewrite(vip: Ipv4Addr, dest: Ipv4Addr, map: &PortMap) -> Vec<Statemen
         dport_is(map.proto, map.public),
         set(payload("ip", "daddr"), addr(dest)),
         set(payload(l4(map.proto), "dport"), Expression::Number(u32::from(map.target))),
+        add_mark(meta(MetaKey::Mark)),
+    ]
+}
+
+/// Marks a request from the mesh for a service this node's own terminator
+/// answers (PLAN.md M33), without rewriting it: the terminator listens on
+/// the service address itself. The mark is what the rest of the machinery
+/// already keys on — the filter's accept, and the host firewalls' openings
+/// (`host_interop`), which admit marked flows and nothing else of ours —
+/// so a terminated flow needs no rule of its own anywhere downstream.
+fn mark_terminated(ifname: &str, vip: Ipv4Addr, map: &PortMap) -> Vec<Statement<'static>> {
+    vec![
+        iifname_is(ifname),
+        is(payload("ip", "daddr"), addr(vip)),
+        dport_is(map.proto, map.public),
         add_mark(meta(MetaKey::Mark)),
     ]
 }
@@ -540,29 +563,52 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
         .iter()
         .filter_map(|r| match *r {
             ServiceRule::Mapped { vip, node, map, .. } => Some((vip, map.addr.unwrap_or(node), map)),
-            ServiceRule::Open { .. } => None,
+            ServiceRule::Open { .. } | ServiceRule::Terminated { .. } => None,
         })
         .collect();
+    // Answered on the service address by this node's own terminator
+    // (PLAN.md M33).
+    let terminated: Vec<(Ipv4Addr, PortMap)> = rules
+        .iter()
+        .filter_map(|r| match *r {
+            ServiceRule::Terminated { vip, map } => Some((vip, map)),
+            _ => None,
+        })
+        .collect();
+    let has_service_addresses = !mapped.is_empty() || !terminated.is_empty();
     // The one client each mapping admits from the mesh, if it is limited to
     // one (PLAN.md M29): the proxy, for a service behind its sign-in.
     let only_from: Vec<Option<Ipv4Addr>> = rules
         .iter()
         .filter_map(|r| match *r {
             ServiceRule::Mapped { only_from, .. } => Some(only_from),
-            ServiceRule::Open { .. } => None,
+            ServiceRule::Open { .. } | ServiceRule::Terminated { .. } => None,
         })
         .collect();
     let open: Vec<(Proto, u16, Ipv4Addr, Option<Ipv6Addr>)> = rules
         .iter()
         .filter_map(|r| match *r {
             ServiceRule::Open { proto, port, node, node6 } => Some((proto, port, node, node6)),
-            ServiceRule::Mapped { .. } => None,
+            ServiceRule::Mapped { .. } | ServiceRule::Terminated { .. } => None,
         })
         .collect();
     let accept = || Statement::Accept(None::<Accept>);
 
     // ---- input: what reaches this host's own sockets from the mesh ----
     objects.push(chain(t, CHAIN_NAME, NfChainType::Filter, NfHook::Input, 0));
+    // A terminated service's address is a local address of this host (the
+    // agent routes it to `lo`), so without this anything on the LAN could
+    // reach the terminator on it — and, where reverse-path filtering is
+    // loose, claim a mesh source address it has not got. Only the mesh and
+    // the host itself may.
+    for (vip, _) in &terminated {
+        objects.push(rule(t, CHAIN_NAME, vec![
+            iifname_is_not(ifname),
+            iifname_is_not("lo"),
+            is(payload("ip", "daddr"), addr(*vip)),
+            Statement::Drop(None::<Drop>),
+        ]));
+    }
     // Allow return traffic for connections this node itself initiated over
     // the WireGuard interface (e.g. this node acting as a client of another
     // peer's declared service) — without this, a WG-interface-scoped
@@ -588,7 +634,7 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
             ]));
         }
     }
-    if !mapped.is_empty() {
+    if has_service_addresses {
         objects.push(rule(t, CHAIN_NAME, vec![iifname_is(ifname), has_mark(ct("mark", None)), accept()]));
     }
     // Default-deny, but ONLY for the WireGuard interface — everything else
@@ -681,8 +727,9 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
     // (PLAN.md M20) — transit needs none of it (a transited connection is
     // forwarded exactly as received, never rewritten), so this early
     // return is unaffected by `transit` and stays keyed on `mapped`
-    // alone, same as before this feature existed.
-    if mapped.is_empty() {
+    // alone, same as before this feature existed — plus the terminated
+    // services (PLAN.md M33), which need the marking half of it.
+    if !has_service_addresses {
         return Nftables { objects: objects.into() };
     }
 
@@ -700,6 +747,9 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
         }
         expr.extend(forward_rewrite(*vip, *dest, map));
         objects.push(rule(t, PRE_CHAIN, expr));
+    }
+    for (vip, map) in &terminated {
+        objects.push(rule(t, PRE_CHAIN, mark_terminated(ifname, *vip, map)));
     }
     // The node's own clients. A `route` chain, so the kernel routes the
     // packet again after its destination changed: it was headed for the
@@ -733,7 +783,7 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
         .iter()
         .filter_map(|r| match *r {
             ServiceRule::Mapped { map, .. } => map.addr.map(|dest| (dest, map)),
-            ServiceRule::Open { .. } => None,
+            ServiceRule::Open { .. } | ServiceRule::Terminated { .. } => None,
         })
         .collect();
     if !remote.is_empty() {
@@ -1196,6 +1246,38 @@ mod tests {
         assert!(!fwd_rules.iter().any(|r| r[0] == iif("wg0") && r.to_string().contains(r#""op":"!=""#)));
     }
 
+    // ---- PLAN.md M33: terminated on this node ----
+
+    fn terminated(map: &str) -> ServiceRule {
+        ServiceRule::Terminated { vip: VIP, map: map.parse().unwrap() }
+    }
+
+    #[test]
+    fn a_terminated_service_is_marked_unrewritten_and_closed_to_the_lan() {
+        let batch = as_json(&apply_batch("wg0", &[terminated("443:32400")], &fwd(&[])));
+        let text = batch.to_string();
+        // Marked on the way in, nothing rewritten anywhere, target never
+        // mentioned: the terminator reaches it locally.
+        let pre = rules_in(&batch, "svc-pre");
+        assert_eq!(pre.len(), 1, "{pre:?}");
+        let pre = pre[0].to_string();
+        assert!(pre.contains("443") && pre.contains(&VIP.to_string()) && pre.contains("mark"), "{pre}");
+        assert!(!text.contains("32400"), "{text}");
+        assert!(rules_in(&batch, "svc-rev-post").is_empty() && rules_in(&batch, "svc-out").is_empty());
+        assert!(chain_names(&batch).contains(&"svc-mark-pre".to_string()), "chains exist with only a terminated rule");
+        // Accepted from the mesh by the mark; dropped from anywhere but the
+        // mesh and the host itself.
+        let input = rules_in(&batch, "wireserve-in");
+        assert!(input.iter().any(|r| r.to_string().contains("ct") && r.to_string().contains("accept")), "{input:?}");
+        let lan_drop = input[0].to_string();
+        assert!(
+            lan_drop.contains("!=") && lan_drop.contains("\"lo\"") && lan_drop.contains(&VIP.to_string()) && lan_drop.contains("drop"),
+            "{lan_drop}"
+        );
+        // Nothing forwarded for it.
+        assert!(!rules_in(&batch, "wireserve-fwd").iter().any(|r| r.to_string().contains("mark")));
+    }
+
     #[test]
     fn without_a_mapped_service_there_are_no_rewrite_chains() {
         let batch = as_json(&apply_batch("wg0", &[open(Proto::Tcp, 22)], &fwd(&[]))).to_string();
@@ -1550,6 +1632,25 @@ mod tests {
         let mut without = pre[0].as_array().unwrap().clone();
         without.remove(1);
         assert_eq!(serde_json::Value::Array(without), plain_pre[0]);
+    }
+
+    /// A terminated service rewrites nothing, so the kernel takes its rules
+    /// in an unprivileged namespace too (PLAN.md M33).
+    #[test]
+    fn kernel_accepts_a_terminated_service() {
+        let batch = serde_json::to_string(&apply_batch("wg0", &[terminated("443:32400")], &fwd(&[]))).unwrap();
+        let script = format!("nft -j -f - <<'JSON'\n{batch}\nJSON\nnft list ruleset");
+        let Some((listing, stderr)) = crate::firewall::netns::run_capturing(&script) else {
+            return;
+        };
+        assert!(stderr.trim().is_empty(), "{stderr}");
+        let lines = normalised_lines(&listing);
+        let has = |l: &str| assert!(lines.iter().any(|x| x == l), "missing `{l}` in:\n{listing}");
+        let m = format!("0x{SERVICE_MARK:08x}");
+        has(&format!("iifname \"wg0\" ip daddr 100.90.0.50 tcp dport 443 meta mark set meta mark | {m}"));
+        has("iifname != \"wg0\" iifname != \"lo\" ip daddr 100.90.0.50 drop");
+        has(&format!("meta mark & {m} == {m} ct mark set ct mark | {m}"));
+        has(&format!("iifname \"wg0\" ct mark & {m} == {m} accept"));
     }
 
     /// The masquerade and the guard rewrite nothing, so unlike the chains

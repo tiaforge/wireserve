@@ -39,7 +39,31 @@ pub struct ServiceNaming {
     /// names.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub proxy_service: Option<String>,
+    /// Where each node's terminator gets its certificates (PLAN.md M33).
+    /// Present only when the coordinator publishes DNS records, which is
+    /// what makes a certificate for a service name obtainable at all.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub acme: Option<AcmeSettings>,
 }
+
+/// The certificate authority every terminator uses, set once on the
+/// coordinator (PLAN.md M33).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcmeSettings {
+    /// The ACME directory URL: Let's Encrypt's production one unless the
+    /// operator set another.
+    pub directory: String,
+    /// The contact address given to the CA, if the operator set one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub email: Option<String>,
+    /// How long to wait after the challenge record is written before
+    /// asking the CA to look, so the record has reached every one of the
+    /// zone's nameservers.
+    pub propagation_secs: u32,
+}
+
+/// Let's Encrypt's production ACME directory.
+pub const LETS_ENCRYPT_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
 
 /// The port whose publication means "serve this under its name, with TLS".
 ///
@@ -121,8 +145,9 @@ impl<'a> ServiceNames<'a> {
         }
     }
 
-    /// Where that name points: the proxy for a service published on 443, its
-    /// own address otherwise. `None` for an address that does not parse.
+    /// Where that name points: the proxy for a service published on 443
+    /// that its own node does not serve with TLS (PLAN.md M33), its own
+    /// address otherwise. `None` for an address that does not parse.
     ///
     /// Publishing 443 is the signal that a service wants to be served under
     /// its name with TLS, so its name has to resolve to the same place from a
@@ -132,7 +157,7 @@ impl<'a> ServiceNames<'a> {
     /// address and no extra hop.
     #[must_use]
     pub fn address(&self, s: &ServiceInfo) -> Option<Ipv4Addr> {
-        match (self.proxy, publishes_tls(s)) {
+        match (self.proxy, publishes_tls(s) && !s.terminated) {
             (Some(proxy), true) => Some(proxy),
             _ => own_address(s).parse().ok(),
         }

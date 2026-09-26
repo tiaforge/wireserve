@@ -333,7 +333,7 @@ pub fn group_exists(name: &str) -> bool {
 }
 
 #[cfg(unix)]
-fn lookup_group(name: &str) -> Option<u32> {
+pub(crate) fn lookup_group(name: &str) -> Option<u32> {
     let cname = std::ffi::CString::new(name).ok()?;
     let mut buf = vec![0u8; 4096];
     loop {
@@ -352,7 +352,7 @@ fn lookup_group(name: &str) -> Option<u32> {
 }
 
 #[cfg(not(unix))]
-fn lookup_group(_name: &str) -> Option<u32> {
+pub(crate) fn lookup_group(_name: &str) -> Option<u32> {
     None
 }
 
@@ -382,7 +382,7 @@ pub async fn serve(ctx: AgentContext, socket_path: &Path) -> std::io::Result<()>
     }
 }
 
-fn bind_socket(socket_path: &Path, gid: Option<u32>) -> std::io::Result<UnixListener> {
+pub(crate) fn bind_socket(socket_path: &Path, gid: Option<u32>) -> std::io::Result<UnixListener> {
     let parent = socket_path.parent();
     if let Some(parent) = parent {
         std::fs::create_dir_all(parent)?;

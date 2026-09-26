@@ -198,6 +198,15 @@ pub const MAX_TRANSIT_WANTED_PER_POLL: usize = 64;
 /// open, one way or the other.
 pub const CAP_SERVICE_AUTH: &str = "service-auth";
 
+/// `tls-terminate` (PLAN.md M33): this agent runs, or can run, the
+/// terminator that serves its own 443 services with TLS on their own
+/// addresses. Reported whether or not a service is ready yet, so the
+/// coordinator can tell an old agent from a terminator that is failing.
+pub const CAP_TLS_TERMINATE: &str = "tls-terminate";
+
+/// At most this many names are read from one poll's `tls_ready`.
+pub const MAX_TLS_READY_PER_POLL: usize = 64;
+
 /// At most this many capability strings are read from one poll.
 pub const MAX_CAPABILITIES_PER_POLL: usize = 16;
 
@@ -303,6 +312,12 @@ pub struct PollRequest {
     /// trusted with a service marked for sign-in.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    /// This node's services whose TLS the local terminator is serving right
+    /// now — certificate held, `vip:443` bound (PLAN.md M33). Only these are
+    /// ever `terminated` in the directory; anything else keeps the path it
+    /// had. Capped at [`MAX_TLS_READY_PER_POLL`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tls_ready: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -380,6 +395,12 @@ pub struct ServiceInfo {
     /// when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auth: bool,
+    /// Served with TLS by its own node (PLAN.md M33): the name resolves to
+    /// the service's own address, where the owner's terminator answers on
+    /// 443, rather than to the proxy. Absent when false, which is every
+    /// service on a coordinator or owner that predates it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminated: bool,
 }
 
 impl ServiceInfo {
@@ -811,6 +832,7 @@ mod tests {
             }],
             services: vec![ServiceInfo {
                 auth: false,
+                terminated: false,
                 name: "plex".into(),
                 node: "homeserver".into(),
                 ip4: "100.90.0.3".into(),

@@ -115,6 +115,30 @@ impl Instance {
         }
     }
 
+    /// The TLS terminator's socket (PLAN.md M33): in a directory of its
+    /// own, beside this instance's run directory rather than inside it —
+    /// that one is root-only, and the terminator runs as its own user.
+    #[must_use]
+    pub fn tls_socket_path(&self) -> PathBuf {
+        let dir = if self.is_default() {
+            run_root().join("wireserve-tls")
+        } else {
+            run_root().join(format!("wireserve-tls-{}", self.name))
+        };
+        dir.join("tls.sock")
+    }
+
+    /// Where the TLS terminator keeps its certificates when not run by its
+    /// unit, which gives it a state directory of its own.
+    #[must_use]
+    pub fn tls_state_dir(&self) -> PathBuf {
+        if self.is_default() {
+            PathBuf::from("/var/lib/wireserve-tls")
+        } else {
+            PathBuf::from("/var/lib/wireserve-tls").join(&self.name)
+        }
+    }
+
     /// Next to the state file: the lock guards that file, so it has to
     /// live wherever the state does — including under a
     /// `WIRESERVE_STATE_PATH` override.

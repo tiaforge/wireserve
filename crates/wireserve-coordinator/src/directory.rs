@@ -45,7 +45,13 @@ pub fn peer_info(node: &NodeRow, online_threshold_secs: i64) -> PeerInfo {
 /// on its own declaration — so the only thing fanning it out would do is
 /// tell the whole mesh what the owner's LAN looks like. Admins still see it
 /// (`admin_service_info`).
-pub fn service_info(service: &ServiceRow, node: &NodeRow, online_threshold_secs: i64, auth: bool) -> ServiceInfo {
+pub fn service_info(
+    service: &ServiceRow,
+    node: &NodeRow,
+    online_threshold_secs: i64,
+    auth: bool,
+    terminated: bool,
+) -> ServiceInfo {
     ServiceInfo {
         name: service.name.clone(),
         node: node.name.clone(),
@@ -56,6 +62,42 @@ pub fn service_info(service: &ServiceRow, node: &NodeRow, online_threshold_secs:
         vip4: service.vip4.clone(),
         ports: service.ports.iter().map(|m| wireserve_types::PortMap { addr: None, ..*m }).collect(),
         auth,
+        terminated,
+    }
+}
+
+/// What decides, beyond a service's own row, how the directory shows it.
+pub struct DirectoryContext<'a> {
+    /// Names marked for sign-in (PLAN.md M29).
+    pub auth: &'a std::collections::HashSet<String>,
+    /// Names their own node reports serving with TLS, with that node
+    /// (PLAN.md M33).
+    pub tls_ready: &'a std::collections::HashMap<String, i64>,
+    /// Whether the coordinator publishes DNS records — without them no
+    /// certificate can be issued, so nothing is terminated.
+    pub dns: bool,
+    pub proxy_service: Option<&'a str>,
+    pub online_threshold_secs: i64,
+}
+
+impl DirectoryContext<'_> {
+    /// Whether `service` is served with TLS by its own node (PLAN.md M33).
+    ///
+    /// Every condition fails toward the path the service already had: no
+    /// records, not on TCP 443, no address of its own, marked for sign-in
+    /// (built in only from M34), the proxy itself (whose address every
+    /// other 443 name points at), or its own node not vouching for it right
+    /// now — an owner that predates termination never does.
+    #[must_use]
+    pub fn terminates(&self, service: &ServiceRow, auth: bool) -> bool {
+        self.dns
+            && service.vip4.is_some()
+            && wireserve_types::effective_ports(&service.ports, service.port, service.proto)
+                .iter()
+                .any(|m| m.public == wireserve_types::TLS_PUBLIC_PORT && m.proto == wireserve_types::Proto::Tcp)
+            && !auth
+            && self.proxy_service != Some(service.name.as_str())
+            && self.tls_ready.get(&service.name) == Some(&service.node_id)
     }
 }
 
@@ -63,19 +105,15 @@ pub fn service_info(service: &ServiceRow, node: &NodeRow, online_threshold_secs:
 /// owner is a live peer, shaped by [`service_info`]. Shared by `/poll` and
 /// the DNS sync (PLAN.md M32), so the names a phone resolves are built from
 /// exactly the directory the nodes see.
-pub fn services_directory(
-    services: &[ServiceRow],
-    peers: &[NodeRow],
-    auth: &std::collections::HashSet<String>,
-    online_threshold_secs: i64,
-) -> Vec<ServiceInfo> {
+pub fn services_directory(services: &[ServiceRow], peers: &[NodeRow], ctx: &DirectoryContext<'_>) -> Vec<ServiceInfo> {
     let peers_by_id: std::collections::HashMap<i64, &NodeRow> = peers.iter().map(|n| (n.id, n)).collect();
     services
         .iter()
         .filter_map(|s| {
-            peers_by_id
-                .get(&s.node_id)
-                .map(|owner| service_info(s, owner, online_threshold_secs, auth.contains(&s.name)))
+            peers_by_id.get(&s.node_id).map(|owner| {
+                let auth = ctx.auth.contains(&s.name);
+                service_info(s, owner, ctx.online_threshold_secs, auth, ctx.terminates(s, auth))
+            })
         })
         .collect()
 }
@@ -202,7 +240,7 @@ mod tests {
             denied_at: None,
             denied_reason: None,
         };
-        let info = service_info(&svc, &n, 180, false);
+        let info = service_info(&svc, &n, 180, false, false);
         assert!(info.online);
     }
 
@@ -221,7 +259,7 @@ mod tests {
             denied_at: None,
             denied_reason: None,
         };
-        let fanned = service_info(&svc, &n, 180, false);
+        let fanned = service_info(&svc, &n, 180, false, false);
         assert_eq!(fanned.ports[0].addr, None);
         assert_eq!((fanned.ports[0].public, fanned.ports[0].target), (443, 80));
         assert_eq!(admin_service_info(&svc, &n, false).ports[0].to_string(), "443:192.168.178.1:80/tcp");

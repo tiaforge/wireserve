@@ -123,6 +123,16 @@ fn over_budget(state: &AppState, parts: &Parts) -> bool {
 /// `reason` is deliberately coarse and never contains any part of the
 /// presented credential — this line goes to a log that gets shipped,
 /// grepped and pasted into support threads.
+/// The node route a failed bearer check was for, as a fixed label: the
+/// log line feeds fail2ban, and an arbitrary request path does not belong
+/// in it.
+fn node_endpoint(parts: &Parts) -> &'static str {
+    match parts.uri.path() {
+        "/tls/challenge" => "/tls/challenge",
+        _ => "/poll",
+    }
+}
+
 fn record_failed_auth(state: &AppState, parts: &Parts, endpoint: &str, reason: &str) -> AuthError {
     let ip = source_ip(state, parts);
     if let Some(ip) = ip {
@@ -198,7 +208,7 @@ impl FromRequestParts<AppState> for BearerNode {
     ) -> Result<Self, Self::Rejection> {
         let blocked = over_budget(state, parts);
         let Some(candidate) = extract_bearer(parts) else {
-            record_failed_auth(state, parts, "/poll", "missing_header");
+            record_failed_auth(state, parts, node_endpoint(parts), "missing_header");
             state.rate_limiter.apply_failure_delay().await;
             return Err(if blocked {
                 AuthError::RateLimited
@@ -219,7 +229,7 @@ impl FromRequestParts<AppState> for BearerNode {
                 // The database lock was released above, before this
                 // point, which is what makes the delay safe to await
                 // here — see `RateLimiter::failure_delay`.
-                record_failed_auth(state, parts, "/poll", "unknown_token");
+                record_failed_auth(state, parts, node_endpoint(parts), "unknown_token");
                 state.rate_limiter.apply_failure_delay().await;
                 Err(if blocked {
                     AuthError::RateLimited

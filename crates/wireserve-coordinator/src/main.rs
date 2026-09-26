@@ -287,6 +287,7 @@ mod tests {
             net_v6_prefix: "fdab:cdef:1234::/64".into(),
             service_domain: None,
             dns: None,
+            acme: config::acme_from_lookup(|_| None).unwrap(),
             service_proxy: None,
             online_threshold_secs: 180,
             rate_limit_max: 10,

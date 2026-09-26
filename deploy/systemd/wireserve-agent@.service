@@ -33,13 +33,15 @@ RestartSec=2s
 # A sibling of /run/wireserve rather than inside it: systemd removes a
 # unit's RuntimeDirectory when the unit stops, so nesting would let the
 # default instance's stop delete this one's socket.
-RuntimeDirectory=wireserve-%i
+RuntimeDirectory=wireserve-%i wireserve-tls-%i
 RuntimeDirectoryMode=0700
 # The directory starts out root-only. When a `wireserve` group exists the
 # daemon hands it, and its IPC socket, to that group (0750/0660) so its
 # members can run `wireserve serve`/`list`/... without sudo. Changing a
 # file's group to one root is not itself a member of needs CAP_CHOWN,
 # hence it in the bounding set below.
+# The second directory holds the TLS terminator's socket (PLAN.md M33),
+# handed to the `wireserve-tls` group the same way.
 StateDirectory=wireserve/instances/%i
 StateDirectoryMode=0700
 
@@ -54,7 +56,7 @@ PrivateTmp=true
 # /etc/hosts as a single file: see wireserve-agent.service for why that
 # works, and what happens when the host replaces the file.
 ProtectSystem=strict
-ReadWritePaths=/var/lib/wireserve/instances/%i /run/wireserve-%i /etc/hosts -/run/xtables.lock -/etc/caddy
+ReadWritePaths=/var/lib/wireserve/instances/%i /run/wireserve-%i /run/wireserve-tls-%i /etc/hosts -/run/xtables.lock -/etc/caddy
 
 [Install]
 WantedBy=multi-user.target

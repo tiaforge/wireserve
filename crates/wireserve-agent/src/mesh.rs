@@ -116,6 +116,7 @@ mod tests {
     fn svc(name: &str, ip4: &str, vip4: Option<&str>) -> ServiceInfo {
         ServiceInfo {
             auth: false,
+            terminated: false,
             name: name.into(),
             node: "a".into(),
             ip4: ip4.into(),

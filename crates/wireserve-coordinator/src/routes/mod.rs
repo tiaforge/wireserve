@@ -2,6 +2,7 @@ pub mod admin;
 pub mod poll;
 pub mod probe;
 pub mod register;
+pub mod tls;
 
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post};
@@ -30,6 +31,7 @@ pub fn node_router(state: AppState) -> Router {
         .route("/register", post(register::register))
         .route("/poll", post(poll::poll))
         .route("/probe", get(probe::probe))
+        .route("/tls/challenge", post(tls::add).delete(tls::remove))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }

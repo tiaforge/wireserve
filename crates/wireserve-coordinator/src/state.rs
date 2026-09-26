@@ -19,6 +19,22 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// How the directory is shaped from this coordinator's settings.
+    #[must_use]
+    pub fn directory_context<'a>(
+        &'a self,
+        auth: &'a std::collections::HashSet<String>,
+        tls_ready: &'a std::collections::HashMap<String, i64>,
+    ) -> crate::directory::DirectoryContext<'a> {
+        crate::directory::DirectoryContext {
+            auth,
+            tls_ready,
+            dns: self.dns.is_some(),
+            proxy_service: self.config.service_proxy.as_deref(),
+            online_threshold_secs: self.config.online_threshold_secs,
+        }
+    }
+
     /// Tells the DNS sync the directory may have changed. Cheap and safe to
     /// call from any handler: pokes coalesce, and the loop spaces its passes.
     pub fn poke_dns(&self) {

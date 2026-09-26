@@ -28,13 +28,15 @@ RestartSec=2s
 # the first real apply() on every startup (spec §5's ordering
 # requirement), so a crash loop never leaves the interface permissive.
 
-RuntimeDirectory=wireserve
+RuntimeDirectory=wireserve wireserve-tls
 RuntimeDirectoryMode=0700
 # The directory starts out root-only. When a `wireserve` group exists the
 # daemon hands it, and its IPC socket, to that group (0750/0660) so its
 # members can run `wireserve serve`/`list`/... without sudo. Changing a
 # file's group to one root is not itself a member of needs CAP_CHOWN,
 # hence it in the bounding set below.
+# The second directory holds the TLS terminator's socket (PLAN.md M33),
+# handed to the `wireserve-tls` group the same way.
 StateDirectory=wireserve
 StateDirectoryMode=0700
 
@@ -74,7 +76,7 @@ ProtectSystem=strict
 # `--proxy caddy` (PLAN.md M25), and ProtectSystem=strict would otherwise
 # make the generated vhost file unwritable. A node with no proxy has no
 # /etc/caddy and systemd skips it.
-ReadWritePaths=/var/lib/wireserve /run/wireserve /etc/hosts -/run/xtables.lock -/etc/caddy
+ReadWritePaths=/var/lib/wireserve /run/wireserve /run/wireserve-tls /etc/hosts -/run/xtables.lock -/etc/caddy
 
 [Install]
 WantedBy=multi-user.target

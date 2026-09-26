@@ -17,6 +17,10 @@ pub struct Config {
     /// Where the service names are published as public DNS records
     /// (PLAN.md M32). `None` leaves DNS to the operator, as before.
     pub dns: Option<crate::dns::DnsConfig>,
+    /// The CA every node's terminator gets certificates from (PLAN.md M33).
+    /// Only handed to nodes while `dns` is set: without the coordinator
+    /// writing the challenge records, no certificate can be issued.
+    pub acme: wireserve_types::AcmeSettings,
     pub online_threshold_secs: i64,
     pub rate_limit_max: u32,
     pub rate_limit_window_secs: u64,
@@ -197,6 +201,7 @@ impl Config {
             Err(_) => None,
         };
         let dns = crate::dns::config::from_lookup(|k| std::env::var(k).ok(), service_domain.as_deref())?;
+        let acme = acme_from_lookup(|k| std::env::var(k).ok())?;
 
         Ok(Loaded {
             config: Self {
@@ -209,6 +214,7 @@ impl Config {
                 service_domain,
                 service_proxy,
                 dns,
+                acme,
                 online_threshold_secs,
                 rate_limit_max,
                 rate_limit_window_secs,
@@ -263,8 +269,39 @@ impl Config {
         self.service_domain.as_ref().map(|domain| wireserve_types::ServiceNaming {
             domain: domain.clone(),
             proxy_service: self.service_proxy.clone(),
+            acme: self.dns.is_some().then(|| self.acme.clone()),
         })
     }
+}
+
+/// The ACME settings (PLAN.md M33), defaulting to Let's Encrypt production.
+///
+/// Every node's terminator uses the one CA the coordinator names, so a
+/// staging or private CA is chosen in one place, and a typo in the URL is a
+/// startup failure rather than every node failing to get certificates.
+pub fn acme_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<wireserve_types::AcmeSettings, ConfigError> {
+    let get = |key: &str| lookup(key).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let directory = get("WIRESERVE_ACME_DIRECTORY").unwrap_or_else(|| wireserve_types::LETS_ENCRYPT_DIRECTORY.to_string());
+    if !directory.starts_with("https://") || directory.contains(char::is_whitespace) {
+        return Err(ConfigError::Invalid("WIRESERVE_ACME_DIRECTORY", format!("{directory:?} is not an https:// URL")));
+    }
+    let email = get("WIRESERVE_ACME_EMAIL");
+    if let Some(e) = &email {
+        let valid = e.split_once('@').is_some_and(|(user, host)| {
+            !user.is_empty() && wireserve_types::is_valid_hostname(host) && !e.contains(char::is_whitespace)
+        });
+        if !valid {
+            return Err(ConfigError::Invalid("WIRESERVE_ACME_EMAIL", format!("{e:?} is not an email address")));
+        }
+    }
+    let propagation_secs = match get("WIRESERVE_ACME_PROPAGATION_SECS") {
+        None => 60,
+        Some(raw) => match raw.parse::<u32>() {
+            Ok(s) if s <= 600 => s,
+            _ => return Err(ConfigError::Invalid("WIRESERVE_ACME_PROPAGATION_SECS", format!("{raw:?} is not 0..=600"))),
+        },
+    };
+    Ok(wireserve_types::AcmeSettings { directory, email, propagation_secs })
 }
 
 /// The result of [`Config::load`]: the config itself, plus which first-run
@@ -504,6 +541,19 @@ mod tests {
         // be flagged either.
         assert!(!v6_prefix_has_nonrandom_global_id("fd7a:115c:a1e0::/48"));
         assert!(!v6_prefix_has_nonrandom_global_id("garbage"));
+    }
+
+    #[test]
+    fn acme_defaults_to_lets_encrypt_and_checks_what_it_is_given() {
+        let none = acme_from_lookup(|_| None).unwrap();
+        assert_eq!(none.directory, wireserve_types::LETS_ENCRYPT_DIRECTORY);
+        assert_eq!((none.email, none.propagation_secs), (None, 60));
+        let bad = |k: &'static str, v: &'static str| {
+            matches!(acme_from_lookup(move |key| (key == k).then(|| v.to_string())), Err(ConfigError::Invalid(key, _)) if key == k)
+        };
+        assert!(bad("WIRESERVE_ACME_DIRECTORY", "http://acme.test/dir"));
+        assert!(bad("WIRESERVE_ACME_EMAIL", "not-an-address"));
+        assert!(bad("WIRESERVE_ACME_PROPAGATION_SECS", "3600"));
     }
 
     #[test]

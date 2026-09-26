@@ -1,0 +1,40 @@
+[package]
+name = "wireserve-tls"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The per-node TLS terminator (PLAN.md M33), run as `wireserve tls-serve`
+# under its own unprivileged unit. A library so the one `wireserve` binary
+# carries it; nothing here needs any privilege beyond binding port 443.
+
+[dependencies]
+wireserve-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+axum.workspace = true
+# ACME with DNS-01; `rcgen` generates the key and CSR, `time` and
+# `x509-parser` give renewal information (ARI). The default aws-lc-rs
+# provider is the one rustls uses everywhere else in the workspace.
+instant-acme = { version = "0.8", features = ["rcgen", "time", "x509-parser"] }
+x509-parser = { version = "0.18", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12", "logging"] }
+rustls-pki-types = "1"
+# The upstream is plain HTTP on this very node, so no TLS client features.
+axum-reverse-proxy = { version = "2.2", default-features = false }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio", "http1", "http2"] }
+tower = { workspace = true, features = ["util"] }
+socket2 = { version = "0.6", features = ["all"] }
+libc.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+rcgen = "0.14"
+time = "0.3"
