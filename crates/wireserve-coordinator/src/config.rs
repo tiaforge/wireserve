@@ -29,7 +29,7 @@ pub struct Config {
     ///
     /// Default 1800 (30 minutes). A join token exists to cover the gap
     /// between an operator creating a node record and walking over to the
-    /// machine to run `wireserve-agent join`; that is a minutes-long
+    /// machine to run `wireserve join`; that is a minutes-long
     /// errand, not an open-ended one. The token travels out of band
     /// through chat, a password manager, terminal scrollback — places a
     /// credential outlives its usefulness by months. `rejoin` mints a

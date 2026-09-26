@@ -22,7 +22,8 @@
 # foreign one, keep separate ports, tables, hosts blocks and firewall
 # rules, carry real traffic only for what each declared, don't fight over
 # the host firewall, clean up after each other only once one is dead, and
-# that the default instance clears up after a pre-instances (wg0) agent.
+# that the default instance clears up after a pre-instances (wg0) agent, and
+# that a group can use the daemon's socket without root while nobody else can.
 #
 # Prerequisites: root, the WireGuard kernel module, nft, iptables-nft, wg,
 # python3. Usage:
@@ -37,7 +38,7 @@ if [ -z "${WIRESERVE_IN_TEST_NETNS:-}" ]; then
     for tool in unshare nsenter ip nft iptables-nft wg python3; do
         command -v "$tool" >/dev/null || { echo "FAIL: $tool not found" >&2; exit 1; }
     done
-    for b in wireserve-agent wireserve-coordinator wireserve-admin; do
+    for b in wireserve wireserve-coordinator wireserve-admin; do
         [ -x "$BIN/$b" ] || { echo "FAIL: $BIN/$b missing — run cargo build --workspace" >&2; exit 1; }
     done
     [ "$(id -u)" = 0 ] || { echo "FAIL: needs root (service addresses rewrite packet headers): sudo $0" >&2; exit 1; }
@@ -130,8 +131,8 @@ mkdir -p "$WORK/host" "$WORK/peer"
 printf '127.0.0.1 localhost\n' | tee "$WORK/host/hosts" > "$WORK/peer/hosts"
 # Plain commands, not functions, so a backgrounded daemon's $! is the
 # agent itself (env and nsenter exec it) and signals reach it.
-host_cmd=("${host_env[@]}" "$BIN/wireserve-agent")
-peer_cmd=(nsenter -t "$PEER_NS" -n "${peer_env[@]}" "$BIN/wireserve-agent")
+host_cmd=("${host_env[@]}" "$BIN/wireserve")
+peer_cmd=(nsenter -t "$PEER_NS" -n "${peer_env[@]}" "$BIN/wireserve")
 host() { "${host_cmd[@]}" "$@"; }
 peer() { "${peer_cmd[@]}" "$@"; }
 daemon() {  # side instance [args…]
@@ -253,6 +254,34 @@ sleep $((POLL * 2))
 [ "$(tags wireserve2)" = 2 ] || fail "restarted instance's accepts not back"
 reach "$BETA" 7002 || fail "mesh B unreachable after the restart"
 pass "the restarted instance is back on wireserve2 with its rules"
+
+# ---------------------------------------------------------------------
+log "the socket is shared with the wireserve group, and only with it"
+# `wireserve` is the default group name; a test must not create system
+# groups, so name one that is already there. Unprivileged callers are
+# numeric ids that exist in no passwd file, one holding the group only as
+# a supplementary group (how `usermod -aG` gives it) and one holding none.
+GRP=$(id -gn nobody); GRP_GID=$(id -g nobody)
+# The socket's ancestors are in this script's private 0700 tmpdir.
+chmod 711 "$WORK" "$WORK/host"
+sock="$WORK/host/run/wireserve-work/agent.sock"
+kill -TERM "$HOST_WORK"; wait "$HOST_WORK" 2>/dev/null || true
+export WIRESERVE_SOCKET_GROUP=$GRP
+daemon host work; HOST_WORK=$LAST_PID; up host work
+unset WIRESERVE_SOCKET_GROUP
+[ "$(stat -c '%a %G' "$sock")" = "660 $GRP" ] || fail "socket is $(stat -c '%a %G' "$sock"), want 660 $GRP"
+[ "$(stat -c '%a %G' "$(dirname "$sock")")" = "750 $GRP" ] || fail "socket directory is not 750 $GRP"
+as_user() { setpriv --reuid=48211 --regid=48211 "$@"; }
+member=(as_user --groups="$GRP_GID" env WIRESERVE_RUN_ROOT="$WORK/host/run" "$BIN/wireserve" --instance work)
+outsider=(as_user --clear-groups env WIRESERVE_RUN_ROOT="$WORK/host/run" "$BIN/wireserve" --instance work)
+"${member[@]}" list >/dev/null || fail "a member of $GRP could not use the daemon"
+"${member[@]}" serve gtest 7099 >/dev/null || fail "a member of $GRP could not change what the node serves"
+"${member[@]}" unserve gtest >/dev/null || fail "a member of $GRP could not withdraw it"
+out=$("${outsider[@]}" list 2>&1) && fail "a non-member could use the daemon"
+echo "$out" | grep -q "not permitted" || fail "a non-member got the wrong message: $out"
+pass "members of $GRP (by supplementary group) can use the daemon; everyone else is told why not"
+sleep $((POLL * 2))
+reach "$BETA" 7002 || fail "mesh B unreachable after the restart with the group"
 
 # ---------------------------------------------------------------------
 log "stopping one instance leaves the other untouched"

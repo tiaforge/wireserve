@@ -136,8 +136,8 @@ node 'homeserver' created — join token: jtk_...
   redeemable until: ...
 
 To add this node to the mesh:
-  sudo wireserve-agent install https://wireserve.example.com
-  (needs the wireserve-agent binary already on that machine, and root)
+  sudo wireserve install https://wireserve.example.com
+  (needs the wireserve binary already on that machine, and root)
   then paste the join token above when prompted
 ```
 
@@ -148,18 +148,19 @@ manager is not a live way into the mesh months later. If the window lapses,
 and address. Override with `--ttl <secs>` per token, or coordinator-wide
 with `WIRESERVE_JOIN_TOKEN_TTL_SECS`; `0` disables expiry.
 
-On the node itself, with the `wireserve-agent` binary already there (built
+On the node itself, with the `wireserve` binary already there (built
 via `cargo build --release --workspace` in a checkout, or copied over from
 wherever you built it):
 
 ```sh
-sudo wireserve-agent install https://wireserve.example.com
+sudo wireserve install https://wireserve.example.com
 ```
 
-One command: it installs the binary to `/usr/local/bin`, installs and
-enables the right systemd unit, then joins — prompting for the join token
+One command: it installs the binary to `/usr/local/bin/wireserve`, installs
+and enables the right systemd unit, then joins — prompting for the join token
 (masked, not echoed) exactly like `join` does below, so nothing sensitive
-ever lands in shell history. Running an *additional* agent on a host that
+ever lands in shell history. It also creates a `wireserve` group (see
+"Using it without sudo" below); it does not add anyone to it. Running an *additional* agent on a host that
 already runs one? Add `--instance work` (see "Several agents on one host"
 below); `wireserve-admin create-node --instance work` fills that flag into
 the printed command for you. `install` needs Linux/systemd — Quadlet/podman
@@ -185,7 +186,7 @@ refuses to start until you set `WIRESERVE_ALLOW_PLAINTEXT_HTTP=1` in
 Or, step by step, if you'd rather not have `install` touch systemd for you:
 
 ```sh
-wireserve-agent join
+wireserve join
 systemctl enable --now wireserve-agent
 ```
 
@@ -194,12 +195,65 @@ then the join token (masked, not echoed) — nothing to paste into the
 command line at all, which is also the safer option: a token passed as an
 argument lands in shell history and is visible to any local user via `ps`
 for as long as the process is alive. Passing both explicitly still works
-the same as before (`wireserve-agent join <url> <token>`, or
+the same as before (`wireserve join <url> <token>`, or
 `--join-token-file <path>`/`-` for scripted joins) if you'd rather not be
 prompted. `join` generates the keypair locally, redeems the token, and
 stores everything mode-600. The daemon brings the mesh up on `wireserve0`,
-or the next free name if that one is taken; `wireserve-agent list` shows
+or the next free name if that one is taken; `wireserve list` shows
 which.
+
+#### Using it without sudo
+
+`install`, `join` and `daemon` need root. Everything else (`serve`,
+`unserve`, `list`, `transit`, `exit`, `leave`) only talks to the running
+daemon over a Unix socket, and needs no root of its own: whoever can open
+the socket can run them. By default that is root alone. If a group named
+`wireserve` exists when the daemon starts, the daemon shares the socket with
+it, and its members can run those commands as themselves:
+
+```sh
+sudo usermod -aG wireserve $USER   # then log out and back in
+wireserve list
+```
+
+`install` creates the group for you and prints that line; without
+`install`, `sudo groupadd --system wireserve` before starting the daemon.
+The group is looked up once, when the daemon binds its socket, so a daemon
+that was already running needs `sudo systemctl restart wireserve-agent`
+to pick it up. Someone who is not allowed in is told so, rather than that
+the daemon isn't running. `WIRESERVE_SOCKET_GROUP` in
+`/etc/wireserve/agent.env` names a different group, and an empty value keeps
+the socket root-only even though the group exists.
+
+Treat membership as "operator of this node", the way you would the `docker`
+group. A member can publish and withdraw services, opt the node in or out
+of transit and exit duty, and `leave` the mesh. What a member cannot do is
+get past the coordinator: a new service, a transit carrier or an exit still
+needs an admin's approval there, and members cannot read the node's keys
+or bearer token, which stay in a root-only state file. Only add people you
+would trust to run that node.
+
+A containerised agent does not see the host's groups, so its socket stays
+root-only (`podman exec`/`docker exec` runs as root anyway).
+
+#### Upgrading a node from `wireserve-agent`
+
+The command used to be `wireserve-agent`; it is `wireserve` now. The systemd
+unit is still `wireserve-agent`. On a node that already runs:
+
+```sh
+sudo install -m 0755 target/release/wireserve /usr/local/bin/wireserve
+sudo install -m 0644 deploy/systemd/wireserve-agent.service deploy/systemd/wireserve-agent@.service /etc/systemd/system/
+sudo groupadd --system wireserve
+sudo systemctl daemon-reload && sudo systemctl restart wireserve-agent   # or wireserve-agent@<instance>
+```
+
+(`install` would also do this, but it joins again, which a node that
+already joined does not want.) The rewritten unit starts the new binary and
+carries the `CAP_CHOWN` the group sharing needs; a daemon that has the group
+but not that capability logs a warning and keeps a root-only socket. Nothing
+deletes the old `/usr/local/bin/wireserve-agent`: it is left as it is, unused
+once the unit points at the new binary, and yours to remove.
 
 ### 3. Publish a service
 
@@ -219,14 +273,14 @@ So the flow is two steps:
 
 ```sh
 # on the node: plex.wg:80 reaches this node's port 32400
-wireserve-agent serve plex 80:32400
+wireserve serve plex 80:32400
 
 # on the coordinator — see what is waiting, then approve it
 wireserve-admin list-services --pending
 wireserve-admin approve-service homeserver plex
 ```
 
-Until it is approved, `wireserve-agent list` shows the service as
+Until it is approved, `wireserve list` shows the service as
 `pending approval`, which is how you tell "waiting on an admin" from "this
 node has not polled yet". The node's own firewall is ready immediately
 either way — it is only firewalling itself, and nothing routes to the
@@ -249,12 +303,12 @@ address is routed to its node and its name appears in every other node's
 hosts file.
 
 ```sh
-wireserve-agent serve openobserve 80:5080          # openobserve.wg:80 -> :5080
-wireserve-agent serve mydns 53/udp 53/tcp 8080:8000 # several ports, TCP and UDP
-wireserve-agent serve plex 32400                    # a bare port maps to itself
-wireserve-agent serve myrouter 443:192.168.178.1:80 # a device on this node's LAN, see below
-wireserve-agent list                    # what this node sees right now (--json for scripts)
-wireserve-agent unserve plex
+wireserve serve openobserve 80:5080          # openobserve.wg:80 -> :5080
+wireserve serve mydns 53/udp 53/tcp 8080:8000 # several ports, TCP and UDP
+wireserve serve plex 32400                    # a bare port maps to itself
+wireserve serve myrouter 443:192.168.178.1:80 # a device on this node's LAN, see below
+wireserve list                    # what this node sees right now (--json for scripts)
+wireserve unserve plex
 ```
 
 Each `PORT` is `[PUBLIC:][ADDRESS:]TARGET[/tcp|/udp]` (TCP unless given;
@@ -327,7 +381,7 @@ A mapping can name an IPv4 address the node reaches, such as a router,
 NAS or printer that can't run an agent itself:
 
 ```sh
-wireserve-agent serve myrouter 443:192.168.178.1:80   # myrouter.wg:443 -> the router's :80
+wireserve serve myrouter 443:192.168.178.1:80   # myrouter.wg:443 -> the router's :80
 ```
 
 The node forwards `myrouter.wg:443` to `192.168.178.1:80`, and the device
@@ -387,7 +441,7 @@ at a node that can carry traffic for it and the whole mesh range is routed
 there instead, so new nodes and services just work:
 
 ```sh
-wireserve-admin approve-transit vps1      # and `wireserve-agent transit on` on vps1
+wireserve-admin approve-transit vps1      # and `wireserve transit on` on vps1
 wireserve-admin export-config myphone --gateway vps1 --qr
 ```
 
@@ -458,8 +512,8 @@ URLs, and anything with a single configured one (Gitea's `ROOT_URL`, Grafana's
 **Publishing on TCP 443 is what asks for a name with TLS:**
 
 ```sh
-wireserve-agent serve plex 443:32400   # plex.int.example.com, via the proxy
-wireserve-agent serve prom 80:9090     # prom.int.example.com, direct
+wireserve serve plex 443:32400   # plex.int.example.com, via the proxy
+wireserve serve prom 80:9090     # prom.int.example.com, direct
 ```
 
 | Published on | Resolves to | From a node | From a phone |
@@ -477,8 +531,8 @@ not HTTP ever gets a hostname or a certificate it did not ask for.
 On the proxy node, publish the proxy itself and run the agent with it:
 
 ```sh
-wireserve-agent serve web 443:8443
-wireserve-agent daemon --proxy caddy
+wireserve serve web 443:8443
+wireserve daemon --proxy caddy
 ```
 
 The agent then writes one matcher and one handler per 443 service into
@@ -490,7 +544,7 @@ changes, ever.
 Two things to get right:
 
 - **Point the wildcard DNS record at the proxy's *service* address**, the one
-  `wireserve-agent list` shows — not at the node's mesh address. The firewall
+  `wireserve list` shows — not at the node's mesh address. The firewall
   opens `service:443` and deliberately refuses `node:443`, so a record aimed
   at the node is dropped by that node's own firewall.
 - **Caddy needs a custom build** for the wildcard certificate: the stock
@@ -581,7 +635,7 @@ its own address. The gateway opts in first, as it did for transit, because
 the traffic leaves under *its* public IP:
 
 ```sh
-wireserve-agent exit on                           # on the gateway, besides `transit on`
+wireserve exit on                           # on the gateway, besides `transit on`
 wireserve-admin export-config myphone --gateway vps1 --exit --dns 9.9.9.9 --qr
 ```
 
@@ -608,7 +662,7 @@ not just HTTP ones**. A resolver that runs on a node reads that node's
 `/etc/hosts`, where the agent writes every service's name:
 
 ```sh
-wireserve-agent serve dns 53:53/udp 53:53/tcp     # on the node running the resolver
+wireserve serve dns 53:53/udp 53:53/tcp     # on the node running the resolver
 wireserve-admin approve-service homeserver dns
 wireserve-admin export-config myphone --gateway vps1 --exit --dns dns --refresh --qr
 ```
@@ -697,8 +751,8 @@ default.** Its own operator opts in, so a node with a data cap, say, is
 never used; and the mesh admin approves it as a carrier:
 
 ```sh
-wireserve-agent transit on   # on the node: willing to carry traffic for others
-wireserve-agent transit off  # stop — takes effect on the next poll, no rejoin
+wireserve transit on   # on the node: willing to carry traffic for others
+wireserve transit off  # stop — takes effect on the next poll, no rejoin
 
 wireserve-admin approve-transit homeserver   # on the admin side: trusted to
 wireserve-admin deny-transit homeserver      # withdraw it again
@@ -710,13 +764,13 @@ a carrier sees the mesh-layer plaintext of whatever pairs route through
 it, and can send packets that appear to come from either end. What a node
 says about itself (that it is willing, which peers it reaches) cannot be
 verified, so without approval a single compromised node could offer to
-carry every pair in the mesh. Until it is approved, `wireserve-agent
+carry every pair in the mesh. Until it is approved, `wireserve
 list` on that node says `Transit: on, waiting for an admin to approve
 this node as a carrier`. Revoking or rejoining a node withdraws its
 approval, and `list-peers` shows who currently has one
 (`transit=approved`).
 
-`wireserve-agent list` shows the outcome, both for a peer this node can't
+`wireserve list` shows the outcome, both for a peer this node can't
 reach directly and for what this node is carrying on others' behalf:
 
 ```
@@ -735,19 +789,21 @@ has failed.
 
 ## Command reference
 
-On a node, talking to the local daemon over a Unix socket:
+On a node, talking to the local daemon over a Unix socket. `install`, `join`
+and `daemon` need root; the others need only access to the socket, which
+members of the `wireserve` group have (see "Using it without sudo"):
 
 | Command | What it does |
 | --- | --- |
-| `wireserve-agent install <url> [--instance name]` | installs the binary + systemd unit, then joins — one command, needs root |
-| `wireserve-agent join [url] [token]` | one-time bootstrap, generates the keypair — prompts for either if omitted |
-| `wireserve-agent serve <name> <[public:][address:]target[/tcp\|/udp]>...` | publish a service on its own address — on this node, or on an address it reaches |
-| `wireserve-agent daemon --proxy caddy` | publish this mesh's 443 services as vhosts on the reverse proxy running here |
-| `wireserve-agent unserve <name>` | withdraw one |
-| `wireserve-agent transit on\|off` | opt in/out of carrying traffic for two other nodes that can't reach each other directly (also needs `approve-transit`) |
-| `wireserve-agent exit on\|off` | opt in/out of sending the internet traffic of devices exported with `--exit` through this node (also needs `transit on` and approval) |
-| `wireserve-agent list [--json]` | services (name, address, ports, owner, state), peers (with each one's route — direct or via a carrier) and anything not published, from the last poll |
-| `wireserve-agent leave` | tear down interface, firewall, hosts block |
+| `wireserve install <url> [--instance name]` | installs the binary + systemd unit, then joins — one command, needs root |
+| `wireserve join [url] [token]` | one-time bootstrap, generates the keypair — prompts for either if omitted |
+| `wireserve serve <name> <[public:][address:]target[/tcp\|/udp]>...` | publish a service on its own address — on this node, or on an address it reaches |
+| `wireserve daemon --proxy caddy` | publish this mesh's 443 services as vhosts on the reverse proxy running here |
+| `wireserve unserve <name>` | withdraw one |
+| `wireserve transit on\|off` | opt in/out of carrying traffic for two other nodes that can't reach each other directly (also needs `approve-transit`) |
+| `wireserve exit on\|off` | opt in/out of sending the internet traffic of devices exported with `--exit` through this node (also needs `transit on` and approval) |
+| `wireserve list [--json]` | services (name, address, ports, owner, state), peers (with each one's route — direct or via a carrier) and anything not published, from the last poll |
+| `wireserve leave` | tear down interface, firewall, hosts block |
 
 Against the admin port (loopback-only by default; run from the coordinator
 host, or point `--coordinator-url`/`WIRESERVE_COORDINATOR_URL` at it from
@@ -787,7 +843,7 @@ cargo build --workspace
 No special system dependencies beyond a C toolchain (for `rusqlite`'s
 bundled SQLite in the coordinator).
 
-At **runtime**, `wireserve-agent` needs the `nft` binary (the `nftables`
+At **runtime**, `wireserve` needs the `nft` binary (the `nftables`
 package on Debian/Ubuntu/Fedora/Arch) at `/usr/sbin/nft`, `/sbin/nft`,
 `/usr/bin/nft` or `/bin/nft` — it manages its firewall through nft's JSON
 API and refuses to start without it. The container image already includes
@@ -844,7 +900,9 @@ Set `--endpoint-addr` on nodes that have a stable reachable address rather
 than relying on the guess.
 
 The agent needs `CAP_NET_ADMIN` and `/dev/net/tun`, and in a container it
-needs host networking, or the mesh exists only inside that container.
+needs host networking, or the mesh exists only inside that container. The
+systemd unit also grants `CAP_CHOWN`, which it uses for one thing: handing
+its socket to the `wireserve` group.
 
 ### Two conflicts worth checking before the first start
 
@@ -951,15 +1009,15 @@ one) by running one agent *instance* per mesh. The plain unit runs the
 default instance; name the others:
 
 ```sh
-sudo wireserve-agent install https://wireserve.example.com --instance work
-sudo wireserve-agent --instance work serve git 3000
-sudo wireserve-agent --instance work list
+sudo wireserve install https://wireserve.example.com --instance work
+wireserve --instance work serve git 3000     # no sudo needed once you are in the group
+wireserve --instance work list
 ```
 
 Or, by hand:
 
 ```sh
-sudo wireserve-agent --instance work join          # prompts, as above
+sudo wireserve --instance work join          # prompts, as above
 sudo systemctl enable --now wireserve-agent@work   # deploy/systemd/wireserve-agent@.service
 ```
 
@@ -974,6 +1032,9 @@ separate node with its own:
 | listen port | first free from 51820 | next free from 51820 |
 | nftables | `inet wireserve.<if>`, `inet wireserve-interop.<if>` | same, for its interface |
 | hosts file | `# BEGIN WIRESERVE` block | `# BEGIN WIRESERVE work` block |
+
+Each instance's socket is shared with the `wireserve` group separately, by
+that instance's own daemon, so one group covers all of them.
 
 Instances leave each other alone: each keeps, rewrites and removes only
 its own table, hosts block and host-firewall rules. Another instance's
@@ -1013,6 +1074,6 @@ Debian release the binary will run on is what keeps that honest.
 
 ```sh
 podman build -f deploy/docker/coordinator.Dockerfile -t wireserve-coordinator .
-podman build -f deploy/docker/agent.Dockerfile -t wireserve-agent .
+podman build -f deploy/docker/agent.Dockerfile -t wireserve-agent .   # the image runs /usr/local/bin/wireserve
 podman builder prune --all   # if a build ever looks like it reused something stale
 ```

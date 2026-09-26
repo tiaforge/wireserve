@@ -496,7 +496,7 @@ doesn't stall or drift:
    WireGuard handshake observation.
 4. **Unix socket protocol (agent-local, §4.6)**: newline-delimited JSON,
    one request/response per connection.
-5. **Agent bootstrap command**: `wireserve-agent join <coordinator-url>
+5. **Agent bootstrap command**: `wireserve join <coordinator-url>
    <join-token>` (name not given in spec's §4.6 list, which only covers
    post-join usage).
 6. **Migrations**: `rusqlite_migration` from day one, even though v1 has
@@ -1773,7 +1773,7 @@ filter — no new relay server, no new protocol, no port pool.
     `None` on purpose — an admin isn't "a requester" polling on behalf of
     a specific node, so there is no requester to compute it relative to.
 
-102. **Opt-in is a live IPC toggle, not a join-time flag** — `wireserve-agent
+102. **Opt-in is a live IPC toggle, not a join-time flag** — `wireserve
     transit on|off`, `IpcRequest::TransitCapable`, `AgentState::transit_capable`
     (`#[serde(default)]`) — same shape as `serve`/`unserve`: mutates the
     running daemon directly, takes effect next poll, no rejoin. Motivated
@@ -1963,7 +1963,7 @@ because deleting the row frees its addresses back to the allocator.
     `transit_capable`, captured once at daemon start
     (`HostInterop::start`), while the coordinator-driven forwarding path is
     not gated on local opt-in at all. A node approved as a gateway but never
-    switched on with `wireserve-agent transit on` would accept the forward
+    switched on with `wireserve transit on` would accept the forward
     in its own nftables table while ufw or firewalld still dropped it —
     invisible from every other node. Rather than make `forward_wanted`
     dynamic, `set-gateway` refuses a node that is not *currently* reporting
@@ -2054,7 +2054,7 @@ plan it started from.
 
 121. **A proxy failure is a warning, never a failed step.** `run_once` returns
     before persisting `last_directory` when any step fails, so folding the
-    proxy into `failures` would freeze `wireserve-agent list` on a stale
+    proxy into `failures` would freeze `wireserve list` on a stale
     directory whenever Caddy was down — a baffling symptom for an unrelated
     cause. The proxy is a convenience layer on a working mesh and must not
     degrade the mesh's own bookkeeping. It is retried every cycle regardless,
@@ -2589,7 +2589,7 @@ cannot carry a per-service `header_up`, so the README suggests a hand-written
     written, which is how the old test passed while the feature did nothing.
 
 146. **Two consents, and no new admin verb.** The gateway opts in locally
-    with `wireserve-agent exit on`, reported every poll as `exit_capable`
+    with `wireserve exit on`, reported every poll as `exit_capable`
     and tracked in memory beside the transit report
     (`TransitState::report_exit`), like `transit on`. The device side is
     the admin's `export-config --exit`, which already is a per-device admin
@@ -2771,3 +2771,62 @@ profile) **passes** as of 2026-09-25, with the rest of the suite.
     TCP 443 with an address of its own, and for the proxy itself. Turning a
     mark off is never refused. What it cannot catch is a later downgrade;
     the README says not to.
+
+## M30 — the command is `wireserve`, and a group can use it without sudo
+
+162. **Only the binary is renamed.** The CLI is typed constantly and the spec
+    (§4.6) already called it `wireserve`; the crate stays `wireserve-agent`
+    (`[[bin]] name = "wireserve"`, so `wireserve_agent::` paths are
+    untouched) and so do the systemd unit, its template and the quadlet.
+    The unit names the daemon, and renaming it would break
+    `systemctl restart wireserve-agent` on every running deployment for
+    nothing. `wireserve-coordinator` and `wireserve-admin` are unchanged.
+    `install` writes `/usr/local/bin/wireserve` and a unit whose
+    `ExecStart` points at it. An already-joined node upgrades by copying the
+    binary and the two unit files and restarting (`install` would join
+    again); README has the commands. **`install` does not remove an existing
+    `/usr/local/bin/wireserve-agent`** (the user's call: never delete a
+    file silently); it says the file is now unused and leaves it. A daemon
+    already running keeps its old binary until restarted.
+
+163. **A group, decided by file permissions alone.** Nothing in the IPC
+    protocol depends on the caller being root; the socket was `0600` in a
+    `0700` directory only because nobody had needed otherwise. Now, if a
+    group named `wireserve` (`WIRESERVE_SOCKET_GROUP` renames it, empty
+    disables) exists when the daemon binds, the socket is `0660` and its
+    directory `0750`, both `root:wireserve`; otherwise exactly as before, so
+    existing deployments and containers change nothing. The directory is
+    opened to the group only after the socket is final, so the group never
+    reaches a socket with default permissions. The group is looked up once,
+    at bind: `install` creates it before starting the unit, and a daemon
+    started before the group existed needs a restart.
+
+164. **Why not a per-request check, or a world-writable socket.**
+    `SO_PEERCRED` reports only a peer's *primary* gid, and `usermod -aG`
+    grants supplementary groups, so a gid check in the daemon would refuse
+    the very users it is for. The kernel's own permission check on the
+    socket handles supplementary groups correctly. A world-writable socket
+    would let any local account `leave` the mesh or publish a service. A
+    second, read-only socket for `list` was declined: it costs client
+    fallback logic and buys little on a single-user node.
+
+165. **What membership grants.** Everything the socket does: `serve`,
+    `unserve`, `transit`, `exit`, `list`, `leave`. Approval still lives at
+    the coordinator, and keys and the bearer token stay in the root-only
+    state file, so a member is a node operator, comparable to the `docker`
+    group, not a way around the coordinator. `daemon`, `install` and `join`
+    stay root: they write the 0700 state directory and bring up the
+    interface.
+
+166. **`CAP_CHOWN` joins the unit's bounding set.** Changing a file's group
+    to one the caller is not a member of needs it; root inside the unit has
+    only what the bounding set allows. The set is documented as informational
+    already (`CAP_DAC_OVERRIDE` makes it no real reduction), so this costs
+    nothing further. If the chown fails anyway (a unit from before this,
+    without the capability) the daemon warns and keeps a root-only socket
+    instead of losing its IPC. `PermissionDenied` on connect is now reported as such
+    ("run with sudo, or join the `wireserve` group") instead of "is it
+    running?". A container sees no host groups, so it stays root-only.
+    `run-multi-instance-test.sh` gained a step that restarts one instance
+    with a group and checks a supplementary-group member succeeds and an
+    outsider gets the message (needs root; not run when this was written).

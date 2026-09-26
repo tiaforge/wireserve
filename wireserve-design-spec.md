@@ -38,7 +38,7 @@ wireserve/
 ├── crates/
 │   ├── wireserve-types/       # shared structs, serde, shared between coordinator & agent
 │   ├── wireserve-coordinator/ # axum + sqlite binary
-│   ├── wireserve-agent/       # daemon + CLI binary (serve/unserve/list/leave)
+│   ├── wireserve-agent/       # daemon + CLI; the binary is `wireserve`
 │   └── wireserve-admin/       # separate CLI binary — distinct trust surface
 │                               # (authward-delegated, not the agent's bearer
 │                               # token), kept out of wireserve-agent so the
@@ -340,6 +340,14 @@ wireserve leave                           # tears down interface, firewall, host
 `serve`/`unserve` talk to the running agent over a local Unix socket
 (`/run/wireserve/agent.sock`), which is also what `list` reads from.
 
+The socket is root-only (0600, in a 0700 directory) unless a `wireserve`
+group exists when the daemon starts; then it is 0660 and 0750, owned by
+that group, and its members can run every command above as themselves.
+Membership means "operator of this node" (they can publish, withdraw and
+`leave`, but approval still happens at the coordinator, and keys never
+leave the root-only state file). `daemon`, `install` and `join` need root.
+The binary is `wireserve`; the systemd unit remains `wireserve-agent`.
+
 ---
 
 ## 5. Firewall rule derivation
@@ -531,7 +539,7 @@ These are treated as core requirements, not hardening to add later:
 
 Not every peer needs to run the agent. A laptop, desktop, or phone that
 only wants to *reach* declared services — never host one itself, never
-need firewall or hosts-file sync — doesn't need `wireserve-agent` at all.
+need firewall or hosts-file sync — doesn't need `wireserve` at all.
 `wireserve-admin` generates a standard WireGuard `.conf` for import into
 whatever official WireGuard client fits the device (Windows/macOS/Linux
 desktop app, or the Android/iOS app; import by file or QR scan). No native

@@ -131,7 +131,7 @@ pub struct RegisterRequest {
     pub reflexive_addr: Option<String>,
     /// This node's own opt-in to carry transit traffic for other peers
     /// (PLAN.md M23) — always `false` at join time. Opt-in is a live,
-    /// post-join operational decision (`wireserve-agent transit on`), not
+    /// post-join operational decision (`wireserve transit on`), not
     /// an identity fact resolved once at bootstrap, so registration never
     /// reports anything but the default.
     #[serde(default)]
@@ -271,11 +271,11 @@ pub struct PollRequest {
     /// This node's own live opt-in to carry transit traffic (PLAN.md
     /// M23) — see `RegisterRequest::transit_capable`. Resent every poll,
     /// same as every other self-reported field, since it's a live toggle
-    /// (`wireserve-agent transit on/off`) rather than a one-time fact.
+    /// (`wireserve transit on/off`) rather than a one-time fact.
     #[serde(default)]
     pub transit_capable: bool,
     /// This node's own live opt-in to be an exit for the devices that use
-    /// it as their gateway (PLAN.md M27, `wireserve-agent exit on/off`).
+    /// it as their gateway (PLAN.md M27, `wireserve exit on/off`).
     /// Separate from `transit_capable`: forwarding between mesh members
     /// is one consent, sending a device's traffic to the internet under
     /// this node's own public address is another. Absent when false, so
@@ -465,7 +465,7 @@ pub struct PollResponse {
     /// offer. A self-reported offer is never enough on its own: a carrier
     /// sees the traffic it relays in the clear and can send packets as
     /// either end, so only an admin decides who may be one. Reported so
-    /// `wireserve-agent list` can say why the node never carries
+    /// `wireserve list` can say why the node never carries
     /// anything; absent from the JSON when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub transit_awaiting_approval: bool,
@@ -655,7 +655,7 @@ pub struct AdminPeersResponse {
     /// Both are needed to pick a gateway, and neither implies the other:
     /// approval is the mesh admin's trust, this is whether the daemon is
     /// actually set up to forward. A node approved but never switched on
-    /// with `wireserve-agent transit on` never opened its host firewall's
+    /// with `wireserve transit on` never opened its host firewall's
     /// forward hook, so it would accept the forward in its own table while
     /// ufw or firewalld dropped it. Reported here so that is caught before
     /// anything is created rather than after.
@@ -670,7 +670,7 @@ pub struct AdminPeersResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub via_gateway: Vec<String>,
     /// Names of the nodes whose most recent poll offered to be an exit
-    /// (`wireserve-agent exit on`, PLAN.md M27), approved for transit or
+    /// (`wireserve exit on`, PLAN.md M27), approved for transit or
     /// not — the export checks both. Empty from a coordinator that predates
     /// exits, which makes `export-config --exit` refuse rather than write a
     /// profile nothing would forward.

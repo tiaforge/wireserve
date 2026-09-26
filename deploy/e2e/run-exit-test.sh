@@ -178,26 +178,26 @@ create_node() { admin create-node "$1" | grep -oE 'jtk_[a-f0-9]+'; }
 log "joining the agents"
 JT_GW=$(create_node node-gw)
 JT_HOME=$(create_node node-home)
-podman exec "$GW" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_GW" \
+podman exec "$GW" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_GW" \
     --listen-port "$WG_PORT" --endpoint-addr "$GW_IP:$WG_PORT" 2>/dev/null
-podman exec "$HOME_AGENT" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_HOME" \
+podman exec "$HOME_AGENT" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_HOME" \
     --listen-port "$WG_PORT" 2>/dev/null
 for a in "$GW" "$HOME_AGENT"; do
-    podman exec -d "$a" wireserve-agent daemon --poll-interval-secs 5
+    podman exec -d "$a" wireserve daemon --poll-interval-secs 5
 done
 sleep 15
 pass "both agents registered and polling"
 
 # The LAN host routes the mesh back through the gateway, so only the exit's
 # own refusal can stop the phone reaching it.
-MESH_V4=$(podman exec "$GW" wireserve-agent list --json \
+MESH_V4=$(podman exec "$GW" wireserve list --json \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(p['ip4'] for p in d['peers'] if p['name']=='node-gw'))")
 MESH_NET="${MESH_V4%.*}.0/24"
 in_netns "$LAN_HOST" ip route replace "$MESH_NET" via "$GW_LAN_IP" >/dev/null
 
 log "a service on the home node, and a resolver on the gateway"
-podman exec "$HOME_AGENT" wireserve-agent serve svc-home 12345 tcp
-podman exec "$GW" wireserve-agent serve dns 53:53/udp 53:53/tcp
+podman exec "$HOME_AGENT" wireserve serve svc-home 12345 tcp
+podman exec "$GW" wireserve serve dns 53:53/udp 53:53/tcp
 sleep 8
 admin approve-service node-home svc-home || fail "could not approve svc-home"
 admin approve-service node-gw dns || fail "could not approve dns"
@@ -216,7 +216,7 @@ in_netns_bg "$HOME_AGENT" "$DEBUG_IMG" nc -l -k -p 12345
 echo "svc-home.wg=$SVC_HOME  dns.wg=$DNS_VIP"
 
 log "making node-gw a gateway"
-podman exec "$GW" wireserve-agent transit on
+podman exec "$GW" wireserve transit on
 admin approve-transit node-gw || fail "could not approve node-gw for transit"
 sleep 10
 
@@ -231,7 +231,7 @@ grep -q "exit on" "$OUT/refused.log" || { cat "$OUT/refused.log"; fail "the refu
 pass "refused, naming \`exit on\`"
 
 log "2/9: two profiles, one key"
-podman exec "$GW" wireserve-agent exit on
+podman exec "$GW" wireserve exit on
 sleep 10
 admin export-config phone --gateway node-gw --exit --dns dns --out /tmp/phone.conf \
     --register-url "http://127.0.0.1:47820" \
@@ -272,7 +272,7 @@ PHONE_IP4=$(grep '^Address' "$OUT/phone.conf" | sed 's/Address = //; s#/32.*##')
 # packets go: in on the mesh, out on the egress, back, or nowhere.
 exit_diagnostics() {
     note "gateway agent's view:"
-    podman exec "$GW" wireserve-agent list --json \
+    podman exec "$GW" wireserve list --json \
         | python3 -c "import json,sys; d=json.load(sys.stdin); print({k: d.get(k) for k in ('transit_capable','exit_capable','exit_clients')})" || true
     note "gateway sysctls:"
     in_netns "$GW" sh -c 'for f in all wireserve0 '"$GW_INET_IF"'; do echo "$f ipv4 forwarding=$(cat /proc/sys/net/ipv4/conf/$f/forwarding) rp_filter=$(cat /proc/sys/net/ipv4/conf/$f/rp_filter)"; done' || true
@@ -341,7 +341,7 @@ in_netns "$GW" iptables -S FORWARD | grep -q "0x2000000/0x2000000" \
 pass "FORWARD DROP opened for exit-marked flows"
 
 log "9/9: exit off"
-podman exec "$GW" wireserve-agent exit off
+podman exec "$GW" wireserve exit off
 sleep 12
 if tcp_line "$PHONE" "$WEB_IP" 8080 >/dev/null 2>&1; then
     fail "the phone still reaches the internet after \`exit off\`"

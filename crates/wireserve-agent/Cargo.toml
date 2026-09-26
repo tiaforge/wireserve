@@ -5,6 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+# The package keeps its name (the library, `wireserve_agent`, and every path
+# dependency on it); the command people type is just `wireserve`. The systemd
+# unit stays `wireserve-agent`: it names the daemon, not the command.
+[[bin]]
+name = "wireserve"
+path = "src/main.rs"
+
 [dependencies]
 wireserve-types.workspace = true
 serde.workspace = true

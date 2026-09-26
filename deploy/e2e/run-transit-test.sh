@@ -187,14 +187,14 @@ log "joining the three nodes"
 JT1=$(create_node node1)
 JT2=$(create_node node2)
 JT4=$(create_node node4)
-podman exec "$AGENT1" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT1" \
+podman exec "$AGENT1" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT1" \
     --listen-port "$WG_PORT" --endpoint-addr "$ROUTER_A_WAN:$WG_PORT" 2>/dev/null
-podman exec "$AGENT2" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT2" --listen-port "$WG_PORT" 2>/dev/null
-podman exec "$AGENT4" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT4" --listen-port "$WG_PORT" 2>/dev/null
+podman exec "$AGENT2" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT2" --listen-port "$WG_PORT" 2>/dev/null
+podman exec "$AGENT4" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT4" --listen-port "$WG_PORT" 2>/dev/null
 pass "all three nodes registered"
 
 for a in "$AGENT1" "$AGENT2" "$AGENT4"; do
-    podman exec -d "$a" wireserve-agent daemon --poll-interval-secs 5
+    podman exec -d "$a" wireserve daemon --poll-interval-secs 5
 done
 log "waiting for poll cycles and WireGuard handshakes (transit still off everywhere)"
 sleep 20
@@ -213,8 +213,8 @@ AGENT2_WG_BASELINE=$(in_netns "$AGENT2" cat /proc/sys/net/ipv4/conf/wireserve0/f
 AGENT4_WG_BASELINE=$(in_netns "$AGENT4" cat /proc/sys/net/ipv4/conf/wireserve0/forwarding 2>/dev/null || echo "?")
 
 log "declaring a service on agent2 and agent4"
-podman exec "$AGENT2" wireserve-agent serve svc-two 12345 tcp
-podman exec "$AGENT4" wireserve-agent serve svc-four 12345 tcp
+podman exec "$AGENT2" wireserve serve svc-two 12345 tcp
+podman exec "$AGENT4" wireserve serve svc-four 12345 tcp
 sleep 8
 podman exec "$COORD" wireserve-admin approve-service node2 svc-two || fail "could not approve svc-two"
 podman exec "$COORD" wireserve-admin approve-service node4 svc-four || fail "could not approve svc-four"
@@ -244,14 +244,14 @@ fi
 pass "agent2 and agent4 cannot reach each other directly — this is the case transit exists for"
 
 log "opting agent1 in as transit"
-podman exec "$AGENT1" wireserve-agent transit on
+podman exec "$AGENT1" wireserve transit on
 log "approving node1 as a carrier (the node's own opt-in is not enough on its own)"
 podman exec "$COORD" wireserve-admin approve-transit node1 || fail "could not approve node1 for transit"
 log "waiting for transit selection to propagate (up to one poll interval each side)"
 sleep 20
 
 log "confirming the coordinator names agent1 as transit_via for this pair"
-NODE2_TRANSIT_VIA=$(podman exec "$AGENT4" wireserve-agent list --json \
+NODE2_TRANSIT_VIA=$(podman exec "$AGENT4" wireserve list --json \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(next((p.get('transit_via') or '' for p in d['peers'] if p.get('name')=='node2'), ''))")
 [ -n "$NODE2_TRANSIT_VIA" ] || fail "agent4's poll response never got a transit_via for node2"
 pass "agent4 was told to route to node2 via a transit carrier"
@@ -269,9 +269,9 @@ else
 fi
 
 log "confirming agent2 has no kernel peer entry for agent4 at all"
-AGENT4_PUBKEY=$(podman exec "$AGENT4" wireserve-agent list --json \
+AGENT4_PUBKEY=$(podman exec "$AGENT4" wireserve list --json \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(next((p.get('pubkey') for p in d['peers'] if p.get('name')=='node4'), ''))")
-AGENT2_PUBKEY=$(podman exec "$AGENT2" wireserve-agent list --json \
+AGENT2_PUBKEY=$(podman exec "$AGENT2" wireserve list --json \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(next((p.get('pubkey') for p in d['peers'] if p.get('name')=='node2'), ''))")
 if in_netns "$AGENT2" wg show wireserve0 allowed-ips | grep -q "$AGENT4_PUBKEY"; then
     fail "agent2 has its own kernel peer entry for agent4 — AllowedIPs redirection did not take effect"
@@ -315,7 +315,7 @@ done
 pass "the two nodes that never opted in have their forwarding posture completely untouched"
 
 log "toggling transit off on agent1 mid-run"
-podman exec "$AGENT1" wireserve-agent transit off
+podman exec "$AGENT1" wireserve transit off
 sleep 20
 in_netns_bg "$AGENT2" nc -l -k -p 12345
 in_netns_bg "$AGENT4" nc -l -k -p 12345

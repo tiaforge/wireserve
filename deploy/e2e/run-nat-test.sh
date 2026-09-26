@@ -203,26 +203,26 @@ JT2=$(create_node node2)
 JT3=$(create_node node3)
 # agent1 knows its public endpoint, because somebody configured the
 # port-forward and told it so. This is the normal home-server case.
-podman exec "$AGENT1" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT1" \
+podman exec "$AGENT1" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT1" \
     --listen-port "$WG_PORT" --endpoint-addr "$ROUTER_A_WAN:$WG_PORT" 2>/dev/null
 # agent2 and agent3 do not: they are behind NAT with nothing forwarded, so
 # they leave it unset and the coordinator falls back to the source address
 # it observes (spec §4.2).
-podman exec "$AGENT2" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT2" --listen-port "$WG_PORT" 2>/dev/null
-podman exec "$AGENT3" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT3" --listen-port "$WG_PORT" 2>/dev/null
+podman exec "$AGENT2" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT2" --listen-port "$WG_PORT" 2>/dev/null
+podman exec "$AGENT3" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT3" --listen-port "$WG_PORT" 2>/dev/null
 pass "all three nodes registered from behind NAT"
 
 log "what endpoint did the coordinator record for each node?"
 podman exec "$COORD" wireserve-admin list-peers | while read -r line; do echo "  $line"; done
 
 for a in "$AGENT1" "$AGENT2" "$AGENT3"; do
-    podman exec -d "$a" wireserve-agent daemon --poll-interval-secs 5
+    podman exec -d "$a" wireserve daemon --poll-interval-secs 5
 done
 log "waiting for poll cycles and WireGuard handshakes"
 sleep 20
 
 mesh_ip_of() {
-    podman exec "$1" wireserve-agent list --json | python3 -c "
+    podman exec "$1" wireserve list --json | python3 -c "
 import json, sys
 peers = json.load(sys.stdin).get('peers', [])
 m = [p['ip4'] for p in peers if p.get('name') == '$2']
@@ -238,9 +238,9 @@ echo "node1 mesh address: $AGENT1_MESH"
 echo "node2 mesh address: $AGENT2_MESH"
 
 log "declaring a service on each of agent1 and agent2"
-podman exec "$AGENT1" wireserve-agent serve svc-one 12345 tcp
-podman exec "$AGENT2" wireserve-agent serve svc-two 12345 tcp
-podman exec "$AGENT3" wireserve-agent serve svc-three 12345 tcp
+podman exec "$AGENT1" wireserve serve svc-one 12345 tcp
+podman exec "$AGENT2" wireserve serve svc-two 12345 tcp
+podman exec "$AGENT3" wireserve serve svc-three 12345 tcp
 sleep 8
 # Service approval is on by default. This harness is about NAT traversal,
 # not about the approval gate (run-e2e-test.sh covers that), so approve

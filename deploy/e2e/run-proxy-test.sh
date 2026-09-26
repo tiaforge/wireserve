@@ -170,14 +170,14 @@ log "joining both nodes over HTTPS through the proxy"
 JT1=$(create_node node1)
 JT2=$(create_node node2)
 URL="https://$HOSTNAME_FQDN"
-podman exec "$AGENT1" wireserve-agent join "$URL" "$JT1" --listen-port 51820 \
+podman exec "$AGENT1" wireserve join "$URL" "$JT1" --listen-port 51820 \
     || fail "agent1 could not register over HTTPS through the proxy"
-podman exec "$AGENT2" wireserve-agent join "$URL" "$JT2" --listen-port 51821 \
+podman exec "$AGENT2" wireserve join "$URL" "$JT2" --listen-port 51821 \
     || fail "agent2 could not register over HTTPS through the proxy"
 pass "both nodes registered over TLS with a validated certificate"
 
 log "checking no plaintext warning was printed for an https:// URL"
-OUT=$(podman exec "$AGENT1" wireserve-agent join "$URL" "jtk_bogus" --listen-port 51820 2>&1 || true)
+OUT=$(podman exec "$AGENT1" wireserve join "$URL" "jtk_bogus" --listen-port 51820 2>&1 || true)
 if echo "$OUT" | grep -qi "over plain HTTP"; then
     fail "the plaintext-HTTP warning fired for an https:// URL"
 fi
@@ -203,17 +203,17 @@ log "checking the two agents get separate rate-limit budgets behind one proxy"
 # Burn agent1's budget with bad bearer tokens, then confirm agent2 is
 # unaffected. Keyed on the proxy's address these would share one bucket.
 for _ in $(seq 1 12); do
-    podman exec "$AGENT1" wireserve-agent join "$URL" "jtk_deliberately_wrong" \
+    podman exec "$AGENT1" wireserve join "$URL" "jtk_deliberately_wrong" \
         --listen-port 51820 >/dev/null 2>&1 || true
 done
 JT3=$(create_node node3)
-podman exec "$AGENT2" wireserve-agent join "$URL" "$JT3" --listen-port 51822 \
+podman exec "$AGENT2" wireserve join "$URL" "$JT3" --listen-port 51822 \
     || fail "agent2 was rate-limited by agent1's failures — the budget is being shared"
 pass "one agent burning its budget does not block the other behind the same proxy"
 
 log "both agents poll successfully through the proxy"
-podman exec -d "$AGENT1" sh -c "wireserve-agent daemon --poll-interval-secs 5 >/tmp/daemon.log 2>&1"
-podman exec -d "$AGENT2" sh -c "wireserve-agent daemon --poll-interval-secs 5 >/tmp/daemon.log 2>&1"
+podman exec -d "$AGENT1" sh -c "wireserve daemon --poll-interval-secs 5 >/tmp/daemon.log 2>&1"
+podman exec -d "$AGENT2" sh -c "wireserve daemon --poll-interval-secs 5 >/tmp/daemon.log 2>&1"
 sleep 15
 for a in node1 node2; do
     podman exec "$COORD" wireserve-admin list-peers | grep -q "^$a" \
@@ -228,7 +228,7 @@ done
 # that was not stripped first.
 coord_events() { podman logs "$COORD" 2>&1 | grep -c "service_declared" || true; }
 POLLED=$(coord_events)
-podman exec "$AGENT1" wireserve-agent serve proxysvc 9999 tcp \
+podman exec "$AGENT1" wireserve serve proxysvc 9999 tcp \
     || fail "could not declare a service on agent1"
 sleep 8
 POLLED_AFTER=$(coord_events)

@@ -1,5 +1,7 @@
 //! Unix-socket IPC server backing `serve`/`unserve`/`list`/`leave` (§4.6).
-//! One request/response per connection, newline-delimited JSON.
+//! One request/response per connection, newline-delimited JSON. Who may
+//! connect is decided by the socket's file permissions alone (see `serve`):
+//! root, plus the members of the `wireserve` group when there is one.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -206,7 +208,7 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
                 return (
                     IpcResponse::error(format!(
                         "this node already declares {} services, which is the limit \
-                         ({}); withdraw one with `wireserve-agent unserve <name>` first",
+                         ({}); withdraw one with `wireserve unserve <name>` first",
                         state.declared_services.len(),
                         wireserve_types::MAX_SERVICES_PER_NODE
                     )),
@@ -300,20 +302,76 @@ where
     let _ = write_half.write_all(out.as_bytes()).await;
 }
 
+/// The group the daemon's socket is shared with when it exists on this
+/// host, and the variable that renames it (empty disables sharing).
+pub const SOCKET_GROUP_ENV: &str = "WIRESERVE_SOCKET_GROUP";
+pub const DEFAULT_SOCKET_GROUP: &str = "wireserve";
+
+/// The group to share the socket with: `$WIRESERVE_SOCKET_GROUP` (default
+/// `wireserve`), if that group exists. Absent means root-only, which is what
+/// every deployment had before the group did, and what a container gets, as
+/// it does not see the host's groups.
+pub fn socket_group() -> Option<(String, u32)> {
+    let name = socket_group_name()?;
+    let gid = lookup_group(&name)?;
+    Some((name, gid))
+}
+
+/// The configured group's name, whether or not it exists yet; `None` when
+/// sharing is switched off. `install` uses it to create the group.
+pub fn socket_group_name() -> Option<String> {
+    match std::env::var(SOCKET_GROUP_ENV) {
+        Ok(v) if v.is_empty() => None,
+        Ok(v) => Some(v),
+        Err(_) => Some(DEFAULT_SOCKET_GROUP.to_string()),
+    }
+}
+
+/// Whether the group exists on this host.
+pub fn group_exists(name: &str) -> bool {
+    lookup_group(name).is_some()
+}
+
+#[cfg(unix)]
+fn lookup_group(name: &str) -> Option<u32> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut buf = vec![0u8; 4096];
+    loop {
+        let mut grp: libc::group = unsafe { std::mem::zeroed() };
+        let mut out: *mut libc::group = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getgrnam_r(cname.as_ptr(), &mut grp, buf.as_mut_ptr().cast(), buf.len(), &mut out)
+        };
+        if rc == libc::ERANGE && buf.len() < 1 << 20 {
+            let doubled = buf.len() * 2;
+            buf.resize(doubled, 0);
+            continue;
+        }
+        return if rc == 0 && !out.is_null() { Some(grp.gr_gid) } else { None };
+    }
+}
+
+#[cfg(not(unix))]
+fn lookup_group(_name: &str) -> Option<u32> {
+    None
+}
+
 /// Binds the socket (removing any stale one from a previous run) and
-/// serves connections until the process exits. The socket and its parent
-/// directory are set root-only (0700/0600) explicitly after creation,
-/// rather than relying on umask.
+/// serves connections until the process exits.
+///
+/// With no `group` the socket and its parent directory are root-only
+/// (0600/0700). With one, the same two are handed to that group (0660/0750),
+/// so its members can use `wireserve serve`/`list`/... without sudo. Modes are
+/// set explicitly rather than left to umask, and the directory is only
+/// opened to the group after the socket is final, so there is no moment
+/// when the group can reach a socket with default permissions.
 pub async fn serve(ctx: AgentContext, socket_path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-        set_mode(parent, 0o700)?;
+    let group = socket_group();
+    match &group {
+        Some((name, _)) => tracing::info!(group = %name, socket = %socket_path.display(), "IPC socket shared with group"),
+        None => tracing::info!(socket = %socket_path.display(), "IPC socket is root-only (no `wireserve` group)"),
     }
-    if socket_path.exists() {
-        std::fs::remove_file(socket_path)?;
-    }
-    let listener = UnixListener::bind(socket_path)?;
-    set_mode(socket_path, 0o600)?;
+    let listener = bind_socket(socket_path, group.map(|(_, gid)| gid))?;
 
     loop {
         let (stream, _addr) = listener.accept().await?;
@@ -322,6 +380,60 @@ pub async fn serve(ctx: AgentContext, socket_path: &Path) -> std::io::Result<()>
             handle_connection(&ctx, stream).await;
         });
     }
+}
+
+fn bind_socket(socket_path: &Path, gid: Option<u32>) -> std::io::Result<UnixListener> {
+    let parent = socket_path.parent();
+    if let Some(parent) = parent {
+        std::fs::create_dir_all(parent)?;
+        set_mode(parent, 0o700)?;
+    }
+    if socket_path.exists() {
+        std::fs::remove_file(socket_path)?;
+    }
+    let listener = UnixListener::bind(socket_path)?;
+    let shared = match gid {
+        None => false,
+        // Sharing is a convenience; failing at it (a unit from before the
+        // group, without CAP_CHOWN, say) must leave a working root-only
+        // socket, not a daemon nobody can talk to.
+        Some(gid) => match share_with_group(socket_path, parent, gid) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not share the IPC socket with the group; it stays root-only");
+                false
+            }
+        },
+    };
+    if !shared {
+        set_mode(socket_path, 0o600)?;
+        if let Some(parent) = parent {
+            set_mode(parent, 0o700)?;
+        }
+    }
+    Ok(listener)
+}
+
+/// The socket first, the directory last: until the directory opens, the
+/// group cannot reach the socket whatever its permissions are.
+fn share_with_group(socket_path: &Path, parent: Option<&Path>, gid: u32) -> std::io::Result<()> {
+    set_group(socket_path, gid)?;
+    set_mode(socket_path, 0o660)?;
+    if let Some(parent) = parent {
+        set_group(parent, gid)?;
+        set_mode(parent, 0o750)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_group(path: &Path, gid: u32) -> std::io::Result<()> {
+    std::os::unix::fs::chown(path, None, Some(gid))
+}
+
+#[cfg(not(unix))]
+fn set_group(_path: &Path, _gid: u32) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -354,6 +466,68 @@ mod tests {
             dir,
             rx,
         )
+    }
+
+    #[tokio::test]
+    async fn socket_without_a_group_is_root_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run/agent.sock");
+        let _l = bind_socket(&path, None).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+    }
+
+    #[tokio::test]
+    async fn socket_with_a_group_is_shared_with_exactly_that_group() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run/agent.sock");
+        // A group the test process may chown to without privilege.
+        let gid = unsafe { libc::getegid() };
+        let _l = bind_socket(&path, Some(gid)).unwrap();
+        let sock = std::fs::metadata(&path).unwrap();
+        let parent = std::fs::metadata(path.parent().unwrap()).unwrap();
+        assert_eq!(sock.permissions().mode() & 0o777, 0o660);
+        assert_eq!(parent.permissions().mode() & 0o777, 0o750);
+        assert_eq!((sock.gid(), parent.gid()), (gid, gid));
+    }
+
+    #[tokio::test]
+    async fn failing_to_share_leaves_a_root_only_socket_not_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root may chown to any group, so there is nothing to fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run/agent.sock");
+        // Group 0 is one an unprivileged test process is not in.
+        let _l = bind_socket(&path, Some(0)).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+    }
+
+    #[test]
+    fn a_missing_group_means_no_sharing() {
+        assert_eq!(lookup_group("wireserve-no-such-group-xyz"), None);
+        assert_eq!(lookup_group("root"), Some(0));
+    }
+
+    #[test]
+    fn group_env_empty_disables_sharing() {
+        // Only this test touches the variable; it restores it.
+        let prev = std::env::var(SOCKET_GROUP_ENV).ok();
+        std::env::set_var(SOCKET_GROUP_ENV, "");
+        assert_eq!(socket_group(), None);
+        std::env::set_var(SOCKET_GROUP_ENV, "root");
+        assert_eq!(socket_group(), Some(("root".to_string(), 0)));
+        match prev {
+            Some(v) => std::env::set_var(SOCKET_GROUP_ENV, v),
+            None => std::env::remove_var(SOCKET_GROUP_ENV),
+        }
     }
 
     #[tokio::test]

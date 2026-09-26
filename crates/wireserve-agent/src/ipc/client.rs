@@ -1,5 +1,8 @@
 //! Thin client used by the `serve`/`unserve`/`list`/`leave` CLI
-//! subcommands to talk to a running daemon over the Unix socket.
+//! subcommands to talk to a running daemon over the Unix socket. The socket
+//! is root-only, or shared with the `wireserve` group when the host has one
+//! (see `server::serve`), so a refused connection is reported as that, not
+//! as a daemon that isn't running.
 
 use std::path::Path;
 
@@ -10,8 +13,14 @@ use super::protocol::{IpcRequest, IpcResponse};
 
 #[derive(Debug, thiserror::Error)]
 pub enum IpcClientError {
-    #[error("could not connect to wireserve-agent daemon at {0}: {1} (is it running?)")]
+    #[error("could not connect to wireserve daemon at {0}: {1} (is it running?)")]
     Connect(std::path::PathBuf, std::io::Error),
+    #[error(
+        "not permitted to use the wireserve daemon at {0}: run this with sudo, or add yourself to \
+         the `wireserve` group (`sudo usermod -aG wireserve $USER`, then log in again). The daemon \
+         shares its socket with that group only if the group existed when it started"
+    )]
+    Denied(std::path::PathBuf),
     #[error("I/O error talking to daemon: {0}")]
     Io(#[from] std::io::Error),
     #[error("daemon returned an unparseable response: {0}")]
@@ -21,7 +30,10 @@ pub enum IpcClientError {
 pub async fn call(socket_path: &Path, req: &IpcRequest) -> Result<IpcResponse, IpcClientError> {
     let stream = UnixStream::connect(socket_path)
         .await
-        .map_err(|e| IpcClientError::Connect(socket_path.to_path_buf(), e))?;
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::PermissionDenied => IpcClientError::Denied(socket_path.to_path_buf()),
+            _ => IpcClientError::Connect(socket_path.to_path_buf(), e),
+        })?;
     let (read_half, mut write_half) = stream.into_split();
 
     let mut line = serde_json::to_string(req)?;

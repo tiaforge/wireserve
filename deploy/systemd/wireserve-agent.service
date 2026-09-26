@@ -18,7 +18,7 @@ ExecStartPre=/usr/bin/install -d -m 0700 /run/wireserve
 # the sandbox below is set up for ReadWritePaths to grant it (the `+` runs
 # this one step outside the sandbox). Harmless where nothing uses it.
 ExecStartPre=+/bin/sh -c 'test -e /run/xtables.lock || : > /run/xtables.lock'
-ExecStart=/usr/local/bin/wireserve-agent daemon
+ExecStart=/usr/local/bin/wireserve daemon
 Restart=on-failure
 RestartSec=2s
 # A dead agent leaves the last-applied nftables state exactly as
@@ -30,6 +30,11 @@ RestartSec=2s
 
 RuntimeDirectory=wireserve
 RuntimeDirectoryMode=0700
+# The directory starts out root-only. When a `wireserve` group exists the
+# daemon hands it, and its IPC socket, to that group (0750/0660) so its
+# members can run `wireserve serve`/`list`/... without sudo. Changing a
+# file's group to one root is not itself a member of needs CAP_CHOWN,
+# hence it in the bounding set below.
 StateDirectory=wireserve
 StateDirectoryMode=0700
 
@@ -45,7 +50,7 @@ StateDirectoryMode=0700
 # safer than root would be dishonest, so the bounding set below is
 # informational (documents exactly which capabilities the workload
 # needs) rather than a real privilege reduction.
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_CHOWN
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 DeviceAllow=/dev/net/tun rw
 NoNewPrivileges=true

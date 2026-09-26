@@ -16,11 +16,11 @@
 #      `<name>.wg`, and anything published on 443 resolves to `web`'s address.
 #
 #   2. On this node, publish the proxy itself and run the agent with it:
-#        wireserve-agent serve web 443:8443
-#        wireserve-agent daemon --proxy caddy
+#        wireserve serve web 443:8443
+#        wireserve daemon --proxy caddy
 #
 #   3. Point *.int.example.com at `web`'s SERVICE address — the one
-#      `wireserve-agent list` shows, not the node's mesh address. The
+#      `wireserve list` shows, not the node's mesh address. The
 #      firewall opens `vip:443` and deliberately refuses `node:443`, so a
 #      record aimed at the node is dropped by this node's own firewall.
 #

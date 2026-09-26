@@ -166,12 +166,12 @@ create_node() { admin create-node "$1" | grep -oE 'jtk_[a-f0-9]+'; }
 log "joining the two agents"
 JT_GW=$(create_node node-gw)
 JT_HOME=$(create_node node-home)
-podman exec "$GW" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_GW" \
+podman exec "$GW" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_GW" \
     --listen-port "$WG_PORT" --endpoint-addr "$GW_HOST:$WG_PORT" 2>/dev/null
-podman exec "$HOME_AGENT" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_HOME" \
+podman exec "$HOME_AGENT" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_HOME" \
     --listen-port "$WG_PORT" 2>/dev/null
 for a in "$GW" "$HOME_AGENT"; do
-    podman exec -d "$a" wireserve-agent daemon --poll-interval-secs 5
+    podman exec -d "$a" wireserve daemon --poll-interval-secs 5
 done
 sleep 15
 pass "both agents registered and polling"
@@ -180,15 +180,15 @@ GW_ALL_BASELINE=$(in_netns "$GW" cat /proc/sys/net/ipv4/conf/all/forwarding 2>/d
 HOME_WG_BASELINE=$(in_netns "$HOME_AGENT" cat /proc/sys/net/ipv4/conf/wireserve0/forwarding 2>/dev/null || echo "?")
 
 log "declaring a service on homeserver and on the gateway"
-podman exec "$HOME_AGENT" wireserve-agent serve svc-home 12345 tcp
-podman exec "$GW" wireserve-agent serve svc-gw 12345 tcp
+podman exec "$HOME_AGENT" wireserve serve svc-home 12345 tcp
+podman exec "$GW" wireserve serve svc-gw 12345 tcp
 sleep 8
 admin approve-service node-home svc-home || fail "could not approve svc-home"
 admin approve-service node-gw svc-gw || fail "could not approve svc-gw"
 sleep 12
 
 log "opting the gateway in as a carrier (both halves)"
-podman exec "$GW" wireserve-agent transit on
+podman exec "$GW" wireserve transit on
 admin approve-transit node-gw || fail "could not approve node-gw for transit"
 sleep 10
 
@@ -199,7 +199,7 @@ admin export-config phone --gateway node-gw \
 note "exported config:"
 sed 's/^PrivateKey = .*/PrivateKey = <redacted>/; s/^/  /' /tmp/wireserve-gw-phone.conf
 
-GW_PUBKEY=$(podman exec "$GW" wireserve-agent list --json \
+GW_PUBKEY=$(podman exec "$GW" wireserve list --json \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(next((p['pubkey'] for p in d['peers'] if p.get('name')=='node-gw'), ''))" 2>/dev/null || true)
 if [ -z "$GW_PUBKEY" ]; then
     GW_PUBKEY=$(in_netns "$GW" wg show wireserve0 public-key)
@@ -255,7 +255,7 @@ fi
 log "3/3: a service declared AFTER the export is reachable with NO re-import"
 # The product claim. Nothing about the phone changes here — no new export,
 # no reimport, no restart of its tunnel.
-podman exec "$HOME_AGENT" wireserve-agent serve svc-later 12399 tcp
+podman exec "$HOME_AGENT" wireserve serve svc-later 12399 tcp
 sleep 8
 admin approve-service node-home svc-later || fail "could not approve svc-later"
 sleep 12

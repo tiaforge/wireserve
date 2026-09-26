@@ -116,7 +116,7 @@ impl TransitState {
     /// is actually set up to forward. The agent captures its own
     /// `transit_capable` once at start and opens the *host* firewall's
     /// FORWARD hook from it, so a node that was approved but never ran
-    /// `wireserve-agent transit on` accepts the forward in its own table
+    /// `wireserve transit on` accepts the forward in its own table
     /// while ufw or firewalld still drops it — silently, and painfully hard
     /// to debug from the other end.
     #[must_use]

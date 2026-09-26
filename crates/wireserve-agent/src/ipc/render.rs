@@ -1,4 +1,4 @@
-//! `wireserve-agent list` for a person: the daemon's cached view as
+//! `wireserve list` for a person: the daemon's cached view as
 //! aligned tables. `list --json` prints the view itself, for scripts.
 //!
 //! Nearly every string here came from the coordinator, which renders it
@@ -170,7 +170,7 @@ pub fn render(view: &ListView, now: DateTime<Utc>) -> String {
 
     out.push('\n');
     if view.services.is_empty() {
-        out.push_str("No services yet. Publish one with `wireserve-agent serve <name> <port>`.\n");
+        out.push_str("No services yet. Publish one with `wireserve serve <name> <port>`.\n");
     } else {
         let mut services: Vec<&LocalServiceView> = view.services.iter().collect();
         services.sort_by(|a, b| a.name.cmp(&b.name));
@@ -224,7 +224,7 @@ pub fn render(view: &ListView, now: DateTime<Utc>) -> String {
     if view.exit_capable {
         out.push_str("Exit: on");
         if !view.transit_capable {
-            out.push_str(", but an exit is a gateway first — also run `wireserve-agent transit on`\n");
+            out.push_str(", but an exit is a gateway first — also run `wireserve transit on`\n");
         } else if view.exit_clients.is_empty() {
             out.push_str(", no device uses this node as its exit yet\n");
         } else {

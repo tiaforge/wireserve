@@ -36,7 +36,7 @@ pub enum PollError {
     Hosts(#[from] std::io::Error),
     #[error(transparent)]
     State(#[from] crate::state::StateError),
-    #[error("agent is not registered yet — run `wireserve-agent join` first")]
+    #[error("agent is not registered yet — run `wireserve join` first")]
     NotRegistered,
     /// One or more of the local steps (peers, firewall, hosts file) failed
     /// while the others were still applied — see `run_once`.
@@ -508,7 +508,7 @@ pub struct PollContext<'a, F: FirewallBackend> {
 /// own function: a proxy failure must never reach `run_once`'s `failures`
 /// vec. That function returns before persisting `last_directory` when any
 /// step fails, so a proxy that is down or misconfigured would otherwise
-/// freeze `wireserve-agent list` on a stale directory — a baffling symptom
+/// freeze `wireserve list` on a stale directory — a baffling symptom
 /// for an unrelated cause. The proxy is a convenience layer on top of a
 /// working mesh and must not degrade the mesh's own bookkeeping. It is
 /// retried next cycle regardless, because the backend compares against what
@@ -832,7 +832,7 @@ where
         // Warn-only, and deliberately NOT a member of `failures`. This
         // function returns before persisting `last_directory` when any step
         // fails, so a proxy that is down or misconfigured would otherwise
-        // freeze `wireserve-agent list` on a stale directory — a baffling
+        // freeze `wireserve list` on a stale directory — a baffling
         // symptom for an unrelated cause. The proxy is a convenience layer on
         // top of a working mesh; it must not degrade the mesh's own
         // bookkeeping. Retried next cycle regardless, since the backend

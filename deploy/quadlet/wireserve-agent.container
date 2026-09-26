@@ -34,7 +34,7 @@
 # or a node serving a device on its LAN. Those write per-interface
 # forwarding switches in /proc/sys/net, which Podman mounts read-only here, so
 # the agent only warns and forwards nothing. Install such a node on the host
-# with `wireserve-agent install` instead. (Unmasking /proc/sys would make it
+# with `wireserve install` instead. (Unmasking /proc/sys would make it
 # work, but in a rootful container it also hands the container's root the
 # host's non-network sysctls, which this unit's "never --privileged" stance
 # exists to avoid.)

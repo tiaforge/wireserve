@@ -11,6 +11,9 @@
 //! | `default` | `/var/lib/wireserve/agent-state.json`               | `/run/wireserve/agent.sock`     |
 //! | `<n>`     | `/var/lib/wireserve/instances/<n>/agent-state.json` | `/run/wireserve-<n>/agent.sock` |
 //!
+//! Each socket is root-only, or shared with the `wireserve` group when the
+//! host has one (see `ipc::server::serve`).
+//!
 //! State nests under the default's directory, so one directory (and the
 //! container image's one volume) holds every instance's keys. Sockets
 //! don't: systemd removes a unit's `RuntimeDirectory` when the unit stops,

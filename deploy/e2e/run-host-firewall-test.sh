@@ -110,7 +110,7 @@ print(sum(1 for o in d if 'rule' in o and str(o['rule'].get('comment', '')).star
 }
 
 mesh_ip_of() {
-    podman exec "$1" wireserve-agent list --json | python3 -c "
+    podman exec "$1" wireserve list --json | python3 -c "
 import json, sys
 m = [p['ip4'] for p in json.load(sys.stdin).get('peers', []) if p.get('name') == '$2']
 print(m[0] if m else '')"
@@ -126,10 +126,10 @@ in_dbg "$HOST_FIREWALL"
 BEFORE_IPT=$(in_dbg "iptables -S INPUT")
 BEFORE_NFT=$(in_dbg "nft list table inet filter")
 
-podman exec "$AGENT1" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT1" --listen-port 51820
-podman exec "$AGENT2" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT2" --listen-port 51820
-podman exec -d "$AGENT1" wireserve-agent daemon --poll-interval-secs 5
-podman exec -d "$AGENT2" wireserve-agent daemon --poll-interval-secs 5
+podman exec "$AGENT1" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT1" --listen-port 51820
+podman exec "$AGENT2" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT2" --listen-port 51820
+podman exec -d "$AGENT1" wireserve daemon --poll-interval-secs 5
+podman exec -d "$AGENT2" wireserve daemon --poll-interval-secs 5
 sleep 8
 
 log "checking the host firewalls now let wireserve0 through (and only wireserve0)"
@@ -150,7 +150,7 @@ log "declaring and approving a service on agent1"
 # Published on :80 of its own address (PLAN.md M20), onto 12345: the
 # rewritten packet still arrives on wireserve0, so it is the same
 # interface-scoped accept in the host firewalls that has to let it in.
-podman exec "$AGENT1" wireserve-agent serve testsvc 80:12345
+podman exec "$AGENT1" wireserve serve testsvc 80:12345
 sleep 6
 podman exec "$COORD" wireserve-admin approve-service node1 testsvc
 sleep 6
@@ -203,7 +203,7 @@ sleep 6
 pass "iptables rule restored, no duplicates anywhere"
 
 log "E4: leave removes everything we added and nothing else"
-podman exec "$AGENT1" wireserve-agent leave
+podman exec "$AGENT1" wireserve leave
 sleep 2
 if in_dbg "nft list ruleset; iptables -S" | grep -q 'wireserve'; then
     in_dbg "nft list ruleset; iptables -S"
@@ -224,11 +224,11 @@ podman exec "$DBG_GUARD" sh -c "wg genkey > /tmp/k && ip link add wg0 type wireg
 guard_rules() { podman exec "$DBG_GUARD" sh -c "nft -s list ruleset; iptables -S"; }
 GUARD_BEFORE=$(guard_rules)
 JT3=$(create_node node3)
-podman exec "$GUARD" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT3" --listen-port 51820
+podman exec "$GUARD" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT3" --listen-port 51820
 # Pinned to that name (without --ifname it would simply pick another), so
 # the agent has to refuse — and must do so before any firewall change,
 # since every rule it would install is keyed on the name.
-if podman exec "$GUARD" wireserve-agent daemon --poll-interval-secs 5 --ifname wg0 >/tmp/hostfw-guard.txt 2>&1; then
+if podman exec "$GUARD" wireserve daemon --poll-interval-secs 5 --ifname wg0 >/tmp/hostfw-guard.txt 2>&1; then
     fail "the agent started on a foreign wg0"
 fi
 grep -qi "cannot use the interface name 'wg0'" /tmp/hostfw-guard.txt || fail "unexpected failure: $(cat /tmp/hostfw-guard.txt)"
@@ -248,13 +248,13 @@ debug_for "$DBG_LEGACY" "$LEGACY"
 if podman exec "$DBG_LEGACY" sh -c "iptables-legacy -A INPUT -i lo -j ACCEPT && iptables-legacy -P INPUT DROP" 2>/dev/null \
    && podman exec "$DBG_LEGACY" grep -qx filter /proc/net/ip_tables_names; then
     JT4=$(create_node node4)
-    podman exec "$LEGACY" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT4" --listen-port 51820
-    podman exec -d "$LEGACY" wireserve-agent daemon --poll-interval-secs 5
+    podman exec "$LEGACY" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT4" --listen-port 51820
+    podman exec -d "$LEGACY" wireserve daemon --poll-interval-secs 5
     sleep 6
     podman exec "$DBG_LEGACY" iptables-legacy -S INPUT | sed -n 2p \
         | grep -qx -- '-A INPUT -i wireserve0 -m comment --comment "wireserve:wireserve0" -j ACCEPT' \
         || fail "legacy iptables INPUT does not start with our wireserve0 accept"
-    podman exec "$LEGACY" wireserve-agent leave
+    podman exec "$LEGACY" wireserve leave
     sleep 2
     if podman exec "$DBG_LEGACY" iptables-legacy -S INPUT | grep -q wireserve; then
         fail "legacy iptables rule left behind after leave"

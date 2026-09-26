@@ -1,6 +1,6 @@
-//! `wireserve-agent install` — installs the binary and the right systemd
+//! `wireserve install` — installs the binary and the right systemd
 //! unit for an instance in one step, then hands off to the same `join`
-//! logic `wireserve-agent join` uses on its own (see `main.rs`'s
+//! logic `wireserve join` uses on its own (see `main.rs`'s
 //! `cmd_join`, which `cmd_install` calls directly — this module supplies
 //! only the install-specific primitives, so the token prompt and every
 //! other bit of `join`'s behaviour stays in exactly one place).
@@ -10,6 +10,13 @@
 //! drift from the binary that installed it, which a separate install
 //! script reading those files at runtime couldn't guarantee.
 //!
+//! It also creates the `wireserve` group whose members may use the daemon
+//! without sudo (see `ipc::server::serve`), but never adds anyone to it.
+//!
+//! The binary is `wireserve`; the systemd unit keeps the name
+//! `wireserve-agent`, since it names the daemon and renaming it would
+//! break `systemctl restart wireserve-agent` on every running deployment.
+//!
 //! Linux/systemd only — Quadlet/podman deployments keep using
 //! `deploy/quadlet/*.container` by hand, as already documented.
 
@@ -17,18 +24,22 @@ use crate::paths::Instance;
 
 const UNIT_DEFAULT: &str = include_str!("../../../deploy/systemd/wireserve-agent.service");
 const UNIT_TEMPLATE: &str = include_str!("../../../deploy/systemd/wireserve-agent@.service");
-const BIN_DEST: &str = "/usr/local/bin/wireserve-agent";
+const BIN_DEST: &str = "/usr/local/bin/wireserve";
+/// Where earlier versions put the binary, before it was called `wireserve`.
+const OLD_BIN_DEST: &str = "/usr/local/bin/wireserve-agent";
 const UNIT_DEFAULT_DEST: &str = "/etc/systemd/system/wireserve-agent.service";
 const UNIT_TEMPLATE_DEST: &str = "/etc/systemd/system/wireserve-agent@.service";
 
 #[derive(Debug, thiserror::Error)]
 pub enum InstallError {
-    #[error("wireserve-agent install must be run as root (sudo)")]
+    #[error("wireserve install must be run as root (sudo)")]
     NotRoot,
-    #[error("wireserve-agent install only supports Linux with systemd")]
+    #[error("wireserve install only supports Linux with systemd")]
     UnsupportedPlatform,
     #[error("could not install the binary to {0}: {1}")]
     InstallBinary(&'static str, std::io::Error),
+    #[error("could not create the `{0}` group: {1}")]
+    Group(String, String),
     #[error("could not install the systemd unit to {0}: {1}")]
     InstallUnit(&'static str, std::io::Error),
     #[error("could not run `systemctl {0}`: {1}")]
@@ -74,6 +85,35 @@ pub fn install_self() -> Result<(), InstallError> {
     let bytes = std::fs::read(&current).map_err(|e| InstallError::InstallBinary(BIN_DEST, e))?;
     crate::fsutil::atomic_write(std::path::Path::new(BIN_DEST), &bytes, 0o755)
         .map_err(|e| InstallError::InstallBinary(BIN_DEST, e))
+}
+
+/// Whether something is still at the path earlier versions installed the
+/// binary to, as `wireserve-agent`. `install` never touches it — it may be
+/// someone's own arrangement, or still what a script points at — it only
+/// says so, since nothing uses it any more.
+pub fn old_binary_present() -> bool {
+    std::fs::symlink_metadata(OLD_BIN_DEST).is_ok()
+}
+
+/// Creates the group the daemon shares its socket with, if sharing is on
+/// and it does not exist yet. Returns its name when it exists afterwards.
+/// Must run before the daemon starts: it looks the group up once, at bind.
+pub fn ensure_socket_group() -> Result<Option<String>, InstallError> {
+    let Some(name) = crate::ipc::server::socket_group_name() else {
+        return Ok(None);
+    };
+    if crate::ipc::server::group_exists(&name) {
+        return Ok(Some(name));
+    }
+    let output = std::process::Command::new("groupadd")
+        .args(["--system", &name])
+        .output()
+        .map_err(|e| InstallError::Group(name.clone(), e.to_string()))?;
+    if output.status.success() {
+        Ok(Some(name))
+    } else {
+        Err(InstallError::Group(name, String::from_utf8_lossy(&output.stderr).trim().to_string()))
+    }
 }
 
 /// Writes the systemd unit for `instance` and returns the unit name
@@ -126,5 +166,11 @@ mod tests {
         assert_eq!(content, UNIT_TEMPLATE);
         assert_eq!(dest, "/etc/systemd/system/wireserve-agent@.service");
         assert_eq!(name, "wireserve-agent@work");
+    }
+
+    #[test]
+    fn the_unit_starts_the_renamed_binary() {
+        assert!(UNIT_DEFAULT.contains(&format!("ExecStart={BIN_DEST} daemon")));
+        assert!(UNIT_TEMPLATE.contains(&format!("ExecStart={BIN_DEST} --instance %i daemon")));
     }
 }

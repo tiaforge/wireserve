@@ -20,12 +20,12 @@ pub enum ExportConfigError {
     NoSuchGateway { name: String },
     #[error(
         "'{name}' is not approved to carry traffic — run `wireserve-admin approve-transit {name}` \
-         (and `wireserve-agent transit on` on that node) first"
+         (and `wireserve transit on` on that node) first"
     )]
     GatewayNotApproved { name: String },
     #[error(
         "'{name}' is approved but is not currently offering to carry traffic — run \
-         `wireserve-agent transit on` on it (and restart it, so it reopens the host \
+         `wireserve transit on` on it (and restart it, so it reopens the host \
          firewall's forward hook), then try again"
     )]
     GatewayNotOffering { name: String },
@@ -46,7 +46,7 @@ pub enum ExportConfigError {
     )]
     ExitNeedsGateway,
     #[error(
-        "'{name}' is not offering to be an exit — run `wireserve-agent exit on` on it, then try \
+        "'{name}' is not offering to be an exit — run `wireserve exit on` on it, then try \
          again (a coordinator older than exit support never reports an offer at all)"
     )]
     ExitNotOffering { name: String },
@@ -277,7 +277,7 @@ fn resolve_dns(
         return Err(ExportConfigError::BadDns(format!(
             "{ip} is neither a mesh address nor a public one, and the exit forwards to neither \
              private ranges nor anything else off the internet — serve the resolver instead \
-             (e.g. `wireserve-agent serve dns 53:{ip}:53/udp 53:{ip}:53/tcp` on a node that \
+             (e.g. `wireserve serve dns 53:{ip}:53/udp 53:{ip}:53/tcp` on a node that \
              reaches it) and pass --dns dns"
         )));
     }

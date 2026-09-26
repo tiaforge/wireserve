@@ -1,9 +1,9 @@
 # A named agent instance: `systemctl enable --now wireserve-agent@work`
-# runs `wireserve-agent --instance work daemon`. One per extra mesh (or
+# runs `wireserve --instance work daemon`. One per extra mesh (or
 # extra identity) on this host, next to the plain wireserve-agent.service,
 # which runs the default instance. Join each instance first:
 #
-#   sudo wireserve-agent --instance work join <coordinator-url> -
+#   sudo wireserve --instance work join <coordinator-url> -
 #
 # Each instance has its own state (/var/lib/wireserve/instances/<name>),
 # socket (/run/wireserve-<name>), WireGuard interface (the first free of
@@ -26,7 +26,7 @@ EnvironmentFile=-/etc/wireserve/agent.env
 EnvironmentFile=-/etc/wireserve/agent-%i.env
 
 ExecStartPre=+/bin/sh -c 'test -e /run/xtables.lock || : > /run/xtables.lock'
-ExecStart=/usr/local/bin/wireserve-agent --instance %i daemon
+ExecStart=/usr/local/bin/wireserve --instance %i daemon
 Restart=on-failure
 RestartSec=2s
 
@@ -35,10 +35,15 @@ RestartSec=2s
 # default instance's stop delete this one's socket.
 RuntimeDirectory=wireserve-%i
 RuntimeDirectoryMode=0700
+# The directory starts out root-only. When a `wireserve` group exists the
+# daemon hands it, and its IPC socket, to that group (0750/0660) so its
+# members can run `wireserve serve`/`list`/... without sudo. Changing a
+# file's group to one root is not itself a member of needs CAP_CHOWN,
+# hence it in the bounding set below.
 StateDirectory=wireserve/instances/%i
 StateDirectoryMode=0700
 
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_CHOWN
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 DeviceAllow=/dev/net/tun rw
 NoNewPrivileges=true

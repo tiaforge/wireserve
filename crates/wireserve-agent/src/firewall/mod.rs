@@ -64,7 +64,7 @@ pub trait InteropHandle {
     /// Poll-tick safety net: reconcile now.
     ///
     /// `forward_wanted` is passed every tick rather than captured at start,
-    /// because `wireserve-agent transit on` and `serve` change it on a
+    /// because `wireserve transit on` and `serve` change it on a
     /// running daemon.
     fn tick(&self, forward_wanted: ForwardWanted);
     /// Remove everything the interop added. Idempotent.

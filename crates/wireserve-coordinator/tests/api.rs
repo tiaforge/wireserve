@@ -2950,7 +2950,7 @@ async fn gateway_scenario(app: &TestApp) -> (String, String, String) {
     app.router.clone().oneshot(req).await.unwrap();
 
     assert_eq!(admin_post(&app.router, "/admin/nodes/gw/transit/approve").await, StatusCode::OK);
-    // Both halves, in the order an operator does them: `wireserve-agent
+    // Both halves, in the order an operator does them: `wireserve
     // transit on` makes the node offer, and it has to have polled at least
     // once before it can be assigned — the agent opens the host firewall's
     // forward hook from that same local flag, so assigning a gateway that

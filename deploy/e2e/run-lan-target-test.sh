@@ -140,27 +140,27 @@ create_node() { admin create-node "$1" | grep -oE 'jtk_[a-f0-9]+'; }
 log "joining both agents"
 JT_OWNER=$(create_node node-owner)
 JT_CLIENT=$(create_node node-client)
-podman exec "$OWNER" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_OWNER" \
+podman exec "$OWNER" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_OWNER" \
     --listen-port "$WG_PORT" --endpoint-addr "$OWNER_INET:$WG_PORT" 2>/dev/null
-podman exec "$CLIENT" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_CLIENT" \
+podman exec "$CLIENT" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_CLIENT" \
     --listen-port "$WG_PORT" --endpoint-addr "$(ip_on "$CLIENT" "$INET"):$WG_PORT" 2>/dev/null
 for a in "$OWNER" "$CLIENT"; do
-    podman exec -d "$a" wireserve-agent daemon --poll-interval-secs 5
+    podman exec -d "$a" wireserve daemon --poll-interval-secs 5
 done
 sleep 15
 pass "both agents registered and polling"
 
 log "refusals at serve time"
-if podman exec "$OWNER" wireserve-agent serve bad 443:127.0.0.1:80 >/dev/null 2>&1; then
+if podman exec "$OWNER" wireserve serve bad 443:127.0.0.1:80 >/dev/null 2>&1; then
     fail "serve accepted a loopback target"
 fi
-if podman exec "$OWNER" wireserve-agent serve bad '443:[fd00::1]:80' >/dev/null 2>&1; then
+if podman exec "$OWNER" wireserve serve bad '443:[fd00::1]:80' >/dev/null 2>&1; then
     fail "serve accepted an IPv6 target"
 fi
 pass "loopback and IPv6 targets are refused"
 
 log "serving the device's port 80 on 443"
-podman exec "$OWNER" wireserve-agent serve myrouter "443:$DEVICE_IP:80"
+podman exec "$OWNER" wireserve serve myrouter "443:$DEVICE_IP:80"
 sleep 8
 admin approve-service node-owner myrouter || fail "could not approve myrouter"
 admin list-services | grep myrouter | grep -q "443:$DEVICE_IP:80/tcp" \
@@ -220,15 +220,15 @@ podman rm -f "$PROBE" >/dev/null
 pass "nothing but the service's own flows is forwarded from $LAN_IF"
 
 log "6/7: the rest of the mesh never learns the device's address"
-if podman exec "$CLIENT" wireserve-agent list --json | grep -q "$DEVICE_IP"; then
+if podman exec "$CLIENT" wireserve list --json | grep -q "$DEVICE_IP"; then
     fail "the client's directory carries the device's address"
 fi
-podman exec "$OWNER" wireserve-agent list | grep myrouter | grep -q "443:$DEVICE_IP:80/tcp" \
+podman exec "$OWNER" wireserve list | grep myrouter | grep -q "443:$DEVICE_IP:80/tcp" \
     || fail "the owner's own list does not show its declaration"
 pass "the client sees only the public face; the owner sees its declaration"
 
 log "7/7: leave turns the lan interface's forwarding back off"
-podman exec "$OWNER" wireserve-agent leave
+podman exec "$OWNER" wireserve leave
 sleep 3
 [ "$(fwd_flag "$LAN_IF")" = 0 ] || fail "$LAN_IF still forwards after leave (got '$(fwd_flag "$LAN_IF")')"
 [ "$(fwd_flag all)" = 0 ] || fail "the global switch changed on leave"

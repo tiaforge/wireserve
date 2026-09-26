@@ -59,7 +59,7 @@ pub struct AgentState {
     #[serde(default)]
     pub ifname_pinned: bool,
     /// This node's own live opt-in to carry transit traffic for other
-    /// mesh peers (PLAN.md M23), set by `wireserve-agent transit on|off`
+    /// mesh peers (PLAN.md M23), set by `wireserve transit on|off`
     /// via IPC and read fresh every poll cycle — matches `serve`/
     /// `unserve`'s shape (a live operational decision on a running
     /// daemon), not a join-time flag. Defaults to `false`, same as
@@ -67,7 +67,7 @@ pub struct AgentState {
     #[serde(default)]
     pub transit_capable: bool,
     /// This node's own live opt-in to be the exit for the devices that use
-    /// it as their gateway (PLAN.md M27), set by `wireserve-agent exit
+    /// it as their gateway (PLAN.md M27), set by `wireserve exit
     /// on|off`. Separate from `transit_capable`: sending a device's
     /// traffic to the internet under this host's own address is a
     /// different decision from forwarding between mesh members. Off by

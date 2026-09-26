@@ -19,7 +19,7 @@ struct Cli {
     /// --coordinator-url, which talks to the admin listener. Spec §4.0
     /// requires the two to be bound separately. Used by `export-config`
     /// (required) and by `create-node`/`rejoin` (optional — fills in the
-    /// exact `wireserve-agent join` command they print). Or set
+    /// exact `wireserve join` command they print). Or set
     /// WIRESERVE_REGISTER_URL, or write one to
     /// ~/.config/wireserve-admin/register_url.
     #[arg(long, global = true)]
@@ -44,7 +44,7 @@ enum Command {
         /// only needed when it's an additional instance alongside
         /// another agent already running there. Never sent to the
         /// coordinator; it only fills in `--instance` on the printed
-        /// `wireserve-agent install` command.
+        /// `wireserve install` command.
         #[arg(long)]
         instance: Option<String>,
     },
@@ -59,7 +59,7 @@ enum Command {
         #[arg(long)]
         ttl: Option<u64>,
         /// Same as `create-node --instance` — fills in `--instance` on
-        /// the printed `wireserve-agent install` command.
+        /// the printed `wireserve install` command.
         #[arg(long)]
         instance: Option<String>,
     },
@@ -123,7 +123,7 @@ enum Command {
     },
     /// Allow a node to carry transit traffic for peers that can't reach
     /// each other directly. The node must also opt in itself
-    /// (`wireserve-agent transit on`). A carrier sees the traffic it
+    /// (`wireserve transit on`). A carrier sees the traffic it
     /// relays unencrypted and can send packets as either end, so approve
     /// only nodes you trust as much as the traffic between any two
     /// others. Revoke and rejoin both withdraw the approval.
@@ -177,7 +177,7 @@ enum Command {
         /// traffic out through its gateway, for public Wi-Fi or a home
         /// connection abroad. IPv4 only; the device's IPv6 is dropped rather
         /// than leaked around the tunnel. The gateway must run
-        /// `wireserve-agent exit on`. Needs --dns, and --out or --qr, since
+        /// `wireserve exit on`. Needs --dns, and --out or --qr, since
         /// there are two files.
         #[arg(long, requires = "dns")]
         exit: bool,
@@ -370,7 +370,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             wireserve_admin::cmd_approve_transit(&client, &name)?;
             println!("node '{name}' approved to carry transit traffic");
             println!(
-                "  it carries nothing until it has also run `wireserve-agent transit on`"
+                "  it carries nothing until it has also run `wireserve transit on`"
             );
         }
         Command::DenyTransit { name } => {
@@ -560,7 +560,7 @@ fn check_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// `--instance` is never sent to the coordinator — it only ends up
-/// interpolated into the printed `wireserve-agent install` command — but
+/// interpolated into the printed `wireserve install` command — but
 /// spec §3's fail-fast rule still applies, and a name that broke that
 /// command's syntax would be a worse failure mode than rejecting it here.
 /// Mirrors `wireserve_agent::paths::Instance::new`'s rule (1-32 chars,
@@ -638,11 +638,11 @@ fn resolve_register_url_best_effort(cli_flag: Option<&str>) -> Option<String> {
 }
 
 /// Printed after a fresh join token, right where the operator is looking —
-/// the actual single command to run on the new machine (`wireserve-agent
+/// the actual single command to run on the new machine (`wireserve
 /// install`, which installs the binary and systemd unit, then joins),
 /// not just the token it needs. Deliberately does not embed the token
 /// itself: a token as a command-line argument lands in shell history and
-/// `ps` output (S7, `wireserve-agent`'s own doc comment on its
+/// `ps` output (S7, the agent's own doc comment on its
 /// `join_token` argument), which `install`/`join`'s interactive prompt
 /// exists to avoid — so the command printed here has no secret in it,
 /// and the token is pasted in response to that prompt instead.
@@ -651,16 +651,16 @@ fn print_install_instructions(register_url: Option<String>, instance: Option<&st
     println!();
     println!("To add this node to the mesh:");
     match register_url {
-        Some(url) => println!("  sudo wireserve-agent install {url}{instance_flag}"),
+        Some(url) => println!("  sudo wireserve install {url}{instance_flag}"),
         None => {
-            println!("  sudo wireserve-agent install <this coordinator's public URL>{instance_flag}");
+            println!("  sudo wireserve install <this coordinator's public URL>{instance_flag}");
             println!(
                 "  (pass --register-url, or set WIRESERVE_REGISTER_URL, so this command is \
                  filled in for you)"
             );
         }
     }
-    println!("  (needs the wireserve-agent binary already on that machine, and root)");
+    println!("  (needs the wireserve binary already on that machine, and root)");
     println!("  then paste the join token above when prompted");
 }
 

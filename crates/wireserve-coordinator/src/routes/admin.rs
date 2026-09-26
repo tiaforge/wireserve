@@ -518,7 +518,7 @@ pub async fn set_gateway(
             if !offering {
                 return Err(AppError::Conflict(format!(
                     "'{gateway_name}' is approved but is not currently offering to carry \
-                     traffic — run `wireserve-agent transit on` on it (and restart it, so it \
+                     traffic — run `wireserve transit on` on it (and restart it, so it \
                      reopens the host firewall's forward hook), then try again"
                 )));
             }
@@ -551,7 +551,7 @@ pub async fn set_gateway(
             .is_some_and(|pk| state.transit.is_offering_exit(pk, state.config.online_threshold_secs));
         if !offering {
             return Err(AppError::Conflict(format!(
-                "'{gateway_name}' is not offering to be an exit — run `wireserve-agent exit on` \
+                "'{gateway_name}' is not offering to be an exit — run `wireserve exit on` \
                  on it, then try again"
             )));
         }
@@ -571,7 +571,7 @@ pub async fn set_gateway(
 /// `POST /admin/nodes/{name}/transit/approve`.
 ///
 /// Lets a node carry transit traffic for other peers, from its next poll
-/// on, provided it has also opted in itself (`wireserve-agent transit
+/// on, provided it has also opted in itself (`wireserve transit
 /// on`). Both halves are required: the node's own opt-in is its
 /// operator's consent to spend the bandwidth, this is the mesh admin's
 /// trust in it — a carrier sees relayed traffic in the clear and can

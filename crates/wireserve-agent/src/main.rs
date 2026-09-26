@@ -11,7 +11,7 @@ use wireserve_agent::{firewall, ifname, lock, poll_loop, register, wg::WgInterfa
 use wireserve_types::{FirewallBackend, PortMap, Proto};
 
 #[derive(Parser)]
-#[command(name = "wireserve-agent")]
+#[command(name = "wireserve")]
 struct Cli {
     /// Which agent instance to act on. Each instance is a separate node
     /// with its own state, interface, firewall rules and hosts-file block,
@@ -66,8 +66,9 @@ enum Command {
     /// right systemd unit for this instance (plain, or the `@.service`
     /// template for a named instance), then joins — everything
     /// `wireserve-admin create-node`'s printed command needs, in one
-    /// step. Needs root, and Linux/systemd (Quadlet/podman deployments
-    /// install by hand, per `deploy/quadlet/`).
+    /// step. Also creates the `wireserve` group whose members can run the
+    /// other commands without sudo. Needs root, and Linux/systemd
+    /// (Quadlet/podman deployments install by hand, per `deploy/quadlet/`).
     Install(JoinArgs),
     /// Runs the poll loop and IPC server. This is the long-running daemon.
     Daemon {
@@ -274,7 +275,7 @@ async fn cmd_join(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn std
 }
 
 /// Installs the binary and this instance's systemd unit, then joins via
-/// exactly the same `cmd_join` a plain `wireserve-agent join` runs — the
+/// exactly the same `cmd_join` a plain `wireserve join` runs — the
 /// token prompt and every other bit of that behaviour lives in one place.
 /// Order: root/platform check, then the two installs (both idempotent),
 /// `daemon-reload`, the join itself, then `enable --now`. A failure at
@@ -287,13 +288,26 @@ async fn cmd_install(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn 
     }
     wireserve_agent::install::require_root()?;
     wireserve_agent::install::install_self()?;
+    // Before the daemon starts: it looks the group up once, when it binds.
+    let group = wireserve_agent::install::ensure_socket_group()?;
     let unit = wireserve_agent::install::install_unit(instance)?;
     wireserve_agent::install::systemctl_daemon_reload()?;
     cmd_join(instance, args).await?;
     wireserve_agent::install::systemctl_enable_now(&unit)?;
     let instance_flag = if instance.is_default() { String::new() } else { format!(" --instance {}", instance.name()) };
     println!();
-    println!("{unit} is running — `wireserve-agent{instance_flag} list` shows its services and peers");
+    println!("{unit} is running — `wireserve{instance_flag} list` shows its services and peers");
+    if wireserve_agent::install::old_binary_present() {
+        println!("(the command is now `wireserve`; /usr/local/bin/wireserve-agent is an older copy that nothing uses any more — left as it was)");
+    }
+    if let Some(group) = group {
+        // The user who ran sudo, not root: root needs no group.
+        let who = std::env::var("SUDO_USER").ok().filter(|u| !u.is_empty() && u != "root");
+        println!();
+        println!("To use it without sudo, join the `{group}` group and log in again:");
+        println!("  sudo usermod -aG {group} {}", who.as_deref().unwrap_or("$USER"));
+        println!("If {unit} was already running, `sudo systemctl restart {unit}` makes it share its socket with that group.");
+    }
     Ok(())
 }
 
@@ -404,7 +418,7 @@ async fn cmd_daemon(
     let state_path = instance.state_path();
     let mut state = AgentState::load(&state_path)?;
     if state.bearer_token.is_none() {
-        return Err("not registered — run `wireserve-agent join` first".into());
+        return Err("not registered — run `wireserve join` first".into());
     }
     // A node that joined before `--allow-plaintext-http` existed has no
     // record of the choice; the environment variable is its way to make
@@ -668,7 +682,7 @@ async fn cmd_daemon(
                         // `wireserve-admin rejoin` overwrites it anyway.
                         tracing::error!(
                             "poll rejected with 401 {} times in a row — this node has been \
-                             revoked; tearing down and stopping (run `wireserve-agent join` \
+                             revoked; tearing down and stopping (run `wireserve join` \
                              again with a fresh token from `wireserve-admin rejoin` to rejoin)",
                             UNAUTHORIZED_STREAK_TO_TEARDOWN
                         );
@@ -840,7 +854,7 @@ async fn cmd_serve(instance: &Instance, name: String, ports: &[String]) -> Resul
     if matches!(resp, wireserve_agent::ipc::IpcResponse::Ok) {
         println!("ok — queued; takes effect on the next poll");
         println!(
-            "  if this coordinator requires admin approval, `wireserve-agent list` will show \
+            "  if this coordinator requires admin approval, `wireserve list` will show \
              it as pending until an admin approves it"
         );
         return Ok(());

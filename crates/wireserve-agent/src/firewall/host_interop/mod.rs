@@ -120,7 +120,7 @@ impl HostInterop {
     /// opened. A node that never opts into transit gets exactly the
     /// footprint this module had before transit existed.
     ///
-    /// It is the value at startup only. `wireserve-agent transit on` mutates
+    /// It is the value at startup only. `wireserve transit on` mutates
     /// the running daemon (M23 #102), so it is re-sent on every tick and the
     /// worker acts on the change — see `run`. This comment used to claim the
     /// flag was "set once at join time and never changed for the life of a
@@ -414,7 +414,7 @@ mod tests {
         let mut interop = HostInterop::start_with("wg0", RealOps::without_firewalld(nft).with_own_table(shared), ForwardWanted::default());
         assert_eq!(forward_rules(), 0, "a node that never opted in opens nothing in FORWARD");
 
-        // `wireserve-agent transit on` — no restart.
+        // `wireserve transit on` — no restart.
         interop.tick(ForwardWanted { transit: true, services: false, exit: false });
         wait_for("forward hook opened after opting in", Duration::from_secs(5), || {
             forward_rules() == 1

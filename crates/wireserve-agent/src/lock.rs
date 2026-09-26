@@ -38,7 +38,7 @@ use crate::paths::Instance;
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
     #[error(
-        "another wireserve-agent process is already using instance '{instance}' (it holds \
+        "another wireserve process is already using instance '{instance}' (it holds \
          {}); stop it first, or use a different --instance",
         path.display()
     )]

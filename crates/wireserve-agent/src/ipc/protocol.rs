@@ -31,12 +31,12 @@ pub enum IpcRequest {
     },
     Unserve { name: String },
     /// This node's live opt-in to carry transit traffic for other mesh
-    /// peers (PLAN.md M23) — `wireserve-agent transit on|off`. Same shape
+    /// peers (PLAN.md M23) — `wireserve transit on|off`. Same shape
     /// as `Serve`/`Unserve`: mutates the running daemon's state directly,
     /// takes effect next poll, no rejoin.
     TransitCapable { enabled: bool },
     /// This node's live opt-in to be an exit (PLAN.md M27) —
-    /// `wireserve-agent exit on|off`. Same shape as `TransitCapable`.
+    /// `wireserve exit on|off`. Same shape as `TransitCapable`.
     ExitCapable { enabled: bool },
     List,
     Leave,

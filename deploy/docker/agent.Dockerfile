@@ -12,7 +12,7 @@
 #     -v wireserve-agent-state:/var/lib/wireserve \
 #     -v wireserve-agent-run:/run/wireserve \
 #     --env-file agent.env \
-#     wireserve-agent daemon
+#     wireserve daemon
 #
 # Never --privileged (spec §8) — CAP_NET_ADMIN + /dev/net/tun is the
 # whole capability set this needs for WireGuard and nftables
@@ -48,7 +48,7 @@
 # The `serve`/`unserve`/`list`/`leave` subcommands talk to the daemon over
 # a Unix socket in /run/wireserve, which only exists inside this
 # container's own namespace — run them via
-# `docker exec wireserve-agent wireserve-agent list`, not from the host,
+# `docker exec wireserve-agent wireserve list`, not from the host,
 # unless /run/wireserve is separately bind-mounted out.
 
 # ---- build stage ----
@@ -72,14 +72,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
     cargo build --release -p wireserve-agent \
     && mkdir -p /out \
-    && cp target/release/wireserve-agent /out/
+    && cp target/release/wireserve /out/
 
 # ---- runtime stage ----
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates nftables iptables \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /out/wireserve-agent /usr/local/bin/wireserve-agent
+COPY --from=builder /out/wireserve /usr/local/bin/wireserve
 
 # Runs as the image's default root user, deliberately — same reasoning as
 # deploy/systemd/wireserve-agent.service: writing the bind-mounted host
@@ -92,5 +92,5 @@ COPY --from=builder /out/wireserve-agent /usr/local/bin/wireserve-agent
 ENV WIRESERVE_STATE_PATH=/var/lib/wireserve/agent-state.json
 ENV WIRESERVE_SOCKET_PATH=/run/wireserve/agent.sock
 VOLUME ["/var/lib/wireserve", "/run/wireserve"]
-ENTRYPOINT ["/usr/local/bin/wireserve-agent"]
+ENTRYPOINT ["/usr/local/bin/wireserve"]
 CMD ["daemon"]

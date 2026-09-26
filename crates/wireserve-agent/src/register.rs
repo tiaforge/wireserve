@@ -1,4 +1,4 @@
-//! `wireserve-agent join <coordinator-url> <join-token>` — the bootstrap
+//! `wireserve join <coordinator-url> <join-token>` — the bootstrap
 //! command spec §4.6 implies but doesn't name (PLAN.md decisions log #5).
 //! Generates a keypair locally, redeems the join token via `/register`,
 //! and persists the result to local state at mode 600.

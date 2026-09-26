@@ -81,7 +81,7 @@ ip_on() {
 }
 admin() { podman exec "$COORD" wireserve-admin "$@"; }
 svc_addr() {
-    podman exec "$1" wireserve-agent list --json \
+    podman exec "$1" wireserve list --json \
         | python3 -c "import json,sys; d=json.load(sys.stdin); print(next((s.get('vip4') or '' for s in d['services'] if s['name']=='$2'), ''))"
 }
 # HTTPS through the proxy, by name, from the client: status, then the body.
@@ -182,19 +182,19 @@ log "joining the three agents"
 for pair in "$PROXY:node-proxy" "$HOME_AGENT:node-home" "$CLIENT:node-client"; do
     c=${pair%%:*}; n=${pair#*:}
     jt=$(create_node "$n")
-    podman exec "$c" wireserve-agent join "http://$COORD_IP:47820" --allow-plaintext-http "$jt" \
+    podman exec "$c" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$jt" \
         --listen-port "$WG_PORT" --endpoint-addr "$(ip_on "$c" "$INET"):$WG_PORT" 2>/dev/null
 done
-podman exec -d "$PROXY" wireserve-agent daemon --poll-interval-secs 5 --proxy caddy
-podman exec -d "$HOME_AGENT" wireserve-agent daemon --poll-interval-secs 5
-podman exec -d "$CLIENT" wireserve-agent daemon --poll-interval-secs 5
+podman exec -d "$PROXY" wireserve daemon --poll-interval-secs 5 --proxy caddy
+podman exec -d "$HOME_AGENT" wireserve daemon --poll-interval-secs 5
+podman exec -d "$CLIENT" wireserve daemon --poll-interval-secs 5
 sleep 12
 pass "all three polling"
 
 log "publishing the proxy, and two services on the home node"
-podman exec "$PROXY" wireserve-agent serve web 443:8443
-podman exec "$HOME_AGENT" wireserve-agent serve jellyfin 443:8096
-podman exec "$HOME_AGENT" wireserve-agent serve grafana 443:3000
+podman exec "$PROXY" wireserve serve web 443:8443
+podman exec "$HOME_AGENT" wireserve serve jellyfin 443:8096
+podman exec "$HOME_AGENT" wireserve serve grafana 443:3000
 # Backends that answer with the request headers they were sent.
 for port in 8096 3000; do
     in_netns_bg "$HOME_AGENT" socat "TCP-LISTEN:$port,fork,reuseaddr" \
