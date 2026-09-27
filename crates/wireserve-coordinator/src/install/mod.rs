@@ -80,8 +80,9 @@ fn check_dns_provider(dns: &questions::DnsAnswer, domain: &str) -> Result<(), In
         provider.add_txt(&name, &value).await.map_err(|e| {
             InstallError::Failed(format!(
                 "the {} provider refused a test record in {}: {e}. Nothing was installed; check the \
-                 credentials and that they may edit that zone (or pass --skip-dns-check)",
-                dns.provider, cfg.zone
+                 credentials, that they may edit that zone, and that {} is the zone's own name (set \
+                 WIRESERVE_DNS_ZONE to the parent zone otherwise), or pass --skip-dns-check",
+                dns.provider, cfg.zone, cfg.zone
             ))
         })?;
         if let Err(e) = provider.remove_txt(&name, &value).await {

@@ -562,7 +562,10 @@ token shows up there rather than as names that never appear.
 | `porkbun` | `WIRESERVE_DNS_API_TOKEN` (the API key), `WIRESERVE_DNS_API_SECRET` |
 
 `WIRESERVE_DNS_ZONE` names the zone when it is a parent of the service domain
-(default: the domain itself); `WIRESERVE_DNS_TTL` defaults to 300 seconds.
+(`example.com` for `int.example.com`; default: the domain itself). The
+wizard asks for it. Hetzner, Porkbun and RFC 2136 need it exactly;
+Cloudflare and deSEC find the parent zone on their own. `WIRESERVE_DNS_TTL`
+defaults to 300 seconds.
 
 What to know first:
 

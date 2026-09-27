@@ -42,12 +42,17 @@ pub struct Naming {
 pub struct DnsAnswer {
     pub provider: String,
     pub fields: Vec<(&'static str, String)>,
+    /// The zone the records go into, when it is a parent of the service
+    /// domain (`home.example.com` in the zone `example.com`); `None` when
+    /// the domain is a zone of its own. Hetzner, Porkbun and RFC 2136 need
+    /// it exactly.
+    pub zone: Option<String>,
 }
 
 // Credentials never reach a log or a panic message.
 impl std::fmt::Debug for DnsAnswer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DnsAnswer").field("provider", &self.provider).finish_non_exhaustive()
+        f.debug_struct("DnsAnswer").field("provider", &self.provider).field("zone", &self.zone).finish_non_exhaustive()
     }
 }
 
@@ -58,6 +63,9 @@ impl DnsAnswer {
         let lookup = |key: &str| {
             if key == "WIRESERVE_DNS_PROVIDER" {
                 return Some(self.provider.clone());
+            }
+            if key == "WIRESERVE_DNS_ZONE" {
+                return self.zone.clone();
             }
             self.fields.iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone())
         };
@@ -127,6 +135,7 @@ impl Current {
                     .iter()
                     .filter_map(|f| Some((f.key, envfile::get(text, f.key).filter(|v| !v.is_empty())?)))
                     .collect(),
+                zone: envfile::get(text, "WIRESERVE_DNS_ZONE").filter(|z| !z.is_empty()),
                 provider,
             });
         let naming = envfile::get(text, "WIRESERVE_SERVICE_DOMAIN").filter(|d| !d.is_empty()).map(|domain| Naming {
@@ -189,6 +198,8 @@ impl Answers {
             let value = dns.and_then(|d| d.fields.iter().find(|(k, _)| *k == key));
             dns_changes.push((key, value.map_or(Change::Clear, |(_, v)| Change::Set(v.clone()))));
         }
+        let zone = dns.and_then(|d| d.zone.clone());
+        dns_changes.push(("WIRESERVE_DNS_ZONE", zone.map_or(Change::Clear, Change::Set)));
         let mut changes = vec![
             ("WIRESERVE_PUBLIC_URL", Change::Set(self.public_url.clone())),
             ("WIRESERVE_LISTEN_ADDR", Change::Set(self.listen_addr().to_string())),
@@ -644,7 +655,7 @@ impl Asker<'_> {
                     &format!("you, like plex.{domain}, through your DNS provider's API. It then"),
                     &format!("manages service names under {domain}: a record with the same"),
                     "name as a service is replaced, and nothing else in the zone is",
-                    "touched. Without it, you add one wildcard record yourself.",
+                    "touched. Without it, the names work on WireServe machines only.",
                 ]);
                 if !ask_yes_no("Let the coordinator write the DNS records?", current.is_some()) {
                     return Ok(None);
@@ -681,13 +692,36 @@ impl Asker<'_> {
                     }
                 }
             }
-            let answer = DnsAnswer { provider: provider.clone(), fields };
+            let zone = self.dns_zone(domain, current.as_ref().and_then(|c| c.zone.clone()))?;
+            let answer = DnsAnswer { provider: provider.clone(), fields, zone };
             match answer.check(domain) {
                 Ok(_) => return Ok(Some(answer)),
                 Err(e) if self.interactive => eprintln!("  {e}; let's try that again"),
                 Err(e) => return Err(AskError::Invalid(e)),
             }
         }
+    }
+
+    /// The zone the records go into: `WIRESERVE_DNS_ZONE` first, then the
+    /// question, then the current setting. The domain itself is the
+    /// default, and stored as no setting at all.
+    fn dns_zone(&self, domain: &str, current: Option<String>) -> Result<Option<String>, AskError> {
+        let zone = if let Some(z) = (self.env)("WIRESERVE_DNS_ZONE").filter(|z| !z.trim().is_empty()) {
+            check_domain(&z).map_err(|e| AskError::Invalid(format!("WIRESERVE_DNS_ZONE: {e}")))?
+        } else if !self.interactive {
+            match current {
+                Some(z) => z,
+                None => return Ok(None),
+            }
+        } else {
+            explain(&[
+                &format!("The DNS zone the records go into: {domain} itself if it is a zone of"),
+                "its own at your provider, or the domain it sits under (example.com",
+                "for home.example.com).",
+            ]);
+            ask_until("DNS zone", Some(current.as_deref().unwrap_or(domain)), check_domain)?
+        };
+        Ok((!zone.eq_ignore_ascii_case(domain)).then_some(zone))
     }
 
     fn admin_user(&self) -> Result<Option<String>, AskError> {
@@ -1107,8 +1141,51 @@ mod tests {
     }
 
     #[test]
+    fn a_parent_zone_is_checked_kept_and_cleared() {
+        let given = Given { domain: Some(Some("home.example.com".into())), dns_provider: Some(Some("hetzner".into())), ..dns_given() };
+        let env = |k: &str| match k {
+            "WIRESERVE_DNS_API_TOKEN" => Some("hz-token".to_string()),
+            "WIRESERVE_DNS_ZONE" => Some("Example.com".to_string()),
+            _ => None,
+        };
+        let a = asker_env(given.clone(), Current::default(), &env).ask_all().unwrap();
+        let dns = a.naming.as_ref().unwrap().dns.clone().unwrap();
+        assert_eq!(dns.check("home.example.com").unwrap().zone, "example.com");
+        let text = envfile::apply("", &a.env_changes());
+        assert!(text.contains("WIRESERVE_DNS_ZONE=example.com"), "{text}");
+
+        // A rerun keeps it, and checks with it.
+        let kept = asker(Given::default(), Current::from_env_file(&text)).ask_all().unwrap();
+        assert_eq!(kept.naming.unwrap().dns.unwrap().check("home.example.com").unwrap().zone, "example.com");
+
+        // A zone that does not contain the domain is refused up front.
+        let wrong = |k: &str| match k {
+            "WIRESERVE_DNS_API_TOKEN" => Some("hz-token".to_string()),
+            "WIRESERVE_DNS_ZONE" => Some("other.com".to_string()),
+            _ => None,
+        };
+        let err = asker_env(given, Current::default(), &wrong).ask_all().unwrap_err();
+        assert!(err.to_string().contains("WIRESERVE_DNS_ZONE"), "{err}");
+
+        // The domain as its own zone is no setting; turning DNS off clears it.
+        let own = |k: &str| match k {
+            "WIRESERVE_DNS_API_TOKEN" => Some("t".to_string()),
+            "WIRESERVE_DNS_ZONE" => Some("int.test".to_string()),
+            _ => None,
+        };
+        let a = asker_env(dns_given(), Current::default(), &own).ask_all().unwrap();
+        assert_eq!(change(&a.env_changes(), "WIRESERVE_DNS_ZONE"), &Change::Clear);
+        let off = asker(Given { dns_provider: Some(None), ..Given::default() }, Current::from_env_file(&text)).ask_all().unwrap();
+        assert_eq!(change(&off.env_changes(), "WIRESERVE_DNS_ZONE"), &Change::Clear);
+    }
+
+    #[test]
     fn the_dns_answer_never_prints_its_credentials() {
-        let d = DnsAnswer { provider: "cloudflare".into(), fields: vec![("WIRESERVE_DNS_API_TOKEN", "cf-live".into())] };
+        let d = DnsAnswer {
+            provider: "cloudflare".into(),
+            fields: vec![("WIRESERVE_DNS_API_TOKEN", "cf-live".into())],
+            zone: None,
+        };
         assert!(!format!("{d:?}").contains("cf-live"));
     }
 }

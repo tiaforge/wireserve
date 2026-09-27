@@ -3217,3 +3217,25 @@ sent is removed. There are no previous installations to carry forward.
     `ProbeResponse.reflexive_port` is required, and `TlsResponse::Unsupported`
     — "an old coordinator" — is gone. `WIRESERVE_STATE_PATH` and
     `WIRESERVE_SOCKET_PATH` are gone too: paths come from the instance.
+
+202. **The install wizard asks for the DNS zone.** It defaulted silently to
+    the service domain, so `home.example.com` inside the zone `example.com`
+    failed the wizard's test record on Hetzner, Porkbun and RFC 2136 (which
+    take the zone name as given; Cloudflare and deSEC walk up to it). Only
+    `--skip-dns-check` and a hand edit got past it, and `--reconfigure`
+    failed again. The zone is now a question (from `WIRESERVE_DNS_ZONE`,
+    then asked, then kept), part of the check, and written only when it
+    differs from the domain. The DNS explanation's "add one wildcard
+    record yourself" went too: with every service on its own address, no
+    wildcard can be right.
+
+203. **`run-nat-test.sh` tests the reflexive tier on a NAT it can work on.**
+    #94 made router-b `masquerade random`, but Linux gives every
+    destination of such a masquerade its own random port: a symmetric NAT,
+    where the reflexive port is useless to anyone but the coordinator
+    (M23's case). Agent1 reached node2 only because node2 dialled agent1's
+    port-forward and WireGuard roamed agent1's endpoint, so the check that
+    agent1 dials the reflexive address failed. Node2 now sits behind an
+    endpoint-independent mapping to a different port (a fixed SNAT to
+    40404 plus a DNAT back), what most home routers do; agent3 stays
+    behind the symmetric one.

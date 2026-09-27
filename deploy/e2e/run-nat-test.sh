@@ -141,15 +141,12 @@ start_router() {
 log "starting the two NAT routers"
 start_router "$ROUTER_A" "$SITE_A"
 start_router "$ROUTER_B" "$SITE_B"
-# Router-b's masquerade rewrites the source port to a DIFFERENT one on
-# every new flow (NAT-traversal step 2, PLAN.md decisions log #90+),
-# instead of the plain masquerade's port-preserving default. Without
-# this, the coordinator's naive WAN-endpoint guess (observed IP + the
-# node's own declared listen_port) happens to already be correct on this
-# harness's simple masquerade, so it would never expose the bug the
-# reflexive-address responder exists to fix — real consumer NAT commonly
-# does not preserve the port either. Router-a is untouched: agent1 has a
-# real port-forward and its guessed endpoint is uninteresting here.
+# Router-b's masquerade picks a random source port for every new flow,
+# instead of the plain masquerade's port-preserving default. Linux NAT
+# keeps no mapping per source, so every destination gets its own port:
+# a symmetric NAT, which is what agent3 sits behind. Node2 gets a mapping
+# of its own below, once its address is known (NAT-traversal step 2,
+# PLAN.md decisions log #94).
 podman exec "$ROUTER_B" nft flush chain ip nat postrouting
 podman exec "$ROUTER_B" nft 'add rule ip nat postrouting oifname "eth0" masquerade random'
 ROUTER_A_WAN=$(ip_on "$ROUTER_A" "$INET")
@@ -185,6 +182,18 @@ log "port-forwarding UDP/$WG_PORT on router-a to agent1"
 podman exec "$ROUTER_A" nft \
     "add rule ip nat prerouting iifname \"eth0\" udp dport $WG_PORT dnat to $AGENT1_LAN:$WG_PORT"
 pass "agent1 is reachable from the inet segment, the other two are not"
+
+# Node2 sits behind what most home routers are: a NAT that gives its
+# WireGuard socket one external port for every destination (endpoint-
+# independent mapping) and lets anyone send to it (endpoint-independent
+# filtering), but not the port the node itself listens on. That port is
+# what the reflexive responder learns and the naive WAN guess
+# (observed IP + listen_port) gets wrong. Set before node2 registers.
+NODE2_NAT_PORT=40404
+podman exec "$ROUTER_B" nft \
+    "insert rule ip nat postrouting oifname \"eth0\" ip saddr $AGENT2_LAN udp sport $WG_PORT snat to $ROUTER_B_WAN:$NODE2_NAT_PORT"
+podman exec "$ROUTER_B" nft \
+    "add rule ip nat prerouting iifname \"eth0\" udp dport $NODE2_NAT_PORT dnat to $AGENT2_LAN:$WG_PORT"
 
 log "checking the agents can reach the coordinator through NAT at all"
 for a in "$AGENT1" "$AGENT2" "$AGENT3"; do
@@ -333,9 +342,11 @@ check_pair() {
 }
 
 # Across the two NATs, in both directions. The second one is the
-# interesting half: nothing is forwarded to agent2, so it can only work
-# because agent2's keepalive holds a mapping open through its router and
-# WireGuard corrected agent2's endpoint from the traffic it received.
+# interesting half: nothing is forwarded to agent2's own listen port, so
+# agent1 needs the reflexive address (checked further down). Agent3,
+# behind the symmetric mapping, is reached only because its keepalive
+# holds a mapping open and WireGuard corrects agent1's endpoint from the
+# traffic it receives.
 check_pair "$AGENT2" "$SVC1" "NAT-ed node reaches the port-forwarded node" required
 check_pair "$AGENT1" "$SVC2" "port-forwarded node reaches back into the NAT-ed node" required
 check_pair "$AGENT3" "$SVC1" "the second NAT-ed node also reaches the port-forwarded node" required
@@ -371,16 +382,15 @@ else
     fail "agent3's configured endpoint for agent2 is not its LAN address — got: $AGENT3_ENDPOINTS"
 fi
 
-# NAT-traversal step 2 (PLAN.md decisions log #90+): agent1 (site-a) and
-# node2/agent2 (site-b) share no LAN, so this pair can only be reached
-# via the naive WAN guess (coordinator-observed IP + node2's own
-# declared listen_port) or the coordinator's self-hosted reflexive
-# responder. Router-b's `masquerade random` (set up before any node
-# registered) makes the naive guess provably wrong, so this is the
-# direct regression test for the feature — run only after the daemons
-# have been polling for a while (not right after `join`), since a UDP
-# conntrack entry from `join`'s own one-shot probe may have already
-# expired.
+# NAT-traversal step 2 (PLAN.md decisions log #94): agent1 (site-a) and
+# node2/agent2 (site-b) share no LAN, so agent1 can only dial node2 at the
+# naive WAN guess (router-b's address + node2's listen_port, which nothing
+# forwards) or at the reflexive address the coordinator's responder saw
+# (router-b's address + the port node2's mapping really uses). Node2's
+# mapping keeps that port for every destination, so it is the one that
+# works — and the one agent1 must end up dialling. (Behind a symmetric
+# NAT, like agent3's, the reflexive port is useless to anyone but the
+# coordinator; that case is M23's transit, run-transit-test.sh.)
 list_peers_field() {
     podman exec "$COORD" wireserve-admin list-peers \
         | awk -v name="$1" -v prefix="$2" '$1 == name { for (i = 1; i <= NF; i++) if (index($i, prefix) == 1) print substr($i, length(prefix) + 1) }'
@@ -392,8 +402,8 @@ if [ -z "$NODE2_REFLEXIVE" ] || [ "$NODE2_REFLEXIVE" = "-" ]; then
     fail "coordinator recorded no reflexive_addr for node2 — the one-shot probe did not succeed"
 fi
 NODE2_REFLEXIVE_PORT=${NODE2_REFLEXIVE##*:}
-if [ "$NODE2_REFLEXIVE_PORT" = "$WG_PORT" ]; then
-    fail "node2's reflexive port equals its own listen_port ($WG_PORT) — router-b's random masquerade should have made these differ"
+if [ "$NODE2_REFLEXIVE_PORT" != "$NODE2_NAT_PORT" ]; then
+    fail "node2's reflexive port is $NODE2_REFLEXIVE_PORT, not the port router-b maps it to ($NODE2_NAT_PORT)"
 fi
 pass "node2's reflexive address ($NODE2_REFLEXIVE) carries a real NAT-mapped port, not the naive guess"
 
