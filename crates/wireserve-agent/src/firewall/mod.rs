@@ -53,7 +53,7 @@ impl ForwardWanted {
             services: state
                 .declared_services
                 .iter()
-                .any(|d| d.port_maps().iter().any(|m| m.addr.is_some())),
+                .any(|d| d.ports.clone().iter().any(|m| m.addr.is_some())),
             exit: state.exit_capable,
         }
     }
@@ -172,6 +172,7 @@ mod tests {
     }
 
     const NODE: std::net::Ipv4Addr = std::net::Ipv4Addr::new(100, 90, 0, 2);
+    const VIP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(100, 90, 0, 50);
 
     #[test]
     fn startup_sequence_runs_strictly_before_first_real_apply() {
@@ -179,12 +180,7 @@ mod tests {
         startup_sequence(&mut backend).unwrap();
         backend
             .apply(
-                &[ServiceRule::Open {
-                    proto: Proto::Tcp,
-                    port: 32400,
-                    node: NODE,
-                    node6: None,
-                }],
+                &[ServiceRule::Mapped { vip: VIP, node: NODE, map: wireserve_types::PortMap::identity(32400, Proto::Tcp) }],
                 &Forwarding::default(),
             )
             .unwrap();
@@ -195,12 +191,7 @@ mod tests {
                 Call::Teardown,
                 Call::Apply(vec![], Forwarding::default()),
                 Call::Apply(
-                    vec![ServiceRule::Open {
-                        proto: Proto::Tcp,
-                        port: 32400,
-                        node: NODE,
-                        node6: None,
-                    }],
+                    vec![ServiceRule::Mapped { vip: VIP, node: NODE, map: wireserve_types::PortMap::identity(32400, Proto::Tcp) }],
                     Forwarding::default()
                 ),
             ]

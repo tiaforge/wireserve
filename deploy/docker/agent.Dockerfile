@@ -86,11 +86,9 @@ COPY --from=builder /out/wireserve /usr/local/bin/wireserve
 # /etc/hosts needs DAC access this container's root has for free and a
 # non-root user would need CAP_DAC_OVERRIDE (nearly as broad as root) to
 # get another way.
-# The default instance's paths (the built-in defaults, spelled out). A
-# named instance (`--instance <n>`) keeps its state under
-# /var/lib/wireserve/instances/<n> — inside the same volume.
-ENV WIRESERVE_STATE_PATH=/var/lib/wireserve/agent-state.json
-ENV WIRESERVE_SOCKET_PATH=/run/wireserve/agent.sock
+# The default instance keeps its state in /var/lib/wireserve and its
+# socket in /run/wireserve; a named instance (`--instance <n>`) keeps its
+# state under /var/lib/wireserve/instances/<n>, inside the same volume.
 VOLUME ["/var/lib/wireserve", "/run/wireserve"]
 ENTRYPOINT ["/usr/local/bin/wireserve"]
 CMD ["daemon"]

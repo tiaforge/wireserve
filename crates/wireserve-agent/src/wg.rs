@@ -1399,8 +1399,6 @@ mod tests {
             name: name.into(),
             node: node.into(),
             ip4: String::new(),
-            port: 80,
-            proto: wireserve_types::Proto::Tcp,
             online: true,
             vip4: vip4.map(Into::into),
             ports: vec![],

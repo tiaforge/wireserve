@@ -23,8 +23,6 @@ pub const PREFIX: &str = "wireserve";
 /// agents plus other tunnels squatting on some of the names, small enough
 /// that a scan stays cheap.
 pub const CANDIDATES: u32 = 16;
-/// The name every agent used before instances existed.
-pub const LEGACY: &str = "wg0";
 
 pub fn candidates() -> impl Iterator<Item = String> {
     (0..CANDIDATES).map(|n| format!("{PREFIX}{n}"))
@@ -223,11 +221,10 @@ pub fn probe_host(name: &str, private_key_b64: &str) -> Probe<crate::lock::Ifnam
 }
 
 /// Names this instance might have left an interface under: every
-/// candidate, the pre-instances default, and whatever it used last.
+/// candidate, and whatever it used last.
 #[must_use]
 pub fn leftover_names(chosen: &str, previous: Option<&str>) -> Vec<String> {
     let mut names: Vec<String> = candidates().collect();
-    names.push(LEGACY.to_string());
     names.extend(previous.map(str::to_string));
     names.sort();
     names.dedup();
@@ -403,8 +400,8 @@ mod tests {
     #[test]
     fn leftovers_cover_every_name_but_the_chosen_one() {
         let names = leftover_names("wireserve1", Some("mesh7"));
-        assert_eq!(names.len(), 16 - 1 + 2);
-        assert!(names.contains(&"wg0".to_string()) && names.contains(&"mesh7".to_string()));
+        assert_eq!(names.len(), 16 - 1 + 1);
+        assert!(names.contains(&"mesh7".to_string()));
         assert!(!names.contains(&"wireserve1".to_string()));
         assert_eq!(leftover_names("wg0", Some("wg0")).len(), 16);
     }

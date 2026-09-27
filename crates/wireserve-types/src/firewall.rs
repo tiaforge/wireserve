@@ -6,7 +6,6 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::node::Proto;
 use crate::ports::PortMap;
 
 /// One hole in the default-deny on the mesh interface.
@@ -22,23 +21,6 @@ pub enum ServiceRule {
     /// with the node's own address as its source, since whatever answers
     /// there has no route back into the mesh.
     Mapped { vip: Ipv4Addr, node: Ipv4Addr, map: PortMap },
-    /// `port` opened on the node's own mesh address(es), as before service
-    /// addresses existed. Only used while the coordinator hands out no
-    /// address for a service, i.e. one that predates them.
-    ///
-    /// The addresses are part of the rule, not decoration (security
-    /// review finding #3): matched on the port alone, the hole also
-    /// admitted a peer's packets *addressed to somewhere else* on that
-    /// port — another local address of the node, a container or VM
-    /// bridge behind it, its LAN — whenever the node forwards, turning a
-    /// declared service into a relay. Only a connection the peer
-    /// addressed to one of these is let through.
-    Open {
-        proto: Proto,
-        port: u16,
-        node: Ipv4Addr,
-        node6: Option<Ipv6Addr>,
-    },
     /// `vip:map.public` answered by this node's own TLS terminator
     /// (PLAN.md M33), which listens on that address itself: the request is
     /// let in unrewritten, and nothing of `map.target` is opened — the
@@ -78,7 +60,7 @@ impl ServiceRule {
             Self::Mapped { map, .. } => map.addr,
             // The terminator connects to a remote target itself, as an
             // ordinary local process: nothing is forwarded for it.
-            Self::Open { .. } | Self::Terminated { .. } => None,
+            Self::Terminated { .. } => None,
         }
     }
 }

@@ -8,7 +8,7 @@ use wireserve_agent::state::AgentState;
 use wireserve_agent::firewall::InteropHandle;
 use wireserve_agent::paths::{self, Instance};
 use wireserve_agent::{firewall, ifname, lock, poll_loop, register, wg::WgInterface};
-use wireserve_types::{FirewallBackend, PortMap, Proto};
+use wireserve_types::{FirewallBackend, PortMap};
 
 #[derive(Parser)]
 #[command(name = "wireserve")]
@@ -90,7 +90,6 @@ enum Command {
     /// LAN, which then sees the connection come from this node (TCP unless
     /// given; a bare port maps to itself). `serve web 80:5080`,
     /// `serve dns 53/udp 53/tcp 8080:8000`, `serve myrouter 443:192.168.178.1:80`.
-    /// The older `serve <name> <port> [tcp|udp]` still works.
     Serve {
         name: String,
         #[arg(required = true, value_name = "PORT")]
@@ -333,9 +332,6 @@ async fn cmd_install(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn 
     let instance_flag = if instance.is_default() { String::new() } else { format!(" --instance {}", instance.name()) };
     println!();
     println!("{unit} is running — `wireserve{instance_flag} list` shows its services and peers");
-    if wireserve_agent::install::old_binary_present() {
-        println!("(the command is now `wireserve`; /usr/local/bin/wireserve-agent is an older copy that nothing uses any more — left as it was)");
-    }
     if let Some(group) = group {
         // The user who ran sudo, not root: root needs no group.
         let who = std::env::var("SUDO_USER").ok().filter(|u| !u.is_empty() && u != "root");
@@ -431,12 +427,13 @@ async fn cmd_daemon(
     if state.bearer_token.is_none() {
         return Err("not registered — run `wireserve join` first".into());
     }
-    // A node that joined before `--allow-plaintext-http` existed has no
-    // record of the choice; the environment variable is its way to make
-    // it without joining again.
-    let plaintext_allowed = state.allow_plaintext_http
-        || std::env::var(register::ALLOW_PLAINTEXT_HTTP_ENV).is_ok_and(|v| v == "1");
-    register::check_coordinator_transport(state.coordinator_url.as_deref().unwrap_or_default(), plaintext_allowed)?;
+    register::check_coordinator_transport(
+        state.coordinator_url.as_deref().unwrap_or_default(),
+        state.allow_plaintext_http,
+    )?;
+    if state.mesh.is_none() {
+        return Err("this node has no pinned mesh range — run `wireserve join` again".into());
+    }
 
     let ip4: std::net::Ipv4Addr = state.ip4.clone().unwrap_or_default().parse()?;
     let ip6: std::net::Ipv6Addr = state.ip6.clone().unwrap_or_default().parse()?;
@@ -491,15 +488,6 @@ async fn cmd_daemon(
 
     let mut wg = WgInterface::new(&ifname)?;
     let mut endpoint_tracker = wireserve_agent::wg::EndpointTracker::default();
-
-    // An agent from before multi-instance support kept its firewall state
-    // under fixed names. Nothing creates those any more, so whatever is
-    // there was left by a crash or a mid-run upgrade — of what is now the
-    // default instance.
-    #[cfg(target_os = "linux")]
-    if instance.is_default() {
-        firewall::host_interop::remove_legacy();
-    }
 
     #[cfg(target_os = "linux")]
     let mut fw = firewall::nftables::NftablesBackend::new(ifname.clone())?;
@@ -875,38 +863,15 @@ async fn teardown_everything<F: FirewallBackend>(
     }
 }
 
-/// `serve`'s port arguments: each a [`PortMap`], or the older
-/// `<port> <tcp|udp>` pair, told apart by the protocol word standing alone.
+/// `serve`'s port arguments, each a [`PortMap`].
 fn parse_serve_ports(args: &[String]) -> Result<Vec<PortMap>, String> {
-    if let [port, proto] = args {
-        if let Ok(proto) = proto.parse::<Proto>() {
-            let port: u16 = port.parse().map_err(|_| format!("invalid port '{port}'"))?;
-            return Ok(vec![PortMap::identity(port, proto)]);
-        }
-    }
     args.iter().map(|a| a.parse::<PortMap>()).collect()
 }
 
 async fn cmd_serve(instance: &Instance, name: String, ports: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let ports = parse_serve_ports(ports)?;
     wireserve_types::validate_service_ports(&ports)?;
-    let first = ports[0];
-    let forwards = ports.iter().any(|m| m.addr.is_some());
-    let req = if forwards {
-        IpcRequest::ServeForwarding { name, port: first.target, proto: first.proto, ports }
-    } else {
-        IpcRequest::Serve { name, port: first.target, proto: first.proto, ports }
-    };
-    let resp = client::call(&instance.socket_path(), &req).await?;
-    if forwards {
-        if let wireserve_agent::ipc::IpcResponse::Error { message } = &resp {
-            if message.contains("unknown variant") {
-                return Err("the running daemon predates target addresses in `serve`; restart it \
-                            (e.g. `systemctl restart wireserve-agent`) and try again"
-                    .into());
-            }
-        }
-    }
+    let resp = client::call(&instance.socket_path(), &IpcRequest::Serve { name, ports }).await?;
     // "ok" alone overstates what just happened: the declaration is queued
     // locally and only reaches the coordinator on the next poll, and if
     // that coordinator requires approval it will sit pending until an
@@ -1042,6 +1007,7 @@ impl FirewallBackend for NoopFirewall {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wireserve_types::Proto;
 
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| (*s).to_string()).collect()
@@ -1058,13 +1024,6 @@ mod tests {
             ]
         );
         assert_eq!(parse_serve_ports(&args(&["80:5080"])).unwrap(), vec!["80:5080".parse().unwrap()]);
-    }
-
-    #[test]
-    fn serve_still_takes_the_old_port_and_protocol_form() {
-        assert_eq!(parse_serve_ports(&args(&["32400"])).unwrap(), vec![PortMap::identity(32400, Proto::Tcp)]);
-        assert_eq!(parse_serve_ports(&args(&["53", "udp"])).unwrap(), vec![PortMap::identity(53, Proto::Udp)]);
-        assert!(parse_serve_ports(&args(&["x", "udp"])).is_err());
     }
 
     #[test]

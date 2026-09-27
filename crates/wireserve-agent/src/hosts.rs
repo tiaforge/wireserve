@@ -6,8 +6,8 @@
 //! already in the file.
 //!
 //! Each agent instance on a host owns its own block: the default instance
-//! keeps the bare `# BEGIN WIRESERVE` / `# END WIRESERVE` markers every
-//! earlier version wrote, a named instance `<n>` writes
+//! writes the bare `# BEGIN WIRESERVE` / `# END WIRESERVE` markers, a
+//! named instance `<n>` writes
 //! `# BEGIN WIRESERVE <n>` / `# END WIRESERVE <n>`. Markers only ever
 //! match a whole line, so `# BEGIN WIRESERVE` never finds the start of
 //! another instance's labelled block.
@@ -250,7 +250,6 @@ fn write_preserving_mode(path: &Path, contents: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wireserve_types::Proto;
 
     fn svc(name: &str, ip4: &str) -> ServiceInfo {
         ServiceInfo {
@@ -259,8 +258,6 @@ mod tests {
             name: name.into(),
             node: "somenode".into(),
             ip4: ip4.into(),
-            port: 1234,
-            proto: Proto::Tcp,
             online: true,
             vip4: None,
             ports: vec![],
@@ -555,8 +552,6 @@ mod naming_tests {
             name: name.into(),
             node: "somenode".into(),
             ip4: "100.90.0.3".into(),
-            port: public,
-            proto: Proto::Tcp,
             online: true,
             vip4: Some(vip.into()),
             ports: vec![PortMap { public, target: 9999, proto: Proto::Tcp, addr: None }],

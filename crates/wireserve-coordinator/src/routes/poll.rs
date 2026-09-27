@@ -56,17 +56,10 @@ pub async fn poll(
                 decl.name
             )));
         }
-        if decl.port == 0 {
-            return Err(AppError::BadRequest(format!(
-                "invalid port 0 for service '{}'",
-                decl.name
-            )));
-        }
-        // The same per-service check the agent's `serve` makes. The
-        // per-node one (a target port mapped once) is left to the agent:
-        // it concerns only its own firewall, and a declaration list from
-        // before port mappings may legitimately alias a port.
-        if let Err(e) = wireserve_types::validate_service_ports(&decl.port_maps()) {
+        // The same per-service check the agent's `serve` makes (no empty
+        // list, no port 0). The per-node one (a target port mapped once) is
+        // left to the agent: it concerns only its own firewall.
+        if let Err(e) = wireserve_types::validate_service_ports(&decl.ports) {
             return Err(AppError::BadRequest(format!("service '{}': {e}", decl.name)));
         }
         // A target address inside the mesh (PLAN.md M26) — the agent's
@@ -249,8 +242,7 @@ pub async fn poll(
                 event = "service_pending_approval",
                 node_name = %node.name,
                 service = %row.name,
-                port = row.port,
-                proto = row.proto.as_str(),
+                ports = %row.ports.iter().map(ToString::to_string).collect::<Vec<_>>().join(","),
             );
         }
     }

@@ -303,14 +303,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // Same S2 defense in depth as list-peers: every field is
                 // sanitized, and denied_reason especially — it is the one
                 // field here an operator typed and a database round-tripped.
-                // `<vip or node address>\t<mapping,...>` (in `serve` syntax): where
-                // `<name>.wg` resolves and what it serves there.
-                let address = s.vip4.as_deref().unwrap_or(&s.ip4);
-                let ports = if s.ports.is_empty() {
-                    format!("{}/{}", s.port, s.proto.as_str())
-                } else {
-                    s.ports.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
-                };
+                // `<address>\t<mapping,...>` (in `serve` syntax): where the
+                // name resolves and what it serves there; `-` for a service
+                // the range had no address left for.
+                let address = s.vip4.as_deref().unwrap_or("-");
+                let ports = s.ports.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
                 // Only present when the coordinator publishes records
                 // (PLAN.md M32); the provider's error text is sanitized like
                 // everything else that came off the wire.

@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::node::{NodeKind, Proto};
+use crate::node::NodeKind;
 use crate::ports::PortMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,11 +79,8 @@ pub struct ProbeResponse {
     /// The UDP port `wireserve-coordinator`'s self-hosted reflexive
     /// responder (`wireserve_types::reflexive`, PLAN.md M22) is bound
     /// on — same port number as this HTTP API, just UDP (see that
-    /// module's doc comment for why no separate port exists). Absent
-    /// for an older coordinator that predates the feature, which an
-    /// agent must treat as a clean "nothing to probe," never an error.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub reflexive_port: Option<u16>,
+    /// module's doc comment for why no separate port exists).
+    pub reflexive_port: u16,
 }
 
 // ---- §4.2 Node: register ----
@@ -102,8 +99,7 @@ pub struct RegisterRequest {
     /// against `/probe` (never derived by the coordinator from a single
     /// passively-observed connection, unlike `endpoint_addr`'s fallback) —
     /// see `wireserve-agent`'s `probe` module. Absent for a node that
-    /// couldn't reach the coordinator over that family at all, or for an
-    /// older agent that predates this field.
+    /// couldn't reach the coordinator over that family at all.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub endpoint_addr_v4: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -125,8 +121,8 @@ pub struct RegisterRequest {
     /// multiplexed with a userspace probe. Unlike `lan_addr`, this
     /// carries its own port — it comes straight from a real observed
     /// socket address rather than borrowing one. `None` when the probe
-    /// failed, the node has real working IPv6 (this mechanism is
-    /// IPv4-only), or the coordinator predates the feature.
+    /// failed, or the node has real working IPv6 (this mechanism is
+    /// IPv4-only).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reflexive_addr: Option<String>,
     /// This node's own opt-in to carry transit traffic for other peers
@@ -144,12 +140,12 @@ pub struct RegisterResponse {
     pub ip4: String,
     pub ip6: String,
     /// The mesh ranges `ip4`/`ip6` came from, for the agent to pin — see
-    /// [`crate::MeshInfo`]. Absent from a coordinator that predates it.
+    /// [`crate::MeshInfo`]. The agent refuses to join without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<crate::MeshInfo>,
     /// How services are named on this mesh (PLAN.md M25). Absent when the
     /// coordinator has no domain configured, which leaves `<name>.wg`
-    /// untouched — and absent from a coordinator that predates it.
+    /// untouched.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub naming: Option<crate::ServiceNaming>,
 }
@@ -194,8 +190,8 @@ pub const MAX_TRANSIT_WANTED_PER_POLL: usize = 64;
 ///
 /// `tls-terminate` (PLAN.md M33): this agent runs, or can run, the
 /// terminator that serves its own 443 services with TLS on their own
-/// addresses. Reported whether or not a service is ready yet, so the
-/// coordinator can tell an old agent from a terminator that is failing.
+/// addresses, as soon as one has checked in, whether or not a service is
+/// ready yet.
 pub const CAP_TLS_TERMINATE: &str = "tls-terminate";
 
 /// `sign-in` (PLAN.md M34): this agent's terminator puts the built-in
@@ -213,15 +209,8 @@ pub const MAX_CAPABILITIES_PER_POLL: usize = 16;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceDecl {
     pub name: String,
-    /// The first mapping's target port and protocol. All a coordinator
-    /// from before port mappings understands; a newer one reads `ports`.
-    pub port: u16,
-    pub proto: Proto,
-    /// Public→target mappings on the service's own address. Empty on a
-    /// declaration from before port mappings existed, which stands for
-    /// the one identity mapping `port:port/proto` — see
-    /// [`ServiceDecl::port_maps`].
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Public→target mappings on the service's own address; never empty
+    /// (see [`crate::validate_service_ports`]).
     pub ports: Vec<PortMap>,
 }
 
@@ -230,30 +219,7 @@ impl ServiceDecl {
     /// [`crate::validate_service_ports`] first).
     #[must_use]
     pub fn new(name: impl Into<String>, ports: Vec<PortMap>) -> Self {
-        let first = ports[0];
-        Self {
-            name: name.into(),
-            port: first.target,
-            proto: first.proto,
-            ports,
-        }
-    }
-
-    /// The mappings this declaration stands for, old form included.
-    #[must_use]
-    pub fn port_maps(&self) -> Vec<PortMap> {
-        effective_ports(&self.ports, self.port, self.proto)
-    }
-}
-
-/// The mappings a declaration stands for: `ports`, or the identity mapping of
-/// the single `port`/`proto` a declaration from before port mappings carries.
-#[must_use]
-pub fn effective_ports(ports: &[PortMap], port: u16, proto: Proto) -> Vec<PortMap> {
-    if ports.is_empty() {
-        vec![PortMap::identity(port, proto)]
-    } else {
-        ports.to_vec()
+        Self { name: name.into(), ports }
     }
 }
 
@@ -287,8 +253,7 @@ pub struct PollRequest {
     /// it as their gateway (PLAN.md M27, `wireserve exit on/off`).
     /// Separate from `transit_capable`: forwarding between mesh members
     /// is one consent, sending a device's traffic to the internet under
-    /// this node's own public address is another. Absent when false, so
-    /// a coordinator that predates it sees nothing new.
+    /// this node's own public address is another. Absent when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exit_capable: bool,
     /// Pubkeys this node currently sees a fresh kernel handshake with —
@@ -307,9 +272,8 @@ pub struct PollRequest {
     pub transit_wanted: Vec<String>,
     #[serde(default)]
     pub services: Vec<ServiceDecl>,
-    /// What this agent can do — see [`CAP_SIGN_IN`]. Absent from an
-    /// agent that predates it, which is exactly the one that must not be
-    /// trusted with a service marked for sign-in.
+    /// What this agent can do — see [`CAP_TLS_TERMINATE`] and
+    /// [`CAP_SIGN_IN`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
     /// This node's services whose TLS the local terminator is serving right
@@ -373,42 +337,25 @@ pub struct PeerInfo {
 pub struct ServiceInfo {
     pub name: String,
     pub node: String,
-    /// The owning NODE's address. Older agents write this into their
-    /// hosts file; newer ones prefer `vip4`.
+    /// The owning node's address.
     pub ip4: String,
-    pub port: u16,
-    pub proto: Proto,
     pub online: bool,
-    /// The service's own address, which `<name>.wg` resolves to and every
-    /// peer routes to the owning node. `None` from a coordinator that
-    /// predates service addresses, or for a declaration from an agent
-    /// that does.
+    /// The service's own address, which its name resolves to and every
+    /// peer routes to the owning node. `None` only while the coordinator
+    /// has none left to give it — such a service is reachable nowhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vip4: Option<String>,
-    /// Empty from a coordinator that predates port mappings; see
-    /// [`ServiceInfo::port_maps`].
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Its public→target mappings, target addresses left out (PLAN.md M26).
     pub ports: Vec<PortMap>,
-    /// Published behind the proxy's sign-in (PLAN.md M29): the proxy puts
-    /// forward_auth in front of it, and the owning node accepts it from the
-    /// proxy's address only, so the sign-in cannot be walked around. Absent
-    /// when false.
+    /// Behind the sign-in (PLAN.md M29, M34): its node's terminator checks
+    /// every request with the provider, and the node opens nothing else of
+    /// it. Absent when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auth: bool,
-    /// Served with TLS by its own node (PLAN.md M33): the name resolves to
-    /// the service's own address, where the owner's terminator answers on
-    /// 443, rather than to the proxy. Absent when false, which is every
-    /// service on a coordinator or owner that predates it.
+    /// Served with TLS by its own node (PLAN.md M33) right now. Absent when
+    /// false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub terminated: bool,
-}
-
-impl ServiceInfo {
-    /// The mappings this entry stands for, old form included.
-    #[must_use]
-    pub fn port_maps(&self) -> Vec<PortMap> {
-        effective_ports(&self.ports, self.port, self.proto)
-    }
 }
 
 /// A declaration the coordinator accepted and stored but has NOT put in
@@ -417,8 +364,7 @@ impl ServiceInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingService {
     pub name: String,
-    pub port: u16,
-    pub proto: Proto,
+    pub ports: Vec<PortMap>,
     /// The address the service will have once approved. Sent to its owner
     /// alone, so the owner's firewall is ready the moment approval puts
     /// the service in everyone else's directory — nothing routes to it
@@ -505,7 +451,7 @@ pub struct PollResponse {
     pub mesh: Option<crate::MeshInfo>,
     /// How services are named on this mesh (PLAN.md M25). Absent when the
     /// coordinator has no domain configured, which leaves `<name>.wg`
-    /// untouched — and absent from a coordinator that predates it.
+    /// untouched.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub naming: Option<crate::ServiceNaming>,
     /// THIS node's own declarations awaiting approval — never anyone
@@ -544,11 +490,8 @@ pub struct AdminServiceInfo {
     pub name: String,
     pub node: String,
     pub ip4: String,
-    pub port: u16,
-    pub proto: Proto,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub vip4: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<PortMap>,
     pub state: ServiceApprovalState,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -648,9 +591,7 @@ pub struct SetGatewayRequest {
     /// The export also rendered a full-tunnel profile (PLAN.md M27), so the
     /// gateway must send this device's internet traffic onwards. Recorded
     /// per export like `conf_peers`, since it describes the files handed
-    /// out: a refresh without `--exit` clears it. Absent when false; a
-    /// coordinator that predates it ignores it, which the admin CLI rules
-    /// out beforehand by requiring the gateway in `exit_offering`.
+    /// out: a refresh without `--exit` clears it. Absent when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exit: bool,
 }
@@ -709,9 +650,7 @@ pub struct AdminPeersResponse {
     pub via_gateway: Vec<String>,
     /// Names of the nodes whose most recent poll offered to be an exit
     /// (`wireserve exit on`, PLAN.md M27), approved for transit or
-    /// not — the export checks both. Empty from a coordinator that predates
-    /// exits, which makes `export-config --exit` refuse rather than write a
-    /// profile nothing would forward.
+    /// not — the export checks both.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exit_offering: Vec<String>,
     /// Names of the static peers whose last export included the
@@ -773,45 +712,10 @@ mod tests {
 
     #[test]
     fn poll_response_without_the_approval_fields_still_deserializes() {
-        // An older coordinator's response reaching a newer agent, and a
-        // state file written before the fields existed.
+        // Empty lists are left off the wire; reading them back must work.
         let resp: PollResponse = serde_json::from_str(r#"{"peers":[],"services":[]}"#).unwrap();
         assert!(resp.pending_services.is_empty());
         assert!(resp.denied_services.is_empty());
-    }
-
-    #[test]
-    fn a_declaration_without_ports_stands_for_its_identity_mapping() {
-        // What an agent from before port mappings sends, and what its
-        // state file holds.
-        let d: ServiceDecl = serde_json::from_str(r#"{"name":"plex","port":32400,"proto":"tcp"}"#).unwrap();
-        assert!(d.ports.is_empty());
-        assert_eq!(d.port_maps(), vec![PortMap::identity(32400, Proto::Tcp)]);
-    }
-
-    #[test]
-    fn a_new_declaration_still_carries_port_and_proto_for_old_coordinators() {
-        let maps = vec!["80:5080".parse().unwrap(), "53/udp".parse().unwrap()];
-        let d = ServiceDecl::new("web", maps);
-        let json: serde_json::Value = serde_json::to_value(&d).unwrap();
-        assert_eq!(json["port"], 5080);
-        assert_eq!(json["proto"], "tcp");
-        assert_eq!(json["ports"][0], serde_json::json!({"public": 80, "target": 5080, "proto": "tcp"}));
-        assert_eq!(d.port_maps(), d.ports);
-    }
-
-    #[test]
-    fn a_service_entry_from_an_old_coordinator_has_no_address_and_one_mapping() {
-        let s: ServiceInfo = serde_json::from_str(
-            r#"{"name":"plex","node":"n","ip4":"10.0.0.3","port":32400,"proto":"tcp","online":true}"#,
-        )
-        .unwrap();
-        assert!(s.vip4.is_none());
-        assert_eq!(s.port_maps(), vec![PortMap::identity(32400, Proto::Tcp)]);
-        // And the new fields stay off the wire when unset, so an old agent
-        // sees exactly the shape it always did.
-        let json = serde_json::to_string(&s).unwrap();
-        assert!(!json.contains("vip4") && !json.contains("ports"), "{json}");
     }
 
     #[test]
@@ -836,8 +740,6 @@ mod tests {
                 name: "plex".into(),
                 node: "homeserver".into(),
                 ip4: "100.90.0.3".into(),
-                port: 32400,
-                proto: Proto::Tcp,
                 online: true,
                 vip4: None,
                 ports: vec![],
@@ -860,6 +762,5 @@ mod tests {
         assert!(back.peers[0].endpoint_addr_v6.is_none());
         assert_eq!(back.peers[0].reflexive_addr.as_deref(), Some("203.0.113.5:55123"));
         assert_eq!(back.services[0].name, "plex");
-        assert_eq!(back.services[0].proto, Proto::Tcp);
     }
 }

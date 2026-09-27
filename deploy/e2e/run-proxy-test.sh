@@ -228,7 +228,7 @@ done
 # that was not stripped first.
 coord_events() { podman logs "$COORD" 2>&1 | grep -c "service_declared" || true; }
 POLLED=$(coord_events)
-podman exec "$AGENT1" wireserve serve proxysvc 9999 tcp \
+podman exec "$AGENT1" wireserve serve proxysvc 9999 \
     || fail "could not declare a service on agent1"
 sleep 8
 POLLED_AFTER=$(coord_events)

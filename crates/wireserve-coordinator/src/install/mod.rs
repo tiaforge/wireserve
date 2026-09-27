@@ -44,11 +44,6 @@ const DROPIN_DEST: &str = "/etc/systemd/system/wireserve-coordinator.service.d/u
 const ENV_DIR: &str = "/etc/wireserve";
 const ENV_DEST: &str = "/etc/wireserve/coordinator.env";
 const STATE_DIR: &str = "/var/lib/wireserve-coordinator";
-/// Where a coordinator from before it had its own state directory kept its
-/// database; the unit's `ExecStartPre=` moves it on first start.
-const OLD_STATE_DB: &str = "/var/lib/wireserve/coordinator.db";
-/// The user the coordinator ran as before M31.
-const OLD_SERVICE_USER: &str = "wireserve";
 
 #[derive(Debug, thiserror::Error)]
 pub enum InstallError {
@@ -304,9 +299,7 @@ pub fn run(args: InstallArgs) -> Result<(), InstallError> {
     };
 
     let state_dir = state_dir(&env_after);
-    // An old database the unit is about to move in brings its own secrets.
-    let old_db_arriving = Path::new(OLD_STATE_DB).exists() && !state_dir.join("coordinator.db").exists();
-    if mode != Mode::Upgrade && !old_db_arriving {
+    if mode != Mode::Upgrade {
         pregenerate_secrets(&env_after, &state_dir, uid, gid)?;
     }
 
@@ -335,16 +328,6 @@ pub fn run(args: InstallArgs) -> Result<(), InstallError> {
         println!(
             "(no wireserve-admin next to this binary, so it was not installed; put it next to \
              wireserve-coordinator and run this again, or copy it to {ADMIN_BIN_DEST} yourself)"
-        );
-    }
-    if old_unit.as_deref().is_some_and(|u| u.lines().any(|l| l.trim() == "User=wireserve"))
-        && service_user != OLD_SERVICE_USER
-        && lookup_user(OLD_SERVICE_USER).is_some()
-    {
-        println!(
-            "(the coordinator used to run as the `{OLD_SERVICE_USER}` user and now runs as \
-             `{service_user}`; `{OLD_SERVICE_USER}` was left as it was. Keep its group if an agent \
-             runs here: that group is what lets people use `wireserve` without sudo)"
         );
     }
 
@@ -733,7 +716,7 @@ mod tests {
     fn the_unit_runs_as_its_own_user_not_the_agents_group() {
         assert!(UNIT.contains("\nUser=wireserve-coordinator\n"));
         assert!(UNIT.contains("\nGroup=wireserve-coordinator\n"));
-        assert!(!UNIT.contains("wireserve:wireserve"), "the migration chown must not name the old user");
+        assert!(!UNIT.contains("ExecStartPre"), "a fresh install has nothing to move");
         assert!(UNIT.contains(&format!("ExecStart={BIN_DEST}\n")));
     }
 

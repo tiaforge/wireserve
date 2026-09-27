@@ -18,12 +18,12 @@ pub enum JoinError {
     State(#[from] crate::state::StateError),
     #[error("{0}")]
     PlaintextHttp(String),
+    #[error(
+        "the coordinator's mesh ranges do not contain the addresses it gave this node; \
+         refusing to join a mesh whose directory could not be checked"
+    )]
+    MeshUnverifiable,
 }
-
-/// The environment override for [`check_coordinator_transport`], for a
-/// node that joined before the flag existed: set to `1` in its
-/// `agent.env` rather than joining again.
-pub const ALLOW_PLAINTEXT_HTTP_ENV: &str = "WIRESERVE_ALLOW_PLAINTEXT_HTTP";
 
 /// Refuses a plain-`http://` coordinator URL to anything but loopback
 /// unless the operator explicitly allowed it (security review finding
@@ -45,8 +45,7 @@ pub fn check_coordinator_transport(url: &str, allowed: bool) -> Result<(), JoinE
          the peer directory (which decides which WireGuard keys this node trusts) would cross \
          the network unprotected. Use an https:// URL through a TLS-terminating reverse proxy \
          (spec §7), or, only if every network between here and the coordinator is trusted, \
-         pass --allow-plaintext-http to `join`/`install` (or set \
-         {ALLOW_PLAINTEXT_HTTP_ENV}=1 for a node that already joined)"
+         pass --allow-plaintext-http to `join`/`install`"
     )))
 }
 
@@ -196,9 +195,11 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
         local_routes: Vec::new(),
     };
     let mut state = state;
-    if let Some(offered) = reg.mesh.filter(|m| crate::mesh::pinnable(m, state.ip4.as_deref(), state.ip6.as_deref())) {
-        state.mesh = Some(offered);
-    }
+    let offered = reg
+        .mesh
+        .filter(|m| crate::mesh::pinnable(m, state.ip4.as_deref(), state.ip6.as_deref()))
+        .ok_or(JoinError::MeshUnverifiable)?;
+    state.mesh = Some(offered);
     state.save(params.state_path)?;
     Ok(state)
 }

@@ -31,9 +31,7 @@ pub struct PortMap {
     pub proto: Proto,
     /// Somewhere the owning node forwards to instead of serving itself — a
     /// router or printer on its LAN (PLAN.md M26). Absent means the node
-    /// itself, so every declaration from before this field means what it
-    /// meant; an older coordinator drops it, which only costs the approver
-    /// seeing it.
+    /// itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addr: Option<Ipv4Addr>,
 }

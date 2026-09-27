@@ -126,12 +126,6 @@ proxy on a different host needs that set to an address it can reach — and
 `WIRESERVE_TRUSTED_PROXY` set to the proxy's address, so the coordinator
 believes the client addresses it forwards and nobody else's.
 
-An existing install that predates the coordinator's own state directory
-used `/var/lib/wireserve`, which it shared with the agent. The unit moves
-the database and `coordinator-secrets.env` over on its first start
-(unless `WIRESERVE_DB_PATH` is set explicitly), and refuses to start
-rather than move anything that is a symlink.
-
 **Containers**, if you'd rather not use systemd directly:
 
 ```sh
@@ -223,9 +217,7 @@ token, the node's bearer token and the peer directory all travel over it,
 and the directory decides which keys the node trusts. For a coordinator
 reached only over a network you trust end to end, pass
 `--allow-plaintext-http` to `install`/`join`; the node remembers the
-choice. A node that joined over plain HTTP before this check existed
-refuses to start until you set `WIRESERVE_ALLOW_PLAINTEXT_HTTP=1` in
-`/etc/wireserve/agent.env` (or join again).
+choice.
 
 Or, step by step, if you'd rather not have `install` touch systemd for you:
 
@@ -297,15 +289,8 @@ and restarts every running `wireserve-agent*` unit, so no agent keeps running
 the old binary. The node keeps its identity and its declared services; the
 mesh drops out for the few seconds the daemon takes to restart, and its
 firewall is rebuilt deny-first as on any start. Pass a URL or a token and it
-joins again, as before. Upgrade the coordinator (copy `wireserve-coordinator`
-and `wireserve-admin` to `/usr/local/bin/` and restart it) before the agents;
-the notes elsewhere in this file say where a feature needs that.
-
-Coming from the days when the command was `wireserve-agent`: the same
-upgrade does it. The systemd unit is still called `wireserve-agent`, the
-old `/usr/local/bin/wireserve-agent` is left where it is — unused once the
-unit points at the new binary, and yours to remove — and the `wireserve`
-group is created (see above).
+joins again. Upgrade the coordinator first, the same way:
+`sudo ./wireserve-coordinator install` on its host.
 
 ### 3. Publish a service
 
@@ -387,8 +372,8 @@ itself: the address it really talks to, which can differ from the one the
 coordinator has on record (an IPv6 candidate this node can't use, say, or
 a peer that roamed).
 
-`(node)` marks a service without an address of its own, which resolves to
-its node: one declared by an agent from before service addresses.
+`(no address)` marks a service the coordinator had no address left for; it
+is reachable nowhere until one frees up.
 
 #### Service addresses
 
@@ -421,11 +406,6 @@ Rewriting packets needs the agent to run as root in the host's own
 namespaces, as the shipped systemd unit and quadlets do. The kernel refuses
 it inside an unprivileged container (LXC, rootless podman); the agent says
 so in its log, and the services on that node stay unreachable.
-
-Upgrade every agent: an agent from before service addresses still resolves
-new services to their node's address, where their ports are now closed.
-Its own declarations keep working the old way (node address, same port)
-until it is upgraded.
 
 #### Devices on the node's network
 
@@ -463,9 +443,6 @@ of the mesh only ever sees `443:80/tcp`.
   answer only to their own name, as a defence against DNS rebinding, and
   refuse `myrouter.<domain>`, which the terminator passes through. Publish
   such a device on another port than 443 and reach it by address.
-- Before downgrading an agent to a version from before target addresses,
-  `unserve` such services: an older agent would read `443:192.168.178.1:80`
-  as its own port 80.
 
 ### 4. Add a phone or laptop
 
@@ -525,8 +502,6 @@ phones and other static devices; how agents reach each other is untouched.
 It changes nothing already on a device either: the command lists the
 devices whose config needs `--refresh`. Such a node is never picked as a
 gateway, and the gateway itself must still reach it directly, as above.
-Upgrade the coordinator before the admin CLI — an older coordinator does
-not know the flag, and the export then keeps the node direct.
 
 **Re-issuing a config** keeps the device's name and mesh address:
 
@@ -1018,17 +993,14 @@ the instance's state). It never takes over an interface it did not create:
 a name held by another tunnel is simply skipped. `--ifname <name>` pins an
 exact name instead — then a conflict makes the daemon refuse to start
 rather than pick another, since you presumably refer to that name
-elsewhere — and `--ifname auto` removes the pin. Agents from before this
-used `wg0`; on upgrade, the default instance moves to `wireserve0` and
-removes what the old one left behind.
+elsewhere — and `--ifname auto` removes the pin.
 
 **The mesh address ranges.** If you left `WIRESERVE_NET_V4_CIDR` and
 `WIRESERVE_NET_V6_PREFIX` unset, the coordinator already generated a safe
 pair for you on first start (see "Run the coordinator" above) and there is
 nothing to do here. This section is for anyone who set one or both
-explicitly, or who is running against an older deployment that still has
-the binary's compiled-in defaults — either way, both are poor choices, for
-unrelated reasons, and changing them requires care: addresses are
+explicitly — the compiled-in defaults are poor choices, for unrelated
+reasons, and changing them requires care: addresses are
 allocated once and kept for the life of the node record, so a later change
 leaves the mesh addressed out of two ranges. Each node also pins the ranges
 it joined with and ignores any peer or service address outside them (so a

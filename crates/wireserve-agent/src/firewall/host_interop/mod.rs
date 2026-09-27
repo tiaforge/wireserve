@@ -182,25 +182,6 @@ pub fn remove_for(ifname: &str) {
     }
 }
 
-/// Removes what an agent from before multi-instance support left behind:
-/// its fixed-name guard (with the firewalld trust it guarded) and its
-/// fixed-name `inet wireserve` table. Its tagged rules go with any
-/// agent's next reconcile, like every other leftover.
-pub fn remove_legacy() {
-    let nft = match Nft::locate() {
-        Ok(nft) => nft,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not look for a legacy agent's leftovers");
-            return;
-        }
-    };
-    let wg0_live = crate::lock::holder(planner::LEGACY_IFNAME).is_agent();
-    ops::remove_legacy(&mut RealOps::new(nft.clone()), wg0_live);
-    if let Err(e) = super::nftables::remove_legacy_table(&nft) {
-        tracing::warn!(error = %e, "could not remove a legacy agent's `inet wireserve` table");
-    }
-}
-
 impl InteropHandle for HostInterop {
     fn tick(&self, forward_wanted: ForwardWanted) {
         if let Some(tx) = &self.tx {

@@ -5,8 +5,7 @@
 //! Newline-delimited JSON, one request and one response per connection,
 //! like the main socket. Two requests only: the terminator checks in and
 //! gets its configuration, and it asks for an ACME challenge record to be
-//! published or withdrawn. An unknown `op` is refused, so a newer
-//! terminator never gets a half-understood answer from an older agent.
+//! published or withdrawn. An unknown `op` is refused.
 
 use std::net::{Ipv4Addr, SocketAddr};
 
@@ -29,8 +28,6 @@ pub enum TlsRequest {
 pub enum TlsResponse {
     Config(Box<TlsConfig>),
     Ok,
-    /// The coordinator predates the challenge endpoint: nothing to retry.
-    Unsupported,
     Error { message: String },
 }
 

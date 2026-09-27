@@ -25,9 +25,6 @@ pub fn tag_owner(comment: &str) -> Option<&str> {
     comment.strip_prefix(TAG_PREFIX)
 }
 
-/// Before several agents could share a host, both of our tables had fixed
-/// names. Nothing creates them any more; see `remove_legacy`.
-pub const LEGACY_GUARD_TABLE: &str = "wireserve-interop";
 const GUARD_TABLE_PREFIX: &str = "wireserve-interop.";
 
 /// Holds `ifname`'s forward guard — see [`Action::GuardCreate`]. One per
@@ -39,17 +36,15 @@ pub fn guard_table(ifname: &str) -> String {
 }
 
 /// Tables that belong to wireserve — any agent on this host, running or
-/// not, current or legacy naming. Never treated as "foreign", never
+/// not. Never treated as "foreign", never
 /// written into by the planner's insert logic, and changes to them never
 /// trigger a reconcile (each backend replaces its own table on every
 /// poll; with several agents, reacting to each other's would have them
 /// reconciling in response to one another forever).
 #[must_use]
 pub fn is_own_table(name: &str) -> bool {
-    use crate::firewall::nftables::{LEGACY_TABLE_NAME, TABLE_PREFIX};
-    name == LEGACY_TABLE_NAME
-        || name == LEGACY_GUARD_TABLE
-        || name.starts_with(TABLE_PREFIX)
+    use crate::firewall::nftables::TABLE_PREFIX;
+    name.starts_with(TABLE_PREFIX)
         || name.starts_with(GUARD_TABLE_PREFIX)
 }
 

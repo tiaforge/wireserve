@@ -743,8 +743,6 @@ mod tests {
             name: "web".into(),
             node: node.into(),
             ip4: String::new(),
-            port: 80,
-            proto: wireserve_types::Proto::Tcp,
             vip4: vip4.map(Into::into),
             ports: vec![],
             state,
@@ -1117,8 +1115,6 @@ mod gateway_tests {
             name: "ssh".into(),
             node: "minipc".into(),
             ip4: String::new(),
-            port: 22,
-            proto: wireserve_types::Proto::Tcp,
             vip4: Some("10.90.0.11".into()),
             ports: vec![],
             state: ServiceApprovalState::Approved,
@@ -1182,7 +1178,7 @@ mod gateway_tests {
 mod exit_tests {
     use super::*;
     use std::net::Ipv4Addr;
-    use wireserve_types::{MeshInfo, MeshRanges, PortMap, Proto};
+    use wireserve_types::{MeshInfo, MeshRanges, PortMap};
 
     fn peer(name: &str, host: u8, endpoint: Option<&str>) -> PeerInfo {
         PeerInfo {
@@ -1225,8 +1221,6 @@ mod exit_tests {
             name: name.into(),
             node: "home".into(),
             ip4: String::new(),
-            port: 53,
-            proto: Proto::Udp,
             vip4: Some(vip.into()),
             ports: ports.iter().map(|p| p.parse::<PortMap>().unwrap()).collect(),
             state,

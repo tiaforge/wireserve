@@ -960,38 +960,6 @@ fn each_agent_keeps_its_own_forward_guard() {
     );
 }
 
-#[test]
-fn legacy_guard_and_its_trust_are_removed_once() {
-    let mut v = view(FIREWALLD_LIKE);
-    v.tables.push(TableInfo {
-        family: Family::Inet,
-        name: LEGACY_GUARD_TABLE.into(),
-        flags: vec![],
-    });
-    let mut obs = observed(v);
-    obs.firewalld = FirewalldState::Running {
-        runtime_zone: Some("trusted".into()),
-        permanent_zone: None,
-    };
-    let delete = Action::GuardDelete {
-        table: "wireserve-interop".into(),
-    };
-    assert_eq!(
-        plan_legacy_removal(&obs, false),
-        [Action::FirewalldUntrust { ifname: "wg0".into() }, delete.clone()]
-    );
-    // A running agent that claims `wg0` now owns that trust.
-    assert_eq!(plan_legacy_removal(&obs, true), std::slice::from_ref(&delete));
-    // An operator's permanent binding is theirs.
-    obs.firewalld = FirewalldState::Running {
-        runtime_zone: Some("trusted".into()),
-        permanent_zone: Some("trusted".into()),
-    };
-    assert_eq!(plan_legacy_removal(&obs, false), [delete]);
-    // Nothing legacy, nothing to do.
-    assert_eq!(plan_legacy_removal(&observed(view(FIREWALLD_LIKE)), false), []);
-}
-
 // ---------------------------------------------------------------------
 // Services mapped onto other addresses (PLAN.md M26)
 // ---------------------------------------------------------------------

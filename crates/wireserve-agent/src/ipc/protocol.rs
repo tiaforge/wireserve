@@ -3,32 +3,13 @@
 //! request/response per connection).
 
 use serde::{Deserialize, Serialize};
-use wireserve_types::{PeerInfo, PortMap, Proto};
+use wireserve_types::{PeerInfo, PortMap};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum IpcRequest {
-    /// `port`/`proto` is the whole declaration from a CLI that predates
-    /// port mappings, and the first mapping's target from one that
-    /// doesn't; `ports`, when present, is what is declared.
-    Serve {
-        name: String,
-        port: u16,
-        proto: Proto,
-        #[serde(default)]
-        ports: Vec<PortMap>,
-    },
-    /// `Serve` for a declaration with at least one mapping onto another
-    /// address (PLAN.md M26), under its own op so that a daemon from before
-    /// target addresses refuses it as an unknown request instead of
-    /// dropping the address it doesn't know and mapping the port onto the
-    /// node itself — the router's port 80 turning into the node's own.
-    ServeForwarding {
-        name: String,
-        port: u16,
-        proto: Proto,
-        ports: Vec<PortMap>,
-    },
+    /// Declares `name` with these mappings (never empty).
+    Serve { name: String, ports: Vec<PortMap> },
     Unserve { name: String },
     /// This node's live opt-in to carry transit traffic for other mesh
     /// peers (PLAN.md M23) — `wireserve transit on|off`. Same shape
@@ -52,12 +33,9 @@ pub struct LocalServiceView {
     pub name: String,
     pub node: String,
     pub ip4: String,
-    pub port: u16,
-    pub proto: Proto,
     /// The service's own address and mappings; see `ServiceInfo`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vip4: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<PortMap>,
     pub online: bool,
     pub local: bool,
@@ -168,18 +146,13 @@ mod tests {
 
     #[test]
     fn request_roundtrips_through_json() {
-        let req = IpcRequest::Serve {
-            name: "plex".into(),
-            port: 32400,
-            proto: Proto::Tcp,
-            ports: vec![],
-        };
+        let req = IpcRequest::Serve { name: "plex".into(), ports: vec!["443:32400".parse().unwrap()] };
         let json = serde_json::to_string(&req).unwrap();
         let back: IpcRequest = serde_json::from_str(&json).unwrap();
         match back {
-            IpcRequest::Serve { name, port, .. } => {
+            IpcRequest::Serve { name, ports } => {
                 assert_eq!(name, "plex");
-                assert_eq!(port, 32400);
+                assert_eq!(ports[0].target, 32400);
             }
             other => panic!("unexpected variant: {other:?}"),
         }

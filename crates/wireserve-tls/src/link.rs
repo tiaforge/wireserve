@@ -20,8 +20,6 @@ pub enum LinkError {
     Timeout,
     #[error("the agent's answer was not understood: {0}")]
     Decode(serde_json::Error),
-    #[error("the coordinator predates per-node TLS")]
-    Unsupported,
     #[error("{0}")]
     Refused(String),
 }
@@ -77,7 +75,6 @@ impl Link {
 
 fn unexpected(resp: TlsResponse) -> LinkError {
     match resp {
-        TlsResponse::Unsupported => LinkError::Unsupported,
         TlsResponse::Error { message } => LinkError::Refused(message),
         other => LinkError::Refused(format!("unexpected answer: {other:?}")),
     }

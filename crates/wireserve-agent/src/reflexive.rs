@@ -35,8 +35,6 @@ const PROBE_ATTEMPTS: u32 = 3;
 enum ReflexiveProbeError {
     #[error("could not reach the coordinator to learn its reflexive UDP port: {0}")]
     FetchProbeResponse(#[from] crate::probe::ProbeError),
-    #[error("coordinator did not report a reflexive UDP port (older coordinator?)")]
-    NoReflexivePort,
     #[error("could not bind local UDP port {0}: {1}")]
     Bind(u16, std::io::Error),
     #[error("network error during the reflexive probe: {0}")]
@@ -46,8 +44,8 @@ enum ReflexiveProbeError {
 }
 
 /// Learns this node's own reflexive `ip:port` for `listen_port`,
-/// best-effort. Every internal failure (DNS, an older coordinator with
-/// no reflexive responder, a bind conflict, a UDP timeout, a corrupt or
+/// best-effort. Every internal failure (DNS, a bind conflict, a UDP
+/// timeout, a corrupt or
 /// mismatched-nonce reply) is logged and folded to `None` — a failed
 /// probe must never fail `join` or the daemon's startup, exactly like
 /// the existing dual-family HTTP probe it runs alongside.
@@ -67,7 +65,7 @@ async fn try_learn(coordinator_url: &str, listen_port: u16, timeout: Duration) -
     // mechanism before ever calling in (see `register::join`,
     // `main::cmd_daemon`).
     let probe_resp = crate::probe::fetch_probe_response(coordinator_url, crate::probe::Family::V4, timeout).await?;
-    let reflexive_port = probe_resp.reflexive_port.ok_or(ReflexiveProbeError::NoReflexivePort)?;
+    let reflexive_port = probe_resp.reflexive_port;
     let (_, coordinator_addr) = crate::probe::resolve_family(coordinator_url, crate::probe::Family::V4).await?;
     let target = std::net::SocketAddr::new(coordinator_addr.ip(), reflexive_port);
 
@@ -108,13 +106,10 @@ mod tests {
 
     /// A minimal, hand-rolled `GET /probe` responder — no framework
     /// dependency needed for one fixed JSON reply per connection.
-    async fn serve_probe_forever(listener: tokio::net::TcpListener, reflexive_port: Option<u16>) {
+    async fn serve_probe_forever(listener: tokio::net::TcpListener, reflexive_port: u16) {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else { return };
-            let body = match reflexive_port {
-                Some(p) => format!(r#"{{"addr":"127.0.0.1","reflexive_port":{p}}}"#),
-                None => r#"{"addr":"127.0.0.1"}"#.to_string(),
-            };
+            let body = format!(r#"{{"addr":"127.0.0.1","reflexive_port":{reflexive_port}}}"#);
             tokio::spawn(async move {
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf).await; // request content is irrelevant
@@ -138,7 +133,7 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http_addr = listener.local_addr().unwrap();
-        tokio::spawn(serve_probe_forever(listener, Some(udp_port)));
+        tokio::spawn(serve_probe_forever(listener, udp_port));
 
         tokio::spawn(async move {
             let mut buf = [0u8; REQUEST_LEN];
@@ -180,7 +175,7 @@ mod tests {
         let udp_port = udp.local_addr().unwrap().port();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http_addr = listener.local_addr().unwrap();
-        tokio::spawn(serve_probe_forever(listener, Some(udp_port)));
+        tokio::spawn(serve_probe_forever(listener, udp_port));
         tokio::spawn(async move {
             let mut buf = [0u8; REQUEST_LEN];
             loop {
@@ -191,17 +186,6 @@ mod tests {
                 let _ = udp.send_to(&resp, src).await;
             }
         });
-
-        let coordinator_url = format!("http://{http_addr}");
-        let addr = learn_reflexive_addr(&coordinator_url, 0, Duration::from_millis(300)).await;
-        assert!(addr.is_none());
-    }
-
-    #[tokio::test]
-    async fn an_older_coordinator_with_no_reflexive_port_is_a_clean_skip() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let http_addr = listener.local_addr().unwrap();
-        tokio::spawn(serve_probe_forever(listener, None));
 
         let coordinator_url = format!("http://{http_addr}");
         let addr = learn_reflexive_addr(&coordinator_url, 0, Duration::from_millis(300)).await;

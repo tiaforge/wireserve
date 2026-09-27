@@ -3176,3 +3176,42 @@ about any more.
     branch: every name points at its service's own address. The installer's
     question is now which service runs the sign-in (`--auth-service`,
     `--no-auth-service`), asked only with a DNS provider.
+
+`deploy/e2e/run-service-auth-test.sh` **passes** (2026-09-27): the stub
+provider on its own node, a marked service refused without a session and
+served with one, identity headers copied and forged ones removed.
+
+## Cleanup — no earlier installation is assumed
+
+Everything that existed only to accept what an earlier version wrote or
+sent is removed. There are no previous installations to carry forward.
+
+198. **No migrations of old names.** The agent no longer removes `wg0` or the
+    old `wireserve` nftables table and host-firewall guards
+    (`remove_legacy`, `plan_legacy_removal`, `ifname::LEGACY`). The
+    coordinator installer no longer moves the pre-M31 state database or
+    notes the old service user, and its unit no longer has the migrating
+    `ExecStartPre`. The agent installer no longer looks for the
+    `wireserve-agent` binary.
+
+199. **Services are declared as port mappings only.** `ServiceDecl`,
+    `ServiceInfo`, `AdminServiceInfo`, `PendingService` and the `Serve`
+    request carry `ports: Vec<PortMap>` and nothing else; the single
+    `port`/`proto` pair and `ServeForwarding` are gone. `wireserve serve
+    <name> <port>` still works because a bare port is a mapping
+    (`443` = `443:443`); `<port> tcp|udp` is no longer accepted. The
+    coordinator's `port`/`proto` columns hold the first mapping, as they
+    are `NOT NULL`.
+
+200. **Every service has its own address.** `ServiceRule::Open` — opening
+    the service on the node's own address when it had no VIP — is removed,
+    with its nftables rule. A service without a VIP is skipped with a
+    warning, and no service rules exist before the node has an address.
+
+201. **Joins and daemons require what the coordinator always sends.** A
+    join needs a mesh range it can pin (`JoinError::MeshUnverifiable`),
+    a daemon refuses to start without one, and plaintext HTTP is a stored
+    per-node setting only (`WIRESERVE_ALLOW_PLAINTEXT_HTTP` gone).
+    `ProbeResponse.reflexive_port` is required, and `TlsResponse::Unsupported`
+    — "an old coordinator" — is gone. `WIRESERVE_STATE_PATH` and
+    `WIRESERVE_SOCKET_PATH` are gone too: paths come from the instance.

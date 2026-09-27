@@ -23,10 +23,7 @@
 //! `WIRESERVE_STATE_ROOT` (default `/var/lib/wireserve`) and
 //! `WIRESERVE_RUN_ROOT` (default `/run`) move all of it, so tests — and
 //! anyone running the agent rootless for development — don't need to
-//! write to `/run` or `/var/lib`. The older `WIRESERVE_STATE_PATH` and
-//! `WIRESERVE_SOCKET_PATH` still set the default instance's exact paths;
-//! they never apply to a named instance, which would otherwise share the
-//! default's state.
+//! write to `/run` or `/var/lib`.
 
 use std::path::PathBuf;
 
@@ -101,18 +98,12 @@ impl Instance {
 
     #[must_use]
     pub fn state_path(&self) -> PathBuf {
-        match std::env::var("WIRESERVE_STATE_PATH") {
-            Ok(path) if self.is_default() => PathBuf::from(path),
-            _ => self.state_dir().join(STATE_FILE),
-        }
+        self.state_dir().join(STATE_FILE)
     }
 
     #[must_use]
     pub fn socket_path(&self) -> PathBuf {
-        match std::env::var("WIRESERVE_SOCKET_PATH") {
-            Ok(path) if self.is_default() => PathBuf::from(path),
-            _ => self.run_dir().join("agent.sock"),
-        }
+        self.run_dir().join("agent.sock")
     }
 
     /// The TLS terminator's socket (PLAN.md M33): in a directory of its
@@ -140,16 +131,14 @@ impl Instance {
     }
 
     /// Next to the state file: the lock guards that file, so it has to
-    /// live wherever the state does — including under a
-    /// `WIRESERVE_STATE_PATH` override.
+    /// live wherever the state does.
     #[must_use]
     pub fn lock_path(&self) -> PathBuf {
         self.state_path().with_file_name("agent.lock")
     }
 
     /// The label on this instance's hosts-file block. `None` for the
-    /// default instance, whose block keeps the unlabelled markers written
-    /// by every earlier version.
+    /// default instance, whose block has unlabelled markers.
     #[must_use]
     pub fn hosts_label(&self) -> Option<&str> {
         (!self.is_default()).then_some(self.name.as_str())
@@ -277,19 +266,8 @@ mod tests {
         assert_eq!(ports(&d), [("work".to_string(), Some(51821))]);
         assert_eq!(ports(&w), [("default".to_string(), Some(51820))]);
 
-        // The old full-path variables move the default instance only.
         unsafe {
-            std::env::set_var("WIRESERVE_STATE_PATH", root.path().join("legacy/state.json"));
-            std::env::set_var("WIRESERVE_SOCKET_PATH", root.path().join("legacy/agent.sock"));
-        }
-        assert_eq!(d.state_path(), root.path().join("legacy/state.json"));
-        assert_eq!(d.lock_path(), root.path().join("legacy/agent.lock"));
-        assert_eq!(d.socket_path(), root.path().join("legacy/agent.sock"));
-        assert_eq!(w.state_path(), lib.join("instances/work/agent-state.json"));
-        assert_eq!(w.socket_path(), run.join("wireserve-work/agent.sock"));
-
-        unsafe {
-            for v in ["WIRESERVE_STATE_ROOT", "WIRESERVE_RUN_ROOT", "WIRESERVE_STATE_PATH", "WIRESERVE_SOCKET_PATH"] {
+            for v in ["WIRESERVE_STATE_ROOT", "WIRESERVE_RUN_ROOT"] {
                 std::env::remove_var(v);
             }
         }

@@ -213,8 +213,8 @@ AGENT2_WG_BASELINE=$(in_netns "$AGENT2" cat /proc/sys/net/ipv4/conf/wireserve0/f
 AGENT4_WG_BASELINE=$(in_netns "$AGENT4" cat /proc/sys/net/ipv4/conf/wireserve0/forwarding 2>/dev/null || echo "?")
 
 log "declaring a service on agent2 and agent4"
-podman exec "$AGENT2" wireserve serve svc-two 12345 tcp
-podman exec "$AGENT4" wireserve serve svc-four 12345 tcp
+podman exec "$AGENT2" wireserve serve svc-two 12345
+podman exec "$AGENT4" wireserve serve svc-four 12345
 sleep 8
 podman exec "$COORD" wireserve-admin approve-service node2 svc-two || fail "could not approve svc-two"
 podman exec "$COORD" wireserve-admin approve-service node4 svc-four || fail "could not approve svc-four"

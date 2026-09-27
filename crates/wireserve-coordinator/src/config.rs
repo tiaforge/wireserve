@@ -249,8 +249,8 @@ impl Config {
 impl Config {
     /// How services are named, as nodes are told it (PLAN.md M25) — at
     /// registration and on every poll, the same shape and for the same reason
-    /// as [`Config::mesh_info`]. `None` when no domain is set, which is the
-    /// pre-M25 behaviour and stays the default.
+    /// as [`Config::mesh_info`]. `None` when no domain is set: services are
+    /// then `<name>.wg`, known only to the nodes' hosts files.
     #[must_use]
     pub fn service_naming(&self) -> Option<wireserve_types::ServiceNaming> {
         self.service_domain.as_ref().map(|domain| wireserve_types::ServiceNaming {

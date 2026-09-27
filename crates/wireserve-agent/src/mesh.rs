@@ -91,7 +91,7 @@ pub fn sanitize(directory: &mut PollResponse, ranges: &MeshRanges) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wireserve_types::{PeerInfo, PendingService, Proto, ServiceInfo};
+    use wireserve_types::{PeerInfo, PendingService, ServiceInfo};
 
     fn info() -> MeshInfo {
         MeshInfo { net_v4_cidr: "10.9.0.0/24".into(), net_v6_prefix: "fdb4:d481:7c21::/64".into() }
@@ -120,8 +120,6 @@ mod tests {
             name: name.into(),
             node: "a".into(),
             ip4: ip4.into(),
-            port: 80,
-            proto: Proto::Tcp,
             online: true,
             vip4: vip4.map(Into::into),
             ports: vec![],
@@ -168,8 +166,7 @@ mod tests {
         );
         d.pending_services = vec![PendingService {
             name: "p".into(),
-            port: 1,
-            proto: Proto::Tcp,
+            ports: vec![],
             vip4: Some("192.168.1.1".into()),
             declared_at: None,
         }];

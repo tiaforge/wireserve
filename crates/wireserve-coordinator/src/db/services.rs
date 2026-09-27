@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension};
-use wireserve_types::{PortMap, Proto, ServiceDecl};
+use wireserve_types::{PortMap, ServiceDecl};
 
 use super::DbError;
 
@@ -8,12 +8,9 @@ use super::DbError;
 pub struct ServiceRow {
     pub node_id: i64,
     pub name: String,
-    pub port: u16,
-    pub proto: Proto,
-    /// The service's own address; see migration 0006. `None` for a
-    /// declaration from an agent that predates port mappings.
+    /// The service's own address; see migration 0006. `None` only when the
+    /// range had none left to give.
     pub vip4: Option<String>,
-    /// Empty means the identity mapping of `port`/`proto`.
     pub ports: Vec<PortMap>,
     pub declared_at: Option<DateTime<Utc>>,
     /// Non-NULL means an admin has approved this node's claim to this
@@ -52,8 +49,6 @@ fn parse_dt(s: &str) -> Option<DateTime<Utc>> {
 }
 
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRow> {
-    let proto_str: String = row.get("proto")?;
-    let port: i64 = row.get("port")?;
     let dt = |col: &str| -> rusqlite::Result<Option<DateTime<Utc>>> {
         Ok(row
             .get::<_, Option<String>>(col)?
@@ -63,8 +58,6 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRow> {
     Ok(ServiceRow {
         node_id: row.get("node_id")?,
         name: row.get("name")?,
-        port: port as u16,
-        proto: proto_str.parse().unwrap_or(Proto::Tcp),
         vip4: row.get("vip4")?,
         ports: row
             .get::<_, Option<String>>("ports")?
@@ -196,14 +189,12 @@ fn owner_of(conn: &Connection, name: &str) -> Result<Option<i64>, DbError> {
 /// * **A pending row heals to approved under `AutoApprove`**, which is
 ///   what an operator turning the flag back off should get.
 ///
-/// Service addresses (migration 0006): a declaration carrying `ports`
-/// gets one from `vip_range` the first time, and keeps it for as long as
-/// the row lives — across re-declarations, port changes and approval.
-/// One without (an agent from before port mappings, which could not serve
-/// an address) has none, and loses any it had. An exhausted range is
-/// logged and leaves the service without one, falling back to the owning
-/// node's address, rather than failing the poll: the agent would resend
-/// the same declaration every cycle and never get a directory again.
+/// Service addresses (migration 0006): every declaration gets one from
+/// `vip_range` the first time, and keeps it for as long as the row lives —
+/// across re-declarations, port changes and approval. An exhausted range
+/// is logged and leaves the service without one — reachable nowhere —
+/// rather than failing the poll: the agent would resend the same
+/// declaration every cycle and never get a directory again.
 pub fn upsert_for_node(
     conn: &mut Connection,
     node_id: i64,
@@ -243,12 +234,13 @@ pub fn upsert_for_node(
 
     let now = super::nodes::now_str();
     let stamp = mode.stamp();
-    for ServiceDecl { name, port, proto, ports } in desired {
-        let ports_json = if ports.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(ports).expect("PortMap always serializes"))
-        };
+    for ServiceDecl { name, ports } in desired {
+        // `port` and `proto` are the first mapping's target, kept only
+        // because the columns are NOT NULL from migration 0001; nothing
+        // reads them.
+        let first = ports.first().copied().unwrap_or(PortMap::identity(0, wireserve_types::Proto::Tcp));
+        let (port, proto) = (first.target, first.proto);
+        let ports_json = serde_json::to_string(ports).expect("PortMap always serializes");
         tx.execute(
             "INSERT INTO services (node_id, name, port, proto, ports, declared_at, approved_at) \
              VALUES (?1, ?2, ?3, ?4, ?7, ?5, ?6) \
@@ -266,14 +258,7 @@ pub fn upsert_for_node(
              WHERE node_id = excluded.node_id",
             rusqlite::params![node_id, name, port, proto.as_str(), now, stamp, ports_json],
         )?;
-        if ports.is_empty() {
-            tx.execute(
-                "UPDATE services SET vip4 = NULL WHERE node_id = ?1 AND name = ?2",
-                rusqlite::params![node_id, name],
-            )?;
-        } else {
-            assign_vip(&tx, node_id, name, vip_range)?;
-        }
+        assign_vip(&tx, node_id, name, vip_range)?;
     }
 
     // Read the verdict back inside the same transaction, so what `/poll`
@@ -467,20 +452,16 @@ pub fn deny(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wireserve_types::Proto;
     use crate::db::nodes::{apply_redemption, create_node, Redemption};
     use crate::db::Db;
     use wireserve_types::NodeKind;
 
     const RANGE: &str = "100.90.0.0/24";
 
-    /// A declaration from an agent that predates port mappings.
+    /// A declaration of one identity mapping.
     fn decl(name: &str, port: u16, proto: Proto) -> ServiceDecl {
-        ServiceDecl {
-            name: name.into(),
-            port,
-            proto,
-            ports: vec![],
-        }
+        ServiceDecl::new(name, vec![PortMap::identity(port, proto)])
     }
 
     fn mapped(name: &str, maps: &[&str]) -> ServiceDecl {
@@ -536,22 +517,6 @@ mod tests {
         upsert_for_node(&mut conn, id, &[], ApprovalMode::AutoApprove, RANGE).unwrap();
         upsert_for_node(&mut conn, id, &[mapped("api", &["80:6080"])], ApprovalMode::AutoApprove, RANGE).unwrap();
         assert_eq!(vip_of(&conn, "api").unwrap(), vip, "the freed address is the first free one again");
-    }
-
-    #[tokio::test]
-    async fn an_old_agents_declaration_has_no_address() {
-        let db = Db::open_in_memory_for_test();
-        let id = node_with_id(&db, "n1", "h1").await;
-        let mut conn = db.conn.lock().await;
-        upsert_for_node(&mut conn, id, &[decl("plex", 32400, Proto::Tcp)], ApprovalMode::AutoApprove, RANGE).unwrap();
-        assert_eq!(vip_of(&conn, "plex"), None);
-        assert!(row_for_name(&conn, "plex").unwrap().unwrap().ports.is_empty());
-        // Upgraded agent: gets one. Downgraded again: loses it, since an
-        // old agent can't serve it.
-        upsert_for_node(&mut conn, id, &[mapped("plex", &["32400"])], ApprovalMode::AutoApprove, RANGE).unwrap();
-        assert!(vip_of(&conn, "plex").is_some());
-        upsert_for_node(&mut conn, id, &[decl("plex", 32400, Proto::Tcp)], ApprovalMode::AutoApprove, RANGE).unwrap();
-        assert_eq!(vip_of(&conn, "plex"), None);
     }
 
     #[tokio::test]
@@ -702,7 +667,7 @@ mod tests {
         assert!(outcome.pending.is_empty(), "a port change is not a re-claim");
         let rows = list_approved(&conn).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].port, 32401);
+        assert_eq!(rows[0].ports, vec![PortMap::identity(32401, Proto::Tcp)]);
     }
 
     #[tokio::test]
@@ -813,7 +778,7 @@ mod tests {
         // node1's own service must be untouched.
         let n1_services = list_for_node(&conn, id1).unwrap();
         assert_eq!(n1_services.len(), 1);
-        assert_eq!(n1_services[0].port, 32400);
+        assert_eq!(n1_services[0].ports, vec![PortMap::identity(32400, Proto::Tcp)]);
         let n2_services = list_for_node(&conn, id2).unwrap();
         assert!(n2_services.is_empty());
     }

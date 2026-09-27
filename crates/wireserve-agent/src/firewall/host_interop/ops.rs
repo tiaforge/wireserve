@@ -270,15 +270,6 @@ pub fn remove(ops: &mut impl HostOps, ifname: &str) {
     execute_all(ops, &planner::plan_removal(&observed, ifname));
 }
 
-/// Removes what an agent from before multi-instance support left behind:
-/// its fixed-name forward guard, and the firewalld trust it guarded. Its
-/// tagged rules need nothing special — nobody claims `wg0` for them, so
-/// every reconcile treats them as leftovers already.
-pub fn remove_legacy(ops: &mut impl HostOps, wg0_live: bool) {
-    let observed = ops.observe(planner::LEGACY_IFNAME);
-    execute_all(ops, &planner::plan_legacy_removal(&observed, wg0_live));
-}
-
 #[cfg(test)]
 pub mod fake {
     use super::*;

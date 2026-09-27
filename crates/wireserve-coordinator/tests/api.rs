@@ -200,7 +200,7 @@ async fn cross_node_service_collision_returns_409_and_leaves_first_untouched() {
         "POST",
         "/poll",
         Some(bearer1),
-        json!({ "services": [{"name": "plex", "port": 32400, "proto": "tcp"}] }),
+        json!({ "services": [{"name": "plex", "ports": [{"public": 32400, "target": 32400, "proto": "tcp"}]}] }),
     );
     let resp = app.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -209,7 +209,7 @@ async fn cross_node_service_collision_returns_409_and_leaves_first_untouched() {
         "POST",
         "/poll",
         Some(bearer2),
-        json!({ "services": [{"name": "plex", "port": 1, "proto": "tcp"}] }),
+        json!({ "services": [{"name": "plex", "ports": [{"public": 1, "target": 1, "proto": "tcp"}]}] }),
     );
     let resp = app.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
@@ -223,13 +223,13 @@ async fn cross_node_service_collision_returns_409_and_leaves_first_untouched() {
         "POST",
         "/poll",
         Some(bearer1),
-        json!({ "services": [{"name": "plex", "port": 32400, "proto": "tcp"}] }),
+        json!({ "services": [{"name": "plex", "ports": [{"public": 32400, "target": 32400, "proto": "tcp"}]}] }),
     );
     let resp = app.router.clone().oneshot(req).await.unwrap();
     let body = body_json(resp).await;
     let services = body["services"].as_array().unwrap();
     assert_eq!(services.len(), 1);
-    assert_eq!(services[0]["port"], 32400);
+    assert_eq!(services[0]["ports"][0]["target"], 32400);
 }
 
 // ---- 3. Revoke ----
@@ -248,7 +248,7 @@ async fn revoke_rejects_old_bearer_and_removes_peer_and_services() {
         "POST",
         "/poll",
         Some(&bearer1),
-        json!({ "services": [{"name": "plex", "port": 32400, "proto": "tcp"}] }),
+        json!({ "services": [{"name": "plex", "ports": [{"public": 32400, "target": 32400, "proto": "tcp"}]}] }),
     );
     app.router.clone().oneshot(req).await.unwrap();
 
@@ -421,8 +421,8 @@ async fn invalid_service_name_in_poll_rejects_whole_batch() {
         "/poll",
         Some(bearer1),
         json!({ "services": [
-            {"name": "good-one", "port": 1, "proto": "tcp"},
-            {"name": "Bad_Name", "port": 2, "proto": "tcp"}
+            {"name": "good-one", "ports": [{"public": 1, "target": 1, "proto": "tcp"}]},
+            {"name": "Bad_Name", "ports": [{"public": 2, "target": 2, "proto": "tcp"}]}
         ] }),
     );
     let resp = app.router.clone().oneshot(req).await.unwrap();
@@ -519,7 +519,7 @@ async fn online_threshold_reflects_last_seen_staleness() {
         "POST",
         "/poll",
         Some(bearer1),
-        json!({ "services": [{"name": "plex", "port": 32400, "proto": "tcp"}] }),
+        json!({ "services": [{"name": "plex", "ports": [{"public": 32400, "target": 32400, "proto": "tcp"}]}] }),
     );
     let resp = app.router.clone().oneshot(req).await.unwrap();
     let body = body_json(resp).await;
@@ -890,7 +890,7 @@ async fn service_collision_409_includes_conflicting_service_field() {
         "POST",
         "/poll",
         Some(bearer1),
-        json!({ "services": [{"name": "plex", "port": 32400, "proto": "tcp"}] }),
+        json!({ "services": [{"name": "plex", "ports": [{"public": 32400, "target": 32400, "proto": "tcp"}]}] }),
     );
     app.router.clone().oneshot(req).await.unwrap();
 
@@ -898,7 +898,7 @@ async fn service_collision_409_includes_conflicting_service_field() {
         "POST",
         "/poll",
         Some(bearer2),
-        json!({ "services": [{"name": "plex", "port": 1, "proto": "tcp"}] }),
+        json!({ "services": [{"name": "plex", "ports": [{"public": 1, "target": 1, "proto": "tcp"}]}] }),
     );
     let resp = app.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
@@ -1255,7 +1255,7 @@ async fn delete_node_frees_name_for_unregistered_and_revoked_nodes() {
         "POST",
         "/poll",
         Some(bearer),
-        json!({ "services": [{"name": "svc", "port": 1, "proto": "tcp"}] }),
+        json!({ "services": [{"name": "svc", "ports": [{"public": 1, "target": 1, "proto": "tcp"}]}] }),
     );
     app.router.clone().oneshot(req).await.unwrap();
     let req = json_request("POST", "/admin/nodes/old/revoke", Some(ADMIN), json!({}));
@@ -1315,13 +1315,13 @@ async fn poll_rejects_port_zero_and_too_many_services() {
         "POST",
         "/poll",
         Some(bearer),
-        json!({ "services": [{"name": "zero", "port": 0, "proto": "tcp"}] }),
+        json!({ "services": [{"name": "zero", "ports": [{"public": 0, "target": 0, "proto": "tcp"}]}] }),
     );
     let resp = app.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     let too_many: Vec<Value> = (0..65)
-        .map(|i| json!({"name": format!("svc{i}"), "port": 1000 + i, "proto": "tcp"}))
+        .map(|i| json!({"name": format!("svc{i}"), "ports": [{"public": 1000 + i, "target": 1000 + i, "proto": "tcp"}]}))
         .collect();
     let req = json_request("POST", "/poll", Some(bearer), json!({ "services": too_many }));
     let resp = app.router.clone().oneshot(req).await.unwrap();
@@ -1638,7 +1638,7 @@ async fn declare(router: &Router, bearer: &str, name: &str) -> Value {
         "POST",
         "/poll",
         Some(bearer),
-        json!({ "services": [{ "name": name, "port": 32400, "proto": "tcp" }] }),
+        json!({ "services": [{ "name": name, "ports": [{"public": 32400, "target": 32400, "proto": "tcp"}] }] }),
     );
     let resp = router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "a declaration must never fail the cycle");
@@ -1904,7 +1904,7 @@ async fn pending_declarations_count_against_the_per_node_limit() {
     let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
 
     let max: Vec<Value> = (0..64)
-        .map(|i| json!({ "name": format!("svc{i}"), "port": 1000 + i, "proto": "tcp" }))
+        .map(|i| json!({ "name": format!("svc{i}"), "ports": [{"public": 1000 + i, "target": 1000 + i, "proto": "tcp"}] }))
         .collect();
     let req = json_request("POST", "/poll", Some(&bearer1), json!({ "services": max }));
     assert_eq!(
@@ -1920,7 +1920,7 @@ async fn pending_declarations_count_against_the_per_node_limit() {
     }
 
     let too_many: Vec<Value> = (0..65)
-        .map(|i| json!({ "name": format!("svc{i}"), "port": 1000 + i, "proto": "tcp" }))
+        .map(|i| json!({ "name": format!("svc{i}"), "ports": [{"public": 1000 + i, "target": 1000 + i, "proto": "tcp"}] }))
         .collect();
     let req = json_request("POST", "/poll", Some(&bearer1), json!({ "services": too_many }));
     assert_eq!(
@@ -1941,9 +1941,9 @@ async fn admin_service_listing_reports_every_state() {
         "/poll",
         Some(&bearer1),
         json!({ "services": [
-            { "name": "approved-one", "port": 1, "proto": "tcp" },
-            { "name": "pending-one", "port": 2, "proto": "tcp" },
-            { "name": "denied-one", "port": 3, "proto": "tcp" }
+            { "name": "approved-one", "ports": [{"public": 1, "target": 1, "proto": "tcp"}] },
+            { "name": "pending-one", "ports": [{"public": 2, "target": 2, "proto": "tcp"}] },
+            { "name": "denied-one", "ports": [{"public": 3, "target": 3, "proto": "tcp"}] }
         ] }),
     );
     assert_eq!(
@@ -2533,7 +2533,7 @@ async fn a_full_size_legitimate_poll_is_still_accepted() {
     let bearer = reg["bearer_token"].as_str().unwrap();
 
     let services: Vec<Value> = (0..wireserve_types::MAX_SERVICES_PER_NODE)
-        .map(|i| json!({ "name": format!("service-number-{i}"), "port": 1000 + i, "proto": "tcp" }))
+        .map(|i| json!({ "name": format!("service-number-{i}"), "ports": [{"public": 1000 + i, "target": 1000 + i, "proto": "tcp"}] }))
         .collect();
     let req = json_request(
         "POST",
@@ -2563,10 +2563,8 @@ async fn a_mapped_service_gets_its_own_address_in_every_directory() {
     let client = register_node(&app.router, &t2, "pk2", 51821).await;
     let owner_bearer = owner["bearer_token"].as_str().unwrap();
 
-    let web = json!({"name": "web", "port": 5080, "proto": "tcp",
-                     "ports": [{"public": 80, "target": 5080, "proto": "tcp"}]});
-    let dns = json!({"name": "dns", "port": 53, "proto": "udp",
-                     "ports": [{"public": 53, "target": 53, "proto": "udp"},
+    let web = json!({"name": "web", "ports": [{"public": 80, "target": 5080, "proto": "tcp"}]});
+    let dns = json!({"name": "dns", "ports": [{"public": 53, "target": 53, "proto": "udp"},
                                {"public": 8080, "target": 8000, "proto": "tcp"}]});
     let (status, _) = poll_with(&app.router, owner_bearer, json!([web, dns])).await;
     assert_eq!(status, StatusCode::OK);
@@ -2589,23 +2587,6 @@ async fn a_mapped_service_gets_its_own_address_in_every_directory() {
 }
 
 #[tokio::test]
-async fn an_old_agents_declaration_gets_no_address_and_the_old_wire_shape() {
-    let app = test_app();
-    let t1 = admin_create_node(&app.router, "n1").await;
-    let r1 = register_node(&app.router, &t1, "pk1", 51820).await;
-    let (_, body) = poll_with(
-        &app.router,
-        r1["bearer_token"].as_str().unwrap(),
-        json!([{"name": "plex", "port": 32400, "proto": "tcp"}]),
-    )
-    .await;
-    let plex = &body["services"][0];
-    assert!(plex.get("vip4").is_none(), "{plex}");
-    assert!(plex.get("ports").is_none(), "{plex}");
-    assert_eq!(plex["port"], 32400);
-}
-
-#[tokio::test]
 async fn a_pending_service_tells_only_its_owner_its_address() {
     let mut config = test_config("");
     config.require_service_approval = true;
@@ -2615,8 +2596,7 @@ async fn a_pending_service_tells_only_its_owner_its_address() {
     let owner = register_node(&app.router, &t1, "pk1", 51820).await;
     let client = register_node(&app.router, &t2, "pk2", 51821).await;
 
-    let web = json!([{"name": "web", "port": 5080, "proto": "tcp",
-                      "ports": [{"public": 80, "target": 5080, "proto": "tcp"}]}]);
+    let web = json!([{"name": "web", "ports": [{"public": 80, "target": 5080, "proto": "tcp"}]}]);
     let (_, body) = poll_with(&app.router, owner["bearer_token"].as_str().unwrap(), web).await;
     assert!(body["services"].as_array().unwrap().is_empty());
     assert_eq!(body["pending_services"][0]["vip4"], "100.90.0.3");
@@ -2639,7 +2619,7 @@ async fn poll_rejects_a_malformed_port_mapping() {
         let (status, body) = poll_with(
             &app.router,
             bearer,
-            json!([{"name": "web", "port": 5080, "proto": "tcp", "ports": ports}]),
+            json!([{"name": "web", "ports": ports}]),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{ports}: {body}");
@@ -2653,8 +2633,7 @@ async fn a_target_address_is_stored_shown_to_admins_and_kept_from_the_mesh() {
     let t2 = admin_create_node(&app.router, "client").await;
     let owner = register_node(&app.router, &t1, "pk1", 51820).await;
     let client = register_node(&app.router, &t2, "pk2", 51821).await;
-    let router_svc = json!([{"name": "myrouter", "port": 80, "proto": "tcp",
-        "ports": [{"public": 443, "target": 80, "proto": "tcp", "addr": "192.168.178.1"}]}]);
+    let router_svc = json!([{"name": "myrouter", "ports": [{"public": 443, "target": 80, "proto": "tcp", "addr": "192.168.178.1"}]}]);
     let (status, body) = poll_with(&app.router, owner["bearer_token"].as_str().unwrap(), router_svc).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
@@ -2679,7 +2658,7 @@ async fn poll_rejects_a_target_address_inside_the_mesh_or_that_cannot_answer() {
         let (status, body) = poll_with(
             &app.router,
             bearer,
-            json!([{"name": "x", "port": 80, "proto": "tcp", "ports": ports}]),
+            json!([{"name": "x", "ports": ports}]),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{addr}: {body}");
@@ -3515,8 +3494,7 @@ fn named_app() -> TestApp {
 }
 
 fn svc(name: &str, public: u16, target: u16) -> Value {
-    json!({"name": name, "port": target, "proto": "tcp",
-           "ports": [{"public": public, "target": target, "proto": "tcp"}]})
+    json!({"name": name, "ports": [{"public": public, "target": target, "proto": "tcp"}]})
 }
 
 async fn poll_caps(router: &Router, bearer: &str, services: Value, capable: bool) -> Value {

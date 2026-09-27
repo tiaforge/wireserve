@@ -7,9 +7,8 @@
 # wireserve-coordinator user, installs both binaries, writes exactly the
 # asked-for settings, starts the service as that user and leaves
 # wireserve-admin working for the admin user with no flags; that
-# --reconfigure changes only its own keys; that a plain re-run upgrades
-# without touching the settings; and that a coordinator installed the old
-# way (as `wireserve`) is moved to the new user with its database intact.
+# --reconfigure changes only its own keys; and that a plain re-run upgrades
+# without touching the settings.
 #
 # The image has to be able to run binaries built on this machine (same or
 # newer glibc) and boot systemd; Arch's does both for an Arch-based host.
@@ -48,16 +47,13 @@ trap cleanup EXIT
 # Just the two binaries, side by side, as an operator would copy them over.
 mkdir -p "$WORK/bin"
 cp "$BIN/wireserve-coordinator" "$BIN/wireserve-admin" "$WORK/bin/"
-# The unit as it was before the coordinator had its own user.
-PRE_M31_REF=${PRE_M31_REF:-9a43d33}
-git show "$PRE_M31_REF:deploy/systemd/wireserve-coordinator.service" > "$WORK/old.service" 2>/dev/null || true
 
 boot() {
     local name=$1
     # SYS_ADMIN (inside the user namespace only): systemd needs it to set
     # up the unit's sandbox (ProtectSystem=, PrivateTmp=, ...).
     $PODMAN run -d --name "$name" --systemd=always --cap-add SYS_ADMIN \
-        -v "$WORK/bin:/opt/ws:ro" -v "$WORK/old.service:/opt/old.service:ro" \
+        -v "$WORK/bin:/opt/ws:ro" \
         "$IMAGE" /usr/lib/systemd/systemd >/dev/null
     CONTAINERS+=("$name")
     for _ in $(seq 1 60); do
@@ -152,41 +148,6 @@ if in_c "$C" /opt/ws/wireserve-coordinator install --domain x.test >"$WORK/refus
 fi
 grep -q -- '--reconfigure' "$WORK/refuse.out" || { cat "$WORK/refuse.out"; fail "refusal does not point at --reconfigure"; }
 pass "settings flags on an installed host point at --reconfigure"
-
-# ---------------------------------------------------------------------
-log "a coordinator installed the old way moves to the new user"
-[ -s "$WORK/old.service" ] || fail "could not read the pre-M31 unit from git ($PRE_M31_REF)"
-grep -qx 'User=wireserve' "$WORK/old.service" || fail "$PRE_M31_REF's unit does not run as wireserve"
-L=wireserve-coord-legacy-$$
-boot "$L"
-in_c "$L" useradd --system --no-create-home --shell /usr/bin/nologin wireserve
-in_c "$L" install -m 0755 /opt/ws/wireserve-coordinator /usr/local/bin/wireserve-coordinator
-in_c "$L" cp /opt/old.service /etc/systemd/system/wireserve-coordinator.service
-in_c "$L" systemctl daemon-reload
-in_c "$L" systemctl enable --now wireserve-coordinator
-for _ in $(seq 1 40); do in_c "$L" test -e /var/lib/wireserve-coordinator/coordinator.db && break; sleep 0.25; done
-[ "$(in_c "$L" stat -c %U /var/lib/wireserve-coordinator/coordinator.db)" = wireserve ] || fail "old setup did not run as wireserve"
-TOKEN=$(in_c "$L" sh -c "grep WIRESERVE_ADMIN_TOKEN /var/lib/wireserve-coordinator/coordinator-secrets.env | cut -d= -f2")
-in_c "$L" /usr/local/bin/wireserve-admin --admin-token "$TOKEN" create-node before-upgrade >/dev/null 2>&1 \
-    || in_c "$L" /opt/ws/wireserve-admin --admin-token "$TOKEN" create-node before-upgrade >/dev/null \
-    || fail "could not create a node on the old setup"
-
-in_c "$L" /opt/ws/wireserve-coordinator install </dev/null >"$WORK/legacy.out" 2>&1 \
-    || { cat "$WORK/legacy.out"; fail "upgrading the old setup failed"; }
-cat "$WORK/legacy.out"
-in_c "$L" systemctl is-active --quiet wireserve-coordinator || fail "service not active after the move"
-owner=$(in_c "$L" stat -c %U "/proc/$(main_pid "$L")")
-[ "$owner" = wireserve-coordinator ] || fail "service runs as $owner after the move"
-for f in coordinator.db coordinator-secrets.env; do
-    o=$(in_c "$L" stat -c %U "/var/lib/wireserve-coordinator/$f")
-    [ "$o" = wireserve-coordinator ] || fail "$f owned by $o after the move"
-done
-in_c "$L" getent passwd wireserve >/dev/null || fail "the old wireserve user was removed"
-grep -q 'used to run as the `wireserve` user' "$WORK/legacy.out" || fail "no note about the old user"
-# rejoin only succeeds for a node record that exists.
-in_c "$L" wireserve-admin --admin-token "$TOKEN" rejoin before-upgrade >/dev/null \
-    || fail "the node created before the move is gone"
-pass "moved to wireserve-coordinator; database, admin key and old user all kept"
 
 echo
 echo "ALL COORDINATOR INSTALL CHECKS PASSED"

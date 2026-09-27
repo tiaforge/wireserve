@@ -32,11 +32,8 @@ Group=wireserve-coordinator
 # Deliberately NOT duplicated as Environment= lines here: systemd applies
 # these in file order, so an Environment= line placed after
 # EnvironmentFile= wins, and the operator's edit to their own env file is
-# silently ignored. This unit used to set WIRESERVE_DB_PATH that way while
-# coordinator.env.example documented it as settable -- the exact trap this
-# comment warns about, sprung two lines below it. There is now no
-# Environment= line here at all; every setting comes from the env file,
-# which carries the same default.
+# silently ignored. There is no Environment= line here at all; every
+# setting comes from the env file.
 #
 # Set WIRESERVE_TRUST_PROXY_HEADERS=true there when (and only when) the
 # node-facing listener is reachable exclusively through a reverse proxy
@@ -53,37 +50,6 @@ Group=wireserve-coordinator
 # firewall/router, since a reverse proxy only ever forwards HTTP.
 EnvironmentFile=-/etc/wireserve/coordinator.env
 
-# One-time move from the directory this unit used to share with the agent
-# (/var/lib/wireserve) to its own (security review finding #6): systemd
-# recursively chowns a StateDirectory= to the unit's User= whenever the
-# owner doesn't match, so while both units named the same directory,
-# starting this one handed the agent's WireGuard private key and bearer
-# token to the unprivileged coordinator user. Runs as root (`+`) because
-# the old directory may be root-owned by then; does nothing once the new
-# directory has a database, when there is nothing to move, or when
-# WIRESERVE_DB_PATH is set explicitly (that database is left where the
-# operator put it). A symlink among the files is never moved or followed:
-# it fails the start instead, since moving the rest would leave the
-# database next to a freshly generated admin token and mesh ranges.
-ExecStartPre=+/bin/sh -c '\
-    old=/var/lib/wireserve; new=/var/lib/wireserve-coordinator; \
-    files="coordinator.db coordinator.db-wal coordinator.db-shm coordinator-secrets.env"; \
-    [ -e "$$new/coordinator.db" ] && exit 0; \
-    grep -qs "^[[:space:]]*WIRESERVE_DB_PATH=" /etc/wireserve/coordinator.env && exit 0; \
-    [ -e "$$old/coordinator.db" ] || [ -L "$$old/coordinator.db" ] || exit 0; \
-    for f in $$files; do \
-        if [ -L "$$old/$$f" ] || { [ -e "$$old/$$f" ] && [ ! -f "$$old/$$f" ]; }; then \
-            echo "refusing to move $$old/$$f: not a regular file" >&2; exit 1; \
-        fi; \
-    done; \
-    for f in $$files; do \
-        if [ -f "$$old/$$f" ]; then \
-            mv "$$old/$$f" "$$new/$$f" && [ ! -L "$$new/$$f" ] && chmod 600 "$$new/$$f" \
-                && chown -h --reference="$$new" "$$new/$$f" || exit 1; \
-        fi; \
-    done; \
-    echo "moved the coordinator database from $$old to $$new"'
-
 ExecStart=/usr/local/bin/wireserve-coordinator
 Restart=on-failure
 RestartSec=2s
@@ -91,8 +57,10 @@ RestartSec=2s
 # The coordinator never touches WireGuard or the host firewall — it is a
 # plain HTTP API and needs no special capabilities (spec §8).
 #
-# Its own directory, never the agent's /var/lib/wireserve: see the
-# ExecStartPre= above for what sharing one did.
+# Its own directory, never the agent's /var/lib/wireserve: systemd chowns a
+# StateDirectory= to the unit's User=, so a shared one would hand the
+# agent's WireGuard key to the unprivileged coordinator user (security
+# review finding #6).
 StateDirectory=wireserve-coordinator
 StateDirectoryMode=0700
 NoNewPrivileges=true

@@ -115,8 +115,7 @@ async fn authorize(
     if !service.is_approved() {
         return refuse("that service is not approved");
     }
-    let tls_port = wireserve_types::effective_ports(&service.ports, service.port, service.proto)
-        .iter()
+    let tls_port = service.ports.iter()
         .any(|m| m.public == wireserve_types::TLS_PUBLIC_PORT && m.proto == wireserve_types::Proto::Tcp);
     if service.vip4.is_none() || !tls_port {
         return refuse("that service is not published on TCP 443 with an address of its own");

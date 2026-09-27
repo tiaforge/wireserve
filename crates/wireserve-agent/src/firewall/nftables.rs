@@ -5,7 +5,7 @@
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv4Addr;
 
 use nftables::expr::{
     BinaryOperation, CTDir, Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, Prefix, SetItem, CT,
@@ -20,9 +20,6 @@ use super::nft::{Nft, NftError};
 /// Our table is `inet wireserve.<ifname>`: one per interface, so several
 /// agents on one host each replace and remove only their own.
 pub const TABLE_PREFIX: &str = "wireserve.";
-/// The single fixed-name table every version before multi-instance
-/// support used. Nothing creates it any more; see `remove_legacy_table`.
-pub const LEGACY_TABLE_NAME: &str = "wireserve";
 pub(crate) const CHAIN_NAME: &str = "wireserve-in";
 pub(crate) const FORWARD_CHAIN: &str = "wireserve-fwd";
 const PRE_CHAIN: &str = "svc-pre";
@@ -207,16 +204,6 @@ fn ct(key: &'static str, dir: Option<CTDir>) -> Expression<'static> {
     }))
 }
 
-/// `ct original ip daddr` / `ct original ip6 daddr`: where the peer sent
-/// the connection, before any NAT on this host rewrote it.
-///
-/// Spelled the way `nft -j` itself spells it — the family folded into the
-/// key (`"ip daddr"`), no `family` field. With `family: "ip"` and key
-/// `"daddr"` nft refuses the rule ("cannot determine ip protocol
-/// version"), which only a real kernel test caught.
-fn ct_original_daddr(protocol: &'static str) -> Expression<'static> {
-    ct(if protocol == "ip6" { "ip6 daddr" } else { "ip daddr" }, Some(CTDir::Original))
-}
 
 fn addr(ip: Ipv4Addr) -> Expression<'static> {
     Expression::String(Cow::Owned(ip.to_string()))
@@ -563,7 +550,7 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
         .iter()
         .filter_map(|r| match *r {
             ServiceRule::Mapped { vip, node, map, .. } => Some((vip, map.addr.unwrap_or(node), map)),
-            ServiceRule::Open { .. } | ServiceRule::Terminated { .. } => None,
+            ServiceRule::Terminated { .. } => None,
         })
         .collect();
     // Answered on the service address by this node's own terminator
@@ -576,13 +563,6 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
         })
         .collect();
     let has_service_addresses = !mapped.is_empty() || !terminated.is_empty();
-    let open: Vec<(Proto, u16, Ipv4Addr, Option<Ipv6Addr>)> = rules
-        .iter()
-        .filter_map(|r| match *r {
-            ServiceRule::Open { proto, port, node, node6 } => Some((proto, port, node, node6)),
-            ServiceRule::Mapped { .. } | ServiceRule::Terminated { .. } => None,
-        })
-        .collect();
     let accept = || Statement::Accept(None::<Accept>);
 
     // ---- input: what reaches this host's own sockets from the mesh ----
@@ -606,25 +586,6 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
     // default-deny would break outbound connectivity through the tunnel
     // just as badly as the bug above broke it on every other interface.
     objects.push(rule(t, CHAIN_NAME, vec![iifname_is(ifname), established_or_related(), accept()]));
-    // Scoped to the node's own mesh addresses, like the forward rule
-    // below: the hole is for the service on this node's mesh address, not
-    // for the same port on every other address this host has.
-    for &(proto, port, node, node6) in &open {
-        objects.push(rule(t, CHAIN_NAME, vec![
-            iifname_is(ifname),
-            is(payload("ip", "daddr"), addr(node)),
-            dport_is(proto, port),
-            accept(),
-        ]));
-        if let Some(node6) = node6 {
-            objects.push(rule(t, CHAIN_NAME, vec![
-                iifname_is(ifname),
-                is(payload("ip6", "daddr"), addr6(node6)),
-                dport_is(proto, port),
-                accept(),
-            ]));
-        }
-    }
     if has_service_addresses {
         objects.push(rule(t, CHAIN_NAME, vec![iifname_is(ifname), has_mark(ct("mark", None)), accept()]));
     }
@@ -656,33 +617,6 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
         ]));
     }
     objects.push(rule(t, FORWARD_CHAIN, vec![iifname_is(ifname), established_or_related(), accept()]));
-    for &(proto, port, node, node6) in &open {
-        // After the runtime's DNAT the packet's own address and port are
-        // the container's; what the peer asked for is the original ones.
-        //
-        // The original destination address is load-bearing (security
-        // review finding #3). Matched on the port alone, this accepted a
-        // peer's packets to *any* address on that port — a container or
-        // VM bridge on this host, its LAN, anything it routes to — the
-        // moment the host forwards (a transit carrier, or any host with
-        // forwarding on for containers), and a firewalld host adds our
-        // interface to its `trusted` zone, which forwards freely. Only a
-        // connection addressed to this node itself, then NATed onward by
-        // the host, is what a published container port looks like.
-        let mut families = vec![("ip", addr(node))];
-        if let Some(node6) = node6 {
-            families.push(("ip6", addr6(node6)));
-        }
-        for (family, own) in families {
-            objects.push(rule(t, FORWARD_CHAIN, vec![
-                iifname_is(ifname),
-                is(meta(MetaKey::L4proto), Expression::String(l4(proto).into())),
-                is(ct_original_daddr(family), own),
-                is(ct("proto-dst", Some(CTDir::Original)), Expression::Number(u32::from(port))),
-                accept(),
-            ]));
-        }
-    }
     if !mapped.is_empty() {
         objects.push(rule(t, FORWARD_CHAIN, vec![iifname_is(ifname), has_mark(ct("mark", None)), accept()]));
     }
@@ -766,7 +700,7 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
         .iter()
         .filter_map(|r| match *r {
             ServiceRule::Mapped { map, .. } => map.addr.map(|dest| (dest, map)),
-            ServiceRule::Open { .. } | ServiceRule::Terminated { .. } => None,
+            ServiceRule::Terminated { .. } => None,
         })
         .collect();
     if !remote.is_empty() {
@@ -790,14 +724,6 @@ pub(crate) fn teardown_batch(table: &str) -> Nftables<'static> {
     }
 }
 
-/// Removes the fixed-name table of an agent from before multi-instance
-/// support — left behind if that version crashed, or was upgraded while
-/// its interface was up. Default-denying `wg0`, it would otherwise keep
-/// blocking any other tunnel that later uses that name.
-pub fn remove_legacy_table(nft: &Nft) -> Result<(), NftablesError> {
-    nft.apply(&teardown_batch(LEGACY_TABLE_NAME))?;
-    Ok(())
-}
 
 impl FirewallBackend for NftablesBackend {
     type Error = NftablesError;
@@ -904,20 +830,6 @@ mod tests {
         out
     }
 
-    fn open(proto: Proto, port: u16) -> ServiceRule {
-        ServiceRule::Open { proto, port, node: NODE, node6: None }
-    }
-
-    const NODE6: &str = "fd00:90::2";
-
-    fn daddr_is(protocol: &str, a: &str) -> Value {
-        json!({"match": {"op": "==", "left": {"payload": {"protocol": protocol, "field": "daddr"}}, "right": a}})
-    }
-
-    fn ct_original_daddr_is(family: &str, a: &str) -> Value {
-        json!({"match": {"op": "==", "left": {"ct": {"key": format!("{family} daddr"), "dir": "original"}}, "right": a}})
-    }
-
     fn mapped(map: &str) -> ServiceRule {
         ServiceRule::Mapped {
             vip: VIP,
@@ -934,63 +846,7 @@ mod tests {
         assert_eq!(as_json(&apply_batch("wg0", &[], &fwd(&[]))), json!({ "nftables": expected }));
     }
 
-    #[test]
-    fn apply_opens_exactly_the_declared_services() {
-        let rules = [open(Proto::Tcp, 32400), open(Proto::Udp, 5353)];
-        let node = NODE.to_string();
-        let mut expected = prelude();
-        expected.push(rule_json(json!([
-            iif("wg0"),
-            daddr_is("ip", &node),
-            {"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": 32400}},
-            {"accept": null}
-        ])));
-        expected.push(rule_json(json!([
-            iif("wg0"),
-            daddr_is("ip", &node),
-            {"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "dport"}}, "right": 5353}},
-            {"accept": null}
-        ])));
-        expected.push(rule_json(json!([iif("wg0"), {"drop": null}])));
-        // A container behind a published port is forwarded to: matched on
-        // the address and port the peer asked for, before the runtime's
-        // DNAT — the node's own address, never anywhere else.
-        expected.extend(forward(vec![
-            rule_in("wireserve-fwd", json!([
-                iif("wg0"),
-                {"match": {"op": "==", "left": {"meta": {"key": "l4proto"}}, "right": "tcp"}},
-                ct_original_daddr_is("ip", &node),
-                {"match": {"op": "==", "left": {"ct": {"key": "proto-dst", "dir": "original"}}, "right": 32400}},
-                {"accept": null}
-            ])),
-            rule_in("wireserve-fwd", json!([
-                iif("wg0"),
-                {"match": {"op": "==", "left": {"meta": {"key": "l4proto"}}, "right": "udp"}},
-                ct_original_daddr_is("ip", &node),
-                {"match": {"op": "==", "left": {"ct": {"key": "proto-dst", "dir": "original"}}, "right": 5353}},
-                {"accept": null}
-            ])),
-        ]));
-        assert_eq!(as_json(&apply_batch("wg0", &rules, &fwd(&[]))), json!({ "nftables": expected }));
-    }
 
-    #[test]
-    fn a_node_with_an_ipv6_mesh_address_gets_the_same_holes_scoped_to_it_too() {
-        let rules = [ServiceRule::Open { proto: Proto::Tcp, port: 22, node: NODE, node6: Some(NODE6.parse().unwrap()) }];
-        let node = NODE.to_string();
-        let dport = json!({"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": 22}});
-        let l4 = json!({"match": {"op": "==", "left": {"meta": {"key": "l4proto"}}, "right": "tcp"}});
-        let proto_dst = json!({"match": {"op": "==", "left": {"ct": {"key": "proto-dst", "dir": "original"}}, "right": 22}});
-        let mut expected = prelude();
-        expected.push(rule_json(json!([iif("wg0"), daddr_is("ip", &node), dport, {"accept": null}])));
-        expected.push(rule_json(json!([iif("wg0"), daddr_is("ip6", NODE6), dport, {"accept": null}])));
-        expected.push(rule_json(json!([iif("wg0"), {"drop": null}])));
-        expected.extend(forward(vec![
-            rule_in("wireserve-fwd", json!([iif("wg0"), l4, ct_original_daddr_is("ip", &node), proto_dst, {"accept": null}])),
-            rule_in("wireserve-fwd", json!([iif("wg0"), l4, ct_original_daddr_is("ip6", NODE6), proto_dst, {"accept": null}])),
-        ]));
-        assert_eq!(as_json(&apply_batch("wg0", &rules, &fwd(&[]))), json!({ "nftables": expected }));
-    }
 
     fn endpoint4(ip: &str, vips: &[&str]) -> TransitEndpoint {
         TransitEndpoint { ip4: Some(ip.parse().unwrap()), ip6: None, vips: vips.iter().map(|v| v.parse().unwrap()).collect() }
@@ -1262,7 +1118,7 @@ mod tests {
 
     #[test]
     fn without_a_mapped_service_there_are_no_rewrite_chains() {
-        let batch = as_json(&apply_batch("wg0", &[open(Proto::Tcp, 22)], &fwd(&[]))).to_string();
+        let batch = as_json(&apply_batch("wg0", &[], &fwd(&[]))).to_string();
         assert!(!batch.contains("svc-") && !batch.contains("mangle"), "{batch}");
     }
 
@@ -1272,9 +1128,8 @@ mod tests {
         // accept keyed on a port alone lets a peer use this host as a
         // relay to anything it routes to. Every accept must be an existing
         // flow, one of our own marked flows, or name its destination.
-        let open6 = ServiceRule::Open { proto: Proto::Udp, port: 53, node: NODE, node6: Some(NODE6.parse().unwrap()) };
         let pair = TransitForward { near: endpoint4("100.90.0.10", &[]), far: endpoint4("100.90.0.20", &[]) };
-        let batch = as_json(&apply_batch("wg0", &[open(Proto::Tcp, 22), open6, mapped("80:5080")], &fwd(&[pair])));
+        let batch = as_json(&apply_batch("wg0", &[terminated("443:22"), mapped("80:5080")], &fwd(&[pair])));
         let forward: Vec<&Value> = batch["nftables"]
             .as_array()
             .unwrap()
@@ -1304,7 +1159,7 @@ mod tests {
         // arrive on it, and replies leave on whatever interface. They're
         // scoped instead to what only this agent produces — its own
         // service address as destination, or its own mark.
-        let rules = [open(Proto::Tcp, 22), mapped("80:5080"), mapped("53:5353/udp"), mapped("443:192.168.178.1:80")];
+        let rules = [terminated("8443:22"), mapped("80:5080"), mapped("53:5353/udp"), mapped("443:192.168.178.1:80")];
         for ifname in ["wg0", "wireserve0", "wg-mesh.1"] {
             let batch = as_json(&apply_batch(ifname, &rules, &exit_fwd(&[CLIENT])));
             let rules: Vec<&Value> = batch["nftables"]
@@ -1317,7 +1172,10 @@ mod tests {
                 let first = &r["expr"][0];
                 let text = r["expr"].to_string();
                 let ok = match r["chain"].as_str().unwrap() {
-                    "wireserve-in" | "wireserve-fwd" | "svc-pre" | "exit-mark" => *first == iif(ifname),
+                    "wireserve-fwd" | "svc-pre" | "exit-mark" => *first == iif(ifname),
+                    // The terminated address's drop is for every interface
+                    // but this one: it names the address.
+                    "wireserve-in" => *first == iif(ifname) || text.contains("100.90.0.50"),
                     "exit-masq" => text.contains(&format!(r#""&":[{{"ct":{{"key":"mark"}}}},{EXIT_MARK}]"#)),
                     "svc-masq" => text.contains(&format!(r#""&":[{{"meta":{{"key":"mark"}}}},{SERVICE_MARK}]"#)),
                     "svc-out" => text.starts_with(r#"[{"match":{"left":{"payload":{"field":"daddr","protocol":"ip"}},"op":"==","right":"100.90.0.50"}}"#),
@@ -1473,50 +1331,7 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn kernel_accepts_apply_and_renders_the_expected_ruleset() {
-        let script = nft_script(&[apply_batch("wg0", &[open(Proto::Tcp, 32400)], &fwd(&[]))]) + "nft list table inet wireserve.wg0";
-        let Some(listing) = crate::firewall::netns::run(&script) else {
-            return;
-        };
-        assert_eq!(
-            normalised_lines(&listing),
-            [
-                "table inet wireserve.wg0 {",
-                "chain wireserve-in {",
-                "type filter hook input priority filter; policy accept;",
-                "iifname \"wg0\" ct state established,related accept",
-                "iifname \"wg0\" ip daddr 100.90.0.2 tcp dport 32400 accept",
-                "iifname \"wg0\" drop",
-                "}",
-                "chain wireserve-fwd {",
-                "type filter hook forward priority filter; policy accept;",
-                "iifname \"wg0\" ct state established,related accept",
-                "iifname \"wg0\" meta l4proto tcp ct original ip daddr 100.90.0.2 ct original proto-dst 32400 accept",
-                "iifname \"wg0\" drop",
-                "}",
-                "}",
-            ]
-        );
-    }
 
-    #[test]
-    fn kernel_accepts_an_open_service_scoped_to_both_mesh_addresses() {
-        let rules = [ServiceRule::Open { proto: Proto::Udp, port: 53, node: NODE, node6: Some(NODE6.parse().unwrap()) }];
-        let script = nft_script(&[apply_batch("wg0", &rules, &fwd(&[]))]) + "nft list table inet wireserve.wg0";
-        let Some(listing) = crate::firewall::netns::run(&script) else {
-            return;
-        };
-        let lines = normalised_lines(&listing);
-        for want in [
-            "iifname \"wg0\" ip daddr 100.90.0.2 udp dport 53 accept",
-            "iifname \"wg0\" ip6 daddr fd00:90::2 udp dport 53 accept",
-            "iifname \"wg0\" meta l4proto udp ct original ip daddr 100.90.0.2 ct original proto-dst 53 accept",
-            "iifname \"wg0\" meta l4proto udp ct original ip6 daddr fd00:90::2 ct original proto-dst 53 accept",
-        ] {
-            assert!(lines.iter().any(|l| l == want), "missing `{want}` in:\n{listing}");
-        }
-    }
 
     #[test]
     fn kernel_accepts_a_transit_pairs_ruleset() {
@@ -1720,14 +1535,15 @@ mod tests {
 
     #[test]
     fn kernel_apply_twice_replaces_rather_than_accumulates() {
-        let tcp = |port| open(Proto::Tcp, port);
+        // Terminated rules only mark, which an unprivileged namespace allows.
+        let tcp = |port: u16| terminated(&format!("{port}:{port}"));
         let script = nft_script(&[apply_batch("wg0", &[tcp(1)], &fwd(&[])), apply_batch("wg0", &[tcp(2)], &fwd(&[]))])
             + "nft list table inet wireserve.wg0";
         let Some(listing) = crate::firewall::netns::run(&script) else {
             return;
         };
         assert!(!listing.contains("dport 1 "), "{listing}");
-        assert!(listing.contains("ip daddr 100.90.0.2 tcp dport 2 accept"), "{listing}");
+        assert!(listing.contains("ip daddr 100.90.0.50 tcp dport 2 meta mark set"), "{listing}");
         assert_eq!(listing.matches("chain wireserve-in").count(), 1, "{listing}");
     }
 
@@ -1765,7 +1581,7 @@ mod tests {
 
     #[test]
     fn kernel_two_interfaces_keep_separate_tables() {
-        let tcp = |port| open(Proto::Tcp, port);
+        let tcp = |port: u16| terminated(&format!("{port}:{port}"));
         let script = nft_script(&[
             apply_batch("wireserve0", &[tcp(1)], &fwd(&[])),
             apply_batch("wireserve1", &[tcp(2)], &fwd(&[])),
@@ -1777,6 +1593,6 @@ mod tests {
         };
         assert!(!listing.contains("wireserve.wireserve0"), "{listing}");
         assert!(listing.contains("table inet wireserve.wireserve1"), "{listing}");
-        assert!(listing.contains("iifname \"wireserve1\" ip daddr 100.90.0.2 tcp dport 2 accept"), "{listing}");
+        assert!(listing.contains("iifname \"wireserve1\" ip daddr 100.90.0.50 tcp dport 2 meta mark set"), "{listing}");
     }
 }

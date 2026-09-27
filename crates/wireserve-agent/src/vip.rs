@@ -87,7 +87,7 @@ pub fn sanitize(directory: &mut PollResponse) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wireserve_types::{PeerInfo, PendingService, Proto, ServiceInfo};
+    use wireserve_types::{PeerInfo, PendingService, ServiceInfo};
 
     fn peer(name: &str, ip4: &str) -> PeerInfo {
         PeerInfo {
@@ -112,8 +112,6 @@ mod tests {
             name: name.into(),
             node: "a".into(),
             ip4: "10.9.0.1".into(),
-            port: 80,
-            proto: Proto::Tcp,
             online: true,
             vip4: vip4.map(Into::into),
             ports: vec![],
@@ -172,8 +170,8 @@ mod tests {
     fn a_pending_address_may_not_collide_with_a_published_one() {
         let mut d = directory(vec![svc("a", Some("10.9.0.50"))]);
         d.pending_services = vec![
-            PendingService { name: "p".into(), port: 1, proto: Proto::Tcp, vip4: Some("10.9.0.50".into()), declared_at: None },
-            PendingService { name: "q".into(), port: 1, proto: Proto::Tcp, vip4: Some("10.9.0.52".into()), declared_at: None },
+            PendingService { name: "p".into(), ports: vec![], vip4: Some("10.9.0.50".into()), declared_at: None },
+            PendingService { name: "q".into(), ports: vec![], vip4: Some("10.9.0.52".into()), declared_at: None },
         ];
         sanitize(&mut d);
         assert_eq!(d.pending_services[0].vip4, None);

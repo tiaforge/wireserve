@@ -31,8 +31,6 @@ use crate::paths::Instance;
 const UNIT_DEFAULT: &str = include_str!("../../../deploy/systemd/wireserve-agent.service");
 const UNIT_TEMPLATE: &str = include_str!("../../../deploy/systemd/wireserve-agent@.service");
 const BIN_DEST: &str = "/usr/local/bin/wireserve";
-/// Where earlier versions put the binary, before it was called `wireserve`.
-const OLD_BIN_DEST: &str = "/usr/local/bin/wireserve-agent";
 const UNIT_DEFAULT_DEST: &str = "/etc/systemd/system/wireserve-agent.service";
 const UNIT_TEMPLATE_DEST: &str = "/etc/systemd/system/wireserve-agent@.service";
 /// The TLS terminator's units (PLAN.md M33), installed beside the agent's.
@@ -86,7 +84,7 @@ pub fn require_root() -> Result<(), InstallError> {
     Err(InstallError::UnsupportedPlatform)
 }
 
-/// Copies the currently running binary to `/usr/local/bin/wireserve-agent`,
+/// Copies the currently running binary to `/usr/local/bin/wireserve`,
 /// unless it's already running from exactly there.
 pub fn install_self() -> Result<(), InstallError> {
     let current = std::env::current_exe()
@@ -98,14 +96,6 @@ pub fn install_self() -> Result<(), InstallError> {
     let bytes = std::fs::read(&current).map_err(|e| InstallError::InstallBinary(BIN_DEST, e))?;
     crate::fsutil::atomic_write(std::path::Path::new(BIN_DEST), &bytes, 0o755)
         .map_err(|e| InstallError::InstallBinary(BIN_DEST, e))
-}
-
-/// Whether something is still at the path earlier versions installed the
-/// binary to, as `wireserve-agent`. `install` never touches it — it may be
-/// someone's own arrangement, or still what a script points at — it only
-/// says so, since nothing uses it any more.
-pub fn old_binary_present() -> bool {
-    std::fs::symlink_metadata(OLD_BIN_DEST).is_ok()
 }
 
 /// Creates the group the daemon shares its socket with, if sharing is on

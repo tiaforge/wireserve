@@ -296,9 +296,8 @@ pub async fn list_services(
 /// is refused: the mesh must have a sign-in (`WIRESERVE_AUTH_SERVICE`, which
 /// needs DNS records and so a service domain); the service must be one a
 /// terminator serves (TCP 443, an address of its own) and not the sign-in
-/// itself; and its node must report `sign-in`. An older agent would fail
-/// closed rather than open — it finds no proxy to admit and opens nothing —
-/// but saying so here beats a service that silently stops answering.
+/// itself; and its node must report `sign-in`, since an agent without the
+/// built-in sign-in would leave the service unserved.
 ///
 /// Turning it off is never refused. Nor is marking a name nothing declares:
 /// it waits, and whoever declares it is published behind the sign-in.
@@ -325,8 +324,7 @@ pub async fn set_service_auth(
         }
         if let Some(service) = services::find_by_name(&conn, &name)? {
             let served = service.vip4.is_some()
-                && wireserve_types::effective_ports(&service.ports, service.port, service.proto)
-                    .iter()
+                && service.ports.iter()
                     .any(|m| m.public == wireserve_types::TLS_PUBLIC_PORT && m.proto == wireserve_types::Proto::Tcp);
             if !served {
                 return Err(AppError::Conflict(format!(

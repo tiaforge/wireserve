@@ -133,7 +133,7 @@ pub fn build_config(state: &AgentState) -> TlsConfig {
         .iter()
         .filter_map(|d| {
             let vip = crate::poll_loop::own_vip(&d.name, node, directory)?;
-            let map = d.port_maps().into_iter().find(|m| m.public == TLS_PUBLIC_PORT && m.proto == Proto::Tcp)?;
+            let map = d.ports.clone().into_iter().find(|m| m.public == TLS_PUBLIC_PORT && m.proto == Proto::Tcp)?;
             Some(TlsService {
                 name: d.name.clone(),
                 fqdn: format!("{}.{}", d.name, naming.domain),
@@ -178,10 +178,6 @@ async fn challenge(ctx: &TlsContext, fqdn: &str, value: &str, present: bool) -> 
     let request = if present { ctx.client.post(&url) } else { ctx.client.delete(&url) };
     match request.bearer_auth(bearer).json(&body).send().await {
         Ok(r) if r.status().is_success() => TlsResponse::Ok,
-        // A coordinator from before M33 has no such route.
-        Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND || r.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED => {
-            TlsResponse::Unsupported
-        }
         Ok(r) => {
             let status = r.status();
             let text = r.text().await.unwrap_or_default();
@@ -203,11 +199,11 @@ mod tests {
                 {"name": "phone", "pubkey": "pk-phone", "ip4": "10.9.0.7", "ip6": ""},
             ],
             "services": [
-                {"name": "plex", "node": "home", "ip4": "10.9.0.1", "port": 443, "proto": "tcp", "online": true,
+                {"name": "plex", "node": "home", "ip4": "10.9.0.1", "ports": [{"public": 443, "target": 443, "proto": "tcp"}], "online": true,
                  "vip4": "10.9.0.50", "auth": auth},
-                {"name": "prom", "node": "home", "ip4": "10.9.0.1", "port": 80, "proto": "tcp", "online": true,
+                {"name": "prom", "node": "home", "ip4": "10.9.0.1", "ports": [{"public": 80, "target": 80, "proto": "tcp"}], "online": true,
                  "vip4": "10.9.0.51"},
-                {"name": "auth", "node": "gate", "ip4": "10.9.0.2", "port": 443, "proto": "tcp", "online": true,
+                {"name": "auth", "node": "gate", "ip4": "10.9.0.2", "ports": [{"public": 443, "target": 443, "proto": "tcp"}], "online": true,
                  "vip4": "10.9.0.60", "terminated": true},
             ],
         }))

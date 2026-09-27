@@ -181,8 +181,6 @@ mod tests {
         };
         state.declared_services.push(ServiceDecl {
             name: "plex".into(),
-            port: 32400,
-            proto: wireserve_types::Proto::Tcp,
             ports: vec![],
         });
         state.save(&path).unwrap();

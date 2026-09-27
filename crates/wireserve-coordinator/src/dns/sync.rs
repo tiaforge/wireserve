@@ -293,8 +293,6 @@ mod tests {
             name: name.into(),
             node: "n".into(),
             ip4: "10.77.0.2".into(),
-            port: public,
-            proto: Proto::Tcp,
             online: true,
             vip4: Some(vip.into()),
             ports: vec![PortMap { public, target: 8080, proto: Proto::Tcp, addr: None }],

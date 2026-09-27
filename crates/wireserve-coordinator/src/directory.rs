@@ -56,8 +56,6 @@ pub fn service_info(
         name: service.name.clone(),
         node: node.name.clone(),
         ip4: node.ip4.clone().unwrap_or_default(),
-        port: service.port,
-        proto: service.proto,
         online: is_recent(node.last_seen, online_threshold_secs),
         vip4: service.vip4.clone(),
         ports: service.ports.iter().map(|m| wireserve_types::PortMap { addr: None, ..*m }).collect(),
@@ -86,15 +84,13 @@ impl DirectoryContext<'_> {
     ///
     /// Every condition fails toward the path the service already had: no
     /// records, not on TCP 443, no address of its own, or its own node not
-    /// vouching for it right now — an owner that predates termination never
-    /// does. A service behind the sign-in terminates like any other (PLAN.md
+    /// vouching for it right now. A service behind the sign-in terminates like any other (PLAN.md
     /// M34): the sign-in is in the terminator.
     #[must_use]
     pub fn terminates(&self, service: &ServiceRow) -> bool {
         self.dns
             && service.vip4.is_some()
-            && wireserve_types::effective_ports(&service.ports, service.port, service.proto)
-                .iter()
+            && service.ports.iter()
                 .any(|m| m.public == wireserve_types::TLS_PUBLIC_PORT && m.proto == wireserve_types::Proto::Tcp)
             && self.tls_ready.get(&service.name) == Some(&service.node_id)
     }
@@ -137,8 +133,7 @@ pub fn approval_state(service: &ServiceRow) -> ServiceApprovalState {
 pub fn pending_service(service: &ServiceRow) -> PendingService {
     PendingService {
         name: service.name.clone(),
-        port: service.port,
-        proto: service.proto,
+        ports: service.ports.clone(),
         vip4: service.vip4.clone(),
         declared_at: service.declared_at,
     }
@@ -159,8 +154,6 @@ pub fn admin_service_info(service: &ServiceRow, owner: &NodeRow, auth: bool) -> 
         name: service.name.clone(),
         node: owner.name.clone(),
         ip4: owner.ip4.clone().unwrap_or_default(),
-        port: service.port,
-        proto: service.proto,
         vip4: service.vip4.clone(),
         ports: service.ports.clone(),
         state: approval_state(service),
@@ -230,8 +223,6 @@ mod tests {
         let svc = ServiceRow {
             node_id: 1,
             name: "plex".into(),
-            port: 32400,
-            proto: wireserve_types::Proto::Tcp,
             vip4: None,
             ports: vec![],
             declared_at: None,
@@ -249,8 +240,6 @@ mod tests {
         let svc = ServiceRow {
             node_id: 1,
             name: "myrouter".into(),
-            port: 80,
-            proto: wireserve_types::Proto::Tcp,
             vip4: Some("10.9.0.50".into()),
             ports: vec!["443:192.168.178.1:80".parse().unwrap()],
             declared_at: None,

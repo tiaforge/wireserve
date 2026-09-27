@@ -31,7 +31,7 @@ use super::iptables::line_tag;
 use super::model::{
     guard_table, is_own_table, tag, tag_owner, Action, ChainInfo, Family, FirewalldState, ForwardWanted,
     Hook, IpVersion, IptablesObservation, IptablesVariant, NftView, Observed, Opening, RuleInfo,
-    FIREWALLD_TABLE, GUARD_CHAIN, IPTABLES_TABLES, LEGACY_GUARD_TABLE, TAG_PREFIX,
+    FIREWALLD_TABLE, GUARD_CHAIN, IPTABLES_TABLES, TAG_PREFIX,
 };
 use crate::firewall::nftables::{EXIT_MARK, SERVICE_MARK};
 
@@ -559,45 +559,6 @@ pub fn plan_removal(observed: &Observed, ifname: &str) -> Vec<Action> {
     if guard_table_exists {
         actions.push(Action::GuardDelete { table });
     }
-    actions
-}
-
-/// The interface name every agent used before `--ifname` had another
-/// default.
-pub const LEGACY_IFNAME: &str = "wg0";
-
-/// What an agent from before multi-instance support leaves behind if it
-/// crashed or was upgraded mid-run, beyond tagged rules: its fixed-name
-/// guard table and, while that exists, the firewalld trust for `wg0` it
-/// guarded. Only planned when the legacy guard is there — the evidence
-/// that trust was ours — and the trust is left alone while a running
-/// agent claims `wg0` now (its trust, guarded by its own table). Same
-/// order as `plan_removal`: trust goes before its guard.
-#[must_use]
-pub fn plan_legacy_removal(observed: &Observed, wg0_live: bool) -> Vec<Action> {
-    let legacy_guard = observed.nft.as_ref().is_some_and(|v| {
-        v.tables
-            .iter()
-            .any(|t| t.family == Family::Inet && t.name == LEGACY_GUARD_TABLE)
-    });
-    if !legacy_guard {
-        return Vec::new();
-    }
-    let mut actions = Vec::new();
-    if let FirewalldState::Running {
-        runtime_zone: Some(zone),
-        permanent_zone: None,
-    } = &observed.firewalld
-    {
-        if zone == TRUSTED && !wg0_live {
-            actions.push(Action::FirewalldUntrust {
-                ifname: LEGACY_IFNAME.to_string(),
-            });
-        }
-    }
-    actions.push(Action::GuardDelete {
-        table: LEGACY_GUARD_TABLE.to_string(),
-    });
     actions
 }
 

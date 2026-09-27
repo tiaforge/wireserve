@@ -180,8 +180,8 @@ GW_ALL_BASELINE=$(in_netns "$GW" cat /proc/sys/net/ipv4/conf/all/forwarding 2>/d
 HOME_WG_BASELINE=$(in_netns "$HOME_AGENT" cat /proc/sys/net/ipv4/conf/wireserve0/forwarding 2>/dev/null || echo "?")
 
 log "declaring a service on homeserver and on the gateway"
-podman exec "$HOME_AGENT" wireserve serve svc-home 12345 tcp
-podman exec "$GW" wireserve serve svc-gw 12345 tcp
+podman exec "$HOME_AGENT" wireserve serve svc-home 12345
+podman exec "$GW" wireserve serve svc-gw 12345
 sleep 8
 admin approve-service node-home svc-home || fail "could not approve svc-home"
 admin approve-service node-gw svc-gw || fail "could not approve svc-gw"
@@ -255,7 +255,7 @@ fi
 log "3/3: a service declared AFTER the export is reachable with NO re-import"
 # The product claim. Nothing about the phone changes here — no new export,
 # no reimport, no restart of its tunnel.
-podman exec "$HOME_AGENT" wireserve serve svc-later 12399 tcp
+podman exec "$HOME_AGENT" wireserve serve svc-later 12399
 sleep 8
 admin approve-service node-home svc-later || fail "could not approve svc-later"
 sleep 12

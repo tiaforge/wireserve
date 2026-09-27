@@ -95,7 +95,7 @@ pub const TLS_PUBLIC_PORT: u16 = 443;
 /// Whether this service publishes [`TLS_PUBLIC_PORT`] over TCP.
 #[must_use]
 pub fn publishes_tls(s: &ServiceInfo) -> bool {
-    s.port_maps().iter().any(|m| m.public == TLS_PUBLIC_PORT && m.proto == Proto::Tcp)
+    s.ports.iter().any(|m| m.public == TLS_PUBLIC_PORT && m.proto == Proto::Tcp)
 }
 
 /// A service's own address: the one the coordinator gave it, else its

@@ -37,6 +37,6 @@ pub async fn probe(
     );
     Json(wireserve_types::ProbeResponse {
         addr: client.ip.to_string(),
-        reflexive_port: Some(state.config.listen_addr.port()),
+        reflexive_port: state.config.listen_addr.port(),
     })
 }

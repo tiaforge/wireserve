@@ -7,7 +7,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 
-# Secrets and per-deployment config (WIRESERVE_STATE_PATH override, poll
+# Per-deployment config (state and run roots, poll
 # interval, etc. — the bearer token and WireGuard private key themselves
 # are never put here, they live in the mode-600 state file the agent
 # manages itself, see PLAN.md decisions log).

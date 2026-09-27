@@ -196,7 +196,7 @@ MESH_NET="${MESH_V4%.*}.0/24"
 in_netns "$LAN_HOST" ip route replace "$MESH_NET" via "$GW_LAN_IP" >/dev/null
 
 log "a service on the home node, and a resolver on the gateway"
-podman exec "$HOME_AGENT" wireserve serve svc-home 12345 tcp
+podman exec "$HOME_AGENT" wireserve serve svc-home 12345
 podman exec "$GW" wireserve serve dns 53:53/udp 53:53/tcp
 sleep 8
 admin approve-service node-home svc-home || fail "could not approve svc-home"

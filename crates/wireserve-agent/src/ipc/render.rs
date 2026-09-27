@@ -68,13 +68,13 @@ fn service_state(s: &LocalServiceView) -> &'static str {
 
 fn service_row(s: &LocalServiceView, domain: Option<&str>) -> Vec<String> {
     let node = if s.local { format!("{} (this node)", clean(&s.node)) } else { clean(&s.node) };
-    // A service without an address of its own (declared by an agent from
-    // before service addresses) resolves to its node.
+    // A service the coordinator had no address left for is reachable
+    // nowhere; say so rather than show its node's.
     let address = match &s.vip4 {
         Some(vip) => clean(vip),
-        None => format!("{} (node)", clean(&s.ip4)),
+        None => "(no address)".to_string(),
     };
-    let maps = if s.ports.is_empty() { vec![PortMap::identity(s.port, s.proto)] } else { s.ports.clone() };
+    let maps = s.ports.clone();
     let host = match domain {
         Some(d) => format!("{}.{}", clean(&s.name), clean(d)),
         None => format!("{}.wg", clean(&s.name)),
@@ -240,7 +240,6 @@ mod tests {
     use super::*;
     use crate::ipc::protocol::TunnelPeer;
     use crate::state::RejectedService;
-    use wireserve_types::Proto;
 
     fn now() -> DateTime<Utc> {
         "2026-09-21T12:00:00Z".parse().unwrap()
@@ -251,8 +250,6 @@ mod tests {
             name: name.into(),
             node: node.into(),
             ip4: "10.1.0.2".into(),
-            port: 1,
-            proto: Proto::Tcp,
             vip4: vip4.map(Into::into),
             ports: ports.iter().map(|p| p.parse().unwrap()).collect(),
             online: true,
@@ -282,9 +279,8 @@ mod tests {
         let mut mine = svc("mydns", "lego2", Some("10.1.0.4"), &["53/udp", "53/tcp", "8080:8000"]);
         mine.local = true;
         mine.pending = true;
-        let mut legacy = svc("plex", "strato", None, &[]);
-        legacy.port = 32400;
-        legacy.online = false;
+        let mut unaddressed = svc("plex", "strato", None, &["32400"]);
+        unaddressed.online = false;
         let view = ListView {
             instance: "default".into(),
             ifname: "wireserve0".into(),
@@ -310,7 +306,7 @@ mod tests {
                 },
                 TunnelPeer { pubkey: "pk-newbie".into(), endpoint: Some("198.51.100.7:51820".into()), last_handshake: None },
             ],
-            services: vec![svc("openobserve", "strato", Some("10.1.0.3"), &["80:5080"]), mine, legacy],
+            services: vec![svc("openobserve", "strato", Some("10.1.0.3"), &["80:5080"]), mine, unaddressed],
             rejected_services: vec![RejectedService {
                 name: "git".into(),
                 reason: r#"{"error":"service name 'git' is already declared by another node","conflicting_service":"git"}"#.into(),
@@ -321,10 +317,10 @@ mod tests {
             "\
 lego2, instance default on wireserve0
 
-SERVICE         ADDRESS          PORTS                        NODE               STATE
-mydns.wg        10.1.0.4         53/udp 53/tcp 8080:8000/tcp  lego2 (this node)  pending approval
-openobserve.wg  10.1.0.3         80:5080/tcp                  strato             online
-plex.wg         10.1.0.2 (node)  32400/tcp                    strato             offline
+SERVICE         ADDRESS       PORTS                        NODE               STATE
+mydns.wg        10.1.0.4      53/udp 53/tcp 8080:8000/tcp  lego2 (this node)  pending approval
+openobserve.wg  10.1.0.3      80:5080/tcp                  strato             online
+plex.wg         (no address)  32400/tcp                    strato             offline
 
 PEER    ADDRESS   ENDPOINT              HANDSHAKE  ROUTE
 lego2   10.1.0.1  -                     this node  -
