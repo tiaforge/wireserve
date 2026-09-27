@@ -6,7 +6,7 @@
 # What this proves:
 #
 #   1. a pending service gets no record; approving it publishes one at its
-#      own address, and a 443 service's name points at the proxy's address;
+#      own address, a 443 service included;
 #   2. `list-services` reports the record as published;
 #   3. withdrawing a service removes its record;
 #   4. revoking a node removes the records of every service it had;
@@ -147,7 +147,7 @@ start_coordinator() {
         -v wireserve-dns-coord-data:/var/lib/wireserve \
         -e WIRESERVE_ADMIN_TOKEN="$ADMIN_TOKEN" \
         -e WIRESERVE_REQUIRE_SERVICE_APPROVAL=true \
-        -e WIRESERVE_SERVICE_DOMAIN="$DOMAIN" -e WIRESERVE_SERVICE_PROXY=web \
+        -e WIRESERVE_SERVICE_DOMAIN="$DOMAIN" \
         -e WIRESERVE_DNS_PROVIDER=rfc2136 \
         -e WIRESERVE_DNS_SERVER="$BIND_IP:53" \
         -e WIRESERVE_DNS_TSIG_KEY_NAME=wireserve \
@@ -162,7 +162,7 @@ start_coordinator
 [ "$(lookup keep.$DOMAIN)" = 192.0.2.10 ] || fail "the hand-made record is not being served"
 pass "BIND serves the zone, and the coordinator is up"
 
-log "1. pending gets nothing; approved gets its record, 443 at the proxy"
+log "1. pending gets nothing; approved gets its record at its own address"
 PX=$(new_node px)
 HOME_B=$(new_node home)
 poll "$PX" "[$(svc web 443 8443)]" >/dev/null
@@ -172,12 +172,12 @@ sleep 8
 admin approve-service px web >/dev/null
 admin approve-service home prom >/dev/null
 admin approve-service home plex >/dev/null
-WEB_VIP=$(vip_of web); PROM_VIP=$(vip_of prom)
+WEB_VIP=$(vip_of web); PROM_VIP=$(vip_of prom); PLEX_VIP=$(vip_of plex)
 [ -n "$WEB_VIP" ] && [ -n "$PROM_VIP" ] || fail "no service addresses: $(admin list-services)"
 expect_record "web.$DOMAIN" "$WEB_VIP"
 expect_record "prom.$DOMAIN" "$PROM_VIP"
-expect_record "plex.$DOMAIN" "$WEB_VIP"
-pass "web and prom at their own addresses, plex (443) at the proxy's $WEB_VIP"
+expect_record "plex.$DOMAIN" "$PLEX_VIP"
+pass "web, prom and plex each at their own address"
 pass "prom's stale hand-made 192.0.2.99 was replaced"
 
 log "2. list-services reports the records"
@@ -187,7 +187,7 @@ pass "dns=published"
 log "3. a withdrawn service leaves DNS"
 poll "$HOME_B" "[$(svc plex 443 32400)]" >/dev/null
 expect_record "prom.$DOMAIN" ""
-expect_record "plex.$DOMAIN" "$WEB_VIP"
+expect_record "plex.$DOMAIN" "$PLEX_VIP"
 pass "prom removed, plex kept"
 
 log "4. a revoked node's services leave DNS"

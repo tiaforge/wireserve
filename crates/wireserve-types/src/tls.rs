@@ -47,6 +47,22 @@ pub struct TlsConfig {
     /// Who is calling, by mesh address: every peer's, and this node's own.
     #[serde(default)]
     pub callers: Vec<Caller>,
+    /// The sign-in provider (PLAN.md M34), resolved to where it answers.
+    /// `None` while none is configured, or its service is not in the
+    /// directory — a marked service is then refused, never served open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in: Option<SignInTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignInTarget {
+    /// `<service>.<domain>`: the name its certificate is checked against.
+    pub fqdn: String,
+    /// Its own address; the request goes to port 443 there.
+    pub vip: Ipv4Addr,
+    pub verify_path: String,
+    pub copy_headers: Vec<String>,
+    pub session_cookie: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +74,9 @@ pub struct TlsService {
     pub vip: Ipv4Addr,
     /// Where to send the requests, in plain HTTP: the service's target.
     pub upstream: SocketAddr,
+    /// Behind the sign-in (PLAN.md M34).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sign_in: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

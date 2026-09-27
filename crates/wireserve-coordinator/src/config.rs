@@ -11,9 +11,9 @@ pub struct Config {
     /// The domain services are named under (PLAN.md M25), e.g.
     /// `int.example.com`. Unset leaves `<name>.wg` exactly as it was.
     pub service_domain: Option<String>,
-    /// The service that fronts everything published on 443. Meaningless
-    /// without `service_domain`.
-    pub service_proxy: Option<String>,
+    /// The sign-in every terminator puts in front of marked services
+    /// (PLAN.md M34). Only with DNS records, which terminated services need.
+    pub sign_in: Option<wireserve_types::SignIn>,
     /// Where the service names are published as public DNS records
     /// (PLAN.md M32). `None` leaves DNS to the operator, as before.
     pub dns: Option<crate::dns::DnsConfig>,
@@ -186,22 +186,9 @@ impl Config {
             }
             Err(_) => None,
         };
-        let service_proxy = match std::env::var("WIRESERVE_SERVICE_PROXY") {
-            Ok(p) if p.trim().is_empty() => None,
-            Ok(p) => {
-                let p = p.trim().to_string();
-                if !wireserve_types::is_valid_dns_label(&p) {
-                    return Err(ConfigError::Invalid(
-                        "WIRESERVE_SERVICE_PROXY",
-                        format!("{p:?} must be a service name, not a node or a domain"),
-                    ));
-                }
-                Some(p)
-            }
-            Err(_) => None,
-        };
         let dns = crate::dns::config::from_lookup(|k| std::env::var(k).ok(), service_domain.as_deref())?;
         let acme = acme_from_lookup(|k| std::env::var(k).ok())?;
+        let sign_in = sign_in_from_lookup(|k| std::env::var(k).ok(), dns.is_some())?;
 
         Ok(Loaded {
             config: Self {
@@ -212,7 +199,7 @@ impl Config {
                 net_v4_cidr,
                 net_v6_prefix,
                 service_domain,
-                service_proxy,
+                sign_in,
                 dns,
                 acme,
                 online_threshold_secs,
@@ -268,8 +255,8 @@ impl Config {
     pub fn service_naming(&self) -> Option<wireserve_types::ServiceNaming> {
         self.service_domain.as_ref().map(|domain| wireserve_types::ServiceNaming {
             domain: domain.clone(),
-            proxy_service: self.service_proxy.clone(),
             acme: self.dns.is_some().then(|| self.acme.clone()),
+            sign_in: self.sign_in.clone(),
         })
     }
 }
@@ -302,6 +289,52 @@ pub fn acme_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<wires
         },
     };
     Ok(wireserve_types::AcmeSettings { directory, email, propagation_secs })
+}
+
+/// The sign-in settings (PLAN.md M34). `None` unless `WIRESERVE_AUTH_SERVICE`
+/// names the service running the provider; the rest default to authward's.
+pub fn sign_in_from_lookup(
+    lookup: impl Fn(&str) -> Option<String>,
+    dns: bool,
+) -> Result<Option<wireserve_types::SignIn>, ConfigError> {
+    let get = |key: &str| lookup(key).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let Some(service) = get("WIRESERVE_AUTH_SERVICE") else {
+        return Ok(None);
+    };
+    let service = service.to_ascii_lowercase();
+    if !wireserve_types::is_valid_dns_label(&service) {
+        return Err(ConfigError::Invalid("WIRESERVE_AUTH_SERVICE", format!("{service:?} must be a service name")));
+    }
+    if !dns {
+        return Err(ConfigError::Invalid(
+            "WIRESERVE_AUTH_SERVICE",
+            "is set but WIRESERVE_DNS_PROVIDER is not; the sign-in is built into each node's TLS \
+             terminator, which needs the DNS records"
+                .into(),
+        ));
+    }
+    let verify_path = get("WIRESERVE_AUTH_VERIFY_PATH").unwrap_or_else(|| "/verify".into());
+    if !verify_path.starts_with('/') || verify_path.contains(char::is_whitespace) || verify_path.contains('#') {
+        return Err(ConfigError::Invalid("WIRESERVE_AUTH_VERIFY_PATH", format!("{verify_path:?} is not a path")));
+    }
+    let copy_headers: Vec<String> = get("WIRESERVE_AUTH_COPY_HEADERS")
+        .unwrap_or_else(|| "X-Auth-User X-Auth-Email X-Auth-Groups".into())
+        .split([' ', ','])
+        .filter(|h| !h.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let reserved = ["host", "cookie", "authorization", "x-wireserve-node", "content-length", "transfer-encoding", "connection"];
+    for h in &copy_headers {
+        let token = !h.is_empty() && h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        if !token || reserved.contains(&h.as_str()) || h.starts_with("x-forwarded-") || h == "forwarded" {
+            return Err(ConfigError::Invalid("WIRESERVE_AUTH_COPY_HEADERS", format!("{h:?} cannot be copied from the sign-in")));
+        }
+    }
+    let session_cookie = get("WIRESERVE_AUTH_SESSION_COOKIE").unwrap_or_else(|| "authward_session".into());
+    if !session_cookie.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err(ConfigError::Invalid("WIRESERVE_AUTH_SESSION_COOKIE", format!("{session_cookie:?} is not a cookie name")));
+    }
+    Ok(Some(wireserve_types::SignIn { service, verify_path, copy_headers, session_cookie }))
 }
 
 /// The result of [`Config::load`]: the config itself, plus which first-run
@@ -554,6 +587,29 @@ mod tests {
         assert!(bad("WIRESERVE_ACME_DIRECTORY", "http://acme.test/dir"));
         assert!(bad("WIRESERVE_ACME_EMAIL", "not-an-address"));
         assert!(bad("WIRESERVE_ACME_PROPAGATION_SECS", "3600"));
+    }
+
+    #[test]
+    fn sign_in_defaults_to_authward_and_needs_dns() {
+        let only = |k: &str| (k == "WIRESERVE_AUTH_SERVICE").then(|| "Auth".to_string());
+        assert_eq!(sign_in_from_lookup(|_| None, true).unwrap(), None);
+        let s = sign_in_from_lookup(only, true).unwrap().unwrap();
+        assert_eq!((s.service.as_str(), s.verify_path.as_str(), s.session_cookie.as_str()), ("auth", "/verify", "authward_session"));
+        assert_eq!(s.copy_headers, vec!["x-auth-user", "x-auth-email", "x-auth-groups"]);
+        assert!(sign_in_from_lookup(only, false).is_err(), "without DNS there is nothing to terminate");
+        for (k, v) in [
+            ("WIRESERVE_AUTH_COPY_HEADERS", "X-Auth-User Cookie"),
+            ("WIRESERVE_AUTH_COPY_HEADERS", "X-Forwarded-For"),
+            ("WIRESERVE_AUTH_VERIFY_PATH", "verify"),
+            ("WIRESERVE_AUTH_SESSION_COOKIE", "a;b"),
+        ] {
+            let l = move |key: &str| match key {
+                "WIRESERVE_AUTH_SERVICE" => Some("auth".to_string()),
+                x if x == k => Some(v.to_string()),
+                _ => None,
+            };
+            assert!(matches!(sign_in_from_lookup(l, true), Err(ConfigError::Invalid(key, _)) if key == k), "{k}={v}");
+        }
     }
 
     #[test]

@@ -53,8 +53,8 @@ a sensible default:
 3. the internal port the web server passes requests to (47820): TCP stays
    closed to the internet, UDP may be forwarded for NAT help;
 4. whether new services wait for your approval (yes);
-5. whether services get names under a domain you own, and which service is
-   your web proxy (`web`, e.g. `wireserve serve web 443:8443`);
+5. whether services get names under a domain you own, the DNS provider that
+   holds it, and which service runs your sign-in, if any;
 6. which local user gets the admin key saved, so `wireserve-admin` needs no
    flags (whoever ran sudo).
 
@@ -440,8 +440,8 @@ The node forwards `myrouter.wg:443` to `192.168.178.1:80`, and the device
 sees every connection come from the node's own LAN address. It has no route
 back into the mesh, so unlike a service on the node, **the client's address
 is not preserved**. Everything else works the same: approval, the name, only
-the published port answering, and (on 443) a reverse-proxy vhost for
-phones. What an admin approves includes the address:
+the published port answering, and (on 443) HTTPS from the node's
+terminator. What an admin approves includes the address:
 `wireserve-admin list-services` shows `443:192.168.178.1:80/tcp`. The rest
 of the mesh only ever sees `443:80/tcp`.
 
@@ -461,10 +461,8 @@ of the mesh only ever sees `443:80/tcp`.
   is left as it is.
 - **Routers that check the Host header.** Many (a FRITZ!Box among them)
   answer only to their own name, as a defence against DNS rebinding, and
-  refuse `myrouter.wg`. The generated proxy vhost passes the client's name
-  through. For such a device, write its `handle` yourself ahead of the
-  generated `import`, with `reverse_proxy <its service address>:443` and
-  `header_up Host fritz.box` (not yet tried against a real router).
+  refuse `myrouter.<domain>`, which the terminator passes through. Publish
+  such a device on another port than 443 and reach it by address.
 - Before downgrading an agent to a version from before target addresses,
   `unserve` such services: an older agent would read `443:192.168.178.1:80`
   as its own port 80.
@@ -547,82 +545,40 @@ that runs the agent.
 ### 4b. Give services real names, reachable from a phone
 
 `<service>.wg` lives in each agent's `/etc/hosts`, which a phone does not
-have. To give services a name that works everywhere, point one node's reverse
-proxy at the mesh and tell the coordinator the domain:
+have. To give services a name that works everywhere, give the coordinator a
+domain and a DNS provider it can write records through:
 
 ```sh
 # on the coordinator
 WIRESERVE_SERVICE_DOMAIN=int.example.com
-WIRESERVE_SERVICE_PROXY=web
+WIRESERVE_DNS_PROVIDER=cloudflare      # or rfc2136, desec, hetzner, porkbun
+WIRESERVE_DNS_API_TOKEN=...            # a token that may edit the zone
 ```
 
 Every service is then `<name>.int.example.com` instead of `<name>.wg` — the
 suffix is **replaced, not added to**. Two working names would mean two base
 URLs, and anything with a single configured one (Gitea's `ROOT_URL`, Grafana's
 `root_url`, an OIDC `redirect_uri`) emits redirects that bounce between them.
+Every name points at the service's own address, from a node and from a phone
+alike, so one base URL is right everywhere.
 
-**Publishing on TCP 443 is what asks for a name with TLS:**
-
-```sh
-wireserve serve plex 443:32400   # plex.int.example.com, via the proxy
-wireserve serve prom 80:9090     # prom.int.example.com, direct
-```
-
-| Published on | Resolves to | From a node | From a phone |
-| --- | --- | --- | --- |
-| 443 | the proxy | via the proxy, HTTPS | via the proxy, HTTPS |
-| anything else | its own address | direct, plain HTTP | direct with [DNS records](#let-the-coordinator-write-the-dns-records), else 404 at the proxy |
-
-A 443 service resolves to the same place with the same scheme wherever you
-ask, which is what makes one configured base URL correct everywhere. Anything
-else keeps the direct path, and with it the real client address and no extra
-hop. A phone reaches it by name only when the coordinator writes the DNS
-records (below); with a hand-made wildcard record it lands on the proxy
-instead. Nothing that is not HTTP ever gets a certificate it did not ask for.
-
-On the proxy node, publish the proxy itself and run the agent with it:
+**Publishing on TCP 443 is what asks for HTTPS:**
 
 ```sh
-wireserve serve web 443:8443
-wireserve daemon --proxy caddy
+wireserve serve plex 443:32400   # https://plex.int.example.com, served by its own node
+wireserve serve prom 80:9090     # http://prom.int.example.com:80, direct
 ```
 
-The agent then writes one matcher and one handler per 443 service into
-`/etc/caddy/conf.d/wireserve.caddy` on every poll that changes anything, and
-reloads Caddy. `deploy/proxy/Caddyfile.services.example` is the half you
-write. A service declared later appears by itself; nothing on any device
-changes, ever.
+Nothing that is not published on 443 ever gets a certificate.
 
-Two things to get right:
+#### The DNS records
 
-- **Let the coordinator write the DNS records** (next section), or point a
-  wildcard record at the proxy's *service* address, the one `wireserve list`
-  shows — not at the node's mesh address. The firewall opens `service:443`
-  and deliberately refuses `node:443`, so a record aimed at the node is
-  dropped by that node's own firewall.
-- **Caddy needs a custom build** for the wildcard certificate: the stock
-  binary ships no DNS provider module (`xcaddy build --with
-  github.com/caddy-dns/cloudflare`). DNS-01 itself is fine for a name the
-  internet cannot reach — it only needs the `_acme-challenge` TXT record.
-
-#### Let the coordinator write the DNS records
-
-Instead of a wildcard record, the coordinator can keep one record per
-service up to date through your DNS provider's API: `plex.int.example.com`
-pointing wherever `plex.int.example.com` resolves on a node, written when
-the service is approved, moved when its address changes, removed when it is
-withdrawn or its node revoked. That is what gives a phone the names of
-services that are not on 443.
-
-```sh
-# on the coordinator, next to WIRESERVE_SERVICE_DOMAIN
-WIRESERVE_DNS_PROVIDER=cloudflare      # or rfc2136, desec, hetzner, porkbun
-WIRESERVE_DNS_API_TOKEN=...            # a token that may edit the zone
-```
-
-`wireserve-coordinator install --reconfigure` asks for these, and before
-saving writes and removes a throwaway `_wireserve-check` TXT record, so a
-wrong token shows up there rather than as names that never appear.
+The coordinator keeps one record per approved service up to date through the
+provider's API — written when the service is approved, moved when its address
+changes, removed when it is withdrawn or its node revoked.
+`wireserve-coordinator install` asks for the provider, and before saving
+writes and removes a throwaway `_wireserve-check` TXT record, so a wrong
+token shows up there rather than as names that never appear.
 
 | Provider | Settings |
 | --- | --- |
@@ -637,8 +593,7 @@ What to know first:
 
 - **The coordinator manages service names under the domain.** A record with
   the same name as a service is replaced. It deletes only records it wrote
-  itself, and never touches anything else in the zone — a wildcard record
-  you made earlier stays, and is simply overridden by each service's own.
+  itself, and never touches anything else in the zone.
 - **Keep the domain to itself.** Most providers' tokens cover a whole zone,
   so a token for `example.com` could also change its mail records. A zone of
   its own (a subdomain delegated to its own zone, or a spare domain) keeps
@@ -646,18 +601,17 @@ What to know first:
 - **The records publish your mesh addresses and service names.** They are
   private addresses and unreachable from outside the mesh, but anyone can
   read them.
-- **An address change waits 20 seconds** before it is written, so a proxy
-  that drops out of the directory for a moment does not swing every name.
+- **An address change waits 20 seconds** before it is written, so a name
+  that swings and swings back never reaches resolver caches.
   `wireserve-admin list-services` shows each record as `dns=published`,
   `dns=pending` or the provider's error.
 
 #### HTTPS on the service's own node
 
-With the coordinator writing the records, a service published on TCP 443 is
-served with HTTPS by **its own node** — no proxy hop, no wildcard key on
-another machine. The `wireserve-tls` unit, which `wireserve install` sets up
-beside the agent, runs a small terminator as its own unprivileged user. For
-each of the node's services on 443 it:
+A service published on TCP 443 is served with HTTPS by **its own node**. The
+`wireserve-tls` unit, which `wireserve install` sets up beside the agent,
+runs a small terminator as its own unprivileged user. For each of the node's
+services on 443 it:
 
 1. gets a certificate for `<name>.<domain>` — the key is made on the node and
    never leaves it; the coordinator publishes the ACME DNS-01 challenge record
@@ -668,10 +622,6 @@ each of the node's services on 443 it:
    node, `X-Forwarded-For` its mesh address, and copies of either sent by the
    client are removed first.
 
-Once the terminator serves a service, the coordinator marks it terminated and
-its name moves from the proxy to the service's own address. Nothing to
-configure: publishing on 443 is still the whole opt-in.
-
 ```sh
 # on the coordinator, optional
 WIRESERVE_ACME_DIRECTORY=https://acme-v02.api.letsencrypt.org/directory  # the default
@@ -681,16 +631,12 @@ WIRESERVE_ACME_EMAIL=you@example.com
 Worth knowing:
 
 - **Every 443 service name becomes public** in the Certificate Transparency
-  logs, one certificate per name. A wildcard certificate hid them.
+  logs, one certificate per name.
 - **Only the service's 443 mapping changes.** Its other ports stay ordinary
   mappings, and its target port stays closed to the mesh.
 - **Something else on `0.0.0.0:443`** on the node (nginx, Caddy) keeps the
-  terminator from binding the service address; the service then keeps the
-  path it had, and the terminator's log says so.
-- **Services behind a sign-in stay on the proxy for now**, as does the proxy
-  service itself.
-- **Nodes that haven't upgraded** still resolve 443 names to the proxy, which
-  reaches a terminated service over verified TLS.
+  terminator from binding the service address; the service is then not
+  served with HTTPS, and the terminator's log says so.
 - **Let's Encrypt limits** — 5 failed validations per name per hour, 5
   duplicate certificates a week: the terminator keeps its certificates across
   restarts and backs off after a failure, and the install wizard checks the
@@ -698,30 +644,43 @@ Worth knowing:
 
 #### A sign-in in front of chosen services
 
-With names in place, a service can also sit behind a sign-in at the proxy —
-per person, with your own identity provider, rather than "anything on the
-mesh gets in". Any `forward_auth` provider works; the example is written for
-[authward](https://git.tia.sh/tia/authward) in front of Pocket ID.
+A service can also sit behind a sign-in — per person, with your own identity
+provider, rather than "anything on the mesh gets in". It is built into every
+node's terminator and speaks `forward_auth`, so any provider for that works;
+the defaults are [authward](https://git.tia.sh/tia/authward)'s.
+
+Run the provider as a mesh service on 443 — its login pages are then
+`https://auth.int.example.com` — and name it on the coordinator:
+
+```sh
+wireserve serve auth 443:8080             # on the node running authward
+# on the coordinator
+WIRESERVE_AUTH_SERVICE=auth
+# optional, shown with their defaults
+WIRESERVE_AUTH_VERIFY_PATH=/verify
+WIRESERVE_AUTH_COPY_HEADERS="X-Auth-User X-Auth-Email X-Auth-Groups"
+WIRESERVE_AUTH_SESSION_COOKIE=authward_session
+```
+
+Then mark services:
 
 ```sh
 wireserve-admin approve-service homeserver jellyfin --auth   # new services
 wireserve-admin service-auth grafana on                      # existing ones
 ```
 
-Two things happen from the next poll:
+From the next poll, every request to a marked service first goes, headers
+only, to `https://auth.<domain>/verify` — over verified TLS on the provider's
+own address, with the original `Host`, `X-Forwarded-Method` and
+`X-Forwarded-Uri`. A 2xx lets it through with the provider's `X-Auth-*`
+headers copied on; a 401 with `X-Login-Url` sends the browser to sign in;
+anything else is the provider's own answer. And the service's **own node
+opens nothing of it but that**: its other mappings stay closed, so nobody on
+the mesh can skip the sign-in by dialling another port.
 
-- the proxy puts your `wireserve_auth` snippet in front of the service — for
-  authward, its `forward_auth` block;
-- the service's **own node admits nobody but the proxy**, on every one of
-  its mappings. Without that, anyone on the mesh could skip the sign-in by
-  dialling the service address directly, and set whatever identity headers
-  they liked. That is authward's trust boundary, enforced by the mesh.
-
-The two snippets, and a handler for authward's own pages, are in
-`deploy/proxy/Caddyfile.services.example`; they are needed once anything is
-marked, and never before. The mark belongs to the service **name**: it
-survives the service being withdrawn and declared again, and can be set
-before anything declares it. `list-services` shows it.
+The mark belongs to the service **name**: it survives the service being
+withdrawn and declared again, and can be set before anything declares it.
+`list-services` shows it.
 
 Worth knowing before you mark something:
 
@@ -729,20 +688,16 @@ Worth knowing before you mark something:
   Assistant apps, or anything speaking CalDAV/CardDAV, fail behind it. That
   is why it is per service. authward's API tokens and `bypass_paths` are the
   way through for those.
-- **Only services published on TCP 443** can be marked — the others are not
-  behind the proxy at all — and the proxy itself cannot be.
-- **Close the owner's LAN yourself.** The mesh admits only the proxy; a
+- **Only services published on TCP 443** can be marked, and the provider
+  itself cannot be.
+- **Close the owner's LAN yourself.** The mesh admits only the terminator; a
   backend listening on every interface is still reachable from its own
   network. Bind it to the node's mesh address.
-- **Every HTTP service under the domain gets the sign-in cookie**, which is
-  scoped to the whole domain. The generated config strips it from
-  everything behind the proxy; a service reached on another port is not
-  behind it and keeps receiving it, so publish HTTP services on 443 once
-  sign-in is in use.
-- **Upgrade before marking.** The coordinator refuses the mark until the
-  service's node and the proxy's node both report that they understand it,
-  because either one ignoring it leaves the service open. Don't downgrade
-  either one while a service is marked.
+- **Identity headers and the session cookie never reach a backend from a
+  client.** Every terminator removes `X-Auth-*` from every request and the
+  provider's session cookie from every request but the provider's own —
+  the cookie is scoped to the whole domain, so the browser sends it to every
+  service.
 
 #### If the name resolves on one network but not another
 
@@ -942,7 +897,6 @@ members of the `wireserve` group have (see "Using it without sudo"):
 | `wireserve install [url] [--instance name]` | installs the binary + systemd unit, then joins — one command, needs root. On a node that already joined, with no URL or token: upgrades and restarts the agents instead |
 | `wireserve join [url] [token]` | one-time bootstrap, generates the keypair — prompts for either if omitted |
 | `wireserve serve <name> <[public:][address:]target[/tcp\|/udp]>...` | publish a service on its own address — on this node, or on an address it reaches |
-| `wireserve daemon --proxy caddy` | publish this mesh's 443 services as vhosts on the reverse proxy running here |
 | `wireserve unserve <name>` | withdraw one |
 | `wireserve transit on\|off` | opt in/out of carrying traffic for two other nodes that can't reach each other directly (also needs `approve-transit`) |
 | `wireserve exit on\|off` | opt in/out of sending the internet traffic of devices exported with `--exit` through this node (also needs `transit on` and approval) |
@@ -971,8 +925,8 @@ anywhere that can reach it):
 | `wireserve-admin delete-node <name>` | remove the record, free the name |
 | `wireserve-admin clear-endpoint <name>` | drop a stale advertised endpoint |
 | `wireserve-admin list-services [--pending]` | declared services and their approval state |
-| `wireserve-admin approve-service <node> <svc> [--auth]` | let a declaration reach the mesh, behind the proxy's sign-in with `--auth` |
-| `wireserve-admin service-auth <svc> on\|off` | publish a service behind the proxy's sign-in, admitting only the proxy |
+| `wireserve-admin approve-service <node> <svc> [--auth]` | let a declaration reach the mesh, behind the sign-in with `--auth` |
+| `wireserve-admin service-auth <svc> on\|off` | put a service behind the sign-in, opening nothing else of it |
 | `wireserve-admin deny-service <node> <svc>` | refuse one, or withdraw an approval |
 | `wireserve-admin approve-transit <name>` | let a node that opted in carry traffic for others |
 | `wireserve-admin deny-transit <name>` | withdraw that |
@@ -1021,6 +975,7 @@ the admin port is deliberately unreachable from anywhere else.
 | --- | --- | --- | --- |
 | 51820/udp | inbound | other agent nodes | the WireGuard listen port, on the node's real interface |
 | 443/tcp | outbound | the coordinator | the poll loop |
+| 443/tcp | outbound | your ACME CA | the TLS terminator, for certificates (Let's Encrypt by default) |
 
 Inbound UDP 51820 has to reach the node for other peers to open a tunnel to
 it, which usually means a port-forward on the router plus an

@@ -13,7 +13,6 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use super::envfile::{self, Change};
 
 pub const DEFAULT_PORT: u16 = 47820;
-pub const DEFAULT_PROXY_SERVICE: &str = "web";
 
 /// Where the HTTPS web server in front of the coordinator runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +28,10 @@ pub enum WebServer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Naming {
     pub domain: String,
-    pub proxy_service: String,
+    /// The service running the sign-in provider (PLAN.md M34), if any. Only
+    /// asked, and only kept, with `dns` set: the sign-in lives in the
+    /// terminators, which need the records.
+    pub sign_in: Option<String>,
     /// The provider the coordinator publishes the names through (PLAN.md
     /// M32), or `None` to leave DNS to the operator.
     pub dns: Option<DnsAnswer>,
@@ -89,7 +91,8 @@ pub struct Given {
     pub approval: Option<bool>,
     /// `Some(None)` is `--no-domain`.
     pub domain: Option<Option<String>>,
-    pub proxy_service: Option<String>,
+    /// `Some(None)` is `--no-auth-service`.
+    pub sign_in: Option<Option<String>>,
     /// `Some(None)` is `--no-dns`.
     pub dns_provider: Option<Option<String>>,
     /// `Some(None)` is `--no-admin-user`.
@@ -128,9 +131,7 @@ impl Current {
             });
         let naming = envfile::get(text, "WIRESERVE_SERVICE_DOMAIN").filter(|d| !d.is_empty()).map(|domain| Naming {
             domain,
-            proxy_service: envfile::get(text, "WIRESERVE_SERVICE_PROXY")
-                .filter(|p| !p.is_empty())
-                .unwrap_or_else(|| DEFAULT_PROXY_SERVICE.to_string()),
+            sign_in: envfile::get(text, "WIRESERVE_AUTH_SERVICE").filter(|p| !p.is_empty()).filter(|_| dns.is_some()),
             dns,
         });
         Self {
@@ -168,9 +169,13 @@ impl Answers {
             WebServer::Here => (true, Change::Clear),
             WebServer::Elsewhere { proxy_ip, .. } => (false, Change::Set(proxy_ip.to_string())),
         };
-        let (domain, proxy) = match &self.naming {
-            Some(n) => (Change::Set(n.domain.clone()), Change::Set(n.proxy_service.clone())),
-            None => (Change::Clear, Change::Clear),
+        let domain = match &self.naming {
+            Some(n) => Change::Set(n.domain.clone()),
+            None => Change::Clear,
+        };
+        let sign_in = match self.naming.as_ref().and_then(|n| n.sign_in.as_ref()) {
+            Some(s) => Change::Set(s.clone()),
+            None => Change::Clear,
         };
         // Turning DNS off, or switching provider, clears every credential
         // the new setting does not use: a token nothing reads any more is
@@ -192,7 +197,7 @@ impl Answers {
             ("WIRESERVE_TRUSTED_PROXY", trusted_proxy),
             ("WIRESERVE_REQUIRE_SERVICE_APPROVAL", Change::Set(self.approval.to_string())),
             ("WIRESERVE_SERVICE_DOMAIN", domain),
-            ("WIRESERVE_SERVICE_PROXY", proxy),
+            ("WIRESERVE_AUTH_SERVICE", sign_in),
         ];
         changes.extend(dns_changes);
         changes
@@ -222,16 +227,16 @@ impl Answers {
         ));
         match &self.naming {
             Some(n) => {
-                s.push_str(&format!(
-                    "  Service names:        <name>.{} through the `{}` service\n",
-                    n.domain, n.proxy_service
-                ));
+                s.push_str(&format!("  Service names:        <name>.{}\n", n.domain));
                 match &n.dns {
                     Some(d) => s.push_str(&format!(
-                        "  DNS records:          written by the coordinator through {}\n",
+                        "  DNS records:          written by the coordinator through {}; HTTPS on each node\n",
                         d.provider
                     )),
-                    None => s.push_str("  DNS records:          yours to create (a wildcard record)\n"),
+                    None => s.push_str("  DNS records:          none (names work on WireServe machines only)\n"),
+                }
+                if let Some(svc) = &n.sign_in {
+                    s.push_str(&format!("  Sign-in:              the `{svc}` service\n"));
                 }
             }
             None => s.push_str("  Service names:        <name>.wg\n"),
@@ -355,7 +360,7 @@ pub fn check_dns_provider(raw: &str) -> Result<String, String> {
     }
 }
 
-pub fn check_proxy_service(raw: &str) -> Result<String, String> {
+pub fn check_service_name(raw: &str) -> Result<String, String> {
     let p = raw.trim().to_lowercase();
     if wireserve_types::is_valid_dns_label(&p) {
         Ok(p)
@@ -551,69 +556,69 @@ impl Asker<'_> {
     }
 
     fn naming(&self) -> Result<Option<Naming>, AskError> {
-        let proxy_default = self
-            .current
-            .naming
-            .as_ref()
-            .map_or(DEFAULT_PROXY_SERVICE, |n| n.proxy_service.as_str());
-        let proxy_given = self
-            .given
-            .proxy_service
-            .as_deref()
-            .map(|p| check_proxy_service(p).map_err(|e| AskError::Invalid(format!("--proxy-service: {e}"))))
-            .transpose()?;
-        match &self.given.domain {
+        let domain = match &self.given.domain {
             Some(None) => return Ok(None),
-            Some(Some(raw)) => {
-                let domain = check_domain(raw).map_err(|e| AskError::Invalid(format!("--domain: {e}")))?;
-                let proxy_service = proxy_given.unwrap_or_else(|| proxy_default.to_string());
-                let dns = self.dns(&domain)?;
-                return Ok(Some(Naming { domain, proxy_service, dns }));
-            }
-            None => {}
-        }
-        if !self.interactive {
-            return self
-                .current
-                .naming
-                .clone()
-                .map(|n| {
-                    let dns = self.dns(&n.domain)?;
-                    Ok(Naming { proxy_service: proxy_given.unwrap_or(n.proxy_service), dns, ..n })
-                })
-                .transpose();
-        }
-        explain(&[
-            "Services are normally named <name>.wg, which only works on machines",
-            "running WireServe. With a domain you control, they become",
-            "<name>.home.example.com instead, which also works from a phone. The",
-            "names need public DNS records, which the coordinator can write for",
-            "you; the README's \"Give services real names\" section walks through it.",
-        ]);
-        if !ask_yes_no("Use a domain for your services?", self.current.naming.is_some()) {
-            return Ok(None);
-        }
-        eprintln!();
-        let domain = ask_until(
-            "Domain (e.g. home.example.com)",
-            self.current.naming.as_ref().map(|n| n.domain.as_str()),
-            check_domain,
-        )?;
-        let proxy_service = match proxy_given {
-            Some(p) => p,
+            Some(Some(raw)) => Some(check_domain(raw).map_err(|e| AskError::Invalid(format!("--domain: {e}")))?),
+            None => None,
+        };
+        let domain = match domain {
+            Some(d) => d,
+            None if !self.interactive => match &self.current.naming {
+                Some(n) => n.domain.clone(),
+                None => return Ok(None),
+            },
             None => {
                 explain(&[
-                    "Which service is your web proxy? That's the name you'll publish it",
-                    "under on the machine that runs it. For example, with Caddy listening",
-                    "on port 8443 there, you'd run `wireserve serve web 443:8443`. Every",
-                    "service you publish on 443 is then reached through it, as",
-                    &format!("https://<name>.{domain}."),
+                    "Services are normally named <name>.wg, which only works on machines",
+                    "running WireServe. With a domain you control, they become",
+                    "<name>.home.example.com instead, which also works from a phone, and",
+                    "each node serves its services on 443 with HTTPS. The names need public",
+                    "DNS records, which the coordinator writes through your DNS provider;",
+                    "the README's \"Give services real names\" section walks through it.",
                 ]);
-                ask_until("Proxy service name", Some(proxy_default), check_proxy_service)?
+                if !ask_yes_no("Use a domain for your services?", self.current.naming.is_some()) {
+                    return Ok(None);
+                }
+                eprintln!();
+                ask_until(
+                    "Domain (e.g. home.example.com)",
+                    self.current.naming.as_ref().map(|n| n.domain.as_str()),
+                    check_domain,
+                )?
             }
         };
         let dns = self.dns(&domain)?;
-        Ok(Some(Naming { domain, proxy_service, dns }))
+        let sign_in = if dns.is_some() { self.sign_in(&domain)? } else { None };
+        Ok(Some(Naming { domain, sign_in, dns }))
+    }
+
+    /// The service running the sign-in provider (PLAN.md M34), if any:
+    /// `--auth-service` / `--no-auth-service`, then the question, then the
+    /// current setting.
+    fn sign_in(&self, domain: &str) -> Result<Option<String>, AskError> {
+        let current = self.current.naming.as_ref().and_then(|n| n.sign_in.clone());
+        match &self.given.sign_in {
+            Some(None) => return Ok(None),
+            Some(Some(raw)) => {
+                return check_service_name(raw).map(Some).map_err(|e| AskError::Invalid(format!("--auth-service: {e}")))
+            }
+            None if !self.interactive => return Ok(current),
+            None => {}
+        }
+        explain(&[
+            "A service can sit behind a sign-in, per person, with your own identity",
+            "provider: run a forward_auth provider such as authward as a mesh service",
+            &format!("on 443 (its pages are then https://<name>.{domain}), and name that"),
+            "service here. `wireserve-admin service-auth <service> on` then puts it",
+            "in front of a service. Enter - for none.",
+        ]);
+        ask_until("Sign-in service", Some(current.as_deref().unwrap_or("-")), |raw| {
+            if raw.trim() == "-" {
+                Ok(None)
+            } else {
+                check_service_name(raw).map(Some)
+            }
+        })
     }
 
     /// The DNS provider for `domain` (PLAN.md M32): `--dns-provider` /
@@ -859,11 +864,11 @@ mod tests {
         let mut a = answers();
         let c = a.env_changes();
         assert_eq!(change(&c, "WIRESERVE_SERVICE_DOMAIN"), &Change::Clear);
-        assert_eq!(change(&c, "WIRESERVE_SERVICE_PROXY"), &Change::Clear);
-        a.naming = Some(Naming { domain: "int.example.com".into(), proxy_service: "web".into(), dns: None });
+        assert_eq!(change(&c, "WIRESERVE_AUTH_SERVICE"), &Change::Clear);
+        a.naming = Some(Naming { domain: "int.example.com".into(), sign_in: Some("auth".into()), dns: None });
         let c = a.env_changes();
         assert_eq!(change(&c, "WIRESERVE_SERVICE_DOMAIN"), &Change::Set("int.example.com".into()));
-        assert_eq!(change(&c, "WIRESERVE_SERVICE_PROXY"), &Change::Set("web".into()));
+        assert_eq!(change(&c, "WIRESERVE_AUTH_SERVICE"), &Change::Set("auth".into()));
     }
 
     #[test]
@@ -874,7 +879,7 @@ mod tests {
             listen_ip: "10.0.0.5".parse().unwrap(),
             proxy_ip: "10.0.0.6".parse().unwrap(),
         };
-        a.naming = Some(Naming { domain: "int.example.com".into(), proxy_service: "gate".into(), dns: None });
+        a.naming = Some(Naming { domain: "int.example.com".into(), sign_in: None, dns: None });
         let text = envfile::apply("", &a.env_changes());
         let current = Current::from_env_file(&text);
         assert_eq!(
@@ -929,8 +934,8 @@ mod tests {
         assert_eq!(check_domain("Home.Example.com."), Ok("home.example.com".into()));
         assert!(check_domain("localhost").is_err());
         assert!(check_domain("bad domain.com").is_err());
-        assert_eq!(check_proxy_service("web"), Ok("web".into()));
-        assert!(check_proxy_service("web.example.com").is_err());
+        assert_eq!(check_service_name("Auth"), Ok("auth".into()));
+        assert!(check_service_name("auth.example.com").is_err());
     }
 
     fn asker<'a>(given: Given, current: Current) -> Asker<'a> {
@@ -977,13 +982,13 @@ mod tests {
             web_server: Some(WebServer::Here),
             port: Some(48000),
             approval: Some(false),
-            naming: Some(Naming { domain: "int.test".into(), proxy_service: "gate".into(), dns: None }),
+            naming: Some(Naming { domain: "int.test".into(), sign_in: None, dns: None }),
         };
         let a = asker(Given { approval: Some(true), ..Given::default() }, current).ask_all().unwrap();
         assert_eq!(a.public_url, "https://old.test");
         assert_eq!(a.port, 48000);
         assert!(a.approval, "the flag wins over the current setting");
-        assert_eq!(a.naming.unwrap().proxy_service, "gate");
+        assert_eq!(a.naming.unwrap().domain, "int.test");
     }
 
     #[test]
@@ -1007,11 +1012,11 @@ mod tests {
             ..Given::default()
         };
         let a = asker(given, Current::default()).ask_all().unwrap();
-        assert_eq!(a.naming, Some(Naming { domain: "int.test".into(), proxy_service: "web".into(), dns: None }));
+        assert_eq!(a.naming, Some(Naming { domain: "int.test".into(), sign_in: None, dns: None }));
 
         let current = Current {
             public_url: Some("https://mesh.test".into()),
-            naming: Some(Naming { domain: "int.test".into(), proxy_service: "web".into(), dns: None }),
+            naming: Some(Naming { domain: "int.test".into(), sign_in: None, dns: None }),
             ..Current::default()
         };
         let a = asker(Given { domain: Some(None), ..Given::default() }, current).ask_all().unwrap();
@@ -1085,6 +1090,20 @@ mod tests {
         let c = off.env_changes();
         assert_eq!(change(&c, "WIRESERVE_DNS_PROVIDER"), &Change::Clear);
         assert_eq!(change(&c, "WIRESERVE_DNS_API_TOKEN"), &Change::Clear);
+    }
+
+    #[test]
+    fn a_sign_in_service_is_kept_only_with_dns_records() {
+        let env = |k: &str| (k == "WIRESERVE_DNS_API_TOKEN").then(|| "cf-token".to_string());
+        let given = Given { sign_in: Some(Some("Auth".into())), ..dns_given() };
+        let a = asker_env(given, Current::default(), &env).ask_all().unwrap();
+        assert_eq!(a.naming.as_ref().unwrap().sign_in.as_deref(), Some("auth"));
+        let text = envfile::apply("", &a.env_changes());
+        assert_eq!(Current::from_env_file(&text).naming.unwrap().sign_in.as_deref(), Some("auth"));
+
+        let no_dns = Given { dns_provider: Some(None), sign_in: Some(Some("auth".into())), ..dns_given() };
+        let a = asker(no_dns, Current::default()).ask_all().unwrap();
+        assert_eq!(a.naming.unwrap().sign_in, None, "no terminators without records, so no sign-in");
     }
 
     #[test]

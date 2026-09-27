@@ -133,11 +133,11 @@ pub fn build_poll_request(
         transit_wanted: transit.wanted,
         services: declared.to_vec(),
         capabilities: {
-            let mut caps = vec![wireserve_types::CAP_SERVICE_AUTH.to_string()];
             if tls.capable {
-                caps.push(wireserve_types::CAP_TLS_TERMINATE.to_string());
+                vec![wireserve_types::CAP_TLS_TERMINATE.to_string(), wireserve_types::CAP_SIGN_IN.to_string()]
+            } else {
+                Vec::new()
             }
-            caps
         },
         tls_ready: {
             let mut ready = tls.ready;
@@ -251,6 +251,13 @@ async fn pinned_mesh_ranges(
 /// mapping becomes [`ServiceRule::Terminated`], which lets the request in
 /// unrewritten and opens nothing of its target. Its other mappings stay
 /// rewrites. The target is still reserved against every other mapping.
+///
+/// A service marked for sign-in (PLAN.md M29, M34) is reached through its
+/// terminator's sign-in and nothing else: only its terminated 443 mapping
+/// is opened — every other mapping would be a door around the sign-in — and
+/// while its terminator does not serve it, nothing at all. The mark only
+/// ever narrows what this node's own declaration opens, so taking it from
+/// the coordinator keeps the rule stated in `run_once` step 3.
 pub fn service_rules(
     declared: &[ServiceDecl],
     node_ip: Option<Ipv4Addr>,
@@ -261,30 +268,17 @@ pub fn service_rules(
 ) -> Vec<ServiceRule> {
     let mut rules = Vec::new();
     let mut targets: Vec<wireserve_types::PortMap> = Vec::new();
-    let proxy = proxy_source(directory);
     for d in declared {
         let vip = node_ip.and_then(|node| own_vip(&d.name, node, directory));
-        // Behind the proxy's sign-in (PLAN.md M29): only the proxy may reach
-        // it, or the sign-in is a door in a wall that isn't there. The mark
-        // can only narrow what this node's own declaration opens, never widen
-        // it, so taking it from the coordinator keeps the rule stated in
-        // `run_once` step 3. Without the proxy's address, or without a
-        // service address to restrict, the service is not opened at all.
-        let only_from = if node_ip.is_some_and(|node| marked_for_auth(&d.name, node, directory)) {
-            match (proxy, vip) {
-                (Some(proxy), Some(_)) => Some(proxy),
-                _ => {
-                    tracing::warn!(
-                        service = %d.name,
-                        "service is marked for sign-in but the proxy's address or its own is \
-                         unknown; not opening it at all rather than opening it to everyone"
-                    );
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
+        let marked = node_ip.is_some_and(|node| marked_for_auth(&d.name, node, directory));
+        if marked && !terminating.contains(&d.name) {
+            tracing::warn!(
+                service = %d.name,
+                "service is marked for sign-in but this node's terminator does not serve it yet; \
+                 not opening it at all rather than opening it to everyone"
+            );
+            continue;
+        }
         for map in d.port_maps() {
             if let Some(addr) = map.addr {
                 let refusal = if vip.is_none() {
@@ -313,10 +307,15 @@ pub fn service_rules(
                     let tls = map.public == wireserve_types::TLS_PUBLIC_PORT && map.proto == wireserve_types::Proto::Tcp;
                     if tls && terminating.contains(&d.name) {
                         ServiceRule::Terminated { vip, map }
+                    } else if marked {
+                        // Every other door of a marked service stays shut.
+                        continue;
                     } else {
-                        ServiceRule::Mapped { vip, node, map, only_from }
+                        ServiceRule::Mapped { vip, node, map }
                     }
                 }
+                // Opening the target port directly would open it to everyone.
+                (None, Some(_)) if marked => continue,
                 (None, Some(node)) => ServiceRule::Open {
                     proto: map.proto,
                     port: map.target,
@@ -405,14 +404,6 @@ fn exit_client_addrs(directory: &PollResponse) -> Vec<Ipv4Addr> {
 fn marked_for_auth(name: &str, node: Ipv4Addr, directory: &PollResponse) -> bool {
     let node = node.to_string();
     directory.services.iter().any(|s| s.name == name && s.ip4 == node && s.auth)
-}
-
-/// The mesh address the proxy's requests come from: the node owning the
-/// service the mesh names as its proxy. `None` without one, or with one not
-/// (yet) in the directory.
-fn proxy_source(directory: &PollResponse) -> Option<Ipv4Addr> {
-    let proxy = directory.naming.as_ref()?.proxy_service.as_deref()?;
-    directory.services.iter().find(|s| s.name == proxy)?.ip4.parse().ok()
 }
 
 pub(crate) fn own_vip(name: &str, node: Ipv4Addr, directory: &PollResponse) -> Option<Ipv4Addr> {
@@ -547,9 +538,6 @@ pub struct PollContext<'a, F: FirewallBackend> {
     /// coordinator's COALESCE contract stays uniform across every
     /// self-reported field.
     pub own_reflexive_addr: Option<&'a str>,
-    /// The reverse proxy this node fronts services with (PLAN.md M25), or
-    /// `None` on the overwhelming majority of nodes, which run none.
-    pub proxy: Option<&'a mut dyn crate::proxy::ProxyBackend>,
     /// This node's TLS terminator's check-ins (PLAN.md M33); `None` where
     /// the daemon runs without one (tests, non-Linux).
     pub tls: Option<&'a crate::tls_link::TlsLink>,
@@ -574,31 +562,6 @@ fn sync_local_routes(old: &BTreeSet<Ipv4Addr>, new: &BTreeSet<Ipv4Addr>, node: O
 #[cfg(not(target_os = "linux"))]
 fn sync_local_routes(old: &BTreeSet<Ipv4Addr>, _new: &BTreeSet<Ipv4Addr>, _node: Option<Ipv4Addr>) -> BTreeSet<Ipv4Addr> {
     old.clone()
-}
-
-/// Publishes this cycle's services to the node's reverse proxy, if it runs
-/// one (PLAN.md M25).
-///
-/// Returns nothing on purpose, and that is the whole point of it being its
-/// own function: a proxy failure must never reach `run_once`'s `failures`
-/// vec. That function returns before persisting `last_directory` when any
-/// step fails, so a proxy that is down or misconfigured would otherwise
-/// freeze `wireserve list` on a stale directory — a baffling symptom
-/// for an unrelated cause. The proxy is a convenience layer on top of a
-/// working mesh and must not degrade the mesh's own bookkeeping. It is
-/// retried next cycle regardless, because the backend compares against what
-/// is on disk rather than what it last wrote.
-fn publish_to_proxy(
-    proxy: Option<&mut (dyn crate::proxy::ProxyBackend + '_)>,
-    directory: &PollResponse,
-) {
-    let (Some(proxy), Some(naming)) = (proxy, directory.naming.as_ref()) else {
-        return;
-    };
-    let vhosts = crate::proxy::vhosts(&directory.services, naming);
-    if let Err(e) = proxy.sync(&vhosts) {
-        tracing::warn!(error = %e, "could not publish services to the reverse proxy");
-    }
 }
 
 /// Runs exactly one poll cycle against the daemon's single shared `state`,
@@ -934,20 +897,7 @@ where
         );
 
         // 4. rewrite the hosts-file managed block from the full directory.
-        // Step 4b (PLAN.md M25): publish services to this node's reverse
-        // proxy, if it runs one.
-        //
-        // Warn-only, and deliberately NOT a member of `failures`. This
-        // function returns before persisting `last_directory` when any step
-        // fails, so a proxy that is down or misconfigured would otherwise
-        // freeze `wireserve list` on a stale directory — a baffling
-        // symptom for an unrelated cause. The proxy is a convenience layer on
-        // top of a working mesh; it must not degrade the mesh's own
-        // bookkeeping. Retried next cycle regardless, since the backend
-        // compares against what is on disk rather than what it last wrote.
-        publish_to_proxy(ctx.proxy.as_deref_mut(), &directory);
-
-        let naming = crate::hosts::naming(directory.naming.as_ref(), &directory.services);
+        let naming = crate::hosts::Naming::new(directory.naming.as_ref());
         if let Err(e) =
             crate::hosts::sync(ctx.hosts_path, ctx.hosts_label, &directory.services, naming)
         {
@@ -1129,9 +1079,9 @@ mod tests {
         assert_eq!(
             rules,
             vec![
-                ServiceRule::Mapped { vip: VIP, node: NODE, only_from: None, map: pm("53/udp") },
-                ServiceRule::Mapped { vip: VIP, node: NODE, only_from: None, map: pm("53/tcp") },
-                ServiceRule::Mapped { vip: VIP, node: NODE, only_from: None, map: pm("8080:8000") },
+                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("53/udp") },
+                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("53/tcp") },
+                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("8080:8000") },
             ]
         );
     }
@@ -1179,7 +1129,7 @@ mod tests {
         dir.pending_services[0].vip4 = Some(VIP.to_string());
         assert_eq!(
             service_rules(&declared, Some(NODE), None, &dir, None, &BTreeSet::new()),
-            vec![ServiceRule::Mapped { vip: VIP, node: NODE, only_from: None, map: pm("80:5080") }]
+            vec![ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("80:5080") }]
         );
     }
 
@@ -1191,63 +1141,39 @@ mod tests {
         let mut entry = published("web", NODE, Some(VIP));
         entry.ports = vec![pm("22:22"), pm("80:22")];
         let rules = service_rules(&declared, Some(NODE), None, &with_services(vec![entry]), None, &BTreeSet::new());
-        assert_eq!(rules, vec![ServiceRule::Mapped { vip: VIP, node: NODE, only_from: None, map: pm("80:5080") }]);
+        assert_eq!(rules, vec![ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("80:5080") }]);
     }
 
     // ---- behind the proxy's sign-in (PLAN.md M29) ----
 
-    const PROXY_NODE: Ipv4Addr = Ipv4Addr::new(10, 9, 0, 7);
-
-    fn with_proxy(mut services: Vec<ServiceInfo>, proxy: bool) -> PollResponse {
-        if proxy {
-            services.push(published("web", PROXY_NODE, Some(Ipv4Addr::new(10, 9, 0, 60))));
-        }
-        let mut dir = with_services(services);
-        dir.naming = Some(wireserve_types::ServiceNaming {
-            domain: "int.example.com".into(),
-            proxy_service: Some("web".into()),
-            acme: None,
-        });
-        dir
-    }
 
     fn marked(name: &str, vip: Option<Ipv4Addr>) -> ServiceInfo {
         let mut s = published(name, NODE, vip);
         s.auth = true;
+        s.terminated = vip.is_some();
         s
     }
 
     #[test]
-    fn a_marked_service_admits_the_proxy_alone_on_every_mapping() {
-        // The second mapping would otherwise be a way round the sign-in.
+    fn a_marked_service_opens_its_terminated_443_and_nothing_else() {
+        // PLAN.md M34: the sign-in is in the terminator, so its 443 is the
+        // only way in; the second mapping would otherwise walk round it.
         let declared = vec![ServiceDecl::new("jellyfin", vec![pm("443:8096"), pm("8920")])];
-        let rules = service_rules(&declared, Some(NODE), None, &with_proxy(vec![marked("jellyfin", Some(VIP))], true), None, &BTreeSet::new());
-        assert_eq!(
-            rules,
-            vec![
-                ServiceRule::Mapped { vip: VIP, node: NODE, only_from: Some(PROXY_NODE), map: pm("443:8096") },
-                ServiceRule::Mapped { vip: VIP, node: NODE, only_from: Some(PROXY_NODE), map: pm("8920") },
-            ]
-        );
+        let serving = BTreeSet::from(["jellyfin".to_string()]);
+        let rules = service_rules(&declared, Some(NODE), None, &with_services(vec![marked("jellyfin", Some(VIP))]), None, &serving);
+        assert_eq!(rules, vec![ServiceRule::Terminated { vip: VIP, map: pm("443:8096") }]);
     }
 
     #[test]
-    fn a_marked_service_is_not_opened_at_all_rather_than_opened_to_everyone() {
-        let declared = vec![ServiceDecl::new("jellyfin", vec![pm("443:8096")])];
-        // No proxy in the directory: nobody to admit.
-        let rules = service_rules(&declared, Some(NODE), None, &with_proxy(vec![marked("jellyfin", Some(VIP))], false), None, &BTreeSet::new());
+    fn a_marked_service_is_not_opened_at_all_while_its_terminator_does_not_serve_it() {
+        let declared = vec![ServiceDecl::new("jellyfin", vec![pm("443:8096"), pm("8920")])];
+        let rules = service_rules(&declared, Some(NODE), None, &with_services(vec![marked("jellyfin", Some(VIP))]), None, &BTreeSet::new());
         assert!(rules.is_empty(), "{rules:?}");
         // No address of its own: the fallback would open the node's port to
         // the whole mesh, which is exactly what the mark forbids.
-        let rules = service_rules(&declared, Some(NODE), None, &with_proxy(vec![marked("jellyfin", None)], true), None, &BTreeSet::new());
+        let serving = BTreeSet::from(["jellyfin".to_string()]);
+        let rules = service_rules(&declared, Some(NODE), None, &with_services(vec![marked("jellyfin", None)]), None, &serving);
         assert!(rules.is_empty(), "{rules:?}");
-    }
-
-    #[test]
-    fn an_unmarked_service_is_untouched_by_the_proxy_being_there() {
-        let declared = vec![ServiceDecl::new("prom", vec![pm("80:9090")])];
-        let rules = service_rules(&declared, Some(NODE), None, &with_proxy(vec![published("prom", NODE, Some(VIP))], true), None, &BTreeSet::new());
-        assert_eq!(rules, vec![ServiceRule::Mapped { vip: VIP, node: NODE, only_from: None, map: pm("80:9090") }]);
     }
 
     #[test]
@@ -1261,7 +1187,7 @@ mod tests {
             TransitSelfReport { capable: false, exit_capable: false, reachable: vec![], wanted: vec![] },
             TlsSelfReport::default(),
         );
-        assert_eq!(req.capabilities, vec![wireserve_types::CAP_SERVICE_AUTH.to_string()]);
+        assert!(req.capabilities.is_empty(), "no terminator, nothing to claim");
         assert!(req.tls_ready.is_empty());
 
         let req = build_poll_request(
@@ -1336,7 +1262,7 @@ mod tests {
         let dir = with_services(vec![published("plex", NODE, Some(VIP)), published("media", NODE, Some(other))]);
         assert_eq!(
             service_rules(&declared, Some(NODE), None, &dir, None, &BTreeSet::new()),
-            vec![ServiceRule::Mapped { vip: VIP, node: NODE, only_from: None, map: PortMap::identity(32400, Proto::Tcp) }]
+            vec![ServiceRule::Mapped { vip: VIP, node: NODE, map: PortMap::identity(32400, Proto::Tcp) }]
         );
     }
 
@@ -1347,8 +1273,8 @@ mod tests {
         assert_eq!(
             rules,
             vec![
-                ServiceRule::Mapped { vip: VIP, node: NODE, only_from: None, map: pm("443:192.168.178.1:80") },
-                ServiceRule::Mapped { vip: VIP, node: NODE, only_from: None, map: pm("8080") },
+                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("443:192.168.178.1:80") },
+                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("8080") },
             ]
         );
         assert_eq!(rules[0].remote_target(), Some(Ipv4Addr::new(192, 168, 178, 1)));
@@ -1626,70 +1552,5 @@ mod tests {
         let msg = PollError::Incomplete(vec![PollError::Firewall("nft said no".into()), io(libc::EROFS)]).to_string();
         assert!(msg.contains("firewall reconciliation failed: nft said no"), "{msg}");
         assert!(msg.contains("hosts-file sync failed"), "{msg}");
-    }
-}
-
-#[cfg(test)]
-mod proxy_step_tests {
-    use super::*;
-    use crate::proxy::fake::FakeProxyBackend;
-    use wireserve_types::{PortMap, Proto, ServiceInfo, ServiceNaming};
-
-    fn directory(naming: Option<ServiceNaming>) -> PollResponse {
-        PollResponse {
-            naming,
-            peers: vec![],
-            services: vec![ServiceInfo {
-                auth: false,
-                terminated: false,
-                name: "plex".into(),
-                node: "n".into(),
-                ip4: "10.9.0.3".into(),
-                port: 443,
-                proto: Proto::Tcp,
-                online: true,
-                vip4: Some("10.9.0.50".into()),
-                ports: vec![PortMap { public: 443, target: 32400, proto: Proto::Tcp, addr: None }],
-            }],
-            pending_services: vec![],
-            denied_services: vec![],
-            transit_carrying: vec![],
-            transit_awaiting_approval: false,
-            exit_clients: vec![],
-            mesh: None,
-        }
-    }
-
-    fn naming() -> ServiceNaming {
-        ServiceNaming { domain: "int.example.com".into(), proxy_service: None, acme: None }
-    }
-
-    #[test]
-    fn a_failing_proxy_never_fails_the_cycle() {
-        // The property that keeps a down Caddy from freezing the directory
-        // cache: this returns `()`, so there is nothing for `run_once` to
-        // fold into `failures`.
-        let mut backend = FakeProxyBackend { fail: true, ..Default::default() };
-        publish_to_proxy(Some(&mut backend), &directory(Some(naming())));
-        assert_eq!(backend.calls.lock().unwrap().len(), 1, "it must still have tried");
-    }
-
-    #[test]
-    fn services_reach_the_backend_as_vhosts() {
-        let mut backend = FakeProxyBackend::default();
-        publish_to_proxy(Some(&mut backend), &directory(Some(naming())));
-        let calls = backend.calls.lock().unwrap();
-        assert_eq!(calls[0].len(), 1);
-        assert_eq!(calls[0][0].host, "plex.int.example.com");
-    }
-
-    #[test]
-    fn a_coordinator_with_no_domain_configured_publishes_nothing() {
-        let mut backend = FakeProxyBackend::default();
-        publish_to_proxy(Some(&mut backend), &directory(None));
-        assert!(
-            backend.calls.lock().unwrap().is_empty(),
-            "without a domain there are no names to publish, so the proxy is left alone"
-        );
     }
 }

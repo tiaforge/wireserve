@@ -21,6 +21,7 @@
 pub mod acme;
 pub mod link;
 pub mod serve;
+pub mod sign_in;
 pub mod store;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,7 +33,7 @@ use tokio::task::JoinHandle;
 use wireserve_types::tls::{TlsConfig, TlsService};
 
 use crate::link::Link;
-use crate::serve::{Callers, Certs};
+use crate::serve::{Callers, Certs, SharedSignIn};
 use crate::store::{Store, Stored};
 
 pub struct Options {
@@ -43,6 +44,9 @@ pub struct Options {
     /// A CA certificate to trust for the ACME server itself, for a test CA
     /// such as Pebble. Never needed for a public CA.
     pub ca_file: Option<PathBuf>,
+    /// Another CA to trust for the sign-in check, besides the public roots —
+    /// a test CA such as Pebble's issuing root. Never needed otherwise.
+    pub trust_file: Option<PathBuf>,
     pub check_in_every: Duration,
 }
 
@@ -85,6 +89,15 @@ pub async fn run(opts: Options) -> Result<(), Error> {
     let certs = Arc::new(Certs::default());
     let tls = serve::server_config(certs.clone());
     let callers: Callers = Arc::default();
+    let sign_in: SharedSignIn = Arc::default();
+    let extra_roots: Vec<rustls_pki_types::CertificateDer<'static>> = match &opts.trust_file {
+        None => Vec::new(),
+        Some(path) => {
+            use rustls_pki_types::pem::PemObject;
+            let pem = std::fs::read(path).map_err(Error::State)?;
+            rustls_pki_types::CertificateDer::pem_slice_iter(&pem).filter_map(Result::ok).collect()
+        }
+    };
 
     let mut served: BTreeMap<String, Served> = BTreeMap::new();
     let mut issuance: BTreeMap<String, Issuance> = BTreeMap::new();
@@ -112,6 +125,7 @@ pub async fn run(opts: Options) -> Result<(), Error> {
             }
         };
         update_callers(&callers, &config);
+        update_sign_in(&sign_in, config.sign_in.as_ref(), &extra_roots);
 
         // Services that are gone: stop serving them.
         let wanted: BTreeSet<&str> = config.services.iter().map(|s| s.name.as_str()).collect();
@@ -183,7 +197,15 @@ pub async fn run(opts: Options) -> Result<(), Error> {
                 match serve::bind(service.vip) {
                     Ok(listener) => {
                         tracing::info!(service = %service.name, addr = %service.vip, upstream = %service.upstream, "serving");
-                        s.listener = Some(serve::spawn(listener, tls.clone(), service.upstream, callers.clone()));
+                        let policy = serve::Policy { marked: service.sign_in, fqdn: service.fqdn.clone() };
+                        s.listener = Some(serve::spawn(
+                            listener,
+                            tls.clone(),
+                            service.upstream,
+                            callers.clone(),
+                            sign_in.clone(),
+                            policy,
+                        ));
                     }
                     // Another listener on 0.0.0.0:443, most likely: this
                     // service is simply not served here, and keeps the path
@@ -229,6 +251,19 @@ pub async fn run(opts: Options) -> Result<(), Error> {
             }
         }
     }
+}
+
+/// Replaces the sign-in client when the provider moved — only then, so its
+/// connection pool survives every check-in that changed nothing.
+fn update_sign_in(shared: &SharedSignIn, target: Option<&wireserve_types::tls::SignInTarget>, extra_roots: &[rustls_pki_types::CertificateDer<'static>]) {
+    let mut current = shared.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if current.as_ref().map(|s| &s.target) == target {
+        return;
+    }
+    *current = target.map(|t| {
+        tracing::info!(provider = %t.fqdn, addr = %t.vip, "sign-in provider");
+        sign_in::SignIn::new(t.clone(), extra_roots)
+    });
 }
 
 fn update_callers(callers: &Callers, config: &TlsConfig) {

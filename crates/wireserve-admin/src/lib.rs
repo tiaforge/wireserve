@@ -126,7 +126,7 @@ pub fn cmd_deny_transit(client: &AdminClient, name: &str) -> Result<(), CliError
     Ok(client.deny_transit(name)?)
 }
 
-/// Publishes a service behind the proxy's sign-in, or stops (PLAN.md M29).
+/// Puts a service behind the sign-in, or takes it away (PLAN.md M29, M34).
 pub fn cmd_set_service_auth(client: &AdminClient, service: &str, enabled: bool) -> Result<(), CliError> {
     validate_name(service)?;
     Ok(client.set_service_auth(service, enabled)?)

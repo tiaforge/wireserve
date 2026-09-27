@@ -76,7 +76,8 @@ pub struct DirectoryContext<'a> {
     /// Whether the coordinator publishes DNS records — without them no
     /// certificate can be issued, so nothing is terminated.
     pub dns: bool,
-    pub proxy_service: Option<&'a str>,
+    /// The service running the sign-in provider (PLAN.md M34).
+    pub sign_in_service: Option<&'a str>,
     pub online_threshold_secs: i64,
 }
 
@@ -84,19 +85,17 @@ impl DirectoryContext<'_> {
     /// Whether `service` is served with TLS by its own node (PLAN.md M33).
     ///
     /// Every condition fails toward the path the service already had: no
-    /// records, not on TCP 443, no address of its own, marked for sign-in
-    /// (built in only from M34), the proxy itself (whose address every
-    /// other 443 name points at), or its own node not vouching for it right
-    /// now — an owner that predates termination never does.
+    /// records, not on TCP 443, no address of its own, or its own node not
+    /// vouching for it right now — an owner that predates termination never
+    /// does. A service behind the sign-in terminates like any other (PLAN.md
+    /// M34): the sign-in is in the terminator.
     #[must_use]
-    pub fn terminates(&self, service: &ServiceRow, auth: bool) -> bool {
+    pub fn terminates(&self, service: &ServiceRow) -> bool {
         self.dns
             && service.vip4.is_some()
             && wireserve_types::effective_ports(&service.ports, service.port, service.proto)
                 .iter()
                 .any(|m| m.public == wireserve_types::TLS_PUBLIC_PORT && m.proto == wireserve_types::Proto::Tcp)
-            && !auth
-            && self.proxy_service != Some(service.name.as_str())
             && self.tls_ready.get(&service.name) == Some(&service.node_id)
     }
 }
@@ -112,7 +111,7 @@ pub fn services_directory(services: &[ServiceRow], peers: &[NodeRow], ctx: &Dire
         .filter_map(|s| {
             peers_by_id.get(&s.node_id).map(|owner| {
                 let auth = ctx.auth.contains(&s.name);
-                service_info(s, owner, ctx.online_threshold_secs, auth, ctx.terminates(s, auth))
+                service_info(s, owner, ctx.online_threshold_secs, auth, ctx.terminates(s))
             })
         })
         .collect()

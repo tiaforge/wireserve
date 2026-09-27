@@ -81,25 +81,6 @@ enum Command {
         /// to start. `auto` removes a pin.
         #[arg(long, value_parser = parse_ifname_flag)]
         ifname: Option<ifname::Flag>,
-        /// Publish this mesh's services on the reverse proxy running here
-        /// (PLAN.md M25). Only services published on TCP 443 are named;
-        /// everything else keeps its direct address.
-        ///
-        /// The domain itself is the coordinator's `WIRESERVE_SERVICE_DOMAIN`,
-        /// so every node agrees on what its own services are called. Without
-        /// this flag the node runs no proxy and writes nothing.
-        #[arg(long, value_name = "BACKEND")]
-        proxy: Option<ProxyKind>,
-        /// The file the proxy configuration is generated into. Owned
-        /// outright and rewritten whenever the mesh changes; the operator's
-        /// own site block imports it.
-        #[arg(long, value_name = "PATH", default_value = "/etc/caddy/conf.d/wireserve.caddy")]
-        proxy_conf: std::path::PathBuf,
-        /// The operator's main Caddyfile, which the generated file is
-        /// validated against — the fragment alone resolves neither the global
-        /// options nor the site block it lives in.
-        #[arg(long, value_name = "PATH", default_value = "/etc/caddy/Caddyfile")]
-        proxy_main_config: std::path::PathBuf,
     },
     /// Queues a local service declaration, applied on the next poll.
     ///
@@ -161,16 +142,13 @@ enum Command {
         /// Pebble. Never needed for Let's Encrypt.
         #[arg(long, value_name = "PEM", env = "WIRESERVE_ACME_CA_FILE", hide = true)]
         acme_ca_file: Option<std::path::PathBuf>,
+        /// Trust this CA too when checking the sign-in provider's
+        /// certificate — a test CA. Never needed with a public CA.
+        #[arg(long, value_name = "PEM", env = "WIRESERVE_TLS_TRUST_FILE", hide = true)]
+        trust_file: Option<std::path::PathBuf>,
         #[arg(long, default_value_t = 5, hide = true)]
         check_in_secs: u64,
     },
-}
-
-/// Which reverse proxy this node runs. One variant today; the backend sits
-/// behind a trait, so a second needs nothing here but another variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum ProxyKind {
-    Caddy,
 }
 
 #[derive(Subcommand)]
@@ -221,19 +199,10 @@ async fn main() {
         Command::Daemon {
             poll_interval_secs,
             ifname,
-            proxy,
-            proxy_conf,
-            proxy_main_config,
         } => {
-            cmd_daemon(
-                &instance,
-                poll_interval_secs,
-                ifname,
-                proxy.map(|kind| ProxyConfig { kind, conf: proxy_conf, main_config: proxy_main_config }),
-            )
-            .await
+            cmd_daemon(&instance, poll_interval_secs, ifname).await
         }
-        Command::TlsServe { state_dir, acme_ca_file, check_in_secs } => {
+        Command::TlsServe { state_dir, acme_ca_file, trust_file, check_in_secs } => {
             // systemd may list several colon-separated state directories;
             // the unit names exactly one.
             let state_dir = state_dir
@@ -243,6 +212,7 @@ async fn main() {
                 socket: instance.tls_socket_path(),
                 state_dir,
                 ca_file: acme_ca_file,
+                trust_file,
                 check_in_every: Duration::from_secs(check_in_secs.max(1)),
             })
             .await
@@ -447,41 +417,14 @@ fn resolve_join_token(
     }
 }
 
-/// What `--proxy` and its companions resolved to.
-struct ProxyConfig {
-    kind: ProxyKind,
-    conf: std::path::PathBuf,
-    main_config: std::path::PathBuf,
-}
-
 async fn cmd_daemon(
     instance: &Instance,
     poll_interval_secs: u64,
     ifname_flag: Option<ifname::Flag>,
-    proxy_config: Option<ProxyConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // First, before anything is looked at or changed: one daemon per
     // instance. Held until the process exits.
     let _lock = lock::lock_instance(instance)?;
-
-    // Located before anything else is set up: the operator explicitly asked
-    // for this backend, so a missing binary is a startup error rather than
-    // something to rediscover and log on every cycle for the life of the
-    // daemon. Same reasoning as `Nft::locate`.
-    let mut proxy: Option<Box<dyn wireserve_agent::proxy::ProxyBackend>> = match proxy_config {
-        None => None,
-        Some(cfg) => match cfg.kind {
-            ProxyKind::Caddy => {
-                let backend =
-                    wireserve_agent::proxy::caddy::Caddy::locate(cfg.conf.clone(), cfg.main_config)?;
-                tracing::info!(
-                    path = %cfg.conf.display(),
-                    "publishing mesh services to caddy; the operator's site block must import this file"
-                );
-                Some(Box::new(backend))
-            }
-        },
-    };
 
     let state_path = instance.state_path();
     let mut state = AgentState::load(&state_path)?;
@@ -698,7 +641,7 @@ async fn cmd_daemon(
         tokio::select! {
             _ = async { tokio::select! { _ = sigterm.recv() => {}, _ = tokio::signal::ctrl_c() => {} } } => {
                 tracing::info!("termination signal received — tearing down");
-                teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, instance.hosts_label(), &socket_path, &shared_state, &state_path, proxy.as_mut().map(|p| p.as_mut() as &mut dyn wireserve_agent::proxy::ProxyBackend), false).await;
+                teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, instance.hosts_label(), &socket_path, &shared_state, &state_path, false).await;
                 break;
             }
             _ = interval.tick() => {
@@ -712,7 +655,6 @@ async fn cmd_daemon(
                     firewall: &mut fw,
                     endpoint_tracker: &mut endpoint_tracker,
                     own_reflexive_addr: own_reflexive_addr.as_deref(),
-                    proxy: proxy.as_mut().map(|p| p.as_mut() as &mut dyn wireserve_agent::proxy::ProxyBackend),
                     tls: Some(&tls_link),
                 };
                 let result = poll_loop::run_once(&mut ctx, &shared_state).await;
@@ -739,7 +681,7 @@ async fn cmd_daemon(
                              replaced it and this unit's mount of it was dropped; exiting so \
                              the service manager restarts the agent with a fresh one"
                         );
-                        teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, instance.hosts_label(), &socket_path, &shared_state, &state_path, proxy.as_mut().map(|p| p.as_mut() as &mut dyn wireserve_agent::proxy::ProxyBackend), false).await;
+                        teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, instance.hosts_label(), &socket_path, &shared_state, &state_path, false).await;
                         return Err("hosts file became read-only; restart required".into());
                     }
                     Err(_) => {}
@@ -777,7 +719,7 @@ async fn cmd_daemon(
                              again with a fresh token from `wireserve-admin rejoin` to rejoin)",
                             UNAUTHORIZED_STREAK_TO_TEARDOWN
                         );
-                        teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, instance.hosts_label(), &socket_path, &shared_state, &state_path, proxy.as_mut().map(|p| p.as_mut() as &mut dyn wireserve_agent::proxy::ProxyBackend), false).await;
+                        teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, instance.hosts_label(), &socket_path, &shared_state, &state_path, false).await;
                         break;
                     }
                     Err(e) => tracing::error!(error = %e, "poll cycle failed, will retry next interval"),
@@ -785,7 +727,7 @@ async fn cmd_daemon(
             }
             _ = shutdown_rx.recv() => {
                 tracing::info!("leave requested, tearing down");
-                teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, instance.hosts_label(), &socket_path, &shared_state, &state_path, proxy.as_mut().map(|p| p.as_mut() as &mut dyn wireserve_agent::proxy::ProxyBackend), true).await;
+                teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, instance.hosts_label(), &socket_path, &shared_state, &state_path, true).await;
                 break;
             }
         }
@@ -871,21 +813,10 @@ async fn teardown_everything<F: FirewallBackend>(
     socket_path: &std::path::Path,
     state: &Mutex<AgentState>,
     state_path: &std::path::Path,
-    proxy: Option<&mut dyn wireserve_agent::proxy::ProxyBackend>,
     reset_state: bool,
 ) where
     F::Error: std::fmt::Display,
 {
-    // Only on an explicit `leave` (PLAN.md M25). Every daemon *restart* runs
-    // this path too, and removing the vhosts then re-adding them seconds
-    // later would reload the proxy twice and re-provision for nothing.
-    if reset_state {
-        if let Some(proxy) = proxy {
-            if let Err(e) = proxy.teardown() {
-                tracing::warn!(error = %e, "failed to remove published vhosts during teardown");
-            }
-        }
-    }
     if let Err(e) = wireserve_agent::hosts::remove_block(hosts_path, hosts_label) {
         tracing::warn!(error = %e, "failed to remove managed hosts-file block during teardown");
     }

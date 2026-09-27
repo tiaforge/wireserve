@@ -3108,3 +3108,71 @@ every HTTPS service depends on, no wildcard key on one box.
     route removed on stop and swept after `kill -9`. Passes (2026-09-27). The
     harnesses' `socat SYSTEM:` test backend, which socat's own escape parsing
     mangled into answering nothing, is now `deploy/e2e/echo-backend.sh`.
+
+## M34 — the sign-in built in, and the central proxy gone
+
+The last of the three per-node TLS milestones. The sign-in that M29 put in
+the central Caddy moves into every node's terminator, and the central proxy
+— `WIRESERVE_SERVICE_PROXY`, `wireserve daemon --proxy caddy`, the generated
+vhost file, the proxy-only firewall rule — is removed. Treated as a fresh
+design, not a migration: nothing from M25–M33's proxy is accepted or warned
+about any more.
+
+192. **Caddy's `forward_auth`, built into the terminator.** Before a request
+    to a marked service goes to its backend, a headers-only copy goes to
+    `https://<provider>.<domain><verify_path>` with the original `Host`,
+    `X-Forwarded-Method`, `X-Forwarded-Uri` and every other header (API-token
+    headers included). 2xx: through, with `copy_headers` copied on. 401 with
+    `X-Login-Url` on a GET or HEAD: 302 to it. Anything else: the provider's
+    answer as is. That is exactly the contract authward documents, so it
+    needs nothing changed. Configured once on the coordinator —
+    `WIRESERVE_AUTH_SERVICE` plus `_VERIFY_PATH`, `_COPY_HEADERS`,
+    `_SESSION_COOKIE`, defaulting to authward's — and shipped to every node
+    in `ServiceNaming.sign_in`. It needs DNS records, since only terminated
+    services exist to be signed in to.
+
+193. **The check reaches the provider through the provider's own
+    terminator, unmodified.** authward has one listener and trusts
+    `X-Forwarded-Host/-Uri/-Method` as its protocol. The calling terminator
+    connects to the provider service's own address over verified TLS
+    (Mozilla's roots via `webpki-roots`; `hyper-rustls`, pooled) with the
+    protected service's name as `Host`; the provider's terminator strips the
+    forwarding headers as it does for everyone, and `axum-reverse-proxy`
+    derives `X-Forwarded-Host` from that `Host` — which is what authward
+    reads. `X-Forwarded-Uri` and `-Method` pass through. No special case on
+    either side. A client calling `/verify` itself only learns about its own
+    session. The provider's target is resolved by the agent from the
+    directory, and only once the provider is `terminated`; until then a
+    marked service answers 503 rather than serve unchecked.
+
+194. **Identity and cookie hygiene on every request, marked or not.** Every
+    terminator removes every `copy_headers` header a client sent, from every
+    request, and the provider's session cookie from every request but the
+    provider's own (it is scoped to the whole domain, so the browser sends it
+    everywhere). M29 needed the operator's `wireserve_upstream` snippet for
+    this; it is now unconditional once a sign-in is configured.
+
+195. **A marked service opens nothing but its terminated 443.** The owner's
+    `service_rules` skip every other mapping of a marked service — each
+    would be a way round the check — and open nothing at all while its
+    terminator does not serve it; the direct-open fallback is refused too.
+    `ServiceRule::Mapped.only_from` and the proxy-source lookup are gone:
+    the one source-restricted rule in the design is no longer needed.
+
+196. **`terminated` no longer excludes anything but readiness.** Marked
+    services and the provider itself terminate like any other; the
+    challenge endpoint no longer refuses them. Marking needs a configured
+    sign-in, a service on 443 with an address that is not the provider, and
+    an owner reporting `sign-in` (`CAP_SIGN_IN`, sent with `tls-terminate`
+    by an agent whose terminator has checked in). `CAP_SERVICE_AUTH` is
+    gone.
+
+197. **The proxy removed outright.** `crates/wireserve-agent/src/proxy/`,
+    the `--proxy`, `--proxy-conf` and `--proxy-main-config` flags,
+    `PollContext.proxy`, the proxy step of the poll, `-/etc/caddy` in both
+    agent units, `ServiceNaming.proxy_service` on the wire, `Config.service_proxy`,
+    the installer's proxy question and `--proxy-service`, and
+    `deploy/proxy/Caddyfile.services.example`. `ServiceNames` has no proxy
+    branch: every name points at its service's own address. The installer's
+    question is now which service runs the sign-in (`--auth-service`,
+    `--no-auth-service`), asked only with a DNS provider.

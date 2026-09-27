@@ -27,7 +27,7 @@ fn test_config(db_path: &str) -> Config {
         net_v4_cidr: "100.90.0.0/24".to_string(),
         net_v6_prefix: "fd00:90::/64".to_string(),
         service_domain: None,
-        service_proxy: None,
+        sign_in: None,
         dns: None,
         acme: wireserve_coordinator::config::acme_from_lookup(|_| None).unwrap(),
         online_threshold_secs: 180,
@@ -3496,12 +3496,21 @@ async fn a_revoked_device_is_no_longer_an_exit_client() {
     assert!(exit_clients(&body).is_empty(), "{body}");
 }
 
-// ---- PLAN.md M29: services behind the proxy's sign-in ----
+// ---- PLAN.md M29, M34: services behind the built-in sign-in ----
+
+fn sign_in() -> wireserve_types::SignIn {
+    wireserve_types::SignIn {
+        service: "auth".into(),
+        verify_path: "/verify".into(),
+        copy_headers: vec!["x-auth-user".into()],
+        session_cookie: "authward_session".into(),
+    }
+}
 
 fn named_app() -> TestApp {
     let mut config = test_config("");
     config.service_domain = Some("int.example.com".into());
-    config.service_proxy = Some("web".into());
+    config.sign_in = Some(sign_in());
     app_with_config(config)
 }
 
@@ -3511,7 +3520,7 @@ fn svc(name: &str, public: u16, target: u16) -> Value {
 }
 
 async fn poll_caps(router: &Router, bearer: &str, services: Value, capable: bool) -> Value {
-    let caps: Vec<&str> = if capable { vec![wireserve_types::CAP_SERVICE_AUTH] } else { vec![] };
+    let caps: Vec<&str> = if capable { vec![wireserve_types::CAP_SIGN_IN] } else { vec![] };
     poll_full(router, bearer, json!({ "services": services, "capabilities": caps })).await.1
 }
 
@@ -3523,20 +3532,21 @@ async fn set_auth(router: &Router, name: &str, enabled: bool) -> (StatusCode, Va
     (status, body)
 }
 
-/// A proxy node publishing `web` on 443 and a home node publishing
-/// `jellyfin` on 443; `capable` says which of them report the capability.
-/// Returns (proxy bearer, home bearer, an unrelated observer's bearer).
-async fn auth_scenario(app: &TestApp, proxy_capable: bool, home_capable: bool) -> (String, String, String) {
+/// A node running the sign-in provider as `auth` on 443 and a home node
+/// publishing `jellyfin` on 443; `home_capable` says whether the home node
+/// reports it can put the sign-in in front of a service. Returns (gate
+/// bearer, home bearer, an unrelated observer's bearer).
+async fn auth_scenario(app: &TestApp, home_capable: bool) -> (String, String, String) {
     let bearer = |r: Value| r["bearer_token"].as_str().unwrap().to_string();
-    let t = admin_create_node(&app.router, "px").await;
-    let px = bearer(register_node(&app.router, &t, "px", 51820).await);
+    let t = admin_create_node(&app.router, "gate").await;
+    let gate = bearer(register_node(&app.router, &t, "gate", 51820).await);
     let t = admin_create_node(&app.router, "home").await;
     let home = bearer(register_node(&app.router, &t, "home", 51820).await);
     let t = admin_create_node(&app.router, "watcher").await;
     let watcher = bearer(register_node(&app.router, &t, "watcher", 51820).await);
-    poll_caps(&app.router, &px, json!([svc("web", 443, 8443)]), proxy_capable).await;
+    poll_caps(&app.router, &gate, json!([svc("auth", 443, 8080)]), true).await;
     poll_caps(&app.router, &home, json!([svc("jellyfin", 443, 8096), svc("prom", 80, 9090)]), home_capable).await;
-    (px, home, watcher)
+    (gate, home, watcher)
 }
 
 fn directory_entry<'a>(body: &'a Value, name: &str) -> &'a Value {
@@ -3546,7 +3556,7 @@ fn directory_entry<'a>(body: &'a Value, name: &str) -> &'a Value {
 #[tokio::test]
 async fn a_marked_service_reaches_every_node_marked_and_the_admin_sees_it() {
     let app = named_app();
-    let (_px, _home, watcher) = auth_scenario(&app, true, true).await;
+    let (_gate, _home, watcher) = auth_scenario(&app, true).await;
 
     assert_eq!(set_auth(&app.router, "jellyfin", true).await.0, StatusCode::OK);
     let (_, body) = poll_full(&app.router, &watcher, json!({})).await;
@@ -3570,7 +3580,7 @@ async fn the_mark_survives_a_withdraw_and_redeclare() {
     // once; a mark stored on the row would have gone with it, and the
     // service would be back open.
     let app = named_app();
-    let (_px, home, watcher) = auth_scenario(&app, true, true).await;
+    let (_gate, home, watcher) = auth_scenario(&app, true).await;
     assert_eq!(set_auth(&app.router, "jellyfin", true).await.0, StatusCode::OK);
 
     poll_caps(&app.router, &home, json!([svc("prom", 80, 9090)]), true).await;
@@ -3581,32 +3591,25 @@ async fn the_mark_survives_a_withdraw_and_redeclare() {
 
 #[tokio::test]
 async fn marking_is_refused_wherever_it_would_leave_the_service_open() {
-    // Without a proxy there is nothing to put a sign-in in front of.
+    // Without a sign-in there is nothing to put in front of it.
     let app = test_app();
     let (status, body) = set_auth(&app.router, "jellyfin", true).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body["error"].as_str().unwrap().contains("WIRESERVE_SERVICE_DOMAIN"), "{body}");
+    assert!(body["error"].as_str().unwrap().contains("WIRESERVE_AUTH_SERVICE"), "{body}");
 
     let app = named_app();
-    let _ = auth_scenario(&app, true, true).await;
-    let (status, _) = set_auth(&app.router, "web", true).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "the proxy cannot sit behind itself");
+    let _ = auth_scenario(&app, true).await;
+    let (status, _) = set_auth(&app.router, "auth", true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "the sign-in cannot sit behind itself");
     let (status, body) = set_auth(&app.router, "prom", true).await;
-    assert_eq!(status, StatusCode::CONFLICT, "not proxied, so no sign-in can front it: {body}");
+    assert_eq!(status, StatusCode::CONFLICT, "not on 443, so no terminator serves it: {body}");
 
-    // An owning agent that would ignore the mark leaves the direct path open.
+    // An owning agent without the built-in sign-in.
     let app = named_app();
-    let _ = auth_scenario(&app, true, false).await;
+    let _ = auth_scenario(&app, false).await;
     let (status, body) = set_auth(&app.router, "jellyfin", true).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body["error"].as_str().unwrap().contains("declaring"), "{body}");
-
-    // A proxy that would ignore it publishes the service with no sign-in.
-    let app = named_app();
-    let _ = auth_scenario(&app, false, true).await;
-    let (status, body) = set_auth(&app.router, "jellyfin", true).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body["error"].as_str().unwrap().contains("proxy"), "{body}");
 }
 
 #[tokio::test]
@@ -3614,7 +3617,7 @@ async fn a_name_nobody_declares_can_be_marked_ahead_of_time() {
     // Whoever declares it next is published behind the sign-in — the safe
     // direction to be early in.
     let app = named_app();
-    let (_px, home, watcher) = auth_scenario(&app, true, true).await;
+    let (_gate, home, watcher) = auth_scenario(&app, true).await;
     assert_eq!(set_auth(&app.router, "immich", true).await.0, StatusCode::OK);
     poll_caps(&app.router, &home, json!([svc("jellyfin", 443, 8096), svc("immich", 443, 2283)]), true).await;
     let (_, body) = poll_full(&app.router, &watcher, json!({})).await;
@@ -3666,7 +3669,6 @@ mod dns_records {
     fn app(fake: &Arc<FakeDns>) -> TestApp {
         let mut config = test_config("");
         config.service_domain = Some("int.example.com".into());
-        config.service_proxy = Some("web".into());
         app_with_dns(config, Some(fake.clone() as Arc<dyn DnsWriter>))
     }
 
@@ -3697,20 +3699,20 @@ mod dns_records {
         let px = node(&app, "px").await;
         let home = node(&app, "home").await;
         poll_with(&app.router, &px, json!([svc("web", 443, 8443)])).await;
-        let (_, body) = poll_with(&app.router, &home, json!([svc("jellyfin", 443, 8096), svc("prom", 80, 9090)])).await;
+        poll_with(&app.router, &home, json!([svc("jellyfin", 443, 8096), svc("prom", 80, 9090)])).await;
 
         assert!(!pass(&app).await.failed);
         let mut calls = fake.take();
         calls.sort();
-        let web = vip(&body, "web");
+        let (_, body) = poll_with(&app.router, &px, json!([svc("web", 443, 8443)])).await;
         assert_eq!(
             calls,
             vec![
-                format!("set jellyfin.int.example.com {web}"),
+                format!("set jellyfin.int.example.com {}", vip(&body, "jellyfin")),
                 format!("set prom.int.example.com {}", vip(&body, "prom")),
-                format!("set web.int.example.com {web}"),
+                format!("set web.int.example.com {}", vip(&body, "web")),
             ],
-            "443 names point at the proxy, others at their own address"
+            "every name at its own service's address"
         );
         assert_eq!(admin_dns(&app, "prom").await, json!({"state": "published"}));
 
@@ -3791,26 +3793,23 @@ mod dns_records {
     }
 
     #[tokio::test]
-    async fn a_ready_service_is_terminated_and_its_name_moves_to_its_own_address() {
+    async fn a_ready_service_is_terminated_and_its_name_stays_put() {
         let fake = Arc::new(FakeDns::default());
         let app = app(&fake);
-        let px = node(&app, "px").await;
         let home = node(&app, "home").await;
-        poll_with(&app.router, &px, json!([svc("web", 443, 8443)])).await;
+        let other = node(&app, "other").await;
+        poll_with(&app.router, &other, json!([svc("web", 443, 8443)])).await;
         let body = poll_ready(&app, &home, json!([svc("plex", 443, 32400)]), &[]).await;
         assert!(directory_entry(&body, "plex").get("terminated").is_none(), "{body}");
         pass(&app).await;
-        let web = vip(&body, "web");
-        assert_eq!(fake.take(), vec![format!("set plex.int.example.com {web}"), format!("set web.int.example.com {web}")]);
+        fake.take();
 
         let body = poll_ready(&app, &home, json!([svc("plex", 443, 32400)]), &["plex", "web"]).await;
         assert_eq!(directory_entry(&body, "plex")["terminated"], json!(true), "{body}");
         assert!(directory_entry(&body, "web").get("terminated").is_none(), "a node vouches only for its own");
-        // The name moves — after the debounce, since it had an address.
-        let dns = app.state.dns.clone().unwrap();
-        let mut moving = Default::default();
-        sync::pass(&app.state, &dns, &mut moving).await;
-        assert!(fake.take().is_empty(), "held by the debounce");
+        // Its name was at its own address all along: nothing to rewrite.
+        pass(&app).await;
+        assert!(fake.take().is_empty());
 
         // A poll that leaves it out stops it at once.
         let body = poll_ready(&app, &home, json!([svc("plex", 443, 32400)]), &[]).await;
@@ -3818,12 +3817,19 @@ mod dns_records {
     }
 
     #[tokio::test]
-    async fn the_proxy_and_marked_services_never_terminate() {
+    async fn a_marked_service_terminates_like_any_other() {
         let fake = Arc::new(FakeDns::default());
         let app = app(&fake);
-        let px = node(&app, "px").await;
-        let body = poll_ready(&app, &px, json!([svc("web", 443, 8443)]), &["web"]).await;
-        assert!(directory_entry(&body, "web").get("terminated").is_none(), "the proxy: {body}");
+        let home = node(&app, "home").await;
+        poll_ready(&app, &home, json!([svc("jellyfin", 443, 8096)]), &[]).await;
+        let req = json_request("PUT", "/admin/services/jellyfin/auth", Some(ADMIN), json!({ "enabled": false }));
+        app.router.clone().oneshot(req).await.unwrap();
+        app.state.db.conn.lock().await.execute(
+            "INSERT INTO service_auth (name, marked_at) VALUES ('jellyfin', '2026-09-27T00:00:00Z')", [],
+        ).unwrap();
+        let body = poll_ready(&app, &home, json!([svc("jellyfin", 443, 8096)]), &["jellyfin"]).await;
+        assert_eq!(directory_entry(&body, "jellyfin")["terminated"], json!(true), "{body}");
+        assert_eq!(directory_entry(&body, "jellyfin")["auth"], json!(true), "{body}");
     }
 
     #[tokio::test]
@@ -3843,7 +3849,6 @@ mod dns_records {
         for (who, fqdn, value, want) in [
             (&px, "plex.int.example.com", DIGEST, StatusCode::FORBIDDEN),   // not its service
             (&home, "prom.int.example.com", DIGEST, StatusCode::FORBIDDEN), // not on 443
-            (&px, "web.int.example.com", DIGEST, StatusCode::FORBIDDEN),    // the proxy
             (&home, "plex.other.com", DIGEST, StatusCode::FORBIDDEN),       // not our domain
             (&home, "x.plex.int.example.com", DIGEST, StatusCode::FORBIDDEN),
             (&home, "plex.int.example.com", "not-a-digest", StatusCode::BAD_REQUEST),

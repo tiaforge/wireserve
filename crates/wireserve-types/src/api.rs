@@ -192,17 +192,17 @@ pub const MAX_TRANSIT_WANTED_PER_POLL: usize = 64;
 /// that polls can. Checked by admin actions whose effect is unsafe on an
 /// agent that would silently ignore it.
 ///
-/// `service-auth` (PLAN.md M29): this agent restricts a service marked for
-/// sign-in to the proxy's address, and, as the proxy, puts the sign-in in
-/// front of it. An agent without either half would leave a marked service
-/// open, one way or the other.
-pub const CAP_SERVICE_AUTH: &str = "service-auth";
-
 /// `tls-terminate` (PLAN.md M33): this agent runs, or can run, the
 /// terminator that serves its own 443 services with TLS on their own
 /// addresses. Reported whether or not a service is ready yet, so the
 /// coordinator can tell an old agent from a terminator that is failing.
 pub const CAP_TLS_TERMINATE: &str = "tls-terminate";
+
+/// `sign-in` (PLAN.md M34): this agent's terminator puts the built-in
+/// sign-in in front of a marked service, and its firewall opens nothing of a
+/// marked service but that. Required of a service's owner before an admin
+/// may mark it.
+pub const CAP_SIGN_IN: &str = "sign-in";
 
 /// At most this many names are read from one poll's `tls_ready`.
 pub const MAX_TLS_READY_PER_POLL: usize = 64;
@@ -307,7 +307,7 @@ pub struct PollRequest {
     pub transit_wanted: Vec<String>,
     #[serde(default)]
     pub services: Vec<ServiceDecl>,
-    /// What this agent can do — see [`CAP_SERVICE_AUTH`]. Absent from an
+    /// What this agent can do — see [`CAP_SIGN_IN`]. Absent from an
     /// agent that predates it, which is exactly the one that must not be
     /// trusted with a service marked for sign-in.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

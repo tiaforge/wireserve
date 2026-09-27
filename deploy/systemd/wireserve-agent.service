@@ -72,11 +72,7 @@ PrivateTmp=true
 # the agent then finds the file read-only and exits so Restart= below
 # re-creates the mount (PLAN.md decisions log #79).
 ProtectSystem=strict
-# `-/etc/caddy` is optional-if-absent: it is only needed on a node running
-# `--proxy caddy` (PLAN.md M25), and ProtectSystem=strict would otherwise
-# make the generated vhost file unwritable. A node with no proxy has no
-# /etc/caddy and systemd skips it.
-ReadWritePaths=/var/lib/wireserve /run/wireserve /run/wireserve-tls /etc/hosts -/run/xtables.lock -/etc/caddy
+ReadWritePaths=/var/lib/wireserve /run/wireserve /run/wireserve-tls /etc/hosts -/run/xtables.lock
 
 [Install]
 WantedBy=multi-user.target

@@ -23,7 +23,7 @@ const APPENDED_HEADING: &str = "# ---- Set by `wireserve-coordinator install` --
 /// active `KEY=value` line wins.
 #[must_use]
 pub fn get(text: &str, key: &str) -> Option<String> {
-    text.lines().filter_map(|line| active_value(line, key)).last().map(str::to_string)
+    text.lines().filter_map(|line| active_value(line, key)).next_back().map(str::to_string)
 }
 
 /// `value` when `line` is an active (not commented) assignment to `key`.

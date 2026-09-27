@@ -289,17 +289,16 @@ pub async fn list_services(
     Ok(Json(AdminServicesResponse { services: out }))
 }
 
-/// `PUT /admin/services/{name}/auth` (PLAN.md M29): publish a service behind
-/// the proxy's sign-in, or stop.
+/// `PUT /admin/services/{name}/auth` (PLAN.md M29, M34): put the built-in
+/// sign-in in front of a service, or take it away.
 ///
 /// Turning it on is where everything that could leave a marked service open
-/// is checked, because every one of them fails *open*: the mesh must name
-/// services and have a proxy; the service must be one the proxy publishes
-/// (TCP 443, an address of its own) and not the proxy itself; and both the
-/// owning node and the proxy's node must say they understand the mark. An
-/// older owning agent would ignore it and leave the service reachable
-/// directly; an older proxy would publish it with no sign-in while the owner
-/// admitted nothing but that proxy.
+/// is refused: the mesh must have a sign-in (`WIRESERVE_AUTH_SERVICE`, which
+/// needs DNS records and so a service domain); the service must be one a
+/// terminator serves (TCP 443, an address of its own) and not the sign-in
+/// itself; and its node must report `sign-in`. An older agent would fail
+/// closed rather than open — it finds no proxy to admit and opens nothing —
+/// but saying so here beats a service that silently stops answering.
 ///
 /// Turning it off is never refused. Nor is marking a name nothing declares:
 /// it waits, and whoever declares it is published behind the sign-in.
@@ -314,57 +313,37 @@ pub async fn set_service_auth(
     }
     let conn = state.db.conn.lock().await;
     if body.enabled {
-        let naming = state.config.service_naming().ok_or_else(|| {
+        let sign_in = state.config.sign_in.as_ref().ok_or_else(|| {
             AppError::Conflict(
-                "sign-in is put in front of a service by the mesh's reverse proxy, and this mesh \
-                 has none — set WIRESERVE_SERVICE_DOMAIN and WIRESERVE_SERVICE_PROXY first"
+                "this mesh has no sign-in — set WIRESERVE_AUTH_SERVICE (with WIRESERVE_SERVICE_DOMAIN \
+                 and WIRESERVE_DNS_PROVIDER) first"
                     .into(),
             )
         })?;
-        let proxy_name = naming.proxy_service.clone().ok_or_else(|| {
-            AppError::Conflict("this mesh has a service domain but no WIRESERVE_SERVICE_PROXY".into())
-        })?;
-        if proxy_name == name {
-            return Err(AppError::BadRequest(
-                "the proxy itself cannot sit behind its own sign-in".into(),
-            ));
+        if sign_in.service == name {
+            return Err(AppError::BadRequest("the sign-in service cannot sit behind itself".into()));
         }
-        let fresh = state.config.online_threshold_secs;
-        let capable = |node_id: i64| -> Result<bool, AppError> {
-            let node = nodes::find_by_id(&conn, node_id)?;
-            Ok(node.and_then(|n| n.pubkey).is_some_and(|pk| {
-                state.transit.has_capability(&pk, wireserve_types::CAP_SERVICE_AUTH, fresh)
-            }))
-        };
         if let Some(service) = services::find_by_name(&conn, &name)? {
-            let proxied = service.vip4.is_some()
+            let served = service.vip4.is_some()
                 && wireserve_types::effective_ports(&service.ports, service.port, service.proto)
                     .iter()
                     .any(|m| m.public == wireserve_types::TLS_PUBLIC_PORT && m.proto == wireserve_types::Proto::Tcp);
-            if !proxied {
+            if !served {
                 return Err(AppError::Conflict(format!(
-                    "'{name}' is not published on TCP 443 with an address of its own, so the proxy \
-                     does not front it and has nothing to put a sign-in in front of"
+                    "'{name}' is not published on TCP 443 with an address of its own, so no terminator \
+                     serves it and there is nothing to put a sign-in in front of"
                 )));
             }
-            if !capable(service.node_id)? {
+            let fresh = state.config.online_threshold_secs;
+            let capable = nodes::find_by_id(&conn, service.node_id)?
+                .and_then(|n| n.pubkey)
+                .is_some_and(|pk| state.transit.has_capability(&pk, wireserve_types::CAP_SIGN_IN, fresh));
+            if !capable {
                 return Err(AppError::Conflict(format!(
-                    "the node declaring '{name}' has not reported that it can restrict a service to \
-                     the proxy — upgrade its agent (and let it poll once) first"
+                    "the node declaring '{name}' has not reported that its terminator puts a sign-in in \
+                     front of a service — upgrade its agent (and let it poll once) first"
                 )));
             }
-        }
-        let proxy = services::find_by_name(&conn, &proxy_name)?.filter(services::ServiceRow::is_approved);
-        let proxy_capable = match proxy {
-            Some(p) => capable(p.node_id)?,
-            None => false,
-        };
-        if !proxy_capable {
-            return Err(AppError::Conflict(format!(
-                "the proxy ('{proxy_name}') is not published, or its node has not reported that it \
-                 can put a sign-in in front of a service — upgrade that agent (and let it poll \
-                 once) first"
-            )));
         }
     }
     services::set_auth(&conn, &name, body.enabled)?;

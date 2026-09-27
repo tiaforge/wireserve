@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
-use wireserve_types::tls::{Caller, TlsConfig, TlsRequest, TlsResponse, TlsService};
+use wireserve_types::tls::{Caller, SignInTarget, TlsConfig, TlsRequest, TlsResponse, TlsService};
 use wireserve_types::{Proto, TLS_PUBLIC_PORT};
 
 use crate::state::AgentState;
@@ -105,8 +105,10 @@ async fn dispatch(ctx: &TlsContext, req: TlsRequest) -> TlsResponse {
 /// not the directory, because the directory leaves a mapping's target
 /// address out and the terminator needs it.
 ///
-/// A service marked for sign-in is left to the proxy (PLAN.md M33): the
-/// built-in sign-in comes in M34.
+/// A service marked for sign-in (PLAN.md M34) is served too, flagged, and
+/// the sign-in resolved to where it answers: the provider's service's own
+/// address, once its own node serves it with TLS — the terminator checks
+/// every request there over verified TLS.
 #[must_use]
 pub fn build_config(state: &AgentState) -> TlsConfig {
     let Some(directory) = &state.last_directory else {
@@ -125,10 +127,10 @@ pub fn build_config(state: &AgentState) -> TlsConfig {
         return TlsConfig { callers, ..TlsConfig::default() };
     };
     let own = node.to_string();
+    let marked = |name: &str| directory.services.iter().any(|s| s.name == name && s.ip4 == own && s.auth);
     let services = state
         .declared_services
         .iter()
-        .filter(|d| !directory.services.iter().any(|s| s.name == d.name && s.ip4 == own && s.auth))
         .filter_map(|d| {
             let vip = crate::poll_loop::own_vip(&d.name, node, directory)?;
             let map = d.port_maps().into_iter().find(|m| m.public == TLS_PUBLIC_PORT && m.proto == Proto::Tcp)?;
@@ -137,10 +139,21 @@ pub fn build_config(state: &AgentState) -> TlsConfig {
                 fqdn: format!("{}.{}", d.name, naming.domain),
                 vip,
                 upstream: SocketAddr::new(map.addr.unwrap_or(node).into(), map.target),
+                sign_in: marked(&d.name),
             })
         })
         .collect();
-    TlsConfig { acme: Some(acme), services, callers }
+    let sign_in = naming.sign_in.as_ref().and_then(|si| {
+        let provider = directory.services.iter().find(|s| s.name == si.service && s.terminated)?;
+        Some(SignInTarget {
+            fqdn: format!("{}.{}", si.service, naming.domain),
+            vip: provider.vip4.as_deref()?.parse().ok()?,
+            verify_path: si.verify_path.clone(),
+            copy_headers: si.copy_headers.clone(),
+            session_cookie: si.session_cookie.clone(),
+        })
+    });
+    TlsConfig { acme: Some(acme), services, callers, sign_in }
 }
 
 /// Publishes or withdraws a challenge value through the coordinator, for a
@@ -194,14 +207,21 @@ mod tests {
                  "vip4": "10.9.0.50", "auth": auth},
                 {"name": "prom", "node": "home", "ip4": "10.9.0.1", "port": 80, "proto": "tcp", "online": true,
                  "vip4": "10.9.0.51"},
+                {"name": "auth", "node": "gate", "ip4": "10.9.0.2", "port": 443, "proto": "tcp", "online": true,
+                 "vip4": "10.9.0.60", "terminated": true},
             ],
         }))
         .unwrap();
         let mut directory = directory;
         directory.naming = Some(ServiceNaming {
             domain: "int.test".into(),
-            proxy_service: None,
             acme: acme.then(|| AcmeSettings { directory: "https://acme.test/dir".into(), email: None, propagation_secs: 0 }),
+            sign_in: Some(wireserve_types::SignIn {
+                service: "auth".into(),
+                verify_path: "/verify".into(),
+                copy_headers: vec!["x-auth-user".into()],
+                session_cookie: "authward_session".into(),
+            }),
         });
         AgentState {
             ip4: Some("10.9.0.1".into()),
@@ -227,9 +247,23 @@ mod tests {
     }
 
     #[test]
-    fn nothing_without_records_and_nothing_behind_the_sign_in() {
+    fn nothing_without_records() {
         assert!(build_config(&state(false, false)).services.is_empty());
-        assert!(build_config(&state(true, true)).services.is_empty());
         assert!(build_config(&AgentState::default()).services.is_empty());
+    }
+
+    #[test]
+    fn a_marked_service_is_served_flagged_with_the_sign_in_resolved() {
+        let cfg = build_config(&state(true, true));
+        assert!(cfg.services[0].sign_in);
+        let si = cfg.sign_in.expect("the provider is terminated, so it can be reached");
+        assert_eq!((si.fqdn.as_str(), si.vip), ("auth.int.test", "10.9.0.60".parse().unwrap()));
+
+        // A provider its own node does not serve with TLS yet is unreachable
+        // for the check, so there is no target — and marked services refuse.
+        let mut st = state(true, true);
+        let dir = st.last_directory.as_mut().unwrap();
+        dir.services.iter_mut().find(|s| s.name == "auth").unwrap().terminated = false;
+        assert!(build_config(&st).sign_in.is_none());
     }
 }

@@ -13,9 +13,10 @@
 //! * **A changed address must hold before it is written.** A new name is
 //!   published at once and a withdrawn one removed at once, but a name
 //!   moving from one address to another is written only once the new
-//!   address has held for [`DEBOUNCE`]. A proxy briefly missing from the
-//!   directory would otherwise swing every 443 name to its own address and
-//!   back, and cached answers would carry the swing for a full TTL.
+//!   address has held for [`DEBOUNCE`]. A name that swung and swung back —
+//!   a service briefly declared without an address of its own falls back
+//!   to its node's — would otherwise leave the swing in resolver caches for
+//!   a full TTL.
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -80,7 +81,7 @@ pub fn desired(services: &[ServiceInfo], naming: Option<&ServiceNaming>) -> BTre
     if naming.is_none() {
         return BTreeMap::new();
     }
-    let names = ServiceNames::new(naming, services);
+    let names = ServiceNames::new(naming);
     services
         .iter()
         // The same re-check the hosts file makes: a name that is not a plain
@@ -300,8 +301,8 @@ mod tests {
         }
     }
 
-    fn naming(proxy: Option<&str>) -> ServiceNaming {
-        ServiceNaming { domain: "Int.Example.com".into(), proxy_service: proxy.map(Into::into), acme: None }
+    fn naming() -> ServiceNaming {
+        ServiceNaming { domain: "Int.Example.com".into(), acme: None, sign_in: None }
     }
 
     fn ip(s: &str) -> Ipv4Addr {
@@ -311,10 +312,10 @@ mod tests {
     #[test]
     fn desired_follows_the_hosts_file_rule() {
         let services = [svc("plex", "10.77.0.10", 443), svc("prom", "10.77.0.11", 80), svc("web", "10.77.0.12", 443)];
-        let d = desired(&services, Some(&naming(Some("web"))));
-        assert_eq!(d["plex.int.example.com"].addr, ip("10.77.0.12"), "443 goes to the proxy");
-        assert_eq!(d["prom.int.example.com"].addr, ip("10.77.0.11"), "everything else to its own address");
-        assert_eq!(d["web.int.example.com"].addr, ip("10.77.0.12"));
+        let d = desired(&services, Some(&naming()));
+        assert_eq!(d["plex.int.example.com"].addr, ip("10.77.0.10"), "443 too: its own node serves it");
+        assert_eq!(d["prom.int.example.com"].addr, ip("10.77.0.11"));
+        assert_eq!(d["web.int.example.com"].addr, ip("10.77.0.12"), "and so does every other");
         assert!(desired(&services, None).is_empty(), "no domain, no public names");
     }
 
@@ -324,7 +325,7 @@ mod tests {
         bad_name.name = "evil.name".into();
         let mut bad_addr = svc("graf", "not-an-ip", 80);
         bad_addr.ip4 = "also-not".into();
-        assert!(desired(&[bad_name, bad_addr], Some(&naming(None))).is_empty());
+        assert!(desired(&[bad_name, bad_addr], Some(&naming())).is_empty());
     }
 
     fn want(pairs: &[(&str, &str)]) -> BTreeMap<String, Wanted> {

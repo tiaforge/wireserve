@@ -288,7 +288,7 @@ mod tests {
             service_domain: None,
             dns: None,
             acme: config::acme_from_lookup(|_| None).unwrap(),
-            service_proxy: None,
+            sign_in: None,
             online_threshold_secs: 180,
             rate_limit_max: 10,
             rate_limit_window_secs: 60,

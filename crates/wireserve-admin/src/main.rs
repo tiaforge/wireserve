@@ -94,21 +94,21 @@ enum Command {
     ApproveService {
         node: String,
         service: String,
-        /// Publish it behind the proxy's sign-in (see `service-auth`). Set
+        /// Put it behind the sign-in (see `service-auth`). Set
         /// before the approval, so the service never appears without it.
         #[arg(long)]
         auth: bool,
     },
-    /// Publish a service behind the reverse proxy's sign-in (`on`), or stop
-    /// (`off`). The proxy runs your `wireserve_auth` snippet — authward's
-    /// forward_auth, say — in front of it, and the service's own node admits
-    /// nobody but the proxy, so the sign-in cannot be walked around.
+    /// Put a service behind the sign-in (`on`), or take it away (`off`). Its
+    /// node's TLS terminator asks the sign-in provider (the coordinator's
+    /// `WIRESERVE_AUTH_SERVICE`, e.g. authward) about every request, and the
+    /// node opens nothing else of the service, so the sign-in cannot be
+    /// walked around.
     ///
     /// Only for services published on TCP 443. Refused until the service's
-    /// node and the proxy's node run an agent that understands it, since
-    /// either one ignoring it would leave the service open. The mark belongs
-    /// to the name: it outlasts the service being withdrawn and declared
-    /// again, and can be set before anything declares it.
+    /// node runs an agent with the built-in sign-in. The mark belongs to the
+    /// name: it outlasts the service being withdrawn and declared again, and
+    /// can be set before anything declares it.
     ServiceAuth { service: String, state: OnOff },
     /// Deny a declaration, or withdraw an approval already granted.
     ///
@@ -344,7 +344,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             wireserve_admin::cmd_approve_service(&client, &node, &service)?;
             if auth {
-                println!("service '{service}' approved for node '{node}', behind the proxy's sign-in");
+                println!("service '{service}' approved for node '{node}', behind the sign-in");
             } else {
                 println!("service '{service}' approved for node '{node}'");
             }
@@ -355,8 +355,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             wireserve_admin::cmd_set_service_auth(&client, &service, enabled)?;
             if enabled {
                 println!(
-                    "'{service}' is published behind the proxy's sign-in from the next poll; its \
-                     node admits only the proxy"
+                    "'{service}' is behind the sign-in from its node's next poll; nothing else of it is \
+                     reachable"
                 );
             } else {
                 println!("'{service}' is published without a sign-in from the next poll, to the whole mesh");

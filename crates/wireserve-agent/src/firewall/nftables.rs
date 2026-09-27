@@ -576,15 +576,6 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
         })
         .collect();
     let has_service_addresses = !mapped.is_empty() || !terminated.is_empty();
-    // The one client each mapping admits from the mesh, if it is limited to
-    // one (PLAN.md M29): the proxy, for a service behind its sign-in.
-    let only_from: Vec<Option<Ipv4Addr>> = rules
-        .iter()
-        .filter_map(|r| match *r {
-            ServiceRule::Mapped { only_from, .. } => Some(only_from),
-            ServiceRule::Open { .. } | ServiceRule::Terminated { .. } => None,
-        })
-        .collect();
     let open: Vec<(Proto, u16, Ipv4Addr, Option<Ipv6Addr>)> = rules
         .iter()
         .filter_map(|r| match *r {
@@ -734,17 +725,9 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
     }
 
     // ---- service addresses ----
-    // A request from anyone but a mapping's one admitted client is never
-    // rewritten, so it is addressed to the service address, which nothing
-    // here answers: it goes nowhere, the way an undeclared port does. Only
-    // requests arriving from the mesh are limited; the node's own clients
-    // below are not, and the proxy on this very node is one of them.
     objects.push(chain(t, PRE_CHAIN, NfChainType::Filter, NfHook::Prerouting, PRIO_RAW));
-    for ((vip, dest, map), only_from) in mapped.iter().zip(&only_from) {
+    for (vip, dest, map) in &mapped {
         let mut expr = vec![iifname_is(ifname)];
-        if let Some(src) = only_from {
-            expr.push(is(payload("ip", "saddr"), addr(*src)));
-        }
         expr.extend(forward_rewrite(*vip, *dest, map));
         objects.push(rule(t, PRE_CHAIN, expr));
     }
@@ -940,7 +923,6 @@ mod tests {
             vip: VIP,
             node: NODE,
             map: map.parse().unwrap(),
-            only_from: None,
         }
     }
 
@@ -1611,27 +1593,6 @@ mod tests {
         has("type nat hook postrouting priority srcnat; policy accept;");
         has(&format!("meta mark & {m} == {m} ip daddr 192.168.178.1 tcp dport 80 oifname != \"wg0\" masquerade"));
         has(&format!("iifname \"eth0\" meta nfproto ipv4 ct mark & {m} != {m} drop"));
-    }
-
-    #[test]
-    fn a_mapping_limited_to_the_proxy_is_rewritten_for_the_proxy_alone() {
-        const PROXY: Ipv4Addr = Ipv4Addr::new(100, 90, 0, 7);
-        let rule = ServiceRule::Mapped { vip: VIP, node: NODE, map: "443:8096".parse().unwrap(), only_from: Some(PROXY) };
-        let batch = as_json(&apply_batch("wg0", &[rule], &fwd(&[])));
-        let pre = rules_in(&batch, "svc-pre");
-        assert_eq!(pre.len(), 1);
-        assert_eq!(pre[0][0], iif("wg0"));
-        assert_eq!(pre[0][1], json!({"match": {"op": "==", "left": field("ip", "saddr"), "right": "100.90.0.7"}}));
-        // The node's own clients — the proxy among them, when it runs here —
-        // are not limited.
-        let out = rules_in(&batch, "svc-out");
-        assert!(!out[0].to_string().contains("saddr"), "{}", out[0]);
-        // Everything else about the mapping is what it always was.
-        let plain = ServiceRule::Mapped { vip: VIP, node: NODE, map: "443:8096".parse().unwrap(), only_from: None };
-        let plain_pre = rules_in(&as_json(&apply_batch("wg0", &[plain], &fwd(&[]))), "svc-pre");
-        let mut without = pre[0].as_array().unwrap().clone();
-        without.remove(1);
-        assert_eq!(serde_json::Value::Array(without), plain_pre[0]);
     }
 
     /// A terminated service rewrites nothing, so the kernel takes its rules

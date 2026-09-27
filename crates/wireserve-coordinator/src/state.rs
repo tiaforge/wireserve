@@ -30,7 +30,7 @@ impl AppState {
             auth,
             tls_ready,
             dns: self.dns.is_some(),
-            proxy_service: self.config.service_proxy.as_deref(),
+            sign_in_service: self.config.sign_in.as_ref().map(|s| s.service.as_str()),
             online_threshold_secs: self.config.online_threshold_secs,
         }
     }

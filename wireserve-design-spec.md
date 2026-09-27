@@ -426,46 +426,36 @@ Instead, each poll cycle the agent writes a static, local lookup table:
   reintroduces the "resolver in the query path" problem this design exists
   to avoid.
 
-### 6.1 Real names, and the reverse proxy (M25)
+### 6.1 Real names, public records and TLS on each node (M25, M32–M34)
 
 `.wg` solves naming for anything that runs the agent and for nothing else,
-which is the whole of the problem a phone has. M25 adds an optional
-mesh-wide domain (`WIRESERVE_SERVICE_DOMAIN`), and with it the suffix is
-**replaced** rather than supplemented: `<name>.int.example.com` instead of
-`<name>.wg`. Two working names would give an application two base URLs, and
-anything with a single configured one — `ROOT_URL`, `root_url`, an OIDC
-`redirect_uri` — then emits redirects and sets cookies that bounce between
-them. One service, one name.
-
-**Publishing TCP 443 is the opt-in**, deliberately an existing field rather
-than a new per-service attribute: it needs no schema change, and it is what
-keeps an SSH or Postgres service from acquiring a public hostname and a
-certificate nobody asked for. A service published on 443 resolves to the
-reverse proxy named by `WIRESERVE_SERVICE_PROXY`, from a node and from a
-phone alike, so one base URL is correct in both places. Everything else
-resolves to its own address and keeps the direct path, the real client
-address and the absence of a hop — without public records it is not
-reachable by name from a device with no hosts file.
-
-This does not walk back §6. WireServe still never listens on 53, never
-touches `resolv.conf`, and never enters anyone's query path: the phone's name
-resolution is ordinary public DNS, and the agent generates a configuration
-file for a proxy the operator runs.
+which is the whole of the problem a phone has. An optional mesh-wide domain
+(`WIRESERVE_SERVICE_DOMAIN`) **replaces** the suffix rather than
+supplementing it: `<name>.int.example.com` instead of `<name>.wg`. Two
+working names would give an application two base URLs, and anything with a
+single configured one — `ROOT_URL`, `root_url`, an OIDC `redirect_uri` —
+then emits redirects and sets cookies that bounce between them. One service,
+one name, and it points at the service's own address from everywhere.
 
 **Public records, written by the coordinator (M32).** With a DNS provider
 configured (`WIRESERVE_DNS_PROVIDER`: RFC 2136, Cloudflare, deSEC, Hetzner or
-Porkbun), the coordinator keeps one A record per approved service, pointing
-wherever that name resolves on a node — the rule is one function in
-`wireserve-types`, used by the agents' hosts files and the coordinator
-alike, so the two cannot disagree. It is a reconcile loop, never part of a
-request: a provider outage costs a warning and a retry. It deletes only
-records listed in its own `dns_records` table and replaces a clashing record
-at a service's name, so the service domain is the coordinator's to manage.
-A changed address is written only after it has held for 20 seconds. The
-credential lives in `coordinator.env`, never in the database.
+Porkbun), the coordinator keeps one A record per approved service — the rule
+is one function in `wireserve-types`, used by the agents' hosts files and the
+coordinator alike, so the two cannot disagree. It is a reconcile loop, never
+part of a request: a provider outage costs a warning and a retry. It deletes
+only records listed in its own `dns_records` table and replaces a clashing
+record at a service's name, so the service domain is the coordinator's to
+manage. A changed address is written only after it has held for 20 seconds.
+The credential lives in `coordinator.env`, never in the database.
 
-**TLS on the service's own node (M33).** A 443 service is served with HTTPS
-by `wireserve tls-serve` on its owner node, as its own user, bound to the
+This does not walk back §6. WireServe still never listens on 53, never
+touches `resolv.conf`, and never enters anyone's query path: a phone's name
+resolution is ordinary public DNS.
+
+**TLS on the service's own node (M33).** Publishing TCP 443 is the opt-in —
+an existing field, so an SSH or Postgres service never acquires a
+certificate nobody asked for. Such a service is served with HTTPS by
+`wireserve tls-serve` on its owner node, as its own user, bound to the
 service address, which the agent routes to the host itself (`local` route,
 protocol 247). The agent lets that traffic in unrewritten, only marked, so the
 existing accept and host-firewall openings cover it, and drops the address
@@ -473,25 +463,27 @@ from any interface but the mesh and loopback. The terminator holds the private
 key; the coordinator, holding the DNS credential, publishes the DNS-01
 challenge for the owner's own approved names only (`/tls/challenge`). A
 service is `terminated` in the directory only while its owner reports it
-ready, so names move only once something answers there. The terminator talks
-to the agent over a second socket that decodes nothing but a check-in and a
-challenge request. The proxied
-path does give up the "service sees the real client" property of §-service
-addresses, which is exactly why it is opt-in and why the direct path is left
-untouched beside it.
+ready. The terminator talks to the agent over a second socket that decodes
+nothing but a check-in and a challenge request, and tells the backend who is
+calling (`X-Wireserve-Node`, `X-Forwarded-For`), removing any copies a client
+sent.
 
-**A sign-in in front of chosen services (M29).** An admin can mark a 443
-service so the proxy puts the operator's own `forward_auth` snippet in front
-of it. The mark is only as good as the rule that the backend is unreachable
-except through the proxy — the trust boundary forward_auth providers
-document — so the owning node's rewrite for every mapping of a marked
-service admits the proxy node's mesh address alone. That is the one
-source-restricted rule in the design and deliberately not a general access
-list. WireServe names no identity provider: it emits two snippet imports the
-operator defines. Marks are stored per name, outside the service rows, so a
-withdraw and re-declare cannot quietly drop one, and the coordinator refuses
-a mark until both the owning and the proxy node report the capability,
-since either one ignoring it fails open.
+**A sign-in in front of chosen services (M29, M34).** An admin can mark a 443
+service; its node's terminator then asks the provider named by
+`WIRESERVE_AUTH_SERVICE` about every request — Caddy's `forward_auth`, built
+in: a headers-only copy of the request to `https://<provider>.<domain>/verify`
+on the provider's own address, verified TLS, with the original `Host`,
+`X-Forwarded-Method` and `X-Forwarded-Uri`. A 2xx passes with the provider's
+identity headers copied on (and any a client sent removed first); a 401 with
+`X-Login-Url` redirects a GET; anything else is returned as is. The mark is
+only as good as the rule that the backend is unreachable except through that
+check — the trust boundary forward_auth providers document — so the owning
+node opens nothing of a marked service but its terminated 443, and nothing at
+all while its terminator does not serve it. Every terminator strips the
+provider's domain-wide session cookie from every request but the provider's
+own. Marks are stored per name, outside the service rows, so a withdraw and
+re-declare cannot quietly drop one, and the coordinator refuses a mark until
+the owning node reports `sign-in`.
 
 ### 6.2 A resolver in a full tunnel (M27)
 
@@ -530,8 +522,8 @@ These are treated as core requirements, not hardening to add later:
 - **All external paths to the coordinator are TLS-terminated at the
   reverse proxy — the coordinator itself never holds a certificate or
   speaks TLS.** (Service certificates, M33, are held by each owner node's
-  terminator; the coordinator only publishes their challenge records.) It listens on plain HTTP, on an address only the proxy can
-  reach (loopback, or an internal Docker network — same principle as the
+  terminator; the coordinator only publishes their challenge records.) It
+  listens on plain HTTP, on an address only the proxy can reach (loopback, or an internal Docker network — same principle as the
   admin listener in §4.0), and the proxy forwards plain HTTP internally
   after terminating TLS. What's required is that this is the *only* path
   in: the coordinator's plain-HTTP listener must never be directly
@@ -704,4 +696,5 @@ What it does, end to end:
   (§4.0), which is enough for a single operator but doesn't distinguish
   between multiple admins
 - STUN, relay/hairpin fallback for symmetric NAT
-- ~~Reverse-proxy auto-publish integration~~ — built in M25, see §6.1
+- ~~Reverse-proxy auto-publish integration~~ — built in M25, replaced in
+  M33–M34 by TLS on each service's own node, see §6.1

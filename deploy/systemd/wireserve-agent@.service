@@ -56,7 +56,7 @@ PrivateTmp=true
 # /etc/hosts as a single file: see wireserve-agent.service for why that
 # works, and what happens when the host replaces the file.
 ProtectSystem=strict
-ReadWritePaths=/var/lib/wireserve/instances/%i /run/wireserve-%i /run/wireserve-tls-%i /etc/hosts -/run/xtables.lock -/etc/caddy
+ReadWritePaths=/var/lib/wireserve/instances/%i /run/wireserve-%i /run/wireserve-tls-%i /etc/hosts -/run/xtables.lock
 
 [Install]
 WantedBy=multi-user.target

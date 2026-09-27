@@ -220,7 +220,7 @@ impl AdminClient {
     }
 
     /// `PUT /admin/services/{name}/auth` (PLAN.md M29) — publish a service
-    /// behind the proxy's sign-in, or stop.
+    /// behind the sign-in, or take it away.
     pub fn set_service_auth(&self, service: &str, enabled: bool) -> Result<(), ClientError> {
         let resp = self
             .http

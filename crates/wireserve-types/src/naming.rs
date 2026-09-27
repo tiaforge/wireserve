@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Proto, ServiceInfo};
 
-/// The suffix services are named under, and which service fronts the ones
-/// published on 443.
+/// The suffix services are named under, and what every node's terminator
+/// needs to serve them with TLS.
 ///
 /// Mesh-wide, and carried on every poll and registration the same way
 /// [`crate::MeshInfo`] is: nodes that disagreed about the suffix would
@@ -29,21 +29,39 @@ pub struct ServiceNaming {
     /// `plex.int.example.com`. Absent from the wire entirely when unset,
     /// which leaves `<name>.wg` exactly as it was.
     pub domain: String,
-    /// The service that terminates TLS for everything published on 443.
-    ///
-    /// A *service* name rather than a node name, for three reasons: the proxy
-    /// is reached at a service address, a node could publish several things on
-    /// 443, and this is the same value the operator puts in the wildcard DNS
-    /// record. `None` means no proxy is configured yet, and services published
-    /// on 443 keep resolving to their own address rather than losing their
-    /// names.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub proxy_service: Option<String>,
     /// Where each node's terminator gets its certificates (PLAN.md M33).
     /// Present only when the coordinator publishes DNS records, which is
     /// what makes a certificate for a service name obtainable at all.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub acme: Option<AcmeSettings>,
+    /// The sign-in in front of services marked for it (PLAN.md M34), built
+    /// into every node's terminator. Absent while none is configured.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sign_in: Option<SignIn>,
+}
+
+/// Where the terminators ask whether a request may pass (PLAN.md M34): a
+/// `forward_auth` provider such as authward, itself a mesh service
+/// published on 443.
+///
+/// The terminator sends each request to a marked service to
+/// `https://<service>.<domain><verify_path>` first — on that service's own
+/// address, verified against its certificate — with the original `Host`,
+/// `X-Forwarded-Method`, `X-Forwarded-Uri` and cookies. A 2xx lets it
+/// through with `copy_headers` copied from the answer; a 401 carrying
+/// `X-Login-Url` sends the browser there; anything else is returned as is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignIn {
+    /// The service running the provider, e.g. `auth`.
+    pub service: String,
+    pub verify_path: String,
+    /// The provider's identity headers. Every one is removed from the
+    /// client's request first, whether or not the provider sends it back.
+    pub copy_headers: Vec<String>,
+    /// The provider's session cookie, removed from every request any
+    /// terminator passes to a backend: it is scoped to the whole domain,
+    /// and no backend needs it.
+    pub session_cookie: String,
 }
 
 /// The certificate authority every terminator uses, set once on the
@@ -69,10 +87,9 @@ pub const LETS_ENCRYPT_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/d
 ///
 /// Deliberately an existing field rather than a new per-service attribute: it
 /// needs no schema change, and it is what keeps a Postgres or SSH service from
-/// acquiring a public hostname and a certificate it never asked for. The proxy
-/// still speaks plain HTTP to the backend — 443 is the *published* port, and
-/// the owning node's rewrite maps it to whatever the service really listens
-/// on, so there is no second TLS hop.
+/// acquiring a certificate it never asked for. The owning node's terminator
+/// (PLAN.md M33) answers on 443 and speaks plain HTTP to the service's real
+/// target port on the same node, so there is no second TLS hop.
 pub const TLS_PUBLIC_PORT: u16 = 443;
 
 /// Whether this service publishes [`TLS_PUBLIC_PORT`] over TCP.
@@ -92,45 +109,19 @@ pub fn own_address(s: &ServiceInfo) -> &str {
 ///
 /// The one place this is decided (PLAN.md M32): each agent's hosts file
 /// and the coordinator's public DNS records both come from it, so a name
-/// cannot resolve one way on a node and another way on a phone.
-///
-/// Resolved once from the coordinator's `naming` and the directory itself,
-/// rather than threaded field by field: deciding a service's address needs
-/// the proxy's address, and that is only knowable by looking the proxy
-/// service up in the same directory.
+/// cannot resolve one way on a node and another way on a phone. Since M34
+/// every name points at the service's own address — a 443 service is served
+/// with TLS there by its own node, and there is no central proxy any more.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ServiceNames<'a> {
     /// The domain services are named under. `None` keeps `<name>.wg`.
     domain: Option<&'a str>,
-    /// The address of the service fronting everything published on 443.
-    proxy: Option<Ipv4Addr>,
 }
 
 impl<'a> ServiceNames<'a> {
-    /// Reads the coordinator's setting against the current directory.
-    ///
-    /// A configured proxy that is missing, unapproved or malformed leaves
-    /// [`Self::proxy`] as `None`, which costs 443 services their proxied
-    /// path but not their names — they fall back to resolving directly,
-    /// which is what they did before a domain was set.
     #[must_use]
-    pub fn new(naming: Option<&'a ServiceNaming>, services: &[ServiceInfo]) -> Self {
-        let Some(naming) = naming else {
-            return Self::default();
-        };
-        let proxy = naming.proxy_service.as_deref().and_then(|want| {
-            services
-                .iter()
-                .find(|s| s.name == want)
-                .and_then(|s| own_address(s).parse::<Ipv4Addr>().ok())
-        });
-        Self { domain: Some(&naming.domain), proxy }
-    }
-
-    /// The proxy's address, when one is configured and in the directory.
-    #[must_use]
-    pub fn proxy(&self) -> Option<Ipv4Addr> {
-        self.proxy
+    pub fn new(naming: Option<&'a ServiceNaming>) -> Self {
+        Self { domain: naming.map(|n| n.domain.as_str()) }
     }
 
     /// `<name>.wg`, or `<name>.<domain>` once a domain is set. The suffix is
@@ -145,21 +136,10 @@ impl<'a> ServiceNames<'a> {
         }
     }
 
-    /// Where that name points: the proxy for a service published on 443
-    /// that its own node does not serve with TLS (PLAN.md M33), its own
-    /// address otherwise. `None` for an address that does not parse.
-    ///
-    /// Publishing 443 is the signal that a service wants to be served under
-    /// its name with TLS, so its name has to resolve to the same place from a
-    /// node as it does from a phone — otherwise the scheme differs by where
-    /// you are standing, and one configured base URL cannot be right in both.
-    /// Everything else keeps the direct path, and with it the real client
-    /// address and no extra hop.
+    /// Where that name points: the service's own address. `None` for an
+    /// address that does not parse.
     #[must_use]
     pub fn address(&self, s: &ServiceInfo) -> Option<Ipv4Addr> {
-        match (self.proxy, publishes_tls(s) && !s.terminated) {
-            (Some(proxy), true) => Some(proxy),
-            _ => own_address(s).parse().ok(),
-        }
+        own_address(s).parse().ok()
     }
 }

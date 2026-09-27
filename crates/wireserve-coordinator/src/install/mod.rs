@@ -137,9 +137,13 @@ pub struct InstallArgs {
     /// Keep services named <name>.wg.
     #[arg(long)]
     pub no_domain: bool,
-    /// With --domain: the service your web proxy is published as (default web).
-    #[arg(long, value_name = "NAME")]
-    pub proxy_service: Option<String>,
+    /// With a DNS provider: the service running your sign-in (forward_auth)
+    /// provider, e.g. authward published as `auth`.
+    #[arg(long, value_name = "NAME", conflicts_with = "no_auth_service")]
+    pub auth_service: Option<String>,
+    /// No sign-in.
+    #[arg(long)]
+    pub no_auth_service: bool,
     /// Let the coordinator write each service's public DNS record through
     /// this provider (rfc2136, cloudflare, desec, hetzner, porkbun). Its
     /// credentials are read from the WIRESERVE_DNS_* environment variables,
@@ -187,7 +191,7 @@ impl InstallArgs {
                 None
             },
             domain: if self.no_domain { Some(None) } else { self.domain.clone().map(Some) },
-            proxy_service: self.proxy_service.clone(),
+            sign_in: if self.no_auth_service { Some(None) } else { self.auth_service.clone().map(Some) },
             dns_provider: if self.no_dns { Some(None) } else { self.dns_provider.clone().map(Some) },
             admin_user: if self.no_admin_user { Some(None) } else { self.admin_user.clone().map(Some) },
         }
@@ -204,7 +208,8 @@ impl InstallArgs {
             (self.no_approval, "--no-approval"),
             (self.domain.is_some(), "--domain"),
             (self.no_domain, "--no-domain"),
-            (self.proxy_service.is_some(), "--proxy-service"),
+            (self.auth_service.is_some(), "--auth-service"),
+            (self.no_auth_service, "--no-auth-service"),
             (self.dns_provider.is_some(), "--dns-provider"),
             (self.no_dns, "--no-dns"),
             (self.admin_user.is_some(), "--admin-user"),
@@ -560,7 +565,7 @@ fn dropin(user: &str) -> String {
 /// The user an earlier `--user` install chose, from its drop-in.
 fn dropin_user() -> Option<String> {
     let text = std::fs::read_to_string(DROPIN_DEST).ok()?;
-    text.lines().filter_map(|l| l.trim().strip_prefix("User=")).last().map(|u| u.trim().to_string())
+    text.lines().filter_map(|l| l.trim().strip_prefix("User=")).next_back().map(|u| u.trim().to_string())
 }
 
 fn run_tool(program: &str, args: &[&str]) -> Result<(), InstallError> {
@@ -685,11 +690,17 @@ fn print_next_steps(answers: &Answers, service_user: &str, state_dir: &Path) {
     }
     if let Some(n) = &answers.naming {
         println!();
-        println!("3. Service names: on the machine that runs your service proxy, publish it");
-        println!("   as `{}` — with Caddy listening on 8443 there:", n.proxy_service);
-        println!("     wireserve serve {} 443:8443", n.proxy_service);
-        println!("   then add a wildcard DNS record *.{} pointing at that service's", n.domain);
-        println!("   address (shown by `wireserve list`).");
+        if n.dns.is_some() {
+            println!("3. Service names: the coordinator writes <name>.{} for every approved", n.domain);
+            println!("   service, and each node serves its services published on 443 with HTTPS.");
+            if let Some(svc) = &n.sign_in {
+                println!("   Publish your sign-in provider as `{svc}` on 443, e.g.:  wireserve serve {svc} 443:8080");
+            }
+        } else {
+            println!("3. Service names: <name>.{} works on machines running WireServe only.", n.domain);
+            println!("   Give the coordinator a DNS provider (install --reconfigure) for names and");
+            println!("   HTTPS everywhere, phones included.");
+        }
     }
     println!();
     match &answers.admin_user {

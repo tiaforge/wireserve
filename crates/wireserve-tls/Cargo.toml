@@ -28,9 +28,14 @@ rustls-pki-types = "1"
 # The upstream is plain HTTP on this very node, so no TLS client features.
 axum-reverse-proxy = { version = "2.2", default-features = false }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio", "http1", "http2", "client-legacy"] }
+http-body-util = "0.1"
 tower = { workspace = true, features = ["util"] }
 socket2 = { version = "0.6", features = ["all"] }
+# The sign-in check (PLAN.md M34): TLS to the provider's own address,
+# verified against the public roots Mozilla ships.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "logging", "aws-lc-rs"] }
+webpki-roots = "1"
 libc.workspace = true
 rand.workspace = true
 

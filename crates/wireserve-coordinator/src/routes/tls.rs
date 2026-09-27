@@ -121,11 +121,5 @@ async fn authorize(
     if service.vip4.is_none() || !tls_port {
         return refuse("that service is not published on TCP 443 with an address of its own");
     }
-    if services::auth_names(&conn)?.contains(&name) {
-        return refuse("that service is behind the proxy's sign-in");
-    }
-    if state.config.service_proxy.as_deref() == Some(name.as_str()) {
-        return refuse("that service is the proxy");
-    }
     Ok((dns, wireserve_types::tls::challenge_name(&fqdn)))
 }

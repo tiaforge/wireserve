@@ -104,7 +104,6 @@ expect_key "$WORK/env1" WIRESERVE_ADMIN_LISTEN_ADDR=127.0.0.1:48001
 expect_key "$WORK/env1" WIRESERVE_TRUST_PROXY_HEADERS=true
 expect_key "$WORK/env1" WIRESERVE_REQUIRE_SERVICE_APPROVAL=true
 expect_key "$WORK/env1" WIRESERVE_SERVICE_DOMAIN=int.test
-expect_key "$WORK/env1" WIRESERVE_SERVICE_PROXY=web
 if grep -q '^WIRESERVE_TRUSTED_PROXY=' "$WORK/env1"; then fail "trusted proxy set for a local web server"; fi
 [ "$(in_c "$C" stat -c '%U %a' /etc/wireserve/coordinator.env)" = "root 600" ] || fail "env file not root 600"
 pass "env file holds exactly the answers, root 600"
