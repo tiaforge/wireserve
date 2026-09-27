@@ -272,8 +272,11 @@ unset WIRESERVE_SOCKET_GROUP
 [ "$(stat -c '%a %G' "$sock")" = "660 $GRP" ] || fail "socket is $(stat -c '%a %G' "$sock"), want 660 $GRP"
 [ "$(stat -c '%a %G' "$(dirname "$sock")")" = "750 $GRP" ] || fail "socket directory is not 750 $GRP"
 as_user() { setpriv --reuid=48211 --regid=48211 "$@"; }
-member=(as_user --groups="$GRP_GID" env WIRESERVE_RUN_ROOT="$WORK/host/run" "$BIN/wireserve" --instance work)
-outsider=(as_user --clear-groups env WIRESERVE_RUN_ROOT="$WORK/host/run" "$BIN/wireserve" --instance work)
+# The checkout may sit under a 0700 home directory, which those ids cannot
+# enter: they run a copy of the client from here instead.
+install -m 755 "$BIN/wireserve" "$WORK/wireserve-client"
+member=(as_user --groups="$GRP_GID" env WIRESERVE_RUN_ROOT="$WORK/host/run" "$WORK/wireserve-client" --instance work)
+outsider=(as_user --clear-groups env WIRESERVE_RUN_ROOT="$WORK/host/run" "$WORK/wireserve-client" --instance work)
 "${member[@]}" list >/dev/null || fail "a member of $GRP could not use the daemon"
 "${member[@]}" serve gtest 7099 >/dev/null || fail "a member of $GRP could not change what the node serves"
 "${member[@]}" unserve gtest >/dev/null || fail "a member of $GRP could not withdraw it"
