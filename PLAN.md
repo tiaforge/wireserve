@@ -3177,9 +3177,11 @@ about any more.
     question is now which service runs the sign-in (`--auth-service`,
     `--no-auth-service`), asked only with a DNS provider.
 
-`deploy/e2e/run-service-auth-test.sh` **passes** (2026-09-27): the stub
-provider on its own node, a marked service refused without a session and
-served with one, identity headers copied and forged ones removed.
+`deploy/e2e/run-service-auth-test.sh` **passes** (2026-09-27), all six
+steps: every service terminated; a marked service sends a caller without a
+session to sign in and serves one with it, the backend seeing who and not
+the cookie; an unmarked one needs no sign-in and loses the cookie too; the
+way round the sign-in leads nowhere; `service-auth off` gives it back.
 
 ## Cleanup — no earlier installation is assumed
 
