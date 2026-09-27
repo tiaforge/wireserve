@@ -198,7 +198,11 @@ pub async fn run(opts: Options) -> Result<(), Error> {
             let s = served.entry(service.name.clone()).or_insert_with(|| Served { service: service.clone(), listener: None });
             if s.service != *service {
                 if let Some(l) = s.listener.take() {
+                    // Aborting only schedules the cancellation; until the
+                    // task is dropped its socket still holds the address,
+                    // and binding it again below would fail.
                     l.abort();
+                    let _ = l.await;
                 }
                 s.service = service.clone();
             }
