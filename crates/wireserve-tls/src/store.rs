@@ -1,5 +1,7 @@
-//! Certificates on disk (PLAN.md M33): one directory per name under the
-//! terminator's own state directory, readable by it alone.
+//! Certificates on disk (PLAN.md M33): one directory per CA and name under
+//! the terminator's own state directory, readable by it alone. Per CA, so a
+//! certificate from Let's Encrypt's staging CA is never served once the
+//! coordinator points at production.
 //!
 //! Kept across restarts so a restart never costs an issuance: Let's
 //! Encrypt allows five duplicate certificates a week, and every agent
@@ -40,6 +42,18 @@ impl Stored {
     }
 }
 
+/// A short name for an ACME directory URL, stable across builds (FNV-1a):
+/// it names files on disk, which must outlive any one toolchain.
+#[must_use]
+pub fn ca_id(directory: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in directory.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
 pub struct Store {
     root: PathBuf,
 }
@@ -57,13 +71,14 @@ impl Store {
         &self.root
     }
 
-    fn dir(&self, fqdn: &str) -> PathBuf {
-        self.root.join("certs").join(fqdn)
+    fn dir(&self, directory: &str, fqdn: &str) -> PathBuf {
+        self.root.join("certs").join(ca_id(directory)).join(fqdn)
     }
 
-    /// The certificate for `fqdn`, if one is stored and readable.
-    pub fn load(&self, fqdn: &str) -> io::Result<Option<Stored>> {
-        let dir = self.dir(fqdn);
+    /// The certificate for `fqdn` from the CA at `directory`, if one is
+    /// stored and readable.
+    pub fn load(&self, directory: &str, fqdn: &str) -> io::Result<Option<Stored>> {
+        let dir = self.dir(directory, fqdn);
         let (Ok(chain), Ok(key)) = (std::fs::read(dir.join("cert.pem")), std::fs::read(dir.join("key.pem"))) else {
             return Ok(None);
         };
@@ -72,11 +87,14 @@ impl Store {
 
     /// Stores a freshly issued certificate, replacing the old one only once
     /// both files are fully written.
-    pub fn save(&self, fqdn: &str, chain_pem: &str, key_pem: &str) -> io::Result<Stored> {
+    pub fn save(&self, directory: &str, fqdn: &str, chain_pem: &str, key_pem: &str) -> io::Result<Stored> {
         let stored = parse(chain_pem.as_bytes(), key_pem.as_bytes())?;
-        let dir = self.dir(fqdn);
+        let dir = self.dir(directory, fqdn);
         std::fs::create_dir_all(&dir)?;
         set_mode(&dir, 0o700)?;
+        if let Some(ca) = dir.parent() {
+            set_mode(ca, 0o700)?;
+        }
         write_atomic(&dir.join("key.pem"), key_pem.as_bytes())?;
         write_atomic(&dir.join("cert.pem"), chain_pem.as_bytes())?;
         Ok(stored)
@@ -141,16 +159,36 @@ pub(crate) mod tests {
     fn a_saved_certificate_loads_back_and_renews_two_thirds_in() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        assert!(store.load("plex.int.test").unwrap().is_none());
+        assert!(store.load(CA, "plex.int.test").unwrap().is_none());
         let (chain, key) = self_signed("plex.int.test", 90);
-        store.save("plex.int.test", &chain, &key).unwrap();
-        let loaded = store.load("plex.int.test").unwrap().unwrap();
+        store.save(CA, "plex.int.test", &chain, &key).unwrap();
+        let loaded = store.load(CA, "plex.int.test").unwrap().unwrap();
         let life = loaded.not_after.duration_since(loaded.not_before).unwrap();
         assert_eq!(life, Duration::from_secs(90 * 86_400));
         assert_eq!(loaded.default_renewal(), loaded.not_before + Duration::from_secs(60 * 86_400));
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(dir.path().join("certs/plex.int.test/key.pem")).unwrap().permissions().mode();
+        let key_path = dir.path().join("certs").join(ca_id(CA)).join("plex.int.test/key.pem");
+        let mode = std::fs::metadata(key_path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    const CA: &str = "https://acme-staging-v02.api.letsencrypt.org/directory";
+
+    #[test]
+    fn another_ca_has_its_own_certificates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let (chain, key) = self_signed("plex.int.test", 90);
+        store.save(CA, "plex.int.test", &chain, &key).unwrap();
+        assert!(store.load(wireserve_types::LETS_ENCRYPT_DIRECTORY, "plex.int.test").unwrap().is_none());
+    }
+
+    #[test]
+    fn the_ca_id_is_fixed_forever() {
+        // Names directories on disk: a change would re-issue everything.
+        assert_eq!(ca_id(""), "cbf29ce484222325");
+        assert_eq!(ca_id("a"), "af63dc4c8601ec8c");
+        assert_ne!(ca_id(CA), ca_id(wireserve_types::LETS_ENCRYPT_DIRECTORY));
     }
 
     #[test]

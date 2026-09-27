@@ -47,10 +47,7 @@ impl Accounts {
     /// One account file per directory URL, so moving between staging and
     /// production — or to a private CA — never reuses the wrong account.
     fn path(&self, directory: &str) -> PathBuf {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        directory.hash(&mut h);
-        self.dir.join(format!("account-{:016x}.json", h.finish()))
+        self.dir.join(format!("account-{}.json", crate::store::ca_id(directory)))
     }
 
     fn builder(&self) -> Result<instant_acme::AccountBuilder, AcmeError> {

@@ -619,6 +619,19 @@ Worth knowing:
   duplicate certificates a week: the terminator keeps its certificates across
   restarts and backs off after a failure, and the install wizard checks the
   DNS credential before anything is issued.
+- **Try it on the staging CA first.** Let's Encrypt's staging CA has far
+  higher limits and issues certificates no browser trusts, so a first setup
+  can go wrong there for free:
+
+  ```sh
+  # /etc/wireserve/coordinator.env, then: sudo systemctl restart wireserve-coordinator
+  WIRESERVE_ACME_DIRECTORY=https://acme-staging-v02.api.letsencrypt.org/directory
+  ```
+
+  Check with `curl -vk https://<name>.<domain>/`: the issuer is `(STAGING)`.
+  Then remove the line and restart the coordinator. Certificates are kept
+  per CA, so each node replaces its staging certificates with production
+  ones within a minute, serving the staging ones until then.
 
 #### A sign-in in front of chosen services
 

@@ -3239,3 +3239,16 @@ sent is removed. There are no previous installations to carry forward.
     endpoint-independent mapping to a different port (a fixed SNAT to
     40404 plus a DNAT back), what most home routers do; agent3 stays
     behind the symmetric one.
+
+204. **Certificates are kept per CA.** The store was keyed by name alone and
+    a held, valid certificate is never re-issued, so moving the coordinator
+    from Let's Encrypt staging to production would have kept serving the
+    untrusted staging certificates until renewal, some 60 days. They now
+    live under `certs/<ca>/<name>`; on a change of CA the terminator loads
+    or issues the new CA's certificate (without ARI's `replaces`, which
+    names a certificate of the same CA only) and serves the old one
+    meanwhile, so the service stays ready. `<ca>` is an FNV-1a hash of the
+    directory URL, as is the account file's name, which used
+    `DefaultHasher` — not stable across Rust releases, so a toolchain
+    upgrade could have created a new account. README documents trying a
+    first setup on the staging CA.

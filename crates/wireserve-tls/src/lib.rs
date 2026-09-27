@@ -68,13 +68,16 @@ struct Served {
     listener: Option<JoinHandle<()>>,
 }
 
-/// An issuance running in the background: the name, and its chain and key.
-type InFlight = (String, JoinHandle<Result<(String, String), acme::AcmeError>>);
+/// An issuance running in the background: the name, the CA's directory,
+/// and its chain and key.
+type InFlight = (String, String, JoinHandle<Result<(String, String), acme::AcmeError>>);
 
 /// Per-name issuance bookkeeping.
 #[derive(Default)]
 struct Issuance {
     cert: Option<Stored>,
+    /// The directory of the CA `cert` came from.
+    ca: Option<String>,
     renew_at: Option<SystemTime>,
     failures: u32,
     not_before: Option<Instant>,
@@ -146,16 +149,17 @@ pub async fn run(opts: Options) -> Result<(), Error> {
         };
 
         // A finished issuance.
-        if in_flight.as_ref().is_some_and(|(_, h)| h.is_finished()) {
-            let (fqdn, handle) = in_flight.take().expect("checked above");
+        if in_flight.as_ref().is_some_and(|(_, _, h)| h.is_finished()) {
+            let (fqdn, directory, handle) = in_flight.take().expect("checked above");
             let entry = issuance.entry(fqdn.clone()).or_default();
             match handle.await {
-                Ok(Ok((chain, key))) => match store.save(&fqdn, &chain, &key) {
+                Ok(Ok((chain, key))) => match store.save(&directory, &fqdn, &chain, &key) {
                     Ok(stored) => {
-                        tracing::info!(fqdn = %fqdn, "certificate issued");
+                        tracing::info!(fqdn = %fqdn, ca = %directory, "certificate issued");
                         certs.set(&fqdn, stored.key.clone());
                         entry.renew_at = None;
                         entry.cert = Some(stored);
+                        entry.ca = Some(directory);
                         entry.failures = 0;
                         entry.not_before = None;
                     }
@@ -173,11 +177,17 @@ pub async fn run(opts: Options) -> Result<(), Error> {
 
         for service in &config.services {
             let entry = issuance.entry(service.fqdn.clone()).or_default();
-            if entry.cert.is_none() {
-                match store.load(&service.fqdn) {
+            // The coordinator moved to another CA (staging to production,
+            // most likely): that CA's certificate, stored or new, replaces
+            // the one served — which stays served until then.
+            let other_ca = |e: &Issuance| e.cert.is_some() && e.ca.as_deref() != Some(settings.directory.as_str());
+            if entry.cert.is_none() || other_ca(entry) {
+                match store.load(&settings.directory, &service.fqdn) {
                     Ok(Some(stored)) if stored.valid_at(SystemTime::now()) => {
                         certs.set(&service.fqdn, stored.key.clone());
                         entry.cert = Some(stored);
+                        entry.ca = Some(settings.directory.clone());
+                        entry.renew_at = None;
                     }
                     Ok(_) => {}
                     Err(e) => tracing::warn!(fqdn = %service.fqdn, error = %e, "stored certificate unreadable; getting a new one"),
@@ -218,8 +228,10 @@ pub async fn run(opts: Options) -> Result<(), Error> {
             if in_flight.is_some() || entry.not_before.is_some_and(|t| Instant::now() < t) {
                 continue;
             }
+            let replacing = other_ca(entry);
             let due = match &entry.cert {
                 None => true,
+                Some(_) if replacing => true,
                 Some(cert) => {
                     if entry.renew_at.is_none() {
                         entry.renew_at = Some(match accounts.get(&settings).await {
@@ -240,12 +252,19 @@ pub async fn run(opts: Options) -> Result<(), Error> {
                         continue;
                     }
                 };
-                tracing::info!(fqdn = %service.fqdn, renewal = entry.cert.is_some(), "requesting a certificate");
-                let (fqdn, link, settings, replaces) =
-                    (service.fqdn.clone(), link.clone(), settings.clone(), entry.cert.clone());
+                tracing::info!(
+                    fqdn = %service.fqdn,
+                    renewal = entry.cert.is_some() && !replacing,
+                    ca = %settings.directory,
+                    "requesting a certificate"
+                );
+                // Renewal information only names a certificate of the same CA.
+                let replaces = if replacing { None } else { entry.cert.clone() };
+                let (fqdn, link, settings) = (service.fqdn.clone(), link.clone(), settings.clone());
                 let name = fqdn.clone();
                 in_flight = Some((
                     name,
+                    settings.directory.clone(),
                     tokio::spawn(async move { acme::issue(&account, &fqdn, &link, &settings, replaces.as_ref()).await }),
                 ));
             }
