@@ -3002,3 +3002,109 @@ record is no longer needed.
     revoked node's services removed; the operator's own record untouched;
     and a restart with everything written leaving the zone serial alone.
     Passes (2026-09-26).
+
+## M33 — each node serves its own 443 services with TLS
+
+The second of the three per-node TLS milestones. A service published on TCP
+443 is served with HTTPS by its own node, on its own address, with a
+certificate that node obtains — `tailscale serve`, on the operator's domain,
+for stock WireGuard phones. No hop through another node, no single proxy
+every HTTPS service depends on, no wildcard key on one box.
+
+182. **A terminator of its own, not a thread of the agent.** `wireserve
+    tls-serve` (crate `wireserve-tls`, in the same binary) runs under
+    `wireserve-tls.service` as the `wireserve-tls` user with only
+    `CAP_NET_BIND_SERVICE` and a strict sandbox, `PartOf=` the agent. It
+    parses TLS and HTTP from the whole mesh, which does not belong in the
+    root process holding the WireGuard key. The old objection to terminating
+    beside the agent — an agent restart takes HTTPS down — no longer holds:
+    a clean agent stop already tears down the interface (`teardown_everything`
+    on SIGTERM), so nothing survives a restart that HTTPS alone would lose.
+
+183. **Reused, not written: `instant-acme`, `rustls`, `axum-reverse-proxy`.**
+    ACME (DNS-01, ARI renewal windows, `replaces`) is djc's crate; SNI
+    selection is one `ResolvesServerCert`; proxying — hop-by-hop headers,
+    WebSocket upgrades, HTTP/2 — is `axum-reverse-proxy` over hyper with
+    `Host` preserved and `X-Forwarded-*` set from the connection. What is
+    ours is the edge: every forwarding header and `X-Wireserve-Node` a client
+    sent is removed before the proxy sets them afresh, and `X-Wireserve-Node`
+    names the node the mesh source address belongs to.
+
+184. **The key stays on the node, the DNS credential on the coordinator.**
+    The terminator generates key and CSR; the coordinator publishes the
+    `_acme-challenge` TXT record through `POST /tls/challenge` (bearer
+    auth), written by the handler itself so the node knows when it exists,
+    and removed on `DELETE` or after 10 minutes by the DNS loop. It is
+    refused unless the name is `<label>.<domain>`, the label is a service the
+    caller owns, approved, on TCP 443 with an address, not behind the
+    sign-in and not the proxy; the value must be a 43-character digest; at
+    most two per name. Not `terminated`: readiness needs a certificate first.
+
+185. **`terminated` follows readiness, per service.** The agent sends
+    `tls_ready` — services whose certificate is held and whose address is
+    bound, as the terminator last said — and the coordinator stores it
+    (`tls_ready` table, so a coordinator restart does not flap every name),
+    replaced on every poll and cleared on revoke, rejoin and re-register. A
+    service is `terminated` only while that holds, it is on 443 with an
+    address, DNS records are written, and it is neither marked for sign-in
+    nor the proxy. `ServiceNames` then points its name at its own address,
+    in hosts files and DNS alike. The agent latches its report for 3 minutes
+    so a terminator restart does not move public DNS.
+
+186. **Unrewritten, marked, local.** The owner's firewall turns a
+    terminated service's 443 mapping into `ServiceRule::Terminated`: a
+    mark-only rule in `svc-pre`, no rewrite, no reply rule, the target still
+    reserved against other mappings and never forwarded. The mark is what the
+    existing input accept and every host-firewall opening already admit, so
+    ufw and firewalld hosts need nothing new. The agent routes the address to
+    the host (`local` route in table local, protocol 247, `prefsrc` the node,
+    so a caller on the node itself is named as the node), and an input rule
+    drops the address from any interface but the mesh and `lo`. It emits the
+    rule only while the directory says terminated **and** the terminator
+    checked in within 30 seconds; otherwise the plain mapping is back.
+
+187. **Local routes survive nothing by accident.** Kept in
+    `AgentState.local_routes`; added before the ruleset that sends traffic
+    to them, removed after the one that stopped; removed on every stop; and
+    after a crash, swept at start by protocol number within this instance's
+    mesh range.
+
+188. **A socket that can do nothing else.** The terminator talks to the
+    agent over `/run/wireserve-tls[-<inst>]/tls.sock` (0660 to the
+    `wireserve-tls` group, in a directory the agent unit creates), decoding
+    only `TlsRequest`: a check-in returning `TlsConfig` (built from the
+    node's own declarations — the directory drops target addresses — plus
+    the ACME settings and a caller map), and a challenge request, which the
+    agent forwards only for names it configured. A compromised terminator
+    cannot `serve`, `unserve` or `leave`, and names it claims to serve beyond
+    its configuration are ignored.
+
+189. **Certificates are kept and not asked for twice.** One issuance at a
+    time; stored per name, 0600, and loaded at start, so restarts and
+    upgrades cost no issuance (Let's Encrypt allows five duplicates a week);
+    renewal inside the CA's ARI window, else two thirds through the
+    lifetime; exponential backoff from 2 minutes to 6 hours after a failure
+    (five failed validations per name per hour). An `EADDRINUSE` on the
+    address — something else on `0.0.0.0:443` — leaves the service on its
+    old path. `WIRESERVE_ACME_DIRECTORY`/`_EMAIL`/`_PROPAGATION_SECS` on the
+    coordinator choose the CA for every node; Let's Encrypt production by
+    default.
+
+190. **The central proxy keeps working meanwhile.** Nodes that predate this
+    still resolve 443 names to the proxy; its generated vhost for a
+    terminated service now uses `transport http { tls; tls_server_name
+    <name> }` to the service's address. Services marked for sign-in stay on
+    the proxy until M34 builds the sign-in in.
+
+191. **Tested against a real CA and DNS.** `run-tls-terminate-test.sh`
+    (rootful podman) runs a coordinator, BIND 9.20 taking TSIG-signed
+    updates, Pebble validating against it, and two agents. It checks: one
+    issuance and the service terminated; verified HTTPS from another node
+    with the right `X-Wireserve-Node`, `X-Forwarded-For` and `Host`, forged
+    copies gone; the owner named as itself; the service's other port still a
+    mapping and its target closed; no challenge record left; a restarted
+    terminator serving the stored certificate; a stopped one handing the
+    address back to the plain mapping and TLS returning with it; the local
+    route removed on stop and swept after `kill -9`. Passes (2026-09-27). The
+    harnesses' `socat SYSTEM:` test backend, which socat's own escape parsing
+    mangled into answering nothing, is now `deploy/e2e/echo-backend.sh`.

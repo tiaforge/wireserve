@@ -651,6 +651,51 @@ What to know first:
   `wireserve-admin list-services` shows each record as `dns=published`,
   `dns=pending` or the provider's error.
 
+#### HTTPS on the service's own node
+
+With the coordinator writing the records, a service published on TCP 443 is
+served with HTTPS by **its own node** — no proxy hop, no wildcard key on
+another machine. The `wireserve-tls` unit, which `wireserve install` sets up
+beside the agent, runs a small terminator as its own unprivileged user. For
+each of the node's services on 443 it:
+
+1. gets a certificate for `<name>.<domain>` — the key is made on the node and
+   never leaves it; the coordinator publishes the ACME DNS-01 challenge record
+   for it, and only for that node's own names;
+2. listens on the service's own address, port 443, and passes each request to
+   the service's target in plain HTTP on the same node;
+3. tells the backend who is calling: `X-Wireserve-Node` names the calling
+   node, `X-Forwarded-For` its mesh address, and copies of either sent by the
+   client are removed first.
+
+Once the terminator serves a service, the coordinator marks it terminated and
+its name moves from the proxy to the service's own address. Nothing to
+configure: publishing on 443 is still the whole opt-in.
+
+```sh
+# on the coordinator, optional
+WIRESERVE_ACME_DIRECTORY=https://acme-v02.api.letsencrypt.org/directory  # the default
+WIRESERVE_ACME_EMAIL=you@example.com
+```
+
+Worth knowing:
+
+- **Every 443 service name becomes public** in the Certificate Transparency
+  logs, one certificate per name. A wildcard certificate hid them.
+- **Only the service's 443 mapping changes.** Its other ports stay ordinary
+  mappings, and its target port stays closed to the mesh.
+- **Something else on `0.0.0.0:443`** on the node (nginx, Caddy) keeps the
+  terminator from binding the service address; the service then keeps the
+  path it had, and the terminator's log says so.
+- **Services behind a sign-in stay on the proxy for now**, as does the proxy
+  service itself.
+- **Nodes that haven't upgraded** still resolve 443 names to the proxy, which
+  reaches a terminated service over verified TLS.
+- **Let's Encrypt limits** — 5 failed validations per name per hour, 5
+  duplicate certificates a week: the terminator keeps its certificates across
+  restarts and backs off after a failure, and the install wizard checks the
+  DNS credential before anything is issued.
+
 #### A sign-in in front of chosen services
 
 With names in place, a service can also sit behind a sign-in at the proxy —

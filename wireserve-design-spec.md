@@ -462,7 +462,20 @@ request: a provider outage costs a warning and a retry. It deletes only
 records listed in its own `dns_records` table and replaces a clashing record
 at a service's name, so the service domain is the coordinator's to manage.
 A changed address is written only after it has held for 20 seconds. The
-credential lives in `coordinator.env`, never in the database. The proxied
+credential lives in `coordinator.env`, never in the database.
+
+**TLS on the service's own node (M33).** A 443 service is served with HTTPS
+by `wireserve tls-serve` on its owner node, as its own user, bound to the
+service address, which the agent routes to the host itself (`local` route,
+protocol 247). The agent lets that traffic in unrewritten, only marked, so the
+existing accept and host-firewall openings cover it, and drops the address
+from any interface but the mesh and loopback. The terminator holds the private
+key; the coordinator, holding the DNS credential, publishes the DNS-01
+challenge for the owner's own approved names only (`/tls/challenge`). A
+service is `terminated` in the directory only while its owner reports it
+ready, so names move only once something answers there. The terminator talks
+to the agent over a second socket that decodes nothing but a check-in and a
+challenge request. The proxied
 path does give up the "service sees the real client" property of §-service
 addresses, which is exactly why it is opt-in and why the direct path is left
 untouched beside it.
@@ -516,7 +529,8 @@ These are treated as core requirements, not hardening to add later:
   crate), to close timing side-channels on the auth path.
 - **All external paths to the coordinator are TLS-terminated at the
   reverse proxy — the coordinator itself never holds a certificate or
-  speaks TLS.** It listens on plain HTTP, on an address only the proxy can
+  speaks TLS.** (Service certificates, M33, are held by each owner node's
+  terminator; the coordinator only publishes their challenge records.) It listens on plain HTTP, on an address only the proxy can
   reach (loopback, or an internal Docker network — same principle as the
   admin listener in §4.0), and the proxy forwards plain HTTP internally
   after terminating TLS. What's required is that this is the *only* path
