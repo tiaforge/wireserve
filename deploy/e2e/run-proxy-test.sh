@@ -187,9 +187,9 @@ log "checking the coordinator resolved each agent's real address, not the proxy'
 # With trust_proxy_headers on, /register's endpoint fallback should record
 # each agent's own front-segment address. If the header were being ignored
 # the two would be identical and equal to the proxy's.
-podman exec "$COORD" wireserve-admin list-peers | awk '{printf "  %-7s %s\n", $1, $NF}'
-EP1=$(podman exec "$COORD" wireserve-admin list-peers | awk '$1=="node1"{print $NF}')
-EP2=$(podman exec "$COORD" wireserve-admin list-peers | awk '$1=="node2"{print $NF}')
+podman exec "$COORD" wireserve-admin list-peers | awk '{ for (i = 1; i <= NF; i++) if (index($i, "endpoint=") == 1) printf "  %-7s %s\n", $1, $i }'
+EP1=$(podman exec "$COORD" wireserve-admin list-peers | awk '$1=="node1" { for (i = 1; i <= NF; i++) if (index($i, "endpoint=") == 1) print $i }')
+EP2=$(podman exec "$COORD" wireserve-admin list-peers | awk '$1=="node2" { for (i = 1; i <= NF; i++) if (index($i, "endpoint=") == 1) print $i }')
 [ "$EP1" != "$EP2" ] \
     || fail "both nodes were recorded at the same endpoint ($EP1) — X-Forwarded-For is not being honoured"
 echo "$EP1" | grep -q "$PROXY_IP" \

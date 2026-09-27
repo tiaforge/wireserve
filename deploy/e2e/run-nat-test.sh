@@ -307,11 +307,11 @@ log "comparing the endpoint the coordinator recorded against the real one"
 # WireGuard's UDP is unrelated to it. So for any node behind NAT this
 # value is a guess, and this check prints how good a guess it was.
 echo "  recorded by the coordinator:"
-podman exec "$COORD" wireserve-admin list-peers | awk '{printf "    %-8s %s\n", $1, $NF}'
+podman exec "$COORD" wireserve-admin list-peers | awk '{ for (i = 1; i <= NF; i++) if (index($i, "endpoint=") == 1) printf "    %-8s %s\n", $1, $i }'
 echo "  actually observed by agent1, learned from received packets:"
 in_netns "$AGENT1" wg show wireserve0 endpoints | awk '{printf "    %s\n", $0}'
 
-DUPES=$(podman exec "$COORD" wireserve-admin list-peers | awk '{print $NF}' \
+DUPES=$(podman exec "$COORD" wireserve-admin list-peers | awk '{ for (i = 1; i <= NF; i++) if (index($i, "endpoint=") == 1) print $i }' \
     | grep -v 'endpoint=-$' | sort | uniq -d)
 if [ -n "$DUPES" ]; then
     note "two nodes were recorded at the SAME endpoint: ${DUPES#endpoint=}"
