@@ -48,7 +48,21 @@ WG_PORT=51820
 
 log()  { echo; echo "=== $* ==="; }
 pass() { echo "PASS: $*"; }
-fail() { echo "FAIL: $*" >&2; exit 1; }
+fail() {
+    echo "FAIL: $*" >&2
+    # The containers go with the trap below; their logs go first.
+    for f in tls.log agent.log agent2.log; do
+        echo "--- $HOME_AGENT:/var/log/$f (tail) ---" >&2
+        podman exec "$HOME_AGENT" tail -n 40 "/var/log/$f" >&2 2>/dev/null || true
+    done
+    echo "--- $CLIENT:/var/log/agent.log (tail) ---" >&2
+    podman exec "$CLIENT" tail -n 15 /var/log/agent.log >&2 2>/dev/null || true
+    echo "--- $COORD (tail) ---" >&2
+    podman logs --tail 40 "$COORD" >&2 2>/dev/null || true
+    echo "--- $PEBBLE (tail) ---" >&2
+    podman logs --tail 30 "$PEBBLE" >&2 2>/dev/null || true
+    exit 1
+}
 
 cleanup() {
     podman rm -f "$COORD" "$BIND" "$PEBBLE" "$HOME_AGENT" "$CLIENT" >/dev/null 2>&1 || true
@@ -71,7 +85,8 @@ in_netns() {
 }
 in_netns_bg() {
     local target=$1; shift
-    podman run -d --name "wireserve-tt-helper-$$-$RANDOM" --network "container:$target" "$DEBUG_IMG" "$@" >/dev/null
+    podman run -d --name "wireserve-tt-helper-$$-$RANDOM" --network "container:$target" \
+        -v "$PWD/deploy/e2e:/e2e:ro" "$DEBUG_IMG" "$@" >/dev/null
 }
 ip_on() {
     podman inspect "$1" --format "{{(index .NetworkSettings.Networks \"$2\").IPAddress}}"
@@ -96,7 +111,10 @@ fetch() {
 }
 # The agent image has no procps: signal by command line through /proc.
 signal() {
-    podman exec "$1" sh -c 'for p in /proc/[0-9]*; do tr "\0" " " < $p/cmdline 2>/dev/null | grep -q -- "'"$3"'" && kill -'"$2"' ${p#/proc/}; done; true'
+    # `$$` is the searching shell itself, whose own command line contains
+    # the pattern: skipped, or it signals itself first.
+    podman exec "$1" sh -c 'for p in /proc/[0-9]*; do [ "${p#/proc/}" = "$$" ] && continue; tr "\0" " " 2>/dev/null <$p/cmdline | grep -q -- "'"$3"'" && kill -'"$2"' ${p#/proc/} 2>/dev/null; done; true' \
+        || fail "could not signal $3 in $1"
 }
 wait_for() {
     local what=$1 secs=$2; shift 2
@@ -191,8 +209,7 @@ start_terminator() {
 start_terminator
 podman exec "$HOME_AGENT" wireserve serve plex 443:32400 81:32401
 for port in 32400 32401; do
-    in_netns_bg "$HOME_AGENT" socat "TCP-LISTEN:$port,fork,reuseaddr" \
-        SYSTEM:'H=$(sed -u "/^\r$/q"); printf "HTTP/1.0 200 OK\r\n\r\nbackend:%s\n%s\n" '"$port"' "$H"'
+    in_netns_bg "$HOME_AGENT" socat "TCP-LISTEN:$port,fork,reuseaddr" EXEC:"/e2e/echo-backend.sh $port"
 done
 sleep 8
 PLEX_VIP=$(entry "$HOME_AGENT" plex vip4)
@@ -201,12 +218,13 @@ HOME_IP=$(podman exec "$HOME_AGENT" wireserve list --json | python3 -c 'import j
 pass "plex at $PLEX_VIP"
 
 log "1/8: a certificate from Pebble, and plex terminated"
-wait_for "the terminator to report plex" 90 sh -c "[ \"\$(podman exec $HOME_AGENT cat /var/lib/wireserve/agent-state.json | grep -c '\"terminated\":true')\" -ge 1 ]"
+terminated_on() { [ "$(entry "$1" plex terminated)" = True ]; }
+wait_for "the terminator to report plex" 90 terminated_on "$HOME_AGENT"
 podman exec "$HOME_AGENT" grep -q 'certificate issued' /var/log/tls.log || fail "no issuance in the terminator's log"
 [ "$(podman exec "$HOME_AGENT" grep -c 'certificate issued' /var/log/tls.log)" = 1 ] || fail "more than one issuance"
 in_netns "$CLIENT" curl -sk --max-time 10 https://pebble:15000/roots/0 > "$WORK/pebble-root.pem"
 grep -q 'BEGIN CERTIFICATE' "$WORK/pebble-root.pem" || fail "could not fetch Pebble's issuing root"
-wait_for "the client to see plex terminated" 30 sh -c "[ \"\$(podman exec $CLIENT cat /var/lib/wireserve/agent-state.json | grep -c '\"terminated\":true')\" -ge 1 ]"
+wait_for "the client to see plex terminated" 30 terminated_on "$CLIENT"
 pass "issued once; the directory says terminated"
 
 log "2/8: from the client, verified TLS on the service's own address"

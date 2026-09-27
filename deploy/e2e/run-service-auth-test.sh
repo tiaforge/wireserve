@@ -73,8 +73,8 @@ in_netns() {
 }
 in_netns_bg() {
     local target=$1; shift
-    podman run -d --name "wireserve-sa-helper-$$-$RANDOM" \
-        --network "container:$target" "$DEBUG_IMG" "$@" >/dev/null
+    podman run -d --name "wireserve-sa-helper-$$-$RANDOM" --network "container:$target" \
+        -v "$PWD/deploy/e2e:/e2e:ro" "$DEBUG_IMG" "$@" >/dev/null
 }
 ip_on() {
     podman inspect "$1" --format "{{(index .NetworkSettings.Networks \"$2\").IPAddress}}"
@@ -197,8 +197,7 @@ podman exec "$HOME_AGENT" wireserve serve jellyfin 443:8096
 podman exec "$HOME_AGENT" wireserve serve grafana 443:3000
 # Backends that answer with the request headers they were sent.
 for port in 8096 3000; do
-    in_netns_bg "$HOME_AGENT" socat "TCP-LISTEN:$port,fork,reuseaddr" \
-        SYSTEM:'H=$(sed -u "/^\r$/q"); printf "HTTP/1.0 200 OK\r\n\r\nbackend:%s\n%s\n" '"$port"' "$H"'
+    in_netns_bg "$HOME_AGENT" socat "TCP-LISTEN:$port,fork,reuseaddr" EXEC:"/e2e/echo-backend.sh $port"
 done
 sleep 12
 admin approve-service node-proxy web >/dev/null 2>&1 || true
