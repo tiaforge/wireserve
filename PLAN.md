@@ -3252,3 +3252,14 @@ sent is removed. There are no previous installations to carry forward.
     `DefaultHasher` — not stable across Rust releases, so a toolchain
     upgrade could have created a new account. README documents trying a
     first setup on the staging CA.
+
+205. **The wizard finds the DNS zone instead of asking for it, and speaks
+    plainly.** Few people know what their provider calls a zone, so #202's
+    question is gone: the install's test record tries a zone already set
+    (`WIRESERVE_DNS_ZONE`, or the env file's), then the domain, then each
+    domain above it down to two labels, keeping the first the provider
+    accepts. The domain, DNS and login questions are reworded for someone
+    who has bought a domain and nothing more, and each provider's
+    credential question is preceded by where that token is created
+    (Hetzner's must come from the Hetzner Console; the old DNS Console's do
+    not work with the Cloud API `dns-update` uses).

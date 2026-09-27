@@ -63,33 +63,69 @@ pub enum InstallError {
 }
 
 /// Writes and removes one throwaway TXT record through the provider, so a
-/// wrong token or a zone it cannot write is found now, while nothing is
-/// installed, and not later as names that never appear.
-fn check_dns_provider(dns: &questions::DnsAnswer, domain: &str) -> Result<(), InstallError> {
-    let cfg = dns.check(domain).map_err(InstallError::Failed)?;
-    let provider = crate::dns::provider::Provider::connect(&cfg).map_err(InstallError::Failed)?;
+/// wrong token is found now, while nothing is installed, and not later as
+/// names that never appear.
+///
+/// It also finds the zone the records go into, which is not asked: few
+/// people know what their provider calls a zone. It tries the zone already
+/// set, then the domain itself, then each domain it sits under
+/// (`home.example.com`, `example.com`), and keeps the first one the
+/// provider takes. Cloudflare and deSEC find the zone themselves, so the
+/// domain itself works there at once.
+fn check_dns_provider(dns: &mut questions::DnsAnswer, domain: &str) -> Result<(), InstallError> {
     let name = format!("_wireserve-check.{domain}");
-    let value = crate::tokengen::generate("wireserve-check-");
-    eprintln!("Checking the DNS provider by writing a test record at {name} …");
+    eprintln!("Checking that WireServe can create DNS records for {domain} …");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| failed("starting the DNS check", e))?;
-    runtime.block_on(async {
-        use crate::dns::provider::DnsWriter as _;
-        provider.add_txt(&name, &value).await.map_err(|e| {
-            InstallError::Failed(format!(
-                "the {} provider refused a test record in {}: {e}. Nothing was installed; check the \
-                 credentials, that they may edit that zone, and that {} is the zone's own name (set \
-                 WIRESERVE_DNS_ZONE to the parent zone otherwise), or pass --skip-dns-check",
-                dns.provider, cfg.zone, cfg.zone
-            ))
-        })?;
-        if let Err(e) = provider.remove_txt(&name, &value).await {
-            eprintln!("note: the test record {name} could not be removed ({e}); delete it by hand");
+    let mut refused = Vec::new();
+    for zone in zone_candidates(dns.zone.as_deref(), domain) {
+        let attempt = questions::DnsAnswer { zone: Some(zone.clone()), ..dns.clone() };
+        let cfg = attempt.check(domain).map_err(InstallError::Failed)?;
+        let provider = crate::dns::provider::Provider::connect(&cfg).map_err(InstallError::Failed)?;
+        let value = crate::tokengen::generate("wireserve-check-");
+        let written = runtime.block_on(async {
+            use crate::dns::provider::DnsWriter as _;
+            provider.add_txt(&name, &value).await?;
+            if let Err(e) = provider.remove_txt(&name, &value).await {
+                eprintln!("note: the test record {name} could not be removed ({e}); delete it by hand");
+            }
+            Ok::<_, String>(())
+        });
+        match written {
+            Ok(()) => {
+                eprintln!("  OK: the records go into {zone}.");
+                dns.zone = (!zone.eq_ignore_ascii_case(domain)).then_some(zone);
+                return Ok(());
+            }
+            Err(e) => refused.push(format!("  as part of {zone}: {e}")),
         }
-        Ok(())
-    })
+    }
+    Err(InstallError::Failed(format!(
+        "{} did not accept a test record for {domain}:\n{}\nNothing was installed. Check that the token is right and may \
+         change DNS records for {domain}, then run the install again (--skip-dns-check skips this test).",
+        dns.provider,
+        refused.join("\n")
+    )))
+}
+
+/// The zones to try for `domain`, most likely first: one already set, the
+/// domain, then each parent down to two labels (never a bare `com`).
+fn zone_candidates(set: Option<&str>, domain: &str) -> Vec<String> {
+    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+    let mut out: Vec<String> = set.map(|z| z.trim_end_matches('.').to_ascii_lowercase()).into_iter().collect();
+    let mut rest = domain.as_str();
+    loop {
+        if !out.iter().any(|z| z == rest) {
+            out.push(rest.to_string());
+        }
+        match rest.split_once('.') {
+            Some((_, parent)) if parent.contains('.') => rest = parent,
+            _ => break,
+        }
+    }
+    out
 }
 
 fn failed(what: impl std::fmt::Display, e: impl std::fmt::Display) -> InstallError {
@@ -268,13 +304,13 @@ pub fn run(args: InstallArgs) -> Result<(), InstallError> {
             is_local: &is_local_address,
             user_exists: &|name| lookup_user(name).is_some(),
         };
-        let answers = asker.ask_all()?;
+        let mut answers = asker.ask_all()?;
         if interactive && !args.yes {
             questions::confirm(&answers, &service_user)?;
         }
         if !args.skip_dns_check {
-            if let Some(n) = &answers.naming {
-                if let Some(dns) = &n.dns {
+            if let Some(n) = &mut answers.naming {
+                if let Some(dns) = &mut n.dns {
                     check_dns_provider(dns, &n.domain)?;
                 }
             }
@@ -704,6 +740,14 @@ fn print_next_steps(answers: &Answers, service_user: &str, state_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_zone_is_looked_for_from_the_domain_down_to_two_labels() {
+        assert_eq!(zone_candidates(None, "Home.Example.com."), ["home.example.com", "example.com"]);
+        assert_eq!(zone_candidates(None, "a.b.example.co.uk"), ["a.b.example.co.uk", "b.example.co.uk", "example.co.uk", "co.uk"]);
+        assert_eq!(zone_candidates(Some("example.com"), "home.example.com"), ["example.com", "home.example.com"]);
+        assert_eq!(zone_candidates(None, "example.com"), ["example.com"]);
+    }
 
     #[test]
     fn an_installed_unit_means_upgrade_unless_reconfiguring() {

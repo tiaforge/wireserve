@@ -83,12 +83,42 @@ const RFC2136_FIELDS: &[Field] = &[
         default: Some("hmac-sha256"),
     },
 ];
-const TOKEN_FIELDS: &[Field] =
-    &[Field { key: "WIRESERVE_DNS_API_TOKEN", label: "API token", secret: true, default: None }];
+const CLOUDFLARE_FIELDS: &[Field] =
+    &[Field { key: "WIRESERVE_DNS_API_TOKEN", label: "Cloudflare API token", secret: true, default: None }];
+const DESEC_FIELDS: &[Field] =
+    &[Field { key: "WIRESERVE_DNS_API_TOKEN", label: "deSEC token", secret: true, default: None }];
+const HETZNER_FIELDS: &[Field] =
+    &[Field { key: "WIRESERVE_DNS_API_TOKEN", label: "Hetzner API token", secret: true, default: None }];
 const PORKBUN_FIELDS: &[Field] = &[
-    Field { key: "WIRESERVE_DNS_API_TOKEN", label: "API key", secret: true, default: None },
-    Field { key: "WIRESERVE_DNS_API_SECRET", label: "Secret API key", secret: true, default: None },
+    Field { key: "WIRESERVE_DNS_API_TOKEN", label: "Porkbun API key (pk1_…)", secret: true, default: None },
+    Field { key: "WIRESERVE_DNS_API_SECRET", label: "Porkbun secret API key (sk1_…)", secret: true, default: None },
 ];
+
+/// Where to get what [`fields`] asks for, in a few plain lines.
+#[must_use]
+pub fn help(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "cloudflare" => &[
+            "In the Cloudflare dashboard: My Profile → API Tokens → Create Token,",
+            "then the \"Edit zone DNS\" template, limited to your domain.",
+        ],
+        "desec" => &["At desec.io: Token Management → add a token."],
+        "hetzner" => &[
+            "In the Hetzner Console, in the project that holds your domain's DNS:",
+            "Security → API tokens → Generate API token, with Read & Write.",
+            "(A token from the old DNS Console at dns.hetzner.com will not work.)",
+        ],
+        "porkbun" => &[
+            "At porkbun.com: Account → API Access → create a key. Then, under",
+            "Domain Management, switch on \"API Access\" for your domain too.",
+        ],
+        "rfc2136" => &[
+            "Your own DNS server (BIND, Knot, PowerDNS) must accept dynamic",
+            "updates (RFC 2136) for the domain, signed with a TSIG key.",
+        ],
+        _ => &[],
+    }
+}
 
 /// The settings `provider` needs, in the order the wizard asks for them.
 #[must_use]
@@ -96,7 +126,9 @@ pub fn fields(provider: &str) -> &'static [Field] {
     match provider {
         "rfc2136" => RFC2136_FIELDS,
         "porkbun" => PORKBUN_FIELDS,
-        "cloudflare" | "desec" | "hetzner" => TOKEN_FIELDS,
+        "cloudflare" => CLOUDFLARE_FIELDS,
+        "desec" => DESEC_FIELDS,
+        "hetzner" => HETZNER_FIELDS,
         _ => &[],
     }
 }

@@ -580,19 +580,20 @@ impl Asker<'_> {
             },
             None => {
                 explain(&[
-                    "Services are normally named <name>.wg, which only works on machines",
-                    "running WireServe. With a domain you control, they become",
-                    "<name>.home.example.com instead, which also works from a phone, and",
-                    "each node serves its services on 443 with HTTPS. The names need public",
-                    "DNS records, which the coordinator writes through your DNS provider;",
-                    "the README's \"Give services real names\" section walks through it.",
+                    "Your services get names like plex.wg, which only work on computers",
+                    "running WireServe. If you own a domain, they can have real names",
+                    "instead, like plex.home.example.com: those work on phones too, and",
+                    "every service on port 443 gets HTTPS with a valid certificate.",
                 ]);
-                if !ask_yes_no("Use a domain for your services?", self.current.naming.is_some()) {
+                if !ask_yes_no("Use your own domain for service names?", self.current.naming.is_some()) {
                     return Ok(None);
                 }
-                eprintln!();
+                explain(&[
+                    "Best is a part of your domain you use for nothing else, like",
+                    "home.example.com for the domain example.com.",
+                ]);
                 ask_until(
-                    "Domain (e.g. home.example.com)",
+                    "Domain for your services (e.g. home.example.com)",
                     self.current.naming.as_ref().map(|n| n.domain.as_str()),
                     check_domain,
                 )?
@@ -617,13 +618,13 @@ impl Asker<'_> {
             None => {}
         }
         explain(&[
-            "A service can sit behind a sign-in, per person, with your own identity",
-            "provider: run a forward_auth provider such as authward as a mesh service",
-            &format!("on 443 (its pages are then https://<name>.{domain}), and name that"),
-            "service here. `wireserve-admin service-auth <service> on` then puts it",
-            "in front of a service. Enter - for none.",
+            "Optional: some services can ask people to log in before they get in.",
+            "That needs a login service of your own (a forward_auth provider such",
+            &format!("as authward), shared on port 443 like any other: https://<name>.{domain}."),
+            "Enter its service name, or - if you have none (you can add it later",
+            "with --reconfigure).",
         ]);
-        ask_until("Sign-in service", Some(current.as_deref().unwrap_or("-")), |raw| {
+        ask_until("Login service", Some(current.as_deref().unwrap_or("-")), |raw| {
             if raw.trim() == "-" {
                 Ok(None)
             } else {
@@ -651,23 +652,31 @@ impl Asker<'_> {
             Some(p) => p,
             None => {
                 explain(&[
-                    "The coordinator can keep one DNS record per service up to date for",
-                    &format!("you, like plex.{domain}, through your DNS provider's API. It then"),
-                    &format!("manages service names under {domain}: a record with the same"),
-                    "name as a service is replaced, and nothing else in the zone is",
-                    "touched. Without it, the names work on WireServe machines only.",
+                    "For these names to work everywhere, WireServe creates a DNS record",
+                    &format!("for each service (like plex.{domain}) at the company that runs your"),
+                    "domain's DNS — usually where you bought the domain, unless you moved",
+                    "its DNS elsewhere, e.g. to Cloudflare. It needs an API token from",
+                    "that company. It only creates and removes records named after your",
+                    &format!("services under {domain}; everything else in your domain is left alone."),
+                    "Without it, the names only work on computers running WireServe, and",
+                    "there is no HTTPS.",
                 ]);
-                if !ask_yes_no("Let the coordinator write the DNS records?", current.is_some()) {
+                if !ask_yes_no("Let WireServe manage these DNS records?", current.is_some()) {
                     return Ok(None);
                 }
                 eprintln!();
                 ask_until(
-                    &format!("DNS provider ({})", crate::dns::config::PROVIDERS.join(", ")),
+                    "Who runs your domain's DNS? (cloudflare, desec, hetzner, porkbun, or rfc2136 for your own DNS server)",
                     current.as_ref().map(|c| c.provider.as_str()),
                     check_dns_provider,
                 )?
             }
         };
+        let asking = self.interactive
+            && crate::dns::config::fields(&provider).iter().any(|f| (self.env)(f.key).is_none_or(|v| v.trim().is_empty()));
+        if asking {
+            explain(crate::dns::config::help(&provider));
+        }
         loop {
             let mut fields = Vec::new();
             for f in crate::dns::config::fields(&provider) {
@@ -692,7 +701,8 @@ impl Asker<'_> {
                     }
                 }
             }
-            let zone = self.dns_zone(domain, current.as_ref().and_then(|c| c.zone.clone()))?;
+            let zone = self.dns_zone(current.as_ref().and_then(|c| c.zone.clone()))?
+                .filter(|z| !z.eq_ignore_ascii_case(domain));
             let answer = DnsAnswer { provider: provider.clone(), fields, zone };
             match answer.check(domain) {
                 Ok(_) => return Ok(Some(answer)),
@@ -702,26 +712,16 @@ impl Asker<'_> {
         }
     }
 
-    /// The zone the records go into: `WIRESERVE_DNS_ZONE` first, then the
-    /// question, then the current setting. The domain itself is the
-    /// default, and stored as no setting at all.
-    fn dns_zone(&self, domain: &str, current: Option<String>) -> Result<Option<String>, AskError> {
-        let zone = if let Some(z) = (self.env)("WIRESERVE_DNS_ZONE").filter(|z| !z.trim().is_empty()) {
-            check_domain(&z).map_err(|e| AskError::Invalid(format!("WIRESERVE_DNS_ZONE: {e}")))?
-        } else if !self.interactive {
-            match current {
-                Some(z) => z,
-                None => return Ok(None),
-            }
-        } else {
-            explain(&[
-                &format!("The DNS zone the records go into: {domain} itself if it is a zone of"),
-                "its own at your provider, or the domain it sits under (example.com",
-                "for home.example.com).",
-            ]);
-            ask_until("DNS zone", Some(current.as_deref().unwrap_or(domain)), check_domain)?
-        };
-        Ok((!zone.eq_ignore_ascii_case(domain)).then_some(zone))
+    /// The zone the records go into, when already known:
+    /// `WIRESERVE_DNS_ZONE`, then the current setting. Never asked — the
+    /// install finds it by trying the domain and its parents (see
+    /// `install::check_dns_provider`); few people know what their
+    /// provider calls a zone.
+    fn dns_zone(&self, current: Option<String>) -> Result<Option<String>, AskError> {
+        match (self.env)("WIRESERVE_DNS_ZONE").filter(|z| !z.trim().is_empty()) {
+            Some(z) => check_domain(&z).map(Some).map_err(|e| AskError::Invalid(format!("WIRESERVE_DNS_ZONE: {e}"))),
+            None => Ok(current),
+        }
     }
 
     fn admin_user(&self) -> Result<Option<String>, AskError> {

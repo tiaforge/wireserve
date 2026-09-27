@@ -553,7 +553,14 @@ provider's API — written when the service is approved, moved when its address
 changes, removed when it is withdrawn or its node revoked.
 `wireserve-coordinator install` asks for the provider, and before saving
 writes and removes a throwaway `_wireserve-check` TXT record, so a wrong
-token shows up there rather than as names that never appear.
+token shows up there rather than as names that never appear. The wizard says where each provider's token is created:
+
+| Provider | Token |
+| --- | --- |
+| Cloudflare | My Profile → API Tokens → Create Token → "Edit zone DNS", limited to the domain |
+| deSEC | Token Management → add a token |
+| Hetzner | Hetzner Console, the project holding the DNS: Security → API tokens, Read & Write (not the old dns.hetzner.com) |
+| Porkbun | Account → API Access; also switch on "API Access" for the domain |
 
 | Provider | Settings |
 | --- | --- |
@@ -563,8 +570,8 @@ token shows up there rather than as names that never appear.
 
 `WIRESERVE_DNS_ZONE` names the zone when it is a parent of the service domain
 (`example.com` for `int.example.com`; default: the domain itself). The
-wizard asks for it. Hetzner, Porkbun and RFC 2136 need it exactly;
-Cloudflare and deSEC find the parent zone on their own. `WIRESERVE_DNS_TTL`
+wizard finds it without asking: its test record tries the domain, then each
+domain above it, and keeps the first the provider accepts. `WIRESERVE_DNS_TTL`
 defaults to 300 seconds.
 
 What to know first:
