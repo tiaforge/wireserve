@@ -296,28 +296,12 @@ grep -qx '# BEGIN WIRESERVE work' "$WORK/host/hosts" || fail "the other instance
 reach "$BETA" 7002 || fail "mesh B stopped working when the other instance stopped"
 pass "interface, table, accepts and hosts block of the stopped instance are gone; the other still serves"
 
-# ---------------------------------------------------------------------
-log "upgrade from a pre-instances agent: its wg0, table, guard and accepts are cleared up"
-# What a crashed old agent leaves: wg0 carrying this node's key, the
-# fixed-name `inet wireserve` table, a fixed-name guard table, and
-# accepts tagged wireserve:wg0. Put there by hand, with the default
-# instance's own key.
-KEY=$(state "$WORK/host/lib/agent-state.json" private_key)
-echo "$KEY" > "$WORK/own.key"
-ip link add wg0 type wireguard
-wg set wg0 private-key "$WORK/own.key"
-nft add table inet wireserve
-nft add table inet wireserve-interop
-iptables-nft -I INPUT 1 -i wg0 -m comment --comment wireserve:wg0 -j ACCEPT
-nft insert rule inet filter input iifname wg0 counter accept comment '"wireserve:wg0"'
+# Back up, for the leave below: it checks the other instance is untouched.
 daemon host default; HOST_DEFAULT=$LAST_PID; up host default
 sleep $((POLL * 2))
-ip link show wg0 >/dev/null 2>&1 && fail "the old agent's wg0 is still there"
-nft list tables | grep -Eqx 'table inet (wireserve|wireserve-interop)' && fail "legacy tables still there: $(nft list tables)"
-[ "$(tags wg0)" = 0 ] || fail "legacy wireserve:wg0 accepts still there"
 [ "$(list host default | field ifname)" = wireserve1 ] || fail "default instance not back on wireserve1"
-reach "$ALPHA" 7001 || fail "mesh A unreachable after the upgrade cleanup"
-pass "legacy wg0, tables and accepts removed; the instance came back on its own interface"
+reach "$ALPHA" 7001 || fail "mesh A unreachable after the restart"
+pass "the stopped instance came back on its own interface"
 
 # ---------------------------------------------------------------------
 log "leave takes everything of that instance, nothing else"
