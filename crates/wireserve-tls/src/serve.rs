@@ -75,6 +75,14 @@ pub fn server_config(certs: Arc<Certs>) -> Arc<rustls::ServerConfig> {
         .with_no_client_auth()
         .with_cert_resolver(certs);
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    // Resumption without a server-side cache: the default one holds 256
+    // sessions for every service and client together, and each handshake
+    // issues two, so with more than a few clients a returning phone finds
+    // its session gone and pays for a full handshake. The ticket keys
+    // rotate every few hours and never leave memory.
+    if let Ok(ticketer) = rustls::crypto::aws_lc_rs::Ticketer::new() {
+        config.ticketer = ticketer;
+    }
     Arc::new(config)
 }
 
