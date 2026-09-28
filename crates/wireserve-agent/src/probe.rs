@@ -14,7 +14,7 @@
 //!
 //! The same result is reused for two different jobs by its two callers:
 //! self-reporting `endpoint_addr_v4`/`endpoint_addr_v6` on `/register` and
-//! `/poll`, and (via [`has_working_ipv6`]) deciding whether *this* node
+//! `/poll`, and (via [`DualProbeResult::v6`] being present) deciding whether *this* node
 //! should prefer a peer's v6 candidate over its v4 one when reconciling
 //! WireGuard peers — see `wg::choose_peer_endpoint`.
 
@@ -143,15 +143,6 @@ pub async fn probe_observed_addr(
     resp.addr
         .parse()
         .map_err(|_| ProbeError::BadResponse(resp.addr))
-}
-
-/// Purpose 2 — the receiving-side self-test: does this node have real,
-/// working IPv6 reachability right now? Reuses the same primitive,
-/// discarding the actual address (only success/failure matters here).
-pub async fn has_working_ipv6(coordinator_url: &str, timeout: Duration) -> bool {
-    probe_observed_addr(coordinator_url, Family::V6, timeout)
-        .await
-        .is_ok()
 }
 
 #[derive(Debug, Clone, Default)]

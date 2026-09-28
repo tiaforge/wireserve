@@ -736,7 +736,7 @@ pub fn peer_allowed_ips(ip4: &str, ip6: &str) -> Vec<IpAddrMask> {
 /// considered choice), so a dual-stack peer can just as easily end up
 /// with a v6 address sitting there as a v4 one. `prefer_ipv6` — this
 /// node's own live "do I have real working IPv6 right now" self-test
-/// against the coordinator (see `probe::has_working_ipv6`, threaded in
+/// against the coordinator (`probe::probe_both`'s v6 result, threaded in
 /// from `poll_loop::run_once`) — is what an IPv6-less node lacks, so an
 /// unusable `endpoint_addr` falls through to the v4/v6 pair below exactly
 /// like the no-explicit-value case already did (the incident that pair
