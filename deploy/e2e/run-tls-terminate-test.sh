@@ -253,7 +253,8 @@ echo "$OUT" | grep -qi '^x-wireserve-node: node-home' || { echo "$OUT"; fail "th
 pass "the owner node is named node-home"
 
 log "4/9: 443 stays the stranger's, and the terminator's port is closed"
-in_netns "$HOME_AGENT" curl -s --max-time 4 http://127.0.0.1:443/ | grep -q stranger \
+# It answers with a bare line, no HTTP: curl takes that only as HTTP/0.9.
+in_netns "$HOME_AGENT" curl -s --http0.9 --max-time 4 http://127.0.0.1:443/ | grep -q stranger \
     || fail "the stranger lost 0.0.0.0:443"
 HOME_LAN=$(ip_on "$HOME_AGENT" "$NET")
 if in_netns "$CLIENT" curl -sk --max-time 4 --resolve "plex.$DOMAIN:11443:$HOME_LAN" "https://plex.$DOMAIN:11443/" | grep -q backend; then
