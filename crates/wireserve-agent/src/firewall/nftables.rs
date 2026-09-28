@@ -392,19 +392,15 @@ fn forward_rewrite(vip: Ipv4Addr, dest: Ipv4Addr, map: &PortMap) -> Vec<Statemen
     ]
 }
 
-/// Marks a request from the mesh for a service this node's own terminator
-/// answers (PLAN.md M33), without rewriting it: the terminator listens on
-/// the service address itself. The mark is what the rest of the machinery
-/// already keys on — the filter's accept, and the host firewalls' openings
-/// (`host_interop`), which admit marked flows and nothing else of ours —
-/// so a terminated flow needs no rule of its own anywhere downstream.
-fn mark_terminated(ifname: &str, vip: Ipv4Addr, map: &PortMap) -> Vec<Statement<'static>> {
-    vec![
-        iifname_is(ifname),
-        is(payload("ip", "daddr"), addr(vip)),
-        dport_is(map.proto, map.public),
-        add_mark(meta(MetaKey::Mark)),
-    ]
+/// The mapping a service this node's own terminator answers (PLAN.md M33)
+/// amounts to: its public port on its address to `port`, where the
+/// terminator listens on every address (PLAN.md M35) — the address itself
+/// kept, since the terminator tells its services apart by it. With this the
+/// rest of the machinery treats it as any other mapping: marked, which the
+/// filter's accept and the host firewalls' openings (`host_interop`) key
+/// on, and rewritten back on the way out.
+fn terminated_map(map: &PortMap, port: u16) -> PortMap {
+    PortMap { target: port, addr: None, ..*map }
 }
 
 /// The way back: a reply leaving the target port of a marked flow gets
@@ -572,7 +568,7 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
     let terminated: Vec<(Ipv4Addr, PortMap)> = rules
         .iter()
         .filter_map(|r| match *r {
-            ServiceRule::Terminated { vip, map } => Some((vip, map)),
+            ServiceRule::Terminated { vip, map, port } => Some((vip, terminated_map(&map, port))),
             _ => None,
         })
         .collect();
@@ -591,6 +587,18 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
             iifname_is_not(ifname),
             iifname_is_not("lo"),
             is(payload("ip", "daddr"), addr(*vip)),
+            Statement::Drop(None::<Drop>),
+        ]));
+    }
+    // The terminator's own port, on every address of the host (PLAN.md
+    // M35): the same, whatever the address. It answers nothing there but
+    // its service addresses anyway; this keeps the LAN from even trying.
+    let ports: std::collections::BTreeSet<u16> = terminated.iter().map(|(_, m)| m.target).collect();
+    for port in ports {
+        objects.push(rule(t, CHAIN_NAME, vec![
+            iifname_is_not(ifname),
+            iifname_is_not("lo"),
+            dport_is(Proto::Tcp, port),
             Statement::Drop(None::<Drop>),
         ]));
     }
@@ -671,7 +679,7 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
     // forwarded exactly as received, never rewritten), so this early
     // return is unaffected by `transit` and stays keyed on `mapped`
     // alone, same as before this feature existed — plus the terminated
-    // services (PLAN.md M33), which need the marking half of it.
+    // services (PLAN.md M33), rewritten to the terminator's port (M35).
     if !has_service_addresses {
         return Nftables { objects: objects.into() };
     }
@@ -684,7 +692,9 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
         objects.push(rule(t, PRE_CHAIN, expr));
     }
     for (vip, map) in &terminated {
-        objects.push(rule(t, PRE_CHAIN, mark_terminated(ifname, *vip, map)));
+        let mut expr = vec![iifname_is(ifname)];
+        expr.extend(forward_rewrite(*vip, *vip, map));
+        objects.push(rule(t, PRE_CHAIN, expr));
     }
     // A port a service address does not publish. A mapped service's address
     // is not local to this host, so such a request never reaches the input
@@ -709,6 +719,10 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
     for (vip, dest, map) in &mapped {
         objects.push(rule(t, OUT_CHAIN, forward_rewrite(*vip, *dest, map)));
     }
+    // Without these a Caddy on this host's [::]:443 would answer them.
+    for (vip, map) in &terminated {
+        objects.push(rule(t, OUT_CHAIN, forward_rewrite(*vip, *vip, map)));
+    }
     // Conntrack exists from here on: carry the packet's mark onto its flow,
     // where the filter and the reply rewrite can see it for every packet
     // in both directions.
@@ -727,6 +741,9 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
         objects.push(chain(t, name, NfChainType::Filter, hook, PRIO_AFTER_NAT));
         for (vip, dest, map) in &mapped {
             objects.push(rule(t, name, reverse_rewrite(*vip, *dest, map)));
+        }
+        for (vip, map) in &terminated {
+            objects.push(rule(t, name, reverse_rewrite(*vip, *vip, map)));
         }
     }
     let remote: Vec<_> = rules
@@ -801,6 +818,7 @@ mod tests {
 
     const NODE: Ipv4Addr = Ipv4Addr::new(100, 90, 0, 2);
     const VIP: Ipv4Addr = Ipv4Addr::new(100, 90, 0, 50);
+    const TLS_PORT: u16 = wireserve_types::TLS_LISTEN_PORT;
 
     fn fwd(transit: &[TransitForward]) -> Forwarding {
         Forwarding { transit: transit.to_vec(), ..Forwarding::default() }
@@ -899,6 +917,12 @@ mod tests {
 
     fn endpoint4(ip: &str, vips: &[&str]) -> TransitEndpoint {
         TransitEndpoint { ip4: Some(ip.parse().unwrap()), ip6: None, vips: vips.iter().map(|v| v.parse().unwrap()).collect() }
+    }
+
+    /// A transit pair told apart by `n`: `100.90.n.1` and `100.90.n.2`. Its
+    /// rules only filter, so an unprivileged namespace takes them.
+    fn pair(n: u8) -> TransitForward {
+        TransitForward { near: endpoint4(&format!("100.90.{n}.1"), &[]), far: endpoint4(&format!("100.90.{n}.2"), &[]) }
     }
 
     #[test]
@@ -1144,32 +1168,48 @@ mod tests {
     // ---- PLAN.md M33: terminated on this node ----
 
     fn terminated(map: &str) -> ServiceRule {
-        ServiceRule::Terminated { vip: VIP, map: map.parse().unwrap() }
+        ServiceRule::Terminated { vip: VIP, map: map.parse().unwrap(), port: TLS_PORT }
     }
 
     #[test]
-    fn a_terminated_service_is_marked_unrewritten_and_closed_to_the_lan() {
+    fn a_terminated_service_is_rewritten_to_the_terminator_and_closed_to_the_lan() {
         let batch = as_json(&apply_batch("wg0", &[terminated("443:32400")], &fwd(&[])));
         let text = batch.to_string();
-        // Marked on the way in, nothing rewritten anywhere, target never
-        // mentioned: the terminator reaches it locally.
-        // Then any other port refused (see the mapped service's test).
+        // 443 on the service address to the terminator's port on the same
+        // address (PLAN.md M35), from the mesh and from the node itself; the
+        // target never mentioned: the terminator reaches it locally. Then
+        // any other port refused (see the mapped service's test).
         let pre = rules_in(&batch, "svc-pre");
         assert_eq!(pre.len(), 2, "{pre:?}");
         assert!(pre[1].to_string().contains("tcp reset"), "{pre:?}");
-        let pre = pre[0].to_string();
-        assert!(pre.contains("443") && pre.contains(&VIP.to_string()) && pre.contains("mark"), "{pre}");
+        let expected = forward_rewrite(VIP, VIP, &"443:11443".parse().unwrap());
+        assert_eq!(pre[0], json!([iif("wg0")].into_iter().chain(expected.iter().map(|e| serde_json::to_value(e).unwrap())).collect::<Vec<_>>()));
+        let out = rules_in(&batch, "svc-out");
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0], serde_json::to_value(&expected).unwrap());
         assert!(!text.contains("32400"), "{text}");
-        assert!(rules_in(&batch, "svc-rev-post").is_empty() && rules_in(&batch, "svc-out").is_empty());
-        assert!(chain_names(&batch).contains(&"svc-mark-pre".to_string()), "chains exist with only a terminated rule");
+        // And back: from the terminator's port to 443, on the way out to the
+        // mesh and to the node's own clients.
+        let back = serde_json::to_value(reverse_rewrite(VIP, VIP, &"443:11443".parse().unwrap())).unwrap();
+        for chain in ["svc-rev-post", "svc-rev-in"] {
+            let rev = rules_in(&batch, chain);
+            assert_eq!(rev.len(), 1, "{rev:?}");
+            assert_eq!(rev[0], back);
+        }
         // Accepted from the mesh by the mark; dropped from anywhere but the
-        // mesh and the host itself.
+        // mesh and the host itself, on the service address and on the
+        // terminator's port at any address.
         let input = rules_in(&batch, "wireserve-in");
         assert!(input.iter().any(|r| r.to_string().contains("ct") && r.to_string().contains("accept")), "{input:?}");
         let lan_drop = input[0].to_string();
         assert!(
             lan_drop.contains("!=") && lan_drop.contains("\"lo\"") && lan_drop.contains(&VIP.to_string()) && lan_drop.contains("drop"),
             "{lan_drop}"
+        );
+        let port_drop = input[1].to_string();
+        assert!(
+            port_drop.contains("!=") && port_drop.contains("\"lo\"") && port_drop.contains("11443") && port_drop.contains("drop"),
+            "{port_drop}"
         );
         // Nothing forwarded for it.
         assert!(!rules_in(&batch, "wireserve-fwd").iter().any(|r| r.to_string().contains("mark")));
@@ -1233,8 +1273,11 @@ mod tests {
                 let ok = match r["chain"].as_str().unwrap() {
                     "wireserve-fwd" | "svc-pre" | "exit-mark" => *first == iif(ifname),
                     // The terminated address's drop is for every interface
-                    // but this one: it names the address.
-                    "wireserve-in" => *first == iif(ifname) || text.contains("100.90.0.50"),
+                    // but this one: it names the address; so is the drop of
+                    // the terminator's own port.
+                    "wireserve-in" => {
+                        *first == iif(ifname) || text.contains("100.90.0.50") || text.contains(&format!(r#""right":{TLS_PORT}"#))
+                    }
                     "exit-masq" => text.contains(&format!(r#""&":[{{"ct":{{"key":"mark"}}}},{EXIT_MARK}]"#)),
                     "svc-masq" => text.contains(&format!(r#""&":[{{"meta":{{"key":"mark"}}}},{SERVICE_MARK}]"#)),
                     "svc-out" => text.starts_with(r#"[{"match":{"left":{"payload":{"field":"daddr","protocol":"ip"}},"op":"==","right":"100.90.0.50"}}"#),
@@ -1470,28 +1513,38 @@ mod tests {
         has(&format!("iifname \"eth0\" meta nfproto ipv4 ct mark & {m} != {m} drop"));
     }
 
-    /// A terminated service rewrites nothing, so the kernel takes its rules
-    /// in an unprivileged namespace too (PLAN.md M33).
+    /// A terminated service's rules (PLAN.md M33, M35). As with the mapped
+    /// ones (`kernel_accepts_the_service_address_chains`), an unprivileged
+    /// namespace refuses the rewrites, and every other rule must still be
+    /// accepted; as root the whole listing is checked.
     #[test]
     fn kernel_accepts_a_terminated_service() {
         let batch = serde_json::to_string(&apply_batch("wg0", &[terminated("443:32400")], &fwd(&[]))).unwrap();
-        let script = format!("nft -j -f - <<'JSON'\n{batch}\nJSON\nnft list ruleset");
+        let script = format!("nft -j -f - <<'JSON' || true\n{batch}\nJSON\nnft list ruleset");
         let Some((listing, stderr)) = crate::firewall::netns::run_capturing(&script) else {
             return;
         };
+        if stderr.contains("Operation not permitted") {
+            for e in stderr.lines().filter(|l| l.contains("Error:")) {
+                assert!(e.contains("Could not process rule: Operation not permitted"), "unexpected nft error: {e}\n{stderr}");
+            }
+            eprintln!("NOTE: payload rewriting refused in this user namespace; checked that nft accepted the JSON");
+            return;
+        }
         assert!(stderr.trim().is_empty(), "{stderr}");
         let lines = normalised_lines(&listing);
         let has = |l: &str| assert!(lines.iter().any(|x| x == l), "missing `{l}` in:\n{listing}");
         let m = format!("0x{SERVICE_MARK:08x}");
-        has(&format!("iifname \"wg0\" ip daddr 100.90.0.50 tcp dport 443 meta mark set meta mark | {m}"));
+        has(&format!("iifname \"wg0\" ip daddr 100.90.0.50 tcp dport 443 ip daddr set 100.90.0.50 tcp dport set 11443 meta mark set meta mark | {m}"));
+        has(&format!("ip daddr 100.90.0.50 tcp dport 443 ip daddr set 100.90.0.50 tcp dport set 11443 meta mark set meta mark | {m}"));
+        has(&format!("ct direction reply ct mark & {m} == {m} ip saddr 100.90.0.50 tcp sport 11443 ip saddr set 100.90.0.50 tcp sport set 443"));
         has("iifname != \"wg0\" iifname != \"lo\" ip daddr 100.90.0.50 drop");
+        has("iifname != \"wg0\" iifname != \"lo\" tcp dport 11443 drop");
         has(&format!("iifname \"wg0\" ip daddr 100.90.0.50 meta mark & {m} != {m} meta l4proto tcp reject with tcp reset"));
         has(&format!("meta mark & {m} == {m} ct mark set ct mark | {m}"));
         has(&format!("iifname \"wg0\" ct mark & {m} == {m} accept"));
     }
 
-    /// The masquerade and the guard rewrite nothing, so unlike the chains
-    /// above the kernel takes them in an unprivileged namespace too.
     #[test]
     fn kernel_accepts_the_masquerade_and_the_guard() {
         let rules = [mapped("443:192.168.178.1:80")];
@@ -1596,15 +1649,14 @@ mod tests {
 
     #[test]
     fn kernel_apply_twice_replaces_rather_than_accumulates() {
-        // Terminated rules only mark, which an unprivileged namespace allows.
-        let tcp = |port: u16| terminated(&format!("{port}:{port}"));
-        let script = nft_script(&[apply_batch("wg0", &[tcp(1)], &fwd(&[])), apply_batch("wg0", &[tcp(2)], &fwd(&[]))])
+        // Transit rules only filter, which an unprivileged namespace allows.
+        let script = nft_script(&[apply_batch("wg0", &[], &fwd(&[pair(1)])), apply_batch("wg0", &[], &fwd(&[pair(2)]))])
             + "nft list table inet wireserve.wg0";
         let Some(listing) = crate::firewall::netns::run(&script) else {
             return;
         };
-        assert!(!listing.contains("dport 1 "), "{listing}");
-        assert!(listing.contains("ip daddr 100.90.0.50 tcp dport 2 meta mark set"), "{listing}");
+        assert!(!listing.contains("100.90.1."), "{listing}");
+        assert!(listing.contains("ip saddr 100.90.2.1 ip daddr 100.90.2.2 accept"), "{listing}");
         assert_eq!(listing.matches("chain wireserve-in").count(), 1, "{listing}");
     }
 
@@ -1642,11 +1694,10 @@ mod tests {
 
     #[test]
     fn kernel_two_interfaces_keep_separate_tables() {
-        let tcp = |port: u16| terminated(&format!("{port}:{port}"));
         let script = nft_script(&[
-            apply_batch("wireserve0", &[tcp(1)], &fwd(&[])),
-            apply_batch("wireserve1", &[tcp(2)], &fwd(&[])),
-            apply_batch("wireserve0", &[tcp(3)], &fwd(&[])),
+            apply_batch("wireserve0", &[], &fwd(&[pair(1)])),
+            apply_batch("wireserve1", &[], &fwd(&[pair(2)])),
+            apply_batch("wireserve0", &[], &fwd(&[pair(3)])),
             teardown_batch("wireserve.wireserve0"),
         ]) + "nft list ruleset";
         let Some(listing) = crate::firewall::netns::run(&script) else {
@@ -1654,6 +1705,6 @@ mod tests {
         };
         assert!(!listing.contains("wireserve.wireserve0"), "{listing}");
         assert!(listing.contains("table inet wireserve.wireserve1"), "{listing}");
-        assert!(listing.contains("iifname \"wireserve1\" ip daddr 100.90.0.50 tcp dport 2 meta mark set"), "{listing}");
+        assert!(listing.contains("iifname \"wireserve1\" ip saddr 100.90.2.1 ip daddr 100.90.2.2 accept"), "{listing}");
     }
 }

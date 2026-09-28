@@ -40,9 +40,10 @@ impl Link {
         &self.socket
     }
 
-    /// Tells the agent what is served now; returns what should be.
-    pub async fn check_in(&self, serving: Vec<String>) -> Result<TlsConfig, LinkError> {
-        match self.exchange(&TlsRequest::CheckIn { serving }).await? {
+    /// Tells the agent what is served now, and on which port; returns what
+    /// should be.
+    pub async fn check_in(&self, serving: Vec<String>, port: u16) -> Result<TlsConfig, LinkError> {
+        match self.exchange(&TlsRequest::CheckIn { serving, port }).await? {
             TlsResponse::Config(config) => Ok(*config),
             other => Err(unexpected(other)),
         }

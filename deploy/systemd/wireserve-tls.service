@@ -8,15 +8,18 @@
 # the whole mesh, and none of that belongs in the root daemon that holds
 # the WireGuard key and edits the firewall. It talks to the agent over
 # /run/wireserve-tls/tls.sock, which answers nothing but a check-in and a
-# challenge request, and binds port 443 on the service addresses the agent
-# routes to this host — the one privilege it has.
+# challenge request. It holds no privilege at all: it listens on the socket
+# wireserve-tls.socket keeps for it on an unprivileged port (PLAN.md M35),
+# to which the agent rewrites the service addresses' 443.
 #
-# PartOf: it stops and restarts with the agent, whose socket it needs.
+# PartOf: it stops and restarts with the agent, whose socket it needs. The
+# listening socket stays with systemd meanwhile.
 
 [Unit]
 Description=WireServe TLS terminator
 Documentation=file:///usr/share/doc/wireserve/wireserve-design-spec.md
-After=wireserve-agent.service
+Requires=wireserve-tls.socket
+After=wireserve-tls.socket wireserve-agent.service
 PartOf=wireserve-agent.service
 
 [Service]
@@ -32,8 +35,7 @@ RestartSec=5s
 StateDirectory=wireserve-tls
 StateDirectoryMode=0700
 
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

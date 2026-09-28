@@ -79,9 +79,11 @@ async fn handle(ctx: &TlsContext, stream: tokio::net::UnixStream) {
 
 async fn dispatch(ctx: &TlsContext, req: TlsRequest) -> TlsResponse {
     match req {
-        TlsRequest::CheckIn { serving } => {
+        TlsRequest::CheckIn { serving, port } => {
+            // No port, nowhere to send anything: it serves nothing.
             let serving: BTreeSet<String> = serving
                 .into_iter()
+                .filter(|_| port != 0)
                 .filter(|n| wireserve_types::is_valid_dns_label(n))
                 .take(MAX_SERVING)
                 .collect();
@@ -91,6 +93,7 @@ async fn dispatch(ctx: &TlsContext, req: TlsRequest) -> TlsResponse {
             let asked: BTreeSet<&str> = config.services.iter().map(|s| s.name.as_str()).collect();
             ctx.link.check_in(
                 serving.into_iter().filter(|n| asked.contains(n.as_str())).collect(),
+                port,
                 std::time::Instant::now(),
             );
             TlsResponse::Config(Box::new(config))

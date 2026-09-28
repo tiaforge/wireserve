@@ -1,5 +1,7 @@
-//! Serving one service (PLAN.md M33): a TLS listener on its own address,
-//! port 443, handing each request to its backend in plain HTTP.
+//! Serving the services (PLAN.md M33): one TLS listener on an unprivileged
+//! port of every address (PLAN.md M35), to which the agent rewrites each
+//! service address's 443; each connection goes to the service whose
+//! address it arrived on, and each request to its backend in plain HTTP.
 //!
 //! The proxying itself is `axum-reverse-proxy` over hyper — hop-by-hop
 //! headers, WebSocket upgrades, HTTP/2, trailers. What is ours is only
@@ -86,37 +88,80 @@ pub fn server_config(certs: Arc<Certs>) -> Arc<rustls::ServerConfig> {
     Arc::new(config)
 }
 
-/// Binds `vip:443`. `IP_FREEBIND` lets the bind happen before the agent has
-/// made the address local; nothing arrives until it has.
-pub fn bind(vip: Ipv4Addr) -> std::io::Result<TcpListener> {
-    use socket2::{Domain, Protocol, Socket, Type};
-    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
-    socket.set_reuse_address(true)?;
-    socket.set_freebind_v4(true)?;
-    socket.set_nonblocking(true)?;
-    socket.bind(&SocketAddr::new(vip.into(), wireserve_types::TLS_PUBLIC_PORT).into())?;
-    socket.listen(1024)?;
-    TcpListener::from_std(socket.into())
+/// One service, as the listener finds it by the address a connection
+/// arrived on.
+#[derive(Clone)]
+pub struct Route {
+    router: axum::Router,
+    policy: Policy,
 }
 
-/// Accepts on `listener` until aborted, proxying every request to
-/// `upstream` in plain HTTP.
+impl Route {
+    /// Proxies to `upstream` in plain HTTP.
+    pub fn new(upstream: SocketAddr, policy: Policy) -> Self {
+        let proxy_policy = ProxyPolicy::new()
+            // The backend sees the name it is served under, as it would behind
+            // any reverse proxy; its configured base URL depends on it.
+            .with_host_behaviour(HostBehaviour::Preserve)
+            .with_x_forwarded_for(XForwardedFor::Append)
+            .with_public_scheme("https");
+        let router = ReverseProxy::new("/", format!("http://{upstream}")).with_policy(proxy_policy).into();
+        Self { router, policy }
+    }
+}
+
+/// Service address → its service, shared by the listener and replaced as
+/// services come and go. An address not in it is nobody's: its connections
+/// are closed unanswered.
+pub type Routes = Arc<RwLock<HashMap<Ipv4Addr, Arc<Route>>>>;
+
+/// The one listening socket (PLAN.md M35): the one systemd passed us when
+/// `wireserve-tls.socket` started this process — held by systemd across
+/// restarts, so no other local user can take the port in between — or,
+/// run outside systemd, `0.0.0.0:port` bound here.
+pub fn listener(port: u16) -> std::io::Result<TcpListener> {
+    use std::os::fd::FromRawFd;
+    let pid = std::process::id();
+    let passed = listen_fd(pid, std::env::var("LISTEN_PID").ok().as_deref(), std::env::var("LISTEN_FDS").ok().as_deref());
+    // Left in the environment: the runtime's other threads may read it, and
+    // a child could never mistake them for its own, `LISTEN_PID` being ours.
+    let std_listener = match passed {
+        // SAFETY: systemd passed this descriptor to this very process
+        // (LISTEN_PID), and nothing else in it has taken ownership of it.
+        Some(fd) => unsafe { std::net::TcpListener::from_raw_fd(fd) },
+        None => {
+            use socket2::{Domain, Protocol, Socket, Type};
+            let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+            socket.set_reuse_address(true)?;
+            socket.bind(&SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port).into())?;
+            socket.listen(1024)?;
+            socket.into()
+        }
+    };
+    std_listener.set_nonblocking(true)?;
+    TcpListener::from_std(std_listener)
+}
+
+/// The descriptor systemd's socket activation passed this process, if it
+/// passed one: `LISTEN_PID` names us, and `LISTEN_FDS` counts at least
+/// one, starting at 3.
+fn listen_fd(pid: u32, listen_pid: Option<&str>, listen_fds: Option<&str>) -> Option<std::os::fd::RawFd> {
+    const SD_LISTEN_FDS_START: std::os::fd::RawFd = 3;
+    let for_us = listen_pid?.parse::<u32>().ok()? == pid;
+    let count = listen_fds?.parse::<u32>().ok()?;
+    (for_us && count >= 1).then_some(SD_LISTEN_FDS_START)
+}
+
+/// Accepts on `listener` until aborted, handing each connection to the
+/// service whose address it arrived on.
 pub fn spawn(
     listener: TcpListener,
     tls: Arc<rustls::ServerConfig>,
-    upstream: SocketAddr,
+    routes: Routes,
     callers: Callers,
     sign_in: SharedSignIn,
-    policy: Policy,
 ) -> JoinHandle<()> {
     let acceptor = tokio_rustls::TlsAcceptor::from(tls);
-    let proxy_policy = ProxyPolicy::new()
-        // The backend sees the name it is served under, as it would behind
-        // any reverse proxy; its configured base URL depends on it.
-        .with_host_behaviour(HostBehaviour::Preserve)
-        .with_x_forwarded_for(XForwardedFor::Append)
-        .with_public_scheme("https");
-    let router: axum::Router = ReverseProxy::new("/", format!("http://{upstream}")).with_policy(proxy_policy).into();
     tokio::spawn(async move {
         loop {
             let (tcp, peer) = match listener.accept().await {
@@ -127,16 +172,23 @@ pub fn spawn(
                     continue;
                 }
             };
+            // The address the agent rewrote 443 to this port on. Anything
+            // else — the host's own addresses, a service no longer served
+            // — is nobody's to answer.
+            let route = tcp.local_addr().ok().and_then(|a| local_v4(a.ip())).and_then(|vip| {
+                routes.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(&vip).cloned()
+            });
+            let Some(route) = route else {
+                continue;
+            };
             // Without it, Nagle holds back the tail of a response written in
             // more than one TLS record until the client ACKs the head — which
             // its delayed ACK puts off by up to 40ms here, and on a phone's
             // link by a round trip on top.
             let _ = tcp.set_nodelay(true);
             let acceptor = acceptor.clone();
-            let router = router.clone();
             let callers = callers.clone();
             let sign_in = sign_in.clone();
-            let policy = policy.clone();
             tokio::spawn(async move {
                 let Ok(tls) = acceptor.accept(tcp).await else {
                     return;
@@ -148,14 +200,14 @@ pub fn spawn(
                     std::net::IpAddr::V6(_) => None,
                 };
                 let service = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
-                    let router = router.clone();
+                    let router = route.router.clone();
                     let sign_in = sign_in.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-                    let policy = policy.clone();
+                    let route = route.clone();
                     prepare(req.headers_mut(), caller.as_deref());
                     req.extensions_mut().insert(ConnectInfo(peer));
                     async move {
                         let mut req = req.map(Body::new);
-                        match guard(&mut req, sign_in.as_ref(), &policy).await {
+                        match guard(&mut req, sign_in.as_ref(), &route.policy).await {
                             Some(denied) => Ok(denied),
                             None => router.oneshot(req).await,
                         }
@@ -167,6 +219,14 @@ pub fn spawn(
             });
         }
     })
+}
+
+/// An IPv4 local address, also when a dual-stack socket reports it mapped.
+fn local_v4(ip: std::net::IpAddr) -> Option<Ipv4Addr> {
+    match ip {
+        std::net::IpAddr::V4(v4) => Some(v4),
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+    }
 }
 
 /// The sign-in's part of a request (PLAN.md M34): `Some` is the answer to
@@ -284,6 +344,63 @@ mod tests {
         let mut req = request();
         assert!(guard(&mut req, None, &Policy { marked: false, fqdn: "grafana.int.test".into() }).await.is_none());
         assert_eq!(req.headers().get("cookie").unwrap(), "theme=dark; authward_session=s3cret");
+    }
+
+    #[test]
+    fn only_a_socket_passed_to_this_very_process_is_taken() {
+        assert_eq!(listen_fd(42, Some("42"), Some("1")), Some(3));
+        assert_eq!(listen_fd(42, Some("41"), Some("1")), None, "meant for another process");
+        assert_eq!(listen_fd(42, Some("42"), Some("0")), None);
+        assert_eq!(listen_fd(42, None, Some("1")), None);
+        assert_eq!(listen_fd(42, Some("42"), None), None);
+        assert_eq!(listen_fd(42, Some("x"), Some("1")), None);
+    }
+
+    #[tokio::test]
+    async fn a_connection_goes_to_the_service_whose_address_it_arrived_on() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            let app = axum::Router::new().fallback(|| async { "from the backend" });
+            axum::serve(backend, app).await.unwrap();
+        });
+
+        let key = rcgen::generate_simple_self_signed(vec!["svc.test".into()]).unwrap();
+        let der = key.cert.der().clone();
+        let private = rustls_pki_types::PrivateKeyDer::try_from(key.signing_key.serialize_der()).unwrap();
+        let certs = Arc::new(Certs::default());
+        certs.set("svc.test", Arc::new(CertifiedKey::new(vec![der.clone()], rustls::crypto::aws_lc_rs::sign::any_supported_type(&private).unwrap())));
+        let listener = listener(0).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let routes: Routes = Arc::default();
+        routes.write().unwrap().insert(
+            Ipv4Addr::LOCALHOST,
+            Arc::new(Route::new(upstream, Policy { marked: false, fqdn: "svc.test".into() })),
+        );
+        spawn(listener, server_config(certs), routes, Arc::default(), Arc::default());
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(der).unwrap();
+        let client = tokio_rustls::TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth(),
+        ));
+        let connect = |ip: &str| {
+            let (client, addr) = (client.clone(), format!("{ip}:{port}"));
+            async move {
+                let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+                client.connect(rustls_pki_types::ServerName::try_from("svc.test").unwrap(), tcp).await
+            }
+        };
+
+        let mut tls = connect("127.0.0.1").await.expect("routed: served");
+        tls.write_all(b"GET / HTTP/1.1\r\nhost: svc.test\r\nconnection: close\r\n\r\n").await.unwrap();
+        let mut answer = String::new();
+        tls.read_to_string(&mut answer).await.unwrap();
+        assert!(answer.ends_with("from the backend"), "{answer}");
+
+        assert!(connect("127.0.0.2").await.is_err(), "an address nobody is routed to is closed unanswered");
     }
 
     #[test]

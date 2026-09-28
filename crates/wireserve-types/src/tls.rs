@@ -16,8 +16,10 @@ use crate::naming::AcmeSettings;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TlsRequest {
-    /// "I serve exactly these services right now; what should I serve?"
-    CheckIn { serving: Vec<String> },
+    /// "I serve exactly these services right now, on this port; what should
+    /// I serve?" The port is the one the terminator's socket really has
+    /// (PLAN.md M35): the agent rewrites a service's 443 to it.
+    CheckIn { serving: Vec<String>, port: u16 },
     /// Publish (`present`) or withdraw one `_acme-challenge` TXT value for
     /// one of this node's own service names.
     Challenge { fqdn: String, value: String, present: bool },
@@ -67,7 +69,9 @@ pub struct TlsService {
     pub name: String,
     /// The certificate's name, `<name>.<domain>`.
     pub fqdn: String,
-    /// Where to listen: the service's own address, port 443.
+    /// The service's own address. Clients reach it on 443, which the agent
+    /// rewrites to the terminator's port (PLAN.md M35); the terminator
+    /// tells its services apart by the address a connection arrived on.
     pub vip: Ipv4Addr,
     /// Where to send the requests, in plain HTTP: the service's target.
     pub upstream: SocketAddr,
@@ -108,9 +112,9 @@ mod tests {
 
     #[test]
     fn requests_round_trip_and_unknown_ones_are_refused() {
-        let req = TlsRequest::CheckIn { serving: vec!["plex".into()] };
+        let req = TlsRequest::CheckIn { serving: vec!["plex".into()], port: 11443 };
         let text = serde_json::to_string(&req).unwrap();
-        assert_eq!(text, r#"{"op":"check_in","serving":["plex"]}"#);
+        assert_eq!(text, r#"{"op":"check_in","serving":["plex"],"port":11443}"#);
         assert_eq!(serde_json::from_str::<TlsRequest>(&text).unwrap(), req);
         assert!(serde_json::from_str::<TlsRequest>(r#"{"op":"leave"}"#).is_err());
         assert!(serde_json::from_str::<TlsRequest>(r#"{"op":"serve","name":"x"}"#).is_err());

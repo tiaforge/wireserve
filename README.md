@@ -601,8 +601,8 @@ services on 443 it:
 1. gets a certificate for `<name>.<domain>` — the key is made on the node and
    never leaves it; the coordinator publishes the ACME DNS-01 challenge record
    for it, and only for that node's own names;
-2. listens on the service's own address, port 443, and passes each request to
-   the service's target in plain HTTP on the same node;
+2. answers on the service's own address, port 443, and passes each request
+   to the service's target in plain HTTP on the same node;
 3. tells the backend who is calling: `X-Wireserve-Node` names the calling
    node, `X-Forwarded-For` its mesh address, and copies of either sent by the
    client are removed first.
@@ -619,9 +619,12 @@ Worth knowing:
   logs, one certificate per name.
 - **Only the service's 443 mapping changes.** Its other ports stay ordinary
   mappings, and its target port stays closed to the mesh.
-- **Something else on `0.0.0.0:443`** on the node (nginx, Caddy) keeps the
-  terminator from binding the service address; the service is then not
-  served with HTTPS, and the terminator's log says so.
+- **Port 443 stays free on the node** for nginx, Caddy or Stalwart. The
+  terminator really listens on port 11443, which systemd holds for it
+  (`wireserve-tls.socket`), and the agent sends the mesh's 443 on service
+  addresses there. If 11443 is taken, pick another with
+  `sudo wireserve install --tls-port <port>`; a second instance gets the
+  next free port automatically.
 - **Let's Encrypt limits** — 5 failed validations per name per hour, 5
   duplicate certificates a week: the terminator keeps its certificates across
   restarts and backs off after a failure, and the install wizard checks the

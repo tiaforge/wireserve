@@ -22,11 +22,11 @@ pub enum ServiceRule {
     /// there has no route back into the mesh.
     Mapped { vip: Ipv4Addr, node: Ipv4Addr, map: PortMap },
     /// `vip:map.public` answered by this node's own TLS terminator
-    /// (PLAN.md M33), which listens on that address itself: the request is
-    /// let in unrewritten, and nothing of `map.target` is opened — the
-    /// terminator reaches the backend locally. `map` is kept so the target
-    /// stays reserved against every other mapping on the node.
-    Terminated { vip: Ipv4Addr, map: PortMap },
+    /// (PLAN.md M33): rewritten to `vip:port`, where the terminator listens
+    /// on every address (PLAN.md M35), and nothing of `map.target` is
+    /// opened — the terminator reaches the backend locally. `map` is kept
+    /// so the target stays reserved against every other mapping on the node.
+    Terminated { vip: Ipv4Addr, map: PortMap, port: u16 },
 }
 
 /// One side of an active [`TransitForward`] pairing (PLAN.md M23): every

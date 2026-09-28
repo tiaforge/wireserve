@@ -1,5 +1,6 @@
 //! What the agent knows about this node's TLS terminator (PLAN.md M33):
-//! when it last checked in, and which services it said it serves.
+//! when it last checked in, which services it said it serves, and on which
+//! port it listens (PLAN.md M35).
 //!
 //! Two readings of the same check-ins, for two different jobs:
 //! * [`TlsLink::serving`] is what the firewall acts on: only while the
@@ -29,19 +30,22 @@ pub struct TlsLink {
 struct Inner {
     last_checkin: Option<Instant>,
     serving: BTreeSet<String>,
+    port: u16,
     /// Name → when the terminator last said it serves it.
     seen: BTreeMap<String, Instant>,
 }
 
 impl TlsLink {
-    /// Records a check-in: the terminator serves exactly `serving` now.
-    pub fn check_in(&self, serving: BTreeSet<String>, now: Instant) {
+    /// Records a check-in: the terminator serves exactly `serving` now, on
+    /// `port`.
+    pub fn check_in(&self, serving: BTreeSet<String>, port: u16, now: Instant) {
         let mut inner = self.lock();
         for name in &serving {
             inner.seen.insert(name.clone(), now);
         }
         inner.seen.retain(|_, at| now.saturating_duration_since(*at) < LATCH);
         inner.serving = serving;
+        inner.port = port;
         inner.last_checkin = Some(now);
     }
 
@@ -59,6 +63,17 @@ impl TlsLink {
         match inner.last_checkin {
             Some(t) if now.saturating_duration_since(t) < ALIVE => inner.serving.clone(),
             _ => BTreeSet::new(),
+        }
+    }
+
+    /// The port [`Self::serving`] is served on, under the same condition:
+    /// where the firewall rewrites those services' 443 to.
+    #[must_use]
+    pub fn port(&self, now: Instant) -> Option<u16> {
+        let inner = self.lock();
+        match inner.last_checkin {
+            Some(t) if now.saturating_duration_since(t) < ALIVE => Some(inner.port),
+            _ => None,
         }
     }
 
@@ -92,6 +107,7 @@ mod tests {
         let now = Instant::now();
         assert!(!link.present(now));
         assert!(link.serving(now).is_empty());
+        assert_eq!(link.port(now), None);
         assert!(link.reported(now).is_empty());
     }
 
@@ -99,20 +115,22 @@ mod tests {
     fn the_firewall_follows_the_terminator_and_the_report_is_latched() {
         let link = TlsLink::default();
         let t0 = Instant::now();
-        link.check_in(set(&["plex", "git"]), t0);
+        link.check_in(set(&["plex", "git"]), 11443, t0);
         assert_eq!(link.serving(t0), set(&["plex", "git"]));
 
         // The terminator drops git: the firewall stops at once, the report
         // keeps it until the latch runs out.
         let t1 = t0 + Duration::from_secs(5);
-        link.check_in(set(&["plex"]), t1);
+        link.check_in(set(&["plex"]), 12443, t1);
         assert_eq!(link.serving(t1), set(&["plex"]));
+        assert_eq!(link.port(t1), Some(12443), "the latest port, as it is now");
         assert_eq!(link.reported(t1), vec!["git".to_string(), "plex".to_string()]);
 
         // The terminator goes quiet: the firewall stops relying on it, the
         // report still holds — a restart must not move public DNS.
         let quiet = t1 + ALIVE;
         assert!(link.serving(quiet).is_empty());
+        assert_eq!(link.port(quiet), None);
         assert_eq!(link.reported(quiet).len(), 2);
         assert!(link.present(quiet));
 

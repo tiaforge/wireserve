@@ -1,0 +1,26 @@
+# The TLS terminator's listening socket (PLAN.md M35), held by systemd
+# rather than the terminator: bound from boot and kept across every
+# restart of wireserve-tls.service, so no other local user can take the
+# port while the terminator is down. The port is unprivileged, so the
+# terminator needs no capability at all.
+#
+# Every address, not the service addresses: those come and go, and 443
+# itself stays free for a Caddy, Stalwart or nginx on this host. The agent
+# rewrites each service address's 443 to this port; the terminator answers
+# only connections that arrived on a service address it serves.
+#
+# Another port: `wireserve install --tls-port <port>` writes a drop-in,
+# or `systemctl edit wireserve-tls.socket` with an empty `ListenStream=`
+# first to clear this one. The agent learns the port from the terminator.
+
+[Unit]
+Description=WireServe TLS terminator socket
+Documentation=file:///usr/share/doc/wireserve/wireserve-design-spec.md
+
+[Socket]
+ListenStream=0.0.0.0:11443
+Backlog=1024
+NoDelay=yes
+
+[Install]
+WantedBy=sockets.target

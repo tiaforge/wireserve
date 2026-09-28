@@ -3014,7 +3014,8 @@ every HTTPS service depends on, no wildcard key on one box.
 182. **A terminator of its own, not a thread of the agent.** `wireserve
     tls-serve` (crate `wireserve-tls`, in the same binary) runs under
     `wireserve-tls.service` as the `wireserve-tls` user with only
-    `CAP_NET_BIND_SERVICE` and a strict sandbox, `PartOf=` the agent. It
+    `CAP_NET_BIND_SERVICE` (none since M35) and a strict sandbox, `PartOf=`
+    the agent. It
     parses TLS and HTTP from the whole mesh, which does not belong in the
     root process holding the WireGuard key. The old objection to terminating
     beside the agent — an agent restart takes HTTPS down — no longer holds:
@@ -3062,6 +3063,7 @@ every HTTPS service depends on, no wildcard key on one box.
     drops the address from any interface but the mesh and `lo`. It emits the
     rule only while the directory says terminated **and** the terminator
     checked in within 30 seconds; otherwise the plain mapping is back.
+    (M35, #208: now rewritten to the terminator's own port.)
 
 187. **Local routes survive nothing by accident.** Kept in
     `AgentState.local_routes`; added before the ruleset that sends traffic
@@ -3086,7 +3088,7 @@ every HTTPS service depends on, no wildcard key on one box.
     lifetime; exponential backoff from 2 minutes to 6 hours after a failure
     (five failed validations per name per hour). An `EADDRINUSE` on the
     address — something else on `0.0.0.0:443` — leaves the service on its
-    old path. `WIRESERVE_ACME_DIRECTORY`/`_EMAIL`/`_PROPAGATION_SECS` on the
+    old path (M35 removed the conflict: #208). `WIRESERVE_ACME_DIRECTORY`/`_EMAIL`/`_PROPAGATION_SECS` on the
     coordinator choose the CA for every node; Let's Encrypt production by
     default.
 
@@ -3309,3 +3311,47 @@ sent is removed. There are no previous installations to carry forward.
     `ENDPOINT_GRACE_WINDOW` is 30s instead of 60s. A working path
     handshakes within a second or two; the window only has to span the
     poll interval (20s by default), since tiers are judged once per poll.
+
+## M35 — the terminator leaves port 443 to others
+
+The terminator bound `<service address>:443` for each service, and on Linux
+that bind and a listener on every address — nginx's `0.0.0.0:443`, Caddy's
+and Go's dual-stack `[::]:443` — refuse each other whichever starts second,
+`SO_REUSEADDR` or not. A node could not run Caddy, Stalwart or nginx on 443
+beside a terminated service.
+
+208. **An unprivileged port on every address, 443 rewritten to it.** The
+    terminator listens on `0.0.0.0:11443` (`TLS_LISTEN_PORT`), and a
+    terminated service's 443 becomes an ordinary mapping onto it: `svc-pre`
+    for the mesh and `svc-out` for the node's own clients rewrite only the
+    port — the address stays, the caller's too — and `svc-rev-*` rewrite the
+    reply back. The terminator tells its services apart by the local address
+    a connection arrived on; any other address (the host's own, a service no
+    longer served) is closed unanswered, and an input rule drops the port
+    from anything but the mesh and `lo`. One listener instead of one per
+    service also ends the rebind race of `d3e58be` and `IP_FREEBIND`.
+
+209. **systemd holds the port, so nobody else can.** An unprivileged port
+    on a local address can be bound by any local user whenever its owner
+    lets go — a restart, a crash — and the agent would keep sending the
+    mesh there. `wireserve-tls.socket` binds it from boot, as root, and
+    keeps it across every restart of the terminator, which takes the
+    descriptor (`LISTEN_FDS`) and needs no capability at all any more
+    (`CapabilityBoundingSet=` empty). Without systemd — the e2e containers —
+    it binds `--port` (`WIRESERVE_TLS_PORT`) itself.
+
+210. **The port is the socket's, and the agent learns it.** The check-in
+    carries the port the terminator's socket really has; the agent writes
+    its rewrite from that, under the same 30-second liveness as `serving`.
+    There is no second setting to keep in step. 11443: unprivileged, below
+    Kubernetes' NodePort range and the kernel's ephemeral ports, and clear
+    of the alternative HTTPS ports other software takes (4443 Jitsi, 6443
+    Kubernetes, 7443/8443 UniFi, 8443/9443 common Caddy and Stalwart setups).
+
+211. **Instances get ports of their own.** Every instance's socket listens
+    on every address, so no two may share a port. `wireserve install`
+    gives a named instance the first port above 11443 that no other
+    instance has and nothing on the host listens on, in a drop-in
+    (`wireserve-tls@<i>.socket.d/port.conf`), and says which. `--tls-port`
+    chooses one for any instance; a drop-in already there is kept as it is.
+

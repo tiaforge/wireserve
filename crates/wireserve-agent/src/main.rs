@@ -57,6 +57,18 @@ struct JoinArgs {
     allow_plaintext_http: bool,
 }
 
+#[derive(clap::Args)]
+struct InstallArgs {
+    #[command(flatten)]
+    join: JoinArgs,
+    /// The port this instance's TLS terminator listens on (PLAN.md M35).
+    /// Without it: the one it has, or 11443 for the default instance and
+    /// the first free one above for a named instance. Clients still use
+    /// 443; the agent rewrites it to this port.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+    tls_port: Option<u16>,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// One-time bootstrap: redeem a join token issued by `wireserve-admin
@@ -69,7 +81,7 @@ enum Command {
     /// step. Also creates the `wireserve` group whose members can run the
     /// other commands without sudo. Needs root, and Linux/systemd
     /// (Quadlet/podman deployments install by hand, per `deploy/quadlet/`).
-    Install(JoinArgs),
+    Install(InstallArgs),
     /// Runs the poll loop and IPC server. This is the long-running daemon.
     Daemon {
         #[arg(long, default_value_t = 20)]
@@ -131,7 +143,8 @@ enum Command {
     /// Runs this node's TLS terminator (PLAN.md M33): serves each of its
     /// services published on TCP 443 with TLS on the service's own address,
     /// with a certificate it obtains itself. Run by the `wireserve-tls`
-    /// unit, as its own unprivileged user, beside the daemon.
+    /// unit, as its own unprivileged user, beside the daemon, on the socket
+    /// `wireserve-tls.socket` holds for it (PLAN.md M35).
     TlsServe {
         /// Where certificates and the ACME account are kept. Defaults to
         /// the unit's state directory.
@@ -147,6 +160,11 @@ enum Command {
         trust_file: Option<std::path::PathBuf>,
         #[arg(long, default_value_t = 5, hide = true)]
         check_in_secs: u64,
+        /// The port to listen on when not started by `wireserve-tls.socket`,
+        /// which otherwise decides it. Service addresses' 443 is rewritten to
+        /// whichever it is.
+        #[arg(long, env = "WIRESERVE_TLS_PORT", default_value_t = wireserve_types::TLS_LISTEN_PORT, hide = true)]
+        port: u16,
     },
 }
 
@@ -201,7 +219,7 @@ async fn main() {
         } => {
             cmd_daemon(&instance, poll_interval_secs, ifname).await
         }
-        Command::TlsServe { state_dir, acme_ca_file, trust_file, check_in_secs } => {
+        Command::TlsServe { state_dir, acme_ca_file, trust_file, check_in_secs, port } => {
             // systemd may list several colon-separated state directories;
             // the unit names exactly one.
             let state_dir = state_dir
@@ -213,6 +231,7 @@ async fn main() {
                 ca_file: acme_ca_file,
                 trust_file,
                 check_in_every: Duration::from_secs(check_in_secs.max(1)),
+                port,
             })
             .await
             .map_err(Into::into)
@@ -284,7 +303,8 @@ async fn cmd_join(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn std
 ///
 /// On a node that has already joined, with no URL or token given, it is an
 /// upgrade instead: same installs, no join, every running agent restarted.
-async fn cmd_install(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn std::error::Error>> {
+async fn cmd_install(instance: &Instance, args: InstallArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let InstallArgs { join: args, tls_port } = args;
     // Refused before anything is installed, not after.
     if let Some(url) = &args.coordinator_url {
         register::check_coordinator_transport(url, args.allow_plaintext_http)?;
@@ -303,7 +323,7 @@ async fn cmd_install(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn 
     // the socket it hands to that user's group.
     wireserve_agent::install::ensure_tls_user()?;
     let unit = wireserve_agent::install::install_unit(instance)?;
-    let tls_unit = wireserve_agent::install::install_tls_unit(instance)?;
+    let tls = wireserve_agent::install::install_tls_units(instance, tls_port)?;
     if upgrade {
         wireserve_agent::install::refresh_other_unit(instance)?;
     }
@@ -328,10 +348,14 @@ async fn cmd_install(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn 
     // Started with the agent from now on (`WantedBy=`), and stopped and
     // restarted with it (`PartOf=`). A node with nothing to serve over TLS
     // runs it idle: it checks in and waits.
-    wireserve_agent::install::systemctl_enable_now(&tls_unit)?;
+    // Its socket from boot on, whatever the terminator does (PLAN.md M35).
+    wireserve_agent::install::start_tls(&tls)?;
     let instance_flag = if instance.is_default() { String::new() } else { format!(" --instance {}", instance.name()) };
     println!();
     println!("{unit} is running — `wireserve{instance_flag} list` shows its services and peers");
+    if let Some(note) = &tls.note {
+        println!("{note}");
+    }
     if let Some(group) = group {
         // The user who ran sudo, not root: root needs no group.
         let who = std::env::var("SUDO_USER").ok().filter(|u| !u.is_empty() && u != "root");

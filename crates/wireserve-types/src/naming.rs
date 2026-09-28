@@ -92,6 +92,16 @@ pub const LETS_ENCRYPT_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/d
 /// target port on the same node, so there is no second TLS hop.
 pub const TLS_PUBLIC_PORT: u16 = 443;
 
+/// Where the terminator really listens (PLAN.md M35), on every address:
+/// the agent rewrites a service address's [`TLS_PUBLIC_PORT`] to it, so
+/// 443 itself stays free for a Caddy, Stalwart or nginx on the same host.
+/// Unprivileged, so the terminator needs no capability at all; held by
+/// systemd (`wireserve-tls.socket`) so no other local user can take it.
+/// Below the Kubernetes NodePort range and the kernel's ephemeral ports,
+/// and clear of the alternative HTTPS ports other software claims (4443,
+/// 6443, 7443, 8443, 9443).
+pub const TLS_LISTEN_PORT: u16 = 11443;
+
 /// Whether this service publishes [`TLS_PUBLIC_PORT`] over TCP.
 #[must_use]
 pub fn publishes_tls(s: &ServiceInfo) -> bool {

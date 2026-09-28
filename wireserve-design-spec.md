@@ -455,11 +455,16 @@ resolution is ordinary public DNS.
 **TLS on the service's own node (M33).** Publishing TCP 443 is the opt-in —
 an existing field, so an SSH or Postgres service never acquires a
 certificate nobody asked for. Such a service is served with HTTPS by
-`wireserve tls-serve` on its owner node, as its own user, bound to the
-service address, which the agent routes to the host itself (`local` route,
-protocol 247). The agent lets that traffic in unrewritten, only marked, so the
-existing accept and host-firewall openings cover it, and drops the address
-from any interface but the mesh and loopback. The terminator holds the private
+`wireserve tls-serve` on its owner node, as its own user with no
+capability, on the service address, which the agent routes to the host
+itself (`local` route, protocol 247). The terminator listens on an
+unprivileged port of every address (11443 by default, M35), held by
+`wireserve-tls.socket` so no other local user can take it, and tells its
+services apart by the address a connection arrived on; the agent rewrites
+the service address's 443 to that port, marked like any other mapping, so
+the existing accept and host-firewall openings cover it, leaving 443 free
+for other software on the host. It drops the address, and the port, from
+any interface but the mesh and loopback. The terminator holds the private
 key; the coordinator, holding the DNS credential, publishes the DNS-01
 challenge for the owner's own approved names only (`/tls/challenge`). A
 service is `terminated` in the directory only while its owner reports it

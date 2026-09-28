@@ -13,11 +13,15 @@
 #      who is calling (X-Wireserve-Node, X-Forwarded-For) with forged copies
 #      of those headers removed;
 #   3. the owner node itself reaches it the same way, named as itself;
-#   4. the service's other port is still an ordinary mapping;
-#   5. the challenge record is gone once the certificate is issued;
-#   6. restarting the terminator serves the stored certificate, no new one;
-#   7. a stopped terminator hands the address back to the plain mapping;
-#   8. a daemon stop removes the local route, and a daemon killed with -9
+#   4. port 443 stays free for other software (PLAN.md M35): a stranger
+#      listening on 0.0.0.0:443 of the home node, started before the
+#      terminator, keeps it, while 1–3 went to the terminator's own port;
+#      that port answers neither the LAN nor the mesh directly;
+#   5. the service's other port is still an ordinary mapping;
+#   6. the challenge record is gone once the certificate is issued;
+#   7. restarting the terminator serves the stored certificate, no new one;
+#   8. a stopped terminator hands the address back to the plain mapping;
+#   9. a daemon stop removes the local route, and a daemon killed with -9
 #      has its leftover route swept on the next start.
 #
 #     ( net )──┬──────────┬───────┬────────┬──────────────┬────────────┐
@@ -206,6 +210,9 @@ start_terminator() {
     podman exec -d "$HOME_AGENT" sh -c 'WIRESERVE_ACME_CA_FILE=/etc/pebble-minica.pem \
         wireserve tls-serve --state-dir /var/lib/wireserve-tls >>/var/log/tls.log 2>&1'
 }
+# Something else of the host's on every address's 443 (PLAN.md M35),
+# there before the terminator, the way a Caddy started at boot would be.
+in_netns_bg "$HOME_AGENT" socat "TCP-LISTEN:443,fork,reuseaddr" SYSTEM:"echo stranger"
 start_terminator
 podman exec "$HOME_AGENT" wireserve serve plex 443:32400 81:32401
 for port in 32400 32401; do
@@ -217,7 +224,7 @@ HOME_IP=$(podman exec "$HOME_AGENT" wireserve list --json | python3 -c 'import j
 [ -n "$PLEX_VIP" ] || fail "plex has no service address: $(podman exec "$HOME_AGENT" wireserve list)"
 pass "plex at $PLEX_VIP"
 
-log "1/8: a certificate from Pebble, and plex terminated"
+log "1/9: a certificate from Pebble, and plex terminated"
 terminated_on() { [ "$(entry "$1" plex terminated)" = True ]; }
 wait_for "the terminator to report plex" 90 terminated_on "$HOME_AGENT"
 podman exec "$HOME_AGENT" grep -q 'certificate issued' /var/log/tls.log || fail "no issuance in the terminator's log"
@@ -227,7 +234,7 @@ grep -q 'BEGIN CERTIFICATE' "$WORK/pebble-root.pem" || fail "could not fetch Peb
 wait_for "the client to see plex terminated" 30 terminated_on "$CLIENT"
 pass "issued once; the directory says terminated"
 
-log "2/8: from the client, verified TLS on the service's own address"
+log "2/9: from the client, verified TLS on the service's own address"
 OUT=$(fetch "$CLIENT" -H 'X-Wireserve-Node: evil' -H 'X-Forwarded-For: 6.6.6.6') || true
 echo "$OUT" | sed 's/^/  /'
 echo "$OUT" | grep -q '^STATUS 200' || fail "the request did not succeed over verified TLS"
@@ -239,13 +246,25 @@ echo "$OUT" | grep -qi '^x-forwarded-proto: https' || fail "no X-Forwarded-Proto
 echo "$OUT" | grep -qi "^host: plex.$DOMAIN" || fail "the backend did not see its own name as Host"
 pass "200 over a Pebble certificate; X-Wireserve-Node: node-client; forged headers gone"
 
-log "3/8: from the owner node itself"
+log "3/9: from the owner node itself"
 OUT=$(fetch "$HOME_AGENT") || true
 echo "$OUT" | grep -q '^STATUS 200' || { echo "$OUT"; fail "the owner node could not reach its own service by name"; }
 echo "$OUT" | grep -qi '^x-wireserve-node: node-home' || { echo "$OUT"; fail "the owner node was not named as itself"; }
 pass "the owner node is named node-home"
 
-log "4/8: the other port is still an ordinary mapping"
+log "4/9: 443 stays the stranger's, and the terminator's port is closed"
+in_netns "$HOME_AGENT" curl -s --max-time 4 http://127.0.0.1:443/ | grep -q stranger \
+    || fail "the stranger lost 0.0.0.0:443"
+HOME_LAN=$(ip_on "$HOME_AGENT" "$NET")
+if in_netns "$CLIENT" curl -sk --max-time 4 --resolve "plex.$DOMAIN:11443:$HOME_LAN" "https://plex.$DOMAIN:11443/" | grep -q backend; then
+    fail "the terminator's port answers the LAN"
+fi
+if in_netns "$CLIENT" curl -sk --max-time 4 --resolve "plex.$DOMAIN:11443:$PLEX_VIP" "https://plex.$DOMAIN:11443/" | grep -q backend; then
+    fail "the terminator's port answers the mesh without the rewrite"
+fi
+pass "the stranger keeps 0.0.0.0:443; 11443 answers only through the rewrite"
+
+log "5/9: the other port is still an ordinary mapping"
 in_netns "$CLIENT" curl -s --max-time 6 "http://$PLEX_VIP:81/" | grep -q 'backend:32401' \
     || fail "port 81 no longer reaches its target"
 if in_netns "$CLIENT" curl -s --max-time 4 "http://$PLEX_VIP:32400/" | grep -q backend; then
@@ -253,11 +272,11 @@ if in_netns "$CLIENT" curl -s --max-time 4 "http://$PLEX_VIP:32400/" | grep -q b
 fi
 pass "81 → 32401 mapped; 32400 closed from the mesh"
 
-log "5/8: no challenge record left behind"
+log "6/9: no challenge record left behind"
 wait_for "the challenge record to go" 30 sh -c "[ -z \"\$(podman run --rm --network container:$COORD $DEBUG_IMG dig +short @$BIND_IP _acme-challenge.plex.$DOMAIN TXT)\" ]"
 pass "_acme-challenge.plex.$DOMAIN is empty"
 
-log "6/8: a restarted terminator serves the stored certificate"
+log "7/9: a restarted terminator serves the stored certificate"
 SERIAL=$(in_netns "$CLIENT" sh -c "echo | openssl s_client -connect $PLEX_VIP:443 -servername plex.$DOMAIN 2>/dev/null | openssl x509 -noout -serial" 2>/dev/null || true)
 signal "$HOME_AGENT" TERM 'wireserve tls-serve'
 sleep 1
@@ -269,7 +288,7 @@ AFTER=$(in_netns "$CLIENT" sh -c "echo | openssl s_client -connect $PLEX_VIP:443
 [ -z "$SERIAL" ] || [ "$SERIAL" = "$AFTER" ] || fail "a different certificate after the restart ($SERIAL → $AFTER)"
 pass "same certificate, no new issuance"
 
-log "7/8: a stopped terminator hands the address back to the mapping"
+log "8/9: a stopped terminator hands the address back to the mapping"
 signal "$HOME_AGENT" TERM 'wireserve tls-serve'
 # The firewall stops relying on it after 30s without a check-in.
 wait_for "plain HTTP on :443 to reach the backend again" 60 \
@@ -279,7 +298,7 @@ start_terminator
 wait_for "TLS back on :443" 60 sh -c "podman run --rm --network container:$CLIENT -v $WORK:/work:ro,Z $DEBUG_IMG curl -s --max-time 3 --cacert /work/pebble-root.pem --resolve plex.$DOMAIN:443:$PLEX_VIP https://plex.$DOMAIN/ | grep -q backend:32400"
 pass "and TLS again once it is back"
 
-log "8/8: local routes go with the daemon, and a crash's are swept"
+log "9/9: local routes go with the daemon, and a crash's are swept"
 in_netns "$HOME_AGENT" ip -4 route show table local proto 247 | grep -q "$PLEX_VIP" \
     || fail "no local route for $PLEX_VIP while terminated"
 signal "$HOME_AGENT" TERM 'wireserve daemon'

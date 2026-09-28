@@ -1,0 +1,20 @@
+# The TLS terminator's listening socket for a named agent instance:
+# `wireserve-tls@work.socket` for `wireserve-tls@work.service`. See
+# wireserve-tls.socket for what it is; keep the two in step.
+#
+# Every instance's socket listens on every address, so no two may share a
+# port: `wireserve install` gives each named instance its own in a drop-in
+# (wireserve-tls@<instance>.socket.d/port.conf), the first free one above
+# 11443, which the default instance keeps.
+
+[Unit]
+Description=WireServe TLS terminator socket (instance %i)
+Documentation=file:///usr/share/doc/wireserve/wireserve-design-spec.md
+
+[Socket]
+ListenStream=0.0.0.0:11443
+Backlog=1024
+NoDelay=yes
+
+[Install]
+WantedBy=sockets.target

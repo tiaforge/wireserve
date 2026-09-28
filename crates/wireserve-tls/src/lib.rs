@@ -33,7 +33,7 @@ use tokio::task::JoinHandle;
 use wireserve_types::tls::{TlsConfig, TlsService};
 
 use crate::link::Link;
-use crate::serve::{Callers, Certs, SharedSignIn};
+use crate::serve::{Callers, Certs, Routes, SharedSignIn};
 use crate::store::{Store, Stored};
 
 pub struct Options {
@@ -48,12 +48,16 @@ pub struct Options {
     /// a test CA such as Pebble's issuing root. Never needed otherwise.
     pub trust_file: Option<PathBuf>,
     pub check_in_every: Duration,
+    /// The port to listen on when systemd passed no socket (PLAN.md M35).
+    pub port: u16,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("state directory: {0}")]
     State(std::io::Error),
+    #[error("cannot listen on port {0}: {1}")]
+    Listen(u16, std::io::Error),
 }
 
 /// The first retry after a failed issuance; doubled each time, up to
@@ -65,7 +69,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(6 * 3600);
 /// One served service.
 struct Served {
     service: TlsService,
-    listener: Option<JoinHandle<()>>,
+    /// In the listener's routes.
+    routed: bool,
 }
 
 /// An issuance running in the background: the name, the CA's directory,
@@ -93,6 +98,9 @@ pub async fn run(opts: Options) -> Result<(), Error> {
     let tls = serve::server_config(certs.clone());
     let callers: Callers = Arc::default();
     let sign_in: SharedSignIn = Arc::default();
+    let routes: Routes = Arc::default();
+    let listener = serve::listener(opts.port).map_err(|e| Error::Listen(opts.port, e))?;
+    let port = listener.local_addr().map_err(|e| Error::Listen(opts.port, e))?.port();
     let extra_roots: Vec<rustls_pki_types::CertificateDer<'static>> = match &opts.trust_file {
         None => Vec::new(),
         Some(path) => {
@@ -108,19 +116,22 @@ pub async fn run(opts: Options) -> Result<(), Error> {
     // rather than asking the CA for all at once.
     let mut in_flight: Option<InFlight> = None;
 
-    tracing::info!(socket = %link.socket().display(), "TLS terminator starting");
+    tracing::info!(socket = %link.socket().display(), port, "TLS terminator starting");
+    let accepting = serve::spawn(listener, tls, routes.clone(), callers.clone(), sign_in.clone());
     let mut tick = tokio::time::interval(opts.check_in_every);
     loop {
         tick.tick().await;
 
-        // What is served right now: a certificate held, and a listener up.
+        // What is served right now: a certificate held, and routed to by a
+        // listener that is up.
+        let up = !accepting.is_finished();
         let serving: Vec<String> = served
             .values()
-            .filter(|s| s.listener.as_ref().is_some_and(|l| !l.is_finished()))
+            .filter(|s| up && s.routed)
             .filter(|s| issuance.get(&s.service.fqdn).and_then(|i| i.cert.as_ref()).is_some_and(|c| c.valid_at(SystemTime::now())))
             .map(|s| s.service.name.clone())
             .collect();
-        let config = match link.check_in(serving).await {
+        let config = match link.check_in(serving, port).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(error = %e, "could not check in with the agent; keeping what is served");
@@ -136,8 +147,8 @@ pub async fn run(opts: Options) -> Result<(), Error> {
             let keep = wanted.contains(name.as_str());
             if !keep {
                 tracing::info!(service = %name, "no longer serving");
-                if let Some(l) = s.listener.take() {
-                    l.abort();
+                if s.routed {
+                    routes.write().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&s.service.vip);
                 }
                 certs.remove(&s.service.fqdn);
             }
@@ -194,38 +205,21 @@ pub async fn run(opts: Options) -> Result<(), Error> {
                 }
             }
 
-            // Listening as soon as there is a certificate to answer with.
-            let s = served.entry(service.name.clone()).or_insert_with(|| Served { service: service.clone(), listener: None });
+            // Routed to as soon as there is a certificate to answer with.
+            let s = served.entry(service.name.clone()).or_insert_with(|| Served { service: service.clone(), routed: false });
             if s.service != *service {
-                if let Some(l) = s.listener.take() {
-                    // Aborting only schedules the cancellation; until the
-                    // task is dropped its socket still holds the address,
-                    // and binding it again below would fail.
-                    l.abort();
-                    let _ = l.await;
+                if s.routed {
+                    routes.write().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&s.service.vip);
+                    s.routed = false;
                 }
                 s.service = service.clone();
             }
-            let dead = s.listener.as_ref().is_none_or(JoinHandle::is_finished);
-            if entry.cert.is_some() && dead {
-                match serve::bind(service.vip) {
-                    Ok(listener) => {
-                        tracing::info!(service = %service.name, addr = %service.vip, upstream = %service.upstream, "serving");
-                        let policy = serve::Policy { marked: service.sign_in, fqdn: service.fqdn.clone() };
-                        s.listener = Some(serve::spawn(
-                            listener,
-                            tls.clone(),
-                            service.upstream,
-                            callers.clone(),
-                            sign_in.clone(),
-                            policy,
-                        ));
-                    }
-                    // Another listener on 0.0.0.0:443, most likely: this
-                    // service is simply not served here, and keeps the path
-                    // it had.
-                    Err(e) => tracing::warn!(service = %service.name, addr = %service.vip, error = %e, "cannot listen"),
-                }
+            if entry.cert.is_some() && !s.routed {
+                tracing::info!(service = %service.name, addr = %service.vip, upstream = %service.upstream, "serving");
+                let policy = serve::Policy { marked: service.sign_in, fqdn: service.fqdn.clone() };
+                let route = Arc::new(serve::Route::new(service.upstream, policy));
+                routes.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(service.vip, route);
+                s.routed = true;
             }
 
             // Issue, or renew, one at a time and not while backing off.

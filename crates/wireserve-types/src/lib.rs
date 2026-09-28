@@ -11,7 +11,7 @@ pub mod validation;
 
 pub use api::*;
 pub use mesh::{MeshInfo, MeshRanges};
-pub use naming::{AcmeSettings, ServiceNames, SignIn, ServiceNaming, LETS_ENCRYPT_DIRECTORY, TLS_PUBLIC_PORT};
+pub use naming::{AcmeSettings, ServiceNames, SignIn, ServiceNaming, LETS_ENCRYPT_DIRECTORY, TLS_LISTEN_PORT, TLS_PUBLIC_PORT};
 pub use firewall::{
     is_internet_v4, FirewallBackend, Forwarding, ServiceRule, TransitEndpoint, TransitForward, NOT_THE_INTERNET_V4,
 };
