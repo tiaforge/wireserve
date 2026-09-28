@@ -11,7 +11,7 @@ use nftables::expr::{
     BinaryOperation, CTDir, Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, Prefix, SetItem, CT,
 };
 use nftables::schema::{Chain, NfCmd, NfListObject, NfObject, Nftables, Rule, Table};
-use nftables::stmt::{Accept, Drop, Mangle, Match, Operator, Statement, NAT};
+use nftables::stmt::{Accept, Drop, Mangle, Match, Operator, Reject, RejectType, Statement, NAT};
 use nftables::types::{NfChainPolicy, NfChainType, NfFamily, NfHook};
 use wireserve_types::{FirewallBackend, Forwarding, PortMap, Proto, ServiceRule, TransitEndpoint, TransitForward};
 
@@ -287,6 +287,20 @@ fn lacks_bits(key: Expression<'static>, bits: u32) -> Statement<'static> {
         Expression::BinaryOperation(Box::new(BinaryOperation::AND(key, Expression::Number(bits)))),
         Expression::Number(0),
     )
+}
+
+/// `meta l4proto tcp reject with tcp reset`: a TCP connection to a port
+/// nothing answers on is refused at once rather than left to time out. A
+/// browser that tries HTTPS first on a service published only on 80 falls
+/// back to HTTP as soon as it is refused, and only after a long wait when
+/// the SYN is dropped. Only TCP: a mesh peer learns "closed" rather than
+/// "filtered" and nothing more, one reset per packet it sent, sent back to
+/// the address WireGuard already authenticated it by.
+fn refuse_tcp() -> [Statement<'static>; 2] {
+    [
+        is(meta(MetaKey::L4proto), Expression::String("tcp".into())),
+        Statement::Reject(Some(Reject::new(Some(RejectType::TCPReset), None))),
+    ]
 }
 
 fn iifname_is_not(ifname: &str) -> Statement<'static> {
@@ -590,7 +604,11 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
         objects.push(rule(t, CHAIN_NAME, vec![iifname_is(ifname), has_mark(ct("mark", None)), accept()]));
     }
     // Default-deny, but ONLY for the WireGuard interface — everything else
-    // stays governed by the chain's own accept policy above.
+    // stays governed by the chain's own accept policy above. TCP is refused
+    // rather than dropped (see `refuse_tcp`).
+    let mut refuse = vec![iifname_is(ifname)];
+    refuse.extend(refuse_tcp());
+    objects.push(rule(t, CHAIN_NAME, refuse));
     objects.push(rule(t, CHAIN_NAME, vec![iifname_is(ifname), Statement::Drop(None::<Drop>)]));
 
     // ---- forward: what the mesh reaches *through* this host ----
@@ -668,6 +686,21 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
     for (vip, map) in &terminated {
         objects.push(rule(t, PRE_CHAIN, mark_terminated(ifname, *vip, map)));
     }
+    // A port a service address does not publish. A mapped service's address
+    // is not local to this host, so such a request never reaches the input
+    // chain's refusal: it would be forwarded into the forward chain's drop,
+    // or dropped by the kernel outright where forwarding is off. Refused
+    // here instead, once the rules above have rewritten or marked every
+    // request for a published port.
+    let vips: std::collections::BTreeSet<Ipv4Addr> =
+        mapped.iter().map(|(vip, ..)| *vip).chain(terminated.iter().map(|(vip, _)| *vip)).collect();
+    let mut refuse = vec![
+        iifname_is(ifname),
+        in_list(payload("ip", "daddr"), vips.into_iter().map(addr).collect()),
+        lacks_mark(meta(MetaKey::Mark)),
+    ];
+    refuse.extend(refuse_tcp());
+    objects.push(rule(t, PRE_CHAIN, refuse));
     // The node's own clients. A `route` chain, so the kernel routes the
     // packet again after its destination changed: it was headed for the
     // mesh interface (see `routes`, which routes this node's own service
@@ -810,6 +843,22 @@ mod tests {
         json!({"match": {"op": "in", "left": {"payload": {"protocol": protocol, "field": field}}, "right": {"set": addrs}}})
     }
 
+    /// The mesh's default-deny at the end of the input chain: TCP refused,
+    /// the rest dropped.
+    fn input_deny() -> [Value; 2] {
+        [
+            rule_json(json!([iif("wg0"), refuse_tcp_json()[0], refuse_tcp_json()[1]])),
+            rule_json(json!([iif("wg0"), {"drop": null}])),
+        ]
+    }
+
+    fn refuse_tcp_json() -> [Value; 2] {
+        [
+            json!({"match": {"op": "==", "left": {"meta": {"key": "l4proto"}}, "right": "tcp"}}),
+            json!({"reject": {"type": "tcp reset"}}),
+        ]
+    }
+
     fn prelude() -> Vec<Value> {
         vec![
             json!({"add": {"table": table_json()}}),
@@ -841,7 +890,7 @@ mod tests {
     #[test]
     fn apply_with_no_services_is_default_deny_on_the_interface_only() {
         let mut expected = prelude();
-        expected.push(rule_json(json!([iif("wg0"), {"drop": null}])));
+        expected.extend(input_deny());
         expected.extend(forward(vec![]));
         assert_eq!(as_json(&apply_batch("wg0", &[], &fwd(&[]))), json!({ "nftables": expected }));
     }
@@ -859,7 +908,7 @@ mod tests {
             far: endpoint4("100.90.0.20", &[]),
         };
         let mut expected = prelude();
-        expected.push(rule_json(json!([iif("wg0"), {"drop": null}])));
+        expected.extend(input_deny());
         expected.extend(forward(vec![
             rule_in("wireserve-fwd", json!([
                 iif("wg0"),
@@ -908,7 +957,7 @@ mod tests {
     fn no_transit_pairs_is_byte_for_byte_unchanged_from_before_the_feature() {
         assert_eq!(apply_batch("wg0", &[], &fwd(&[])), apply_batch("wg0", &[], &fwd(&[])));
         let mut expected = prelude();
-        expected.push(rule_json(json!([iif("wg0"), {"drop": null}])));
+        expected.extend(input_deny());
         expected.extend(forward(vec![]));
         assert_eq!(as_json(&apply_batch("wg0", &[], &fwd(&[]))), json!({ "nftables": expected }));
     }
@@ -975,7 +1024,15 @@ mod tests {
         ];
         let mut from_mesh = vec![iif("wg0")];
         from_mesh.extend(rewrite.clone());
-        assert_eq!(rules_of("svc-pre"), [Value::Array(from_mesh)]);
+        let [l4proto, reject] = refuse_tcp_json();
+        let refuse = json!([
+            iif("wg0"),
+            in_addrs("ip", "daddr", &["100.90.0.50"]),
+            {"match": {"op": "!=", "left": {"&": [meta_mark, SERVICE_MARK]}, "right": SERVICE_MARK}},
+            l4proto,
+            reject,
+        ]);
+        assert_eq!(rules_of("svc-pre"), [Value::Array(from_mesh), refuse]);
         assert_eq!(rules_of("svc-out"), [Value::Array(rewrite)]);
 
         let carry = json!([has_mark(json!({"meta": {"key": "mark"}})), mangle(ct_mark.clone(), json!({"|": [ct_mark, SERVICE_MARK]}))]);
@@ -1096,8 +1153,10 @@ mod tests {
         let text = batch.to_string();
         // Marked on the way in, nothing rewritten anywhere, target never
         // mentioned: the terminator reaches it locally.
+        // Then any other port refused (see the mapped service's test).
         let pre = rules_in(&batch, "svc-pre");
-        assert_eq!(pre.len(), 1, "{pre:?}");
+        assert_eq!(pre.len(), 2, "{pre:?}");
+        assert!(pre[1].to_string().contains("tcp reset"), "{pre:?}");
         let pre = pre[0].to_string();
         assert!(pre.contains("443") && pre.contains(&VIP.to_string()) && pre.contains("mark"), "{pre}");
         assert!(!text.contains("32400"), "{text}");
@@ -1350,6 +1409,7 @@ mod tests {
                 "chain wireserve-in {",
                 "type filter hook input priority filter; policy accept;",
                 "iifname \"wg0\" ct state established,related accept",
+                "iifname \"wg0\" meta l4proto tcp reject with tcp reset",
                 "iifname \"wg0\" drop",
                 "}",
                 "chain wireserve-fwd {",
@@ -1425,6 +1485,7 @@ mod tests {
         let m = format!("0x{SERVICE_MARK:08x}");
         has(&format!("iifname \"wg0\" ip daddr 100.90.0.50 tcp dport 443 meta mark set meta mark | {m}"));
         has("iifname != \"wg0\" iifname != \"lo\" ip daddr 100.90.0.50 drop");
+        has(&format!("iifname \"wg0\" ip daddr 100.90.0.50 meta mark & {m} != {m} meta l4proto tcp reject with tcp reset"));
         has(&format!("meta mark & {m} == {m} ct mark set ct mark | {m}"));
         has(&format!("iifname \"wg0\" ct mark & {m} == {m} accept"));
     }
