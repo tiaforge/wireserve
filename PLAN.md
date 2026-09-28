@@ -3285,3 +3285,27 @@ sent is removed. There are no previous installations to carry forward.
       without a port-forward, that's the only one that works.
     - The `Lan` tier is skipped when both nodes' public IPv4 addresses are
       known and none match. Unknown on either side stays optimistic.
+
+207. **Hole-punching for a transited pair, and tiers that stay confirmed.**
+    #206 wasn't enough for lego2 ↔ minipc: minipc is reachable directly
+    only over IPv6, and lego2 has none. That leaves IPv4 hole-punching,
+    which three things prevented:
+    - **A node with working IPv6 never learned its reflexive IPv4
+      address** (#90 skipped the probe), so its IPv4-only peers had
+      nothing to punch towards. The probe now always runs.
+    - **Backoff kept the two sides of a punch apart.** Each side's retries
+      back off independently, up to 30 minutes, so both sending at once
+      was luck. A transited peer's entry is only a probe, so failing costs
+      nothing: it is never backed off or put on `Wan`, and keeps dialling
+      its ranked candidates, taking turns each grace window, until one
+      handshakes.
+    - **A confirmed tier fell back at the next poll without a newer
+      handshake**, which on a live session (one handshake per ~2 minutes)
+      is nearly every poll. It now stays while handshakes keep coming
+      within `ENDPOINT_CONFIRMED_MAX` (180s, WireGuard's session limit,
+      plus a grace window). This also covers the hand-over: a tier
+      confirmed while transited keeps its endpoint when the transit ends.
+
+    `ENDPOINT_GRACE_WINDOW` is 30s instead of 60s. A working path
+    handshakes within a second or two; the window only has to span the
+    poll interval (20s by default), since tiers are judged once per poll.

@@ -61,9 +61,7 @@ pub async fn learn_reflexive_addr(coordinator_url: &str, listen_port: u16, timeo
 
 async fn try_learn(coordinator_url: &str, listen_port: u16, timeout: Duration) -> Result<String, ReflexiveProbeError> {
     // IPv4 only (PLAN.md decisions log #90+) — the wire protocol itself
-    // is IPv4-only, and a node with real working IPv6 skips this whole
-    // mechanism before ever calling in (see `register::join`,
-    // `main::cmd_daemon`).
+    // is IPv4-only. A node with working IPv6 calls in too (#207).
     let probe_resp = crate::probe::fetch_probe_response(coordinator_url, crate::probe::Family::V4, timeout).await?;
     let reflexive_port = probe_resp.reflexive_port;
     let (_, coordinator_addr) = crate::probe::resolve_family(coordinator_url, crate::probe::Family::V4).await?;

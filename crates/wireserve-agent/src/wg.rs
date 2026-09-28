@@ -348,13 +348,29 @@ pub struct EndpointPeerState {
     /// only for the (purely relative, monotonic) grace-window/backoff
     /// deadlines below.
     baseline_handshake: Option<chrono::DateTime<chrono::Utc>>,
+    /// When `current` last produced a handshake newer than
+    /// `baseline_handshake`, or `None` if it hasn't since it was switched
+    /// to. See [`ENDPOINT_CONFIRMED_MAX`].
+    confirmed_at: Option<std::time::Instant>,
     per_tier: HashMap<EndpointTier, TierState>,
 }
 
 /// How long a freshly-tried tier gets to produce a real handshake before
-/// falling back — long enough for at least two
-/// `persistent_keepalive`-triggered handshake attempts.
-pub const ENDPOINT_GRACE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// falling back. WireGuard sends its first handshake the moment the
+/// endpoint is configured and retries every 5 seconds, so a working path
+/// handshakes almost at once; what this has to cover is the poll interval,
+/// since a tier is only judged once per poll. At the default 20s, 30s means
+/// a tier is judged at the second poll after switching, not the first.
+pub const ENDPOINT_GRACE_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long a confirmed tier stays confirmed without a newer handshake. A
+/// live session handshakes afresh about every two minutes (it rekeys when
+/// sending on a key older than 120s, and the 25s keepalive keeps it
+/// sending), and never lasts past 180s without one — plus a grace window
+/// for when the poll happens to see it. Without this a confirmed tier fell
+/// back to `Wan` at the first poll that saw no newer handshake, which on a
+/// live session is nearly every one.
+pub const ENDPOINT_CONFIRMED_MAX: std::time::Duration =
+    std::time::Duration::from_secs(180).saturating_add(ENDPOINT_GRACE_WINDOW);
 /// The first backoff before retrying a tier that just failed.
 pub const ENDPOINT_RETRY_BACKOFF_INITIAL: std::time::Duration = std::time::Duration::from_secs(120);
 /// The cap the backoff doubles up to on repeated failures — bounds the
@@ -383,6 +399,15 @@ fn pick_tier(
     })
 }
 
+/// The next ranked tier after `after` that has a candidate this cycle,
+/// wrapping around (so `after` itself when it is the only one).
+fn next_tier_round(candidates: &PeerTierCandidates<'_>, after: EndpointTier) -> Option<EndpointTier> {
+    let at = RANKED_TIERS.iter().position(|&t| t == after).unwrap_or(RANKED_TIERS.len() - 1);
+    (1..=RANKED_TIERS.len())
+        .map(|i| RANKED_TIERS[(at + i) % RANKED_TIERS.len()])
+        .find(|&t| candidate_value(candidates, t).is_some())
+}
+
 /// Decides this cycle's endpoint-tier preference for one peer, and the
 /// updated state to keep (`None` to stop tracking it entirely — no
 /// candidate on any ranked tier at all, today's plain-`Wan` behavior).
@@ -397,11 +422,20 @@ fn pick_tier(
 /// the next-best tier that isn't itself backed off — rather than
 /// jumping straight to `Wan` — before eventually landing there once
 /// nothing ranked is available.
+///
+/// A `transited` peer (its traffic goes via a carrier, PLAN.md M23) is
+/// never put on `Wan` or backed off: its kernel entry is only a probe
+/// (see `desired_peers`), so a failing candidate costs nothing, and the
+/// backoff that protects real traffic from one would only stop both sides
+/// of a NAT hole-punch from ever sending at the same time. It keeps
+/// dialling its ranked candidates, taking turns each grace window, until
+/// one handshakes.
 #[must_use]
 pub fn resolve_endpoint_candidate(
     candidates: PeerTierCandidates<'_>,
     kernel_last_handshake: Option<chrono::DateTime<chrono::Utc>>,
     state: Option<EndpointPeerState>,
+    transited: bool,
     now: std::time::Instant,
 ) -> (EndpointTier, Option<EndpointPeerState>) {
     if RANKED_TIERS.iter().all(|&t| candidate_value(&candidates, t).is_none()) {
@@ -429,22 +463,53 @@ pub fn resolve_endpoint_candidate(
     if let Some(s) = &state {
         if RANKED_TIERS.contains(&s.current) {
             if let (Some(_value), true) = (candidate_value(&candidates, s.current), per_tier.contains_key(&s.current)) {
-                let confirmed = match (kernel_last_handshake, s.baseline_handshake) {
+                let advanced = match (kernel_last_handshake, s.baseline_handshake) {
                     (Some(h), Some(baseline)) => h > baseline,
                     (Some(_), None) => true,
                     (None, _) => false,
                 };
                 let tier = s.current;
-                if confirmed {
+                if advanced {
                     per_tier.get_mut(&tier).unwrap().backoff = ENDPOINT_RETRY_BACKOFF_INITIAL;
                     return (
                         tier,
-                        Some(EndpointPeerState { current: tier, switched_at: s.switched_at, baseline_handshake: kernel_last_handshake, per_tier }),
+                        Some(EndpointPeerState {
+                            current: tier,
+                            switched_at: s.switched_at,
+                            baseline_handshake: kernel_last_handshake,
+                            confirmed_at: Some(now),
+                            per_tier,
+                        }),
                     );
-                } else if now.duration_since(s.switched_at) < ENDPOINT_GRACE_WINDOW {
+                }
+                let still_confirmed = s.confirmed_at.is_some_and(|c| now.duration_since(c) < ENDPOINT_CONFIRMED_MAX);
+                if still_confirmed || now.duration_since(s.switched_at) < ENDPOINT_GRACE_WINDOW {
                     return (
                         tier,
-                        Some(EndpointPeerState { current: tier, switched_at: s.switched_at, baseline_handshake: s.baseline_handshake, per_tier }),
+                        Some(EndpointPeerState {
+                            current: tier,
+                            switched_at: s.switched_at,
+                            baseline_handshake: s.baseline_handshake,
+                            confirmed_at: s.confirmed_at,
+                            per_tier,
+                        }),
+                    );
+                }
+                if transited {
+                    // Next candidate's turn, with nothing held against the
+                    // one that just failed.
+                    let next = next_tier_round(&candidates, tier).expect("`tier` itself still has a candidate");
+                    let value = candidate_value(&candidates, next).expect("next_tier_round only returns a tier with a candidate");
+                    per_tier.entry(next).or_insert_with(|| TierState::fresh(value));
+                    return (
+                        next,
+                        Some(EndpointPeerState {
+                            current: next,
+                            switched_at: now,
+                            baseline_handshake: kernel_last_handshake,
+                            confirmed_at: None,
+                            per_tier,
+                        }),
                     );
                 }
                 // Grace window expired without confirmation -- fail this
@@ -461,14 +526,26 @@ pub fn resolve_endpoint_candidate(
     // active tier that just failed its grace window above -- in every
     // case, pick whichever ranked tier is best available this cycle
     // (preserving any existing tier's accumulated backoff, since a
-    // retry-due tier is not a fresh one), or fall to `Wan`.
-    match pick_tier(&candidates, &per_tier, now) {
+    // retry-due tier is not a fresh one), or fall to `Wan`. A transited
+    // peer ignores backoff (see above).
+    let picked = if transited {
+        RANKED_TIERS.iter().copied().find(|&t| candidate_value(&candidates, t).is_some())
+    } else {
+        pick_tier(&candidates, &per_tier, now)
+    };
+    match picked {
         Some(tier) => {
             let value = candidate_value(&candidates, tier).expect("pick_tier only ever returns a tier with a candidate this cycle");
             per_tier.entry(tier).or_insert_with(|| TierState::fresh(value));
             (
                 tier,
-                Some(EndpointPeerState { current: tier, switched_at: now, baseline_handshake: kernel_last_handshake, per_tier }),
+                Some(EndpointPeerState {
+                    current: tier,
+                    switched_at: now,
+                    baseline_handshake: kernel_last_handshake,
+                    confirmed_at: None,
+                    per_tier,
+                }),
             )
         }
         // Staying on `Wan` keeps the time it was entered: that is what
@@ -478,7 +555,13 @@ pub fn resolve_endpoint_candidate(
             let switched_at = state.filter(|s| s.current == EndpointTier::Wan).map_or(now, |s| s.switched_at);
             (
                 EndpointTier::Wan,
-                Some(EndpointPeerState { current: EndpointTier::Wan, switched_at, baseline_handshake: None, per_tier }),
+                Some(EndpointPeerState {
+                    current: EndpointTier::Wan,
+                    switched_at,
+                    baseline_handshake: None,
+                    confirmed_at: None,
+                    per_tier,
+                }),
             )
         }
     }
@@ -505,7 +588,8 @@ impl EndpointTracker {
         now: std::time::Instant,
     ) -> EndpointTier {
         let state = self.states.remove(pubkey);
-        let (tier, new_state) = resolve_endpoint_candidate(candidates, kernel_last_handshake, state, now);
+        let transited = self.transited.contains(pubkey);
+        let (tier, new_state) = resolve_endpoint_candidate(candidates, kernel_last_handshake, state, transited, now);
         if let Some(new_state) = new_state {
             self.states.insert(pubkey.to_string(), new_state);
         }
@@ -1991,7 +2075,7 @@ mod tests {
     #[test]
     fn no_candidate_on_any_tier_is_plain_wan_untracked() {
         let now = std::time::Instant::now();
-        let (tier, state) = resolve_endpoint_candidate(PeerTierCandidates::default(), None, None, now);
+        let (tier, state) = resolve_endpoint_candidate(PeerTierCandidates::default(), None, None, false, now);
         assert_eq!(tier, EndpointTier::Wan);
         assert!(state.is_none());
     }
@@ -1999,7 +2083,7 @@ mod tests {
     #[test]
     fn first_cycle_on_a_matching_lan_optimistically_tries_lan() {
         let now = std::time::Instant::now();
-        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, now);
+        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, now);
         assert_eq!(tier, EndpointTier::Lan);
         assert!(state.is_some());
     }
@@ -2008,32 +2092,105 @@ mod tests {
     fn a_handshake_after_switching_confirms_the_tier_and_resets_its_backoff() {
         let now = std::time::Instant::now();
         let t0 = chrono::Utc::now();
-        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), None, now);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), None, false, now);
         // A genuinely newer handshake than the baseline taken at switch time.
         let newer = t0 + chrono::Duration::seconds(5);
-        let (tier, state) = resolve_endpoint_candidate(
-            lan_only("192.168.1.50"),
-            Some(newer),
-            state,
-            now + std::time::Duration::from_secs(1),
-        );
+        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(newer), state, false, now + std::time::Duration::from_secs(1));
         assert_eq!(tier, EndpointTier::Lan);
         assert_eq!(state.unwrap().per_tier[&EndpointTier::Lan].backoff, ENDPOINT_RETRY_BACKOFF_INITIAL);
     }
 
     #[test]
+    fn a_confirmed_tier_stays_put_between_handshakes() {
+        // WireGuard only handshakes every ~2 minutes on a live session, so
+        // most polls see no newer one: that must not fail a confirmed tier.
+        let now = std::time::Instant::now();
+        let t0 = chrono::Utc::now();
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, now);
+        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), state, false, now + GRACE / 2);
+        assert_eq!(tier, EndpointTier::Lan);
+        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), state, false, now + GRACE * 2);
+        assert_eq!(tier, EndpointTier::Lan);
+        let (tier, _) = resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), state, false, now + GRACE * 3);
+        assert_eq!(tier, EndpointTier::Lan);
+    }
+
+    #[test]
+    fn a_confirmed_tier_falls_back_once_its_handshakes_stop() {
+        let now = std::time::Instant::now();
+        let t0 = chrono::Utc::now();
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, now);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), state, false, now + GRACE / 2);
+        let confirmed_at = now + GRACE / 2;
+        let (tier, state) =
+            resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), state, false, confirmed_at + ENDPOINT_CONFIRMED_MAX / 2);
+        assert_eq!(tier, EndpointTier::Lan);
+        let (tier, _) =
+            resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), state, false, confirmed_at + ENDPOINT_CONFIRMED_MAX);
+        assert_eq!(tier, EndpointTier::Wan);
+    }
+
+    #[test]
+    fn a_transited_peer_keeps_dialling_its_only_candidate_without_backoff() {
+        // Both sides of a hole-punch have to be sending at once; a backoff
+        // on either would make that a matter of luck.
+        let now = std::time::Instant::now();
+        let (_, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), None, None, true, now);
+        let (tier, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), None, state, true, now + GRACE);
+        assert_eq!(tier, EndpointTier::Reflexive);
+        let state = state.unwrap();
+        assert_eq!(state.per_tier[&EndpointTier::Reflexive].next_retry_at, None);
+        assert_eq!(state.switched_at, now + GRACE, "a fresh grace window, so a handshake still confirms it");
+    }
+
+    #[test]
+    fn a_transited_peer_takes_turns_between_its_candidates() {
+        let both = PeerTierCandidates { lan: Some("192.168.1.50"), reflexive: Some("203.0.113.5:40404") };
+        let now = std::time::Instant::now();
+        let (tier, state) = resolve_endpoint_candidate(both, None, None, true, now);
+        assert_eq!(tier, EndpointTier::Lan);
+        let (tier, state) = resolve_endpoint_candidate(both, None, state, true, now + GRACE);
+        assert_eq!(tier, EndpointTier::Reflexive);
+        let (tier, _) = resolve_endpoint_candidate(both, None, state, true, now + GRACE * 2);
+        assert_eq!(tier, EndpointTier::Lan);
+    }
+
+    #[test]
+    fn a_peer_becoming_transited_retries_a_backed_off_candidate_at_once() {
+        let now = std::time::Instant::now();
+        let (_, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), None, None, false, now);
+        let (tier, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), None, state, false, now + GRACE);
+        assert_eq!(tier, EndpointTier::Wan);
+        let (tier, _) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), None, state, true, now + GRACE * 2);
+        assert_eq!(tier, EndpointTier::Reflexive);
+    }
+
+    #[test]
+    fn a_tier_confirmed_while_transited_is_kept_once_the_transit_ends() {
+        // The hand-over: the punched path handshakes, the transit ends, and
+        // the endpoint must not move off the address that just worked.
+        let now = std::time::Instant::now();
+        let t0 = chrono::Utc::now();
+        let (_, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), None, None, true, now);
+        let (tier, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), Some(t0), state, true, now + GRACE / 2);
+        assert_eq!(tier, EndpointTier::Reflexive);
+        let (tier, _) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), Some(t0), state, false, now + GRACE * 3);
+        assert_eq!(tier, EndpointTier::Reflexive);
+    }
+
+    #[test]
     fn still_within_the_grace_window_stays_put_awaiting_a_handshake() {
         let now = std::time::Instant::now();
-        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, now);
-        let (tier, _) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, now + GRACE / 2);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, now);
+        let (tier, _) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, false, now + GRACE / 2);
         assert_eq!(tier, EndpointTier::Lan);
     }
 
     #[test]
     fn no_handshake_within_the_grace_window_falls_back_to_wan_and_schedules_a_retry() {
         let now = std::time::Instant::now();
-        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, now);
-        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, now + GRACE);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, now);
+        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, false, now + GRACE);
         assert_eq!(tier, EndpointTier::Wan);
         let state = state.unwrap();
         let lan = &state.per_tier[&EndpointTier::Lan];
@@ -2044,43 +2201,33 @@ mod tests {
     #[test]
     fn wan_retries_the_tier_once_the_backoff_elapses_not_before() {
         let now = std::time::Instant::now();
-        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, now);
-        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, now + GRACE);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, now);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, false, now + GRACE);
         // Not due yet.
-        let (tier, state) = resolve_endpoint_candidate(
-            lan_only("192.168.1.50"),
-            None,
-            state,
-            now + GRACE + std::time::Duration::from_secs(1),
-        );
+        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, false, now + GRACE + std::time::Duration::from_secs(1));
         assert_eq!(tier, EndpointTier::Wan);
         // Due.
-        let (tier, _) = resolve_endpoint_candidate(
-            lan_only("192.168.1.50"),
-            None,
-            state,
-            now + GRACE + ENDPOINT_RETRY_BACKOFF_INITIAL,
-        );
+        let (tier, _) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, false, now + GRACE + ENDPOINT_RETRY_BACKOFF_INITIAL);
         assert_eq!(tier, EndpointTier::Lan);
     }
 
     #[test]
     fn backoff_doubles_up_to_the_cap_on_repeated_failures() {
         let now = std::time::Instant::now();
-        let (_, mut state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, now);
+        let (_, mut state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, now);
         let mut t = now;
         let mut last_backoff = ENDPOINT_RETRY_BACKOFF_INITIAL;
         for _ in 0..10 {
             // Fail the grace window.
             t += GRACE;
-            let (_, s) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, t);
+            let (_, s) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, false, t);
             let s = s.unwrap();
             let lan = s.per_tier[&EndpointTier::Lan].clone();
             assert!(lan.backoff <= ENDPOINT_RETRY_BACKOFF_MAX);
             last_backoff = lan.backoff;
             // Retry once due, so the next iteration fails from Lan again.
             t = lan.next_retry_at.unwrap();
-            let (_, s) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, Some(s), t);
+            let (_, s) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, Some(s), false, t);
             state = s;
         }
         assert_eq!(last_backoff, ENDPOINT_RETRY_BACKOFF_MAX, "must have capped by now");
@@ -2089,18 +2236,13 @@ mod tests {
     #[test]
     fn a_peer_roaming_to_a_different_lan_address_resets_to_a_fresh_optimistic_attempt() {
         let now = std::time::Instant::now();
-        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, now);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, now);
         // Fall back to Wan first, so the roam is a real behavior change,
         // not just staying on Lan by coincidence.
-        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, now + GRACE);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, false, now + GRACE);
         assert_eq!(state.as_ref().unwrap().current, EndpointTier::Wan);
 
-        let (tier, state) = resolve_endpoint_candidate(
-            lan_only("192.168.2.50"),
-            None,
-            state,
-            now + GRACE + std::time::Duration::from_secs(1),
-        );
+        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.2.50"), None, state, false, now + GRACE + std::time::Duration::from_secs(1));
         assert_eq!(tier, EndpointTier::Lan, "a new address gets a fresh optimistic attempt");
         assert_eq!(state.unwrap().per_tier[&EndpointTier::Lan].backoff, ENDPOINT_RETRY_BACKOFF_INITIAL);
     }
@@ -2108,16 +2250,11 @@ mod tests {
     #[test]
     fn a_peer_roaming_to_a_different_reflexive_address_resets_to_a_fresh_optimistic_attempt() {
         let now = std::time::Instant::now();
-        let (_, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:55123"), None, None, now);
-        let (_, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:55123"), None, state, now + GRACE);
+        let (_, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:55123"), None, None, false, now);
+        let (_, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:55123"), None, state, false, now + GRACE);
         assert_eq!(state.as_ref().unwrap().current, EndpointTier::Wan);
 
-        let (tier, state) = resolve_endpoint_candidate(
-            reflexive_only("203.0.113.5:60000"),
-            None,
-            state,
-            now + GRACE + std::time::Duration::from_secs(1),
-        );
+        let (tier, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:60000"), None, state, false, now + GRACE + std::time::Duration::from_secs(1));
         assert_eq!(tier, EndpointTier::Reflexive);
         assert_eq!(state.unwrap().per_tier[&EndpointTier::Reflexive].backoff, ENDPOINT_RETRY_BACKOFF_INITIAL);
     }
@@ -2132,11 +2269,11 @@ mod tests {
     fn lan_failing_its_grace_window_advances_to_reflexive_in_the_same_cycle() {
         let now = std::time::Instant::now();
         let candidates = lan_and_reflexive("192.168.1.50", "203.0.113.5:55123");
-        let (tier, state) = resolve_endpoint_candidate(candidates, None, None, now);
+        let (tier, state) = resolve_endpoint_candidate(candidates, None, None, false, now);
         assert_eq!(tier, EndpointTier::Lan);
 
         // Lan never confirms within its own grace window.
-        let (tier, state) = resolve_endpoint_candidate(candidates, None, state, now + GRACE);
+        let (tier, state) = resolve_endpoint_candidate(candidates, None, state, false, now + GRACE);
         assert_eq!(
             tier,
             EndpointTier::Reflexive,
@@ -2154,12 +2291,12 @@ mod tests {
     fn reflexive_also_failing_falls_back_to_wan_with_independent_backoff_timers() {
         let now = std::time::Instant::now();
         let candidates = lan_and_reflexive("192.168.1.50", "203.0.113.5:55123");
-        let (_, state) = resolve_endpoint_candidate(candidates, None, None, now);
+        let (_, state) = resolve_endpoint_candidate(candidates, None, None, false, now);
         // Lan fails -> advances to Reflexive this same cycle.
-        let (tier, state) = resolve_endpoint_candidate(candidates, None, state, now + GRACE);
+        let (tier, state) = resolve_endpoint_candidate(candidates, None, state, false, now + GRACE);
         assert_eq!(tier, EndpointTier::Reflexive);
         // Reflexive, now active, also fails its own grace window.
-        let (tier, state) = resolve_endpoint_candidate(candidates, None, state, now + GRACE + GRACE);
+        let (tier, state) = resolve_endpoint_candidate(candidates, None, state, false, now + GRACE + GRACE);
         assert_eq!(tier, EndpointTier::Wan);
         let state = state.unwrap();
         assert_eq!(

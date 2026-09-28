@@ -518,13 +518,12 @@ async fn cmd_daemon(
     // NAT-traversal step 2 (PLAN.md decisions log #90+): the one-shot
     // reflexive-address probe MUST run here, before `bring_up` claims
     // `listen_port` in the kernel — see `reflexive` module doc for why
-    // it can never run again for the life of this process. IPv4 only,
-    // skipped entirely for a node with real working IPv6.
-    let own_reflexive_addr = if wireserve_agent::probe::has_working_ipv6(&coordinator_url, wireserve_agent::probe::PROBE_TIMEOUT).await {
-        None
-    } else {
-        wireserve_agent::reflexive::learn_reflexive_addr(&coordinator_url, listen_port, wireserve_agent::reflexive::PROBE_TIMEOUT).await
-    };
+    // it can never run again for the life of this process. IPv4 only, and
+    // run even on a node with working IPv6: its IPv4-only peers can't use
+    // that, and without this address can't reach it at all (PLAN.md
+    // decisions log #207).
+    let own_reflexive_addr =
+        wireserve_agent::reflexive::learn_reflexive_addr(&coordinator_url, listen_port, wireserve_agent::reflexive::PROBE_TIMEOUT).await;
     tracing::info!(reflexive_addr = ?own_reflexive_addr, "one-shot reflexive-address probe");
 
     // Where the interop restores our own table from, if something else on
