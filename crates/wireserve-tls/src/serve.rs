@@ -198,6 +198,23 @@ pub fn prepare(headers: &mut HeaderMap, caller: Option<&str>) {
     if let Some(node) = caller.and_then(|n| HeaderValue::from_str(n).ok()) {
         headers.insert(NODE_HEADER, node);
     }
+    join_cookies(headers);
+}
+
+/// Browsers speaking HTTP/2 send each cookie as a header of its own, and the
+/// backend is spoken to in HTTP/1.1, where there may be only one: many
+/// backends read the first and never see the rest — a session cookie among
+/// them. RFC 9113 §8.2.3 has the proxy join them with "; ".
+fn join_cookies(headers: &mut HeaderMap) {
+    use axum::http::header::COOKIE;
+    if headers.get_all(COOKIE).iter().nth(1).is_none() {
+        return;
+    }
+    let crumbs: Vec<&[u8]> = headers.get_all(COOKIE).iter().map(HeaderValue::as_bytes).collect();
+    let joined = crumbs.join(&b"; "[..]);
+    if let Ok(value) = HeaderValue::from_bytes(&joined) {
+        headers.insert(COOKIE, value);
+    }
 }
 
 #[cfg(test)]
@@ -270,5 +287,22 @@ mod tests {
 
         prepare(&mut h, None);
         assert!(h.get(NODE_HEADER).is_none(), "an unknown caller is named by nobody");
+    }
+
+    #[tokio::test]
+    async fn cookies_sent_one_per_header_reach_the_backend_as_one() {
+        let mut req = request();
+        req.headers_mut().remove("cookie");
+        for crumb in ["theme=dark", "authward_session=s3cret", "auth_tokens=abc"] {
+            req.headers_mut().append("cookie", HeaderValue::from_static(crumb));
+        }
+        prepare(req.headers_mut(), None);
+        let cookies: Vec<_> = req.headers().get_all("cookie").iter().collect();
+        assert_eq!(cookies, ["theme=dark; authward_session=s3cret; auth_tokens=abc"]);
+
+        // And the sign-in's cookie still comes out of the joined header.
+        assert!(guard(&mut req, Some(&sign_in()), &Policy { marked: false, fqdn: "observe.int.test".into() }).await.is_none());
+        let cookies: Vec<_> = req.headers().get_all("cookie").iter().collect();
+        assert_eq!(cookies, ["theme=dark; auth_tokens=abc"]);
     }
 }
