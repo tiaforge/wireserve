@@ -119,6 +119,11 @@ pub fn spawn(
                     continue;
                 }
             };
+            // Without it, Nagle holds back the tail of a response written in
+            // more than one TLS record until the client ACKs the head — which
+            // its delayed ACK puts off by up to 40ms here, and on a phone's
+            // link by a round trip on top.
+            let _ = tcp.set_nodelay(true);
             let acceptor = acceptor.clone();
             let router = router.clone();
             let callers = callers.clone();
