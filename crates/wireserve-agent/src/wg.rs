@@ -212,8 +212,9 @@ pub fn own_lan_subnets(ifaces: &[LocalLan]) -> Vec<(Ipv4Addr, u8)> {
 /// Whether `addr` falls inside any of `own_subnets`. A `true` result is a
 /// hint, not proof, that a peer advertising it is actually on this LAN —
 /// two unrelated sites both using `192.168.1.0/24` collide here by
-/// construction, which is exactly why `resolve_lan_candidate` treats a
-/// match as an optimistic attempt to verify, never a fact.
+/// construction (every Fritz!Box ships `192.168.178.0/24`), which is why
+/// `peer_tier_candidates` also compares public addresses, and why a match
+/// is still only ever an optimistic attempt to verify, never a fact.
 #[must_use]
 pub fn is_on_own_lan(own_subnets: &[(Ipv4Addr, u8)], addr: Ipv4Addr) -> bool {
     own_subnets.iter().any(|&(net, prefix_len)| network_address(addr, prefix_len) == net)
@@ -253,16 +254,52 @@ pub struct PeerTierCandidates<'a> {
 
 /// Builds `peer`'s candidates for this cycle. A `Lan` value is present
 /// only when it both parses and falls inside one of `own_subnets` (see
-/// `is_on_own_lan`'s doc comment on why that's a hint, not proof); a
+/// `is_on_own_lan`'s doc comment on why that's a hint, not proof), and
+/// the peer isn't known to sit behind a different public address; a
 /// `Reflexive` value is present whenever it's structurally well-formed.
+///
+/// `own_public` is this node's own public IPv4 addresses (see
+/// [`public_v4s`]). Two nodes behind one router share its public address,
+/// so when both sides know theirs and none match, the peer is on some
+/// other LAN that merely reuses the same range — lego2 and minipc, both
+/// `192.168.178.0/24` at different homes, spent a failed grace window on
+/// each other's private address every time, and fell into transit
+/// through it. When either side's is unknown, the attempt stays
+/// optimistic, as before.
 #[must_use]
-pub fn peer_tier_candidates<'a>(own_subnets: &[(Ipv4Addr, u8)], peer: &'a PeerInfo) -> PeerTierCandidates<'a> {
+pub fn peer_tier_candidates<'a>(
+    own_subnets: &[(Ipv4Addr, u8)],
+    own_public: &[Ipv4Addr],
+    peer: &'a PeerInfo,
+) -> PeerTierCandidates<'a> {
+    let peer_public = public_v4s(peer, None);
+    let other_site = !own_public.is_empty() && !peer_public.is_empty() && !peer_public.iter().any(|a| own_public.contains(a));
     let lan = peer
         .lan_addr
         .as_deref()
+        .filter(|_| !other_site)
         .filter(|s| s.parse::<Ipv4Addr>().is_ok_and(|a| is_on_own_lan(own_subnets, a)));
     let reflexive = peer.reflexive_addr.as_deref().filter(|s| wireserve_types::is_valid_reflexive_addr(s));
     PeerTierCandidates { lan, reflexive }
+}
+
+/// The public IPv4 addresses a node is known by: its probed
+/// `endpoint_addr_v4`, an `endpoint_addr` that is a v4 literal (an
+/// operator's hostname is skipped rather than looked up), its advertised
+/// `reflexive_addr`, and `reflexive` — for this node itself, whose own
+/// reflexive address comes from its startup probe rather than the
+/// directory. Ports are dropped: only the address says which router.
+#[must_use]
+pub fn public_v4s(p: &PeerInfo, reflexive: Option<&str>) -> Vec<Ipv4Addr> {
+    let mut out: Vec<Ipv4Addr> = [p.endpoint_addr_v4.as_deref(), p.endpoint_addr.as_deref(), p.reflexive_addr.as_deref(), reflexive]
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.parse::<std::net::SocketAddrV4>().ok())
+        .map(|a| *a.ip())
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 fn candidate_value<'a>(candidates: &PeerTierCandidates<'a>, tier: EndpointTier) -> Option<&'a str> {
@@ -434,10 +471,16 @@ pub fn resolve_endpoint_candidate(
                 Some(EndpointPeerState { current: tier, switched_at: now, baseline_handshake: kernel_last_handshake, per_tier }),
             )
         }
-        None => (
-            EndpointTier::Wan,
-            Some(EndpointPeerState { current: EndpointTier::Wan, switched_at: now, baseline_handshake: None, per_tier }),
-        ),
+        // Staying on `Wan` keeps the time it was entered: that is what
+        // `EndpointTracker::peers_wanting_transit` measures the WAN dial's
+        // own grace window from.
+        None => {
+            let switched_at = state.filter(|s| s.current == EndpointTier::Wan).map_or(now, |s| s.switched_at);
+            (
+                EndpointTier::Wan,
+                Some(EndpointPeerState { current: EndpointTier::Wan, switched_at, baseline_handshake: None, per_tier }),
+            )
+        }
     }
 }
 
@@ -448,6 +491,9 @@ pub fn resolve_endpoint_candidate(
 #[derive(Debug, Default)]
 pub struct EndpointTracker {
     states: HashMap<String, EndpointPeerState>,
+    /// The peers last cycle's directory routed via a carrier (PLAN.md
+    /// M23) — see [`Self::peers_wanting_transit`].
+    transited: std::collections::HashSet<String>,
 }
 
 impl EndpointTracker {
@@ -497,23 +543,52 @@ impl EndpointTracker {
     }
 
     /// This node's actual "I need transit help reaching this peer" signal
-    /// (PLAN.md M23) — [`Self::peers_on_wan`] narrowed to peers this node
-    /// does NOT currently have a live handshake with. `peers_on_wan`
-    /// alone conflates "my LAN/Reflexive NAT-punch probe failed" with "I
-    /// can't reach this peer at all" — but a failed probe still falls
-    /// back to a working plain WAN dial in the common case, and that
-    /// fallback must not trigger a false transit request. Uses the same
-    /// freshness ground truth as [`transit_reachable_peers`],
-    /// deliberately: a peer must be able to fail this same test on both
+    /// (PLAN.md M23): every peer this node has no live handshake with
+    /// (the same freshness ground truth as [`transit_reachable_peers`],
+    /// deliberately — a peer must be able to fail this same test on both
     /// the "do I need help" and "can I offer help" sides for the same
-    /// reason.
+    /// reason) that is either
+    ///
+    /// - **on `Wan` for a full [`ENDPOINT_GRACE_WINDOW`]**: a failed
+    ///   LAN/Reflexive probe still falls back to a working plain WAN dial
+    ///   in the common case, and that dial must get its own chance before
+    ///   transit is asked for. Asking in the same cycle the peer landed on
+    ///   `Wan` meant the WAN address was never dialled at all; or
+    /// - **transited right now** (see [`Self::note_transit`]): a transited
+    ///   peer's kernel entry is only a probe (see `desired_peers`), so its
+    ///   handshake is the direct path's alone, and the pair stays transited
+    ///   until that path proves itself — not merely until a tier retry
+    ///   briefly moves this peer off `Wan`, which would drop the transit
+    ///   and black-hole the pair for a grace window each time.
+    ///
+    /// A peer with no tracked history that isn't transited never counts:
+    /// the ordinary plain-WAN-works-fine case must never request transit
+    /// help for free.
     pub fn peers_wanting_transit<'a>(
         &'a self,
         handshakes: &HashMap<String, Option<chrono::DateTime<chrono::Utc>>>,
-        now: chrono::DateTime<chrono::Utc>,
+        now_utc: chrono::DateTime<chrono::Utc>,
+        now: std::time::Instant,
     ) -> Vec<&'a str> {
-        let fresh: std::collections::HashSet<&str> = transit_reachable_peers(handshakes, now).into_iter().collect();
-        self.peers_on_wan().into_iter().filter(|pk| !fresh.contains(pk)).collect()
+        let fresh: std::collections::HashSet<&str> = transit_reachable_peers(handshakes, now_utc).into_iter().collect();
+        let wan_given_up = self
+            .states
+            .iter()
+            .filter(|(_, s)| s.current == EndpointTier::Wan && now.duration_since(s.switched_at) >= ENDPOINT_GRACE_WINDOW)
+            .map(|(k, _)| k.as_str());
+        let mut wanted: Vec<&str> = wan_given_up
+            .chain(self.transited.iter().map(String::as_str))
+            .filter(|pk| !fresh.contains(pk))
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        wanted
+    }
+
+    /// Records which peers this cycle's directory routes via a carrier, for
+    /// the next cycle's [`Self::peers_wanting_transit`].
+    pub fn note_transit(&mut self, transit: &TransitAssignments<'_>) {
+        self.transited = transit.keys().map(|k| (*k).to_string()).collect();
     }
 }
 
@@ -672,23 +747,28 @@ pub type TransitAssignments<'a> = HashMap<&'a str, &'a str>;
 /// cryptographic source filter — so a destination can only ever sit in
 /// one peer's `AllowedIPs` at a time:
 ///
-/// - **Pass 1** builds one entry for every peer that is *not* a key in
-///   `transit` (i.e. not itself being redirected elsewhere) — the same
-///   logic as before this feature existed.
+/// - **Pass 1** builds one entry for every peer — the same logic as
+///   before this feature existed — except that a peer that is a key in
+///   `transit` (itself being redirected elsewhere) gets no `AllowedIPs`.
+///   Its entry is a probe: it still dials the peer's direct endpoint on
+///   the keepalive, so a direct handshake can happen while its traffic
+///   goes via the carrier. Without it nothing could ever handshake over
+///   the direct path again, "wanted" never cleared, and a pair stayed
+///   transited for good (see `EndpointTracker::peers_wanting_transit`).
+///   An entry with no `AllowedIPs` routes nothing and accepts nothing.
 /// - **Pass 2** folds each transited peer's address(es) and owned VIPs
-///   into its `via` peer's *already-built* entry from pass 1, instead of
-///   giving the transited peer its own entry at all.
+///   into its `via` peer's *already-built* entry from pass 1.
 ///
 /// Edge cases, all handled by construction, not special-cased: a `via`
 /// peer that's also an ordinary direct peer is the common case, not
 /// special (pass 1 builds it normally, pass 2 just extends it); a
 /// dangling `via` (unparseable, or naming a peer this node has no record
 /// for — a stale/inconsistent directory) is a safe no-op, since there is
-/// nothing to fold into and the transited peer correctly gets no entry
-/// either; a cycle (A via B, B via A — shouldn't happen given the
-/// coordinator excludes both endpoints from candidacy, but a
-/// stale/adversarial coordinator could send it) leaves both peers with
-/// no entry at all, safely, since pass 1 skips both.
+/// nothing to fold into and the transited peer keeps only its probe; a
+/// cycle (A via B, B via A — shouldn't happen given the coordinator
+/// excludes both endpoints from candidacy, but a stale/adversarial
+/// coordinator could send it) leaves both peers with only probes,
+/// safely, since pass 1 gives neither any `AllowedIPs`.
 pub fn desired_peers(
     peers: &[PeerInfo],
     services: &[ServiceInfo],
@@ -700,7 +780,7 @@ pub fn desired_peers(
 ) -> HashMap<Key, Peer> {
     let mut desired = HashMap::new();
     for p in peers {
-        if p.pubkey == self_pubkey || transit.contains_key(p.pubkey.as_str()) {
+        if p.pubkey == self_pubkey {
             continue;
         }
         let Ok(key) = Key::try_from(p.pubkey.as_str()) else {
@@ -708,10 +788,12 @@ pub fn desired_peers(
             continue;
         };
         let mut peer = Peer::new(key.clone());
-        peer.allowed_ips = peer_allowed_ips(&p.ip4, &p.ip6);
-        peer.allowed_ips.extend(
-            owned_vips(services, &p.name).map(|vip| IpAddrMask::host(IpAddr::V4(vip))),
-        );
+        if !transit.contains_key(p.pubkey.as_str()) {
+            peer.allowed_ips = peer_allowed_ips(&p.ip4, &p.ip6);
+            peer.allowed_ips.extend(
+                owned_vips(services, &p.name).map(|vip| IpAddrMask::host(IpAddr::V4(vip))),
+            );
+        }
         let tier = endpoint_tiers.get(&p.pubkey).copied();
         if let Some(endpoint) = choose_peer_endpoint(p, prefer_ipv6, tier) {
             peer.endpoint = resolve(&endpoint);
@@ -727,6 +809,12 @@ pub fn desired_peers(
         let Some(&via) = transit.get(p.pubkey.as_str()) else {
             continue;
         };
+        // A via that is itself transited only has a probe entry, and
+        // folding into it would route this peer's traffic to the wrong
+        // node (in a cycle, each to the other).
+        if transit.contains_key(via) {
+            continue;
+        }
         let Ok(via_key) = Key::try_from(via) else {
             continue;
         };
@@ -807,14 +895,21 @@ pub fn peers_to_remove<'a>(
 /// calls, same reasoning as `peers_to_remove`. See `WgInterface::reconcile`
 /// for why re-sending an unchanged peer defeats WireGuard's own roaming
 /// correction.
-pub fn peers_to_configure<'a>(
-    applied: &HashMap<Key, Peer>,
-    desired: &'a HashMap<Key, Peer>,
-) -> Vec<&'a Peer> {
+///
+/// The same goes for a changed peer whose endpoint didn't change: it is
+/// sent without one, which the kernel reads as "keep yours". Otherwise
+/// moving a transited peer's `AllowedIPs` back onto its own entry would
+/// also reset the address the kernel learned from the peer's handshake —
+/// for a peer that is only reachable because *it* dialled in, the one
+/// address that works.
+pub fn peers_to_configure(applied: &HashMap<Key, Peer>, desired: &HashMap<Key, Peer>) -> Vec<Peer> {
     desired
         .iter()
-        .filter(|(key, peer)| applied.get(*key) != Some(*peer))
-        .map(|(_, peer)| peer)
+        .filter_map(|(key, peer)| match applied.get(key) {
+            Some(old) if old == peer => None,
+            Some(old) if old.endpoint == peer.endpoint => Some(Peer { endpoint: None, ..peer.clone() }),
+            _ => Some(peer.clone()),
+        })
         .collect()
 }
 
@@ -1033,7 +1128,7 @@ impl WgInterface {
         // build below reads them — never inside it (see `endpoint_dns`).
         let endpoints: Vec<String> = peers
             .iter()
-            .filter(|p| p.pubkey != self_pubkey && !transit.contains_key(p.pubkey.as_str()))
+            .filter(|p| p.pubkey != self_pubkey)
             .filter_map(|p| choose_peer_endpoint(p, prefer_ipv6, endpoint_tiers.get(&p.pubkey).copied()))
             .collect();
         self.resolver.prepare(endpoints.iter().map(String::as_str));
@@ -1046,10 +1141,7 @@ impl WgInterface {
         for key in &to_remove {
             self.api.remove_peer(key)?;
         }
-        let to_configure: Vec<Peer> = peers_to_configure(&self.applied, &desired)
-            .into_iter()
-            .cloned()
-            .collect();
+        let to_configure = peers_to_configure(&self.applied, &desired);
         for peer in &to_configure {
             self.api.configure_peer(peer)?;
         }
@@ -1196,14 +1288,22 @@ mod tests {
     // ---- transit (PLAN.md M23) ----
 
     #[test]
-    fn a_transited_peer_gets_no_kernel_entry_of_its_own() {
+    fn a_transited_peer_keeps_a_probe_entry_that_routes_nothing() {
+        // Its keepalive still dials the direct endpoint, so a direct
+        // handshake can end the transit; with no `AllowedIPs` it neither
+        // takes the traffic now carried by its via peer nor accepts any.
         let self_key = key_b64(1);
         let (b_key, c_key) = (key_b64(2), key_b64(3));
-        let peers = vec![peer("b", &b_key), peer("c", &c_key)];
+        let mut c = peer("c", &c_key);
+        c.endpoint_addr = Some("203.0.113.9:51820".into());
+        let peers = vec![peer("b", &b_key), c];
         let transit: TransitAssignments<'_> = HashMap::from([(c_key.as_str(), b_key.as_str())]);
         let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &transit, &crate::endpoint_dns::literal_only);
-        assert_eq!(desired.len(), 1);
-        assert!(desired.contains_key(&Key::try_from(b_key.as_str()).unwrap()));
+        assert_eq!(desired.len(), 2);
+        let probe = desired.get(&Key::try_from(c_key.as_str()).unwrap()).unwrap();
+        assert!(probe.allowed_ips.is_empty());
+        assert_eq!(probe.endpoint, Some("203.0.113.9:51820".parse().unwrap()));
+        assert_eq!(probe.persistent_keepalive_interval, Some(25));
     }
 
     #[test]
@@ -1236,7 +1336,6 @@ mod tests {
         c.ip6 = String::new();
         let transit: TransitAssignments<'_> = HashMap::from([(c_key.as_str(), b_key.as_str())]);
         let desired = desired_peers(&[b, c], &[], &self_key, false, &HashMap::new(), &transit, &crate::endpoint_dns::literal_only);
-        assert_eq!(desired.len(), 1);
         let via = desired.get(&Key::try_from(b_key.as_str()).unwrap()).unwrap();
         let ips: Vec<String> = via.allowed_ips.iter().map(ToString::to_string).collect();
         assert_eq!(ips, ["100.90.0.2/32", "100.90.0.3/32"]);
@@ -1250,7 +1349,7 @@ mod tests {
         let peers = vec![peer("c", &c_key)];
         let transit: TransitAssignments<'_> = HashMap::from([(c_key.as_str(), unknown_via.as_str())]);
         let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &transit, &crate::endpoint_dns::literal_only);
-        assert!(desired.is_empty());
+        assert!(desired.values().all(|p| p.allowed_ips.is_empty()));
     }
 
     #[test]
@@ -1261,7 +1360,9 @@ mod tests {
         // A stale/adversarial coordinator naming each as the other's via.
         let transit: TransitAssignments<'_> = HashMap::from([(b_key.as_str(), c_key.as_str()), (c_key.as_str(), b_key.as_str())]);
         let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &transit, &crate::endpoint_dns::literal_only);
-        assert!(desired.is_empty());
+        // Both probe entries exist, and neither was folded into the other.
+        assert_eq!(desired.len(), 2);
+        assert!(desired.values().all(|p| p.allowed_ips.is_empty()));
     }
 
     #[test]
@@ -1341,7 +1442,7 @@ mod tests {
 
         let now_utc = chrono::Utc::now();
         let handshakes = HashMap::from([(pubkey.clone(), Some(now_utc))]);
-        assert!(tracker.peers_wanting_transit(&handshakes, now_utc).is_empty());
+        assert!(tracker.peers_wanting_transit(&handshakes, now_utc, now + GRACE * 3).is_empty());
     }
 
     #[test]
@@ -1352,10 +1453,11 @@ mod tests {
         tracker.resolve(&pubkey, lan_only("192.168.1.50"), None, now);
         let tier = tracker.resolve(&pubkey, lan_only("192.168.1.50"), None, now + GRACE);
         assert_eq!(tier, EndpointTier::Wan);
+        let later = now + GRACE * 2;
 
         let now_utc = chrono::Utc::now();
         // No entry at all for this pubkey in `handshakes` — never handshaked.
-        assert_eq!(tracker.peers_wanting_transit(&HashMap::new(), now_utc), vec![pubkey.as_str()]);
+        assert_eq!(tracker.peers_wanting_transit(&HashMap::new(), now_utc, later), vec![pubkey.as_str()]);
 
         // A handshake that exists but is older than
         // `TRANSIT_REACHABLE_HANDSHAKE_MAX` counts the same as none.
@@ -1363,7 +1465,48 @@ mod tests {
             pubkey.clone(),
             Some(now_utc - chrono::Duration::from_std(TRANSIT_REACHABLE_HANDSHAKE_MAX).unwrap() - chrono::Duration::seconds(1)),
         )]);
-        assert_eq!(tracker.peers_wanting_transit(&stale, now_utc), vec![pubkey.as_str()]);
+        assert_eq!(tracker.peers_wanting_transit(&stale, now_utc, later), vec![pubkey.as_str()]);
+    }
+
+    #[test]
+    fn peers_wanting_transit_gives_the_wan_dial_its_own_grace_window_first() {
+        // The bug this guards: landing on `Wan` and asking for transit in
+        // the same cycle, before the WAN address was ever dialled.
+        let now = std::time::Instant::now();
+        let mut tracker = EndpointTracker::default();
+        let pubkey = key_b64(2).to_string();
+        tracker.resolve(&pubkey, lan_only("192.168.1.50"), None, now);
+        let on_wan = now + GRACE;
+        assert_eq!(tracker.resolve(&pubkey, lan_only("192.168.1.50"), None, on_wan), EndpointTier::Wan);
+        let now_utc = chrono::Utc::now();
+        assert!(tracker.peers_wanting_transit(&HashMap::new(), now_utc, on_wan).is_empty());
+
+        // Further cycles on `Wan` don't restart that window.
+        let mid = on_wan + GRACE / 2;
+        assert_eq!(tracker.resolve(&pubkey, lan_only("192.168.1.50"), None, mid), EndpointTier::Wan);
+        assert!(tracker.peers_wanting_transit(&HashMap::new(), now_utc, mid).is_empty());
+        let end = on_wan + GRACE;
+        assert_eq!(tracker.resolve(&pubkey, lan_only("192.168.1.50"), None, end), EndpointTier::Wan);
+        assert_eq!(tracker.peers_wanting_transit(&HashMap::new(), now_utc, end), vec![pubkey.as_str()]);
+    }
+
+    #[test]
+    fn a_transited_peer_stays_wanted_until_its_direct_path_handshakes() {
+        // Even while a tier retry has it off `Wan`, and with no tracked
+        // history at all (the other side may be the one that asked).
+        let now = std::time::Instant::now();
+        let mut tracker = EndpointTracker::default();
+        let (c_key, b_key) = (key_b64(3), key_b64(2));
+        tracker.resolve(&c_key, lan_only("192.168.1.50"), None, now);
+        tracker.note_transit(&HashMap::from([(c_key.as_str(), b_key.as_str())]));
+        let now_utc = chrono::Utc::now();
+        assert_eq!(tracker.peers_wanting_transit(&HashMap::new(), now_utc, now), vec![c_key.as_str()]);
+
+        let direct = HashMap::from([(c_key.clone(), Some(now_utc))]);
+        assert!(tracker.peers_wanting_transit(&direct, now_utc, now).is_empty());
+
+        tracker.note_transit(&HashMap::new());
+        assert!(tracker.peers_wanting_transit(&HashMap::new(), now_utc, now).is_empty());
     }
 
     #[test]
@@ -1692,6 +1835,28 @@ mod tests {
         assert_eq!(to_configure[0].public_key, b);
     }
 
+    #[test]
+    fn peers_to_configure_leaves_an_unchanged_endpoint_to_the_kernel() {
+        // Moving `AllowedIPs` (a transit ending) must not reset the address
+        // the kernel learned by roaming; a changed endpoint is still sent.
+        let a = defguard_wireguard_rs::key::Key::new([1; 32]);
+        let mut old = Peer::new(a.clone());
+        old.endpoint = Some("203.0.113.9:51820".parse().unwrap());
+        let applied = HashMap::from([(a.clone(), old.clone())]);
+
+        let mut more_ips = old.clone();
+        more_ips.allowed_ips = peer_allowed_ips("100.90.0.3", "");
+        let sent = peers_to_configure(&applied, &HashMap::from([(a.clone(), more_ips)]));
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].endpoint, None);
+        assert_eq!(sent[0].allowed_ips.len(), 1);
+
+        let mut moved = old.clone();
+        moved.endpoint = Some("192.168.1.50:51820".parse().unwrap());
+        let sent = peers_to_configure(&applied, &HashMap::from([(a, moved)]));
+        assert_eq!(sent[0].endpoint, Some("192.168.1.50:51820".parse().unwrap()));
+    }
+
     // ---- NAT-hairpin fix: subnet math and containment ----
 
     fn lan(addr: &str, prefix_len: u8) -> LocalLan {
@@ -1749,26 +1914,66 @@ mod tests {
     fn peer_tier_candidates_keeps_a_lan_addr_inside_an_own_subnet() {
         let subnets = own_lan_subnets(&[lan("192.168.1.2", 24)]);
         let p = info_with(Some("192.168.1.50"), None);
-        assert_eq!(peer_tier_candidates(&subnets, &p).lan, Some("192.168.1.50"));
+        assert_eq!(peer_tier_candidates(&subnets, &[], &p).lan, Some("192.168.1.50"));
     }
 
     #[test]
     fn peer_tier_candidates_drops_a_lan_addr_outside_every_own_subnet() {
         let subnets = own_lan_subnets(&[lan("192.168.1.2", 24)]);
         let p = info_with(Some("10.0.0.5"), None);
-        assert_eq!(peer_tier_candidates(&subnets, &p).lan, None);
+        assert_eq!(peer_tier_candidates(&subnets, &[], &p).lan, None);
+    }
+
+    #[test]
+    fn peer_tier_candidates_drops_a_lan_addr_behind_a_different_public_address() {
+        // lego2 and minipc: both 192.168.178.0/24, at two different homes.
+        let subnets = own_lan_subnets(&[lan("192.168.178.26", 24)]);
+        let own: [Ipv4Addr; 1] = ["213.196.211.215".parse().unwrap()];
+        let mut p = info_with(Some("192.168.178.44"), None);
+        p.endpoint_addr_v4 = Some("92.208.31.99:51820".into());
+        assert_eq!(peer_tier_candidates(&subnets, &own, &p).lan, None);
+    }
+
+    #[test]
+    fn peer_tier_candidates_keeps_a_lan_addr_behind_the_same_public_address() {
+        let subnets = own_lan_subnets(&[lan("192.168.178.44", 24)]);
+        let own: [Ipv4Addr; 1] = ["92.208.31.99".parse().unwrap()];
+        // Matched on the reflexive address, a different port and all.
+        let p = info_with(Some("192.168.178.28"), Some("92.208.31.99:40404"));
+        assert_eq!(peer_tier_candidates(&subnets, &own, &p).lan, Some("192.168.178.28"));
+    }
+
+    #[test]
+    fn peer_tier_candidates_stays_optimistic_when_either_public_address_is_unknown() {
+        let subnets = own_lan_subnets(&[lan("192.168.178.26", 24)]);
+        let own: [Ipv4Addr; 1] = ["213.196.211.215".parse().unwrap()];
+        let p = info_with(Some("192.168.178.44"), None);
+        assert_eq!(peer_tier_candidates(&subnets, &own, &p).lan, Some("192.168.178.44"));
+        let mut p = p;
+        p.endpoint_addr_v4 = Some("92.208.31.99:51820".into());
+        assert_eq!(peer_tier_candidates(&subnets, &[], &p).lan, Some("192.168.178.44"));
+    }
+
+    #[test]
+    fn public_v4s_takes_v4_addresses_and_skips_hostnames_and_v6() {
+        let mut p = info_with(None, Some("198.51.100.7:40404"));
+        p.endpoint_addr = Some("home.example.org:51820".into());
+        p.endpoint_addr_v4 = Some("198.51.100.7:51820".into());
+        p.endpoint_addr_v6 = Some("[2001:db8::1]:51820".into());
+        let got = public_v4s(&p, Some("203.0.113.1:1234"));
+        assert_eq!(got, ["198.51.100.7".parse::<Ipv4Addr>().unwrap(), "203.0.113.1".parse().unwrap()]);
     }
 
     #[test]
     fn peer_tier_candidates_keeps_a_well_formed_reflexive_addr() {
         let p = info_with(None, Some("203.0.113.5:55123"));
-        assert_eq!(peer_tier_candidates(&[], &p).reflexive, Some("203.0.113.5:55123"));
+        assert_eq!(peer_tier_candidates(&[], &[], &p).reflexive, Some("203.0.113.5:55123"));
     }
 
     #[test]
     fn peer_tier_candidates_drops_a_malformed_reflexive_addr() {
         let p = info_with(None, Some("not-an-ip:port"));
-        assert_eq!(peer_tier_candidates(&[], &p).reflexive, None);
+        assert_eq!(peer_tier_candidates(&[], &[], &p).reflexive, None);
     }
 
     // ---- NAT-hairpin fix: resolve_endpoint_candidate's staleness state machine ----
@@ -2140,6 +2345,68 @@ mod tests {
         wg.teardown().unwrap();
         assert!(!sh("ip -o link show").contains("wgtest"), "interface still there after teardown");
         wg.teardown().unwrap();
+    }
+
+    /// The transit exit path, end to end on two real interfaces. A
+    /// transited peer's probe entry (no `AllowedIPs`) still completes a
+    /// direct handshake, which is what lets a pair leave transit at all.
+    /// And once the transit ends, moving the `AllowedIPs` back keeps the
+    /// endpoint the kernel learned from that handshake rather than
+    /// resetting it to the configured one, which here, as for a node with
+    /// no port-forward, doesn't work.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_a_transited_peers_probe_handshakes_and_its_roamed_endpoint_survives_the_transit_ending() {
+        if !crate::firewall::netns::reexec(
+            "wg::tests::kernel_a_transited_peers_probe_handshakes_and_its_roamed_endpoint_survives_the_transit_ending",
+        ) {
+            return;
+        }
+        let out = std::process::Command::new("ip").args(["link", "set", "lo", "up"]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        let (a_key, b_key) = (clamp_private_key(&Key::generate()), clamp_private_key(&Key::generate()));
+        let (a_pub, b_pub) = (a_key.public_key().to_string(), b_key.public_key().to_string());
+        let via = key_b64(9);
+        let mut a = WgInterface::new("wgtesta").unwrap();
+        a.bring_up(&a_key.to_string(), "100.90.0.2".parse().unwrap(), "fd00:90::2".parse().unwrap(), 51820).unwrap();
+        let mut b = WgInterface::new("wgtestb").unwrap();
+        b.bring_up(&b_key.to_string(), "100.90.0.3".parse().unwrap(), "fd00:90::3".parse().unwrap(), 51821).unwrap();
+
+        let mut a_info = peer("a", &a_pub);
+        a_info.ip4 = "100.90.0.2".into();
+        a_info.ip6 = "fd00:90::2".into();
+        // Where B is told A is: nothing listens there.
+        a_info.endpoint_addr = Some("127.0.0.1:51899".into());
+        let mut b_info = peer("b", &b_pub);
+        b_info.ip4 = "100.90.0.3".into();
+        b_info.ip6 = "fd00:90::3".into();
+        b_info.endpoint_addr = Some("127.0.0.1:51821".into());
+        let peers = [a_info, b_info];
+
+        // Both sides transited via a carrier neither has an entry for.
+        let a_transit: TransitAssignments<'_> = HashMap::from([(b_pub.as_str(), via.as_str())]);
+        let b_transit: TransitAssignments<'_> = HashMap::from([(a_pub.as_str(), via.as_str())]);
+        a.reconcile(&peers, &[], &a_pub, false, &HashMap::new(), &a_transit).unwrap();
+        b.reconcile(&peers, &[], &b_pub, false, &HashMap::new(), &b_transit).unwrap();
+
+        let handshaked = |ifname: &str| tunnel_peers(ifname).unwrap().iter().any(|t| t.last_handshake.is_some());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !(handshaked("wgtesta") && handshaked("wgtestb")) {
+            assert!(std::time::Instant::now() < deadline, "no handshake over the probe entries");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let roamed = tunnel_peers("wgtestb").unwrap()[0].endpoint.clone();
+        assert_eq!(roamed.as_deref(), Some("127.0.0.1:51820"), "B learns A's real address from the handshake");
+
+        // The transit ends on B's side: A's addresses move back onto its own
+        // entry, whose configured endpoint is unchanged (and wrong).
+        b.reconcile(&peers, &[], &b_pub, false, &HashMap::new(), &HashMap::new()).unwrap();
+        let after = tunnel_peers("wgtestb").unwrap();
+        assert_eq!(after[0].endpoint.as_deref(), Some("127.0.0.1:51820"), "the roamed endpoint must survive");
+
+        a.teardown().unwrap();
+        b.teardown().unwrap();
     }
 
     /// NAT-hairpin fix (PLAN.md decisions log #85), end to end: when the

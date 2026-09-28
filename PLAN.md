@@ -3263,3 +3263,25 @@ sent is removed. There are no previous installations to carry forward.
     credential question is preceded by where that token is created
     (Hetzner's must come from the Hetzner Console; the old DNS Console's do
     not work with the Cloud API `dns-update` uses).
+
+206. **A pair leaves transit once a direct path works.** On the real mesh,
+    lego2 and minipc (both `192.168.178.0/24`, at two homes) stayed
+    transited via strato for good, although minipc's port-forward made it
+    directly reachable. Each tried the other's private address, fell to
+    `Wan` and asked for transit in that same cycle, before the WAN address
+    was ever dialled. The transit then removed the peer's own kernel entry,
+    so no direct handshake could ever clear "wanted". Four changes, all in
+    the agent:
+    - A transited peer keeps a **probe entry**: its endpoint and keepalive,
+      no `AllowedIPs`. It routes and accepts nothing, but a direct
+      handshake over it ends the transit. Pass 2 no longer folds into a
+      via that is itself transited, so a cycle still routes nothing.
+    - A peer that is transited **stays wanted until its direct path
+      handshakes**, so a tier retry can't drop the transit for a grace
+      window, and **`Wan` gets its own `ENDPOINT_GRACE_WINDOW`** before it
+      asks (`switched_at` is kept across `Wan` cycles).
+    - `peers_to_configure` sends an unchanged endpoint as none, so moving
+      `AllowedIPs` back keeps the address the kernel roamed to. For a node
+      without a port-forward, that's the only one that works.
+    - The `Lan` tier is skipped when both nodes' public IPv4 addresses are
+      known and none match. Unknown on either side stays optimistic.

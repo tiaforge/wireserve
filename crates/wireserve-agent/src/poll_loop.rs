@@ -603,7 +603,7 @@ where
     // help even if it can't offer it.
     let mut transit_wanted: Vec<String> = ctx
         .endpoint_tracker
-        .peers_wanting_transit(&handshakes, now_utc)
+        .peers_wanting_transit(&handshakes, now_utc, std::time::Instant::now())
         .into_iter()
         .map(String::from)
         .collect();
@@ -739,6 +739,7 @@ where
         .filter(|p| p.pubkey != self_pubkey)
         .filter_map(|p| p.transit_via.as_deref().map(|via| (p.pubkey.as_str(), via)))
         .collect();
+    ctx.endpoint_tracker.note_transit(&transit);
     // This node's own carrier role this cycle (PLAN.md M23) — built from
     // `transit_carrying`, never from `transit` above: `transit` is about
     // how *this* node reaches *its own* peers, which is never itself a
@@ -763,13 +764,23 @@ where
         // resolve each peer's best endpoint tier before reconciling.
         // Reuses the `handshakes` map already read above (pre-request),
         // rather than reading the kernel's peer table a second time.
+        //
+        // This node's own public addresses — from its own directory entry
+        // plus its startup reflexive probe — tell a peer on this LAN apart
+        // from one on another LAN that reuses the same private range.
+        let own_public = directory
+            .peers
+            .iter()
+            .find(|p| p.pubkey == self_pubkey)
+            .map(|p| crate::wg::public_v4s(p, ctx.own_reflexive_addr))
+            .unwrap_or_default();
         let now = std::time::Instant::now();
         let endpoint_tiers: std::collections::HashMap<String, crate::wg::EndpointTier> = directory
             .peers
             .iter()
             .filter(|p| p.pubkey != self_pubkey)
             .map(|p| {
-                let candidates = crate::wg::peer_tier_candidates(&own_lan_subnets, p);
+                let candidates = crate::wg::peer_tier_candidates(&own_lan_subnets, &own_public, p);
                 let tier = ctx.endpoint_tracker.resolve(
                     &p.pubkey,
                     candidates,
