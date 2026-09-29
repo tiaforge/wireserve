@@ -240,7 +240,14 @@ pub fn spawn(listener: TcpListener, tls: Arc<rustls::ServerConfig>, shared: Shar
                             "misdirected request: it names another host"
                         );
                     }
-                    prepare(req.headers_mut(), caller.as_ref().map(|c| c.node.as_str()));
+                    // The provider's own verify endpoint is asked by the other
+                    // terminators, which name the service in X-Forwarded-Host;
+                    // everywhere else a client's copy is removed.
+                    let verify = sign_in.as_ref().is_some_and(|si| {
+                        policy.as_ref().is_some_and(|p| p.fqdn.eq_ignore_ascii_case(&si.target.fqdn))
+                            && req.uri().path() == si.target.verify_path
+                    });
+                    prepare(req.headers_mut(), caller.as_ref().map(|c| c.node.as_str()), verify);
                     req.extensions_mut().insert(ConnectInfo(peer));
                     async move {
                         let Some(policy) = policy else {
@@ -391,9 +398,17 @@ fn name_owner(headers: &mut HeaderMap, owner: &wireserve_types::CallerIdentity, 
 /// names the calling node. The forwarding headers are then set afresh by
 /// the proxy from the connection itself — never appended to what the client
 /// sent.
-pub fn prepare(headers: &mut HeaderMap, caller: Option<&str>) {
+///
+/// `verify`: this is the sign-in provider's own verify endpoint, where the
+/// other terminators name the service they ask about in `X-Forwarded-Host`
+/// (PLAN.md M34). It stays there. Anyone may send it, but asking `/verify`
+/// directly only ever answers the asker — it opens no backend — so there is
+/// nothing to borrow.
+pub fn prepare(headers: &mut HeaderMap, caller: Option<&str>, verify: bool) {
     for name in ["x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "forwarded", "x-real-ip", NODE_HEADER] {
-        headers.remove(name);
+        if !(verify && name == "x-forwarded-host") {
+            headers.remove(name);
+        }
     }
     if let Some(node) = caller.and_then(|n| HeaderValue::from_str(n).ok()) {
         headers.insert(NODE_HEADER, node);
@@ -633,12 +648,16 @@ mod tests {
         h.insert("forwarded", HeaderValue::from_static("for=1.2.3.4"));
         h.insert(NODE_HEADER, HeaderValue::from_static("admin-laptop"));
         h.insert("cookie", HeaderValue::from_static("a=b"));
-        prepare(&mut h, Some("phone"));
+        h.insert("x-forwarded-host", HeaderValue::from_static("jellyfin.int.test"));
+        prepare(&mut h, Some("phone"), false);
+        assert!(h.get("x-forwarded-host").is_none());
         assert!(h.get("x-forwarded-for").is_none() && h.get("forwarded").is_none());
         assert_eq!(h.get(NODE_HEADER).unwrap(), "phone");
         assert_eq!(h.get("cookie").unwrap(), "a=b");
 
-        prepare(&mut h, None);
+        h.insert("x-forwarded-host", HeaderValue::from_static("jellyfin.int.test"));
+        prepare(&mut h, None, true);
+        assert_eq!(h.get("x-forwarded-host").unwrap(), "jellyfin.int.test", "kept for the provider's verify endpoint");
         assert!(h.get(NODE_HEADER).is_none(), "an unknown caller is named by nobody");
     }
 
@@ -649,7 +668,7 @@ mod tests {
         for crumb in ["theme=dark", "authward_session=s3cret", "auth_tokens=abc"] {
             req.headers_mut().append("cookie", HeaderValue::from_static(crumb));
         }
-        prepare(req.headers_mut(), None);
+        prepare(req.headers_mut(), None, false);
         let cookies: Vec<_> = req.headers().get_all("cookie").iter().collect();
         assert_eq!(cookies, ["theme=dark; authward_session=s3cret; auth_tokens=abc"]);
 

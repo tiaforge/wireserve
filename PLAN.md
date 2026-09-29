@@ -3375,7 +3375,10 @@ builds on the sign-in they concern.
     own name as `Host`, since the provider is itself a terminated service
     that answers for its own name only (sending the service's name there
     was 421'd by the provider's terminator: found by
-    `run-service-auth-test.sh`, fixed 2026-09-29). Every terminated
+    `run-service-auth-test.sh`, fixed 2026-09-29). The provider's own
+    terminator keeps a client's `X-Forwarded-Host` on its verify path
+    alone, where the other terminators send it — asking `/verify` directly
+    only ever answers the asker. Every terminated
     service answers a request whose `Host` or authority names anything else
     with **421 Misdirected Request** before the sign-in or the backend sees
     it. `run-service-auth-test.sh` step 6.
