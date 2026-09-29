@@ -128,7 +128,7 @@ done
 admin tag add node-a ops
 podman exec "$HOME_AGENT" wireserve serve web 80:8080
 podman exec "$HOME_AGENT" wireserve serve db 5432
-in_netns_bg "$HOME_AGENT" socat TCP-LISTEN:8080,fork,reuseaddr SYSTEM:'echo web'
+in_netns_bg "$HOME_AGENT" socat TCP-LISTEN:8080,fork,reuseaddr SYSTEM:'read x; echo web'
 in_netns_bg "$HOME_AGENT" socat TCP-LISTEN:5432,fork,reuseaddr EXEC:cat
 wait_for "db to resolve on a" 60 sh -c "podman exec $CLIENT_A getent hosts db.wg"
 wait_for "db to resolve on b" 60 sh -c "podman exec $CLIENT_B getent hosts db.wg"
@@ -171,7 +171,7 @@ log "5/6: a declaration names a group once, and never an unknown one"
 admin grant add tag:ops infra
 admin group create media
 podman exec "$HOME_AGENT" wireserve serve vault 8200 --group infra
-in_netns_bg "$HOME_AGENT" socat TCP-LISTEN:8200,fork,reuseaddr SYSTEM:'echo vault'
+in_netns_bg "$HOME_AGENT" socat TCP-LISTEN:8200,fork,reuseaddr SYSTEM:'read x; echo vault'
 wait_for "vault to resolve on b" 60 sh -c "podman exec $CLIENT_B getent hosts vault.wg"
 wait_for "a to reach vault" 30 reaches "$CLIENT_A" vault 8200
 refused "$CLIENT_B" vault 8200 || fail "vault landed in default"
