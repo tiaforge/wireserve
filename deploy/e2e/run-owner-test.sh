@@ -79,7 +79,7 @@ ip_on() {
     podman inspect "$1" --format "{{(index .NetworkSettings.Networks \"$2\").IPAddress}}"
 }
 admin() { podman exec "$COORD" wireserve-admin "$@"; }
-vip_of() { podman exec "$LAPTOP" getent hosts "$1.wg" | awk '{print $1}'; }
+vip_of() { podman exec "$LAPTOP" getent hosts "$1.wg" | awk '{print $1; exit}'; }
 ask() { in_netns "$1" sh -c "echo hi | timeout 8 socat -t3 - TCP:$(vip_of db):5432" 2>/dev/null || true; }
 reaches() { [ -n "$(ask "$1")" ]; }
 refused() { [ -z "$(ask "$1")" ]; }

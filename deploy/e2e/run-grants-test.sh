@@ -80,7 +80,7 @@ ip_on() {
     podman inspect "$1" --format "{{(index .NetworkSettings.Networks \"$2\").IPAddress}}"
 }
 admin() { podman exec "$COORD" wireserve-admin "$@"; }
-vip_of() { podman exec "$CLIENT_A" getent hosts "$1.wg" | awk '{print $1}'; }
+vip_of() { podman exec "$CLIENT_A" getent hosts "$1.wg" | awk '{print $1; exit}'; }
 # One exchange with a service: what came back, empty when refused. socat's
 # own complaint goes to $WORK/ask.err, for `explain`.
 ask() {
