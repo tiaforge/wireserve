@@ -18,7 +18,7 @@ One `WARN` per failed authentication, on `/register`, `/poll` and the admin
 listener:
 
 ```
-event="auth_failure" client_ip="203.0.113.9" endpoint="/register" reason="unknown_token"
+event="auth_failure" client_ip=203.0.113.9 endpoint="/register" reason="unknown_token"
 ```
 
 `reason` is one of `unknown_token`, `missing_header`, `bad_admin_token`. It

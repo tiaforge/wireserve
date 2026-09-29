@@ -557,7 +557,7 @@ mod naming_tests {
     }
 
     fn cfg_for(domain: &str) -> ServiceNaming {
-        ServiceNaming { domain: domain.into(), acme: None, sign_in: None, identity_headers: Default::default() }
+        ServiceNaming { domain: domain.into(), acme: None, sign_in: None, identity_headers: Default::default(), strip_headers: Vec::new() }
     }
 
     #[test]

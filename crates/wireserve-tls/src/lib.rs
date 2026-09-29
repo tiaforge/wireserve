@@ -146,6 +146,7 @@ pub async fn run(opts: Options) -> Result<(), Error> {
         update_callers(&shared.callers, &config);
         update_sign_in(&shared.sign_in, config.sign_in.as_ref(), &extra_roots);
         *shared.identity.write().unwrap_or_else(std::sync::PoisonError::into_inner) = config.identity_headers.clone();
+        *shared.strip.write().unwrap_or_else(std::sync::PoisonError::into_inner) = config.strip_headers.clone();
 
         forget_gone(&mut served, &mut issuance, &certs, &shared, &config);
 

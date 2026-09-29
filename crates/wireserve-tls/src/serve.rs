@@ -71,6 +71,8 @@ pub struct Shared {
     pub callers: Callers,
     pub sign_in: SharedSignIn,
     pub identity: Arc<RwLock<wireserve_types::IdentityHeaders>>,
+    /// Further headers removed from every request (`WIRESERVE_STRIP_HEADERS`).
+    pub strip: Arc<RwLock<Vec<String>>>,
     /// Known devices that connected since the last check-in (PLAN.md M38):
     /// what the agent tells the coordinator, which then names their owners
     /// to this node and nobody else's.
@@ -467,6 +469,7 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                     }
                     let sign_in = read(&shared.sign_in).clone();
                     let identity = read(&shared.identity).clone();
+                    let strip = read(&shared.strip).clone();
                     let misdirected = policy.as_ref().is_some_and(|p| !for_this_service(&req, &p.fqdn));
                     if misdirected {
                         tracing::info!(
@@ -485,7 +488,7 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                             && req.uri().path() == si.target.verify_path
                     });
                     let router = if verify { route.verify_router.clone() } else { route.router.clone() };
-                    prepare(req.headers_mut(), caller.as_ref().map(|c| c.node.as_str()), verify);
+                    prepare(req.headers_mut(), caller.as_ref().map(|c| c.node.as_str()), verify, &strip);
                     req.extensions_mut().insert(ConnectInfo(peer));
                     async move {
                         let _in_flight = in_flight;
@@ -634,10 +637,38 @@ fn name_owner(headers: &mut HeaderMap, owner: &wireserve_types::CallerIdentity, 
     set(&identity.groups, &owner.groups.join(","));
 }
 
+/// Headers a proxy or an identity-aware front end sets and a backend may
+/// believe, so none may arrive from a client: where the request came from,
+/// which URL it asked for, and who is calling, in the spellings the common
+/// proxies and providers use. (The identity headers of *this* deployment are
+/// removed separately, whatever their names, and set again only from the
+/// sign-in or the device's owner.)
+const UNTRUSTED_EXACT: &[&str] = &[
+    "forwarded", "x-real-ip", "true-client-ip", "cf-connecting-ip", "x-client-ip", "x-cluster-client-ip",
+    "x-url-scheme", "front-end-https", "x-rewrite-url", "x-http-host-override",
+    "remote-user", "remote-email", "remote-groups", "remote-name",
+];
+/// The same, for families of names.
+const UNTRUSTED_PREFIX: &[&str] = &["x-forwarded-", "x-original-", "x-remote-", "x-auth-request-", "x-webauth-", "x-authentik-", "x-authelia-"];
+/// What only the calling terminator sets, and the provider's own reads.
+const VERIFY_KEEPS: &[&str] = &["x-forwarded-host", "x-forwarded-for", "x-forwarded-uri", "x-forwarded-method"];
+
+fn is_untrusted(name: &str, verify: bool, extra: &[String]) -> bool {
+    if name == NODE_HEADER {
+        return true;
+    }
+    if verify && VERIFY_KEEPS.contains(&name) {
+        return false;
+    }
+    UNTRUSTED_EXACT.contains(&name)
+        || UNTRUSTED_PREFIX.iter().any(|p| name.starts_with(p))
+        || extra.iter().any(|e| e == name)
+}
+
 /// Strips every header a client could use to claim to be someone else, and
 /// names the calling node. The forwarding headers are then set afresh by
 /// the proxy from the connection itself — never appended to what the client
-/// sent.
+/// sent. `extra` is the operator's own list on top of the built-in one.
 ///
 /// `verify`: this is the sign-in provider's own verify endpoint, where the
 /// other terminators name the service they ask about in `X-Forwarded-Host`
@@ -645,11 +676,11 @@ fn name_owner(headers: &mut HeaderMap, owner: &wireserve_types::CallerIdentity, 
 /// provider may bind a session to. Both stay there. Anyone may send it, but asking `/verify`
 /// directly only ever answers the asker — it opens no backend — so there is
 /// nothing to borrow.
-pub fn prepare(headers: &mut HeaderMap, caller: Option<&str>, verify: bool) {
-    for name in ["x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "forwarded", "x-real-ip", NODE_HEADER] {
-        if !(verify && (name == "x-forwarded-host" || name == "x-forwarded-for")) {
-            headers.remove(name);
-        }
+pub fn prepare(headers: &mut HeaderMap, caller: Option<&str>, verify: bool, extra: &[String]) {
+    let doomed: Vec<axum::http::HeaderName> =
+        headers.keys().filter(|n| is_untrusted(n.as_str(), verify, extra)).cloned().collect();
+    for name in doomed {
+        headers.remove(name);
     }
     if let Some(node) = caller.and_then(|n| HeaderValue::from_str(n).ok()) {
         headers.insert(NODE_HEADER, node);
@@ -904,6 +935,40 @@ mod tests {
     }
 
     #[test]
+    fn what_a_backend_might_believe_about_who_or_where_never_arrives_from_a_client() {
+        let spoof = [
+            "x-forwarded-uri", "x-forwarded-user", "x-forwarded-email", "x-forwarded-port", "x-forwarded-prefix",
+            "x-original-url", "x-original-uri", "x-original-host", "x-rewrite-url", "remote-user", "remote-groups",
+            "x-remote-user", "x-auth-request-user", "x-auth-request-email", "x-webauth-user", "x-authentik-username",
+            "x-authelia-username", "true-client-ip", "cf-connecting-ip", "x-client-ip", "x-cluster-client-ip",
+            "x-url-scheme", "front-end-https", "x-corp-user",
+        ];
+        let mut h = HeaderMap::new();
+        for name in spoof {
+            h.insert(axum::http::HeaderName::from_static(name), HeaderValue::from_static("admin"));
+        }
+        for keep in ["authorization", "user-agent", "accept", "x-request-id", "x-custom"] {
+            h.insert(axum::http::HeaderName::from_static(keep), HeaderValue::from_static("kept"));
+        }
+        // `x-corp-user` is the operator's own addition.
+        prepare(&mut h, None, false, &["x-corp-user".to_string()]);
+        let left: Vec<&str> = h.keys().map(|k| k.as_str()).collect();
+        assert!(left.iter().all(|k| !spoof.contains(k)), "still there: {left:?}");
+        assert_eq!(h.len(), 5, "everything else is untouched: {left:?}");
+
+        // Without the operator's addition, that one passes; and the provider's verify path keeps
+        // exactly what the calling terminator set on it.
+        let mut h = HeaderMap::new();
+        for name in ["x-corp-user", "x-forwarded-host", "x-forwarded-for", "x-forwarded-uri", "x-forwarded-method", "x-forwarded-proto", "x-forwarded-user", "remote-user"] {
+            h.insert(axum::http::HeaderName::from_static(name), HeaderValue::from_static("v"));
+        }
+        prepare(&mut h, None, true, &[]);
+        let mut left: Vec<&str> = h.keys().map(|k| k.as_str()).collect();
+        left.sort_unstable();
+        assert_eq!(left, ["x-corp-user", "x-forwarded-for", "x-forwarded-host", "x-forwarded-method", "x-forwarded-uri"]);
+    }
+
+    #[test]
     fn forged_headers_are_removed_and_the_caller_named() {
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
@@ -911,19 +976,19 @@ mod tests {
         h.insert(NODE_HEADER, HeaderValue::from_static("admin-laptop"));
         h.insert("cookie", HeaderValue::from_static("a=b"));
         h.insert("x-forwarded-host", HeaderValue::from_static("jellyfin.int.test"));
-        prepare(&mut h, Some("phone"), false);
+        prepare(&mut h, Some("phone"), false, &[]);
         assert!(h.get("x-forwarded-host").is_none());
         assert!(h.get("x-forwarded-for").is_none() && h.get("forwarded").is_none());
         assert_eq!(h.get(NODE_HEADER).unwrap(), "phone");
         assert_eq!(h.get("cookie").unwrap(), "a=b");
 
         h.insert("x-forwarded-host", HeaderValue::from_static("jellyfin.int.test"));
-        prepare(&mut h, None, true);
+        prepare(&mut h, None, true, &[]);
         assert_eq!(h.get("x-forwarded-host").unwrap(), "jellyfin.int.test", "kept for the provider's verify endpoint");
         h.insert("x-forwarded-for", HeaderValue::from_static("10.9.0.3"));
-        prepare(&mut h, None, true);
+        prepare(&mut h, None, true, &[]);
         assert_eq!(h.get("x-forwarded-for").unwrap(), "10.9.0.3", "the calling device, for the provider's verify endpoint");
-        prepare(&mut h, None, false);
+        prepare(&mut h, None, false, &[]);
         assert!(h.get("x-forwarded-for").is_none(), "anywhere else a client's is removed");
         assert!(h.get(NODE_HEADER).is_none(), "an unknown caller is named by nobody");
     }
@@ -935,7 +1000,7 @@ mod tests {
         for crumb in ["theme=dark", "authward_session=s3cret", "auth_tokens=abc"] {
             req.headers_mut().append("cookie", HeaderValue::from_static(crumb));
         }
-        prepare(req.headers_mut(), None, false);
+        prepare(req.headers_mut(), None, false, &[]);
         let cookies: Vec<_> = req.headers().get_all("cookie").iter().collect();
         assert_eq!(cookies, ["theme=dark; authward_session=s3cret; auth_tokens=abc"]);
 

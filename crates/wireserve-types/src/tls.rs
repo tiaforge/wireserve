@@ -60,6 +60,9 @@ pub struct TlsConfig {
     /// Removed from every request, and set only by the terminator.
     #[serde(default)]
     pub identity_headers: IdentityHeaders,
+    /// Removed from every request too, beyond the terminator's built-in list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub strip_headers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

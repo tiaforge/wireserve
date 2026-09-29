@@ -16,6 +16,8 @@ pub struct Config {
     pub sign_in: Option<wireserve_types::SignIn>,
     /// The headers backends learn who is calling from (PLAN.md M36).
     pub identity_headers: wireserve_types::IdentityHeaders,
+    /// Further request headers the terminators remove (`WIRESERVE_STRIP_HEADERS`).
+    pub strip_headers: Vec<String>,
     /// Where browsers and nodes reach the coordinator, e.g.
     /// `https://mesh.example.com` (`WIRESERVE_PUBLIC_URL`), without a
     /// trailing slash. Needed for the claim links of device owners.
@@ -211,6 +213,7 @@ impl Config {
         let acme = acme_from_lookup(|k| std::env::var(k).ok())?;
         let sign_in = sign_in_from_lookup(|k| std::env::var(k).ok(), dns.is_some())?;
         let identity_headers = identity_headers_from_lookup(|k| std::env::var(k).ok())?;
+        let strip_headers = strip_headers_from(std::env::var("WIRESERVE_STRIP_HEADERS").ok().as_deref())?;
         let public_url = public_url_from_lookup(|k| std::env::var(k).ok())?;
         let oidc = oidc_from_lookup(|k| std::env::var(k).ok(), public_url.as_deref(), &bootstrapped_token_key)?;
 
@@ -225,6 +228,7 @@ impl Config {
                 service_domain,
                 sign_in,
                 identity_headers,
+                strip_headers,
                 public_url,
                 oidc,
                 dns,
@@ -260,6 +264,23 @@ impl Config {
             net_v6_prefix: self.net_v6_prefix.clone(),
         }
     }
+}
+
+/// `WIRESERVE_STRIP_HEADERS`: header names, comma-separated, lowercased.
+/// Never one a request cannot do without.
+pub fn strip_headers_from(raw: Option<&str>) -> Result<Vec<String>, ConfigError> {
+    let vital = ["host", "content-length", "transfer-encoding", "connection", "upgrade", "te", "trailer"];
+    let mut out: Vec<String> = Vec::new();
+    for h in raw.unwrap_or("").split(',').map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()) {
+        let token = h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        if !token || vital.contains(&h.as_str()) {
+            return Err(ConfigError::Invalid("WIRESERVE_STRIP_HEADERS", format!("{h:?} cannot be stripped")));
+        }
+        if !out.contains(&h) {
+            out.push(h);
+        }
+    }
+    Ok(out)
 }
 
 /// `WIRESERVE_RESERVED_SERVICE_NAMES`: service names, comma-separated.
@@ -315,6 +336,7 @@ impl Config {
             acme: self.dns.is_some().then(|| self.acme.clone()),
             sign_in: self.sign_in.clone(),
             identity_headers: self.identity_headers.clone(),
+            strip_headers: self.strip_headers.clone(),
         })
     }
 }
@@ -741,6 +763,7 @@ mod tests {
             poll_rate_burst: 20,
             poll_rate_per_min: 0,
             reserved_service_names: Vec::new(),
+            strip_headers: Vec::new(),
         }
     }
 
@@ -762,6 +785,15 @@ mod tests {
         assert_eq!(reserving(&[], Some("https://coord.example.org"), Some("int.example.com")).reserved_reason("coord"), None);
         assert_eq!(reserving(&[], Some("https://a.b.int.example.com"), Some("int.example.com")).reserved_reason("a"), None);
         assert_eq!(reserving(&[], None, None).reserved_reason("coord"), None);
+    }
+
+    #[test]
+    fn extra_stripped_headers_are_header_names_and_never_ones_a_request_needs() {
+        assert_eq!(strip_headers_from(Some(" X-Corp-User, x-corp-user ,Remote-Roles,")).unwrap(), ["x-corp-user", "remote-roles"]);
+        assert!(strip_headers_from(None).unwrap().is_empty());
+        for bad in ["host", "Content-Length", "a b", "x:y"] {
+            assert!(strip_headers_from(Some(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]

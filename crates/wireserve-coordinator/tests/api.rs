@@ -55,6 +55,7 @@ fn test_config(db_path: &str) -> Config {
         poll_rate_burst: 20,
         poll_rate_per_min: 0,
         reserved_service_names: Vec::new(),
+        strip_headers: Vec::new(),
     }
 }
 

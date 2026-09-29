@@ -3658,3 +3658,31 @@ them.
     served: the cap of 16 per node (#230) bounds how many, and revoking the
     node frees them. No admin command reserves a name in the database yet;
     the environment list does.
+
+232. **Three small audit findings** (security audit 2026-09-29, findings 6–8).
+    (6) The coordinator read the *first* `X-Forwarded-For` line, so behind a
+    proxy that adds a line of its own instead of appending to the client's
+    (HAProxy's `option forwardfor`) the client chose the address it was rate
+    limited, logged and fail2ban-banned under — including someone else's. It
+    now reads the last line, then that line's right-most entry; `nginx`'s and
+    Caddy's single line gives the same answer as before. (7) The shipped
+    fail2ban filter required `client_ip="<HOST>"` and the coordinator logs
+    `client_ip=203.0.113.9` — no quotes, tracing's `%` — so the jail matched
+    nothing and banned nobody, silently. Filter and README corrected, and
+    `tests/fail2ban_filter.rs` runs the *shipped* `failregex` (through the
+    `regex` crate, a dev-dependency) against the lines `/poll`, `/register`
+    and the admin listener really log, IPv6 included; the old filter fails it.
+    (8) Only the configured identity headers were removed from a client's
+    request; `Remote-User`, `X-Forwarded-User`, `X-Original-URL` and their
+    kin reached the backend, and a backend that trusts one could be spoofed.
+    `serve::prepare` now removes a built-in list — `X-Forwarded-*`,
+    `X-Original-*`, `X-Remote-*`, `X-Auth-Request-*`, `X-WebAuth-*`,
+    `X-Authentik-*`, `X-Authelia-*` by prefix, and `Forwarded`, `X-Real-IP`,
+    `True-Client-IP`, `CF-Connecting-IP`, `X-Client-IP`, `Remote-User/-Email/
+    -Groups/-Name` and a few more by name — plus `WIRESERVE_STRIP_HEADERS`
+    (`ServiceNaming::strip_headers`, `TlsConfig::strip_headers`); the
+    provider's verify path keeps `X-Forwarded-Host/-For/-Uri/-Method`, which
+    the calling terminator sets. Headers the terminator sets itself (the
+    identity headers, the node's name) come after and are unaffected. A
+    proxy in front of the terminator that legitimately forwards one of these
+    to a backend behind it would now lose it; none is known.

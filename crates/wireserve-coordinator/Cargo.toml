@@ -38,3 +38,5 @@ tempfile = "3"
 # Only the integration tests drive the routers directly via
 # `tower::ServiceExt::oneshot`; the binary itself never uses tower.
 tower.workspace = true
+# Runs the shipped fail2ban filter against the coordinator's real log lines.
+regex = "1"

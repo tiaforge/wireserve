@@ -41,6 +41,12 @@ pub struct ServiceNaming {
     /// The headers a backend learns who is calling from (PLAN.md M36).
     #[serde(default)]
     pub identity_headers: IdentityHeaders,
+    /// Further request headers every terminator removes before a backend sees
+    /// the request, on top of the built-in list (`WIRESERVE_STRIP_HEADERS`):
+    /// for a backend that believes a header of its own naming about who is
+    /// calling or where from.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub strip_headers: Vec<String>,
 }
 
 /// The headers a terminator tells a backend who is calling in — filled

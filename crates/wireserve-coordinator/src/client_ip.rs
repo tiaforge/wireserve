@@ -18,7 +18,9 @@ use axum::http::HeaderMap;
 /// endpoint fallback. If `trust_proxy_headers` is set, prefers the
 /// right-most `X-Forwarded-For` entry — the address the *nearest* hop
 /// (the operator's own trusted reverse proxy) appended — over the raw
-/// TCP peer address. This is a deliberately single-trusted-hop model: it
+/// TCP peer address. Right-most means of the last header *line* too: a proxy
+/// may append to the line the client sent or add a line of its own (HAProxy's
+/// `option forwardfor` does), and only the last line is certainly its. This is a deliberately single-trusted-hop model: it
 /// does not attempt to validate or walk a chain of untrusted proxies, on
 /// the assumption (spec §7) that there is exactly one proxy in front of
 /// the coordinator and it is trusted by the operator who set
@@ -60,7 +62,9 @@ pub fn resolve_client(
         };
     }
     match headers
-        .get("x-forwarded-for")
+        .get_all("x-forwarded-for")
+        .iter()
+        .next_back()
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.rsplit(',').next())
         .and_then(|s| s.trim().parse::<IpAddr>().ok())
@@ -182,6 +186,25 @@ mod tests {
         // The rightmost entry is what the nearest (trusted) proxy hop
         // appended; anything to its left is client-supplied and untrusted.
         assert_eq!(resolve(&h, connect, true), "198.51.100.9".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn the_last_header_line_wins_when_a_proxy_adds_a_line_of_its_own() {
+        let connect: IpAddr = "10.0.0.1".parse().unwrap();
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", HeaderValue::from_static("9.9.9.9")); // sent by the client
+        h.append("x-forwarded-for", HeaderValue::from_static("198.51.100.7")); // the proxy's own line
+        assert_eq!(resolve(&h, connect, true), "198.51.100.7".parse::<IpAddr>().unwrap());
+
+        // A proxy that appends to the client's line gives the same answer.
+        let joined = headers_with_xff("9.9.9.9, 198.51.100.7");
+        assert_eq!(resolve(&joined, connect, true), resolve(&h, connect, true));
+
+        // A last line that is not an address is not overridden by an earlier one.
+        let mut junk = HeaderMap::new();
+        junk.append("x-forwarded-for", HeaderValue::from_static("9.9.9.9"));
+        junk.append("x-forwarded-for", HeaderValue::from_static("not-an-ip"));
+        assert_eq!(resolve(&junk, connect, true), connect);
     }
 
     #[test]

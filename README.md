@@ -847,7 +847,12 @@ Worth knowing:
   client.** Every terminator removes the identity headers from every request,
   on every service, and the provider's session cookie from every request but
   the provider's own — the cookie is scoped to the whole domain, so the
-  browser sends it to every service.
+  browser sends it to every service. So do the headers a proxy or an
+  identity-aware front end sets and a backend may believe: every
+  `X-Forwarded-*`, `X-Original-*`, `X-Auth-Request-*` and `X-WebAuth-*`,
+  `Remote-User` and its kin, `X-Real-IP`, `True-Client-IP` and the like. A
+  backend that trusts a header of its own naming adds it to
+  `WIRESERVE_STRIP_HEADERS` on the coordinator.
 - **A node learns who owns a device only when that device calls it.** The
   identity headers name the owner of a calling device; the coordinator tells
   a node an owner's subject, e-mail and groups only for a device the node

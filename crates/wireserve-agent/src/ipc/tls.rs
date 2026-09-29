@@ -165,7 +165,14 @@ pub fn build_config(state: &AgentState) -> TlsConfig {
             session_cookie: si.session_cookie.clone(),
         })
     });
-    TlsConfig { acme: Some(acme), services, callers, sign_in, identity_headers: naming.identity_headers.clone() }
+    TlsConfig {
+        acme: Some(acme),
+        services,
+        callers,
+        sign_in,
+        identity_headers: naming.identity_headers.clone(),
+        strip_headers: naming.strip_headers.clone(),
+    }
 }
 
 /// Publishes or withdraws a challenge value through the coordinator, for a
@@ -231,6 +238,7 @@ mod tests {
                 session_cookie: "authward_session".into(),
             }),
             identity_headers: wireserve_types::IdentityHeaders::default(),
+            strip_headers: Vec::new(),
         });
         let open = |name: &str| wireserve_types::ServiceAccess { name: name.into(), open: true, ..Default::default() };
         let plex = if restricted {
