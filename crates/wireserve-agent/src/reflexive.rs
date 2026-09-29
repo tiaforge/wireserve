@@ -50,20 +50,43 @@ enum ReflexiveProbeError {
 /// probe must never fail `join` or the daemon's startup, exactly like
 /// the existing dual-family HTTP probe it runs alongside.
 pub async fn learn_reflexive_addr(coordinator_url: &str, listen_port: u16, timeout: Duration) -> Option<String> {
+    learn(coordinator_url, listen_port, timeout).await.addr
+}
+
+/// What the one-shot probe learned.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Learned {
+    /// The reflexive `ip:port`.
+    pub addr: Option<String>,
+    /// Whether unsolicited traffic reaches `listen_port` (PLAN.md M40): the
+    /// coordinator's second answer, from a port this node never sent to,
+    /// arrived. Only a NAT or firewall that lets inbound traffic in lets it
+    /// through — a phone could dial this node directly. `None` when it could
+    /// not be told: no answer at all, or a coordinator that answers once.
+    pub dialable: Option<bool>,
+}
+
+/// [`learn_reflexive_addr`], and whether this node is dialable from outside.
+pub async fn learn(coordinator_url: &str, listen_port: u16, timeout: Duration) -> Learned {
     match try_learn(coordinator_url, listen_port, timeout).await {
-        Ok(addr) => Some(addr),
+        Ok(learned) => learned,
         Err(e) => {
             tracing::info!(error = %e, "reflexive-address probe did not succeed — continuing without it");
-            None
+            Learned::default()
         }
     }
 }
 
-async fn try_learn(coordinator_url: &str, listen_port: u16, timeout: Duration) -> Result<String, ReflexiveProbeError> {
+/// How long to wait for the coordinator's second answer once the first came:
+/// both are sent together, so anything later is lost, not late.
+const SECOND_ANSWER_WAIT: Duration = Duration::from_millis(800);
+
+async fn try_learn(coordinator_url: &str, listen_port: u16, timeout: Duration) -> Result<Learned, ReflexiveProbeError> {
     // IPv4 only (PLAN.md decisions log #90+) — the wire protocol itself
     // is IPv4-only. A node with working IPv6 calls in too (#207).
     let probe_resp = crate::probe::fetch_probe_response(coordinator_url, crate::probe::Family::V4, timeout).await?;
     let reflexive_port = probe_resp.reflexive_port;
+    let answers_twice = probe_resp.answers_twice;
     let (_, coordinator_addr) = crate::probe::resolve_family(coordinator_url, crate::probe::Family::V4).await?;
     let target = std::net::SocketAddr::new(coordinator_addr.ip(), reflexive_port);
 
@@ -82,15 +105,36 @@ async fn try_learn(coordinator_url: &str, listen_port: u16, timeout: Duration) -
         let Ok(recv) = tokio::time::timeout(per_attempt_timeout, socket.recv_from(&mut buf)).await else {
             continue; // this attempt timed out — retry
         };
-        let (n, _src) = recv.map_err(ReflexiveProbeError::Io)?;
+        let (n, src) = recv.map_err(ReflexiveProbeError::Io)?;
         // Anything malformed, or a stray reply answering a different
         // request than the one just sent, is ignored rather than
         // trusted — retry instead.
-        if let Some((echoed_nonce, observed)) = parse_response(&buf[..n]) {
-            if echoed_nonce == nonce {
-                return Ok(observed.to_string());
-            }
+        let Some((echoed_nonce, observed)) = parse_response(&buf[..n]) else {
+            continue;
+        };
+        if echoed_nonce != nonce {
+            continue;
         }
+        // The answer from the port this node sent to came first, or the
+        // second one did (its own NAT or firewall passed it before the
+        // first arrived). Either way: whether the one from the other port
+        // arrives is the question.
+        let mut from_other_port = src != target;
+        let dialable = if !answers_twice {
+            None
+        } else {
+            let deadline = tokio::time::Instant::now() + SECOND_ANSWER_WAIT;
+            while !from_other_port {
+                let Ok(Ok((n, src))) = tokio::time::timeout_at(deadline, socket.recv_from(&mut buf)).await else {
+                    break;
+                };
+                if src.ip() == target.ip() && src != target && parse_response(&buf[..n]).is_some_and(|(e, _)| e == nonce) {
+                    from_other_port = true;
+                }
+            }
+            Some(from_other_port)
+        };
+        return Ok(Learned { addr: Some(observed.to_string()), dialable });
     }
     Err(ReflexiveProbeError::NoResponse)
 }

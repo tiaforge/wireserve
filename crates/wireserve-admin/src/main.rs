@@ -143,27 +143,23 @@ enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
-    /// Allow a node to carry transit traffic for peers that can't reach
-    /// each other directly. The node must also opt in itself
-    /// (`wireserve transit on`). A carrier sees the traffic it
-    /// relays unencrypted and can send packets as either end, so approve
-    /// only nodes you trust as much as the traffic between any two
-    /// others. Revoke and rejoin both withdraw the approval.
+    /// Allow a node to carry traffic for others: relay the sessions of peers
+    /// that can't reach each other directly, and of phones through its
+    /// public relay ports, and — with `wireserve exit on` — be a device's
+    /// exit. The node must also opt in itself (`wireserve transit on`). A
+    /// relay can't read or forge what it relays, but sees who talks to whom
+    /// and can drop it; an exit reads everything it sends on. Revoke and
+    /// rejoin both withdraw the approval.
     ApproveTransit { name: String },
-    /// Withdraw a node's approval to carry transit traffic. Takes effect
-    /// for new carrier choices at once; the pairs it carried move off it
-    /// on their next poll.
+    /// Withdraw a node's approval to carry traffic. Takes effect for new
+    /// carrier choices at once; the pairs it carried move off it on their
+    /// next poll, and devices relying on it need re-exporting.
     DenyTransit { name: String },
-    /// Mark a node as not dialable from outside the mesh (`on`), or clear
-    /// that (`off`). For a node that advertises a public endpoint but whose
-    /// router drops inbound WireGuard.
-    ///
-    /// Only `export-config` reads this: a phone or other static device
-    /// exported with a gateway then reaches the node through the gateway
-    /// instead of dialling it directly. How agents reach each other is
-    /// unaffected. Existing configs change only when re-exported with
-    /// `--refresh`; the devices that need it are listed.
-    ViaGateway { name: String, state: OnOff },
+    /// Every public relay port phones use or used (PLAN.md M40): on which
+    /// carrier and address it must be open, which node it leads to, which
+    /// devices rely on it, and whether it was last seen open. A port no
+    /// device relies on any more may be closed again.
+    RelayPorts,
     /// Generate a WireGuard .conf for an agent-less consumer-only device
     /// (spec §9).
     ExportConfig {
@@ -185,24 +181,22 @@ enum Command {
         /// a config too large to fit a terminal.
         #[arg(long)]
         qr: bool,
-        /// Route this device through the named node for anything not written
-        /// into its config directly, so adding nodes or services later needs
-        /// no re-export. The node must be approved to carry traffic
-        /// (`approve-transit`) and be reachable from outside the mesh.
-        ///
-        /// Picked automatically when exactly one node qualifies. The choice
-        /// is baked into the config, so changing it means re-exporting.
-        #[arg(long)]
-        gateway: Option<String>,
         /// Also write a full-tunnel profile, with the same key and address:
         /// switched on in the WireGuard app, it sends all of the device's
-        /// traffic out through its gateway, for public Wi-Fi or a home
-        /// connection abroad. IPv4 only; the device's IPv6 is dropped rather
-        /// than leaked around the tunnel. The gateway must run
-        /// `wireserve exit on`. Needs --dns, and --out or --qr, since
-        /// there are two files.
-        #[arg(long, requires = "dns")]
-        exit: bool,
+        /// internet traffic out through the named node — which reads it, as
+        /// any exit does — for public Wi-Fi or a home connection abroad. The
+        /// mesh stays end to end in it. IPv4 only; the device's IPv6 is
+        /// dropped rather than leaked around the tunnel. The node must run
+        /// `wireserve exit on`; without a name, the one node that qualifies
+        /// is picked. Needs --dns, and --out or --qr, since there are two
+        /// files.
+        #[arg(long, requires = "dns", value_name = "NODE", num_args = 0..=1, default_missing_value = "")]
+        exit: Option<String>,
+        /// Write the config even if a carrier's relay port could not be seen
+        /// open from outside — for a port you know is open, or a check that
+        /// can't reach it from the coordinator's network.
+        #[arg(long)]
+        allow_unverified: bool,
         /// The resolver to name: an approved service by name (a Pi-hole you
         /// `serve` on 53, say, which then also answers the mesh's own names),
         /// or an IPv4 address such as 9.9.9.9. Goes into the full-tunnel
@@ -257,11 +251,6 @@ enum TagAction {
     List { tag: Option<String> },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum OnOff {
-    On,
-    Off,
-}
 
 /// Prints the join token's deadline immediately under the token itself.
 ///
@@ -616,35 +605,33 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             wireserve_admin::cmd_deny_transit(&client, &name)?;
             println!("node '{name}' may no longer carry transit traffic");
         }
-        Command::ViaGateway { name, state } => {
-            check_name(&name)?;
-            let enabled = state == OnOff::On;
+        Command::RelayPorts => {
             let client = build_client(&coordinator_url, &admin_token)?;
-            let resp = wireserve_admin::cmd_set_via_gateway(&client, &name, enabled)?;
-            if enabled {
-                println!("devices exported with a gateway will reach '{name}' through it");
-            } else {
-                println!("devices exported with a gateway will dial '{name}' directly again");
+            let resp = wireserve_admin::cmd_relay_ports(&client)?;
+            if resp.ports.is_empty() {
+                println!("no public relay ports: no device reaches a node through a carrier");
             }
-            if !resp.affected_devices.is_empty() {
-                if enabled {
-                    println!(
-                        "  these devices still dial '{name}' directly (or use it as their \
-                         gateway) until re-exported:"
-                    );
+            for p in resp.ports {
+                let state = match p.open {
+                    Some(true) => "open",
+                    Some(false) => "CLOSED",
+                    None => "unchecked",
+                };
+                let devices = if p.devices.is_empty() {
+                    "no device uses it — safe to close".to_string()
                 } else {
-                    println!(
-                        "  these devices keep reaching '{name}' through their gateway, which \
-                         still works, until re-exported:"
-                    );
-                }
-                for device in &resp.affected_devices {
-                    println!(
-                        "    {}: wireserve-admin export-config {} --refresh",
-                        sanitize_for_terminal(device),
-                        sanitize_for_terminal(device)
-                    );
-                }
+                    format!("used by {}", sanitize_for_terminal(&p.devices.join(", ")))
+                };
+                println!(
+                    "{}\tudp/{}\taddress={}\tnode={}\t{}\tchecked={}\t{}",
+                    sanitize_for_terminal(&p.carrier),
+                    p.port,
+                    p.address.as_deref().map(sanitize_for_terminal).unwrap_or_else(|| "-".into()),
+                    p.node.as_deref().map(sanitize_for_terminal).unwrap_or_else(|| "-".into()),
+                    state,
+                    p.checked_at.map_or_else(|| "never".to_string(), |t| t.format("%Y-%m-%d").to_string()),
+                    devices,
+                );
             }
         }
         Command::ListPeers => {
@@ -652,7 +639,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let resp = wireserve_admin::cmd_list_peers(&client)?;
             for p in resp.peers {
                 let transit = if resp.transit_approved.contains(&p.name) { "approved" } else { "-" };
-                let via_gateway = if resp.via_gateway.contains(&p.name) { "yes" } else { "-" };
+                let stale = if resp.stale_devices.contains(&p.name) { "yes" } else { "-" };
+                let dialable = match resp.dialable.get(&p.name) {
+                    Some(true) => "yes",
+                    Some(false) => "no",
+                    None => "-",
+                };
                 // "offering" for a node that runs `exit on`, "yes" for a
                 // device whose last export has the full-tunnel profile.
                 let exit = if resp.exit_devices.contains(&p.name) {
@@ -668,7 +660,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // only line of defense" reasoning as export_config's
                 // renderer.
                 println!(
-                    "{}\t{}\t{}\t{}\tendpoint={}\tv4={}\tv6={}\tlan={}\treflexive={}\ttransit={}\tvia_gateway={}\texit={}\ttags={}",
+                    "{}\t{}\t{}\t{}\tendpoint={}\tv4={}\tv6={}\tlan={}\treflexive={}\ttransit={}\tdialable={}\tstale={}\texit={}\ttags={}",
                     sanitize_for_terminal(&p.name),
                     sanitize_for_terminal(&p.pubkey),
                     sanitize_for_terminal(&p.ip4),
@@ -694,7 +686,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         .map(sanitize_for_terminal)
                         .unwrap_or_else(|| "-".to_string()),
                     transit,
-                    via_gateway,
+                    dialable,
+                    stale,
                     exit,
                     match resp.tags.get(&p.name) {
                         Some(t) if !t.is_empty() => sanitize_for_terminal(&t.join(",")),
@@ -703,27 +696,28 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        Command::ExportConfig { name, out, refresh, qr, gateway, exit, dns, mesh_dns } => {
+        Command::ExportConfig { name, out, refresh, qr, exit, allow_unverified, dns, mesh_dns } => {
             check_name(&name)?;
-            if let Some(gateway) = &gateway {
-                check_name(gateway)?;
+            if let Some(exit) = exit.as_deref().filter(|e| !e.is_empty()) {
+                check_name(exit)?;
             }
+            let wants_exit = exit.is_some();
             // Before any request: two profiles cannot both go to stdout.
-            if exit && out.is_none() && !qr {
+            if wants_exit && out.is_none() && !qr {
                 return Err("--exit writes a second profile; pass --out <file> (the full-tunnel one \
                             goes beside it as <file>-exit.conf) or --qr"
                     .into());
             }
-            if dns.is_some() && !exit && !mesh_dns {
+            if dns.is_some() && !wants_exit && !mesh_dns {
                 return Err("--dns needs --exit (the full-tunnel profile) or --mesh-dns (the mesh \
                             profile), to say which profile it goes into"
                     .into());
             }
             let opts = wireserve_admin::export_config::ExportOptions {
-                gateway: gateway.as_deref(),
+                exit: exit.as_deref(),
                 dns: dns.as_deref(),
-                exit,
                 mesh_dns,
+                allow_unverified,
             };
             let client = build_client(&coordinator_url, &admin_token)?;
             let register_url = config::resolve_register_url_interactive(register_url.as_deref())?;
@@ -761,12 +755,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("\nScan with the WireGuard app{label}. This code contains the private key —");
                 eprintln!("it stays in your scrollback and in any screen recording.");
             }
-            if exit && exported.exit_conf.is_none() {
-                eprintln!(
-                    "warning: no full-tunnel profile was written — the export fell back to a \
-                     config without a gateway, see above"
-                );
-            } else if exit {
+            if wants_exit && exported.exit_conf.is_none() {
+                eprintln!("warning: no full-tunnel profile was written — its exit is not in the config, see above");
+            } else if wants_exit {
                 eprintln!(
                     "\nImport both on the device and switch on the -exit one for public Wi-Fi or \
                      to browse from home; the WireGuard app runs only one tunnel at a time."

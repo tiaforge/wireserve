@@ -105,6 +105,11 @@ pub enum Opening {
     ExitRequest,
     /// `oifname <if> ct mark & E == E` on `FORWARD`: its reply.
     ExitReply,
+    /// `oifname <if> ct mark & R == R` on `FORWARD`: a phone's session,
+    /// relayed from this node's public address into the mesh (PLAN.md M40).
+    RelayRequest,
+    /// `iifname <if> ct mark & R == R` on `FORWARD`: its reply.
+    RelayReply,
 }
 
 impl Opening {
@@ -112,9 +117,13 @@ impl Opening {
     pub fn hook(self) -> Hook {
         match self {
             Self::Input => Hook::Input,
-            Self::Hairpin | Self::ServiceRequest | Self::ServiceReply | Self::ExitRequest | Self::ExitReply => {
-                Hook::Forward
-            }
+            Self::Hairpin
+            | Self::ServiceRequest
+            | Self::ServiceReply
+            | Self::ExitRequest
+            | Self::ExitReply
+            | Self::RelayRequest
+            | Self::RelayReply => Hook::Forward,
         }
     }
 
@@ -133,6 +142,9 @@ impl Opening {
                 }
                 if forward.exit {
                     out.extend([Self::ExitRequest, Self::ExitReply]);
+                }
+                if forward.relay {
+                    out.extend([Self::RelayRequest, Self::RelayReply]);
                 }
                 out
             }

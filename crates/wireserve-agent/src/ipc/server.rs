@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, Mutex};
-use wireserve_types::{PollResponse, ServiceDecl};
+use wireserve_types::ServiceDecl;
 
 use crate::ipc::protocol::{IpcRequest, IpcResponse, ListView, LocalServiceView};
 use crate::state::AgentState;
@@ -32,21 +32,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
     let directory = state
         .last_directory
         .clone()
-        .unwrap_or(PollResponse {
-            peers: vec![],
-            services: vec![],
-            pending_services: vec![],
-            denied_services: vec![],
-            transit_carrying: vec![],
-            relay_carrying: vec![],
-            transit_awaiting_approval: false,
-            exit_clients: vec![],
-            mesh: None,
-            naming: None,
-            access: vec![],
-            service_notices: vec![],
-            identities: vec![],
-        });
+        .unwrap_or_default();
 
     let self_name = state.public_key.as_ref().and_then(|pk| {
         directory
@@ -120,8 +106,12 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
         ifname: ctx.ifname.clone(),
         node: self_name,
         transit_capable: state.transit_capable,
-        transit_carrying: directory.transit_carrying.clone(),
         relay_carrying: directory.relay_carrying.clone(),
+        relay_public: directory
+            .relay_public
+            .iter()
+            .filter_map(|pk| directory.peers.iter().find(|p| &p.pubkey == pk).map(|p| p.name.clone()))
+            .collect(),
         // Only meaningful while opted in: the directory can be one poll
         // older than a `transit off` issued since.
         transit_awaiting_approval: state.transit_capable && directory.transit_awaiting_approval,

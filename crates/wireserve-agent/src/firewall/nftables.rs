@@ -8,12 +8,12 @@ use std::sync::{Arc, Mutex};
 use std::net::Ipv4Addr;
 
 use nftables::expr::{
-    BinaryOperation, CTDir, Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, Prefix, SetItem, CT,
+    BinaryOperation, CTDir, Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, Prefix, Range, SetItem, CT,
 };
 use nftables::schema::{Chain, NfCmd, NfListObject, NfObject, Nftables, Rule, Table};
-use nftables::stmt::{Accept, Drop, Mangle, Match, NATFamily, Operator, Reject, RejectType, Statement, NAT};
+use nftables::stmt::{Accept, Drop, Limit, Mangle, Match, NATFamily, Operator, Reject, RejectType, Statement, NAT};
 use nftables::types::{NfChainPolicy, NfChainType, NfFamily, NfHook};
-use wireserve_types::{FirewallBackend, Forwarding, PortMap, Proto, RelayForward, ServiceRule, Sources, TransitEndpoint, TransitForward};
+use wireserve_types::{FirewallBackend, Forwarding, PortMap, Proto, PublicRelay, RelayForward, ServiceRule, Sources};
 
 use super::nft::{Nft, NftError};
 
@@ -61,6 +61,12 @@ pub const SERVICE_MARK: u32 = 0x0100_0000;
 /// bit, so an exit flow to the same address and port sharing the bit would
 /// have its replies rewritten to look like they came from the service.
 pub const EXIT_MARK: u32 = 0x0200_0000;
+
+/// The conntrack mark bit that says "this flow is a phone's session,
+/// relayed from this node's public address to another node" (PLAN.md M40).
+/// Its own bit, like [`EXIT_MARK`]: the host firewalls are opened for
+/// exactly these flows, and the guard on the public interface lets them in.
+pub const RELAY_MARK: u32 = 0x0400_0000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NftablesError {
@@ -222,10 +228,6 @@ fn ct(key: &'static str, dir: Option<CTDir>) -> Expression<'static> {
 
 
 fn addr(ip: Ipv4Addr) -> Expression<'static> {
-    Expression::String(Cow::Owned(ip.to_string()))
-}
-
-fn addr6(ip: std::net::Ipv6Addr) -> Expression<'static> {
     Expression::String(Cow::Owned(ip.to_string()))
 }
 
@@ -437,48 +439,6 @@ fn reverse_rewrite(vip: Ipv4Addr, dest: Ipv4Addr, map: &PortMap) -> Vec<Statemen
     ]
 }
 
-/// Every rule for one active transit pair (PLAN.md M23): one direction ×
-/// one address family, only when that family actually has an address on
-/// both ends of that direction. `TransitEndpoint::addrs4`/`addrs6` are
-/// this endpoint's host address plus every owned VIP — matches
-/// `ServiceRule::Mapped`'s existing "the node's own service addresses are
-/// just more addresses that route to it" treatment.
-fn transit_forward_rules(t: &str, ifname: &str, pair: &TransitForward) -> Vec<NfObject<'static>> {
-    fn addrs4(e: &TransitEndpoint) -> Vec<Ipv4Addr> {
-        e.ip4.into_iter().chain(e.vips.iter().copied()).collect()
-    }
-    fn addrs6(e: &TransitEndpoint) -> Vec<std::net::Ipv6Addr> {
-        e.ip6.into_iter().collect()
-    }
-
-    let mut out = Vec::new();
-    let accept = || Statement::Accept(None::<Accept>);
-
-    let (near4, far4) = (addrs4(&pair.near), addrs4(&pair.far));
-    if !near4.is_empty() && !far4.is_empty() {
-        for (from, to) in [(&near4, &far4), (&far4, &near4)] {
-            out.push(rule(t, FORWARD_CHAIN, vec![
-                iifname_is(ifname),
-                in_list(payload("ip", "saddr"), from.iter().map(|a| addr(*a)).collect()),
-                in_list(payload("ip", "daddr"), to.iter().map(|a| addr(*a)).collect()),
-                accept(),
-            ]));
-        }
-    }
-    let (near6, far6) = (addrs6(&pair.near), addrs6(&pair.far));
-    if !near6.is_empty() && !far6.is_empty() {
-        for (from, to) in [(&near6, &far6), (&far6, &near6)] {
-            out.push(rule(t, FORWARD_CHAIN, vec![
-                iifname_is(ifname),
-                in_list(payload("ip6", "saddr"), from.iter().map(|a| addr6(*a)).collect()),
-                in_list(payload("ip6", "daddr"), to.iter().map(|a| addr6(*a)).collect()),
-                accept(),
-            ]));
-        }
-    }
-    out
-}
-
 /// End-to-end relaying (PLAN.md M39): this node forwards a pair's WireGuard
 /// session, which it cannot read, between their carry interfaces. For each
 /// direction, a packet from one side to this node's own mesh address at the
@@ -492,11 +452,6 @@ fn transit_forward_rules(t: &str, ifname: &str, pair: &TransitForward) -> Vec<Nf
 fn relay_rules(t: &str, ifname: &str, me: Ipv4Addr, pairs: &[RelayForward]) -> (Vec<NfObject<'static>>, Vec<NfObject<'static>>) {
     let mut nat = Vec::new();
     let mut fwd = Vec::new();
-    if pairs.is_empty() {
-        return (nat, fwd);
-    }
-    nat.push(chain(t, RELAY_PRE_CHAIN, NfChainType::NAT, NfHook::Prerouting, PRIO_DSTNAT));
-    nat.push(chain(t, RELAY_POST_CHAIN, NfChainType::NAT, NfHook::Postrouting, PRIO_SRCNAT));
     let udp_dport = |port: u16| dport_is(Proto::Udp, port);
     let mut seen = std::collections::BTreeSet::new();
     for pair in pairs {
@@ -538,6 +493,84 @@ fn relay_rules(t: &str, ifname: &str, me: Ipv4Addr, pairs: &[RelayForward]) -> (
             ]));
         }
     }
+    (nat, fwd)
+}
+
+fn port_range(lo: u16, hi: u16) -> Expression<'static> {
+    Expression::Range(Box::new(Range { range: [Expression::Number(u32::from(lo)), Expression::Number(u32::from(hi))] }))
+}
+
+/// Phones relayed through this node's public address (PLAN.md M40): what
+/// arrives on `public` at a node's relay port goes on to that node's own
+/// WireGuard port, marked with [`RELAY_MARK`] and leaving from this node's
+/// mesh address on a port of `phones` — a range, not one port, because a
+/// phone that roams starts a new flow while its old one is still tracked.
+/// Only new flows are rate-limited (a nat chain sees nothing else): past
+/// the limit a packet isn't translated and meets the input drop for the
+/// relay ports, so a flood from spoofed sources costs this node nothing it
+/// forwards. WireGuard at the other end drops whatever no phone signed.
+///
+/// Returns the nat rules and the forward chain's rules for `public`.
+fn public_relay_rules(
+    t: &str,
+    ifname: &str,
+    public: &str,
+    me: Ipv4Addr,
+    relays: &[PublicRelay],
+    phones: (u16, u16),
+) -> (Vec<NfObject<'static>>, Vec<NfObject<'static>>) {
+    let mut nat = Vec::new();
+    let mut fwd = Vec::new();
+    if relays.is_empty() || public == ifname {
+        return (nat, fwd);
+    }
+    for r in relays {
+        nat.push(rule(t, RELAY_PRE_CHAIN, vec![
+            iifname_is(public),
+            dport_is(Proto::Udp, r.port),
+            Statement::Limit(Limit {
+                rate: 200,
+                rate_unit: None,
+                per: Some("second".into()),
+                burst: Some(400),
+                burst_unit: None,
+                inv: None,
+            }),
+            add_bit(ct("mark", None), RELAY_MARK),
+            Statement::DNAT(Some(NAT {
+                addr: Some(addr(r.to)),
+                family: Some(NATFamily::IP),
+                port: Some(Expression::Number(u32::from(r.to_port))),
+                flags: None,
+            })),
+        ]));
+        fwd.push(rule(t, FORWARD_CHAIN, vec![
+            iifname_is(public),
+            oifname_is(ifname),
+            has_bit(ct("mark", None), RELAY_MARK),
+            is(payload("ip", "daddr"), addr(r.to)),
+            dport_is(Proto::Udp, r.to_port),
+            Statement::Accept(None::<Accept>),
+        ]));
+    }
+    // A flow whose relay has since gone: its phone still sends keepalives,
+    // which would otherwise keep it forwarded for as long as it does.
+    fwd.push(rule(t, FORWARD_CHAIN, vec![
+        iifname_is(public),
+        has_bit(ct("mark", None), RELAY_MARK),
+        Statement::Drop(None::<Drop>),
+    ]));
+    nat.push(rule(t, RELAY_POST_CHAIN, vec![
+        oifname_is(ifname),
+        is(meta(MetaKey::L4proto), Expression::String("udp".into())),
+        has_bit(ct("mark", None), RELAY_MARK),
+        Statement::SNAT(Some(NAT {
+            addr: Some(addr(me)),
+            family: Some(NATFamily::IP),
+            port: Some(port_range(phones.0, phones.1)),
+            flags: None,
+        })),
+    ]));
     (nat, fwd)
 }
 
@@ -682,6 +715,28 @@ pub(crate) fn apply_batch_with(
         out.extend(carry.map(iifname_is_not));
         out
     };
+    // Relay ports (PLAN.md M40) from anywhere but the mesh: a relayed
+    // packet was translated in prerouting and is forwarded, never
+    // delivered here, so what reaches the input hook on one is untranslated
+    // — its relay rule isn't in place yet, or it is over the limit. Dropped
+    // before conntrack confirms it, so no flow is left behind that its
+    // sender's keepalives would keep alive untranslated once the rule comes.
+    // A port under a check is left to the agent's listener.
+    if let Some(((lo, hi), _)) = forwarding.relay_ranges {
+        let mut expr = not_mesh();
+        expr.push(is(payload("udp", "dport"), port_range(lo, hi)));
+        if !forwarding.relay_checks.is_empty() {
+            expr.push(Statement::Match(Match {
+                left: payload("udp", "dport"),
+                right: Expression::Named(NamedExpression::Set(
+                    forwarding.relay_checks.iter().map(|p| SetItem::Element(Expression::Number(u32::from(*p)))).collect(),
+                )),
+                op: Operator::NEQ,
+            }));
+        }
+        expr.push(Statement::Drop(None::<Drop>));
+        objects.push(rule(t, CHAIN_NAME, expr));
+    }
     for (vip, ..) in &terminated {
         let mut expr = not_mesh();
         expr.extend([is(payload("ip", "daddr"), addr(*vip)), Statement::Drop(None::<Drop>)]);
@@ -742,7 +797,7 @@ pub(crate) fn apply_batch_with(
         objects.push(rule(t, FORWARD_CHAIN, vec![
             iifname_is(lan),
             is(meta(MetaKey::Nfproto), Expression::String("ipv4".into())),
-            lacks_bits(ct("mark", None), SERVICE_MARK | EXIT_MARK),
+            lacks_bits(ct("mark", None), SERVICE_MARK | EXIT_MARK | RELAY_MARK),
             Statement::Drop(None::<Drop>),
         ]));
     }
@@ -760,14 +815,24 @@ pub(crate) fn apply_batch_with(
     // family that actually has addresses on both ends (up to four for a
     // fully dual-stack pair), narrowly scoped to exactly this pair's own
     // addresses — never a blanket forward-everything rule.
-    for pair in &forwarding.transit {
-        objects.extend(transit_forward_rules(t, ifname, pair));
-    }
-    let (relay_nat, relay_fwd) = match forwarding.relay_self {
+    let (mut relay_nat, relay_fwd) = match forwarding.relay_self {
         Some(me) => relay_rules(t, ifname, me, &forwarding.relay),
         None => (Vec::new(), Vec::new()),
     };
     objects.extend(relay_fwd);
+    if let (Some(me), Some(public), Some((_, phones))) =
+        (forwarding.relay_self, forwarding.relay_public_iface.as_deref(), forwarding.relay_ranges)
+    {
+        let (nat, fwd) = public_relay_rules(t, ifname, public, me, &forwarding.relay_public, phones);
+        relay_nat.extend(nat);
+        objects.extend(fwd);
+    }
+    if !relay_nat.is_empty() {
+        relay_nat.splice(0..0, [
+            chain(t, RELAY_PRE_CHAIN, NfChainType::NAT, NfHook::Prerouting, PRIO_DSTNAT),
+            chain(t, RELAY_POST_CHAIN, NfChainType::NAT, NfHook::Postrouting, PRIO_SRCNAT),
+        ]);
+    }
     // An exit client's new flow to the internet (PLAN.md M27), marked in
     // `exit-mark`. Anything else from it — its gateway's LAN, IPv6 on a host
     // that forwards it — meets the drop below.
@@ -1009,8 +1074,10 @@ mod tests {
     const VIP: Ipv4Addr = Ipv4Addr::new(100, 90, 0, 50);
     const TLS_PORT: u16 = wireserve_types::TLS_LISTEN_PORT;
 
-    fn fwd(transit: &[TransitForward]) -> Forwarding {
-        Forwarding { transit: transit.to_vec(), ..Forwarding::default() }
+    /// This node relaying `pairs` (PLAN.md M39) — with none, nothing but
+    /// the default-deny.
+    fn fwd(pairs: &[RelayForward]) -> Forwarding {
+        Forwarding { relay: pairs.to_vec(), relay_self: Some(NODE), ..Forwarding::default() }
     }
 
     fn as_json(batch: &Nftables<'_>) -> Value {
@@ -1105,70 +1172,15 @@ mod tests {
 
 
 
-    fn endpoint4(ip: &str, vips: &[&str]) -> TransitEndpoint {
-        TransitEndpoint { ip4: Some(ip.parse().unwrap()), ip6: None, vips: vips.iter().map(|v| v.parse().unwrap()).collect() }
-    }
-
-    /// A transit pair told apart by `n`: `100.90.n.1` and `100.90.n.2`. Its
-    /// rules only filter, so an unprivileged namespace takes them.
-    fn pair(n: u8) -> TransitForward {
-        TransitForward { near: endpoint4(&format!("100.90.{n}.1"), &[]), far: endpoint4(&format!("100.90.{n}.2"), &[]) }
+    fn pair(n: u8) -> RelayForward {
+        RelayForward {
+            a: wireserve_types::RelayEnd { ip4: format!("100.90.{n}.1").parse().unwrap(), relay_port: 41001, carry_port: 50001 },
+            c: wireserve_types::RelayEnd { ip4: format!("100.90.{n}.3").parse().unwrap(), relay_port: 41003, carry_port: 50003 },
+        }
     }
 
     #[test]
-    fn a_transit_pair_produces_bidirectional_address_scoped_forward_rules() {
-        let pair = TransitForward {
-            near: endpoint4("100.90.0.10", &["100.90.0.50"]),
-            far: endpoint4("100.90.0.20", &[]),
-        };
-        let mut expected = prelude();
-        expected.extend(input_deny());
-        expected.extend(forward(vec![
-            rule_in("wireserve-fwd", json!([
-                iif("wg0"),
-                in_addrs("ip", "saddr", &["100.90.0.10", "100.90.0.50"]),
-                in_addrs("ip", "daddr", &["100.90.0.20"]),
-                {"accept": null}
-            ])),
-            rule_in("wireserve-fwd", json!([
-                iif("wg0"),
-                in_addrs("ip", "saddr", &["100.90.0.20"]),
-                in_addrs("ip", "daddr", &["100.90.0.10", "100.90.0.50"]),
-                {"accept": null}
-            ])),
-        ]));
-        assert_eq!(as_json(&apply_batch("wg0", &[], &fwd(&[pair]))), json!({ "nftables": expected }));
-    }
-
-    #[test]
-    fn a_v6_only_transit_pair_produces_ip6_rules_not_ip4() {
-        let pair = TransitForward {
-            near: TransitEndpoint { ip4: None, ip6: Some("fd00:90::10".parse().unwrap()), vips: vec![] },
-            far: TransitEndpoint { ip4: None, ip6: Some("fd00:90::20".parse().unwrap()), vips: vec![] },
-        };
-        let batch = as_json(&apply_batch("wg0", &[], &fwd(&[pair]))).to_string();
-        assert!(batch.contains("\"protocol\":\"ip6\""), "{batch}");
-        assert!(!batch.contains("\"protocol\":\"ip\""), "{batch}");
-    }
-
-    #[test]
-    fn a_transit_pair_missing_one_sides_family_emits_no_rule_for_that_family() {
-        // `near` has no v6 address at all — a rule with an empty `saddr`
-        // set would be nonsensical (and, more importantly, would nft
-        // reject or mis-render it as "match nothing" vs "match
-        // everything"?). Emitting no rule for that family is the only
-        // safe reading, mirrored on `desired_peers`'s dangling-`via`
-        // handling: nothing to fold into, so nothing is misrouted either.
-        let pair = TransitForward {
-            near: endpoint4("100.90.0.10", &[]),
-            far: TransitEndpoint { ip4: Some("100.90.0.20".parse().unwrap()), ip6: Some("fd00:90::20".parse().unwrap()), vips: vec![] },
-        };
-        let batch = as_json(&apply_batch("wg0", &[], &fwd(&[pair]))).to_string();
-        assert!(!batch.contains("ip6"), "{batch}");
-    }
-
-    #[test]
-    fn no_transit_pairs_is_byte_for_byte_unchanged_from_before_the_feature() {
+    fn no_relay_pairs_is_byte_for_byte_the_plain_default_deny() {
         assert_eq!(apply_batch("wg0", &[], &fwd(&[])), apply_batch("wg0", &[], &fwd(&[])));
         let mut expected = prelude();
         expected.extend(input_deny());
@@ -1344,9 +1356,9 @@ mod tests {
             json!([
                 iif("eth0"),
                 {"match": {"op": "==", "left": {"meta": {"key": "nfproto"}}, "right": "ipv4"}},
-                // Neither ours nor an exit's (PLAN.md M27): replies to both
-                // arrive on an interface the agent owns.
-                {"match": {"op": "==", "left": {"&": [{"ct": {"key": "mark"}}, SERVICE_MARK | EXIT_MARK]}, "right": 0}},
+                // Neither ours, an exit's (PLAN.md M27) nor a relayed phone's
+                // (M40): all of them arrive on an interface the agent owns.
+                {"match": {"op": "==", "left": {"&": [{"ct": {"key": "mark"}}, SERVICE_MARK | EXIT_MARK | RELAY_MARK]}, "right": 0}},
                 {"drop": null},
             ])
         );
@@ -1417,8 +1429,7 @@ mod tests {
         // accept keyed on a port alone lets a peer use this host as a
         // relay to anything it routes to. Every accept must be an existing
         // flow, one of our own marked flows, or name its destination.
-        let pair = TransitForward { near: endpoint4("100.90.0.10", &[]), far: endpoint4("100.90.0.20", &[]) };
-        let batch = as_json(&apply_batch("wg0", &[terminated("443:22"), mapped("80:5080")], &fwd(&[pair])));
+        let batch = as_json(&apply_batch("wg0", &[terminated("443:22"), mapped("80:5080")], &fwd(&[pair(0)])));
         let forward: Vec<&Value> = batch["nftables"]
             .as_array()
             .unwrap()
@@ -1663,44 +1674,40 @@ mod tests {
 
 
 
+    /// The relays' rules (PLAN.md M39, M40) are accepted by a real kernel —
+    /// NAT included, which an unprivileged namespace allows.
     #[test]
-    fn kernel_accepts_a_transit_pairs_ruleset() {
-        let pair = TransitForward {
-            near: endpoint4("100.90.0.10", &["100.90.0.50"]),
-            far: endpoint4("100.90.0.20", &[]),
+    fn kernel_accepts_a_carriers_relay_rules() {
+        let forwarding = Forwarding {
+            relay_public: vec![wireserve_types::PublicRelay { port: 41004, to: "100.90.0.4".parse().unwrap(), to_port: 51820 }],
+            relay_public_iface: Some("eth0".into()),
+            relay_ranges: Some(((41000, 41999), (42000, 42999))),
+            relay_checks: vec![41005],
+            guarded: vec!["eth0".into()],
+            ..fwd(&[pair(0)])
         };
-        let script = nft_script(&[apply_batch("wg0", &[], &fwd(&[pair]))]) + "nft list table inet wireserve.wg0";
+        let script = nft_script(&[apply_batch("wg0", &[], &forwarding)]) + "nft list table inet wireserve.wg0";
         let Some(listing) = crate::firewall::netns::run(&script) else {
             return;
         };
-        assert_eq!(
-            normalised_lines(&listing),
-            [
-                "table inet wireserve.wg0 {",
-                "chain wireserve-in {",
-                "type filter hook input priority filter; policy accept;",
-                "iifname \"wg0\" ct state established,related accept",
-                "iifname \"wg0\" meta l4proto tcp reject with tcp reset",
-                "iifname \"wg0\" drop",
-                "}",
-                "chain wireserve-fwd {",
-                "type filter hook forward priority filter; policy accept;",
-                "iifname \"wg0\" ct state established,related accept",
-                "iifname \"wg0\" ip saddr { 100.90.0.10, 100.90.0.50 } ip daddr 100.90.0.20 accept",
-                "iifname \"wg0\" ip saddr 100.90.0.20 ip daddr { 100.90.0.10, 100.90.0.50 } accept",
-                "iifname \"wg0\" drop",
-                "}",
-                "}",
-            ]
-        );
+        let lines = normalised_lines(&listing);
+        let r = format!("0x{RELAY_MARK:08x}");
+        for want in [
+            "iifname \"wg0\" ip saddr 100.90.0.1 ip daddr 100.90.0.2 udp dport 41003 dnat ip to 100.90.0.3:50003".to_string(),
+            "oifname \"wg0\" ip saddr 100.90.0.1 ip daddr 100.90.0.3 udp dport 50003 snat ip to 100.90.0.2:41001".to_string(),
+            "iifname \"wg0\" oifname \"wg0\" ip saddr 100.90.0.1 ip daddr 100.90.0.3 udp dport 50003 accept".to_string(),
+            format!("iifname \"eth0\" udp dport 41004 limit rate 200/second burst 400 packets ct mark set ct mark | {r} dnat ip to 100.90.0.4:51820"),
+            format!("oifname \"wg0\" meta l4proto udp ct mark & {r} == {r} snat ip to 100.90.0.2:42000-42999"),
+            format!("iifname \"eth0\" oifname \"wg0\" ct mark & {r} == {r} ip daddr 100.90.0.4 udp dport 51820 accept"),
+            format!("iifname \"eth0\" ct mark & {r} == {r} drop"),
+            "iifname != \"wg0\" iifname != \"lo\" udp dport 41000-41999 udp dport != 41005 drop".to_string(),
+        ] {
+            assert!(lines.contains(&want), "missing `{want}` in:\n{listing}");
+        }
+        let guard = format!("iifname \"eth0\" meta nfproto ipv4 ct mark & 0x{:08x} == 0x00000000 drop", SERVICE_MARK | EXIT_MARK | RELAY_MARK);
+        assert!(lines.contains(&guard), "missing `{guard}` in:\n{listing}");
     }
 
-    /// The service-address chains. Rewriting headers needs the host's own
-    /// user namespace, which an unprivileged test namespace is not: there
-    /// the kernel refuses exactly the rules that rewrite, with EPERM, after
-    /// `nft` has parsed and evaluated every statement — so that is checked
-    /// instead, and every other rule must still have been accepted. As
-    /// root (`sudo -E cargo test`, or CI) the whole listing is checked.
     #[test]
     fn kernel_accepts_the_service_address_chains() {
         let rules = [mapped("80:5080"), mapped("53:5353/udp"), mapped("443:192.168.178.1:80")];
@@ -1826,7 +1833,7 @@ mod tests {
         for want in [
             "type nat hook postrouting priority srcnat; policy accept;".to_string(),
             format!("meta mark & {m} == {m} ip daddr 192.168.178.1 tcp dport 80 oifname != \"wg0\" masquerade"),
-            format!("iifname \"eth0\" meta nfproto ipv4 ct mark & 0x{:08x} == 0x00000000 drop", SERVICE_MARK | EXIT_MARK),
+            format!("iifname \"eth0\" meta nfproto ipv4 ct mark & 0x{:08x} == 0x00000000 drop", SERVICE_MARK | EXIT_MARK | RELAY_MARK),
         ] {
             assert!(lines.contains(&want), "missing `{want}` in:\n{listing}");
         }
@@ -1911,13 +1918,9 @@ mod tests {
         }
     }
 
-    fn relay_fwd(pairs: &[RelayForward]) -> Forwarding {
-        Forwarding { relay: pairs.to_vec(), relay_self: Some("100.90.0.2".parse().unwrap()), ..Forwarding::default() }
-    }
-
     #[test]
     fn a_relayed_pair_is_sent_on_to_the_other_sides_carry_port_from_the_senders_relay_port() {
-        let batch = as_json(&apply_batch("wg0", &[], &relay_fwd(&[relay_pair()])));
+        let batch = as_json(&apply_batch("wg0", &[], &fwd(&[relay_pair()])));
         let udp = |port: u16| json!({"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "dport"}}, "right": port}});
         let ip = |field: &str, a: &str| json!({"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": field}}, "right": a}});
         let oif = json!({"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "wg0"}});
@@ -1941,8 +1944,8 @@ mod tests {
 
     #[test]
     fn no_relay_rules_without_this_nodes_own_address_or_any_pair() {
-        let without_self = Forwarding { relay_self: None, ..relay_fwd(&[relay_pair()]) };
-        for f in [without_self, relay_fwd(&[])] {
+        let without_self = Forwarding { relay_self: None, ..fwd(&[relay_pair()]) };
+        for f in [without_self, fwd(&[])] {
             let batch = serde_json::to_string(&apply_batch("wg0", &[], &f)).unwrap();
             assert!(!batch.contains("relay-") && !batch.contains("nat\""), "{batch}");
         }
@@ -2036,7 +2039,7 @@ mod tests {
         // real mesh, where it holds from the agent's start: a packet that
         // meets its drop is never tracked, so the first packet after the
         // relay rules arrive is the one that sets the flow's translation.
-        sh(&nft_script(&[apply_batch("wg0", &[], &relay_fwd(&[relay_pair()]))]));
+        sh(&nft_script(&[apply_batch("wg0", &[], &fwd(&[relay_pair()]))]));
         // A and C alike: mesh interface to B, carry interface to the other.
         for (pid, me, k, other, other_pub, other_relay, carry, other_carry) in [
             (a, "100.90.0.1", ka, "100.90.0.3", pc, 41003, 50001, 50003),
@@ -2096,14 +2099,14 @@ mod tests {
 
     #[test]
     fn kernel_apply_twice_replaces_rather_than_accumulates() {
-        // Transit rules only filter, which an unprivileged namespace allows.
+        // Relay rules only filter and NAT, which an unprivileged namespace allows.
         let script = nft_script(&[apply_batch("wg0", &[], &fwd(&[pair(1)])), apply_batch("wg0", &[], &fwd(&[pair(2)]))])
             + "nft list table inet wireserve.wg0";
         let Some(listing) = crate::firewall::netns::run(&script) else {
             return;
         };
         assert!(!listing.contains("100.90.1."), "{listing}");
-        assert!(listing.contains("ip saddr 100.90.2.1 ip daddr 100.90.2.2 accept"), "{listing}");
+        assert!(listing.contains("ip saddr 100.90.2.1 ip daddr 100.90.2.3 udp dport 50003 accept"), "{listing}");
         assert_eq!(listing.matches("chain wireserve-in").count(), 1, "{listing}");
     }
 
@@ -2152,6 +2155,6 @@ mod tests {
         };
         assert!(!listing.contains("wireserve.wireserve0"), "{listing}");
         assert!(listing.contains("table inet wireserve.wireserve1"), "{listing}");
-        assert!(listing.contains("iifname \"wireserve1\" ip saddr 100.90.2.1 ip daddr 100.90.2.2 accept"), "{listing}");
+        assert!(listing.contains("iifname \"wireserve1\" oifname \"wireserve1\" ip saddr 100.90.2.1 ip daddr 100.90.2.3 udp dport 50003 accept"), "{listing}");
     }
 }

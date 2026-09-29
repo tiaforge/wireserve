@@ -8,11 +8,12 @@ this checklist lives in the session that created it — this file is the
 source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
-**Currently working on:** M39–M41 — end-to-end relaying: a carry
-interface for agent pairs (M39), phones reaching NAT'd nodes through a
-carrier's public relay port (M40), and the gateway's hop-by-hop mesh
-forwarding retired (M41). The plan is
-`~/.claude/plans/wobbly-roaming-karp.md` (not in the repo). Items 234+.
+**Currently working on:** nothing in progress. M39–M41 (end-to-end
+relaying: carry interface, phone relays through a carrier's public port, the
+gateway retired; items 234–249) are done; plan
+`~/.claude/plans/wobbly-roaming-karp.md` (not in the repo). Their e2e suites
+(`run-transit-test.sh`, `run-phone-relay-test.sh`, `run-exit-test.sh`,
+`run-nat-test.sh`) have not been run since.
 
 Everything that can be verified here now is. What remains unverified is
 scale (three nodes, not thirty), real WAN paths, and long-running
@@ -3793,3 +3794,104 @@ both directions, and not one ICMP packet through the carrier's forward hook.
     relay by name, the carry interface's routes, and that the carrier
     forwarded UDP and not one TCP packet while the services were reached —
     not run yet (rootful podman).
+
+## M40 — phones reach every node end to end, through a carrier's public port
+
+A phone can't nest a tunnel: the WireGuard apps' own sockets bypass their
+tunnel (Android `VpnService.protect()`, iOS's tunnel extension), so a phone
+can only dial a carrier at its public address. Kernel WireGuard gives nft no
+way to tell which node a packet from the internet is for — the handshake
+names its responder only through a MAC keyed on its public key — so the
+destination has to be in the port: each NAT-ed node a phone reaches through
+a carrier gets that carrier's public relay port for it. IPv4 only (per-node
+IPv6 addresses were considered and left out: phones on IPv4-only Wi-Fi, NDP
+proxying, `force_forwarding`).
+
+241. **The same relay port.** A phone's relay for node C is C's relay port
+    (#235) on the carrier's public address. `nftables::public_relay_rules`:
+    `iifname <public> udp dport P_C limit 200/s ct mark |= RELAY_MARK dnat
+    to C:<C's own listen port>`; srcnat of marked flows to the carrier's mesh
+    address on a port of the range after the relay ports
+    (`base + 1000 … base + 1999`), because a phone that roams starts a new
+    flow while its old one is still tracked and a fixed port would clash;
+    forward accepts per destination, and a drop for marked flows whose relay
+    has gone. The session ends on C's mesh interface, whose entry for the
+    phone exists anyway and learns the carrier as its endpoint. Only new
+    flows are rate-limited — a nat chain sees nothing else.
+242. **A packet before its rule must not be tracked** (found in the spike: a
+    phone whose first packets beat the carrier's rules stayed broken, its
+    keepalives keeping an untranslated flow alive, until it roamed). The
+    carrier drops the whole relay port range on every interface but the
+    mesh's in its input chain (`Forwarding::relay_ranges`), before conntrack
+    confirms anything. `RELAY_MARK` (`0x0400_0000`) is its own bit: the
+    guard on the public interface (M26's, which the carrier's egress joins)
+    lets it through, and the host-firewall interop opens exactly marked
+    flows (`Opening::RelayRequest`/`RelayReply`; the firewalld guard's
+    exception is the reply — a test caught it missing).
+243. **Dialable, measured.** The coordinator's reflexive responder answers
+    each probe a second time from its own second socket (`AppState::
+    probe_udp`, advertised as `ProbeResponse::answers_twice`); two answers
+    stay under the request's size (a compile-time check). Only a NAT or
+    firewall that admits unsolicited traffic delivers the second, so the
+    agent reports `dialable_v4` each poll; `list-peers` shows it. Known
+    misclassification, documented: an address-restricted (not
+    port-restricted) cone passes. A node that never said (an older agent) is
+    treated as before: direct if it has a public endpoint.
+244. **The export plans, checks and records** (`POST /admin/relays/plan`,
+    `PUT /admin/nodes/{name}/export`). Direct for a dialable node; else a
+    carrier that is approved, offering, relays, is itself dialable, has a
+    public IPv4 and reaches the node now — preferring one whose port for it
+    was already seen open, then one already serving phones, so as few ports
+    as possible ever need opening. Every port not seen open in the last 30
+    days is **checked from outside** first: the carrier's next poll carries
+    `port_checks`, its agent listens on the port (`port_check.rs`, the port
+    left open for it and its relay stood down meanwhile, so a re-check of a
+    port in use isn't eaten by its own DNAT), the coordinator sends the
+    nonce from its second socket, and the carrier's next poll — brought
+    forward by the nonce — reports it. A closed port stops the export before
+    anything is created, naming the port, carrier and address to open;
+    `--allow-unverified` writes the config anyway. Results are kept in
+    `relay_ports` (migration 0020); `wireserve-admin relay-ports` lists
+    every port, its devices, whether it was open, and which may be closed.
+    The rendered config gets `MTU = 1340` when anything in it is relayed.
+245. **Settled with the user:** IPv4 only; one port per NAT-ed node, never a
+    range to open; wireserve never touches a firewall outside the machine,
+    and says exactly when one has to be changed.
+
+## M41 — the gateway is retired
+
+With every node reachable end to end, the gateway's hop-by-hop mesh
+forwarding (M24) and `via-gateway` (#134) have nothing left to do, and they
+were the only places a node still read traffic it merely forwarded.
+
+246. **Removed:** `via-gateway`, `--gateway`, `export_via_gateway`,
+    `static_conf_peers` and the gateway's `transit_carrying` pairs, the
+    agent's pass-2 fold of `AllowedIPs`, `PeerInfo::transit_via`,
+    `TransitForward`, and M23's hop-by-hop forward rules
+    (`transit_forward_rules`). #106/#107 and #134 are superseded.
+    `run-gateway-test.sh` became `run-phone-relay-test.sh`.
+247. **The exit stays, and still reads what it sends on** (settled with the
+    user). `--exit [node]` names it (`gateway_node_id` became
+    `exit_node_id`); it must be approved, `exit on` and dialable directly.
+    The full-tunnel profile holds the same end-to-end entries as the mesh
+    profile, with the exit's `AllowedIPs` widened to `0.0.0.0/0, ::/0`:
+    longest-prefix match keeps the mesh end to end and sends only the rest
+    to the exit. A relayed node is never an exit.
+248. **What this costs** (the user's trade): a phone's config is a snapshot
+    again — a node that joins later needs `--refresh`, and `list-peers`
+    marks such devices `stale=yes` (also: never exported since the upgrade,
+    or a carrier or exit that no longer qualifies) — and two phones don't
+    reach each other. Upgrading: every node together (no fallback, #238),
+    then re-export every phone; the migration clears a gateway that was not
+    also an exit.
+249. **Verification.** Unit and API tests for the plan, the port check round
+    trip (a carrier picking up a check and reporting its nonce), the record,
+    exits, relays, stale devices and refusals; the carrier's rules against a
+    real kernel (`kernel_accepts_a_carriers_relay_rules`), the interop
+    openings round trip. The spike behind #241/#242 ran in network
+    namespaces with plain `wg` (roaming included). Not run yet (rootful
+    podman): `run-phone-relay-test.sh` (dialability, a port blocked upstream
+    stopping the export, the relay, 0 TCP through the carrier, a roam,
+    default-deny, `relay-ports`, refresh), `run-exit-test.sh` (`--exit
+    node-gw`, no covering route), and `run-nat-test.sh`'s new dialability
+    check.

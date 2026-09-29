@@ -107,6 +107,11 @@ pub struct ProbeResponse {
     /// on — same port number as this HTTP API, just UDP (see that
     /// module's doc comment for why no separate port exists).
     pub reflexive_port: u16,
+    /// The reflexive responder also answers from a second port (PLAN.md
+    /// M40), so a node can tell whether traffic it never sent anything to
+    /// reaches it. Absent from an older coordinator, which never does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub answers_twice: bool,
 }
 
 // ---- §4.2 Node: register ----
@@ -361,7 +366,30 @@ pub struct PollRequest {
     /// it has one. Chosen by the kernel, so reported every poll.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carry_port: Option<u16>,
+    /// Whether a packet from outside reaches this node's WireGuard port
+    /// (PLAN.md M40), as tested once at startup: the coordinator answers the
+    /// reflexive probe a second time from another port, which only arrives
+    /// where inbound traffic is let in. `None` when it could not be tested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialable_v4: Option<bool>,
+    /// The port checks this node was asked to run (PLAN.md M40) and the
+    /// nonce each one received from the coordinator.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub port_checks_seen: Vec<PortCheck>,
 }
+
+/// A check that one of a carrier's public relay ports is open (PLAN.md
+/// M40): the carrier listens on `port` for a while, and the coordinator
+/// sends `nonce` to it from outside.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortCheck {
+    pub port: u16,
+    /// 16 hex digits.
+    pub nonce: String,
+}
+
+/// At most this many port checks are read from one poll.
+pub const MAX_PORT_CHECKS_PER_POLL: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
@@ -399,17 +427,6 @@ pub struct PeerInfo {
     /// observation (the coordinator is never itself a WireGuard peer).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_handshake: Option<chrono::DateTime<chrono::Utc>>,
-    /// The pubkey of the node the *requester* of this poll should route
-    /// through to reach this peer (PLAN.md M23), computed fresh per
-    /// (requester, peer) pair every poll — `None` when this peer should
-    /// be dialed directly, as before this feature existed. Pairwise, not
-    /// a property of the peer itself: two different requesters can (and
-    /// often will) get different answers for "the same" peer entry.
-    /// `GET /admin/peers` always leaves this `None` — an admin isn't "a
-    /// requester" polling on behalf of a specific node, so there is no
-    /// requester to compute it relative to.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub transit_via: Option<String>,
     /// How this peer is reached through a carrier that forwards only
     /// ciphertext (PLAN.md M39) — see [`PeerRelay`].
     #[serde(default, skip_serializing_if = "PeerRelay::is_empty")]
@@ -424,6 +441,10 @@ pub struct PeerInfo {
 /// other always at the same carrier address and port.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerRelay {
+    /// This peer's own WireGuard listen port, which a phone's session
+    /// relayed through a carrier's public port ends on (PLAN.md M40).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_port: Option<u16>,
     /// This peer's relay port: the same on every carrier, and stable for
     /// as long as the peer exists. `None` on a coordinator that assigns
     /// none, or for a peer that has none yet.
@@ -434,8 +455,9 @@ pub struct PeerRelay {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carry_port: Option<u16>,
     /// The pubkey of the carrier the *requester* of this poll reaches this
-    /// peer through right now, computed per (requester, peer) pair like
-    /// `transit_via`. Always `None` in `GET /admin/peers`.
+    /// peer through right now, computed afresh for each (requester, peer)
+    /// pair — two nodes can get different answers for the same peer.
+    /// Always `None` in `GET /admin/peers`, which has no requester.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
 }
@@ -506,47 +528,45 @@ pub struct DeniedService {
 /// [`MAX_SERVICES_PER_NODE`].
 pub const MAX_DENY_REASON_LEN: usize = 256;
 
-/// One active transit pairing THIS polling node must carry (PLAN.md M23)
-/// — present only in the poll response of the node selected as `via` for
-/// this pair, never in `a`'s or `c`'s own response (they instead see
-/// `PeerInfo::transit_via` naming this node on the *other* endpoint's own
-/// entry). This is how a node discovers its own role as transit carrier:
-/// a bare `transit_via` can never fire on a node's own poll response,
-/// since `select` only ever picks a node that already reaches both
-/// endpoints directly — its own peer entries for `a` and `c` need no
-/// routing help and so never carry `transit_via` themselves.
-///
-/// Both `a` and `c` are guaranteed to be real peers already present in
-/// this same response's `peers` array — look up each one's addresses and
-/// owned service VIPs there to build the actual forwarding rule
-/// (`wireserve-agent`'s `wg::transit_forwards`).
+/// A pair of peers, by pubkey, whose session THIS polling node relays
+/// (PLAN.md M39) — only ever in the carrier's own response; the two ends
+/// see `PeerRelay::via` on each other's entry instead. Both are peers in
+/// the same response, which is where their addresses and ports come from
+/// (`wireserve-agent`'s `wg::relay_forwards`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitPair {
     pub a: String,
     pub c: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PollResponse {
     pub peers: Vec<PeerInfo>,
     pub services: Vec<ServiceInfo>,
-    /// Every active transit pairing THIS node currently carries as `via`
-    /// (PLAN.md M23) — see [`TransitPair`]. Empty for a node that never
-    /// opted in, or that opted in but wasn't selected for anything this
-    /// cycle.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub transit_carrying: Vec<TransitPair>,
     /// Every pair whose end-to-end session THIS node relays right now
     /// (PLAN.md M39): it forwards their UDP between the two relay ports and
     /// never sees inside. Both are in `peers`, which is where their
     /// addresses and ports come from.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relay_carrying: Vec<TransitPair>,
+    /// The nodes THIS node relays phones to through its public relay port
+    /// (PLAN.md M40), by pubkey: each one's relay port on this node's public
+    /// address goes on to that node's own WireGuard port.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_public: Vec<String>,
+    /// The first relay port (`WIRESERVE_RELAY_PORT_BASE`): relay ports run
+    /// from it for [`RELAY_SLOTS`], and the phone sessions a carrier relays
+    /// leave it from the [`RELAY_SLOTS`] after those.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_port_base: Option<u16>,
+    /// Port checks THIS node should run now (PLAN.md M40).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub port_checks: Vec<PortCheck>,
     /// THIS node asked to carry transit (`transit_capable`) but no admin
     /// has approved it as a carrier, so the coordinator is ignoring the
     /// offer. A self-reported offer is never enough on its own: a carrier
-    /// sees the traffic it relays in the clear and can send packets as
-    /// either end, so only an admin decides who may be one. Reported so
+    /// sees who talks to whom and can drop it, and an exit reads what it
+    /// sends on, so only an admin decides who may be one. Reported so
     /// `wireserve list` can say why the node never carries
     /// anything; absent from the JSON when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -697,52 +717,110 @@ pub struct RejoinResponse {
     pub join_token_expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// `PUT /admin/nodes/{name}/gateway` (PLAN.md M24) — records how a static
-/// peer's exported `.conf` is shaped, so the coordinator can derive routing
-/// that matches it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SetGatewayRequest {
-    /// The node this device routes through for anything not listed in
-    /// `conf_peers`. `None` clears the assignment, which is the pre-gateway
-    /// all-direct behaviour.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub gateway: Option<String>,
-    /// The peers written into the device's `.conf` as direct `[Peer]` blocks.
-    ///
-    /// Sent rather than recomputed because the `.conf` is a snapshot and this
-    /// describes that snapshot. Deriving it from live endpoint state later
-    /// would drift against the file actually on the device, and the drift is
-    /// not benign: a node that gains a routable endpoint after export would
-    /// stop being routed through the gateway while the device still has no
-    /// direct entry for it, breaking that path in both directions at once.
-    #[serde(default)]
-    pub conf_peers: Vec<String>,
-    /// The export also rendered a full-tunnel profile (PLAN.md M27), so the
-    /// gateway must send this device's internet traffic onwards. Recorded
-    /// per export like `conf_peers`, since it describes the files handed
-    /// out: a refresh without `--exit` clears it. Absent when false.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub exit: bool,
+/// `PUT /admin/nodes/{name}/export` (PLAN.md M40, M41) — records how a
+/// static peer's exported `.conf` is shaped: which node is its exit, and
+/// which nodes it reaches through which carrier. The `.conf` is a snapshot,
+/// and this describes that snapshot; the coordinator acts on it (a carrier
+/// forwards exactly these, an exit sends on exactly this device's traffic)
+/// rather than on anything re-derived later.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExportRecord {
+    /// The node whose full-tunnel profile the export rendered (PLAN.md
+    /// M27), which must then send this device's internet traffic on.
+    /// `None` for a mesh-only export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<String>,
+    /// The nodes the device reaches through a carrier's public relay port,
+    /// each with that carrier.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relays: Vec<RelayAssignment>,
 }
 
-/// `PUT /admin/nodes/{name}/via-gateway` (PLAN.md #134) — whether devices
-/// exported with a gateway must reach this node through it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SetViaGatewayRequest {
-    pub enabled: bool,
+/// One node a device reaches through a carrier (PLAN.md M40).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayAssignment {
+    pub node: String,
+    pub carrier: String,
+}
+
+/// `POST /admin/relays/plan` (PLAN.md M40): how a device exported now
+/// reaches each node — directly, or through which carrier's public relay
+/// port — with that port checked from the internet first.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RelayPlanRequest {
+    /// Keep a relay whose port could not be confirmed open (`export-config
+    /// --allow-unverified`), for an operator who knows better than the
+    /// check, which runs from the coordinator's own network.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_unverified: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SetViaGatewayResponse {
-    /// Static peers whose `.conf` a refresh would change. The flag only
-    /// shapes the next export; nothing already on a device changes by itself.
+pub struct RelayPlan {
+    /// Nodes a device dials directly: they accept inbound WireGuard.
     #[serde(default)]
-    pub affected_devices: Vec<String>,
+    pub direct: Vec<String>,
+    /// Nodes it reaches through a carrier.
+    #[serde(default)]
+    pub relayed: Vec<RelayPlanEntry>,
+    /// Nodes nothing reaches from outside: not dialable, and no carrier
+    /// qualifies. Left out of the `.conf`, with the reason.
+    #[serde(default)]
+    pub unreachable: Vec<Unreachable>,
+    /// Relay ports that must be opened before the plan can be used — the
+    /// export stops with exactly these unless `allow_unverified`.
+    #[serde(default)]
+    pub closed: Vec<RelayPortStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayPlanEntry {
+    pub node: String,
+    pub carrier: String,
+    /// `<carrier public IPv4>:<the node's relay port>`, the `Endpoint =`.
+    pub endpoint: String,
+    /// Whether the port was seen open from outside; `None` when it could
+    /// not be checked in time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unreachable {
+    pub node: String,
+    pub reason: String,
+}
+
+/// `GET /admin/relay-ports` (PLAN.md M40): every public relay port a
+/// carrier has or had, what it serves and whether it may be closed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RelayPortsResponse {
+    #[serde(default)]
+    pub ports: Vec<RelayPortStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayPortStatus {
+    pub carrier: String,
+    /// The carrier's public IPv4 address, where the port has to be open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    pub port: u16,
+    /// The node the port leads to, when one still has it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// The devices whose `.conf` uses it; empty means it may be closed.
+    #[serde(default)]
+    pub devices: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open: Option<bool>,
 }
 
 // ---- §4.5.1 Admin: list peers ----
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AdminPeersResponse {
     pub peers: Vec<PeerInfo>,
     /// Names of the nodes an admin has approved to carry transit traffic.
@@ -762,14 +840,15 @@ pub struct AdminPeersResponse {
     /// anything is created rather than after.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transit_offering: Vec<String>,
-    /// Names of the nodes an admin marked as not dialable from outside the
-    /// mesh (`wireserve-admin via-gateway`). Only `export-config` reads it:
-    /// a device exported with a gateway reaches these through the gateway
-    /// rather than holding a direct `[Peer]`. Admin-only like the two above,
-    /// and for the same reason it is not on `PeerInfo` — agents route among
-    /// themselves and never act on it.
+    /// Whether each agent found itself dialable from outside at its last
+    /// start (PLAN.md M40), by name; agents that couldn't tell are left out.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub dialable: std::collections::BTreeMap<String, bool>,
+    /// Static peers whose `.conf` no longer matches the mesh (PLAN.md M40):
+    /// a node joined after the export, or a carrier it relies on no longer
+    /// qualifies. `export-config --refresh` brings one up to date.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub via_gateway: Vec<String>,
+    pub stale_devices: Vec<String>,
     /// Names of the nodes whose most recent poll offered to be an exit
     /// (`wireserve exit on`, PLAN.md M27), approved for transit or
     /// not — the export checks both.
@@ -910,8 +989,10 @@ mod tests {
             services: vec![],
             pending_services: vec![],
             denied_services: vec![],
-            transit_carrying: vec![],
             relay_carrying: vec![],
+            relay_public: vec![],
+            relay_port_base: None,
+            port_checks: vec![],
             transit_awaiting_approval: false,
             exit_clients: vec![],
             mesh: None,
@@ -949,7 +1030,6 @@ mod tests {
                 lan_addr: None,
                 reflexive_addr: Some("203.0.113.5:55123".into()),
                 last_handshake: None,
-                transit_via: None,
                 relay: Default::default(),
             }],
             services: vec![ServiceInfo {
@@ -963,8 +1043,10 @@ mod tests {
             }],
             pending_services: vec![],
             denied_services: vec![],
-            transit_carrying: vec![],
             relay_carrying: vec![],
+            relay_public: vec![],
+            relay_port_base: None,
+            port_checks: vec![],
             transit_awaiting_approval: false,
             exit_clients: vec![],
             mesh: None,

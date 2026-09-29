@@ -205,8 +205,7 @@ the printed command for you. `install` needs Linux/systemd — Quadlet/podman
 deployments install by hand, per `deploy/quadlet/`.
 
 **Run the agent on the host, not in a container, on any node that forwards**:
-a transit carrier, a phone's gateway or exit, or a node serving a device on
-its LAN. Those need the agent to switch on forwarding for its own interfaces
+a carrier, an exit, or a node serving a device on its LAN. Those need the agent to switch on forwarding for its own interfaces
 in `/proc/sys/net`, which Podman and Docker mount read-only. A containerised
 agent logs a warning and forwards nothing, and from the other end that looks
 like a dead route. A node that only serves its own ports, and never
@@ -470,47 +469,53 @@ the QR code — it will sit in your scrollback.) Such a peer gets a mesh
 address and reaches every service by its address (in `wireserve-admin
 list-services`) and port, but has no `.wg` name resolution.
 
-**Give it a gateway so the config does not go stale.** Without one, the
-config is a snapshot: every node is listed individually, so anything that
-joins later is unreachable from the device until you export again. Point it
-at a node that can carry traffic for it and the whole mesh range is routed
-there instead, so new nodes and services just work:
+**Every node, end to end.** The config holds one `[Peer]` per node, and the
+phone talks to each one directly — WireGuard between the two, as between
+agents. How depends on the node:
+
+- **A node that accepts inbound WireGuard** (a VPS, a home server with a port
+  forward) is dialled at its own endpoint. Each agent finds this out itself
+  when it starts: the coordinator answers its startup probe a second time,
+  from a port the node never sent anything to, and that answer only gets in
+  where the node's router or firewall lets unsolicited traffic in.
+  `list-peers` shows the result (`dialable=yes|no`).
+- **A node behind a NAT nothing gets through** (a home server without a port
+  forward, CGNAT) is reached through a **carrier**: an approved node with a
+  public IPv4 address that currently reaches it. The phone dials the
+  carrier's public address on that node's **relay port**, and the carrier
+  sends the packets on to the node without being able to read them — the
+  session is the phone's and the node's, the carrier holds no key to it.
+  It still sees that the two talk, when and how much.
 
 ```sh
 wireserve-admin approve-transit vps1      # and `wireserve transit on` on vps1
-wireserve-admin export-config myphone --gateway vps1 --qr
+wireserve-admin export-config myphone --qr
 ```
 
-The gateway needs a publicly reachable endpoint — a phone on cellular has
-one `Endpoint =` line and no way to refresh it — and must be carrying
-traffic already, which is the same opt-in plus approval that
-[transit](#6-route-through-another-node-when-nat-blocks-a-direct-path) uses,
-for the same reason: it sees the traffic in the clear. With exactly one
-node eligible, `--gateway` can be left off.
+Before writing anything the export checks, from outside, that every relay
+port it needs is open, since that is the one thing that may need doing by
+hand (see "What each machine needs open"). A closed one stops it:
 
-Nodes that *are* reachable from anywhere still get their own direct entry,
-so the device talks to them straight rather than through the gateway. Only
-what it cannot dial itself is routed onward.
-
-**A node with a public address its router will not let in.** An endpoint
-can be globally routable on paper and still be undialable: a home router
-that firewalls inbound IPv6, a public IPv4 with no port forward. The export
-cannot tell, and WireGuard has no failover — a direct entry for such a node
-outranks the gateway's range and drops everything sent to it, its services
-included. Tell the coordinator once:
-
-```sh
-wireserve-admin via-gateway minipc on       # `off` undoes it
-wireserve-admin export-config myphone --refresh --qr
+```
+these relay ports must be reachable from the internet first:
+  open UDP 41003 inbound on vps1 (203.0.113.7) in any firewall outside the
+  host — cloud firewall or router port forward — for minipc; it was not reachable
+then run this again (or pass --allow-unverified to write the config regardless)
 ```
 
-From then on every export with a gateway reaches `minipc` through it, and a
-service `minipc` declares later is reachable from the phone without
-re-exporting. This affects **only** configs made by `export-config` for
-phones and other static devices; how agents reach each other is untouched.
-It changes nothing already on a device either: the command lists the
-devices whose config needs `--refresh`. Such a node is never picked as a
-gateway, and the gateway itself must still reach it directly, as above.
+Each node's relay port is `41000` plus a number it keeps for life, the same
+on every carrier, so a port opened once stays right. The export prefers a
+carrier whose port for that node is already open, then one already serving
+phones, so as few as possible ever need opening. `wireserve-admin
+relay-ports` lists every one: where it must be open, which node it leads to,
+which devices use it, whether it was open when last checked — and which no
+device uses any more and may be closed again.
+
+**The config is a snapshot.** A node that joins later isn't in it, nor is
+one no carrier reaches at the time of the export (the export says so).
+`list-peers` marks such devices `stale=yes`; `--refresh` (below) brings one
+up to date. Two phones don't reach each other: neither has anything the
+other could dial.
 
 **Re-issuing a config** keeps the device's name and mesh address:
 
@@ -854,9 +859,11 @@ Worth knowing:
 - **Native apps can't do a browser sign-in.** The Jellyfin, Immich and Home
   Assistant apps, or anything speaking CalDAV/CardDAV, fail behind it — grant
   their devices instead, or use authward's API tokens and `bypass_paths`.
-- **A transit carrier speaks for the peers it carries.** A phone routed
-  through a gateway arrives with its own address, which the gateway could
-  also send; a grant to a transited peer trusts its carrier.
+- **No carrier speaks for anyone.** A relayed session — between two agents,
+  or a phone and a node — is end to end; the carrier forwards packets it can
+  neither read nor forge, so a grant to a relayed peer trusts that peer and
+  nobody else. An exit reads what it sends on to the internet, and nothing
+  of the mesh.
 - **Close the owner's LAN yourself.** The mesh admits only the grants; a
   backend listening on every interface is still reachable from its own
   network. Bind it to the node's mesh address.
@@ -904,18 +911,22 @@ public resolvers generally do not filter, which is why the symptom is often
 `100.64.0.0/10` is not on the strip list, but do not reach for it — see the
 mesh-range warning further down, since Tailscale allocates that entire `/10`.
 
-### 4c. Send all of a phone's traffic through the gateway
+### 4c. Send all of a phone's traffic through an exit
 
-For public Wi-Fi, or to browse from home while away, a device exported with
-a gateway can also get a **full-tunnel profile**: same key, same address,
-but everything goes to the gateway, which sends it on to the internet under
-its own address. The gateway opts in first, as it did for transit, because
-the traffic leaves under *its* public IP:
+For public Wi-Fi, or to browse from home while away, a device can also get a
+**full-tunnel profile**: same key, same address, same end-to-end entries for
+every node, but everything else goes to an **exit**, which sends it on to the
+internet under its own address. The exit reads that traffic, as any exit
+does — only the mesh stays end to end. It opts in first, as for transit,
+because the traffic leaves under *its* public IP, and the phone must be able
+to dial it directly:
 
 ```sh
-wireserve exit on                           # on the gateway, besides `transit on`
-wireserve-admin export-config myphone --gateway vps1 --exit --dns 9.9.9.9 --qr
+wireserve exit on                           # on the exit, besides `transit on`
+wireserve-admin export-config myphone --exit vps1 --dns 9.9.9.9 --qr
 ```
+
+With exactly one node qualifying, `--exit` needs no name.
 
 That prints two codes; import both. The WireGuard app runs one tunnel at a
 time, so switching on `myphone-exit` is the exit switch. With `--out
@@ -923,14 +934,14 @@ myphone.conf` the second one is written beside it as `myphone-exit.conf`.
 `--refresh` without `--exit` withdraws it.
 
 - **IPv4 only.** The full tunnel captures the device's IPv6 as well, so none
-  of it leaks around the tunnel on someone else's network, and the gateway
+  of it leaks around the tunnel on someone else's network, and the exit
   drops it. Phones fall back to IPv4 on their own, since the only IPv6
   address the tunnel gives them is a private one.
-- **The internet, not the gateway's LAN.** Private and other non-public
+- **The internet, not the exit's LAN.** Private and other non-public
   destinations are refused, so the exit never reaches around the per-service
   approval a device on a LAN needs. To reach one, [serve it](#devices-on-the-nodes-network).
 - **`--dns` is required.** Without it, the phone keeps asking the café's
-  resolver, at a private address the gateway will not forward to.
+  resolver, at a private address the exit will not forward to.
 
 #### A home resolver, which also names the mesh
 
@@ -942,7 +953,7 @@ not just HTTP ones**. A resolver that runs on a node reads that node's
 ```sh
 wireserve serve dns 53:53/udp 53:53/tcp     # on the node running the resolver
 wireserve-admin approve-service homeserver dns
-wireserve-admin export-config myphone --gateway vps1 --exit --dns dns --refresh --qr
+wireserve-admin export-config myphone --exit vps1 --dns dns --refresh --qr
 ```
 
 `ssh backup.wg` and `jellyfin.wg:8096` then work from the phone while the
@@ -985,7 +996,7 @@ The mesh profile can name the resolver too, so every service has a name on
 the phone whether or not the full tunnel is on:
 
 ```sh
-wireserve-admin export-config myphone --gateway vps1 --dns dns --mesh-dns --refresh --qr
+wireserve-admin export-config myphone --dns dns --mesh-dns --refresh --qr
 # with the exit as well:  ... --exit --dns dns --mesh-dns ...
 ```
 
@@ -1145,9 +1156,9 @@ anywhere that can reach it):
 | Command | What it does |
 | --- | --- |
 | `wireserve-admin create-node <name>` | create a node, print a join token |
-| `wireserve-admin export-config <name> [--gateway <node>] [--dns <svc\|ip> [--exit] [--mesh-dns]] [--refresh] [--qr]` | create (or re-issue) a static peer's `.conf`; `--exit` adds a full-tunnel profile, `--mesh-dns` names the resolver in the mesh profile too |
-| `wireserve-admin list-peers` | the full directory |
-| `wireserve-admin via-gateway <name> on\|off` | exported phones reach this node through their gateway, not directly |
+| `wireserve-admin export-config <name> [--exit [node]] [--dns <svc\|ip>] [--mesh-dns] [--allow-unverified] [--refresh] [--qr]` | create (or re-issue) a static peer's `.conf`: every node end to end, directly or through a carrier's relay port; `--exit` adds a full-tunnel profile, `--mesh-dns` names the resolver in the mesh profile too |
+| `wireserve-admin list-peers` | the full directory, with each agent's `dialable=` and each device's `stale=` |
+| `wireserve-admin relay-ports` | every public relay port phones use: where it must be open, which node and devices, whether it was open, which may be closed |
 | `wireserve-admin revoke <name>` | cut a node off, keep its name reserved |
 | `wireserve-admin rejoin <name>` | fresh join token, same name and address; the old key stops working at once |
 | `wireserve-admin delete-node <name>` | remove the record, free the name |
@@ -1163,7 +1174,7 @@ anywhere that can reach it):
 | `wireserve-admin claim-url <node> [--qr]` | a single-use link for whoever the device belongs to |
 | `wireserve-admin owner clear <node>` | the device belongs to nobody again |
 | `wireserve-admin deny-service <node> <svc>` | refuse one, or withdraw an approval |
-| `wireserve-admin approve-transit <name>` | let a node that opted in carry traffic for others |
+| `wireserve-admin approve-transit <name>` | let a node that opted in relay for others, and be an exit |
 | `wireserve-admin deny-transit <name>` | withdraw that |
 
 ## Workspace layout
@@ -1208,7 +1219,8 @@ the admin port is deliberately unreachable from anywhere else.
 
 | Port | Direction | Who connects | Notes |
 | --- | --- | --- | --- |
-| 51820/udp | inbound | other agent nodes | the WireGuard listen port, on the node's real interface |
+| 51820/udp | inbound | other agent nodes, phones | the WireGuard listen port, on the node's real interface |
+| relay ports/udp | inbound | phones | **carriers only, and only the ports `wireserve-admin relay-ports` lists** — see below |
 | 443/tcp | outbound | the coordinator | the poll loop |
 | 443/tcp | outbound | your ACME CA | the TLS terminator, for certificates (Let's Encrypt by default) |
 
@@ -1218,9 +1230,25 @@ it, which usually means a port-forward on the router plus an
 port-forward can still reach nodes that do have one, and they can reach
 back into it, because `PersistentKeepalive` holds its side of the mapping
 open. Two nodes that both lack a forward cannot reach each other at all.
-There is no relay, STUN or NAT traversal in v1, which the spec lists as
-deliberately deferred. `deploy/e2e/run-nat-test.sh` builds this topology
-and checks all of it.
+Unless a third node relays them, that is: see
+[relaying](#6-route-through-another-node-when-nat-blocks-a-direct-path), which
+needs nothing opened, since relayed sessions travel inside the carrier's own
+tunnels. `deploy/e2e/run-nat-test.sh` builds this topology and checks all of
+it.
+
+**What a carrier needs open, and when.** Nothing, for relaying between
+agents. For phones (PLAN.md M40): one UDP port per node a phone reaches
+through it — that node's relay port, `41000` plus its number — on its public
+IPv4 address. Its own firewall (ufw, firewalld, nftables) is WireServe's to
+handle; a firewall **outside** the machine is yours: a cloud provider's
+security group, or the router's port forward for a carrier at home.
+`export-config` checks each port from outside before writing a config that
+needs it, and stops with the exact port and address if it is closed;
+`wireserve-admin relay-ports` lists them all afterwards, including those no
+device uses any more. A port stays the same for the node's life, so it is
+opened once. The whole relay range (`41000`–`42999` by default, moved with
+`WIRESERVE_RELAY_PORT_BASE`) is closed to anything not relayed on a
+carrier's other interfaces, so keep other services off it there.
 
 **Two machines behind the same router is the case to watch.** They learn
 each other's address as their shared router's external one, so reaching it

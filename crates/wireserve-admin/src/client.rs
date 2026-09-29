@@ -13,8 +13,8 @@ use reqwest::blocking::{Client, Response};
 use reqwest::StatusCode;
 use wireserve_types::{
     AdminPeersResponse, AdminServicesResponse, CreateNodeRequest, CreateNodeResponse,
-    DenyServiceRequest, ErrorBody, NodeKind, RegisterRequest, RegisterResponse, RejoinRequest, SetGatewayRequest,
-    RejoinResponse, SetViaGatewayRequest, SetViaGatewayResponse,
+    DenyServiceRequest, ErrorBody, ExportRecord, NodeKind, RegisterRequest, RegisterResponse, RejoinRequest,
+    RejoinResponse, RelayPlan, RelayPlanRequest, RelayPortsResponse,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -158,39 +158,37 @@ impl AdminClient {
         Ok(Self::check_status(resp)?.json()?)
     }
 
-    /// `PUT /admin/nodes/{name}/gateway` (PLAN.md M24) — records how a static
-    /// peer's `.conf` is shaped, so `/poll` can derive routing that matches
-    /// the file actually on the device.
-    pub fn set_gateway(
-        &self,
-        name: &str,
-        gateway: Option<&str>,
-        conf_peers: &[String],
-        exit: bool,
-    ) -> Result<(), ClientError> {
+    /// `PUT /admin/nodes/{name}/export` (PLAN.md M40, M41) — records how a
+    /// static peer's `.conf` is shaped: its exit and its relays, which the
+    /// exit and the carriers then act on.
+    pub fn record_export(&self, name: &str, record: &ExportRecord) -> Result<(), ClientError> {
         let resp = self
             .http
-            .put(self.url(&format!("/admin/nodes/{name}/gateway")))
+            .put(self.url(&format!("/admin/nodes/{name}/export")))
             .bearer_auth(&self.admin_token)
-            .json(&SetGatewayRequest {
-                gateway: gateway.map(ToString::to_string),
-                conf_peers: conf_peers.to_vec(),
-                exit,
-            })
+            .json(record)
             .send()?;
         Self::check_status(resp)?;
         Ok(())
     }
 
-    /// `PUT /admin/nodes/{name}/via-gateway` (PLAN.md #134) — whether devices
-    /// exported with a gateway reach this node through it.
-    pub fn set_via_gateway(&self, name: &str, enabled: bool) -> Result<SetViaGatewayResponse, ClientError> {
+    /// `POST /admin/relays/plan` (PLAN.md M40) — how a device reaches each
+    /// node, with the relay ports checked. Can take most of a minute: a
+    /// carrier has to poll to learn of a check, and again to report it.
+    pub fn relay_plan(&self, allow_unverified: bool) -> Result<RelayPlan, ClientError> {
         let resp = self
             .http
-            .put(self.url(&format!("/admin/nodes/{name}/via-gateway")))
+            .post(self.url("/admin/relays/plan"))
             .bearer_auth(&self.admin_token)
-            .json(&SetViaGatewayRequest { enabled })
+            .timeout(std::time::Duration::from_secs(90))
+            .json(&RelayPlanRequest { allow_unverified })
             .send()?;
+        Ok(Self::check_status(resp)?.json()?)
+    }
+
+    /// `GET /admin/relay-ports` (PLAN.md M40).
+    pub fn relay_ports(&self) -> Result<RelayPortsResponse, ClientError> {
+        let resp = self.http.get(self.url("/admin/relay-ports")).bearer_auth(&self.admin_token).send()?;
         Ok(Self::check_status(resp)?.json()?)
     }
 

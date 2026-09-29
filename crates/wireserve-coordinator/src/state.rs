@@ -28,6 +28,11 @@ pub struct AppState {
     /// identity named to the node since this process started — so that the
     /// first time is logged, and only the first.
     pub released: Arc<std::sync::Mutex<std::collections::HashSet<(i64, i64)>>>,
+    /// A UDP socket on a port of its own (PLAN.md M40), which nothing ever
+    /// sent to: the reflexive responder answers from it a second time, and
+    /// port checks are sent from it, so what arrives from it was let in
+    /// unasked. `None` where it could not be bound.
+    pub probe_udp: Option<Arc<std::net::UdpSocket>>,
 }
 
 impl AppState {

@@ -72,14 +72,14 @@ pub struct ListView {
     /// mesh peers (PLAN.md M23) — see `state::AgentState::transit_capable`.
     #[serde(default)]
     pub transit_capable: bool,
-    /// Every active transit pairing this node is currently carrying, as
-    /// of the last poll — see `wireserve_types::PollResponse::transit_carrying`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub transit_carrying: Vec<wireserve_types::TransitPair>,
     /// Every pair whose session this node relays end to end, as of the last
     /// poll (PLAN.md M39) — see `wireserve_types::PollResponse::relay_carrying`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relay_carrying: Vec<wireserve_types::TransitPair>,
+    /// The nodes phones reach through this node's public relay ports, by
+    /// name (PLAN.md M40).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_public: Vec<String>,
     /// Opted in, but no admin has approved this node as a carrier yet —
     /// see `wireserve_types::PollResponse::transit_awaiting_approval`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

@@ -42,6 +42,10 @@ const VERSION: u8 = 1;
 // The whole anti-amplification mitigation, as a compile-time fact (see
 // module doc) rather than merely a test that happens to run.
 const _: () = assert!(RESPONSE_LEN < REQUEST_LEN);
+// The coordinator answers each request twice (PLAN.md M40: once from its
+// own port, once from another, which tells a node whether unsolicited
+// traffic reaches it) — still under 1x together.
+const _: () = assert!(2 * RESPONSE_LEN < REQUEST_LEN);
 
 pub type Nonce = [u8; 8];
 

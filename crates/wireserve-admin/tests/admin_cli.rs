@@ -25,7 +25,6 @@ fn export_config_end_to_end_and_private_key_never_leaves_process() {
         lan_addr: None,
         reflexive_addr: None,
         last_handshake: None,
-        transit_via: None,
         relay: Default::default(),
     }]);
 
@@ -42,12 +41,12 @@ fn export_config_end_to_end_and_private_key_never_leaves_process() {
     assert!(conf.contains("AllowedIPs = 100.90.0.3/32, fd00:90::3/128"));
     assert!(conf.contains("Endpoint = duckdns.example.com:51820"));
 
-    // list-peers, create-node, register, list-services (for the service
-    // addresses each peer owns), set-gateway — exactly five requests, no
-    // more. list-peers comes *first* so the gateway choice is validated
-    // before anything is created; set-gateway records how the config was
-    // shaped so /poll can derive routing that matches it.
-    assert_eq!(mock.request_count(), 5);
+    // list-peers, relay-plan, create-node, register, list-services (for the
+    // service addresses each peer owns), record-export — exactly six
+    // requests, no more. list-peers and the relay plan come *first*, so the
+    // exit and every relay port are checked before anything is created;
+    // record-export tells the exit and carriers what the config relies on.
+    assert_eq!(mock.request_count(), 6);
     assert_eq!(
         mock.paths().first().map(String::as_str),
         Some("/admin/peers"),
@@ -81,11 +80,11 @@ fn export_config_refresh_rejoins_instead_of_creating_and_keeps_the_same_call_cou
             .conf;
     assert!(conf.contains("[Interface]"));
 
-    // The same five as the create path, with rejoin standing in for
+    // The same six as the create path, with rejoin standing in for
     // create-node — and the directory read first, which matters more here:
-    // rejoin is destructive, so a gateway choice that cannot be satisfied
-    // must fail before the device's pubkey is nulled.
-    assert_eq!(mock.request_count(), 5);
+    // rejoin is destructive, so an exit or relay port that cannot be
+    // satisfied must fail before the device's pubkey is nulled.
+    assert_eq!(mock.request_count(), 6);
     let paths = mock.paths();
     assert_eq!(
         paths.first().map(String::as_str),
@@ -226,24 +225,15 @@ fn transit_approval_targets_the_named_node() {
 }
 
 #[test]
-fn via_gateway_targets_the_named_node_and_returns_the_devices_to_refresh() {
+fn an_export_records_its_relays_and_exit_under_the_devices_name() {
     let mock = MockCoordinator::start(TOKEN);
     let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
-
-    let on = wireserve_admin::cmd_set_via_gateway(&client, "minipc", true).unwrap();
-    wireserve_admin::cmd_set_via_gateway(&client, "minipc", false).unwrap();
-    assert!(wireserve_admin::cmd_set_via_gateway(&client, "../peers", true).is_err());
-
-    assert_eq!(on.affected_devices, vec!["phone".to_string()]);
-    assert_eq!(
-        mock.paths(),
-        vec![
-            "/admin/nodes/minipc/via-gateway".to_string(),
-            "/admin/nodes/minipc/via-gateway".to_string(),
-        ]
-    );
-    assert!(mock.bodies()[0].contains("\"enabled\":true"), "{:?}", mock.bodies());
-    assert!(mock.bodies()[1].contains("\"enabled\":false"), "{:?}", mock.bodies());
+    wireserve_admin::export_config::run(&client, mock.base_url.as_str(), "phone", &Default::default()).unwrap();
+    let paths = mock.paths();
+    assert_eq!(paths.last().map(String::as_str), Some("/admin/nodes/phone/export"), "{paths:?}");
+    let plan_at = paths.iter().position(|p| p == "/admin/relays/plan").unwrap();
+    let create_at = paths.iter().position(|p| p == "/admin/nodes").unwrap();
+    assert!(plan_at < create_at, "relay ports are checked before anything is created: {paths:?}");
 }
 
 #[test]
@@ -353,7 +343,6 @@ fn list_peers_reflects_mock_directory() {
         lan_addr: None,
         reflexive_addr: None,
         last_handshake: None,
-        transit_via: None,
         relay: Default::default(),
     }]);
     let client = AdminClient::new(mock.base_url.as_str(), TOKEN);

@@ -95,7 +95,7 @@ fn ago(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
 
 /// This node's own name for whichever peer `view.peers` lists under
 /// `pubkey`, or the pubkey itself (truncated) if no such peer is known —
-/// a dangling `transit_via`/`TransitPair` entry (a stale/inconsistent
+/// a dangling `relay.via`/`TransitPair` entry (a stale/inconsistent
 /// directory) should never crash rendering, only degrade to something
 /// still readable.
 fn peer_name(view: &ListView, pubkey: &str) -> String {
@@ -105,8 +105,8 @@ fn peer_name(view: &ListView, pubkey: &str) -> String {
         .map_or_else(|| format!("{}…", &pubkey[..pubkey.len().min(8)]), |p| clean(&p.name))
 }
 
-/// "direct" or "via <name>" (PLAN.md M23) — this node's own routing
-/// decision for `p`, from the coordinator's `transit_via` hint on its
+/// "direct" or "relayed by <name>" (PLAN.md M39) — this node's own routing
+/// decision for `p`, from the coordinator's `relay.via` hint on its
 /// most recent poll response. Never reflects the kernel's actual live
 /// `AllowedIPs` state (`list` reads `tunnel` for endpoint/handshake, but
 /// `wg show allowed-ips` isn't parsed here) — the coordinator's hint and
@@ -115,12 +115,9 @@ fn peer_name(view: &ListView, pubkey: &str) -> String {
 /// "last poll" staleness every other cached field in this view already
 /// has.
 fn route(p: &PeerInfo, view: &ListView) -> String {
-    // A relay (PLAN.md M39) runs end to end: the carrier sees only
-    // ciphertext, which is worth saying next to its name.
-    match (p.relay.via.as_deref(), p.transit_via.as_deref()) {
-        (Some(via), _) => format!("relayed by {}", peer_name(view, via)),
-        (None, Some(via)) => format!("via {}", peer_name(view, via)),
-        (None, None) => "direct".to_string(),
+    match p.relay.via.as_deref() {
+        Some(via) => format!("relayed by {}", peer_name(view, via)),
+        None => "direct".to_string(),
     }
 }
 
@@ -213,26 +210,29 @@ pub fn render(view: &ListView, now: DateTime<Utc>) -> String {
     // Transit (PLAN.md M23): silent in the common case (opted out, not
     // carrying anything) so this stays out of the way for every node that
     // never touches the feature.
-    if view.transit_capable || !view.transit_carrying.is_empty() || !view.relay_carrying.is_empty() {
+    if view.transit_capable || !view.relay_carrying.is_empty() || !view.relay_public.is_empty() {
         out.push('\n');
         out.push_str(&format!("Transit: {}", if view.transit_capable { "on" } else { "off" }));
-        let pairs = |list: &[wireserve_types::TransitPair]| -> String {
-            list.iter()
-                .map(|pair| format!("{} <-> {}", peer_name(view, &pair.a), peer_name(view, &pair.c)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
         if view.transit_awaiting_approval {
             out.push_str(", waiting for an admin to approve this node as a carrier\n");
-        } else if view.transit_carrying.is_empty() && view.relay_carrying.is_empty() {
+        } else if view.relay_carrying.is_empty() && view.relay_public.is_empty() {
             out.push_str(", carrying nothing right now\n");
         } else {
             out.push('\n');
             if !view.relay_carrying.is_empty() {
-                out.push_str(&format!("  relaying (end to end, unreadable here): {}\n", pairs(&view.relay_carrying)));
+                let pairs: Vec<String> = view
+                    .relay_carrying
+                    .iter()
+                    .map(|pair| format!("{} <-> {}", peer_name(view, &pair.a), peer_name(view, &pair.c)))
+                    .collect();
+                out.push_str(&format!("  relaying (end to end, unreadable here): {}\n", pairs.join(", ")));
             }
-            if !view.transit_carrying.is_empty() {
-                out.push_str(&format!("  forwarding (readable here): {}\n", pairs(&view.transit_carrying)));
+            if !view.relay_public.is_empty() {
+                let names: Vec<String> = view.relay_public.iter().map(|n| clean(n)).collect();
+                out.push_str(&format!(
+                    "  relaying devices to (end to end, on public ports — see `wireserve-admin relay-ports`): {}\n",
+                    names.join(", ")
+                ));
             }
         }
     }
@@ -287,7 +287,6 @@ mod tests {
             lan_addr: None,
             reflexive_addr: None,
             last_handshake: online.then(chrono::Utc::now),
-            transit_via: None,
             relay: Default::default(),
         }
     }
@@ -305,8 +304,8 @@ mod tests {
             node: Some("lego2".into()),
             service_domain: None,
             transit_capable: false,
-            transit_carrying: vec![],
             relay_carrying: vec![],
+            relay_public: vec![],
             transit_awaiting_approval: false,
             exit_capable: false,
             exit_clients: vec![],
@@ -364,25 +363,25 @@ Not published:
     }
 
     #[test]
-    fn a_peer_routed_via_transit_shows_the_via_peers_name_not_its_pubkey() {
+    fn a_relayed_peer_shows_the_carriers_name_not_its_pubkey() {
         let mut c = peer("c", "10.1.0.3", None, true);
-        c.transit_via = Some("pk-b".into());
+        c.relay.via = Some("pk-b".into());
         let view = ListView {
             peers: vec![peer("b", "10.1.0.2", None, true), c],
             ..Default::default()
         };
         let out = render(&view, now());
-        assert!(out.contains("via b"), "{out}");
+        assert!(out.contains("relayed by b"), "{out}");
         assert!(!out.contains("pk-b"), "{out}");
     }
 
     #[test]
-    fn a_dangling_transit_via_naming_an_unknown_peer_degrades_to_a_truncated_pubkey_not_a_panic() {
+    fn a_dangling_carrier_naming_an_unknown_peer_degrades_to_a_truncated_pubkey_not_a_panic() {
         let mut c = peer("c", "10.1.0.3", None, true);
-        c.transit_via = Some("pk-does-not-exist".into());
+        c.relay.via = Some("pk-does-not-exist".into());
         let view = ListView { peers: vec![c], ..Default::default() };
         let out = render(&view, now());
-        assert!(out.contains("via pk-does-…"), "{out}");
+        assert!(out.contains("relayed by pk-does-…"), "{out}");
     }
 
     #[test]
@@ -436,17 +435,18 @@ Not published:
     }
 
     #[test]
-    fn a_carried_pair_is_shown_by_name() {
+    fn a_carried_pair_and_the_relayed_devices_are_shown_by_name() {
         let view = ListView {
             transit_capable: true,
-            transit_carrying: vec![wireserve_types::TransitPair { a: "pk-a".into(), c: "pk-c".into() }],
             relay_carrying: vec![wireserve_types::TransitPair { a: "pk-c".into(), c: "pk-x".into() }],
-            peers: vec![peer("a", "10.1.0.1", None, true), peer("c", "10.1.0.3", None, true), peer("x", "10.1.0.4", None, true)],
+            relay_public: vec!["minipc".into()],
+            peers: vec![peer("c", "10.1.0.3", None, true), peer("x", "10.1.0.4", None, true)],
             ..Default::default()
         };
         let out = render(&view, now());
         assert!(out.contains("relaying (end to end, unreadable here): c <-> x"), "{out}");
-        assert!(out.contains("forwarding (readable here): a <-> c"), "{out}");
+        assert!(out.contains("relaying devices to (end to end, on public ports"), "{out}");
+        assert!(out.contains("minipc"), "{out}");
     }
 
     #[test]

@@ -3202,9 +3202,9 @@ async fn every_node_has_its_own_stable_relay_port_and_its_reported_carry_port() 
     register_node(&app.router, &t3, "pk3", 51822).await;
     let n1 = n1["bearer_token"].as_str().unwrap();
     let (_, body) = poll_full(&app.router, n1, relay_poll(json!({ "services": [] }))).await;
-    assert_eq!(relay_of(&body, "n1"), json!({"port": base, "carry_port": 50000}));
-    assert_eq!(relay_of(&body, "n2"), json!({"port": base + 1}), "no carry port before it polls");
-    assert_eq!(relay_of(&body, "n3"), json!({"port": base + 2}));
+    assert_eq!(relay_of(&body, "n1"), json!({"port": base, "carry_port": 50000, "listen_port": 51820}));
+    assert_eq!(relay_of(&body, "n2"), json!({"port": base + 1, "listen_port": 51821}), "no carry port before it polls");
+    assert_eq!(relay_of(&body, "n3"), json!({"port": base + 2, "listen_port": 51822}));
 
     // A deleted node's slot is the next one handed out; the rest keep theirs.
     assert_eq!(admin_post(&app.router, "/admin/nodes/n2/revoke").await, StatusCode::OK);
@@ -3217,424 +3217,62 @@ async fn every_node_has_its_own_stable_relay_port_and_its_reported_carry_port() 
     assert_eq!(relay_of(&body, "n3")["port"], json!(base + 2));
 }
 
-// ---- PLAN.md M24: gateway routing for static peers ----
+// ---- PLAN.md M40, M41: phones reach every node end to end ----
 
-/// A gateway `gw` (approved), a `direct` node written into the phone's
-/// config, a `behind_nat` node that was not, and the phone itself.
-/// Returns the three agents' bearer tokens.
-async fn gateway_scenario(app: &TestApp) -> (String, String, String) {
+/// An agent's poll, as one on this version sends it: the relay capability
+/// and carry port, whether it is dialable, and a public IPv4 endpoint.
+fn phone_era_poll(dialable: bool, endpoint: &str, extra: Value) -> Value {
+    let mut body = relay_poll(json!({ "services": [], "dialable_v4": dialable, "endpoint_addr_v4": endpoint }));
+    for (k, v) in extra.as_object().unwrap() {
+        body[k] = v.clone();
+    }
+    body
+}
+
+/// `gw`: approved, `transit on` and `exit on`, dialable at a public address,
+/// reaching `minipc`. `minipc`: behind a NAT nothing gets through. `phone`:
+/// a registered static peer. Returns the two agents' bearer tokens.
+async fn phone_scenario(app: &TestApp) -> (String, String) {
+    let bearer = |v: Value| v["bearer_token"].as_str().unwrap().to_string();
     let t = admin_create_node(&app.router, "gw").await;
-    let gw = register_node(&app.router, &t, "gw", 51820).await["bearer_token"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let t = admin_create_node(&app.router, "direct").await;
-    let direct = register_node(&app.router, &t, "direct", 51820).await["bearer_token"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let t = admin_create_node(&app.router, "behind-nat").await;
-    let behind = register_node(&app.router, &t, "behind-nat", 51820).await["bearer_token"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let req = json_request(
-        "POST",
-        "/admin/nodes",
-        Some(ADMIN),
-        json!({ "name": "phone", "kind": "static" }),
-    );
-    let resp = app.router.clone().oneshot(req).await.unwrap();
-    let pt = body_json(resp).await["join_token"].as_str().unwrap().to_string();
-    let req = json_request(
-        "POST",
-        "/register",
-        None,
-        json!({ "join_token": pt, "pubkey": pubkey_for("phone"), "kind": "static" }),
-    );
-    app.router.clone().oneshot(req).await.unwrap();
-
-    assert_eq!(admin_post(&app.router, "/admin/nodes/gw/transit/approve").await, StatusCode::OK);
-    // Both halves, in the order an operator does them: `wireserve
-    // transit on` makes the node offer, and it has to have polled at least
-    // once before it can be assigned — the agent opens the host firewall's
-    // forward hook from that same local flag, so assigning a gateway that
-    // is not offering would bake in a config nothing can make work.
-    poll_full(&app.router, &gw, json!({ "services": [], "transit_capable": true })).await;
-
-    let req = json_request(
-        "PUT",
-        "/admin/nodes/phone/gateway",
-        Some(ADMIN),
-        json!({ "gateway": "gw", "conf_peers": ["direct"] }),
-    );
-    let resp = app.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    (gw, direct, behind)
-}
-
-#[tokio::test]
-async fn a_node_absent_from_the_phones_config_routes_to_it_through_the_gateway() {
-    let app = test_app();
-    let (_gw, _direct, behind) = gateway_scenario(&app).await;
-
-    let (status, body) = poll_full(&app.router, &behind, json!({})).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        transit_via_for(&body, "phone").as_deref(),
-        Some(pubkey_for("gw").as_str()),
-        "the phone has no direct entry here and cannot be dialled, so the reply path \
-         must be folded onto the gateway's peer entry: {body}"
-    );
-}
-
-#[tokio::test]
-async fn a_node_written_into_the_phones_config_is_never_routed_through_the_gateway() {
-    let app = test_app();
-    let (_gw, direct, _behind) = gateway_scenario(&app).await;
-
-    let (_, body) = poll_full(&app.router, &direct, json!({})).await;
-    // This is the rule the whole feature turns on. `wg::desired_peers` drops
-    // a transited peer's own entry, and the phone's config holds a /32 for
-    // this node that outranks the gateway's covering route — WireGuard has no
-    // failover — so naming a gateway here would black-hole the pair rather
-    // than reroute it.
-    assert_eq!(transit_via_for(&body, "phone"), None, "{body}");
-}
-
-#[tokio::test]
-async fn the_gateway_itself_keeps_a_direct_entry_for_the_phone() {
-    let app = test_app();
-    let (gw, _direct, _behind) = gateway_scenario(&app).await;
-
-    let (_, body) = poll_full(&app.router, &gw, json!({})).await;
-    assert_eq!(
-        transit_via_for(&body, "phone"),
-        None,
-        "the gateway terminates the phone's tunnel; routing it via itself would \
-         delete the only peer entry that can: {body}"
-    );
-}
-
-#[tokio::test]
-async fn the_gateway_is_told_to_forward_between_the_phone_and_what_it_cannot_reach() {
-    let app = test_app();
-    let (gw, _direct, _behind) = gateway_scenario(&app).await;
-
-    let (_, body) = poll_full(&app.router, &gw, json!({})).await;
-    let carrying = body["transit_carrying"].as_array().cloned().unwrap_or_default();
-    let has = |x: &str, y: &str| {
-        carrying.iter().any(|p| {
-            (p["a"] == pubkey_for(x) && p["c"] == pubkey_for(y))
-                || (p["a"] == pubkey_for(y) && p["c"] == pubkey_for(x))
-        })
-    };
-    assert!(has("phone", "behind-nat"), "{body}");
-    assert!(
-        !has("phone", "direct"),
-        "the phone reaches this one directly, so the gateway has no business \
-         forwarding for the pair: {body}"
-    );
-}
-
-#[tokio::test]
-async fn two_phones_on_one_gateway_can_reach_each_other() {
-    // A second static peer has no endpoint, so it is never in anyone's
-    // config and always falls on the gateway side — the pair still needs a
-    // forwarding rule, and it is reachable from both ends so it must be
-    // emitted exactly once.
-    let app = test_app();
-    let (gw, _direct, _behind) = gateway_scenario(&app).await;
-
-    let req = json_request(
-        "POST",
-        "/admin/nodes",
-        Some(ADMIN),
-        json!({ "name": "tablet", "kind": "static" }),
-    );
-    let resp = app.router.clone().oneshot(req).await.unwrap();
-    let t = body_json(resp).await["join_token"].as_str().unwrap().to_string();
-    let req = json_request(
-        "POST",
-        "/register",
-        None,
-        json!({ "join_token": t, "pubkey": pubkey_for("tablet"), "kind": "static" }),
-    );
-    app.router.clone().oneshot(req).await.unwrap();
-    let req = json_request(
-        "PUT",
-        "/admin/nodes/tablet/gateway",
-        Some(ADMIN),
-        json!({ "gateway": "gw", "conf_peers": [] }),
-    );
-    app.router.clone().oneshot(req).await.unwrap();
-
-    let (_, body) = poll_full(&app.router, &gw, json!({})).await;
-    let carrying = body["transit_carrying"].as_array().cloned().unwrap_or_default();
-    let matches = carrying
-        .iter()
-        .filter(|p| {
-            let (a, c) = (&p["a"], &p["c"]);
-            (*a == pubkey_for("phone") && *c == pubkey_for("tablet"))
-                || (*a == pubkey_for("tablet") && *c == pubkey_for("phone"))
-        })
-        .count();
-    assert_eq!(matches, 1, "exactly one pair, reachable from both ends: {body}");
-}
-
-#[tokio::test]
-async fn a_revoked_gateway_degrades_the_phone_to_direct_rather_than_erasing_it() {
-    let app = test_app();
-    let (_gw, _direct, behind) = gateway_scenario(&app).await;
-
-    assert_eq!(admin_post(&app.router, "/admin/nodes/gw/revoke").await, StatusCode::OK);
-
-    let (_, body) = poll_full(&app.router, &behind, json!({})).await;
-    // Not merely "no longer via gw": `wg::desired_peers` skips a transited
-    // peer in pass 1 and only re-adds it folded into the via peer in pass 2,
-    // so a transit_via naming a node no longer in the directory would leave
-    // the phone with no entry anywhere at all.
-    assert_eq!(transit_via_for(&body, "phone"), None, "{body}");
-    assert!(
-        body["peers"].as_array().unwrap().iter().any(|p| p["name"] == "phone"),
-        "the phone must still be in the directory: {body}"
-    );
-}
-
-#[tokio::test]
-async fn withdrawing_transit_approval_also_stops_the_node_acting_as_a_gateway() {
-    let app = test_app();
-    let (_gw, _direct, behind) = gateway_scenario(&app).await;
-
-    assert_eq!(admin_post(&app.router, "/admin/nodes/gw/transit/deny").await, StatusCode::OK);
-
-    let (_, body) = poll_full(&app.router, &behind, json!({})).await;
-    assert_eq!(
-        transit_via_for(&body, "phone"),
-        None,
-        "gateway forwarding is transit forwarding, gated on the same approval: {body}"
-    );
-}
-
-#[tokio::test]
-async fn a_gateway_must_be_approved_before_it_can_be_assigned() {
-    let app = test_app();
-    let t = admin_create_node(&app.router, "gw").await;
-    register_node(&app.router, &t, "gw", 51820).await;
-    let req = json_request(
-        "POST",
-        "/admin/nodes",
-        Some(ADMIN),
-        json!({ "name": "phone", "kind": "static" }),
-    );
-    let resp = app.router.clone().oneshot(req).await.unwrap();
-    let pt = body_json(resp).await["join_token"].as_str().unwrap().to_string();
-    let req = json_request(
-        "POST",
-        "/register",
-        None,
-        json!({ "join_token": pt, "pubkey": pubkey_for("phone"), "kind": "static" }),
-    );
-    app.router.clone().oneshot(req).await.unwrap();
-
-    let req = json_request(
-        "PUT",
-        "/admin/nodes/phone/gateway",
-        Some(ADMIN),
-        json!({ "gateway": "gw", "conf_peers": [] }),
-    );
-    let resp = app.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-}
-
-#[tokio::test]
-async fn an_agent_node_cannot_be_given_a_gateway() {
-    let app = test_app();
-    let t = admin_create_node(&app.router, "n1").await;
-    register_node(&app.router, &t, "n1", 51820).await;
-    let req = json_request(
-        "PUT",
-        "/admin/nodes/n1/gateway",
-        Some(ADMIN),
-        json!({ "gateway": null, "conf_peers": [] }),
-    );
-    let resp = app.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn deleting_a_gateway_is_refused_while_a_device_still_routes_through_it() {
-    let app = test_app();
-    let (_gw, _direct, _behind) = gateway_scenario(&app).await;
-
-    assert_eq!(admin_post(&app.router, "/admin/nodes/gw/revoke").await, StatusCode::OK);
-    let req = raw_request("DELETE", "/admin/nodes/gw", Some(&format!("Bearer {ADMIN}")));
-    let resp = app.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::CONFLICT,
-        "the FK would null the reference silently, leaving the device with no \
-         path to anything it lacks a direct entry for and nothing saying so"
-    );
-}
-
-#[tokio::test]
-async fn a_refresh_keeps_the_phone_on_the_same_gateway() {
-    let app = test_app();
-    let (_gw, _direct, behind) = gateway_scenario(&app).await;
-
-    // What `export-config --refresh` does to the node record.
-    let req = json_request(
-        "POST",
-        "/admin/nodes/phone/rejoin",
-        Some(ADMIN),
-        json!({ "kind": "static" }),
-    );
-    let resp = app.router.clone().oneshot(req).await.unwrap();
-    let t = body_json(resp).await["join_token"].as_str().unwrap().to_string();
-    let req = json_request(
-        "POST",
-        "/register",
-        None,
-        json!({ "join_token": t, "pubkey": pubkey_for("phone-rotated"), "kind": "static" }),
-    );
-    let resp = app.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let (_, body) = poll_full(&app.router, &behind, json!({})).await;
-    assert_eq!(
-        transit_via_for(&body, "phone").as_deref(),
-        Some(pubkey_for("gw").as_str()),
-        "rotating the keypair is not a reason to re-home the device: {body}"
-    );
-}
-
-#[tokio::test]
-async fn a_gateway_that_never_switched_transit_on_is_refused_with_an_actionable_message() {
-    // Approval is the mesh admin's trust; the node's own `transit on` is what
-    // opens the host firewall's forward hook. Missing the second half fails
-    // invisibly from every other node, so it is caught here instead.
-    let app = test_app();
-    let t = admin_create_node(&app.router, "gw").await;
-    register_node(&app.router, &t, "gw", 51820).await;
-    assert_eq!(admin_post(&app.router, "/admin/nodes/gw/transit/approve").await, StatusCode::OK);
-
-    let req = json_request(
-        "POST",
-        "/admin/nodes",
-        Some(ADMIN),
-        json!({ "name": "phone", "kind": "static" }),
-    );
-    let resp = app.router.clone().oneshot(req).await.unwrap();
-    let pt = body_json(resp).await["join_token"].as_str().unwrap().to_string();
-    let req = json_request(
-        "POST",
-        "/register",
-        None,
-        json!({ "join_token": pt, "pubkey": pubkey_for("phone"), "kind": "static" }),
-    );
-    app.router.clone().oneshot(req).await.unwrap();
-
-    let req = json_request(
-        "PUT",
-        "/admin/nodes/phone/gateway",
-        Some(ADMIN),
-        json!({ "gateway": "gw", "conf_peers": [] }),
-    );
-    let resp = app.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-    let body = body_json(resp).await;
-    let msg = body["error"].as_str().unwrap_or_default();
-    assert!(msg.contains("transit on"), "must say what to do: {body}");
-}
-
-async fn set_via_gateway(router: &Router, node: &str, enabled: bool) -> (StatusCode, Value) {
-    let req = json_request(
-        "PUT",
-        &format!("/admin/nodes/{node}/via-gateway"),
-        Some(ADMIN),
-        json!({ "enabled": enabled }),
-    );
-    let resp = router.clone().oneshot(req).await.unwrap();
-    let status = resp.status();
-    (status, body_json(resp).await)
-}
-
-async fn via_gateway_listed(router: &Router) -> Value {
-    let req = json_request("GET", "/admin/peers", Some(ADMIN), json!({}));
-    let resp = router.clone().oneshot(req).await.unwrap();
-    body_json(resp).await["via_gateway"].clone()
-}
-
-#[tokio::test]
-async fn via_gateway_names_the_devices_that_still_dial_the_node_directly() {
-    let app = test_app();
-    let (_gw, direct, _behind) = gateway_scenario(&app).await;
-
-    let (status, body) = set_via_gateway(&app.router, "direct", true).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["affected_devices"], json!(["phone"]), "{body}");
-    assert_eq!(via_gateway_listed(&app.router).await, json!(["direct"]));
-
-    // The flag shapes the next export and nothing else: until the phone is
-    // re-exported its config still holds `direct`, so routing must not move.
-    let (_, poll) = poll_full(&app.router, &direct, json!({})).await;
-    assert_eq!(transit_via_for(&poll, "phone"), None, "{poll}");
-
-    // What the refreshed export records: `direct` left out of the conf.
-    let req = json_request(
-        "PUT",
-        "/admin/nodes/phone/gateway",
-        Some(ADMIN),
-        json!({ "gateway": "gw", "conf_peers": [] }),
-    );
+    let gw = bearer(register_node(&app.router, &t, "gw", 51820).await);
+    let t = admin_create_node(&app.router, "minipc").await;
+    let minipc = bearer(register_node(&app.router, &t, "minipc", 51820).await);
+    let req = json_request("POST", "/admin/nodes", Some(ADMIN), json!({ "name": "phone", "kind": "static" }));
+    let pt = body_json(app.router.clone().oneshot(req).await.unwrap()).await["join_token"].as_str().unwrap().to_string();
+    let req = json_request("POST", "/register", None, json!({ "join_token": pt, "pubkey": pubkey_for("phone"), "kind": "static" }));
     assert_eq!(app.router.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
-    let (_, poll) = poll_full(&app.router, &direct, json!({})).await;
-    assert_eq!(transit_via_for(&poll, "phone").as_deref(), Some(pubkey_for("gw").as_str()), "{poll}");
+
+    assert_eq!(admin_post(&app.router, "/admin/nodes/gw/transit/approve").await, StatusCode::OK);
+    poll_full(&app.router, &minipc, phone_era_poll(false, "198.51.100.3:51820", json!({}))).await;
+    poll_full(&app.router, &gw, gw_offers()).await;
+    (gw, minipc)
 }
 
-#[tokio::test]
-async fn turning_via_gateway_off_names_the_devices_a_refresh_would_make_direct() {
-    let app = test_app();
-    gateway_scenario(&app).await;
-    set_via_gateway(&app.router, "behind-nat", true).await;
-
-    let (status, body) = set_via_gateway(&app.router, "behind-nat", false).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["affected_devices"], json!(["phone"]), "{body}");
-    assert_eq!(via_gateway_listed(&app.router).await, Value::Null, "an empty list is omitted");
+fn gw_offers() -> Value {
+    phone_era_poll(
+        true,
+        "203.0.113.2:51820",
+        json!({ "transit_capable": true, "exit_capable": true, "transit_reachable": [pubkey_for("minipc")] }),
+    )
 }
 
-#[tokio::test]
-async fn via_gateway_on_a_devices_own_gateway_names_that_device() {
-    // The device dials its gateway directly by necessity, so this says its
-    // config is already broken; the flag is still recorded.
-    let app = test_app();
-    gateway_scenario(&app).await;
-
-    let (status, body) = set_via_gateway(&app.router, "gw", true).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["affected_devices"], json!(["phone"]), "{body}");
-    assert_eq!(via_gateway_listed(&app.router).await, json!(["gw"]));
+async fn admin_get(router: &Router, path: &str) -> Value {
+    let req = raw_request("GET", path, Some(&format!("Bearer {ADMIN}")));
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
 }
 
-#[tokio::test]
-async fn via_gateway_is_refused_where_it_cannot_mean_anything() {
-    let app = test_app();
-    gateway_scenario(&app).await;
-
-    let (status, _) = set_via_gateway(&app.router, "nope", true).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, _) = set_via_gateway(&app.router, "phone", true).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "nothing dials a static peer");
+async fn relay_plan(router: &Router, allow_unverified: bool) -> Value {
+    let req = json_request("POST", "/admin/relays/plan", Some(ADMIN), json!({ "allow_unverified": allow_unverified }));
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
 }
 
-// ---- PLAN.md M27: exit profiles for static peers ----
-
-async fn put_gateway(router: &Router, node: &str, body: Value) -> (StatusCode, Value) {
-    let req = json_request("PUT", &format!("/admin/nodes/{node}/gateway"), Some(ADMIN), body);
+async fn record_export(router: &Router, node: &str, body: Value) -> (StatusCode, Value) {
+    let req = json_request("PUT", &format!("/admin/nodes/{node}/export"), Some(ADMIN), body);
     let resp = router.clone().oneshot(req).await.unwrap();
     let status = resp.status();
     let body = if status == StatusCode::OK { json!(null) } else { body_json(resp).await };
@@ -3648,99 +3286,161 @@ fn exit_clients(body: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The M24 scenario, with the gateway also offering to be an exit and the
-/// phone re-exported with the full-tunnel profile.
-async fn exit_scenario(app: &TestApp) -> (String, String, String) {
-    let (gw, direct, behind) = gateway_scenario(app).await;
-    poll_full(&app.router, &gw, json!({ "services": [], "transit_capable": true, "exit_capable": true })).await;
-    let (status, body) =
-        put_gateway(&app.router, "phone", json!({ "gateway": "gw", "conf_peers": ["direct"], "exit": true })).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    (gw, direct, behind)
+/// What the plan says about `node`'s relay, once `gw` has picked up the
+/// port check the plan started and seen its nonce.
+async fn plan_with_the_check_answered(app: &TestApp, gw: &str) -> Value {
+    let router = app.router.clone();
+    let plan = tokio::spawn(async move { relay_plan(&router, false).await });
+    let mut checks = Value::Null;
+    for _ in 0..40 {
+        let (_, body) = poll_full(&app.router, gw, gw_offers()).await;
+        if body.get("port_checks").is_some() {
+            checks = body["port_checks"].clone();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(checks.is_array(), "the carrier is asked to listen");
+    let mut answer = gw_offers();
+    answer["port_checks_seen"] = checks;
+    poll_full(&app.router, gw, answer).await;
+    plan.await.unwrap()
 }
 
 #[tokio::test]
-async fn the_gateway_is_told_which_devices_it_is_the_exit_for_and_nobody_else_is() {
+async fn a_dialable_node_is_dialled_directly_and_one_that_is_not_is_relayed_through_a_checked_port() {
     let app = test_app();
-    let (gw, direct, behind) = exit_scenario(&app).await;
+    let (gw, _minipc) = phone_scenario(&app).await;
+    let port = wireserve_types::DEFAULT_RELAY_PORT_BASE + 1;
 
-    let (_, body) = poll_full(&app.router, &gw, json!({ "transit_capable": true, "exit_capable": true })).await;
+    let plan = plan_with_the_check_answered(&app, &gw).await;
+    assert_eq!(plan["direct"], json!(["gw"]), "{plan}");
+    assert_eq!(
+        plan["relayed"],
+        json!([{ "node": "minipc", "carrier": "gw", "endpoint": format!("203.0.113.2:{port}"), "open": true }]),
+        "{plan}"
+    );
+    assert_eq!(plan["closed"], json!([]), "{plan}");
+    assert_eq!(plan["unreachable"], json!([]), "{plan}");
+
+    // Seen open: the next export trusts it without another check.
+    let again = relay_plan(&app.router, false).await;
+    assert_eq!(again["relayed"][0]["open"], json!(true), "{again}");
+    let ports = admin_get(&app.router, "/admin/relay-ports").await;
+    assert_eq!(ports["ports"][0]["port"], json!(port), "{ports}");
+    assert_eq!(ports["ports"][0]["open"], json!(true), "{ports}");
+    assert_eq!(ports["ports"][0]["devices"], json!([]), "no device uses it yet: {ports}");
+}
+
+#[tokio::test]
+async fn nothing_reaches_a_node_no_carrier_qualifies_for_and_the_plan_says_why() {
+    let app = test_app();
+    let (_gw, _minipc) = phone_scenario(&app).await;
+    assert_eq!(admin_post(&app.router, "/admin/nodes/gw/transit/deny").await, StatusCode::OK);
+    let plan = relay_plan(&app.router, false).await;
+    assert_eq!(plan["relayed"], json!([]), "{plan}");
+    assert_eq!(plan["unreachable"][0]["node"], json!("minipc"), "{plan}");
+    assert!(plan["unreachable"][0]["reason"].as_str().unwrap().contains("dialable"), "{plan}");
+}
+
+#[tokio::test]
+async fn an_export_makes_its_carrier_relay_and_its_exit_send_on_and_nobody_else() {
+    let app = test_app();
+    let (gw, minipc) = phone_scenario(&app).await;
+    let (status, body) = record_export(
+        &app.router,
+        "phone",
+        json!({ "exit": "gw", "relays": [{ "node": "minipc", "carrier": "gw" }] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, body) = poll_full(&app.router, &gw, gw_offers()).await;
+    assert_eq!(body["relay_public"], json!([pubkey_for("minipc")]), "{body}");
+    assert_eq!(body["relay_port_base"], json!(wireserve_types::DEFAULT_RELAY_PORT_BASE), "{body}");
     assert_eq!(exit_clients(&body), vec![pubkey_for("phone")], "{body}");
-    for other in [&direct, &behind] {
-        let (_, body) = poll_full(&app.router, other, json!({})).await;
-        assert!(exit_clients(&body).is_empty(), "only the device's own gateway is its exit: {body}");
-    }
+    // The relayed node's own entry says where a phone's session ends.
+    let minipc_entry = body["peers"].as_array().unwrap().iter().find(|p| p["name"] == "minipc").unwrap();
+    assert_eq!(minipc_entry["relay"]["listen_port"], json!(51820), "{body}");
+
+    let (_, body) = poll_full(&app.router, &minipc, phone_era_poll(false, "198.51.100.3:51820", json!({}))).await;
+    assert!(body.get("relay_public").is_none() && exit_clients(&body).is_empty(), "{body}");
 
     let peers = admin_peers(&app.router).await;
-    assert_eq!(peers["exit_offering"], json!(["gw"]), "{peers}");
     assert_eq!(peers["exit_devices"], json!(["phone"]), "{peers}");
+    assert!(peers.get("stale_devices").is_none(), "{peers}");
+    let ports = admin_get(&app.router, "/admin/relay-ports").await;
+    assert_eq!(ports["ports"][0]["devices"], json!(["phone"]), "{ports}");
 }
 
 #[tokio::test]
-async fn a_device_exported_without_the_exit_profile_is_no_exit_client() {
+async fn an_export_is_refused_where_it_could_not_work() {
     let app = test_app();
-    let (gw, _direct, _behind) = gateway_scenario(&app).await;
-    poll_full(&app.router, &gw, json!({ "transit_capable": true, "exit_capable": true })).await;
-
-    let (_, body) = poll_full(&app.router, &gw, json!({ "transit_capable": true, "exit_capable": true })).await;
-    assert!(exit_clients(&body).is_empty(), "an offer alone forwards nothing for anyone: {body}");
-}
-
-#[tokio::test]
-async fn an_exit_profile_is_refused_while_the_gateway_does_not_offer_one() {
-    // The gateway's half of the consent is its own `exit on`. Without it the
-    // profile would send a phone's internet traffic somewhere that drops it.
-    let app = test_app();
-    let (_gw, _direct, _behind) = gateway_scenario(&app).await;
-
-    let (status, body) =
-        put_gateway(&app.router, "phone", json!({ "gateway": "gw", "conf_peers": [], "exit": true })).await;
+    let (gw, _minipc) = phone_scenario(&app).await;
+    // The exit's own half of the consent is `exit on`.
+    poll_full(&app.router, &gw, phone_era_poll(true, "203.0.113.2:51820", json!({ "transit_capable": true }))).await;
+    let (status, body) = record_export(&app.router, "phone", json!({ "exit": "gw" })).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body["error"].as_str().unwrap_or_default().contains("exit on"), "must say what to do: {body}");
+    assert!(body["error"].as_str().unwrap().contains("exit on"), "{body}");
+    // A carrier needs the admin's approval.
+    let (status, body) = record_export(&app.router, "phone", json!({ "relays": [{ "node": "gw", "carrier": "minipc" }] })).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    // Only a device has an export, and only agents relay or are relayed to.
+    let (status, _) = record_export(&app.router, "gw", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = record_export(&app.router, "phone", json!({ "relays": [{ "node": "phone", "carrier": "gw" }] })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
-async fn an_exit_profile_needs_a_gateway() {
+async fn withdrawing_approval_ends_the_relay_and_the_exit_and_marks_the_device_stale() {
     let app = test_app();
-    let (gw, _direct, _behind) = gateway_scenario(&app).await;
-    poll_full(&app.router, &gw, json!({ "transit_capable": true, "exit_capable": true })).await;
-
-    let (status, body) = put_gateway(&app.router, "phone", json!({ "conf_peers": [], "exit": true })).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-}
-
-#[tokio::test]
-async fn a_refresh_without_the_exit_profile_withdraws_it() {
-    // Recorded per export: it describes the files on the device, and the new
-    // files no longer send anything to the internet.
-    let app = test_app();
-    let (gw, _direct, _behind) = exit_scenario(&app).await;
-
-    let (status, _) = put_gateway(&app.router, "phone", json!({ "gateway": "gw", "conf_peers": ["direct"] })).await;
+    let (gw, _minipc) = phone_scenario(&app).await;
+    let (status, _) = record_export(&app.router, "phone", json!({ "exit": "gw", "relays": [{ "node": "minipc", "carrier": "gw" }] })).await;
     assert_eq!(status, StatusCode::OK);
-    let (_, body) = poll_full(&app.router, &gw, json!({ "transit_capable": true, "exit_capable": true })).await;
-    assert!(exit_clients(&body).is_empty(), "{body}");
-    assert!(admin_peers(&app.router).await.get("exit_devices").is_none());
-}
-
-#[tokio::test]
-async fn withdrawing_transit_approval_also_ends_the_exit() {
-    let app = test_app();
-    let (gw, _direct, _behind) = exit_scenario(&app).await;
 
     assert_eq!(admin_post(&app.router, "/admin/nodes/gw/transit/deny").await, StatusCode::OK);
-    let (_, body) = poll_full(&app.router, &gw, json!({ "transit_capable": true, "exit_capable": true })).await;
-    assert!(exit_clients(&body).is_empty(), "an exit is a gateway first: {body}");
+    let (_, body) = poll_full(&app.router, &gw, gw_offers()).await;
+    assert!(body.get("relay_public").is_none() && exit_clients(&body).is_empty(), "{body}");
+    assert_eq!(admin_peers(&app.router).await["stale_devices"], json!(["phone"]));
 }
 
 #[tokio::test]
-async fn a_revoked_device_is_no_longer_an_exit_client() {
+async fn a_device_is_stale_until_exported_and_again_once_a_node_joins_after_it() {
     let app = test_app();
-    let (gw, _direct, _behind) = exit_scenario(&app).await;
+    let (_gw, _minipc) = phone_scenario(&app).await;
+    assert_eq!(admin_peers(&app.router).await["stale_devices"], json!(["phone"]), "never exported under this version");
+    record_export(&app.router, "phone", json!({})).await;
+    assert!(admin_peers(&app.router).await.get("stale_devices").is_none());
 
+    // `created_at` has second resolution; a node created in the same second
+    // as the export can't be told apart from one created before it.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let t = admin_create_node(&app.router, "newcomer").await;
+    register_node(&app.router, &t, "newcomer", 51820).await;
+    assert_eq!(admin_peers(&app.router).await["stale_devices"], json!(["phone"]));
+}
+
+#[tokio::test]
+async fn a_carrier_or_exit_is_not_deleted_while_a_device_relies_on_it() {
+    let app = test_app();
+    let (_gw, _minipc) = phone_scenario(&app).await;
+    record_export(&app.router, "phone", json!({ "relays": [{ "node": "minipc", "carrier": "gw" }] })).await;
+    assert_eq!(admin_post(&app.router, "/admin/nodes/gw/revoke").await, StatusCode::OK);
+    let req = json_request("DELETE", "/admin/nodes/gw", Some(ADMIN), json!({}));
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert!(body_json(resp).await["error"].as_str().unwrap().contains("phone"));
+}
+
+#[tokio::test]
+async fn a_revoked_device_is_no_longer_an_exit_client_nor_relayed() {
+    let app = test_app();
+    let (gw, _minipc) = phone_scenario(&app).await;
+    record_export(&app.router, "phone", json!({ "exit": "gw", "relays": [{ "node": "minipc", "carrier": "gw" }] })).await;
     assert_eq!(admin_post(&app.router, "/admin/nodes/phone/revoke").await, StatusCode::OK);
-    let (_, body) = poll_full(&app.router, &gw, json!({ "transit_capable": true, "exit_capable": true })).await;
-    assert!(exit_clients(&body).is_empty(), "{body}");
+    let (_, body) = poll_full(&app.router, &gw, gw_offers()).await;
+    assert!(exit_clients(&body).is_empty() && body.get("relay_public").is_none(), "{body}");
 }
 
 // ---- PLAN.md M36: who can reach what ----

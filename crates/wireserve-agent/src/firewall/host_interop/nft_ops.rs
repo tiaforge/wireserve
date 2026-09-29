@@ -11,7 +11,7 @@ use nftables::stmt::{Accept, Counter, Drop, Match, Operator, Statement};
 use nftables::types::{NfChainPolicy, NfChainType, NfFamily, NfHook};
 
 use super::model::{guard_table, tag, ChainRef, Family, ForwardWanted, Opening, GUARD_CHAIN};
-use crate::firewall::nftables::{EXIT_MARK, SERVICE_MARK};
+use crate::firewall::nftables::{EXIT_MARK, RELAY_MARK, SERVICE_MARK};
 
 fn nf_family(family: Family) -> NfFamily {
     match family {
@@ -62,6 +62,8 @@ fn opening_matches(ifname: &str, opening: Opening) -> Vec<Statement<'static>> {
         Opening::ServiceReply => vec![oifname_is(ifname), mark_is(SERVICE_MARK)],
         Opening::ExitRequest => vec![iifname_is(ifname), mark_is(EXIT_MARK)],
         Opening::ExitReply => vec![oifname_is(ifname), mark_is(EXIT_MARK)],
+        Opening::RelayRequest => vec![oifname_is(ifname), mark_is(RELAY_MARK)],
+        Opening::RelayReply => vec![iifname_is(ifname), mark_is(RELAY_MARK)],
     }
 }
 
@@ -150,6 +152,7 @@ pub fn guard_create(ifname: &str, forward: ForwardWanted) -> Nftables<'static> {
         (forward.transit, Opening::Hairpin),
         (forward.services, Opening::ServiceRequest),
         (forward.exit, Opening::ExitRequest),
+        (forward.relay, Opening::RelayReply),
     ];
     for (_, opening) in exceptions.into_iter().filter(|(wanted, _)| *wanted) {
         let mut expr = opening_matches(ifname, opening);
@@ -193,7 +196,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const TRANSIT: ForwardWanted = ForwardWanted { transit: true, services: false, exit: false };
+    const TRANSIT: ForwardWanted = ForwardWanted { transit: true, services: false, exit: false, relay: false };
 
     fn chain() -> ChainRef {
         ChainRef {
@@ -398,7 +401,7 @@ mod tests {
     /// expects, so they settle instead of being replaced every reconcile.
     #[test]
     fn kernel_service_openings_round_trip_and_settle() {
-        let both = ForwardWanted { transit: true, services: true, exit: true };
+        let both = ForwardWanted { transit: true, services: true, exit: true, relay: true };
         let forward = ChainRef { family: Family::Inet, table: "filter".into(), chain: "forward".into() };
         let setup = "nft -f - <<'EOF'\n\
             table inet filter {\n  chain input {\n    type filter hook input priority 0; policy drop;\n  }\n  \
@@ -411,6 +414,8 @@ mod tests {
             Opening::ServiceReply,
             Opening::ExitRequest,
             Opening::ExitReply,
+            Opening::RelayRequest,
+            Opening::RelayReply,
         ] {
             script += &apply_script(&insert_accept(&forward, "wg0", opening));
         }
@@ -421,9 +426,11 @@ mod tests {
         };
         let view = ruleset::parse(out.as_bytes()).unwrap();
         let fwd = view.chains.iter().find(|c| c.chain == forward).unwrap();
-        assert_eq!(fwd.rules.len(), 5);
+        assert_eq!(fwd.rules.len(), 7);
         // Each was inserted at the head, so they list back newest first.
         for (rule, opening) in fwd.rules.iter().zip([
+            Opening::RelayReply,
+            Opening::RelayRequest,
             Opening::ExitReply,
             Opening::ExitRequest,
             Opening::ServiceReply,

@@ -30,7 +30,12 @@ use crate::rate_limit::SlidingWindowLimiter;
 /// spawned as a detached task from `main`, same as the two HTTP servers
 /// are `axum::serve`d, but never itself part of their `try_join!` exit
 /// condition (a UDP recv loop has no natural "done").
-pub async fn serve(socket: UdpSocket, limiter: Arc<SlidingWindowLimiter>) {
+///
+/// `second` answers every request again, from a port the node never sent
+/// anything to (PLAN.md M40): that answer only arrives where the node's NAT
+/// or firewall lets unsolicited traffic in. Both answers together are
+/// still smaller than the request (`reflexive`'s own compile-time check).
+pub async fn serve(socket: UdpSocket, second: Option<Arc<std::net::UdpSocket>>, limiter: Arc<SlidingWindowLimiter>) {
     let mut buf = [0u8; wireserve_types::reflexive::REQUEST_LEN];
     loop {
         let (n, src) = match socket.recv_from(&mut buf).await {
@@ -40,11 +45,17 @@ pub async fn serve(socket: UdpSocket, limiter: Arc<SlidingWindowLimiter>) {
                 continue;
             }
         };
-        handle_datagram(&socket, &buf[..n], src, &limiter).await;
+        handle_datagram(&socket, second.as_deref(), &buf[..n], src, &limiter).await;
     }
 }
 
-async fn handle_datagram(socket: &UdpSocket, datagram: &[u8], src: SocketAddr, limiter: &SlidingWindowLimiter) {
+async fn handle_datagram(
+    socket: &UdpSocket,
+    second: Option<&std::net::UdpSocket>,
+    datagram: &[u8],
+    src: SocketAddr,
+    limiter: &SlidingWindowLimiter,
+) {
     // IPv4 only (decisions log #90+) — the request format itself is
     // IPv4-only (`wireserve_types::reflexive`), so a v6 source could
     // never be answered meaningfully anyway.
@@ -67,6 +78,13 @@ async fn handle_datagram(socket: &UdpSocket, datagram: &[u8], src: SocketAddr, l
     if let Err(e) = socket.send_to(&response, src).await {
         tracing::debug!(error = %e, %src, "reflexive UDP responder: send error");
     }
+    if let Some(second) = second {
+        // A UDP send on an unconnected socket doesn't block for long enough
+        // to matter; the socket is shared with port checks, so std's.
+        if let Err(e) = second.send_to(&response, src) {
+            tracing::debug!(error = %e, %src, "reflexive UDP responder: second send error");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -82,8 +100,32 @@ mod tests {
     async fn spawn_responder_with(limiter: SlidingWindowLimiter) -> SocketAddr {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
-        tokio::spawn(serve(socket, Arc::new(limiter)));
+        tokio::spawn(serve(socket, None, Arc::new(limiter)));
         addr
+    }
+
+    #[tokio::test]
+    async fn a_second_answer_comes_from_another_port() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let second = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+        let second_addr = second.local_addr().unwrap();
+        tokio::spawn(serve(socket, Some(second), Arc::new(SlidingWindowLimiter::new(10, 60))));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let nonce = [7u8; 8];
+        client.send_to(&build_request(nonce), addr).await.unwrap();
+        let mut from = Vec::new();
+        let mut buf = [0u8; 64];
+        for _ in 0..2 {
+            let (n, src) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf)).await.unwrap().unwrap();
+            assert_eq!(parse_response(&buf[..n]).unwrap().0, nonce);
+            from.push(src);
+        }
+        from.sort();
+        let mut want = vec![addr, second_addr];
+        want.sort();
+        assert_eq!(from, want);
     }
 
     #[tokio::test]

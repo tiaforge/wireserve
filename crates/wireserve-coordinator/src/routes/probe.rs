@@ -38,5 +38,6 @@ pub async fn probe(
     Json(wireserve_types::ProbeResponse {
         addr: client.ip.to_string(),
         reflexive_port: state.config.listen_addr.port(),
+        answers_twice: state.probe_udp.is_some(),
     })
 }

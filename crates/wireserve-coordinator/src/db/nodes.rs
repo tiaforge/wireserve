@@ -41,22 +41,19 @@ pub struct NodeRow {
     /// for other peers (`transit_approved_at IS NOT NULL`). The node's own
     /// `transit_capable` report counts for nothing without it.
     pub transit_approved: bool,
-    /// For a `kind=static` node, the node it routes through to reach
-    /// anything not written directly into its `.conf` (PLAN.md M24). `None`
-    /// for every agent node and for a static peer exported without one.
-    pub gateway_node_id: Option<i64>,
-    /// An admin's statement that nothing outside the mesh can dial this node,
-    /// whatever endpoint it advertises (PLAN.md #134). Read by `export-config`
-    /// only: a device exported with a gateway reaches this node through it
-    /// instead of holding a direct `[Peer]` for it. Deliberately absent from
-    /// `PeerInfo`, so no agent ever sees it.
-    pub export_via_gateway: bool,
+    /// For a `kind=static` node: the exit its full-tunnel profile names
+    /// (PLAN.md M27, M41). `None` for every agent and for a mesh-only export.
+    pub exit_node_id: Option<i64>,
+    /// For a `kind=static` node: when its `.conf` was last written.
+    pub exported_at: Option<DateTime<Utc>>,
+    /// When the node was created.
+    pub created_at: Option<DateTime<Utc>>,
+    /// For a `kind=static` node: its last export included the full-tunnel
+    /// profile, so `exit_node_id` is its exit (PLAN.md M27).
+    pub exit_enabled: bool,
     /// Its relay slot (PLAN.md M39): its relay port is the configured base
     /// plus this. `None` once every slot is taken.
     pub relay_slot: Option<u16>,
-    /// For a `kind=static` node: its last export included the full-tunnel
-    /// profile, so its gateway is its exit (PLAN.md M27).
-    pub exit_enabled: bool,
 }
 
 #[cfg(test)]
@@ -81,8 +78,9 @@ impl NodeRow {
             revoked: false,
             last_seen: None,
             transit_approved: false,
-            gateway_node_id: None,
-            export_via_gateway: false,
+            exit_node_id: None,
+            exported_at: None,
+            created_at: None,
             exit_enabled: false,
             relay_slot: None,
         }
@@ -110,11 +108,17 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
         revoked: row.get("revoked")?,
         last_seen: last_seen_str.and_then(|s| parse_dt(&s)),
         transit_approved: row.get::<_, Option<String>>("transit_approved_at")?.is_some(),
-        gateway_node_id: row.get("gateway_node_id")?,
-        export_via_gateway: row.get("export_via_gateway")?,
+        exit_node_id: row.get("exit_node_id")?,
+        exported_at: row.get::<_, Option<String>>("exported_at")?.and_then(|s| parse_dt(&s)),
+        created_at: row.get::<_, Option<String>>("created_at")?.and_then(|s| parse_sqlite_dt(&s)),
         exit_enabled: row.get("exit_enabled")?,
         relay_slot: row.get("relay_slot")?,
     })
+}
+
+/// `CURRENT_TIMESTAMP`'s `YYYY-MM-DD HH:MM:SS`, in UTC.
+fn parse_sqlite_dt(s: &str) -> Option<DateTime<Utc>> {
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok().map(|t| t.and_utc()).or_else(|| parse_dt(s))
 }
 
 fn parse_dt(s: &str) -> Option<DateTime<Utc>> {
@@ -456,105 +460,89 @@ pub fn set_transit_approved(conn: &Connection, node_id: i64, approved: bool) -> 
     Ok(())
 }
 
-/// Records which gateway a static peer routes through, and which peers were
-/// written into its `.conf` as direct `[Peer]` blocks, in one transaction
-/// (PLAN.md M24).
-///
-/// The two are written together because they are two halves of one fact: the
-/// conf's shape. `transit_via` is later derived from `conf_peer_ids` — it must
-/// name exactly the nodes *absent* from the conf — so a gateway recorded
-/// without its membership list, or vice versa, would misroute. Whether the
-/// export included a full-tunnel profile (PLAN.md M27) is the third half of
-/// the same fact, and is written with them.
-pub fn set_gateway(
+/// Records a static peer's export (PLAN.md M40, M41): its exit, if its
+/// full-tunnel profile names one, and the nodes it reaches through which
+/// carrier — all in one transaction, since together they are the shape of
+/// the `.conf` just handed out, which carriers and exits then act on.
+pub fn record_export(
     conn: &mut Connection,
     static_node_id: i64,
-    gateway_node_id: Option<i64>,
-    conf_peer_ids: &[i64],
-    exit: bool,
+    exit_node_id: Option<i64>,
+    relays: &[(i64, i64)],
 ) -> Result<(), DbError> {
     let tx = conn.transaction()?;
     tx.execute(
-        "UPDATE nodes SET gateway_node_id = ?1, exit_enabled = ?2 WHERE id = ?3",
-        rusqlite::params![gateway_node_id, exit && gateway_node_id.is_some(), static_node_id],
+        "UPDATE nodes SET exit_node_id = ?1, exit_enabled = ?2, exported_at = ?3 WHERE id = ?4",
+        rusqlite::params![exit_node_id, exit_node_id.is_some(), now_str(), static_node_id],
     )?;
-    tx.execute(
-        "DELETE FROM static_conf_peers WHERE static_node_id = ?1",
-        [static_node_id],
-    )?;
-    for peer_id in conf_peer_ids {
+    tx.execute("DELETE FROM static_relay_peers WHERE static_node_id = ?1", [static_node_id])?;
+    for (peer, carrier) in relays {
         tx.execute(
-            "INSERT INTO static_conf_peers (static_node_id, peer_node_id) VALUES (?1, ?2)",
-            rusqlite::params![static_node_id, peer_id],
+            "INSERT INTO static_relay_peers (static_node_id, peer_node_id, carrier_node_id) VALUES (?1, ?2, ?3)",
+            rusqlite::params![static_node_id, peer, carrier],
         )?;
     }
     tx.commit()?;
     Ok(())
 }
 
-/// Sets or clears [`NodeRow::export_via_gateway`]. Idempotent.
-///
-/// Left alone by `revoke` and `reissue_join_token`: whether the node can be
-/// dialled from outside is a fact about its network, not about its key.
-pub fn set_export_via_gateway(conn: &Connection, node_id: i64, enabled: bool) -> Result<(), DbError> {
+/// Every recorded relay: `(static_node_id, peer_node_id, carrier_node_id)`.
+pub fn all_static_relays(conn: &Connection) -> Result<Vec<(i64, i64, i64)>, DbError> {
+    let mut stmt = conn.prepare("SELECT static_node_id, peer_node_id, carrier_node_id FROM static_relay_peers")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// What was last seen of a carrier's public relay port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayPortRow {
+    pub carrier_node_id: i64,
+    pub port: u16,
+    pub address: String,
+    pub open: bool,
+    pub checked_at: Option<DateTime<Utc>>,
+}
+
+/// Records a port check's outcome, replacing the last one.
+pub fn record_relay_port(conn: &Connection, carrier: i64, port: u16, address: &str, open: bool) -> Result<(), DbError> {
     conn.execute(
-        "UPDATE nodes SET export_via_gateway = ?1 WHERE id = ?2",
-        rusqlite::params![enabled, node_id],
+        "INSERT INTO relay_ports (carrier_node_id, port, address, open, checked_at) VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT (carrier_node_id, port) DO UPDATE SET address = ?3, open = ?4, checked_at = ?5",
+        rusqlite::params![carrier, port, address, open, now_str()],
     )?;
     Ok(())
 }
 
-/// The static peers whose `.conf` a refresh would change after
-/// [`set_export_via_gateway`] flips to `enabled` for `node_id`, by name.
-///
-/// Turning it on affects every device with a gateway that holds `node_id` as
-/// a direct `[Peer]` (a device without a gateway has no other way to reach it,
-/// so its export keeps the direct entry). Turning it off affects every device that routes through a
-/// gateway and does *not* hold one, since its next export would add it — but
-/// only the first group is broken meanwhile; the second keeps working through
-/// the gateway until it is refreshed.
-pub fn static_nodes_affected_by_via_gateway(
-    conn: &Connection,
-    node_id: i64,
-    enabled: bool,
-) -> Result<Vec<String>, DbError> {
-    let sql = if enabled {
-        "SELECT n.name FROM nodes n \
-         JOIN static_conf_peers c ON c.static_node_id = n.id \
-         WHERE c.peer_node_id = ?1 AND n.gateway_node_id IS NOT NULL ORDER BY n.name"
-    } else {
-        "SELECT n.name FROM nodes n \
-         WHERE n.kind = 'static' AND n.gateway_node_id IS NOT NULL AND n.gateway_node_id != ?1 \
-         AND NOT EXISTS (SELECT 1 FROM static_conf_peers c \
-                         WHERE c.static_node_id = n.id AND c.peer_node_id = ?1) \
-         ORDER BY n.name"
-    };
-    let mut stmt = conn.prepare(sql)?;
+/// Every recorded relay port.
+pub fn relay_ports(conn: &Connection) -> Result<Vec<RelayPortRow>, DbError> {
+    let mut stmt = conn.prepare("SELECT carrier_node_id, port, address, open, checked_at FROM relay_ports ORDER BY carrier_node_id, port")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(RelayPortRow {
+                carrier_node_id: r.get(0)?,
+                port: r.get(1)?,
+                address: r.get(2)?,
+                open: r.get(3)?,
+                checked_at: r.get::<_, String>(4).ok().and_then(|s| parse_dt(&s)),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The static nodes that depend on `node_id` — as their exit, or as the
+/// carrier of one of their relays — by name. Used to warn on lifecycle
+/// operations that would strand them.
+pub fn static_nodes_depending_on(conn: &Connection, node_id: i64) -> Result<Vec<String>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT name FROM nodes WHERE exit_node_id = ?1 \
+         UNION SELECT n.name FROM nodes n JOIN static_relay_peers r ON r.static_node_id = n.id \
+         WHERE r.carrier_node_id = ?1 ORDER BY 1",
+    )?;
     let rows = stmt
         .query_map([node_id], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
-}
-
-/// Every `(static_node_id, peer_node_id)` pair recorded by [`set_gateway`].
-pub fn all_static_conf_peers(conn: &Connection) -> Result<Vec<(i64, i64)>, DbError> {
-    let mut stmt =
-        conn.prepare("SELECT static_node_id, peer_node_id FROM static_conf_peers")?;
-    let rows = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
-}
-
-/// The static nodes that route through `gateway_node_id`, by name. Used to
-/// refuse or warn on lifecycle operations that would strand them.
-pub fn static_nodes_using_gateway(
-    conn: &Connection,
-    gateway_node_id: i64,
-) -> Result<Vec<String>, DbError> {
-    let mut stmt = conn.prepare("SELECT name FROM nodes WHERE gateway_node_id = ?1 ORDER BY name")?;
-    let rows = stmt
-        .query_map([gateway_node_id], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -1053,50 +1041,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn export_via_gateway_is_off_by_default_and_survives_revoke_and_rejoin() {
+    async fn an_export_records_its_exit_and_relays_and_replaces_the_last_one() {
         let db = test_db();
-        let conn = db.conn.lock().await;
-        let id = create_node(&conn, "n1", NodeKind::Agent, "joinhash1", None).unwrap();
-        register(&conn, id, "pk1", "bearer1");
-        assert!(!find_by_id(&conn, id).unwrap().unwrap().export_via_gateway);
+        let mut conn = db.conn.lock().await;
+        let exit = create_node(&conn, "exit", NodeKind::Agent, "h-exit", None).unwrap();
+        let home = create_node(&conn, "home", NodeKind::Agent, "h-home", None).unwrap();
+        let phone = create_node(&conn, "phone", NodeKind::Static, "h-phone", None).unwrap();
+        record_export(&mut conn, phone, Some(exit), &[(home, exit)]).unwrap();
+        let row = find_by_id(&conn, phone).unwrap().unwrap();
+        assert_eq!((row.exit_node_id, row.exit_enabled), (Some(exit), true));
+        assert!(row.exported_at.is_some());
+        assert_eq!(all_static_relays(&conn).unwrap(), [(phone, home, exit)]);
+        assert_eq!(static_nodes_depending_on(&conn, exit).unwrap(), ["phone"]);
 
-        set_export_via_gateway(&conn, id, true).unwrap();
-        set_export_via_gateway(&conn, id, true).unwrap();
-        assert!(find_by_id(&conn, id).unwrap().unwrap().export_via_gateway);
-
-        // Whether the node can be dialled from outside is about its network,
-        // not its key: neither a new key nor a revoke changes that.
-        reissue_join_token(&conn, id, "joinhash2", None).unwrap();
-        assert!(find_by_id(&conn, id).unwrap().unwrap().export_via_gateway);
-        revoke(&conn, id).unwrap();
-        assert!(find_by_id(&conn, id).unwrap().unwrap().export_via_gateway);
-
-        set_export_via_gateway(&conn, id, false).unwrap();
-        set_export_via_gateway(&conn, id, false).unwrap();
-        assert!(!find_by_id(&conn, id).unwrap().unwrap().export_via_gateway);
+        record_export(&mut conn, phone, None, &[]).unwrap();
+        let row = find_by_id(&conn, phone).unwrap().unwrap();
+        assert_eq!((row.exit_node_id, row.exit_enabled), (None, false));
+        assert!(all_static_relays(&conn).unwrap().is_empty());
+        assert!(static_nodes_depending_on(&conn, exit).unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn via_gateway_names_the_devices_a_refresh_would_change() {
+    async fn a_relay_port_check_is_recorded_and_replaced() {
         let db = test_db();
-        let mut conn = db.conn.lock().await;
-        let gw = create_node(&conn, "gw", NodeKind::Agent, "h-gw", None).unwrap();
-        let home = create_node(&conn, "home", NodeKind::Agent, "h-home", None).unwrap();
-        let dials = create_node(&conn, "dials-home", NodeKind::Static, "h-p1", None).unwrap();
-        let routed = create_node(&conn, "routed", NodeKind::Static, "h-p2", None).unwrap();
-        let no_gw = create_node(&conn, "no-gateway", NodeKind::Static, "h-p3", None).unwrap();
-        set_gateway(&mut conn, dials, Some(gw), &[home], false).unwrap();
-        set_gateway(&mut conn, routed, Some(gw), &[], false).unwrap();
-        set_gateway(&mut conn, no_gw, None, &[gw, home], false).unwrap();
-
-        // On: only a device that both dials `home` and has a gateway to fall
-        // back on. The gateway-less one keeps its direct entry regardless.
-        assert_eq!(static_nodes_affected_by_via_gateway(&conn, home, true).unwrap(), vec!["dials-home"]);
-        // Off: devices that reach `home` through a gateway today and would
-        // get a direct entry on their next export.
-        assert_eq!(static_nodes_affected_by_via_gateway(&conn, home, false).unwrap(), vec!["routed"]);
-        // A device's own gateway is never a direct entry to add or remove.
-        assert!(static_nodes_affected_by_via_gateway(&conn, gw, false).unwrap().is_empty());
+        let conn = db.conn.lock().await;
+        let carrier = create_node(&conn, "c", NodeKind::Agent, "h-c", None).unwrap();
+        record_relay_port(&conn, carrier, 41003, "203.0.113.7", false).unwrap();
+        record_relay_port(&conn, carrier, 41003, "203.0.113.7", true).unwrap();
+        let rows = relay_ports(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].open && rows[0].checked_at.is_some());
+        assert_eq!(rows[0].address, "203.0.113.7");
     }
 
     #[tokio::test]

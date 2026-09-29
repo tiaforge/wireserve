@@ -4,7 +4,7 @@
 //! and keeping it here avoids a cross-crate trait-orphan problem if
 //! anything else ever needs to reference `ServiceRule`.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv4Addr;
 
 use crate::ports::PortMap;
 
@@ -34,29 +34,6 @@ pub enum ServiceRule {
     Terminated { vip: Ipv4Addr, map: PortMap, port: u16, sources: Sources },
 }
 
-/// One side of an active [`TransitForward`] pairing (PLAN.md M23): every
-/// address that side's peer entry — plus its owned service VIPs — routes
-/// to, gathered agent-side from the same poll response's `PeerInfo`/
-/// `ServiceInfo` entries.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TransitEndpoint {
-    pub ip4: Option<Ipv4Addr>,
-    pub ip6: Option<Ipv6Addr>,
-    pub vips: Vec<Ipv4Addr>,
-}
-
-/// One active transit pairing this node must forward IP traffic between,
-/// as this node's own kernel forwarding/firewall rules — never a rewrite,
-/// unlike [`ServiceRule::Mapped`] (PLAN.md M23: this node is B, decrypting
-/// and re-encrypting an ordinary connection between two other peers, not
-/// terminating or rewriting it). Crosses the [`FirewallBackend`] trait
-/// boundary the same way [`ServiceRule`] does.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TransitForward {
-    pub near: TransitEndpoint,
-    pub far: TransitEndpoint,
-}
-
 /// One side of a relayed pair (PLAN.md M39), as its carrier sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelayEnd {
@@ -67,6 +44,16 @@ pub struct RelayEnd {
     pub relay_port: u16,
     /// The listen port of its carry interface, where the session ends.
     pub carry_port: u16,
+}
+
+/// A node this node relays phones to (PLAN.md M40): UDP arriving from the
+/// internet at `port` goes on to `to:to_port`, the node's own WireGuard
+/// port, leaving this node from its mesh address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicRelay {
+    pub port: u16,
+    pub to: Ipv4Addr,
+    pub to_port: u16,
 }
 
 /// A pair whose end-to-end session this node relays (PLAN.md M39): UDP
@@ -106,19 +93,34 @@ impl ServiceRule {
 /// which cycle they reflect.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Forwarding {
-    /// Active transit pairs (PLAN.md M23) — empty whenever this node
-    /// currently carries none, whether or not it has opted in.
-    pub transit: Vec<TransitForward>,
     /// Pairs this node relays end to end (PLAN.md M39). Needs `relay_self`.
     pub relay: Vec<RelayForward>,
     /// This node's own mesh address, which relayed packets arrive at and
     /// leave from. Without it no relay rule is written.
     pub relay_self: Option<Ipv4Addr>,
     /// UDP ports of this node's own WireGuard interfaces that relayed
-    /// sessions arrive at through the mesh interface (PLAN.md M39): the
-    /// carry interface's listen port. WireGuard authenticates every packet
-    /// on them, so letting the mesh send there opens nothing else.
+    /// sessions arrive at through the mesh interface (PLAN.md M39, M40):
+    /// the carry interface's listen port, and the mesh interface's own for
+    /// a phone relayed through a carrier's public port. WireGuard
+    /// authenticates every packet on them, so letting the mesh send there
+    /// opens nothing else.
     pub relay_ends: Vec<u16>,
+    /// Nodes this node relays phones to (PLAN.md M40): what arrives on
+    /// `relay_public_iface` at one of their relay ports goes on to them.
+    pub relay_public: Vec<PublicRelay>,
+    /// The interface phones reach this node's public address on — the one
+    /// its default route leaves by. `None` writes no public relay rules.
+    pub relay_public_iface: Option<String>,
+    /// Every relay port, and the ports relayed phone sessions leave this
+    /// node from, as two inclusive ranges. The first is closed to anything
+    /// not relayed on every interface but the mesh's, so a packet that
+    /// arrives before its relay rule is dropped rather than tracked — and
+    /// then kept alive untranslated by its sender's keepalives. Checked
+    /// ports (`relay_checks`) are left open for their check.
+    pub relay_ranges: Option<((u16, u16), (u16, u16))>,
+    /// Relay ports under a port check right now, which a listener of the
+    /// agent's own answers.
+    pub relay_checks: Vec<u16>,
     /// Interfaces whose IPv4 forwarding this agent turned on so replies
     /// from a service's target address can reach the mesh (PLAN.md M26).
     /// Nothing else may be forwarded from them: before the agent turned

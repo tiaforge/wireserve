@@ -151,6 +151,10 @@ pub async fn poll(
         .collect();
     state.transit.report_capabilities(&self_pubkey, &capabilities);
     state.transit.report_carry_port(&self_pubkey, req.carry_port);
+    state.transit.report_dialable(&self_pubkey, req.dialable_v4);
+    let seen: Vec<wireserve_types::PortCheck> =
+        req.port_checks_seen.iter().take(wireserve_types::MAX_PORT_CHECKS_PER_POLL).cloned().collect();
+    state.transit.record_seen(&self_pubkey, &seen);
 
     // Same observed-source-address fallback as `/register` (spec §4.2),
     // re-applied on every poll rather than frozen at join time — see
@@ -292,42 +296,6 @@ pub async fn poll(
         .map(|n| directory::peer_info(n, state.config.online_threshold_secs, state.config.relay_port_base))
         .collect();
 
-    // Second pass (PLAN.md M23): `transit_via` is requester-relative —
-    // "how THIS polling node should reach each peer" — which
-    // `directory::peer_info` structurally can't express on its own.
-    // `GET /admin/peers` deliberately skips this and leaves it always
-    // `None`: an admin isn't "a requester" polling on behalf of a
-    // specific node, so there is no requester to compute it relative to.
-    //
-    // Gateway routing for static peers (PLAN.md M24) is computed here too,
-    // and takes precedence. It is DB-driven and deliberately bypasses
-    // `either_wants`/`select`: a static peer never polls, so it can never
-    // file a `TransitState` report and the dynamic path can structurally
-    // never fire for one. The precedence is made explicit rather than left
-    // resting on that — the dynamic branch below assigns unconditionally,
-    // so an assignment made here must not be reachable by it.
-    let conf_peers: std::collections::HashSet<(i64, i64)> =
-        nodes::all_static_conf_peers(&conn)?.into_iter().collect();
-    let live_by_id: std::collections::HashMap<i64, &nodes::NodeRow> =
-        all_peers.iter().map(|n| (n.id, n)).collect();
-
-    // The gateway a node routes through, *if* it can still serve as one.
-    // `all_peers` is already filtered to registered, non-revoked nodes, so
-    // presence in `live_by_id` covers revoke and delete; approval is checked
-    // on top so `deny-transit` takes effect on the next poll rather than
-    // waiting for anything to be re-exported.
-    //
-    // Resolving this live, instead of trusting the stored id, is what keeps a
-    // withdrawn gateway from erasing the phone: `wg::desired_peers` drops a
-    // transited peer's entry in pass 1 and only re-adds it folded into the
-    // via peer in pass 2, so a `transit_via` naming a node that is no longer
-    // in the directory leaves the phone with no entry anywhere. Falling back
-    // to `None` here degrades to an ordinary direct entry instead.
-    let gateway_id_of = |n: &nodes::NodeRow| -> Option<i64> {
-        let gw = live_by_id.get(&n.gateway_node_id?)?;
-        gw.transit_approved.then_some(gw.id)
-    };
-
     // End-to-end relaying (PLAN.md M39). A node takes part only while its
     // own latest poll says it can: a carry port, and the capability.
     let fresh = state.config.online_threshold_secs;
@@ -350,40 +318,19 @@ pub async fn poll(
         state.transit.select_where(a, c, fresh, &can_carry)
     };
 
-    for (peer, row) in peers.iter_mut().zip(all_peers.iter()) {
+    for peer in &mut peers {
         if peer.pubkey == self_pubkey {
-            continue;
-        }
-        if let Some(gw_id) = gateway_id_of(row) {
-            // The gateway itself terminates this peer's tunnel, so it keeps a
-            // direct entry and must never be told to route via itself.
-            if gw_id == node.id {
-                continue;
-            }
-            // Whoever was written into this device's `.conf` as a direct
-            // `[Peer]` also keeps a direct entry. Naming them here would make
-            // them drop the device while it still dials them — its /32 in the
-            // conf outranks the gateway's covering route, and WireGuard has
-            // no failover — which is a black hole, not a fallback.
-            if conf_peers.contains(&(row.id, node.id)) {
-                continue;
-            }
-            peer.transit_via = live_by_id.get(&gw_id).and_then(|g| g.pubkey.clone());
             continue;
         }
         peer.relay.via = relay_carrier(&self_pubkey, &peer.pubkey).filter(|via| via != &self_pubkey);
     }
 
-    // This requester's own carrier role this cycle (PLAN.md M23): every
-    // OTHER pair (x, y) — neither of them this requester — that wants
-    // transit help and for which `select` names this requester as `via`.
-    // A node discovers its own role as `via` purely from this list; it
-    // never appears via a bare `transit_via` on its own response (by
-    // construction, `select` only ever picks a node that already reaches
-    // both endpoints directly, so its own peer-a/peer-c entries never
-    // need routing help and so never carry `transit_via` themselves).
+    // This requester's own carrier role this cycle (PLAN.md M39): every
+    // OTHER pair (x, y) — neither of them this requester — for which
+    // `relay_carrier` names this requester. A carrier learns its role from
+    // this list alone: its own entries for x and y never carry a `via`,
+    // since it is only ever chosen when it reaches both directly.
     let all_pubkeys: Vec<&str> = all_peers.iter().filter_map(|n| n.pubkey.as_deref()).collect();
-    let mut transit_carrying: Vec<wireserve_types::TransitPair> = Vec::new();
     let mut relay_carrying = Vec::new();
     for (i, &x) in all_pubkeys.iter().enumerate() {
         if x == self_pubkey {
@@ -399,53 +346,38 @@ pub async fn poll(
         }
     }
 
-    // This requester's gateway role (PLAN.md M24), on the same wire field as
-    // M23's dynamic pairs: for every static peer routing through it, forward
-    // between that peer and everything the peer does not reach directly.
-    //
-    // Iterating all peers rather than only agents is what covers phone↔phone
-    // — a second static peer has no endpoint, so it is never in anyone's conf
-    // and always falls into this set. Pairs are normalised and de-duplicated
-    // because that case is reachable from both ends.
-    if node.transit_approved {
-        let mut gateway_pairs: std::collections::BTreeSet<(String, String)> =
-            std::collections::BTreeSet::new();
-        for client in all_peers.iter().filter(|n| gateway_id_of(n) == Some(node.id)) {
-            let Some(client_pk) = client.pubkey.as_deref() else { continue };
-            for other in &all_peers {
-                if other.id == client.id || other.id == node.id {
-                    continue;
-                }
-                if conf_peers.contains(&(client.id, other.id)) {
-                    continue;
-                }
-                let Some(other_pk) = other.pubkey.as_deref() else { continue };
-                gateway_pairs.insert(if client_pk < other_pk {
-                    (client_pk.to_string(), other_pk.to_string())
-                } else {
-                    (other_pk.to_string(), client_pk.to_string())
-                });
-            }
-        }
-        for (a, c) in gateway_pairs {
-            if !transit_carrying.iter().any(|p| (p.a == a && p.c == c) || (p.a == c && p.c == a)) {
-                transit_carrying.push(wireserve_types::TransitPair { a, c });
-            }
-        }
-    }
+    // This requester's exit role (PLAN.md M27): the devices whose last export
+    // named it as their exit, while it is still approved — withdrawing the
+    // approval ends the exit on the same poll — and a revoked device leaves
+    // `all_peers`. Whether the node itself still offers is its own
+    // business: the agent acts on this only while `exit on`.
+    let exit_clients: Vec<String> = if node.transit_approved {
+        all_peers
+            .iter()
+            .filter(|n| n.exit_enabled && n.exit_node_id == Some(node.id))
+            .filter_map(|n| n.pubkey.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
 
-    // This requester's exit role (PLAN.md M27): the devices routing through
-    // it whose last export included the full-tunnel profile. Derived through
-    // `gateway_id_of`, so a gateway that stops qualifying — revoked, deleted,
-    // transit approval withdrawn — loses its exit clients on the same poll
-    // it loses its gateway clients, and a revoked device leaves `all_peers`.
-    // Whether the node itself still offers is its own business: the agent
-    // acts on this only while `exit on`.
-    let exit_clients: Vec<String> = all_peers
-        .iter()
-        .filter(|n| n.exit_enabled && gateway_id_of(n) == Some(node.id))
-        .filter_map(|n| n.pubkey.clone())
-        .collect();
+    // This requester's public relays (PLAN.md M40): the nodes devices reach
+    // through its public address, from their exports — only while it is
+    // approved to carry, and only nodes still in the directory.
+    let relay_public: Vec<String> = if node.transit_approved {
+        let live: std::collections::HashMap<i64, &nodes::NodeRow> = all_peers.iter().map(|n| (n.id, n)).collect();
+        let mut dests: Vec<String> = nodes::all_static_relays(&conn)?
+            .into_iter()
+            .filter(|(device, _, carrier)| *carrier == node.id && live.contains_key(device))
+            .filter_map(|(_, peer, _)| live.get(&peer)?.pubkey.clone())
+            .collect();
+        dests.sort();
+        dests.dedup();
+        dests
+    } else {
+        Vec::new()
+    };
+    let port_checks = state.transit.checks_for(&self_pubkey);
 
     let tls_ready = crate::db::tls::ready(&conn)?;
     let ctx = state.directory_context(&tls_ready);
@@ -513,8 +445,10 @@ pub async fn poll(
         services,
         pending_services: outcome.pending.iter().map(directory::pending_service).collect(),
         denied_services: outcome.denied.iter().map(directory::denied_service).collect(),
-        transit_carrying,
         relay_carrying,
+        relay_public,
+        relay_port_base: Some(state.config.relay_port_base),
+        port_checks,
         transit_awaiting_approval,
         exit_clients,
         mesh: Some(state.config.mesh_info()),

@@ -246,6 +246,18 @@ AGENT2_MESH=$(mesh_ip_of "$AGENT1" node2)
 echo "node1 mesh address: $AGENT1_MESH"
 echo "node2 mesh address: $AGENT2_MESH"
 
+log "each node tested whether it is dialable from outside (PLAN.md M40)"
+# The coordinator answers the startup probe a second time from a port the
+# node never sent to: only a NAT or firewall that lets unsolicited traffic
+# in delivers it. agent1 has a port-forward and agent2 an endpoint-
+# independent mapping; agent3's symmetric NAT drops it.
+PEERS=$(podman exec "$COORD" wireserve-admin list-peers)
+for want in "node1:yes" "node2:yes" "node3:no"; do
+    echo "$PEERS" | grep "^${want%%:*}	" | grep -q "dialable=${want#*:}" \
+        || { echo "$PEERS"; fail "${want%%:*} should report dialable=${want#*:}"; }
+done
+pass "the port-forwarded and endpoint-independent nodes are dialable, the symmetric one is not"
+
 log "declaring a service on each of agent1 and agent2"
 podman exec "$AGENT1" wireserve serve svc-one 12345
 podman exec "$AGENT2" wireserve serve svc-two 12345

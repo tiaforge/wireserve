@@ -210,13 +210,8 @@ pub fn cmd_node_access(client: &AdminClient, node: &str) -> Result<wireserve_typ
     Ok(client.node_access(node)?)
 }
 
-pub fn cmd_set_via_gateway(
-    client: &AdminClient,
-    name: &str,
-    enabled: bool,
-) -> Result<wireserve_types::SetViaGatewayResponse, CliError> {
-    validate_name(name)?;
-    Ok(client.set_via_gateway(name, enabled)?)
+pub fn cmd_relay_ports(client: &AdminClient) -> Result<wireserve_types::RelayPortsResponse, CliError> {
+    Ok(client.relay_ports()?)
 }
 
 pub fn cmd_export_config(
@@ -226,8 +221,8 @@ pub fn cmd_export_config(
     opts: &export_config::ExportOptions<'_>,
 ) -> Result<export_config::Exported, CliError> {
     validate_name(name)?;
-    if let Some(gateway) = opts.gateway {
-        validate_name(gateway)?;
+    if let Some(exit) = opts.exit.filter(|e| !e.is_empty()) {
+        validate_name(exit)?;
     }
     Ok(export_config::run(admin_client, node_facing_url, name, opts)?)
 }
@@ -242,8 +237,8 @@ pub fn cmd_export_config_refresh(
     opts: &export_config::ExportOptions<'_>,
 ) -> Result<export_config::Exported, CliError> {
     validate_name(name)?;
-    if let Some(gateway) = opts.gateway {
-        validate_name(gateway)?;
+    if let Some(exit) = opts.exit.filter(|e| !e.is_empty()) {
+        validate_name(exit)?;
     }
     Ok(export_config::run_refresh(admin_client, node_facing_url, name, opts)?)
 }

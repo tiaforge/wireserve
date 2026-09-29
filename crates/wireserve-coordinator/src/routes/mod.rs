@@ -63,14 +63,9 @@ pub fn admin_router(state: AppState) -> Router {
             post(admin::approve_transit),
         )
         .route("/admin/nodes/{name}/transit/deny", post(admin::deny_transit))
-        .route(
-            "/admin/nodes/{name}/gateway",
-            axum::routing::put(admin::set_gateway),
-        )
-        .route(
-            "/admin/nodes/{name}/via-gateway",
-            axum::routing::put(admin::set_via_gateway),
-        )
+        .route("/admin/nodes/{name}/export", axum::routing::put(admin::record_export))
+        .route("/admin/relays/plan", post(admin::relay_plan))
+        .route("/admin/relay-ports", get(admin::relay_ports))
         .route("/admin/peers", get(admin::list_peers))
         .route("/admin/services", get(admin::list_services))
         .route("/admin/groups", get(admin::list_groups).post(admin::create_group))

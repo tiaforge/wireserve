@@ -568,9 +568,15 @@ async fn cmd_daemon(
     // run even on a node with working IPv6: its IPv4-only peers can't use
     // that, and without this address can't reach it at all (PLAN.md
     // decisions log #207).
-    let own_reflexive_addr =
-        wireserve_agent::reflexive::learn_reflexive_addr(&coordinator_url, listen_port, wireserve_agent::reflexive::PROBE_TIMEOUT).await;
-    tracing::info!(reflexive_addr = ?own_reflexive_addr, "one-shot reflexive-address probe");
+    //
+    // The same probe tells whether this node is dialable from outside
+    // (PLAN.md M40), from whether the coordinator's second answer, from a
+    // port this node never sent to, gets in.
+    let learned =
+        wireserve_agent::reflexive::learn(&coordinator_url, listen_port, wireserve_agent::reflexive::PROBE_TIMEOUT).await;
+    let own_reflexive_addr = learned.addr;
+    let own_dialable_v4 = learned.dialable;
+    tracing::info!(reflexive_addr = ?own_reflexive_addr, dialable = ?own_dialable_v4, "one-shot reflexive-address probe");
 
     // Where the interop restores our own table from, if something else on
     // the host removes it (see `nftables::SharedRuleset`).
@@ -629,6 +635,8 @@ async fn cmd_daemon(
         .build()?;
     // The TLS terminator's own socket (PLAN.md M33).
     let tls_link = Arc::new(wireserve_agent::tls_link::TlsLink::default());
+    // Relay port checks (PLAN.md M40).
+    let port_checks = Arc::new(wireserve_agent::port_check::PortChecker::default());
     let tls_socket_path = instance.tls_socket_path();
     {
         let ctx = wireserve_agent::ipc::tls::TlsContext {
@@ -703,6 +711,8 @@ async fn cmd_daemon(
                 tokio::select! {
                     _ = interval.tick() => {}
                     () = tls_link.wake.notified() => tokio::time::sleep(Duration::from_secs(1)).await,
+                    // A port check answered: the coordinator is waiting on it.
+                    () = port_checks.wake.notified() => {}
                 }
             } => {
                 let mut ctx = poll_loop::PollContext {
@@ -716,6 +726,8 @@ async fn cmd_daemon(
                     endpoint_tracker: &mut endpoint_tracker,
                     own_reflexive_addr: own_reflexive_addr.as_deref(),
                     tls: Some(&tls_link),
+                    own_dialable_v4,
+                    port_checks: Some(&port_checks),
                 };
                 let result = poll_loop::run_once(&mut ctx, &shared_state).await;
                 // Safety net for host-firewall changes the interop's own

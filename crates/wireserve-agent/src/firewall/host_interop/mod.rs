@@ -396,7 +396,7 @@ mod tests {
         assert_eq!(forward_rules(), 0, "a node that never opted in opens nothing in FORWARD");
 
         // `wireserve transit on` — no restart.
-        interop.tick(ForwardWanted { transit: true, services: false, exit: false });
+        interop.tick(ForwardWanted { transit: true, services: false, exit: false, relay: false });
         wait_for("forward hook opened after opting in", Duration::from_secs(5), || {
             forward_rules() == 1
         });
@@ -493,8 +493,8 @@ mod tests {
         // check nothing is being rewritten any more.
         std::thread::sleep(Duration::from_millis(1500));
         let settled = sh("nft -a list ruleset");
-        a.tick(ForwardWanted { transit: true, services: false, exit: false });
-        b.tick(ForwardWanted { transit: true, services: false, exit: false });
+        a.tick(ForwardWanted { transit: true, services: false, exit: false, relay: false });
+        b.tick(ForwardWanted { transit: true, services: false, exit: false, relay: false });
         std::thread::sleep(Duration::from_millis(1500));
         assert_eq!(sh("nft -a list ruleset"), settled, "rules were rewritten: the agents are fighting");
         assert_eq!((count("wireserve0"), count("wireserve1")), (2, 2));

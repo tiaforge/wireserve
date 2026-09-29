@@ -275,17 +275,31 @@ async fn rejoin_node(
     }))
 }
 
-async fn set_gateway(
+async fn record_export(
     State(state): State<MockState>,
     headers: HeaderMap,
     Path(name): Path<String>,
     body: Bytes,
 ) -> Result<StatusCode, StatusCode> {
-    record(&state, "PUT", &format!("/admin/nodes/{name}/gateway"), &body);
+    record(&state, "PUT", &format!("/admin/nodes/{name}/export"), &body);
     if !admin_auth_ok(&state, &headers) {
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(StatusCode::OK)
+}
+
+/// Every peer dialled directly: the mock has no carriers.
+async fn relay_plan(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<wireserve_types::RelayPlan>, StatusCode> {
+    record(&state, "POST", "/admin/relays/plan", &body);
+    if !admin_auth_ok(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let direct = state.peers.lock().unwrap().iter().map(|p| p.name.clone()).collect();
+    Ok(Json(wireserve_types::RelayPlan { direct, ..Default::default() }))
 }
 
 async fn list_peers(
@@ -297,15 +311,7 @@ async fn list_peers(
         return Err(StatusCode::UNAUTHORIZED);
     }
     let peers = state.peers.lock().unwrap().clone();
-    Ok(Json(AdminPeersResponse {
-        peers,
-        transit_approved: vec![],
-        transit_offering: vec![],
-        via_gateway: vec![],
-        exit_offering: vec![],
-        exit_devices: vec![],
-        tags: state.tags.lock().unwrap().clone(),
-    }))
+    Ok(Json(AdminPeersResponse { peers, tags: state.tags.lock().unwrap().clone(), ..Default::default() }))
 }
 
 async fn approve_transit(
@@ -330,19 +336,6 @@ async fn deny_transit(
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(StatusCode::OK)
-}
-
-async fn set_via_gateway(
-    State(state): State<MockState>,
-    headers: HeaderMap,
-    Path(name): Path<String>,
-    body: Bytes,
-) -> Result<Json<wireserve_types::SetViaGatewayResponse>, StatusCode> {
-    record(&state, "PUT", &format!("/admin/nodes/{name}/via-gateway"), &body);
-    if !admin_auth_ok(&state, &headers) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    Ok(Json(wireserve_types::SetViaGatewayResponse { affected_devices: vec!["phone".into()] }))
 }
 
 async fn register(
@@ -373,8 +366,8 @@ fn admin_only_routes() -> Router<MockState> {
         )
         .route("/admin/nodes/{name}/transit/approve", post(approve_transit))
         .route("/admin/nodes/{name}/transit/deny", post(deny_transit))
-        .route("/admin/nodes/{name}/gateway", axum::routing::put(set_gateway))
-        .route("/admin/nodes/{name}/via-gateway", axum::routing::put(set_via_gateway))
+        .route("/admin/nodes/{name}/export", axum::routing::put(record_export))
+        .route("/admin/relays/plan", post(relay_plan))
         .route("/admin/peers", get(list_peers))
         .route("/admin/services", get(list_services))
         .route(

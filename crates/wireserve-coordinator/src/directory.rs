@@ -30,15 +30,10 @@ pub fn peer_info(node: &NodeRow, online_threshold_secs: i64, relay_base: u16) ->
         lan_addr: node.lan_addr.clone(),
         reflexive_addr: node.reflexive_addr.clone(),
         last_handshake: if recent { node.last_seen } else { None },
-        // Requester-relative (PLAN.md M23) — a single-peer function
-        // structurally can't express it. Filled by a second pass in
-        // `routes/poll.rs`, once the requester is known; left `None`
-        // here and (deliberately) by `GET /admin/peers`, which has no
-        // requester to compute it relative to.
-        transit_via: None,
         // The carry port and carrier are live facts, filled in by `/poll`.
         relay: wireserve_types::PeerRelay {
             port: wireserve_types::relay_port(relay_base, node.relay_slot),
+            listen_port: node.listen_port.and_then(|p| u16::try_from(p).ok()),
             ..Default::default()
         },
     }
@@ -186,8 +181,9 @@ mod tests {
             revoked: false,
             last_seen,
             transit_approved: false,
-            gateway_node_id: None,
-            export_via_gateway: false,
+            exit_node_id: None,
+            exported_at: None,
+            created_at: None,
             exit_enabled: false,
             relay_slot: None,
         }

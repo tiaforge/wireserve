@@ -130,18 +130,16 @@ pub async fn revoke_node(
     }
     // Nor its word that it serves anything with TLS (PLAN.md M33).
     crate::db::tls::clear_node(&conn, node.id)?;
-    // PLAN.md M24: warn, never refuse. Revoking is how a compromised node is
-    // cut off, so it must not be blockable by a routing dependency — and it
-    // degrades safely, because `/poll` resolves a gateway against the live
-    // directory and falls back to direct entries when it is gone.
-    let dependents = nodes::static_nodes_using_gateway(&conn, node.id)?;
+    // Warn, never refuse. Revoking is how a compromised node is cut off, so
+    // it must not be blockable by a device depending on it — and it degrades
+    // safely: an exit or carrier that is revoked simply stops forwarding.
+    let dependents = nodes::static_nodes_depending_on(&conn, node.id)?;
     if !dependents.is_empty() {
         tracing::warn!(
-            event = "gateway_revoked_with_dependents",
+            event = "revoked_with_dependents",
             node_name = %name,
             dependents = %dependents.join(","),
-            "revoked node was the gateway for these devices; they now reach only \
-             the peers written directly into their config until re-exported"
+            "revoked node was the exit or a carrier for these devices; re-export them"
         );
     }
     tracing::info!(event = "node_revoked", node_name = %name);
@@ -167,17 +165,14 @@ pub async fn delete_node(
             "node is still active — revoke it first, then delete".into(),
         ));
     }
-    // PLAN.md M24. The FK would set `gateway_node_id` back to NULL on its
-    // own, so nothing dangles — but the devices routing through this node
-    // would silently lose every path they do not hold a direct `[Peer]` for,
-    // and nothing would say so. Refusing is the same shape as the guard just
-    // above, and deleting a node is never the urgent operation: `revoke`
-    // already cut it off.
-    let dependents = nodes::static_nodes_using_gateway(&conn, node.id)?;
+    // The foreign keys would clear the references on their own, so nothing
+    // dangles — but the devices that use this node as their exit or carrier
+    // would silently lose that, and nothing would say so. Deleting is never
+    // the urgent operation: `revoke` already cut the node off.
+    let dependents = nodes::static_nodes_depending_on(&conn, node.id)?;
     if !dependents.is_empty() {
         return Err(AppError::Conflict(format!(
-            "node is the gateway for {}: re-export {} against another gateway first, \
-             or clear the assignment",
+            "node is the exit or a carrier for {}: re-export {} first",
             dependents.join(", "),
             if dependents.len() == 1 { "it" } else { "them" },
         )));
@@ -767,115 +762,281 @@ pub async fn deny_service(
     }
 }
 
-/// `PUT /admin/nodes/{name}/gateway` (PLAN.md M24).
+/// `PUT /admin/nodes/{name}/export` (PLAN.md M40, M41).
 ///
-/// Records the shape of a static peer's exported `.conf`: which node it
-/// routes through, and which peers it holds direct `[Peer]` blocks for.
-/// `/poll` derives `transit_via` from exactly this, so the two can never
-/// disagree about a device's routing.
-pub async fn set_gateway(
+/// Records the shape of a static peer's exported `.conf`: its exit, and the
+/// nodes it reaches through which carrier. The exit then sends on exactly
+/// this device's traffic, and each carrier forwards exactly these relays.
+pub async fn record_export(
     State(state): State<AppState>,
     _admin: AdminAuth,
     Path(name): Path<String>,
-    Json(body): Json<wireserve_types::SetGatewayRequest>,
+    Json(body): Json<wireserve_types::ExportRecord>,
 ) -> Result<(), AppError> {
     let mut conn = state.db.conn.lock().await;
     let node = nodes::find_by_name(&conn, &name)?.ok_or(AppError::NotFound)?;
     if node.kind != wireserve_types::NodeKind::Static {
-        return Err(AppError::BadRequest(
-            "only a kind=static node routes through a gateway; an agent reaches peers itself"
-                .into(),
-        ));
+        return Err(AppError::BadRequest("only a kind=static node has an exported config".into()));
     }
-
-    let gateway_id = match &body.gateway {
+    let fresh = state.config.online_threshold_secs;
+    let agent = |conn: &rusqlite::Connection, what: &str, n: &str| -> Result<nodes::NodeRow, AppError> {
+        let row = nodes::find_by_name(conn, n)?.ok_or_else(|| AppError::BadRequest(format!("no such node '{n}' ({what})")))?;
+        if row.kind != wireserve_types::NodeKind::Agent || row.revoked || row.pubkey.is_none() {
+            return Err(AppError::BadRequest(format!("'{n}' is not a registered agent, so it cannot be a device's {what}")));
+        }
+        Ok(row)
+    };
+    // The device's half of the exit consent is this export; the exit's own
+    // half is `exit on`, and the admin's is the transit approval — checked
+    // here as well as by the CLI, so a hand-made request cannot record a
+    // profile nothing forwards (PLAN.md M27).
+    let exit_id = match &body.exit {
         None => None,
-        Some(gateway_name) => {
-            let gw = nodes::find_by_name(&conn, gateway_name)?.ok_or_else(|| {
-                AppError::BadRequest(format!("no such node '{gateway_name}' to use as a gateway"))
-            })?;
-            if gw.id == node.id {
-                return Err(AppError::BadRequest(
-                    "a node cannot be its own gateway".into(),
-                ));
-            }
-            if gw.kind != wireserve_types::NodeKind::Agent {
-                return Err(AppError::BadRequest(format!(
-                    "'{gateway_name}' is kind=static and never polls, so it cannot forward for anyone"
-                )));
-            }
-            // Gateway forwarding is transit forwarding: the carrier sees the
-            // traffic in the clear and can send as either end. It is gated on
-            // the same approval rather than a second one of its own.
-            if !gw.transit_approved {
+        Some(exit_name) => {
+            let exit = agent(&conn, "exit", exit_name)?;
+            if !exit.transit_approved {
                 return Err(AppError::Conflict(format!(
-                    "'{gateway_name}' is not approved to carry traffic — run \
-                     `wireserve-admin approve-transit {gateway_name}` first"
+                    "'{exit_name}' is not approved to send others' traffic on — run                      `wireserve-admin approve-transit {exit_name}` first"
                 )));
             }
-            // Approval alone is not enough to make forwarding actually work.
-            // The agent opens the *host* firewall's FORWARD hook from its own
-            // `transit_capable`, captured once when the daemon starts — so a
-            // node approved here but never switched on there would accept the
-            // forward in its own nftables table while ufw or firewalld still
-            // dropped it. That failure is invisible from every other node, so
-            // it is worth refusing up front rather than baking a dead gateway
-            // into a config that cannot be changed without re-exporting.
-            let offering = gw
-                .pubkey
-                .as_deref()
-                .is_some_and(|pk| state.transit.is_offering(pk, state.config.online_threshold_secs));
-            if !offering {
+            if !exit.pubkey.as_deref().is_some_and(|pk| state.transit.is_offering_exit(pk, fresh)) {
                 return Err(AppError::Conflict(format!(
-                    "'{gateway_name}' is approved but is not currently offering to carry \
-                     traffic — run `wireserve transit on` on it (and restart it, so it \
-                     reopens the host firewall's forward hook), then try again"
+                    "'{exit_name}' is not offering to be an exit — run `wireserve exit on` on it, then try again"
                 )));
             }
-            Some(gw.id)
+            Some(exit.id)
         }
     };
-
-    let mut conf_peer_ids = Vec::with_capacity(body.conf_peers.len());
-    for peer_name in &body.conf_peers {
-        let peer = nodes::find_by_name(&conn, peer_name)?.ok_or_else(|| {
-            AppError::BadRequest(format!("no such node '{peer_name}' in the config's peer list"))
-        })?;
-        conf_peer_ids.push(peer.id);
-    }
-
-    // The device's half of the exit consent is this export; the gateway's
-    // half is its own `exit on`, checked here as well as by the CLI so an
-    // older CLI or a hand-made request cannot record a profile nothing
-    // forwards (PLAN.md M27).
-    if body.exit {
-        let Some(gateway_name) = &body.gateway else {
-            return Err(AppError::BadRequest(
-                "a full-tunnel profile routes through the device's gateway; name one".into(),
-            ));
-        };
-        let gw = nodes::find_by_name(&conn, gateway_name)?.ok_or(AppError::NotFound)?;
-        let offering = gw
-            .pubkey
-            .as_deref()
-            .is_some_and(|pk| state.transit.is_offering_exit(pk, state.config.online_threshold_secs));
-        if !offering {
+    let mut relays = Vec::with_capacity(body.relays.len());
+    for r in &body.relays {
+        let peer = agent(&conn, "relayed node", &r.node)?;
+        let carrier = agent(&conn, "carrier", &r.carrier)?;
+        if !carrier.transit_approved {
             return Err(AppError::Conflict(format!(
-                "'{gateway_name}' is not offering to be an exit — run `wireserve exit on` \
-                 on it, then try again"
+                "'{}' is not approved to carry traffic — run `wireserve-admin approve-transit {}` first",
+                r.carrier, r.carrier
             )));
         }
+        if carrier.id == peer.id {
+            return Err(AppError::BadRequest(format!("'{}' cannot relay to itself", r.node)));
+        }
+        relays.push((peer.id, carrier.id));
     }
-
-    nodes::set_gateway(&mut conn, node.id, gateway_id, &conf_peer_ids, body.exit)?;
+    nodes::record_export(&mut conn, node.id, exit_id, &relays)?;
     tracing::info!(
-        event = "gateway_set",
+        event = "export_recorded",
         node_name = %name,
-        gateway = body.gateway.as_deref().unwrap_or("-"),
-        direct_peers = conf_peer_ids.len(),
-        exit = body.exit,
+        exit = body.exit.as_deref().unwrap_or("-"),
+        relays = relays.len(),
     );
     Ok(())
+}
+
+/// How long a port found open stays trusted before an export checks it
+/// again (PLAN.md M40).
+const RELAY_PORT_TRUSTED_DAYS: i64 = 30;
+/// How long an export waits for a port check: the carrier has to poll to
+/// learn of it, listen, and poll again to report it.
+const PORT_CHECK_WAIT: std::time::Duration = std::time::Duration::from_secs(50);
+
+/// A node's public IPv4 `ip`, from its endpoint, if it has a globally
+/// routable one — where a device off the mesh can reach it.
+fn public_v4(peer: &wireserve_types::PeerInfo) -> Option<std::net::Ipv4Addr> {
+    [peer.endpoint_addr_v4.as_deref(), peer.endpoint_addr.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|e| wireserve_types::is_globally_routable_endpoint(e))
+        .find_map(|e| e.parse::<std::net::SocketAddrV4>().ok().map(|a| *a.ip()))
+}
+
+/// `POST /admin/relays/plan` (PLAN.md M40): how a device exported now
+/// reaches each node, with every relay port it needs checked from outside
+/// first (or recently).
+///
+/// A node that reported itself dialable is dialled directly. One that
+/// reported it isn't gets a carrier: approved, offering, able to relay,
+/// itself dialable, with a public IPv4 address, and reaching the node right
+/// now — preferring one whose port for that node was already seen open,
+/// then one already serving devices, so as few ports as possible need
+/// opening. A node that never said either way (an older agent) is dialled
+/// directly if it has a public endpoint, as before.
+pub async fn relay_plan(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Json(body): Json<wireserve_types::RelayPlanRequest>,
+) -> Result<Json<wireserve_types::RelayPlan>, AppError> {
+    let fresh = state.config.online_threshold_secs;
+    let (rows, relays, ports) = {
+        let conn = state.db.conn.lock().await;
+        (nodes::list_all_peers(&conn)?, nodes::all_static_relays(&conn)?, nodes::relay_ports(&conn)?)
+    };
+    let infos: Vec<wireserve_types::PeerInfo> =
+        rows.iter().map(|n| crate::directory::peer_info(n, fresh, state.config.relay_port_base)).collect();
+    let agents: Vec<(&nodes::NodeRow, &wireserve_types::PeerInfo)> = rows
+        .iter()
+        .zip(&infos)
+        .filter(|(n, _)| n.kind == wireserve_types::NodeKind::Agent)
+        .collect();
+    let carriers: Vec<(&nodes::NodeRow, &wireserve_types::PeerInfo, std::net::Ipv4Addr)> = agents
+        .iter()
+        .filter(|(n, p)| {
+            n.transit_approved
+                && state.transit.is_offering(&p.pubkey, fresh)
+                && state.transit.has_capability(&p.pubkey, wireserve_types::CAP_RELAY, fresh)
+                && state.transit.dialable(&p.pubkey, fresh) == Some(true)
+        })
+        .filter_map(|(n, p)| Some((*n, *p, public_v4(p)?)))
+        .collect();
+    let serving: std::collections::HashSet<i64> = relays.iter().map(|(_, _, c)| *c).collect();
+    let now = chrono::Utc::now();
+    let trusted_open = |carrier: i64, port: u16, address: std::net::Ipv4Addr| {
+        ports.iter().any(|r| {
+            r.carrier_node_id == carrier
+                && r.port == port
+                && r.open
+                && r.address == address.to_string()
+                && r.checked_at.is_some_and(|t| (now - t).num_days() < RELAY_PORT_TRUSTED_DAYS)
+        })
+    };
+
+    let mut plan = wireserve_types::RelayPlan::default();
+    let mut to_check: Vec<(usize, i64, String, u16, std::net::SocketAddrV4)> = Vec::new();
+    for (node, peer) in &agents {
+        let dialable = state.transit.dialable(&peer.pubkey, fresh);
+        if dialable == Some(true) || (dialable.is_none() && public_v4(peer).is_some()) {
+            plan.direct.push(node.name.clone());
+            continue;
+        }
+        let (Some(port), Some(_)) = (peer.relay.port, peer.relay.listen_port) else {
+            plan.unreachable.push(wireserve_types::Unreachable {
+                node: node.name.clone(),
+                reason: "it has no relay port or no known listen port".into(),
+            });
+            continue;
+        };
+        let mut candidates: Vec<&(&nodes::NodeRow, &wireserve_types::PeerInfo, std::net::Ipv4Addr)> = carriers
+            .iter()
+            .filter(|(c, cp, _)| c.id != node.id && state.transit.reaches(&cp.pubkey, &peer.pubkey, fresh))
+            .collect();
+        candidates.sort_by_key(|(c, cp, addr)| (!trusted_open(c.id, port, *addr), !serving.contains(&c.id), cp.pubkey.clone()));
+        let Some((carrier, _, addr)) = candidates.first() else {
+            plan.unreachable.push(wireserve_types::Unreachable {
+                node: node.name.clone(),
+                reason: if dialable == Some(false) {
+                    "it isn't dialable from outside, and no approved carrier that relays, is itself \
+                     dialable and reaches it right now exists"
+                        .into()
+                } else {
+                    "it has no public endpoint".into()
+                },
+            });
+            continue;
+        };
+        let endpoint = format!("{addr}:{port}");
+        let open = trusted_open(carrier.id, port, *addr).then_some(true);
+        if open.is_none() {
+            to_check.push((plan.relayed.len(), carrier.id, carrier.pubkey.clone().unwrap_or_default(), port, std::net::SocketAddrV4::new(*addr, port)));
+        }
+        plan.relayed.push(wireserve_types::RelayPlanEntry { node: node.name.clone(), carrier: carrier.name.clone(), endpoint, open });
+    }
+
+    // Check every port that needs it, together.
+    if !to_check.is_empty() {
+        if let Some(socket) = state.probe_udp.clone() {
+            let nonces: Vec<[u8; 8]> =
+                to_check.iter().map(|(_, _, pk, port, _)| state.transit.start_check(pk, *port)).collect();
+            let deadline = tokio::time::Instant::now() + PORT_CHECK_WAIT;
+            loop {
+                let pending: Vec<usize> = (0..to_check.len())
+                    .filter(|i| state.transit.check_state(&to_check[*i].2, to_check[*i].3) != Some(crate::transit::CheckState::Seen))
+                    .collect();
+                if pending.is_empty() || tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                for i in &pending {
+                    let (_, _, pk, _, target) = &to_check[*i];
+                    if state.transit.check_state(pk, target.port()) == Some(crate::transit::CheckState::Listening) {
+                        let datagram = wireserve_types::reflexive::build_response(nonces[*i], *target);
+                        let _ = socket.send_to(&datagram, target);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            let conn = state.db.conn.lock().await;
+            for (entry, carrier_id, pk, port, target) in &to_check {
+                let open = match state.transit.check_state(pk, *port) {
+                    Some(crate::transit::CheckState::Seen) => Some(true),
+                    Some(crate::transit::CheckState::Listening) => Some(false),
+                    _ => None,
+                };
+                state.transit.finish_check(pk, *port);
+                if let Some(open) = open {
+                    nodes::record_relay_port(&conn, *carrier_id, *port, &target.ip().to_string(), open)?;
+                }
+                plan.relayed[*entry].open = open;
+            }
+        }
+    }
+    for entry in &plan.relayed {
+        if entry.open != Some(true) {
+            let port = entry.endpoint.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(0);
+            plan.closed.push(wireserve_types::RelayPortStatus {
+                carrier: entry.carrier.clone(),
+                address: entry.endpoint.rsplit_once(':').map(|(a, _)| a.to_string()),
+                port,
+                node: Some(entry.node.clone()),
+                devices: Vec::new(),
+                checked_at: None,
+                open: entry.open,
+            });
+        }
+    }
+    if !plan.closed.is_empty() && !body.allow_unverified {
+        tracing::info!(event = "relay_plan_ports_closed", ports = plan.closed.len());
+    }
+    Ok(Json(plan))
+}
+
+/// `GET /admin/relay-ports` (PLAN.md M40): every public relay port a
+/// carrier has had checked or has in use, what it leads to, which devices
+/// use it, and whether it was open.
+pub async fn relay_ports(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+) -> Result<Json<wireserve_types::RelayPortsResponse>, AppError> {
+    let conn = state.db.conn.lock().await;
+    let rows = nodes::list_all_peers(&conn)?;
+    let by_id: std::collections::HashMap<i64, &nodes::NodeRow> = rows.iter().map(|n| (n.id, n)).collect();
+    let port_of = |id: i64| by_id.get(&id).and_then(|n| wireserve_types::relay_port(state.config.relay_port_base, n.relay_slot));
+    let mut out: std::collections::BTreeMap<(String, u16), wireserve_types::RelayPortStatus> = std::collections::BTreeMap::new();
+    for r in nodes::relay_ports(&conn)? {
+        let Some(carrier) = by_id.get(&r.carrier_node_id) else { continue };
+        out.insert((carrier.name.clone(), r.port), wireserve_types::RelayPortStatus {
+            carrier: carrier.name.clone(),
+            address: Some(r.address.clone()),
+            port: r.port,
+            node: rows.iter().find(|n| port_of(n.id) == Some(r.port)).map(|n| n.name.clone()),
+            devices: Vec::new(),
+            checked_at: r.checked_at,
+            open: Some(r.open),
+        });
+    }
+    for (device, peer, carrier) in nodes::all_static_relays(&conn)? {
+        let (Some(d), Some(p), Some(c), Some(port)) = (by_id.get(&device), by_id.get(&peer), by_id.get(&carrier), port_of(peer)) else {
+            continue;
+        };
+        let entry = out.entry((c.name.clone(), port)).or_insert_with(|| wireserve_types::RelayPortStatus {
+            carrier: c.name.clone(),
+            address: None,
+            port,
+            node: Some(p.name.clone()),
+            devices: Vec::new(),
+            checked_at: None,
+            open: None,
+        });
+        entry.devices.push(d.name.clone());
+    }
+    Ok(Json(wireserve_types::RelayPortsResponse { ports: out.into_values().collect() }))
 }
 
 /// `POST /admin/nodes/{name}/transit/approve`.
@@ -922,14 +1083,14 @@ pub async fn deny_transit(
 ) -> Result<(), AppError> {
     let conn = state.db.conn.lock().await;
     let node = nodes::find_by_name(&conn, &name)?.ok_or(AppError::NotFound)?;
-    let dependents = nodes::static_nodes_using_gateway(&conn, node.id)?;
+    let dependents = nodes::static_nodes_depending_on(&conn, node.id)?;
     if !dependents.is_empty() {
         tracing::warn!(
-            event = "gateway_approval_withdrawn_with_dependents",
+            event = "transit_approval_withdrawn_with_dependents",
             node_name = %name,
             dependents = %dependents.join(","),
-            "node was the gateway for these devices; withdrawing approval also stops \
-             it forwarding for them from their next poll"
+            "node was the exit or a carrier for these devices; withdrawing approval also stops \
+             that from their next poll — re-export them"
         );
     }
     nodes::set_transit_approved(&conn, node.id, false)?;
@@ -940,63 +1101,12 @@ pub async fn deny_transit(
     Ok(())
 }
 
-/// `PUT /admin/nodes/{name}/via-gateway` (PLAN.md #134).
-///
-/// Marks a node as not dialable from outside the mesh, or clears that. Read
-/// by `export-config` only: a device exported with a gateway then reaches the
-/// node through the gateway instead of holding a direct `[Peer]` for it. No
-/// agent, and nothing in `/poll`, reads it — the routing follows from the
-/// conf membership the export records, exactly as for a node with no public
-/// endpoint at all.
-///
-/// Nothing already on a device changes: the response names the devices whose
-/// config the next refresh would change.
-pub async fn set_via_gateway(
-    State(state): State<AppState>,
-    _admin: AdminAuth,
-    Path(name): Path<String>,
-    Json(body): Json<wireserve_types::SetViaGatewayRequest>,
-) -> Result<Json<wireserve_types::SetViaGatewayResponse>, AppError> {
-    let conn = state.db.conn.lock().await;
-    let node = nodes::find_by_name(&conn, &name)?.ok_or(AppError::NotFound)?;
-    if node.kind == wireserve_types::NodeKind::Static {
-        return Err(AppError::BadRequest(
-            "a kind=static node has no endpoint and is never dialled by another device".into(),
-        ));
-    }
-    nodes::set_export_via_gateway(&conn, node.id, body.enabled)?;
-    let mut affected = nodes::static_nodes_affected_by_via_gateway(&conn, node.id, body.enabled)?;
-    if body.enabled {
-        // A device dials its gateway by the one `Endpoint =` line it has, so a
-        // gateway nobody can dial is already broken for those devices. The
-        // flag is still the truth about the node, so it is recorded — and
-        // those devices are named, since they need another gateway.
-        let dependents = nodes::static_nodes_using_gateway(&conn, node.id)?;
-        if !dependents.is_empty() {
-            tracing::warn!(
-                event = "via_gateway_set_on_a_gateway",
-                node_name = %name,
-                dependents = %dependents.join(","),
-                "node is the gateway for these devices, which must dial it directly; \
-                 re-export them with another gateway"
-            );
-        }
-        affected.extend(dependents);
-        affected.sort();
-        affected.dedup();
-    }
-    tracing::info!(event = "via_gateway_set", node_name = %name, enabled = body.enabled);
-    Ok(Json(wireserve_types::SetViaGatewayResponse { affected_devices: affected }))
-}
-
 /// `GET /admin/peers` (spec §4.5.1).
 ///
-/// Every entry's `transit_via` (PLAN.md M23) is always `None` here —
+/// Every entry's `relay.via` (PLAN.md M39) is always `None` here —
 /// deliberately, not an oversight: it's requester-relative ("how THIS
 /// polling node should reach this peer"), and an admin browsing the
-/// directory isn't a requester polling on behalf of a specific node, so
-/// there is no requester to compute it relative to. `POST /poll` fills it
-/// in for real; see `routes::poll::poll`.
+/// directory isn't a requester polling on behalf of a specific node.
 pub async fn list_peers(
     State(state): State<AppState>,
     _admin: AdminAuth,
@@ -1021,11 +1131,6 @@ pub async fn list_peers(
         })
         .map(|n| n.name.clone())
         .collect();
-    let via_gateway = rows
-        .iter()
-        .filter(|n| n.export_via_gateway)
-        .map(|n| n.name.clone())
-        .collect();
     let exit_offering = rows
         .iter()
         .filter(|n| {
@@ -1037,7 +1142,30 @@ pub async fn list_peers(
         .collect();
     let exit_devices = rows
         .iter()
-        .filter(|n| n.exit_enabled && n.gateway_node_id.is_some())
+        .filter(|n| n.exit_enabled && n.exit_node_id.is_some())
+        .map(|n| n.name.clone())
+        .collect();
+    // A device's `.conf` is a snapshot (PLAN.md M40): stale once a node
+    // joined after it was written, or a carrier or exit it names no longer
+    // qualifies.
+    let live: std::collections::HashMap<i64, &nodes::NodeRow> = rows.iter().map(|n| (n.id, n)).collect();
+    let relays = nodes::all_static_relays(&conn)?;
+    let qualifies = |id: i64| live.get(&id).is_some_and(|n| n.transit_approved);
+    let stale_devices = rows
+        .iter()
+        .filter(|n| n.kind == wireserve_types::NodeKind::Static)
+        .filter(|d| {
+            let newer_node = rows.iter().any(|n| {
+                n.kind == wireserve_types::NodeKind::Agent
+                    && matches!((n.created_at, d.exported_at), (Some(c), Some(e)) if c > e)
+            });
+            let lost_carrier = relays.iter().any(|(dev, _, carrier)| *dev == d.id && !qualifies(*carrier));
+            let lost_exit = d.exit_node_id.is_some_and(|e| !qualifies(e));
+            // Never recorded since the gateway went (PLAN.md M41): its
+            // `.conf` still sends the mesh to a gateway that forwards nothing.
+            let never = d.exported_at.is_none();
+            never || newer_node || lost_carrier || lost_exit
+        })
         .map(|n| n.name.clone())
         .collect();
     let tags_by_id = grants::tags(&conn)?;
@@ -1045,11 +1173,16 @@ pub async fn list_peers(
         .iter()
         .filter_map(|n| Some((n.name.clone(), tags_by_id.get(&n.id)?.iter().cloned().collect())))
         .collect();
+    let dialable = rows
+        .iter()
+        .filter_map(|n| Some((n.name.clone(), state.transit.dialable(n.pubkey.as_deref()?, state.config.online_threshold_secs)?)))
+        .collect();
     Ok(Json(AdminPeersResponse {
+        dialable,
         peers,
         transit_approved,
         transit_offering,
-        via_gateway,
+        stale_devices,
         exit_offering,
         exit_devices,
         tags,

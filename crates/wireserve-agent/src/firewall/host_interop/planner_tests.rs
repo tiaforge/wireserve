@@ -11,12 +11,12 @@ use super::model::*;
 use super::planner::*;
 use super::ruleset;
 
-const NONE: ForwardWanted = ForwardWanted { transit: false, services: false, exit: false };
-const TRANSIT: ForwardWanted = ForwardWanted { transit: true, services: false, exit: false };
-const SERVICES: ForwardWanted = ForwardWanted { transit: false, services: true, exit: false };
-const BOTH: ForwardWanted = ForwardWanted { transit: true, services: true, exit: false };
-const EXIT: ForwardWanted = ForwardWanted { transit: true, services: false, exit: true };
-const ALL: ForwardWanted = ForwardWanted { transit: true, services: true, exit: true };
+const NONE: ForwardWanted = ForwardWanted { transit: false, services: false, exit: false, relay: false };
+const TRANSIT: ForwardWanted = ForwardWanted { transit: true, services: false, exit: false, relay: false };
+const SERVICES: ForwardWanted = ForwardWanted { transit: false, services: true, exit: false, relay: false };
+const BOTH: ForwardWanted = ForwardWanted { transit: true, services: true, exit: false, relay: false };
+const EXIT: ForwardWanted = ForwardWanted { transit: true, services: false, exit: true, relay: false };
+const ALL: ForwardWanted = ForwardWanted { transit: true, services: true, exit: true, relay: true };
 
 const STRATO_LIKE: &[u8] = include_bytes!("../../../tests/fixtures/nft/strato_like.json");
 const NATIVE: &[u8] = include_bytes!("../../../tests/fixtures/nft/native.json");
@@ -1111,7 +1111,7 @@ fn firewalld_guard_gets_a_service_exception_ahead_of_the_drop() {
         let after = simulate(&obs, &actions);
         let guard = after.nft.as_ref().unwrap().chains.iter().find(|c| c.chain.table == guard_table("wg0")).unwrap();
         assert!(is_guard_shape(&guard.rules, "wg0", forward));
-        assert_eq!(guard.rules.len(), 1 + [forward.transit, forward.services, forward.exit].iter().filter(|b| **b).count());
+        assert_eq!(guard.rules.len(), 1 + [forward.transit, forward.services, forward.exit, forward.relay].iter().filter(|b| **b).count());
         for other in [NONE, TRANSIT, SERVICES, BOTH, EXIT, ALL].into_iter().filter(|o| *o != forward) {
             assert!(!is_guard_shape(&guard.rules, "wg0", other), "{forward:?} guard taken for {other:?}");
         }

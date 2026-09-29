@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+# WireServe phone relay test (PLAN.md M40, M41).
+#
+# A phone cannot run the agent, so it joins with an exported `.conf` and an
+# official WireGuard client. A node behind a NAT nothing gets through can't
+# be dialled by it directly; the phone reaches that node through a carrier's
+# public relay port instead, and the carrier forwards the phone's session
+# with the node — end to end, WireGuard between the two — without being able
+# to read it.
+#
+# What this proves, and what no unit or namespace test can:
+#
+#   1. the agents tell whether they are dialable: the carrier on a public
+#      address is, the node behind NAT is not (`list-peers` shows it);
+#   2. the export checks the carrier's relay port from outside, and with the
+#      port blocked upstream of the carrier stops before creating anything,
+#      naming the exact port and address to open;
+#   3. once it is open, the config dials the carrier directly and the NAT-ed
+#      node at the carrier's relay port, with the carry MTU, and no covering
+#      mesh route to anyone;
+#   4. the phone reaches the NAT-ed node's service with real TCP;
+#   5. the carrier forwarded only UDP while it did — not one TCP packet, it
+#      never saw inside;
+#   6. the phone roams (a new source port) and reaches it again;
+#   7. default-deny still holds through the relay;
+#   8. `relay-ports` names the port, its device, and that it is open;
+#   9. a refresh keeps the phone's address.
+#
+#     ( inet 198.51.100.0/24 )──────────┬──────────────┬─────────────┐
+#          │                            │              │             │
+#     [coordinator]               [carrier agent]  [router-h]    [router-p]
+#                                 (public address, masquerade    masquerade
+#                                  transit on)         │             │
+#                                                  ( site-h )    ( site-p )
+#                                                      │             │
+#                                                  [homeserver]   [phone]
+#                                                (NAT, nothing   (plain wg,
+#                                                  forwarded)     no agent)
+#
+# The inet segment uses TEST-NET-2 on purpose: a carrier needs a public
+# address to be one, and every podman default is private.
+#
+# Rootful Podman, same reasoning as run-transit-test.sh.
+#
+# Usage: sudo ./deploy/e2e/run-phone-relay-test.sh
+# Exit code 0 = every check passed.
+
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+
+INET=wireserve-pr-inet
+SITE_H=wireserve-pr-site-h
+SITE_P=wireserve-pr-site-p
+COORD=wireserve-pr-coord
+ROUTER_H=wireserve-pr-router-h
+ROUTER_P=wireserve-pr-router-p
+CARRIER=wireserve-pr-carrier
+HOME_AGENT=wireserve-pr-homeserver
+PHONE=wireserve-pr-phone
+DEBUG_IMG=wireserve-e2e-debug-tools
+ADMIN_TOKEN=phone-relay-test-admin-token
+WG_PORT=51820
+OUT=$(mktemp -d)
+
+log()  { echo; echo "=== $* ==="; }
+pass() { echo "PASS: $*"; }
+fail() { echo "FAIL: $*" >&2; exit 1; }
+note() { echo "NOTE: $*"; }
+
+cleanup() {
+    podman rm -f "$COORD" "$ROUTER_H" "$ROUTER_P" "$CARRIER" "$HOME_AGENT" "$PHONE" >/dev/null 2>&1 || true
+    for c in $(podman ps -aq --filter "name=wireserve-pr-helper" 2>/dev/null); do
+        podman rm -f "$c" >/dev/null 2>&1 || true
+    done
+    podman network rm "$SITE_H" "$SITE_P" "$INET" >/dev/null 2>&1 || true
+    rm -rf "$OUT"
+}
+trap cleanup EXIT
+cleanup
+OUT=$(mktemp -d)
+
+in_netns() {
+    local target=$1; shift
+    podman run --rm --name "wireserve-pr-helper-$$-$RANDOM" \
+        --network "container:$target" --cap-add=NET_ADMIN "$DEBUG_IMG" "$@"
+}
+in_netns_bg() {
+    local target=$1; shift
+    podman run -d --name "wireserve-pr-helper-$$-$RANDOM" \
+        --network "container:$target" --cap-add=NET_ADMIN "$DEBUG_IMG" "$@" >/dev/null
+}
+ip_on() {
+    podman inspect "$1" --format "{{(index .NetworkSettings.Networks \"$2\").IPAddress}}"
+}
+admin() { podman exec "$COORD" wireserve-admin "$@"; }
+
+log "checking prerequisites"
+command -v podman >/dev/null || fail "podman not found on PATH"
+command -v python3 >/dev/null || fail "python3 not found on PATH"
+modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available"
+[ "$(podman info --format '{{.Host.Security.Rootless}}')" = false ] \
+    || fail "needs rootful podman (service-address rewrites and the forwarding sysctl are refused in a user namespace): sudo $0"
+pass "podman, python3 and the WireGuard kernel module are present"
+
+log "building images"
+podman build -q -f deploy/docker/coordinator.Dockerfile -t wireserve-coordinator:pr-test . >/dev/null
+podman build -q -f deploy/docker/agent.Dockerfile -t wireserve-agent:pr-test . >/dev/null
+podman build -q -f deploy/e2e/debug-tools.Dockerfile -t "$DEBUG_IMG" deploy/e2e >/dev/null
+pass "images built"
+
+log "creating the network segments"
+podman network create --internal --subnet 198.51.100.0/24 "$INET" >/dev/null
+podman network create --internal "$SITE_H" >/dev/null
+podman network create --internal "$SITE_P" >/dev/null
+pass "an 'internet' on a public-looking range, and two NAT-ed sites"
+
+log "starting the coordinator"
+podman run -d --name "$COORD" --network "$INET" \
+    -e WIRESERVE_ADMIN_TOKEN="$ADMIN_TOKEN" \
+    wireserve-coordinator:pr-test >/dev/null
+sleep 2
+COORD_IP=$(ip_on "$COORD" "$INET")
+echo "coordinator: $COORD_IP"
+
+start_router() {
+    local name=$1 site=$2
+    podman run -d --name "$name" --network "$INET" --network "$site" \
+        --cap-add=NET_ADMIN --sysctl net.ipv4.ip_forward=1 \
+        "$DEBUG_IMG" sleep infinity >/dev/null
+    sleep 1
+    podman exec "$name" nft add table ip nat
+    podman exec "$name" nft 'add chain ip nat postrouting { type nat hook postrouting priority 100 ; }'
+    podman exec "$name" nft 'add rule ip nat postrouting oifname "eth0" masquerade'
+}
+
+log "starting the two NAT routers"
+start_router "$ROUTER_H" "$SITE_H"
+start_router "$ROUTER_P" "$SITE_P"
+ROUTER_H_LAN=$(ip_on "$ROUTER_H" "$SITE_H")
+ROUTER_P_LAN=$(ip_on "$ROUTER_P" "$SITE_P")
+
+log "starting the carrier directly on the inet segment"
+podman run -d --name "$CARRIER" --network "$INET" \
+    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun --sysctl net.ipv4.ip_forward=0 \
+    --entrypoint sleep wireserve-agent:pr-test infinity >/dev/null
+sleep 1
+CARRIER_IP=$(ip_on "$CARRIER" "$INET")
+# Internal networks have no default route; a carrier finds the interface
+# phones reach it on by one.
+CARRIER_IF=$(in_netns "$CARRIER" sh -c "ip -o -4 addr show | awk '/ $CARRIER_IP\\//{print \$2}'")
+in_netns "$CARRIER" ip route replace default dev "$CARRIER_IF" >/dev/null
+echo "carrier: $CARRIER_IP ($CARRIER_IF)"
+
+log "starting the homeserver agent behind NAT"
+podman run -d --name "$HOME_AGENT" --network "$SITE_H" \
+    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
+    --entrypoint sleep wireserve-agent:pr-test infinity >/dev/null
+sleep 1
+in_netns "$HOME_AGENT" ip route replace default via "$ROUTER_H_LAN" >/dev/null
+
+create_node() { admin create-node "$1" | grep -oE 'jtk_[a-f0-9]+'; }
+
+log "joining the two agents"
+JT_CARRIER=$(create_node node-carrier)
+JT_HOME=$(create_node node-home)
+podman exec "$CARRIER" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_CARRIER" \
+    --listen-port "$WG_PORT" 2>/dev/null
+podman exec "$HOME_AGENT" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_HOME" \
+    --listen-port "$WG_PORT" 2>/dev/null
+for a in "$CARRIER" "$HOME_AGENT"; do
+    podman exec -d "$a" wireserve daemon --poll-interval-secs 5
+done
+sleep 15
+pass "both agents registered and polling"
+
+log "1/9: each agent knows whether it is dialable"
+PEERS=$(admin list-peers)
+echo "$PEERS" | grep '^node-carrier' | grep -q 'dialable=yes' || { echo "$PEERS"; fail "the carrier on a public address did not find itself dialable"; }
+echo "$PEERS" | grep '^node-home' | grep -q 'dialable=no' || { echo "$PEERS"; fail "the node behind NAT did not find itself undialable"; }
+pass "carrier dialable, homeserver not"
+
+log "declaring a service on homeserver"
+podman exec "$HOME_AGENT" wireserve serve svc-home 12345
+sleep 8
+admin approve-service node-home svc-home || fail "could not approve svc-home"
+sleep 8
+
+log "opting the carrier in (both halves)"
+podman exec "$CARRIER" wireserve transit on
+admin approve-transit node-carrier || fail "could not approve node-carrier"
+sleep 12
+
+RELAY_PORT=$(admin list-peers >/dev/null; podman exec "$HOME_AGENT" wireserve list --json \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(p['relay']['port'] for p in d['peers'] if p['name']=='node-home'))")
+echo "homeserver's relay port: $RELAY_PORT"
+
+log "2/9: with the relay port blocked upstream, the export stops and says what to open"
+# A cloud firewall in front of the carrier: it drops the port before
+# anything on the carrier sees it.
+in_netns "$CARRIER" nft -f - <<NFT
+table ip cloudfw {
+    chain pre {
+        type filter hook prerouting priority -400; policy accept;
+        iifname "$CARRIER_IF" udp dport $RELAY_PORT drop
+    }
+}
+NFT
+if admin export-config phone --register-url "http://127.0.0.1:47820" >"$OUT/closed.conf" 2>"$OUT/closed.log"; then
+    cat "$OUT/closed.log"
+    fail "the export went ahead with the relay port closed"
+fi
+grep -q "open UDP $RELAY_PORT inbound on node-carrier ($CARRIER_IP)" "$OUT/closed.log" \
+    || { cat "$OUT/closed.log"; fail "the refusal does not name the port and address to open"; }
+admin list-peers | grep -q '^phone' && fail "the refused export created the node anyway"
+pass "refused before creating anything, naming UDP $RELAY_PORT on $CARRIER_IP"
+in_netns "$CARRIER" nft delete table ip cloudfw
+
+log "3/9: exporting the phone's config"
+admin export-config phone --register-url "http://127.0.0.1:47820" > "$OUT/phone.conf" 2>"$OUT/export.log" \
+    || { cat "$OUT/export.log"; fail "export-config failed with the port open"; }
+note "exported config:"
+sed 's/^PrivateKey = .*/PrivateKey = <redacted>/; s/^/  /' "$OUT/phone.conf"
+grep -qx "MTU = 1340" "$OUT/phone.conf" || fail "no carry MTU, though a node is relayed"
+grep -qx "Endpoint = $CARRIER_IP:$WG_PORT" "$OUT/phone.conf" || fail "the carrier is not dialled directly"
+grep -qx "Endpoint = $CARRIER_IP:$RELAY_PORT" "$OUT/phone.conf" || fail "homeserver is not dialled at the carrier's relay port"
+grep -qE "AllowedIPs = [0-9.]+/2[0-9]" "$OUT/phone.conf" && fail "a covering mesh route in the config — the gateway is supposed to be gone"
+[ "$(grep -c '^\[Peer\]' "$OUT/phone.conf")" = "2" ] || fail "expected exactly two [Peer] blocks"
+pass "carrier direct, homeserver at the relay port, carry MTU, no covering route"
+
+sleep 8
+
+log "bringing the phone up as a plain WireGuard client, no agent"
+podman run -d --name "$PHONE" --network "$SITE_P" \
+    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
+    "$DEBUG_IMG" sleep infinity >/dev/null
+sleep 1
+podman exec "$PHONE" ip route replace default via "$ROUTER_P_LAN"
+podman exec "$PHONE" mkdir -p /etc/wireguard
+podman exec -i "$PHONE" tee /etc/wireguard/wg0.conf < "$OUT/phone.conf" >/dev/null
+podman exec "$PHONE" wg-quick up wg0 || fail "the official-client config would not come up"
+
+in_netns "$CARRIER" nft -f - <<'NFT'
+table inet relayprobe {
+    chain f {
+        type filter hook forward priority -10; policy accept;
+        meta l4proto tcp counter
+        meta l4proto udp counter
+    }
+}
+NFT
+
+svc_addr() { podman exec "$1" getent hosts "$2" | awk '{print $1}'; }
+SVC_HOME=$(svc_addr "$CARRIER" svc-home.wg)
+[ -n "$SVC_HOME" ] || fail "svc-home.wg does not resolve"
+in_netns_bg "$HOME_AGENT" nc -l -k -p 12345
+sleep 5
+
+log "4/9: the phone reaches the NAT-ed node's service through the relay"
+podman exec "$PHONE" timeout 30 bash -c "exec 3<>/dev/tcp/$SVC_HOME/12345" \
+    || { podman exec "$PHONE" wg show wg0; in_netns "$CARRIER" nft list ruleset; fail "the phone cannot reach svc-home"; }
+pass "svc-home reached"
+
+log "5/9: the carrier forwarded only the session's UDP"
+COUNTERS=$(in_netns "$CARRIER" nft list chain inet relayprobe f)
+TCP_SEEN=$(echo "$COUNTERS" | awk '/l4proto tcp/ {for (i=1;i<=NF;i++) if ($i=="packets") print $(i+1)}')
+UDP_SEEN=$(echo "$COUNTERS" | awk '/l4proto udp/ {for (i=1;i<=NF;i++) if ($i=="packets") print $(i+1)}')
+[ "$TCP_SEEN" = "0" ] || fail "the carrier forwarded $TCP_SEEN TCP packets — it saw inside the session"
+[ "${UDP_SEEN:-0}" -gt 0 ] || fail "the carrier forwarded no UDP — the connection did not go through it"
+pass "$UDP_SEEN UDP packets and 0 TCP through the carrier"
+
+log "6/9: the phone roams and gets back"
+podman exec "$PHONE" wg set wg0 listen-port 51999
+sleep 3
+podman exec "$PHONE" timeout 40 bash -c "until exec 3<>/dev/tcp/$SVC_HOME/12345; do sleep 2; done" 2>/dev/null \
+    || fail "after a new source port the phone never reached svc-home again"
+pass "reached again from a new source port"
+
+log "7/9: default-deny holds through the relay"
+in_netns_bg "$HOME_AGENT" nc -l -k -p 12346
+sleep 2
+if podman exec "$PHONE" timeout 8 bash -c "exec 3<>/dev/tcp/$SVC_HOME/12346" 2>/dev/null; then
+    fail "an UNDECLARED port on homeserver was reachable through the relay"
+fi
+pass "an undeclared port stays refused"
+
+log "8/9: relay-ports names the port, its device, and that it is open"
+PORTS=$(admin relay-ports)
+echo "$PORTS"
+echo "$PORTS" | grep "udp/$RELAY_PORT" | grep -q "address=$CARRIER_IP" || fail "relay-ports does not list the port with its address"
+echo "$PORTS" | grep "udp/$RELAY_PORT" | grep -q "open" || fail "relay-ports does not say it is open"
+echo "$PORTS" | grep "udp/$RELAY_PORT" | grep -q "used by phone" || fail "relay-ports does not name the phone"
+pass "listed, open, used by the phone"
+
+log "9/9: a refresh keeps the phone's address"
+PHONE_IP4=$(grep '^Address' "$OUT/phone.conf" | sed 's/Address = //; s#/32.*##')
+admin export-config phone --refresh --register-url "http://127.0.0.1:47820" > "$OUT/phone2.conf" 2>/dev/null \
+    || fail "export-config --refresh failed"
+NEW_IP4=$(grep '^Address' "$OUT/phone2.conf" | sed 's/Address = //; s#/32.*##')
+[ "$NEW_IP4" = "$PHONE_IP4" ] || fail "a refresh renumbered the device ($PHONE_IP4 -> $NEW_IP4)"
+grep -qx "Endpoint = $CARRIER_IP:$RELAY_PORT" "$OUT/phone2.conf" || fail "the refreshed config lost its relay"
+pass "same address, same relay"
+
+echo
+echo "=== PHONE RELAY TEST COMPLETE ==="

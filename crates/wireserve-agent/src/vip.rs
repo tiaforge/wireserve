@@ -101,7 +101,6 @@ mod tests {
             lan_addr: None,
             reflexive_addr: None,
             last_handshake: None,
-            transit_via: None,
             relay: Default::default(),
         }
     }
@@ -128,8 +127,10 @@ mod tests {
             services,
             pending_services: vec![],
             denied_services: vec![],
-            transit_carrying: vec![],
             relay_carrying: vec![],
+            relay_public: vec![],
+            relay_port_base: None,
+            port_checks: vec![],
             transit_awaiting_approval: false,
             exit_clients: vec![],
             mesh: None,

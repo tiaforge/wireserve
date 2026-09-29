@@ -98,6 +98,7 @@ async fn serve() {
         std::sync::Arc::new(provider) as std::sync::Arc<dyn dns::provider::DnsWriter>
     });
     let state = build_state_with_dns(config, db, dns_writer);
+    let probe_udp = state.probe_udp.clone();
     if let Some(dns) = state.dns.clone() {
         tokio::spawn(dns::sync::run(state.clone(), dns));
     }
@@ -203,7 +204,7 @@ async fn serve() {
         reflexive_rate_limit_max,
         reflexive_rate_limit_window_secs,
     ));
-    tokio::spawn(reflexive::serve(reflexive_socket, reflexive_limiter));
+    tokio::spawn(reflexive::serve(reflexive_socket, probe_udp, reflexive_limiter));
 
     let node_server = axum::serve(node_listener, node_app);
     let admin_server = axum::serve(admin_listener, admin_app);

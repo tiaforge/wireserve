@@ -37,12 +37,16 @@ pub struct ForwardWanted {
     /// This node is an exit (PLAN.md M27): mesh → internet and back, for
     /// flows our table marked with the exit bit only.
     pub exit: bool,
+    /// This node relays phones from its public address (PLAN.md M40):
+    /// internet → mesh and back, for flows our table marked with the relay
+    /// bit only.
+    pub relay: bool,
 }
 
 impl ForwardWanted {
     #[must_use]
     pub fn any(self) -> bool {
-        self.transit || self.services || self.exit
+        self.transit || self.services || self.exit || self.relay
     }
 
     /// What the daemon's state calls for right now.
@@ -55,6 +59,8 @@ impl ForwardWanted {
                 .iter()
                 .any(|d| d.ports.clone().iter().any(|m| m.addr.is_some())),
             exit: state.exit_capable,
+            relay: state.transit_capable
+                && state.last_directory.as_ref().is_some_and(|d| !d.relay_public.is_empty()),
         }
     }
 }
@@ -153,6 +159,7 @@ pub mod fake {
     use wireserve_types::{FirewallBackend, Forwarding, ServiceRule};
 
     #[derive(Debug, Clone, PartialEq)]
+    #[allow(clippy::large_enum_variant)]
     pub enum Call {
         Teardown,
         Apply(Vec<ServiceRule>, Forwarding),

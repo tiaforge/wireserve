@@ -2,9 +2,15 @@
 //! keypair locally, creates and immediately redeems a `kind: "static"` node
 //! in one CLI call, and renders a `.conf` for import into an official
 //! WireGuard client.
+//!
+//! Every node the device reaches, it reaches end to end (PLAN.md M40, M41):
+//! directly when the node accepts inbound WireGuard, and otherwise through a
+//! carrier's public relay port, which forwards the session without being
+//! able to read it. Only an exit, which the device's full-tunnel profile
+//! sends its internet traffic to, sees any of it — that is what an exit is.
 
 use defguard_wireguard_rs::key::Key;
-use wireserve_types::{AdminServiceInfo, NodeKind, PeerInfo, RegisterRequest, ServiceApprovalState};
+use wireserve_types::{AdminServiceInfo, ExportRecord, NodeKind, PeerInfo, RegisterRequest, RelayAssignment, RelayPlan, ServiceApprovalState};
 
 use crate::client::{self, AdminClient, ClientError};
 
@@ -16,40 +22,30 @@ pub enum ExportConfigError {
     /// not an auto-create: a typo would otherwise silently mint a new node.
     #[error("no such node '{name}' — run export-config without --refresh to create it ({message})")]
     NoSuchNode { name: String, message: String },
-    #[error("no such node '{name}' to use as a gateway")]
-    NoSuchGateway { name: String },
+    #[error("no such node '{name}' to use as the exit")]
+    NoSuchExit { name: String },
     #[error(
-        "'{name}' is not approved to carry traffic — run `wireserve-admin approve-transit {name}` \
-         (and `wireserve transit on` on that node) first"
+        "'{name}' is not approved to send others' traffic on — run `wireserve-admin approve-transit {name}` \
+         (and `wireserve transit on` and `wireserve exit on` on that node) first"
     )]
-    GatewayNotApproved { name: String },
-    #[error(
-        "'{name}' is approved but is not currently offering to carry traffic — run \
-         `wireserve transit on` on it (and restart it, so it reopens the host \
-         firewall's forward hook), then try again"
-    )]
-    GatewayNotOffering { name: String },
-    #[error(
-        "'{name}' has no publicly reachable endpoint, so a device off the mesh could never dial \
-         it. Give it a reachable --endpoint-addr, or pick another gateway."
-    )]
-    GatewayNotReachable { name: String },
-    #[error(
-        "'{name}' is marked as not dialable from outside the mesh (`wireserve-admin via-gateway \
-         {name} on`), and a device must dial its gateway directly. Pick another gateway, or \
-         clear the mark with `wireserve-admin via-gateway {name} off` if it is reachable now."
-    )]
-    GatewayNotDialable { name: String },
-    #[error(
-        "a full-tunnel profile sends everything through the device's gateway, and no node \
-         qualifies as one — name one with --gateway"
-    )]
-    ExitNeedsGateway,
+    ExitNotApproved { name: String },
     #[error(
         "'{name}' is not offering to be an exit — run `wireserve exit on` on it, then try \
          again (a coordinator older than exit support never reports an offer at all)"
     )]
     ExitNotOffering { name: String },
+    #[error(
+        "'{name}' can't be dialled from outside the mesh, and a device sends its full tunnel \
+         straight to its exit — pick a node with a public endpoint that accepts WireGuard"
+    )]
+    ExitNotDialable { name: String },
+    #[error("--exit: no node qualifies as an exit (approved, `exit on`, dialable from outside) — name one")]
+    NoExit,
+    #[error(
+        "several nodes could be the exit ({names}) — name one with --exit <node>, since the \
+         choice is baked into the config and cannot be changed without re-exporting"
+    )]
+    AmbiguousExit { names: String },
     #[error("{0}")]
     BadDns(String),
     /// `--dns` without a profile to put it in, or a profile that needs one
@@ -57,11 +53,10 @@ pub enum ExportConfigError {
     /// for a caller of the library.
     #[error("{0}")]
     DnsUsage(&'static str),
-    #[error(
-        "several nodes could be the gateway ({names}) — name one with --gateway, since the \
-         choice is baked into the config and cannot be changed without re-exporting"
-    )]
-    AmbiguousGateway { names: String },
+    /// Relay ports that must be opened first (PLAN.md M40) — each named with
+    /// exactly where.
+    #[error("{0}")]
+    PortsClosed(String),
 }
 
 /// This node's own interface parameters for rendering: the private key
@@ -78,168 +73,122 @@ pub struct InterfaceParams {
     pub dns: Option<std::net::Ipv4Addr>,
 }
 
+/// How the device reaches each node (PLAN.md M40), from the coordinator's
+/// relay plan: a node in neither list isn't reachable from outside, and
+/// gets no `[Peer]` at all.
+#[derive(Debug, Clone, Default)]
+pub struct Routes {
+    /// Dialled directly, at its own endpoint.
+    pub direct: Vec<String>,
+    /// Reached through a carrier: `(node, carrier, endpoint)`.
+    pub relayed: Vec<(String, String, String)>,
+}
+
+impl From<&RelayPlan> for Routes {
+    fn from(plan: &RelayPlan) -> Self {
+        Self {
+            direct: plan.direct.clone(),
+            relayed: plan.relayed.iter().map(|r| (r.node.clone(), r.carrier.clone(), r.endpoint.clone())).collect(),
+        }
+    }
+}
+
+/// The full-tunnel profile (PLAN.md M27): which peer carries everything,
+/// and the resolver it names.
+pub struct ExitProfile<'a> {
+    pub node: &'a str,
+    pub dns: std::net::Ipv4Addr,
+}
+
+/// What a render produced: the file itself, the full-tunnel profile when one
+/// was asked for, and the relays the file relies on, which the caller records.
+pub struct RenderedConf {
+    pub text: String,
+    /// The same peers, with the exit's entry carrying everything and a
+    /// `DNS =` line: longest-prefix match keeps every other node's `/32` —
+    /// the mesh — end to end, and only the rest goes to the exit.
+    pub exit_text: Option<String>,
+    pub relays: Vec<RelayAssignment>,
+}
+
 /// Renders a full WireGuard `.conf`: this node's own `[Interface]` block,
-/// then one `[Peer]` block per entry in `peers`, skipping any peer whose
-/// pubkey matches this node's own (defensive — whether `/admin/peers`
-/// already includes the just-registered node depends on timing, and either
-/// way it must never get a `[Peer]` block pointing at itself).
+/// then one `[Peer]` block per node `routes` reaches, skipping this node's
+/// own entry (defensive — whether `/admin/peers` already includes the
+/// just-registered node depends on timing).
 ///
 /// Every peer's `AllowedIPs` is that peer's own `/32` (v4) + `/128` (v6),
 /// plus the `/32` of every approved service it owns (`services`, PLAN.md
-/// M20 — the same rule the agent applies), never a shared mesh CIDR block — spec §9 is explicit about why: a wider
-/// block would make this device act as a router for other peers' traffic,
-/// and WireGuard requires non-overlapping `AllowedIPs` across peers on one
-/// interface regardless.
+/// M20 — the same rule the agent applies), never a shared mesh CIDR block.
 ///
-/// Defense in depth (security review S2): the coordinator now validates
-/// `pubkey`/`endpoint_addr` strictly at `/register` and `/poll` (rejecting
-/// anything containing control characters, among other checks), so a
-/// value reaching this function *should* already be safe — but this
-/// renderer refuses to emit any peer whose `pubkey` or `endpoint_addr`
-/// contains a newline regardless, rather than trusting the coordinator's
-/// validation as the only line of defense against a value that would
-/// otherwise let one field smuggle an entire extra `.conf` directive
-/// (e.g. an `endpoint_addr` of `"1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0"`
-/// hijacking this exported device's routing).
-/// What a render produced: the file itself, plus the peers that got a direct
-/// `[Peer]` block.
+/// A relayed node's `Endpoint =` is its carrier's public relay port; with
+/// one in the file, the interface's MTU drops to the carry interface's
+/// 1340, since the carrier sends those packets on inside its own tunnel.
 ///
-/// The caller records that list against the node. `/poll` must set
-/// `transit_via` for exactly the peers *absent* from it, and the only way to
-/// know which those are later is to have been told at export time — the conf
-/// is a snapshot, so its membership is a fact about a moment, not something
-/// re-derivable from live state.
-pub struct RenderedConf {
-    pub text: String,
-    /// The full-tunnel profile (PLAN.md M27), when the gateway is also the
-    /// device's exit: the same key, address and direct peers, plus a `DNS =`
-    /// line, with the gateway carrying everything rather than the mesh range.
-    pub exit_text: Option<String>,
-    pub direct_peers: Vec<String>,
-}
-
-/// The gateway a rendered config routes through.
-pub struct Gateway<'a> {
-    pub peer: &'a PeerInfo,
-    pub ranges: wireserve_types::MeshRanges,
-    /// Nodes an admin marked as not dialable from outside
-    /// (`wireserve-admin via-gateway`, PLAN.md #134). Reached through the
-    /// gateway whatever endpoint they advertise. Meaningless without a
-    /// gateway — there is no other way to reach them then — which is why it
-    /// lives here rather than beside `peers`.
-    pub via_gateway: &'a [String],
-    /// The resolver the full-tunnel profile names, when this gateway is also
-    /// the device's exit (PLAN.md M27). `None` renders no second profile.
-    pub exit_dns: Option<std::net::Ipv4Addr>,
-}
-
+/// Defense in depth (security review S2): the coordinator validates
+/// `pubkey`/`endpoint_addr` strictly at `/register` and `/poll`, but this
+/// renderer still refuses any peer whose `pubkey` or endpoint contains a
+/// newline, which would otherwise let one field smuggle an entire extra
+/// `.conf` directive into the file.
 #[must_use]
 pub fn render_conf(
     iface: &InterfaceParams,
     peers: &[PeerInfo],
     services: &[AdminServiceInfo],
-    gateway: Option<&Gateway<'_>>,
+    routes: &Routes,
+    exit: Option<&ExitProfile<'_>>,
 ) -> RenderedConf {
-    // Built once and shared by both profiles, so the full-tunnel one can
-    // never disagree with the recorded `direct_peers`.
     let mut head = String::new();
     head.push_str("[Interface]\n");
     head.push_str(&format!("PrivateKey = {}\n", iface.private_key));
     head.push_str(&format!("Address = {}/32, {}/128\n", iface.ip4, iface.ip6));
-    let mut out = String::new();
-    let mut direct_peers = Vec::new();
+    if !routes.relayed.is_empty() {
+        head.push_str("MTU = 1340\n");
+    }
+    let mut mesh = String::new();
+    let mut full = String::new();
+    let mut relays = Vec::new();
+    let mut exit_rendered = false;
 
     for peer in peers {
         if peer.pubkey == iface.own_pubkey {
             continue;
         }
-        // The gateway is rendered once, below, with the whole mesh range. It
-        // necessarily has a routable endpoint, so it would otherwise also
-        // qualify as a direct peer here and be emitted twice under one
-        // `PublicKey` — which `wg setconf` resolves silently last-wins, but
-        // the iOS and Android apps reject outright.
-        if gateway.is_some_and(|g| g.peer.pubkey == peer.pubkey) {
+        let relayed = routes.relayed.iter().find(|(node, ..)| node == &peer.name);
+        let endpoint = if let Some((_, _, endpoint)) = relayed {
+            Some(endpoint.clone())
+        } else if routes.direct.iter().any(|n| n == &peer.name) {
+            choose_endpoint(peer)
+        } else {
             continue;
-        }
-        let endpoint = choose_endpoint(peer);
-        // Checked before anything else about this peer, and on the pubkey
-        // whether or not there is an endpoint: a peer with no endpoint is
-        // still rendered below when there is no gateway, so deferring this
-        // until after the endpoint is known would let a pubkey carrying
-        // `\nAllowedIPs = 0.0.0.0/0` through on exactly that path.
+        };
         if contains_newline(&peer.pubkey) || endpoint.as_deref().is_some_and(contains_newline) {
             warn_skipped(&peer.name);
             continue;
         }
-        match (&endpoint, gateway) {
-            // With a gateway in play, a direct entry is only worth having when
-            // the device can actually dial it from anywhere. An endpoint on a
-            // private address is the trap: `is_valid_endpoint_addr` permits
-            // RFC1918 on purpose, and a node on a home LAN legitimately
-            // advertises one, so a naive "has an endpoint" test would mint a
-            // /32 that outranks the gateway's covering route and black-holes
-            // the moment the device leaves that LAN.
-            (Some(e), Some(_)) if !wireserve_types::is_globally_routable_endpoint(e) => continue,
-            // An endpoint that is routable on paper but that the node's own
-            // router refuses inbound — the admin said so, since nothing here
-            // can tell. Same black hole as the arm above, from the other side.
-            (Some(_), Some(g)) if g.via_gateway.iter().any(|n| n == &peer.name) => continue,
-            // No endpoint and a gateway: reached through the gateway instead.
-            (None, Some(_)) => continue,
-            _ => {}
+        render_peer(&mut mesh, peer, services, endpoint.as_deref(), None);
+        let is_exit = relayed.is_none() && exit.is_some_and(|e| e.node == peer.name);
+        exit_rendered |= is_exit;
+        render_peer(&mut full, peer, services, endpoint.as_deref(), is_exit.then_some("0.0.0.0/0, ::/0"));
+        if let Some((node, carrier, _)) = relayed {
+            relays.push(RelayAssignment { node: node.clone(), carrier: carrier.clone() });
         }
-        render_peer(&mut out, peer, services, endpoint.as_deref());
-        direct_peers.push(peer.name.clone());
     }
 
-    let peers_text = out;
     let mut text = head.clone();
     if let Some(dns) = iface.dns {
         text.push_str(&format!("DNS = {dns}\n"));
     }
-    text.push_str(&peers_text);
-    let mut exit_text = None;
-    if let Some(gateway) = gateway {
-        // Everything not listed above is reached through here. The mesh range
-        // is a shorter prefix than any peer's /32, so cryptokey routing sends
-        // only what has no direct entry this way — and service VIPs are
-        // allocated out of the same v4 range, so they are covered without
-        // being enumerated.
-        let endpoint = choose_endpoint(gateway.peer);
-        if contains_newline(&gateway.peer.pubkey) || endpoint.as_deref().is_some_and(contains_newline) {
-            warn_skipped(&gateway.peer.name);
-        } else {
-            let mesh = format!("{}, {}", gateway.ranges.v4_cidr(), gateway.ranges.v6_prefix());
-            text.push_str(&gateway_peer(gateway.peer, &mesh, endpoint.as_deref()));
-            // The full tunnel: the direct peers keep their /32s, which
-            // outrank the default route, so the mesh stays exactly as direct
-            // as in the profile above. `::/0` goes in too although the exit
-            // forwards no IPv6: left out, the device's IPv6 would leave
-            // around the tunnel, which is the very thing a full tunnel on
-            // someone else's Wi-Fi is for.
-            if let Some(dns) = gateway.exit_dns {
-                let mut exit = head.clone();
-                exit.push_str(&format!("DNS = {dns}\n"));
-                exit.push_str(&peers_text);
-                exit.push_str(&gateway_peer(gateway.peer, "0.0.0.0/0, ::/0", endpoint.as_deref()));
-                exit_text = Some(exit);
-            }
-        }
-    }
-
-    RenderedConf { text, exit_text, direct_peers }
-}
-
-/// The gateway's `[Peer]` block, carrying `allowed`.
-fn gateway_peer(peer: &PeerInfo, allowed: &str, endpoint: Option<&str>) -> String {
-    let mut out = String::from("\n[Peer]\n");
-    out.push_str(&format!("PublicKey = {}\n", peer.pubkey));
-    out.push_str(&format!("AllowedIPs = {allowed}\n"));
-    if let Some(endpoint) = endpoint {
-        out.push_str(&format!("Endpoint = {endpoint}\n"));
-    }
-    out.push_str("PersistentKeepalive = 25\n");
-    out
+    text.push_str(&mesh);
+    // `::/0` goes in too although the exit forwards no IPv6: left out, the
+    // device's IPv6 would leave around the tunnel, which is the very thing a
+    // full tunnel on someone else's Wi-Fi is for.
+    let exit_text = exit.filter(|_| exit_rendered).map(|e| {
+        let mut out = head.clone();
+        out.push_str(&format!("DNS = {}\n", e.dns));
+        out.push_str(&full);
+        out
+    });
+    RenderedConf { text, exit_text, relays }
 }
 
 /// What `export-config` produced: the mesh profile, and the full-tunnel one
@@ -255,10 +204,10 @@ pub struct Exported {
 /// Where the full-tunnel profile sends DNS (PLAN.md M27), from `--dns`: an
 /// approved service by name, which becomes its address, or an IPv4 address.
 ///
-/// Resolved before anything is created, like the gateway. A literal must be
+/// Resolved before anything is created, like the exit. A literal must be
 /// somewhere the tunnel can take it: a mesh address the directory knows, or
 /// a public one the exit forwards to. A private address outside the mesh —
-/// a Pi-hole on the gateway's LAN, say — is exactly what the exit refuses
+/// a Pi-hole on the exit's LAN, say — is exactly what the exit refuses
 /// to forward to, so it is refused here with the way to reach it instead.
 ///
 /// Also says whether the address is the mesh's own, which the mesh profile
@@ -312,19 +261,32 @@ fn resolve_dns(
 }
 
 /// One ordinary `[Peer]` block, with the peer's own host prefixes and the
-/// addresses of the services it owns.
+/// addresses of the services it owns — or `allowed` in their place, for the
+/// exit's entry in the full-tunnel profile.
 fn render_peer(
     out: &mut String,
     peer: &PeerInfo,
     services: &[AdminServiceInfo],
     endpoint: Option<&str>,
+    allowed: Option<&str>,
 ) {
     out.push('\n');
     out.push_str("[Peer]\n");
     out.push_str(&format!("PublicKey = {}\n", peer.pubkey));
-    // Parsed, not copied — the same rule `service_addresses` already follows.
-    // Interpolating these straight from the directory is what would let a
-    // field smuggle an extra `.conf` directive into the file.
+    let allowed = allowed.map_or_else(|| own_allowed_ips(peer, services), str::to_string);
+    out.push_str(&format!("AllowedIPs = {allowed}\n"));
+    if let Some(endpoint) = endpoint {
+        out.push_str(&format!("Endpoint = {endpoint}\n"));
+    }
+    // This device likely roams networks (wifi/cellular switching, laptop
+    // suspend) — keep the NAT mapping alive so return traffic works.
+    out.push_str("PersistentKeepalive = 25\n");
+}
+
+/// A peer's own host prefixes and its services' addresses. Parsed, not
+/// copied — interpolating these straight from the directory is what would
+/// let a field smuggle an extra `.conf` directive into the file.
+fn own_allowed_ips(peer: &PeerInfo, services: &[AdminServiceInfo]) -> String {
     let mut allowed = String::new();
     if let Ok(v4) = peer.ip4.parse::<std::net::Ipv4Addr>() {
         allowed.push_str(&format!("{v4}/32"));
@@ -338,13 +300,7 @@ fn render_peer(
     for vip in service_addresses(services, &peer.name) {
         allowed.push_str(&format!(", {vip}/32"));
     }
-    out.push_str(&format!("AllowedIPs = {allowed}\n"));
-    if let Some(endpoint) = endpoint {
-        out.push_str(&format!("Endpoint = {endpoint}\n"));
-    }
-    // This device likely roams networks (wifi/cellular switching, laptop
-    // suspend) — keep the NAT mapping alive so return traffic works.
-    out.push_str("PersistentKeepalive = 25\n");
+    allowed
 }
 
 /// The single address to write on this peer's `Endpoint =` line.
@@ -388,127 +344,57 @@ fn contains_newline(s: &str) -> bool {
     s.contains('\n') || s.contains('\r')
 }
 
-/// Tells the operator, on stderr so the `.conf` on stdout stays clean, what
-/// `via-gateway` did to this export — or that it could not do anything.
-fn report_via_gateway(via_gateway: &[String], peers: &[PeerInfo], gateway: Option<&Gateway<'_>>) {
-    let flagged = peers.iter().filter(|p| via_gateway.iter().any(|n| n == &p.name));
-    for peer in flagged {
-        let name = &peer.name;
-        match gateway {
-            Some(g) => eprintln!(
-                "{name}: reached through gateway '{}' (via-gateway is on)",
-                g.peer.name
-            ),
-            None => eprintln!(
-                "warning: {name} is marked via-gateway, but this config has no gateway, so it \
-                 keeps a direct entry the device may not be able to dial; export with \
-                 --gateway <node> to route it"
-            ),
-        }
-    }
-}
-
-/// Picks the node a device should route through, from the current directory.
-///
-/// Gateway forwarding *is* transit forwarding — the carrier sees the traffic
-/// in the clear — so eligibility is the existing transit approval rather than
-/// a second flag of its own. On top of that the node must be dialable from
-/// wherever the device ends up, which a phone's single unrefreshable
-/// `Endpoint =` line makes non-negotiable.
-fn select_gateway<'a>(
-    peers: &'a [PeerInfo],
-    transit_approved: &[String],
-    transit_offering: &[String],
-    via_gateway: &[String],
+/// Picks the device's exit (PLAN.md M27), when `--exit` asked for one: a
+/// node that is approved, offers to be one, and that the device can dial —
+/// its full tunnel goes straight to it. `Some("")` picks the one node that
+/// qualifies, if exactly one does.
+fn select_exit<'a>(
+    directory: &'a wireserve_types::AdminPeersResponse,
     requested: Option<&str>,
 ) -> Result<Option<&'a PeerInfo>, ExportConfigError> {
-    let dialable = |p: &PeerInfo| !via_gateway.iter().any(|n| n == &p.name);
-    let eligible = |p: &PeerInfo| {
-        transit_approved.iter().any(|n| n == &p.name)
-            && transit_offering.iter().any(|n| n == &p.name)
-            && dialable(p)
-            && choose_endpoint(p).is_some_and(|e| wireserve_types::is_globally_routable_endpoint(&e))
+    let Some(requested) = requested else {
+        return Ok(None);
     };
-
-    if let Some(name) = requested {
-        let peer = peers
+    let approved = |p: &PeerInfo| directory.transit_approved.iter().any(|n| n == &p.name);
+    let offering = |p: &PeerInfo| directory.exit_offering.iter().any(|n| n == &p.name);
+    let dialable = |p: &PeerInfo| choose_endpoint(p).is_some_and(|e| wireserve_types::is_globally_routable_endpoint(&e));
+    if !requested.is_empty() {
+        let peer = directory
+            .peers
             .iter()
-            .find(|p| p.name == name)
-            .ok_or_else(|| ExportConfigError::NoSuchGateway { name: name.to_string() })?;
-        // Checked here, before the caller creates or rejoins anything: the
-        // coordinator enforces all three again when the assignment is
-        // recorded, but that happens at the very end of the export, and
-        // failing there would leave a node created with no config to show
-        // for it.
-        if !transit_approved.iter().any(|n| n == name) {
-            return Err(ExportConfigError::GatewayNotApproved { name: name.to_string() });
+            .find(|p| p.name == requested)
+            .ok_or_else(|| ExportConfigError::NoSuchExit { name: requested.to_string() })?;
+        if !approved(peer) {
+            return Err(ExportConfigError::ExitNotApproved { name: requested.to_string() });
         }
-        if !transit_offering.iter().any(|n| n == name) {
-            return Err(ExportConfigError::GatewayNotOffering { name: name.to_string() });
+        if !offering(peer) {
+            return Err(ExportConfigError::ExitNotOffering { name: requested.to_string() });
         }
         if !dialable(peer) {
-            return Err(ExportConfigError::GatewayNotDialable { name: name.to_string() });
-        }
-        if !eligible(peer) {
-            return Err(ExportConfigError::GatewayNotReachable { name: name.to_string() });
+            return Err(ExportConfigError::ExitNotDialable { name: requested.to_string() });
         }
         return Ok(Some(peer));
     }
-
-    let mut candidates = peers.iter().filter(|p| eligible(p));
-    let first = candidates.next();
-    if let (Some(a), Some(b)) = (first, candidates.next()) {
-        return Err(ExportConfigError::AmbiguousGateway {
-            names: std::iter::once(a.name.clone())
-                .chain(std::iter::once(b.name.clone()))
-                .chain(peers.iter().filter(|p| eligible(p)).skip(2).map(|p| p.name.clone()))
-                .collect::<Vec<_>>()
-                .join(", "),
-        });
+    let eligible: Vec<&PeerInfo> = directory.peers.iter().filter(|p| approved(p) && offering(p) && dialable(p)).collect();
+    match eligible.as_slice() {
+        [] => Err(ExportConfigError::NoExit),
+        [one] => Ok(Some(*one)),
+        many => Err(ExportConfigError::AmbiguousExit { names: many.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ") }),
     }
-    Ok(first)
-}
-
-/// Runs the full `export-config` flow end to end against a live
-/// coordinator: keygen (local only), create+redeem a `kind: "static"` node,
-/// fetch the peer directory, render the `.conf`.
-///
-/// Takes two base URLs, not one: `admin_client` talks to the coordinator's
-/// admin listener (`create_node`, `list_peers`), while `node_facing_url`
-/// is where `/register` actually lives — a separate listener by spec
-/// §4.0's design, not just a separate path on the same one.
-pub fn run(
-    admin_client: &AdminClient,
-    node_facing_url: &str,
-    name: &str,
-    opts: &ExportOptions<'_>,
-) -> Result<Exported, ExportConfigError> {
-    let directory = admin_client.list_peers()?;
-    let chosen = select_gateway(
-        &directory.peers,
-        &directory.transit_approved,
-        &directory.transit_offering,
-        &directory.via_gateway,
-        opts.gateway,
-    )?;
-    let dns = check_dns(admin_client, &directory, chosen, opts)?;
-    let created = admin_client.create_node(name, NodeKind::Static, None)?;
-    let mut exported = finish(admin_client, node_facing_url, name, &created.join_token, &directory, chosen, dns)?;
-    exported.claim = created.claim;
-    Ok(exported)
 }
 
 /// How an export is shaped beyond its name.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ExportOptions<'a> {
-    /// `--gateway`; `None` picks the one eligible node, if exactly one is.
-    pub gateway: Option<&'a str>,
+    /// `--exit [node]`: also render the full-tunnel profile (PLAN.md M27),
+    /// to this node, or with `Some("")` to the one that qualifies.
+    pub exit: Option<&'a str>,
     /// `--dns`: an approved service by name, or an IPv4 address.
     pub dns: Option<&'a str>,
-    /// `--exit`: also render the full-tunnel profile (PLAN.md M27).
-    pub exit: bool,
     /// `--mesh-dns`: put the resolver into the mesh profile too (M28).
     pub mesh_dns: bool,
+    /// `--allow-unverified`: write relays whose port couldn't be seen open.
+    pub allow_unverified: bool,
 }
 
 /// Where each profile sends DNS, resolved from [`ExportOptions`].
@@ -519,17 +405,16 @@ struct Resolvers {
 }
 
 /// The resolver half of an export, checked before anything is created or
-/// rejoined: for the full-tunnel profile (M27) a gateway, that gateway's
-/// own `exit on`, and a resolver the tunnel can reach; for the mesh profile
-/// (M28) a resolver on the mesh itself.
+/// rejoined: for the full-tunnel profile (M27) an exit and a resolver the
+/// tunnel can reach; for the mesh profile (M28) a resolver on the mesh.
 fn check_dns(
     admin_client: &AdminClient,
     directory: &wireserve_types::AdminPeersResponse,
-    gateway: Option<&PeerInfo>,
+    exit: Option<&PeerInfo>,
     opts: &ExportOptions<'_>,
 ) -> Result<Resolvers, ExportConfigError> {
     let Some(spec) = opts.dns else {
-        if opts.exit {
+        if opts.exit.is_some() {
             return Err(ExportConfigError::DnsUsage("--exit needs --dns: the full tunnel has to name a resolver"));
         }
         if opts.mesh_dns {
@@ -537,16 +422,13 @@ fn check_dns(
         }
         return Ok(Resolvers::default());
     };
-    if !opts.exit && !opts.mesh_dns {
+    if opts.exit.is_none() && !opts.mesh_dns {
         return Err(ExportConfigError::DnsUsage(
             "--dns needs --exit (for the full-tunnel profile) or --mesh-dns (for the mesh profile)",
         ));
     }
-    if opts.exit {
-        let gateway = gateway.ok_or(ExportConfigError::ExitNeedsGateway)?;
-        if !directory.exit_offering.iter().any(|n| n == &gateway.name) {
-            return Err(ExportConfigError::ExitNotOffering { name: gateway.name.clone() });
-        }
+    if opts.exit.is_some() && exit.is_none() {
+        return Err(ExportConfigError::NoExit);
     }
     let services = admin_client.list_services()?;
     resolve_profiles(spec, opts, &directory.peers, &services.services)
@@ -569,9 +451,71 @@ fn resolve_profiles(
         )));
     }
     Ok(Resolvers {
-        exit: opts.exit.then_some(addr),
+        exit: opts.exit.is_some().then_some(addr),
         mesh: opts.mesh_dns.then_some(addr),
     })
+}
+
+/// Asks the coordinator how the device reaches each node (PLAN.md M40), and
+/// stops — before anything is created — if a relay port it needs isn't
+/// open, naming exactly which port to open where.
+fn plan_routes(admin_client: &AdminClient, opts: &ExportOptions<'_>, exit: Option<&PeerInfo>) -> Result<RelayPlan, ExportConfigError> {
+    eprintln!("working out how the device reaches each node (checking a relay port can take up to a minute)…");
+    let plan = admin_client.relay_plan(opts.allow_unverified)?;
+    for u in &plan.unreachable {
+        eprintln!("warning: {} is left out of the config: {}", u.node, u.reason);
+    }
+    if let Some(exit) = exit {
+        if !plan.direct.iter().any(|n| n == &exit.name) {
+            return Err(ExportConfigError::ExitNotDialable { name: exit.name.clone() });
+        }
+    }
+    if !plan.closed.is_empty() {
+        let mut msg = String::from("these relay ports must be reachable from the internet first:\n");
+        for port in &plan.closed {
+            let at = port.address.as_deref().unwrap_or("its public address");
+            let node = port.node.as_deref().unwrap_or("a node");
+            let why = if port.open == Some(false) { "was not reachable" } else { "could not be checked in time" };
+            msg.push_str(&format!(
+                "  open UDP {} inbound on {} ({at}) in any firewall outside the host — cloud firewall or \
+                 router port forward — for {node}; it {why}\n",
+                port.port, port.carrier
+            ));
+        }
+        if opts.allow_unverified {
+            eprint!("warning: writing the config anyway (--allow-unverified); {msg}");
+        } else {
+            msg.push_str("then run this again (or pass --allow-unverified to write the config regardless)");
+            return Err(ExportConfigError::PortsClosed(msg));
+        }
+    }
+    for r in &plan.relayed {
+        eprintln!("{}: relayed by {} at {} (end to end — {} can't read it)", r.node, r.carrier, r.endpoint, r.carrier);
+    }
+    Ok(plan)
+}
+
+/// Runs the full `export-config` flow end to end against a live
+/// coordinator: keygen (local only), create+redeem a `kind: "static"` node,
+/// fetch the peer directory and relay plan, render the `.conf`, record it.
+///
+/// Takes two base URLs, not one: `admin_client` talks to the coordinator's
+/// admin listener, while `node_facing_url` is where `/register` actually
+/// lives — a separate listener by spec §4.0's design.
+pub fn run(
+    admin_client: &AdminClient,
+    node_facing_url: &str,
+    name: &str,
+    opts: &ExportOptions<'_>,
+) -> Result<Exported, ExportConfigError> {
+    let directory = admin_client.list_peers()?;
+    let exit = select_exit(&directory, opts.exit)?;
+    let dns = check_dns(admin_client, &directory, exit, opts)?;
+    let plan = plan_routes(admin_client, opts, exit)?;
+    let created = admin_client.create_node(name, NodeKind::Static, None)?;
+    let mut exported = finish(admin_client, node_facing_url, name, &created.join_token, &directory, &plan, exit, dns)?;
+    exported.claim = created.claim;
+    Ok(exported)
 }
 
 /// Re-issues a `.conf` for a static peer that already exists (PLAN.md M24),
@@ -580,16 +524,14 @@ fn resolve_profiles(
 /// address. Only the keypair changes.
 ///
 /// **Destructive from its first mutating call.** `rejoin` nulls the node's
-/// pubkey, which drops it out of `/admin/peers` and so off every other
-/// node's directory on their next poll; `/register` puts it back. A failure
-/// in between leaves the node alive but unregistered, recoverable by running
-/// the same command again — not a name-burning failure. The `kind`
-/// expectation is checked by the coordinator *before* it mutates anything,
-/// so pointing this at an agent node by mistake is refused outright rather
-/// than kicking a live node off the mesh.
+/// pubkey, which drops it out of every other node's directory on their next
+/// poll; `/register` puts it back. A failure in between leaves the node
+/// alive but unregistered, recoverable by running the same command again.
+/// The `kind` expectation is checked by the coordinator *before* it mutates
+/// anything, so pointing this at an agent node by mistake is refused.
 ///
-/// Everything that can fail on the way in — the directory fetch and the
-/// gateway choice — happens ahead of the rejoin for the same reason.
+/// Everything that can fail on the way in — the directory, the exit, the
+/// relay ports — happens ahead of the rejoin for the same reason.
 pub fn run_refresh(
     admin_client: &AdminClient,
     node_facing_url: &str,
@@ -597,36 +539,30 @@ pub fn run_refresh(
     opts: &ExportOptions<'_>,
 ) -> Result<Exported, ExportConfigError> {
     let directory = admin_client.list_peers()?;
-    let chosen = select_gateway(
-        &directory.peers,
-        &directory.transit_approved,
-        &directory.transit_offering,
-        &directory.via_gateway,
-        opts.gateway,
-    )?;
-    let dns = check_dns(admin_client, &directory, chosen, opts)?;
+    let exit = select_exit(&directory, opts.exit)?;
+    let dns = check_dns(admin_client, &directory, exit, opts)?;
+    let plan = plan_routes(admin_client, opts, exit)?;
     let rejoined = match admin_client.rejoin(name, None, Some(NodeKind::Static)) {
         Ok(r) => r,
         Err(ClientError::Api { status, message }) if status == reqwest::StatusCode::NOT_FOUND => {
-            return Err(ExportConfigError::NoSuchNode {
-                name: name.to_string(),
-                message,
-            });
+            return Err(ExportConfigError::NoSuchNode { name: name.to_string(), message });
         }
         Err(e) => return Err(e.into()),
     };
-    finish(admin_client, node_facing_url, name, &rejoined.join_token, &directory, chosen, dns)
+    finish(admin_client, node_facing_url, name, &rejoined.join_token, &directory, &plan, exit, dns)
 }
 
 /// The half both paths share, after the token exists: generate a keypair
 /// locally, redeem it, render, and record how the config was shaped.
+#[allow(clippy::too_many_arguments)]
 fn finish(
     admin_client: &AdminClient,
     node_facing_url: &str,
     name: &str,
     join_token: &str,
     directory: &wireserve_types::AdminPeersResponse,
-    gateway: Option<&PeerInfo>,
+    plan: &RelayPlan,
+    exit: Option<&PeerInfo>,
     dns: Resolvers,
 ) -> Result<Exported, ExportConfigError> {
     let private_key = Key::generate();
@@ -649,27 +585,6 @@ fn finish(
     )?;
 
     let services = admin_client.list_services()?;
-
-    // The mesh range comes back from `/register`, which already carries it so
-    // an agent can pin it — no new wire field needed. Without it there is
-    // nothing to point the gateway peer's `AllowedIPs` at, so the export
-    // falls back to all-direct rather than rendering a config that silently
-    // reaches only what it lists.
-    let ranges = reg.mesh.as_ref().and_then(wireserve_types::MeshRanges::parse);
-    let gateway = match (gateway, ranges) {
-        (Some(peer), Some(ranges)) => Some(Gateway { peer, ranges, via_gateway: &directory.via_gateway, exit_dns: dns.exit }),
-        (Some(peer), None) => {
-            eprintln!(
-                "warning: the coordinator did not report a usable mesh range, so '{}' cannot be \
-                 used as a gateway; writing an all-direct config that will need re-exporting \
-                 whenever the mesh changes",
-                peer.name
-            );
-            None
-        }
-        (None, _) => None,
-    };
-
     let iface = InterfaceParams {
         private_key: private_key.to_string(),
         ip4: reg.ip4,
@@ -684,22 +599,21 @@ fn finish(
              tunnel is switched off"
         );
     }
+    let exit_profile = match (exit, dns.exit) {
+        (Some(peer), Some(dns)) => Some(ExitProfile { node: &peer.name, dns }),
+        _ => None,
+    };
+    let rendered = render_conf(&iface, &directory.peers, &services.services, &Routes::from(plan), exit_profile.as_ref());
 
-    let rendered = render_conf(&iface, &directory.peers, &services.services, gateway.as_ref());
-    report_via_gateway(&directory.via_gateway, &directory.peers, gateway.as_ref());
-
-    // Recorded, not recomputed: `/poll` sets `transit_via` for exactly the
-    // peers absent from this list, and it has to match the file that is about
-    // to be written rather than whatever the directory looks like later.
-    //
-    // The exit is recorded from what was actually rendered, not from what was
-    // asked: a gateway dropped for want of a mesh range above renders no
-    // full-tunnel profile, and the gateway must then forward nothing for it.
-    admin_client.set_gateway(
+    // Recorded from what was actually rendered: the exit sends on this
+    // device's traffic only if its profile names it, and each carrier
+    // forwards exactly the relays the file relies on.
+    admin_client.record_export(
         name,
-        gateway.as_ref().map(|g| g.peer.name.as_str()),
-        &rendered.direct_peers,
-        rendered.exit_text.is_some(),
+        &ExportRecord {
+            exit: rendered.exit_text.as_ref().and(exit).map(|p| p.name.clone()),
+            relays: rendered.relays.clone(),
+        },
     )?;
 
     Ok(Exported { conf: rendered.text, exit_conf: rendered.exit_text, claim: None })
@@ -709,10 +623,10 @@ fn finish(
 mod tests {
     use super::*;
 
-    /// The pre-gateway shape, which most of these tests assert on: no
-    /// gateway, so every peer keeps a direct entry exactly as before.
+    /// Every peer dialled directly, which most of these tests assert on.
     fn render(iface: &InterfaceParams, peers: &[PeerInfo], services: &[AdminServiceInfo]) -> String {
-        render_conf(iface, peers, services, None).text
+        let routes = Routes { direct: peers.iter().map(|p| p.name.clone()).collect(), relayed: vec![] };
+        render_conf(iface, peers, services, &routes, None).text
     }
 
     fn peer(pubkey: &str, ip4: &str, ip6: &str, endpoint: Option<&str>) -> PeerInfo {
@@ -727,7 +641,6 @@ mod tests {
             lan_addr: None,
             reflexive_addr: None,
             last_handshake: None,
-            transit_via: None,
             relay: Default::default(),
         }
     }
@@ -928,264 +841,8 @@ mod tests {
 }
 
 #[cfg(test)]
-mod gateway_tests {
+mod routes_tests {
     use super::*;
-    use wireserve_types::{MeshInfo, MeshRanges};
-
-    fn ranges() -> MeshRanges {
-        MeshRanges::parse(&MeshInfo {
-            net_v4_cidr: "10.90.0.0/24".into(),
-            net_v6_prefix: "fdb4:d481:7c21::/64".into(),
-        })
-        .unwrap()
-    }
-
-    fn iface() -> InterfaceParams {
-        InterfaceParams {
-            private_key: "privkeybase64==".into(),
-            ip4: "10.90.0.7".into(),
-            ip6: "fdb4:d481:7c21::7".into(),
-            own_pubkey: "ownpubkeybase64==".into(),
-            dns: None,
-        }
-    }
-
-    fn peer(name: &str, host: u8, endpoint: Option<&str>) -> PeerInfo {
-        PeerInfo {
-            name: name.into(),
-            pubkey: format!("pk-{name}"),
-            ip4: format!("10.90.0.{host}"),
-            ip6: format!("fdb4:d481:7c21::{host}"),
-            endpoint_addr: endpoint.map(Into::into),
-            endpoint_addr_v4: None,
-            endpoint_addr_v6: None,
-            lan_addr: None,
-            reflexive_addr: None,
-            last_handshake: None,
-            transit_via: None,
-            relay: Default::default(),
-        }
-    }
-
-    #[test]
-    fn the_gateway_carries_the_mesh_range_and_is_rendered_exactly_once() {
-        let gw = peer("vps", 2, Some("vps.example.com:51820"));
-        let out = render_conf(
-            &iface(),
-            std::slice::from_ref(&gw),
-            &[],
-            Some(&Gateway { peer: &gw, ranges: ranges(), via_gateway: &[], exit_dns: None }),
-        );
-        assert_eq!(
-            out.text.matches("[Peer]").count(),
-            1,
-            "a gateway also qualifies as a direct peer, and two blocks under one PublicKey \
-             are rejected outright by the iOS and Android apps:\n{}",
-            out.text
-        );
-        assert!(
-            out.text.contains("AllowedIPs = 10.90.0.0/24, fdb4:d481:7c21::/64\n"),
-            "{}",
-            out.text
-        );
-        assert!(out.text.contains("Endpoint = vps.example.com:51820"));
-        assert!(
-            !out.direct_peers.contains(&"vps".to_string()),
-            "the gateway is not a direct peer — /poll must still route others through it"
-        );
-    }
-
-    #[test]
-    fn only_peers_reachable_from_anywhere_keep_a_direct_entry() {
-        let gw = peer("vps", 2, Some("vps.example.com:51820"));
-        let public = peer("vps2", 3, Some("203.0.113.9:51820"));
-        // The trap this gate exists for: a real, valid, self-reported
-        // endpoint that is useless the moment the device leaves that LAN.
-        let lan_only = peer("homeserver", 4, Some("192.168.1.50:51820"));
-        let no_endpoint = peer("laptop", 5, None);
-
-        let out = render_conf(
-            &iface(),
-            &[gw.clone(), public, lan_only, no_endpoint],
-            &[],
-            Some(&Gateway { peer: &gw, ranges: ranges(), via_gateway: &[], exit_dns: None }),
-        );
-
-        assert_eq!(out.direct_peers, vec!["vps2".to_string()]);
-        assert!(out.text.contains("10.90.0.3/32"), "{}", out.text);
-        assert!(
-            !out.text.contains("192.168.1.50"),
-            "a LAN endpoint would mint a /32 that outranks the gateway's covering route \
-             and black-hole off that LAN:\n{}",
-            out.text
-        );
-        assert!(!out.text.contains("10.90.0.4/32"), "{}", out.text);
-        assert!(!out.text.contains("10.90.0.5/32"), "{}", out.text);
-    }
-
-    #[test]
-    fn without_a_gateway_every_peer_still_gets_a_direct_entry_as_before() {
-        let lan_only = peer("homeserver", 4, Some("192.168.1.50:51820"));
-        let no_endpoint = peer("laptop", 5, None);
-        let out = render_conf(&iface(), &[lan_only, no_endpoint], &[], None);
-        assert_eq!(out.text.matches("[Peer]").count(), 2, "{}", out.text);
-        assert_eq!(out.direct_peers, vec!["homeserver".to_string(), "laptop".to_string()]);
-    }
-
-    #[test]
-    fn a_bracketed_v6_endpoint_falls_back_to_v4_so_a_cellular_device_can_dial_it() {
-        // `endpoint_addr` is recorded family-blind, from whichever family the
-        // node's poll arrived over. As one peer among many that mis-picks one
-        // entry; as the gateway it is the whole config.
-        let mut gw = peer("vps", 2, Some("[2001:db8::1]:51820"));
-        gw.endpoint_addr_v4 = Some("203.0.113.9:51820".into());
-        let out = render_conf(&iface(), &[gw.clone()], &[], Some(&Gateway { peer: &gw, ranges: ranges(), via_gateway: &[], exit_dns: None }));
-        assert!(out.text.contains("Endpoint = 203.0.113.9:51820"), "{}", out.text);
-        assert!(!out.text.contains("2001:db8::1"), "{}", out.text);
-    }
-
-    #[test]
-    fn a_v6_only_peer_keeps_its_v6_endpoint() {
-        let gw = peer("vps", 2, Some("[2001:db8::1]:51820"));
-        let out = render_conf(&iface(), std::slice::from_ref(&gw), &[], Some(&Gateway { peer: &gw, ranges: ranges(), via_gateway: &[], exit_dns: None }));
-        assert!(out.text.contains("Endpoint = [2001:db8::1]:51820"), "{}", out.text);
-    }
-
-    #[test]
-    fn addresses_are_reparsed_rather_than_interpolated_from_the_directory() {
-        let mut bad = peer("evil", 3, Some("203.0.113.9:51820"));
-        bad.ip4 = "10.90.0.3/0, 0.0.0.0/0".into();
-        let out = render_conf(&iface(), &[bad], &[], None);
-        assert!(
-            !out.text.contains("0.0.0.0/0"),
-            "an address must come back out of a parser before reaching the file:\n{}",
-            out.text
-        );
-    }
-
-    #[test]
-    fn selecting_a_gateway_refuses_a_node_that_cannot_be_dialled_from_outside() {
-        let lan_only = peer("homeserver", 4, Some("192.168.1.50:51820"));
-        let approved = vec!["homeserver".to_string()];
-        let err = select_gateway(&[lan_only], &approved, &approved, &[], Some("homeserver")).unwrap_err();
-        assert!(matches!(err, ExportConfigError::GatewayNotReachable { .. }), "{err}");
-    }
-
-    #[test]
-    fn selecting_a_gateway_refuses_an_unapproved_node() {
-        let p = peer("vps", 2, Some("vps.example.com:51820"));
-        let err = select_gateway(&[p], &[], &[], &[], Some("vps")).unwrap_err();
-        assert!(matches!(err, ExportConfigError::GatewayNotApproved { .. }), "{err}");
-    }
-
-    #[test]
-    fn a_single_eligible_node_is_picked_automatically_and_two_are_not() {
-        let a = peer("vps", 2, Some("vps.example.com:51820"));
-        let b = peer("vps2", 3, Some("203.0.113.9:51820"));
-        let lan = peer("homeserver", 4, Some("192.168.1.50:51820"));
-        let approved = vec!["vps".to_string(), "vps2".to_string(), "homeserver".to_string()];
-
-        let just_one = [a.clone(), lan.clone()];
-        let one = select_gateway(&just_one, &approved, &approved, &[], None).unwrap();
-        assert_eq!(one.map(|p| p.name.as_str()), Some("vps"));
-
-        // Ambiguity is an error, not a coin flip: the choice is baked into
-        // the config and cannot be changed without re-exporting.
-        let two = [a, b, lan];
-        let err = select_gateway(&two, &approved, &approved, &[], None).unwrap_err();
-        assert!(matches!(err, ExportConfigError::AmbiguousGateway { .. }), "{err}");
-    }
-
-    #[test]
-    fn an_approved_node_that_is_not_currently_offering_is_refused_before_anything_is_created() {
-        // Approval alone leaves the host firewall's forward hook shut. The
-        // coordinator refuses this too, but only when the assignment is
-        // recorded — which is the last step of an export, and failing there
-        // would leave a node created with no config to show for it.
-        let p = peer("vps", 2, Some("vps.example.com:51820"));
-        let approved = vec!["vps".to_string()];
-        let err = select_gateway(&[p], &approved, &[], &[], Some("vps")).unwrap_err();
-        assert!(matches!(err, ExportConfigError::GatewayNotOffering { .. }), "{err}");
-    }
-
-    #[test]
-    fn a_node_marked_via_gateway_is_reached_through_the_gateway_despite_a_public_endpoint() {
-        // minipc's case: a real, globally routable v6 endpoint that the home
-        // router drops inbound. Written in as a direct /32 it would outrank
-        // the gateway's range and black-hole every service on it.
-        let gw = peer("vps", 2, Some("vps.example.com:51820"));
-        let home = peer("minipc", 9, Some("[2001:db8::9]:51820"));
-        let flagged = vec!["minipc".to_string()];
-        let services = [AdminServiceInfo {
-            groups: vec![],
-            dns: None,
-            name: "ssh".into(),
-            node: "minipc".into(),
-            ip4: String::new(),
-            vip4: Some("10.90.0.11".into()),
-            ports: vec![],
-            state: ServiceApprovalState::Approved,
-            declared_at: None,
-            approved_at: None,
-            denied_at: None,
-            denied_reason: None,
-        }];
-
-        let out = render_conf(
-            &iface(),
-            &[gw.clone(), home],
-            &services,
-            Some(&Gateway { peer: &gw, ranges: ranges(), via_gateway: &flagged, exit_dns: None }),
-        );
-
-        assert!(out.direct_peers.is_empty(), "{:?}", out.direct_peers);
-        assert_eq!(out.text.matches("[Peer]").count(), 1, "{}", out.text);
-        assert!(!out.text.contains("2001:db8::9"), "{}", out.text);
-        assert!(
-            !out.text.contains("10.90.0.11/32"),
-            "the service address falls under the gateway's range, so services declared \
-             after the export are reachable too:\n{}",
-            out.text
-        );
-    }
-
-    #[test]
-    fn without_a_gateway_a_node_marked_via_gateway_keeps_its_direct_entry() {
-        // Nothing else could carry it, so dropping it would make it
-        // unreachable rather than rerouted.
-        let home = peer("minipc", 9, Some("[2001:db8::9]:51820"));
-        let out = render_conf(&iface(), &[home], &[], None);
-        assert_eq!(out.direct_peers, vec!["minipc".to_string()]);
-    }
-
-    #[test]
-    fn a_node_marked_via_gateway_is_never_picked_as_the_gateway() {
-        // A device dials its gateway by its one `Endpoint =` line.
-        let a = peer("vps", 2, Some("vps.example.com:51820"));
-        let home = peer("minipc", 9, Some("203.0.113.9:51820"));
-        let approved = vec!["vps".to_string(), "minipc".to_string()];
-        let flagged = vec!["minipc".to_string()];
-
-        let both = [a, home];
-        let one = select_gateway(&both, &approved, &approved, &flagged, None).unwrap();
-        assert_eq!(one.map(|p| p.name.as_str()), Some("vps"), "not ambiguous: minipc is out");
-
-        let err = select_gateway(&both, &approved, &approved, &flagged, Some("minipc")).unwrap_err();
-        assert!(matches!(err, ExportConfigError::GatewayNotDialable { .. }), "{err}");
-    }
-
-    #[test]
-    fn no_eligible_node_is_not_an_error_it_is_the_old_all_direct_behaviour() {
-        let lan = peer("homeserver", 4, Some("192.168.1.50:51820"));
-        assert!(select_gateway(&[lan], &[], &[], &[], None).unwrap().is_none());
-    }
-}
-
-#[cfg(test)]
-mod exit_tests {
-    use super::*;
-    use std::net::Ipv4Addr;
-    use wireserve_types::{MeshInfo, MeshRanges, PortMap};
 
     fn peer(name: &str, host: u8, endpoint: Option<&str>) -> PeerInfo {
         PeerInfo {
@@ -1199,7 +856,6 @@ mod exit_tests {
             lan_addr: None,
             reflexive_addr: None,
             last_handshake: None,
-            transit_via: None,
             relay: Default::default(),
         }
     }
@@ -1214,12 +870,87 @@ mod exit_tests {
         }
     }
 
-    fn ranges() -> MeshRanges {
-        MeshRanges::parse(&MeshInfo {
-            net_v4_cidr: "10.90.0.0/24".into(),
-            net_v6_prefix: "fdb4:d481:7c21::/64".into(),
-        })
-        .unwrap()
+    fn directory(peers: Vec<PeerInfo>, approved: &[&str], exit_offering: &[&str]) -> wireserve_types::AdminPeersResponse {
+        wireserve_types::AdminPeersResponse {
+            peers,
+            transit_approved: approved.iter().map(ToString::to_string).collect(),
+            exit_offering: exit_offering.iter().map(ToString::to_string).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_relayed_node_is_dialled_at_its_carriers_relay_port_and_recorded() {
+        let peers = [peer("vps", 2, Some("203.0.113.2:51820")), peer("minipc", 3, None), peer("gone", 4, None)];
+        let routes = Routes {
+            direct: vec!["vps".into()],
+            relayed: vec![("minipc".into(), "vps".into(), "203.0.113.2:41003".into())],
+        };
+        let out = render_conf(&iface(), &peers, &[], &routes, None);
+        assert!(out.text.contains("MTU = 1340\n"), "{}", out.text);
+        assert!(out.text.contains("PublicKey = minipc-pubkey=\nAllowedIPs = 10.90.0.3/32, fdb4:d481:7c21::3/128\nEndpoint = 203.0.113.2:41003\n"), "{}", out.text);
+        assert!(out.text.contains("Endpoint = 203.0.113.2:51820\n"), "{}", out.text);
+        assert!(!out.text.contains("gone-pubkey"), "a node reached neither way has no entry: {}", out.text);
+        assert!(!out.text.contains("/24") && !out.text.contains("/64"), "no covering route to anyone: {}", out.text);
+        assert_eq!(out.relays, [RelayAssignment { node: "minipc".into(), carrier: "vps".into() }]);
+    }
+
+    #[test]
+    fn without_a_relay_the_mtu_is_left_alone() {
+        let peers = [peer("vps", 2, Some("203.0.113.2:51820"))];
+        let out = render_conf(&iface(), &peers, &[], &Routes { direct: vec!["vps".into()], relayed: vec![] }, None);
+        assert!(!out.text.contains("MTU"), "{}", out.text);
+        assert!(out.relays.is_empty());
+    }
+
+    #[test]
+    fn an_exit_must_be_approved_offering_and_dialable_and_one_is_picked_automatically() {
+        let peers = vec![peer("vps", 2, Some("203.0.113.2:51820")), peer("home", 3, Some("192.168.1.3:51820")), peer("vps2", 5, Some("203.0.113.5:51820"))];
+        let d = directory(peers.clone(), &["vps", "home"], &["vps", "home"]);
+        assert_eq!(select_exit(&d, Some("")).unwrap().unwrap().name, "vps", "home's endpoint is private");
+        assert!(select_exit(&d, None).unwrap().is_none());
+        assert!(matches!(select_exit(&d, Some("home")), Err(ExportConfigError::ExitNotDialable { .. })));
+        assert!(matches!(select_exit(&d, Some("vps2")), Err(ExportConfigError::ExitNotApproved { .. })));
+        assert!(matches!(select_exit(&d, Some("nope")), Err(ExportConfigError::NoSuchExit { .. })));
+        let d = directory(peers.clone(), &["vps", "vps2"], &["vps"]);
+        assert!(matches!(select_exit(&d, Some("vps2")), Err(ExportConfigError::ExitNotOffering { .. })));
+        let d = directory(peers.clone(), &["vps", "vps2"], &["vps", "vps2"]);
+        assert!(matches!(select_exit(&d, Some("")), Err(ExportConfigError::AmbiguousExit { .. })));
+        let d = directory(peers, &[], &[]);
+        assert!(matches!(select_exit(&d, Some("")), Err(ExportConfigError::NoExit)));
+    }
+}
+
+#[cfg(test)]
+mod exit_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+    use wireserve_types::PortMap;
+
+    fn peer(name: &str, host: u8, endpoint: Option<&str>) -> PeerInfo {
+        PeerInfo {
+            name: name.into(),
+            pubkey: format!("{name}-pubkey="),
+            ip4: format!("10.90.0.{host}"),
+            ip6: format!("fdb4:d481:7c21::{host}"),
+            endpoint_addr: endpoint.map(Into::into),
+            endpoint_addr_v4: None,
+            endpoint_addr_v6: None,
+            lan_addr: None,
+            reflexive_addr: None,
+            last_handshake: None,
+            relay: Default::default(),
+        }
+    }
+
+    fn iface() -> InterfaceParams {
+        InterfaceParams {
+            private_key: "privkeybase64==".into(),
+            ip4: "10.90.0.7".into(),
+            ip6: "fdb4:d481:7c21::7".into(),
+            own_pubkey: "ownpubkeybase64==".into(),
+            dns: None,
+        }
     }
 
     fn dns_service(name: &str, vip: &str, ports: &[&str], state: ServiceApprovalState) -> AdminServiceInfo {
@@ -1240,48 +971,51 @@ mod exit_tests {
     }
 
     #[test]
-    fn the_full_tunnel_profile_is_the_mesh_profile_with_everything_on_the_gateway_and_a_resolver() {
-        let gw = peer("vps", 2, Some("vps.example.com:51820"));
+    fn the_full_tunnel_profile_is_the_mesh_profile_with_everything_on_the_exit_and_a_resolver() {
+        let exit = peer("vps", 2, Some("vps.example.com:51820"));
         let public = peer("vps2", 3, Some("203.0.113.9:51820"));
+        let natted = peer("minipc", 4, None);
         let dns = Ipv4Addr::new(10, 90, 0, 50);
-        let out = render_conf(
-            &iface(),
-            &[gw.clone(), public],
-            &[],
-            Some(&Gateway { peer: &gw, ranges: ranges(), via_gateway: &[], exit_dns: Some(dns) }),
-        );
-        let exit = out.exit_text.expect("an exit resolver asks for the second profile");
+        let routes = Routes {
+            direct: vec!["vps".into(), "vps2".into()],
+            relayed: vec![("minipc".into(), "vps2".into(), "203.0.113.9:41004".into())],
+        };
+        let out = render_conf(&iface(), &[exit.clone(), public, natted], &[], &routes, Some(&ExitProfile { node: "vps", dns }));
+        let full = out.exit_text.expect("an exit resolver asks for the second profile");
 
         // The mesh profile is untouched: no resolver (PLAN.md #104 still
-        // holds for it), the gateway carries the mesh range only.
+        // holds for it), and every node on its own /32s.
         assert!(!out.text.contains("DNS ="), "{}", out.text);
-        assert!(out.text.contains("AllowedIPs = 10.90.0.0/24, fdb4:d481:7c21::/64\n"), "{}", out.text);
         assert!(!out.text.contains("0.0.0.0/0"), "{}", out.text);
 
-        assert!(exit.contains("[Interface]\nPrivateKey = privkeybase64==\nAddress = 10.90.0.7/32, fdb4:d481:7c21::7/128\nDNS = 10.90.0.50\n"), "{exit}");
-        assert!(exit.contains("AllowedIPs = 0.0.0.0/0, ::/0\n"), "{exit}");
-        assert!(!exit.contains("10.90.0.0/24"), "one gateway block, carrying everything: {exit}");
-        assert_eq!(exit.matches("[Peer]").count(), 2, "{exit}");
-        // Direct peers stay direct: their /32s outrank the default route.
-        assert!(exit.contains("AllowedIPs = 10.90.0.3/32, fdb4:d481:7c21::3/128\n"), "{exit}");
+        assert!(full.contains("DNS = 10.90.0.50\n"), "{full}");
+        assert!(full.contains("PublicKey = vps-pubkey=\nAllowedIPs = 0.0.0.0/0, ::/0\n"), "{full}");
+        assert_eq!(full.matches("[Peer]").count(), 3, "{full}");
+        // Every other node stays end to end: its /32s outrank the default
+        // route, and a relayed one keeps its relay.
+        assert!(full.contains("AllowedIPs = 10.90.0.3/32, fdb4:d481:7c21::3/128\n"), "{full}");
+        assert!(full.contains("Endpoint = 203.0.113.9:41004\n"), "{full}");
         assert_eq!(
-            out.text.replace("AllowedIPs = 10.90.0.0/24, fdb4:d481:7c21::/64", "AllowedIPs = 0.0.0.0/0, ::/0"),
-            exit.replace("DNS = 10.90.0.50\n", ""),
-            "the two profiles differ in exactly the resolver and the gateway's range"
+            out.text.replace("AllowedIPs = 10.90.0.2/32, fdb4:d481:7c21::2/128", "AllowedIPs = 0.0.0.0/0, ::/0"),
+            full.replace("DNS = 10.90.0.50\n", ""),
+            "the two profiles differ in exactly the resolver and the exit's range"
         );
-        assert_eq!(out.direct_peers, vec!["vps2".to_string()]);
     }
 
     #[test]
     fn no_resolver_no_second_profile() {
-        let gw = peer("vps", 2, Some("vps.example.com:51820"));
-        let out = render_conf(
-            &iface(),
-            std::slice::from_ref(&gw),
-            &[],
-            Some(&Gateway { peer: &gw, ranges: ranges(), via_gateway: &[], exit_dns: None }),
-        );
+        let exit = peer("vps", 2, Some("vps.example.com:51820"));
+        let routes = Routes { direct: vec!["vps".into()], relayed: vec![] };
+        let out = render_conf(&iface(), std::slice::from_ref(&exit), &[], &routes, None);
         assert!(out.exit_text.is_none());
+    }
+
+    #[test]
+    fn a_relayed_node_is_never_the_exit() {
+        let natted = peer("minipc", 4, None);
+        let routes = Routes { direct: vec![], relayed: vec![("minipc".into(), "vps".into(), "203.0.113.9:41004".into())] };
+        let out = render_conf(&iface(), &[natted], &[], &routes, Some(&ExitProfile { node: "minipc", dns: Ipv4Addr::new(9, 9, 9, 9) }));
+        assert!(out.exit_text.is_none(), "a full tunnel through a relay would send the internet through the carrier");
     }
 
     #[test]
@@ -1326,32 +1060,26 @@ mod exit_tests {
     // ---- the mesh profile's resolver (PLAN.md M28) ----
 
     fn opts(exit: bool, mesh_dns: bool) -> ExportOptions<'static> {
-        ExportOptions { gateway: None, dns: None, exit, mesh_dns }
+        ExportOptions { exit: exit.then_some(""), dns: None, mesh_dns, allow_unverified: false }
     }
 
     #[test]
     fn the_mesh_profile_names_a_resolver_only_when_asked() {
-        let gw = peer("vps", 2, Some("vps.example.com:51820"));
+        let exit = peer("vps", 2, Some("vps.example.com:51820"));
         let mut with = iface();
         with.dns = Some(Ipv4Addr::new(10, 90, 0, 50));
-        let gateway = Gateway { peer: &gw, ranges: ranges(), via_gateway: &[], exit_dns: Some(Ipv4Addr::new(9, 9, 9, 9)) };
-        let out = render_conf(&with, std::slice::from_ref(&gw), &[], Some(&gateway));
+        let routes = Routes { direct: vec!["vps".into()], relayed: vec![] };
+        let out = render_conf(&with, std::slice::from_ref(&exit), &[], &routes, Some(&ExitProfile { node: "vps", dns: Ipv4Addr::new(9, 9, 9, 9) }));
         assert!(
             out.text.contains("Address = 10.90.0.7/32, fdb4:d481:7c21::7/128\nDNS = 10.90.0.50\n\n[Peer]"),
             "{}",
             out.text
         );
-        assert!(out.text.contains("AllowedIPs = 10.90.0.0/24, fdb4:d481:7c21::/64\n"), "still the mesh only: {}", out.text);
-        let exit = out.exit_text.unwrap();
-        assert_eq!(exit.matches("DNS =").count(), 1, "each profile names its own resolver once: {exit}");
-        assert!(exit.contains("DNS = 9.9.9.9\n"), "{exit}");
+        let full = out.exit_text.unwrap();
+        assert_eq!(full.matches("DNS =").count(), 1, "each profile names its own resolver once: {full}");
+        assert!(full.contains("DNS = 9.9.9.9\n"), "{full}");
 
-        // Without a gateway too: the resolver's owner is then a direct peer.
-        let owner = peer("home", 4, None);
-        let out = render_conf(&with, std::slice::from_ref(&owner), &[], None);
-        assert!(out.text.contains("DNS = 10.90.0.50\n"), "{}", out.text);
-
-        let out = render_conf(&iface(), std::slice::from_ref(&gw), &[], None);
+        let out = render_conf(&iface(), std::slice::from_ref(&exit), &[], &routes, None);
         assert!(!out.text.contains("DNS ="), "{}", out.text);
     }
 
@@ -1387,18 +1115,10 @@ mod exit_tests {
     fn a_resolver_needs_a_profile_and_a_profile_that_needs_one_gets_one() {
         // Decided before any request: the client points nowhere.
         let client = AdminClient::new("http://127.0.0.1:9", "t");
-        let directory = wireserve_types::AdminPeersResponse {
-            peers: vec![],
-            transit_approved: vec![],
-            transit_offering: vec![],
-            via_gateway: vec![],
-            exit_offering: vec![],
-            exit_devices: vec![],
-            tags: Default::default(),
-        };
+        let directory = wireserve_types::AdminPeersResponse::default();
         let usage = |o: ExportOptions<'_>| matches!(check_dns(&client, &directory, None, &o), Err(ExportConfigError::DnsUsage(_)));
         assert!(usage(ExportOptions { dns: Some("pihole"), ..Default::default() }));
-        assert!(usage(ExportOptions { exit: true, ..Default::default() }));
+        assert!(usage(ExportOptions { exit: Some(""), ..Default::default() }));
         assert!(usage(ExportOptions { mesh_dns: true, ..Default::default() }));
         assert_eq!(check_dns(&client, &directory, None, &ExportOptions::default()).unwrap(), Resolvers::default());
     }

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# WireServe exit test (PLAN.md M27): a phone's full-tunnel profile sends its
-# internet traffic out through its gateway, and a home resolver served on the
-# mesh names services for it.
+# WireServe exit test (PLAN.md M27, M41): a phone's full-tunnel profile sends
+# its internet traffic out through its exit — the node named by `--exit` —
+# while the mesh stays end to end, and a home resolver served on the mesh
+# names services for it.
 #
 # What this proves, and what the namespace test in nftables.rs cannot — that
 # one has no WireGuard, no coordinator and no exported config:
@@ -221,7 +222,7 @@ admin approve-transit node-gw || fail "could not approve node-gw for transit"
 sleep 10
 
 log "1/9: --exit is refused while the gateway has not opted in"
-if admin export-config phone --gateway node-gw --exit --dns dns --out /tmp/phone.conf \
+if admin export-config phone --exit node-gw --dns dns --out /tmp/phone.conf \
     --register-url "http://127.0.0.1:47820" >"$OUT/refused.log" 2>&1; then
     fail "an exit profile was written for a gateway that never ran \`exit on\`"
 fi
@@ -233,7 +234,7 @@ pass "refused, naming \`exit on\`"
 log "2/9: two profiles, one key"
 podman exec "$GW" wireserve exit on
 sleep 10
-admin export-config phone --gateway node-gw --exit --dns dns --out /tmp/phone.conf \
+admin export-config phone --exit node-gw --dns dns --out /tmp/phone.conf \
     --register-url "http://127.0.0.1:47820" \
     || fail "export-config --exit failed (a conflict here means step 1 created the node before refusing)"
 podman cp "$COORD:/tmp/phone.conf" "$OUT/phone.conf"
@@ -242,7 +243,10 @@ note "full-tunnel profile:"
 sed 's/^PrivateKey = .*/PrivateKey = <redacted>/; s/^/  /' "$OUT/phone-exit.conf"
 [ "$(grep '^PrivateKey' "$OUT/phone.conf")" = "$(grep '^PrivateKey' "$OUT/phone-exit.conf")" ] \
     || fail "the two profiles hold different keys"
-grep -qx "AllowedIPs = 0.0.0.0/0, ::/0" "$OUT/phone-exit.conf" || fail "the gateway does not carry everything"
+grep -qx "AllowedIPs = 0.0.0.0/0, ::/0" "$OUT/phone-exit.conf" || fail "the exit does not carry everything"
+# No covering mesh route to anyone (PLAN.md M41): every node the phone
+# reaches, it reaches on its own /32s, end to end.
+grep -qE "AllowedIPs = [0-9.]+/2[0-9]" "$OUT/phone.conf" && fail "the mesh profile still sends a mesh range to one peer"
 grep -qx "DNS = $DNS_VIP" "$OUT/phone-exit.conf" || fail "the resolver is not the dns service's address"
 grep -q "^DNS" "$OUT/phone.conf" && fail "the mesh profile must not name a resolver (PLAN.md #104)"
 admin list-peers | grep '^phone' | grep -q 'exit=yes' || fail "list-peers does not show the phone's exit"
@@ -351,12 +355,12 @@ podman exec "$PHONE" timeout 15 bash -c "exec 3<>/dev/tcp/$SVC_HOME/12345" \
 pass "the internet is gone, the mesh stays"
 
 log "10/10: names without the full tunnel (--mesh-dns)"
-if admin export-config tablet --gateway node-gw --dns 9.9.9.9 --mesh-dns --out /tmp/tablet.conf \
+if admin export-config tablet --dns 9.9.9.9 --mesh-dns --out /tmp/tablet.conf \
     --register-url "http://127.0.0.1:47820" >"$OUT/mesh-refused.log" 2>&1; then
     fail "a public resolver was accepted for the mesh profile, which would ask it outside the tunnel"
 fi
 grep -q "not on the mesh" "$OUT/mesh-refused.log" || { cat "$OUT/mesh-refused.log"; fail "the refusal does not say why"; }
-admin export-config tablet --gateway node-gw --dns dns --mesh-dns --out /tmp/tablet.conf \
+admin export-config tablet --dns dns --mesh-dns --out /tmp/tablet.conf \
     --register-url "http://127.0.0.1:47820" || fail "export-config --mesh-dns failed"
 podman cp "$COORD:/tmp/tablet.conf" "$OUT/tablet.conf"
 grep -qx "DNS = $DNS_VIP" "$OUT/tablet.conf" || fail "the mesh profile does not name the resolver"
