@@ -3480,6 +3480,7 @@ async fn a_revoked_device_is_no_longer_an_exit_client() {
 fn sign_in() -> wireserve_types::SignIn {
     wireserve_types::SignIn {
         service: "auth".into(),
+        node: "gate".into(),
         verify_path: "/verify".into(),
         copy_headers: vec!["x-auth-user".into()],
         session_cookie: "authward_session".into(),

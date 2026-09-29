@@ -477,8 +477,10 @@ sent.
 service; its node's terminator then asks the provider named by
 `WIRESERVE_AUTH_SERVICE` about every request — Caddy's `forward_auth`, built
 in: a headers-only copy of the request to `https://<provider>.<domain>/verify`
-on the provider's own address, verified TLS, with the original `Host`,
-`X-Forwarded-Method` and `X-Forwarded-Uri`. A 2xx passes with the provider's
+on the provider's own address, verified TLS, with `X-Forwarded-Method`,
+`X-Forwarded-Uri` and the service's own name as `Host` and `X-Forwarded-Host`
+— a request whose `Host` names another service gets 421 first. The provider
+is trusted only while `WIRESERVE_AUTH_NODE` declares it. A 2xx passes with the provider's
 identity headers copied on (and any a client sent removed first); a 401 with
 `X-Login-Url` redirects a GET; anything else is returned as is. The mark is
 only as good as the rule that the backend is unreachable except through that

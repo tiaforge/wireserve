@@ -31,10 +31,19 @@ pub struct Naming {
     /// The service running the sign-in provider (PLAN.md M34), if any. Only
     /// asked, and only kept, with `dns` set: the sign-in lives in the
     /// terminators, which need the records.
-    pub sign_in: Option<String>,
+    pub sign_in: Option<SignInAnswer>,
     /// The provider the coordinator publishes the names through (PLAN.md
     /// M32), or `None` to leave DNS to the operator.
     pub dns: Option<DnsAnswer>,
+}
+
+/// The sign-in provider's service, and the node it must run on. The node
+/// may be missing in a file written before it was asked for; the sign-in
+/// is then off until it is given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignInAnswer {
+    pub service: String,
+    pub node: Option<String>,
 }
 
 /// A DNS provider and the settings it needs, as `WIRESERVE_DNS_*` keys.
@@ -101,6 +110,8 @@ pub struct Given {
     pub domain: Option<Option<String>>,
     /// `Some(None)` is `--no-auth-service`.
     pub sign_in: Option<Option<String>>,
+    /// `--auth-node`.
+    pub sign_in_node: Option<String>,
     /// `Some(None)` is `--no-dns`.
     pub dns_provider: Option<Option<String>>,
     /// `Some(None)` is `--no-admin-user`.
@@ -140,7 +151,12 @@ impl Current {
             });
         let naming = envfile::get(text, "WIRESERVE_SERVICE_DOMAIN").filter(|d| !d.is_empty()).map(|domain| Naming {
             domain,
-            sign_in: envfile::get(text, "WIRESERVE_AUTH_SERVICE").filter(|p| !p.is_empty()).filter(|_| dns.is_some()),
+            sign_in: envfile::get(text, "WIRESERVE_AUTH_SERVICE").filter(|p| !p.is_empty()).filter(|_| dns.is_some()).map(
+                |service| SignInAnswer {
+                    service,
+                    node: envfile::get(text, "WIRESERVE_AUTH_NODE").filter(|n| !n.is_empty()),
+                },
+            ),
             dns,
         });
         Self {
@@ -182,10 +198,9 @@ impl Answers {
             Some(n) => Change::Set(n.domain.clone()),
             None => Change::Clear,
         };
-        let sign_in = match self.naming.as_ref().and_then(|n| n.sign_in.as_ref()) {
-            Some(s) => Change::Set(s.clone()),
-            None => Change::Clear,
-        };
+        let sign_in = self.naming.as_ref().and_then(|n| n.sign_in.as_ref());
+        let sign_in_node = sign_in.and_then(|s| s.node.clone()).map_or(Change::Clear, Change::Set);
+        let sign_in = sign_in.map_or(Change::Clear, |s| Change::Set(s.service.clone()));
         // Turning DNS off, or switching provider, clears every credential
         // the new setting does not use: a token nothing reads any more is
         // still a live token sitting in a file.
@@ -209,6 +224,7 @@ impl Answers {
             ("WIRESERVE_REQUIRE_SERVICE_APPROVAL", Change::Set(self.approval.to_string())),
             ("WIRESERVE_SERVICE_DOMAIN", domain),
             ("WIRESERVE_AUTH_SERVICE", sign_in),
+            ("WIRESERVE_AUTH_NODE", sign_in_node),
         ];
         changes.extend(dns_changes);
         changes
@@ -246,8 +262,14 @@ impl Answers {
                     )),
                     None => s.push_str("  DNS records:          none (names work on WireServe machines only)\n"),
                 }
-                if let Some(svc) = &n.sign_in {
-                    s.push_str(&format!("  Sign-in:              the `{svc}` service\n"));
+                match &n.sign_in {
+                    Some(SignInAnswer { service, node: Some(node) }) => {
+                        s.push_str(&format!("  Sign-in:              the `{service}` service on {node}\n"));
+                    }
+                    Some(SignInAnswer { service, node: None }) => s.push_str(&format!(
+                        "  Sign-in:              the `{service}` service — OFF until its node is given\n"
+                    )),
+                    None => {}
                 }
             }
             None => s.push_str("  Service names:        <name>.wg\n"),
@@ -368,6 +390,15 @@ pub fn check_dns_provider(raw: &str) -> Result<String, String> {
         Ok(p)
     } else {
         Err(format!("pick one of {}", crate::dns::config::PROVIDERS.join(", ")))
+    }
+}
+
+pub fn check_node_name(raw: &str) -> Result<String, String> {
+    let p = raw.trim().to_lowercase();
+    if wireserve_types::is_valid_dns_label(&p) {
+        Ok(p)
+    } else {
+        Err("a node name is one word of letters, digits and dashes, like homeserver".into())
     }
 }
 
@@ -604,33 +635,59 @@ impl Asker<'_> {
         Ok(Some(Naming { domain, sign_in, dns }))
     }
 
-    /// The service running the sign-in provider (PLAN.md M34), if any:
-    /// `--auth-service` / `--no-auth-service`, then the question, then the
-    /// current setting.
-    fn sign_in(&self, domain: &str) -> Result<Option<String>, AskError> {
+    /// The service running the sign-in provider (PLAN.md M34), if any, and
+    /// the node it runs on: `--auth-service` / `--no-auth-service` and
+    /// `--auth-node`, then the questions, then the current setting.
+    fn sign_in(&self, domain: &str) -> Result<Option<SignInAnswer>, AskError> {
         let current = self.current.naming.as_ref().and_then(|n| n.sign_in.clone());
-        match &self.given.sign_in {
+        let given_node = match &self.given.sign_in_node {
+            Some(raw) => Some(check_node_name(raw).map_err(|e| AskError::Invalid(format!("--auth-node: {e}")))?),
+            None => None,
+        };
+        let service = match &self.given.sign_in {
             Some(None) => return Ok(None),
-            Some(Some(raw)) => {
-                return check_service_name(raw).map(Some).map_err(|e| AskError::Invalid(format!("--auth-service: {e}")))
+            Some(Some(raw)) => check_service_name(raw).map_err(|e| AskError::Invalid(format!("--auth-service: {e}")))?,
+            None if !self.interactive => {
+                return Ok(current.map(|c| SignInAnswer { node: given_node.or(c.node), ..c }));
             }
-            None if !self.interactive => return Ok(current),
-            None => {}
-        }
-        explain(&[
-            "Optional: some services can ask people to log in before they get in.",
-            "That needs a login service of your own (a forward_auth provider such",
-            &format!("as authward), shared on port 443 like any other: https://<name>.{domain}."),
-            "Enter its service name, or - if you have none (you can add it later",
-            "with --reconfigure).",
-        ]);
-        ask_until("Login service", Some(current.as_deref().unwrap_or("-")), |raw| {
-            if raw.trim() == "-" {
-                Ok(None)
-            } else {
-                check_service_name(raw).map(Some)
+            None => {
+                explain(&[
+                    "Optional: some services can ask people to log in before they get in.",
+                    "That needs a login service of your own (a forward_auth provider such",
+                    &format!("as authward), shared on port 443 like any other: https://<name>.{domain}."),
+                    "Enter its service name, or - if you have none (you can add it later",
+                    "with --reconfigure).",
+                ]);
+                let current_service = current.as_ref().map(|c| c.service.as_str());
+                let answer = ask_until("Login service", Some(current_service.unwrap_or("-")), |raw| {
+                    if raw.trim() == "-" {
+                        Ok(None)
+                    } else {
+                        check_service_name(raw).map(Some)
+                    }
+                })?;
+                match answer {
+                    Some(s) => s,
+                    None => return Ok(None),
+                }
             }
-        })
+        };
+        let current_node = current.and_then(|c| c.node);
+        let node = match given_node {
+            Some(n) => n,
+            None if !self.interactive => match current_node {
+                Some(n) => n,
+                None => return Err(AskError::Invalid("--auth-service needs --auth-node, the node that runs it".into())),
+            },
+            None => {
+                explain(&[
+                    "Every sign-in goes to that service, so it is trusted only on the machine",
+                    "you name here: the same name shared by any other machine is ignored.",
+                ]);
+                ask_until("Machine running it (its node name)", current_node.as_deref(), check_node_name)?
+            }
+        };
+        Ok(Some(SignInAnswer { service, node: Some(node) }))
     }
 
     /// The DNS provider for `domain` (PLAN.md M32): `--dns-provider` /
@@ -899,10 +956,13 @@ mod tests {
         let c = a.env_changes();
         assert_eq!(change(&c, "WIRESERVE_SERVICE_DOMAIN"), &Change::Clear);
         assert_eq!(change(&c, "WIRESERVE_AUTH_SERVICE"), &Change::Clear);
-        a.naming = Some(Naming { domain: "int.example.com".into(), sign_in: Some("auth".into()), dns: None });
+        assert_eq!(change(&c, "WIRESERVE_AUTH_NODE"), &Change::Clear);
+        let sign_in = Some(SignInAnswer { service: "auth".into(), node: Some("gate".into()) });
+        a.naming = Some(Naming { domain: "int.example.com".into(), sign_in, dns: None });
         let c = a.env_changes();
         assert_eq!(change(&c, "WIRESERVE_SERVICE_DOMAIN"), &Change::Set("int.example.com".into()));
         assert_eq!(change(&c, "WIRESERVE_AUTH_SERVICE"), &Change::Set("auth".into()));
+        assert_eq!(change(&c, "WIRESERVE_AUTH_NODE"), &Change::Set("gate".into()));
     }
 
     #[test]
@@ -1129,11 +1189,26 @@ mod tests {
     #[test]
     fn a_sign_in_service_is_kept_only_with_dns_records() {
         let env = |k: &str| (k == "WIRESERVE_DNS_API_TOKEN").then(|| "cf-token".to_string());
-        let given = Given { sign_in: Some(Some("Auth".into())), ..dns_given() };
+        let given = Given { sign_in: Some(Some("Auth".into())), sign_in_node: Some("Gate".into()), ..dns_given() };
         let a = asker_env(given, Current::default(), &env).ask_all().unwrap();
-        assert_eq!(a.naming.as_ref().unwrap().sign_in.as_deref(), Some("auth"));
+        let expected = Some(SignInAnswer { service: "auth".into(), node: Some("gate".into()) });
+        assert_eq!(a.naming.as_ref().unwrap().sign_in, expected);
         let text = envfile::apply("", &a.env_changes());
-        assert_eq!(Current::from_env_file(&text).naming.unwrap().sign_in.as_deref(), Some("auth"));
+        assert_eq!(Current::from_env_file(&text).naming.unwrap().sign_in, expected);
+
+        let without_node = Given { sign_in: Some(Some("auth".into())), ..dns_given() };
+        assert!(asker_env(without_node, Current::default(), &env).ask_all().is_err(), "the node is required");
+
+        // A file written before the node was asked for: an upgrade keeps the
+        // service, and `--auth-node` alone adds the node.
+        let old = "WIRESERVE_PUBLIC_URL=https://mesh.test\nWIRESERVE_SERVICE_DOMAIN=int.test\n\
+                   WIRESERVE_DNS_PROVIDER=cloudflare\nWIRESERVE_AUTH_SERVICE=auth\n";
+        let current = Current::from_env_file(old);
+        let kept = current.naming.as_ref().unwrap().sign_in.clone();
+        assert_eq!(kept, Some(SignInAnswer { service: "auth".into(), node: None }));
+        let given = Given { sign_in_node: Some("gate".into()), ..Given::default() };
+        let a = asker_env(given, current, &env).ask_all().unwrap();
+        assert_eq!(a.naming.unwrap().sign_in, expected);
 
         let no_dns = Given { dns_provider: Some(None), sign_in: Some(Some("auth".into())), ..dns_given() };
         let a = asker(no_dns, Current::default()).ask_all().unwrap();

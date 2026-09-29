@@ -46,14 +46,18 @@ pub struct ServiceNaming {
 ///
 /// The terminator sends each request to a marked service to
 /// `https://<service>.<domain><verify_path>` first — on that service's own
-/// address, verified against its certificate — with the original `Host`,
-/// `X-Forwarded-Method`, `X-Forwarded-Uri` and cookies. A 2xx lets it
+/// address, verified against its certificate, and only while `node` owns
+/// it — with the service's own name as `Host`, `X-Forwarded-Method`,
+/// `X-Forwarded-Uri` and cookies. A 2xx lets it
 /// through with `copy_headers` copied from the answer; a 401 carrying
 /// `X-Login-Url` sends the browser there; anything else is returned as is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignIn {
     /// The service running the provider, e.g. `auth`.
     pub service: String,
+    /// The node that service must be declared by. A terminator trusts the
+    /// provider only there: whoever declares the name elsewhere is not it.
+    pub node: String,
     pub verify_path: String,
     /// The provider's identity headers. Every one is removed from the
     /// client's request first, whether or not the provider sends it back.

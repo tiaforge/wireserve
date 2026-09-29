@@ -8,18 +8,10 @@ this checklist lives in the session that created it — this file is the
 source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
-**Currently working on:** nothing open — all milestones complete through
-M26 (serving an address the node reaches, e.g. its LAN router). 770 tests
-passing across `cargo test --workspace`. **M26's `run-lan-target-test.sh`
-has NOT been run** (needs `sudo`). Several container harnesses in
-`deploy/e2e/` pass on a real kernel: `run-e2e-test.sh` (mesh, firewall,
-interface guard), `run-nat-test.sh` (two NAT-ed sites) and
-`run-proxy-test.sh` (TLS-terminating reverse proxy, the topology spec §7
-actually mandates). **M23's own `run-transit-test.sh` has NOT been run**
-— written against the same rootful-Podman pattern as the others, but
-needs `sudo` and hasn't had its first real execution yet, so M23's actual
-end-to-end behaviour (as opposed to its unit/integration/kernel-gated
-tests, which have all run and pass) is unverified until it has.
+**Currently working on:** M36 (service groups, grants and tags; items 212+),
+then M37 (caching `/verify`) and M38 (device owners through OIDC). The plan
+is `~/.claude/plans/alright-then-lets-create-shimmying-panda.md` (not in the
+repo). Step 0 (items 212–213) is done.
 
 Everything that can be verified here now is. What remains unverified is
 scale (three nodes, not thirty), real WAN paths, and long-running
@@ -3355,3 +3347,39 @@ beside a terminated service.
     (`wireserve-tls@<i>.socket.d/port.conf`), and says which. `--tls-port`
     chooses one for any instance; a drop-in already there is kept as it is.
 
+
+## M36 — who can reach what: service groups, grants and tags
+
+Today every approved service is reachable by every node, and the only way
+to restrict one is M34's mark, which asks the sign-in about every request —
+the owner's own laptop included — and covers HTTP on 443 alone. M36 moves
+access into grants the coordinator computes and every node enforces
+itself: nft by source node for any protocol, the terminator by device and
+then by sign-in for HTTP. One earlier installation exists: its services all
+land in the built-in `default` group, which everyone is granted, so it
+upgrades without a change in behaviour.
+
+Two findings of the 2026-09-27 security review come first, because M36
+builds on the sign-in they concern.
+
+212. **The provider is told the service's own name, and a request naming
+    another is misdirected.** The terminator picks the service by the
+    address a connection arrived on, but passed the client's `Host` to
+    `/verify` — and authward chooses its per-host rules (`bypass_paths`,
+    `required_group`) by that name, so a mesh peer could have another
+    host's rules applied to a marked service. `SignIn::check` now sends the
+    route's fqdn as `Host` and `X-Forwarded-Host`, and every terminated
+    service answers a request whose `Host` or authority names anything else
+    with **421 Misdirected Request** before the sign-in or the backend sees
+    it. `run-service-auth-test.sh` step 6.
+
+213. **The provider is trusted on one node only.** It was known by service
+    name alone: whichever node declared `auth` after the real one withdrew
+    it would have received every `/verify` request, session cookies
+    included, and decided who gets in. `WIRESERVE_AUTH_NODE` names the node
+    (installer: `--auth-node` and a question), `SignIn` carries it, and the
+    agent builds a `SignInTarget` only from a directory entry owned by that
+    node; otherwise there is none, and marked services refuse with 503.
+    Without `WIRESERVE_AUTH_NODE` the sign-in is off, with a warning at
+    startup — a coordinator configured before the setting still starts.
+    `run-service-auth-test.sh` step 7.

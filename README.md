@@ -54,7 +54,7 @@ a sensible default:
    closed to the internet, UDP may be forwarded for NAT help;
 4. whether new services wait for your approval (yes);
 5. whether services get names under a domain you own, the DNS provider that
-   holds it, and which service runs your sign-in, if any;
+   holds it, and which service runs your sign-in, if any, on which node;
 6. which local user gets the admin key saved, so `wireserve-admin` needs no
    flags (whoever ran sudo).
 
@@ -651,12 +651,14 @@ node's terminator and speaks `forward_auth`, so any provider for that works;
 the defaults are [authward](https://git.tia.sh/tia/authward)'s.
 
 Run the provider as a mesh service on 443 — its login pages are then
-`https://auth.int.example.com` — and name it on the coordinator:
+`https://auth.int.example.com` — and name it, and the node running it, on
+the coordinator:
 
 ```sh
 wireserve serve auth 443:8080             # on the node running authward
 # on the coordinator
 WIRESERVE_AUTH_SERVICE=auth
+WIRESERVE_AUTH_NODE=gate                  # the node that runs it
 # optional, shown with their defaults
 WIRESERVE_AUTH_VERIFY_PATH=/verify
 WIRESERVE_AUTH_COPY_HEADERS="X-Auth-User X-Auth-Email X-Auth-Groups"
@@ -672,8 +674,9 @@ wireserve-admin service-auth grafana on                      # existing ones
 
 From the next poll, every request to a marked service first goes, headers
 only, to `https://auth.<domain>/verify` — over verified TLS on the provider's
-own address, with the original `Host`, `X-Forwarded-Method` and
-`X-Forwarded-Uri`. A 2xx lets it through with the provider's `X-Auth-*`
+own address, with `X-Forwarded-Method`, `X-Forwarded-Uri`, and the
+service's own name in `Host` and `X-Forwarded-Host` (a request naming any
+other host is refused with 421 before it gets that far). A 2xx lets it through with the provider's `X-Auth-*`
 headers copied on; a 401 with `X-Login-Url` sends the browser to sign in;
 anything else is the provider's own answer. And the service's **own node
 opens nothing of it but that**: its other mappings stay closed, so nobody on
@@ -682,6 +685,12 @@ the mesh can skip the sign-in by dialling another port.
 The mark belongs to the service **name**: it survives the service being
 withdrawn and declared again, and can be set before anything declares it.
 `list-services` shows it.
+
+The provider is trusted **only on `WIRESERVE_AUTH_NODE`**: every request
+behind the sign-in goes to it, cookies included, and its answer decides who
+gets in, so the same service name declared by any other node is ignored and
+marked services refuse until the named node serves it again. Without
+`WIRESERVE_AUTH_NODE` the sign-in is off, with a warning at startup.
 
 Worth knowing before you mark something:
 

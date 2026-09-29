@@ -200,12 +200,19 @@ pub fn spawn(
                     std::net::IpAddr::V6(_) => None,
                 };
                 let service = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
+                    let misdirected = !for_this_service(&req, &route.policy.fqdn);
                     let router = route.router.clone();
                     let sign_in = sign_in.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
                     let route = route.clone();
                     prepare(req.headers_mut(), caller.as_deref());
                     req.extensions_mut().insert(ConnectInfo(peer));
                     async move {
+                        if misdirected {
+                            return Ok(crate::sign_in::plain(
+                                axum::http::StatusCode::MISDIRECTED_REQUEST,
+                                "this address serves another name",
+                            ));
+                        }
                         let mut req = req.map(Body::new);
                         match guard(&mut req, sign_in.as_ref(), &route.policy).await {
                             Some(denied) => Ok(denied),
@@ -229,6 +236,37 @@ fn local_v4(ip: std::net::IpAddr) -> Option<Ipv4Addr> {
     }
 }
 
+/// Whether a request names the service its connection was routed to, in
+/// its `Host` and, over HTTP/2 or in absolute form, its authority. The
+/// routing is by address; a request naming another host would otherwise
+/// reach this backend — and the sign-in — under a name it does not have.
+fn for_this_service<B>(req: &Request<B>, fqdn: &str) -> bool {
+    let same = |host: &str| {
+        let host = host.strip_suffix('.').unwrap_or(host);
+        host.eq_ignore_ascii_case(fqdn)
+    };
+    let authority = req.uri().host();
+    let header = match req.headers().get(axum::http::header::HOST) {
+        Some(v) => match v.to_str() {
+            Ok(h) => Some(without_port(h)),
+            Err(_) => return false,
+        },
+        None => None,
+    };
+    if authority.is_none() && header.is_none() {
+        return false;
+    }
+    authority.is_none_or(same) && header.is_none_or(same)
+}
+
+/// `name:port` without the port; anything else as it is.
+fn without_port(host: &str) -> &str {
+    match host.rsplit_once(':') {
+        Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => host,
+    }
+}
+
 /// The sign-in's part of a request (PLAN.md M34): `Some` is the answer to
 /// send instead of passing it on.
 async fn guard(
@@ -247,7 +285,7 @@ async fn guard(
             ));
         };
         let (method, uri, headers) = (req.method().clone(), req.uri().clone(), req.headers().clone());
-        match si.check(&method, &uri, &headers).await {
+        match si.check(&method, &uri, &headers, &policy.fqdn).await {
             crate::sign_in::Verdict::Allow(identity) => req.headers_mut().extend(identity),
             crate::sign_in::Verdict::Deny(answer) => return Some(answer),
         }
@@ -400,7 +438,38 @@ mod tests {
         tls.read_to_string(&mut answer).await.unwrap();
         assert!(answer.ends_with("from the backend"), "{answer}");
 
+        let mut tls = connect("127.0.0.1").await.expect("routed: served");
+        tls.write_all(b"GET / HTTP/1.1\r\nhost: other.test\r\nconnection: close\r\n\r\n").await.unwrap();
+        let mut answer = String::new();
+        tls.read_to_string(&mut answer).await.unwrap();
+        assert!(answer.starts_with("HTTP/1.1 421"), "{answer}");
+        assert!(!answer.contains("from the backend"));
+
         assert!(connect("127.0.0.2").await.is_err(), "an address nobody is routed to is closed unanswered");
+    }
+
+    #[test]
+    fn a_request_must_name_the_service_it_was_routed_to() {
+        let req = |uri: &str, host: Option<&str>| {
+            let mut b = Request::builder().uri(uri);
+            if let Some(h) = host {
+                b = b.header("host", h);
+            }
+            b.body(()).unwrap()
+        };
+        let fqdn = "jellyfin.int.test";
+        assert!(for_this_service(&req("/", Some("jellyfin.int.test")), fqdn));
+        assert!(for_this_service(&req("/", Some("Jellyfin.INT.test:443")), fqdn));
+        assert!(for_this_service(&req("/", Some("jellyfin.int.test.")), fqdn));
+        assert!(for_this_service(&req("https://jellyfin.int.test/x", None), fqdn), "HTTP/2's authority");
+        assert!(!for_this_service(&req("/", Some("grafana.int.test")), fqdn));
+        assert!(!for_this_service(&req("/", Some("jellyfin.int.test.evil")), fqdn));
+        assert!(!for_this_service(&req("/", None), fqdn), "no name at all");
+        assert!(
+            !for_this_service(&req("https://jellyfin.int.test/", Some("grafana.int.test")), fqdn),
+            "authority and Host disagreeing"
+        );
+        assert!(!for_this_service(&req("https://grafana.int.test/", Some("jellyfin.int.test")), fqdn));
     }
 
     #[test]

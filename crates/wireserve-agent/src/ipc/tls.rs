@@ -147,7 +147,9 @@ pub fn build_config(state: &AgentState) -> TlsConfig {
         })
         .collect();
     let sign_in = naming.sign_in.as_ref().and_then(|si| {
-        let provider = directory.services.iter().find(|s| s.name == si.service && s.terminated)?;
+        // Only on its own node: a service of the same name declared by any
+        // other would receive every sign-in cookie, and decide who gets in.
+        let provider = directory.services.iter().find(|s| s.name == si.service && s.node == si.node && s.terminated)?;
         Some(SignInTarget {
             fqdn: format!("{}.{}", si.service, naming.domain),
             vip: provider.vip4.as_deref()?.parse().ok()?,
@@ -217,6 +219,7 @@ mod tests {
             acme: acme.then(|| AcmeSettings { directory: "https://acme.test/dir".into(), email: None, propagation_secs: 0 }),
             sign_in: Some(wireserve_types::SignIn {
                 service: "auth".into(),
+                node: "gate".into(),
                 verify_path: "/verify".into(),
                 copy_headers: vec!["x-auth-user".into()],
                 session_cookie: "authward_session".into(),
@@ -264,5 +267,13 @@ mod tests {
         let dir = st.last_directory.as_mut().unwrap();
         dir.services.iter_mut().find(|s| s.name == "auth").unwrap().terminated = false;
         assert!(build_config(&st).sign_in.is_none());
+    }
+
+    #[test]
+    fn a_provider_on_any_other_node_is_not_the_provider() {
+        let mut st = state(true, true);
+        let dir = st.last_directory.as_mut().unwrap();
+        dir.services.iter_mut().find(|s| s.name == "auth").unwrap().node = "impostor".into();
+        assert!(build_config(&st).sign_in.is_none(), "every cookie would go to whoever declared the name");
     }
 }

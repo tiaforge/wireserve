@@ -39,7 +39,7 @@ enum Command {
     /// installs this binary (and the wireserve-admin next to it), creates
     /// the wireserve-coordinator user, and starts the service. On a machine
     /// where it is already installed, upgrades it instead. Needs root.
-    Install(wireserve_coordinator::install::InstallArgs),
+    Install(Box<wireserve_coordinator::install::InstallArgs>),
     /// Used by `install`, as the admin user, to save wireserve-admin's
     /// settings in their home.
     #[command(hide = true)]
@@ -50,7 +50,7 @@ fn main() {
     match Cli::parse().command {
         None => serve(),
         Some(Command::Install(args)) => {
-            if let Err(err) = wireserve_coordinator::install::run(args) {
+            if let Err(err) = wireserve_coordinator::install::run(*args) {
                 eprintln!("error: {err}");
                 std::process::exit(1);
             }

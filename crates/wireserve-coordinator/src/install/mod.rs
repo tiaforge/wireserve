@@ -176,6 +176,10 @@ pub struct InstallArgs {
     /// No sign-in.
     #[arg(long)]
     pub no_auth_service: bool,
+    /// The node that runs the sign-in service. Every sign-in goes there,
+    /// and a service of the same name on any other node is ignored.
+    #[arg(long, value_name = "NODE", conflicts_with = "no_auth_service")]
+    pub auth_node: Option<String>,
     /// Let the coordinator write each service's public DNS record through
     /// this provider (rfc2136, cloudflare, desec, hetzner, porkbun). Its
     /// credentials are read from the WIRESERVE_DNS_* environment variables,
@@ -224,6 +228,7 @@ impl InstallArgs {
             },
             domain: if self.no_domain { Some(None) } else { self.domain.clone().map(Some) },
             sign_in: if self.no_auth_service { Some(None) } else { self.auth_service.clone().map(Some) },
+            sign_in_node: self.auth_node.clone(),
             dns_provider: if self.no_dns { Some(None) } else { self.dns_provider.clone().map(Some) },
             admin_user: if self.no_admin_user { Some(None) } else { self.admin_user.clone().map(Some) },
         }
@@ -242,6 +247,7 @@ impl InstallArgs {
             (self.no_domain, "--no-domain"),
             (self.auth_service.is_some(), "--auth-service"),
             (self.no_auth_service, "--no-auth-service"),
+            (self.auth_node.is_some(), "--auth-node"),
             (self.dns_provider.is_some(), "--dns-provider"),
             (self.no_dns, "--no-dns"),
             (self.admin_user.is_some(), "--admin-user"),
@@ -713,8 +719,10 @@ fn print_next_steps(answers: &Answers, service_user: &str, state_dir: &Path) {
         if n.dns.is_some() {
             println!("3. Service names: the coordinator writes <name>.{} for every approved", n.domain);
             println!("   service, and each node serves its services published on 443 with HTTPS.");
-            if let Some(svc) = &n.sign_in {
-                println!("   Publish your sign-in provider as `{svc}` on 443, e.g.:  wireserve serve {svc} 443:8080");
+            if let Some(si) = &n.sign_in {
+                let (svc, node) = (&si.service, si.node.as_deref().unwrap_or("<its node>"));
+                println!("   Publish your sign-in provider as `{svc}` on 443 from {node}, e.g.:");
+                println!("     wireserve serve {svc} 443:8080");
             }
         } else {
             println!("3. Service names: <name>.{} works on machines running WireServe only.", n.domain);

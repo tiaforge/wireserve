@@ -292,7 +292,15 @@ pub fn acme_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<wires
 }
 
 /// The sign-in settings (PLAN.md M34). `None` unless `WIRESERVE_AUTH_SERVICE`
-/// names the service running the provider; the rest default to authward's.
+/// names the service running the provider and `WIRESERVE_AUTH_NODE` the node
+/// it must run on; the rest default to authward's.
+///
+/// The node pins the provider: every request to a service behind the
+/// sign-in goes to it, cookies included, and its answer decides who gets
+/// in. Were it known by service name alone, whichever node declared that
+/// name next — after the real provider withdrew it — would take its place.
+/// Without the node the sign-in stays off, with a warning, so a coordinator
+/// configured before the setting existed still starts.
 pub fn sign_in_from_lookup(
     lookup: impl Fn(&str) -> Option<String>,
     dns: bool,
@@ -304,6 +312,17 @@ pub fn sign_in_from_lookup(
     let service = service.to_ascii_lowercase();
     if !wireserve_types::is_valid_dns_label(&service) {
         return Err(ConfigError::Invalid("WIRESERVE_AUTH_SERVICE", format!("{service:?} must be a service name")));
+    }
+    let Some(node) = get("WIRESERVE_AUTH_NODE") else {
+        tracing::warn!(
+            "WIRESERVE_AUTH_SERVICE is set but WIRESERVE_AUTH_NODE is not; the sign-in stays off until it names \
+             the node that runs `{service}`"
+        );
+        return Ok(None);
+    };
+    let node = node.to_ascii_lowercase();
+    if !wireserve_types::is_valid_dns_label(&node) {
+        return Err(ConfigError::Invalid("WIRESERVE_AUTH_NODE", format!("{node:?} must be a node name")));
     }
     if !dns {
         return Err(ConfigError::Invalid(
@@ -334,7 +353,7 @@ pub fn sign_in_from_lookup(
     if !session_cookie.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
         return Err(ConfigError::Invalid("WIRESERVE_AUTH_SESSION_COOKIE", format!("{session_cookie:?} is not a cookie name")));
     }
-    Ok(Some(wireserve_types::SignIn { service, verify_path, copy_headers, session_cookie }))
+    Ok(Some(wireserve_types::SignIn { service, node, verify_path, copy_headers, session_cookie }))
 }
 
 /// The result of [`Config::load`]: the config itself, plus which first-run
@@ -591,10 +610,17 @@ mod tests {
 
     #[test]
     fn sign_in_defaults_to_authward_and_needs_dns() {
-        let only = |k: &str| (k == "WIRESERVE_AUTH_SERVICE").then(|| "Auth".to_string());
+        let only = |k: &str| match k {
+            "WIRESERVE_AUTH_SERVICE" => Some("Auth".to_string()),
+            "WIRESERVE_AUTH_NODE" => Some("Homeserver".to_string()),
+            _ => None,
+        };
         assert_eq!(sign_in_from_lookup(|_| None, true).unwrap(), None);
         let s = sign_in_from_lookup(only, true).unwrap().unwrap();
         assert_eq!((s.service.as_str(), s.verify_path.as_str(), s.session_cookie.as_str()), ("auth", "/verify", "authward_session"));
+        assert_eq!(s.node, "homeserver");
+        let no_node = |k: &str| (k == "WIRESERVE_AUTH_SERVICE").then(|| "auth".to_string());
+        assert_eq!(sign_in_from_lookup(no_node, true).unwrap(), None, "no node: off, not a startup failure");
         assert_eq!(s.copy_headers, vec!["x-auth-user", "x-auth-email", "x-auth-groups"]);
         assert!(sign_in_from_lookup(only, false).is_err(), "without DNS there is nothing to terminate");
         for (k, v) in [
@@ -602,10 +628,12 @@ mod tests {
             ("WIRESERVE_AUTH_COPY_HEADERS", "X-Forwarded-For"),
             ("WIRESERVE_AUTH_VERIFY_PATH", "verify"),
             ("WIRESERVE_AUTH_SESSION_COOKIE", "a;b"),
+            ("WIRESERVE_AUTH_NODE", "not a node"),
         ] {
             let l = move |key: &str| match key {
-                "WIRESERVE_AUTH_SERVICE" => Some("auth".to_string()),
                 x if x == k => Some(v.to_string()),
+                "WIRESERVE_AUTH_SERVICE" => Some("auth".to_string()),
+                "WIRESERVE_AUTH_NODE" => Some("homeserver".to_string()),
                 _ => None,
             };
             assert!(matches!(sign_in_from_lookup(l, true), Err(ConfigError::Invalid(key, _)) if key == k), "{k}={v}");

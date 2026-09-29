@@ -3,8 +3,9 @@
 //!
 //! Before a request to a marked service goes anywhere, a copy of it —
 //! headers only — goes to the provider's verify endpoint, over verified TLS
-//! on the provider service's own address, with the original `Host`,
-//! `X-Forwarded-Method` and `X-Forwarded-Uri`. Then:
+//! on the provider service's own address, with `X-Forwarded-Method` and
+//! `X-Forwarded-Uri`, and the service's own name — never the client's — in
+//! `Host` and `X-Forwarded-Host`. Then:
 //! * **2xx:** the request goes on, with the provider's identity headers
 //!   (`copy_headers`) copied onto it. Every one of them was removed from the
 //!   client's request first, so a client can never supply its own.
@@ -93,16 +94,18 @@ impl SignIn {
         Self { target, client }
     }
 
-    /// Asks the provider about a request. `headers` are the client's,
-    /// already cleaned of forwarding headers. Taken apart rather than as the
-    /// request itself, whose body could not be held across the check.
-    pub async fn check(&self, method: &Method, uri: &Uri, headers: &HeaderMap) -> Verdict {
-        let host = headers
-            .get(header::HOST)
-            .cloned()
-            .or_else(|| uri.authority().and_then(|a| HeaderValue::from_str(a.as_str()).ok()));
-        let Some(host) = host else {
-            return Verdict::Deny(plain(StatusCode::BAD_REQUEST, "no host"));
+    /// Asks the provider about a request to the service `fqdn`. `headers`
+    /// are the client's, already cleaned of forwarding headers. Taken apart
+    /// rather than as the request itself, whose body could not be held
+    /// across the check.
+    ///
+    /// The provider is told the service's own name — the one the connection
+    /// was routed by — never the client's `Host`: providers choose their
+    /// per-host rules by it, and a client could otherwise have another
+    /// host's rules applied to this service.
+    pub async fn check(&self, method: &Method, uri: &Uri, headers: &HeaderMap, fqdn: &str) -> Verdict {
+        let Ok(host) = HeaderValue::from_str(fqdn) else {
+            return Verdict::Deny(plain(StatusCode::INTERNAL_SERVER_ERROR, "bad service name"));
         };
         let verify: Uri = match format!("https://{}{}", self.target.fqdn, self.target.verify_path).parse() {
             Ok(u) => u,
@@ -110,13 +113,14 @@ impl SignIn {
         };
         let mut check = Request::builder().method(Method::GET).uri(verify).body(Body::empty()).expect("valid parts");
         for (name, value) in headers {
-            if !is_hop_by_hop(name) && name != header::CONTENT_LENGTH && name != header::HOST {
+            if !is_hop_by_hop(name) && name != header::CONTENT_LENGTH && name != header::HOST && name != "x-forwarded-host" {
                 check.headers_mut().append(name.clone(), value.clone());
             }
         }
         let path = uri.path_and_query().map_or("/", |p| p.as_str());
         let h = check.headers_mut();
-        h.insert(header::HOST, host);
+        h.insert(header::HOST, host.clone());
+        h.insert("x-forwarded-host", host);
         h.insert("x-forwarded-method", HeaderValue::from_str(method.as_str()).expect("a method is a token"));
         if let Ok(v) = HeaderValue::from_str(path) {
             h.insert("x-forwarded-uri", v);
