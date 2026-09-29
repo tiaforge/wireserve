@@ -47,6 +47,10 @@ fail() {
     done
     echo "--- home's firewall ---" >&2
     in_netns "$HOME_AGENT" nft list table inet wireserve.wireserve0 >&2 2>/dev/null || true
+    echo "--- home's listeners ---" >&2
+    in_netns "$HOME_AGENT" ss -ltnp >&2 2>/dev/null || true
+    echo "--- helper containers ---" >&2
+    podman ps -a --filter "name=wireserve-gr-helper" --format '{{.Names}} {{.Status}} {{.Command}}' >&2 || true
     exit 1
 }
 
@@ -77,10 +81,22 @@ ip_on() {
 }
 admin() { podman exec "$COORD" wireserve-admin "$@"; }
 vip_of() { podman exec "$CLIENT_A" getent hosts "$1.wg" | awk '{print $1}'; }
-# One exchange with a service: what came back, empty when refused.
+# One exchange with a service: what came back, empty when refused. socat's
+# own complaint goes to $WORK/ask.err, for `explain`.
 ask() {
     local from=$1 name=$2 port=$3
-    in_netns "$from" sh -c "echo hi | timeout 8 socat -t3 - TCP:$(vip_of "$name"):$port" 2>/dev/null || true
+    in_netns "$from" sh -c "echo hi | timeout 8 socat -t3 - TCP:$(vip_of "$name"):$port" 2>"$WORK/ask.err" || true
+}
+# Where a failed exchange stopped: the client's error, the backend asked
+# directly on home, and the service address asked from home itself.
+explain() {
+    local name=$1 port=$2 target=$3
+    echo "--- asking $name ($(vip_of "$name"):$port) from $CLIENT_A: ---" >&2
+    ask "$CLIENT_A" "$name" "$port" >&2; cat "$WORK/ask.err" >&2
+    echo "--- the backend on home, directly (127.0.0.1:$target): ---" >&2
+    in_netns "$HOME_AGENT" sh -c "echo hi | timeout 8 socat -t3 - TCP:127.0.0.1:$target" >&2 2>&1 || true
+    echo "--- the service address from home itself: ---" >&2
+    ask "$HOME_AGENT" "$name" "$port" >&2; cat "$WORK/ask.err" >&2
 }
 reaches() { [ -n "$(ask "$1" "$2" "$3")" ]; }
 refused() { [ -z "$(ask "$1" "$2" "$3")" ]; }
@@ -137,8 +153,8 @@ pass "home serves web and db; node-a is tagged ops"
 log "1/6: a fresh mesh reaches everything"
 wait_for "a to reach db" 30 reaches "$CLIENT_A" db 5432
 for c in "$CLIENT_A" "$CLIENT_B"; do
-    reaches "$c" web 80 || fail "$c does not reach web"
-    reaches "$c" db 5432 || fail "$c does not reach db"
+    reaches "$c" web 80 || { explain web 80 8080; fail "$c does not reach web"; }
+    reaches "$c" db 5432 || { explain db 5432 5432; fail "$c does not reach db"; }
 done
 pass "a and b reach web and db"
 
