@@ -3550,3 +3550,22 @@ refused refresh); `deploy/e2e/run-owner-test.sh` does it against
 mock-oauth2-server, and passes (2026-09-29). The installer does not ask for the provider;
 the settings go into `coordinator.env` by hand, where `--reconfigure` leaves
 them.
+
+227. **The provider is told which device is asking** (security audit
+    2026-09-29, finding 1). The provider's session cookie is scoped to the
+    whole domain, so any node owner with an approved :443 service can read a
+    visitor's cookie and replay it at another service's terminator; the
+    provider could not tell, because it never learnt the caller's address
+    (both terminators removed `X-Forwarded-For`, and the verify request came
+    from the calling node). `SignIn::check_request` now sets one
+    `X-Forwarded-For` — the TCP peer, so never something the client wrote —
+    and the provider's own terminator keeps it on its verify path (as it does
+    `X-Forwarded-Host`) and proxies it on without appending its own peer
+    (`Route::verify_router`, `XForwardedFor::Preserve`); anywhere else a
+    client's is still removed. Standard forward_auth semantics, so nothing is
+    provider-specific: a provider that binds sessions to the client address
+    (authward's `bind_session_to_client_ip`) then rejects a replay; one that
+    ignores it behaves as before. Login reaches the provider through the same
+    terminator, so the address is the same single value there. A forged value
+    on a direct `/verify` only ever answers the forger. Not exercised by a
+    harness yet.

@@ -125,6 +125,10 @@ pub fn server_config(certs: Arc<Certs>) -> Arc<rustls::ServerConfig> {
 #[derive(Clone)]
 pub struct Route {
     router: axum::Router,
+    /// For the provider's verify path: the calling terminator's
+    /// `X-Forwarded-For` (the device's address) goes to the provider as it
+    /// is, without this node's own peer appended after it.
+    verify_router: axum::Router,
 }
 
 impl Route {
@@ -136,8 +140,10 @@ impl Route {
             .with_host_behaviour(HostBehaviour::Preserve)
             .with_x_forwarded_for(XForwardedFor::Append)
             .with_public_scheme("https");
+        let verify_policy = proxy_policy.clone().with_x_forwarded_for(XForwardedFor::Preserve);
         let router = ReverseProxy::new("/", format!("http://{upstream}")).with_policy(proxy_policy).into();
-        Self { router }
+        let verify_router = ReverseProxy::new("/", format!("http://{upstream}")).with_policy(verify_policy).into();
+        Self { router, verify_router }
     }
 }
 
@@ -225,7 +231,6 @@ pub fn spawn(listener: TcpListener, tls: Arc<rustls::ServerConfig>, shared: Shar
                 };
                 let caller_addr = local_v4(peer.ip());
                 let service = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
-                    let router = route.router.clone();
                     let policy = read(&shared.policies).get(&vip).cloned();
                     let caller = caller_addr.and_then(|a| read(&shared.callers).get(&a).cloned());
                     let sign_in = read(&shared.sign_in).clone();
@@ -247,6 +252,7 @@ pub fn spawn(listener: TcpListener, tls: Arc<rustls::ServerConfig>, shared: Shar
                         policy.as_ref().is_some_and(|p| p.fqdn.eq_ignore_ascii_case(&si.target.fqdn))
                             && req.uri().path() == si.target.verify_path
                     });
+                    let router = if verify { route.verify_router.clone() } else { route.router.clone() };
                     prepare(req.headers_mut(), caller.as_ref().map(|c| c.node.as_str()), verify);
                     req.extensions_mut().insert(ConnectInfo(peer));
                     async move {
@@ -361,7 +367,7 @@ async fn guard(
             ));
         };
         let (method, uri, headers) = (req.method().clone(), req.uri().clone(), req.headers().clone());
-        match si.check(&method, &uri, &headers, &policy.fqdn, identity).await {
+        match si.check(&method, &uri, &headers, &policy.fqdn, identity, caller).await {
             crate::sign_in::Verdict::Allow { headers, groups } => {
                 if !groups.iter().any(|g| access.sign_in_groups.contains(g)) {
                     return Some(crate::sign_in::plain(StatusCode::FORBIDDEN, "signed in, but not allowed here"));
@@ -401,12 +407,13 @@ fn name_owner(headers: &mut HeaderMap, owner: &wireserve_types::CallerIdentity, 
 ///
 /// `verify`: this is the sign-in provider's own verify endpoint, where the
 /// other terminators name the service they ask about in `X-Forwarded-Host`
-/// (PLAN.md M34). It stays there. Anyone may send it, but asking `/verify`
+/// (PLAN.md M34) and the device calling it in `X-Forwarded-For`, which a
+/// provider may bind a session to. Both stay there. Anyone may send it, but asking `/verify`
 /// directly only ever answers the asker — it opens no backend — so there is
 /// nothing to borrow.
 pub fn prepare(headers: &mut HeaderMap, caller: Option<&str>, verify: bool) {
     for name in ["x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "forwarded", "x-real-ip", NODE_HEADER] {
-        if !(verify && name == "x-forwarded-host") {
+        if !(verify && (name == "x-forwarded-host" || name == "x-forwarded-for")) {
             headers.remove(name);
         }
     }
@@ -617,6 +624,27 @@ mod tests {
         assert!(connect("127.0.0.2").await.is_err(), "an address nobody is routed to is closed unanswered");
     }
 
+    #[tokio::test]
+    async fn the_verify_path_passes_the_devices_address_on_alone_and_other_paths_get_the_peer() {
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            let app = axum::Router::new().fallback(|h: HeaderMap| async move {
+                h.get_all("x-forwarded-for").iter().map(|v| v.to_str().unwrap().to_string()).collect::<Vec<_>>().join("|")
+            });
+            axum::serve(backend, app).await.unwrap();
+        });
+        let route = Route::new(upstream);
+        let ask = |router: axum::Router| async move {
+            let mut req = Request::builder().uri("/verify").header("host", "auth.int.test").header("x-forwarded-for", "10.9.0.3").body(Body::empty()).unwrap();
+            req.extensions_mut().insert(ConnectInfo("10.9.0.7:5555".parse::<SocketAddr>().unwrap()));
+            let resp = router.oneshot(req).await.unwrap();
+            String::from_utf8(axum::body::to_bytes(resp.into_body(), 4096).await.unwrap().to_vec()).unwrap()
+        };
+        assert_eq!(ask(route.verify_router.clone()).await, "10.9.0.3", "the device's address, not followed by the calling node's");
+        assert_eq!(ask(route.router.clone()).await, "10.9.0.3, 10.9.0.7", "an ordinary request gets its peer appended");
+    }
+
     #[test]
     fn a_request_must_name_the_service_it_was_routed_to() {
         let req = |uri: &str, host: Option<&str>| {
@@ -658,6 +686,11 @@ mod tests {
         h.insert("x-forwarded-host", HeaderValue::from_static("jellyfin.int.test"));
         prepare(&mut h, None, true);
         assert_eq!(h.get("x-forwarded-host").unwrap(), "jellyfin.int.test", "kept for the provider's verify endpoint");
+        h.insert("x-forwarded-for", HeaderValue::from_static("10.9.0.3"));
+        prepare(&mut h, None, true);
+        assert_eq!(h.get("x-forwarded-for").unwrap(), "10.9.0.3", "the calling device, for the provider's verify endpoint");
+        prepare(&mut h, None, false);
+        assert!(h.get("x-forwarded-for").is_none(), "anywhere else a client's is removed");
         assert!(h.get(NODE_HEADER).is_none(), "an unknown caller is named by nobody");
     }
 

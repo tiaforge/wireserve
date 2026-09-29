@@ -224,30 +224,25 @@ impl SignIn {
         Self { target, client, cache: Arc::default() }
     }
 
-    /// Asks the provider about a request to the service `fqdn`. `headers`
-    /// are the client's, already cleaned of forwarding headers. Taken apart
-    /// rather than as the request itself, whose body could not be held
-    /// across the check.
-    ///
-    /// The provider is told the service's own name — the one the connection
-    /// was routed by — in `X-Forwarded-Host`, never the client's `Host`:
-    /// providers choose their per-host rules by it, and a client could
-    /// otherwise have another host's rules applied to this service. `Host`
-    /// is the provider's own name, as for any request to it.
-    pub async fn check(
+    /// The header-only copy of the client's request that goes to the
+    /// provider. `client` is the mesh address of the device that made it —
+    /// the TCP peer, so never something the client wrote — sent as the one
+    /// `X-Forwarded-For` value, which is what a `forward_auth` provider
+    /// reads the client address from (and may bind a session to).
+    fn check_request(
         &self,
         method: &Method,
         uri: &Uri,
         headers: &HeaderMap,
         fqdn: &str,
-        identity: &IdentityHeaders,
-    ) -> Verdict {
+        client: Option<Ipv4Addr>,
+    ) -> Result<Request<Body>, Verdict> {
         let Ok(host) = HeaderValue::from_str(fqdn) else {
-            return Verdict::Deny(plain(StatusCode::INTERNAL_SERVER_ERROR, "bad service name"));
+            return Err(Verdict::Deny(plain(StatusCode::INTERNAL_SERVER_ERROR, "bad service name")));
         };
         let verify: Uri = match format!("https://{}{}", self.target.fqdn, self.target.verify_path).parse() {
             Ok(u) => u,
-            Err(_) => return Verdict::Deny(plain(StatusCode::INTERNAL_SERVER_ERROR, "bad sign-in address")),
+            Err(_) => return Err(Verdict::Deny(plain(StatusCode::INTERNAL_SERVER_ERROR, "bad sign-in address"))),
         };
         let mut check = Request::builder().method(Method::GET).uri(verify).body(Body::empty()).expect("valid parts");
         for (name, value) in headers {
@@ -266,7 +261,40 @@ impl SignIn {
             h.insert("x-forwarded-uri", v);
         }
         h.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        // Replaced, never appended to: one address, the device's.
+        h.remove("x-forwarded-for");
+        if let Some(addr) = client {
+            if let Ok(v) = HeaderValue::from_str(&addr.to_string()) {
+                h.insert("x-forwarded-for", v);
+            }
+        }
+        Ok(check)
+    }
 
+    /// Asks the provider about a request to the service `fqdn`. `headers`
+    /// are the client's, already cleaned of forwarding headers. Taken apart
+    /// rather than as the request itself, whose body could not be held
+    /// across the check.
+    ///
+    /// The provider is told the service's own name — the one the connection
+    /// was routed by — in `X-Forwarded-Host`, never the client's `Host`:
+    /// providers choose their per-host rules by it, and a client could
+    /// otherwise have another host's rules applied to this service. `Host`
+    /// is the provider's own name, as for any request to it.
+    /// `X-Forwarded-For` is the calling device's address, `client`.
+    pub async fn check(
+        &self,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        fqdn: &str,
+        identity: &IdentityHeaders,
+        client: Option<Ipv4Addr>,
+    ) -> Verdict {
+        let check = match self.check_request(method, uri, headers, fqdn, client) {
+            Ok(r) => r,
+            Err(v) => return v,
+        };
         let sent = check.headers().clone();
         let cached = |provider_down: bool| {
             self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).lookup(fqdn, &sent, Instant::now(), provider_down)
@@ -405,6 +433,34 @@ pub fn plain(status: StatusCode, text: &'static str) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_provider_is_told_the_callers_address_and_nothing_a_client_wrote() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let si = SignIn::new(
+            SignInTarget {
+                fqdn: "auth.int.test".into(),
+                vip: "10.9.0.60".parse().unwrap(),
+                verify_path: "/verify".into(),
+                session_cookie: "authward_session".into(),
+            },
+            &[],
+        );
+        let mut sent = HeaderMap::new();
+        sent.insert("cookie", HeaderValue::from_static("authward_session=s"));
+        sent.insert("x-forwarded-for", HeaderValue::from_static("6.6.6.6, 7.7.7.7"));
+        let uri: Uri = "/x?y=1".parse().unwrap();
+        let req = si.check_request(&Method::POST, &uri, &sent, "jf.int.test", Some("10.9.0.3".parse().unwrap())).ok().unwrap();
+        let all: Vec<_> = req.headers().get_all("x-forwarded-for").iter().collect();
+        assert_eq!(all, ["10.9.0.3"], "one value, the device's");
+        assert_eq!(req.headers()["x-forwarded-host"], "jf.int.test");
+        assert_eq!(req.headers()["host"], "auth.int.test");
+        assert_eq!(req.headers()["x-forwarded-method"], "POST");
+        assert_eq!(req.headers()["x-forwarded-uri"], "/x?y=1");
+
+        let req = si.check_request(&Method::GET, &uri, &sent, "jf.int.test", None).ok().unwrap();
+        assert!(req.headers().get("x-forwarded-for").is_none(), "unknown caller: nothing, not the client's");
+    }
 
     #[test]
     fn only_the_session_cookie_is_removed() {
