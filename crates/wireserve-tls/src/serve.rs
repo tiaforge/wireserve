@@ -29,19 +29,44 @@ use wireserve_types::tls::NODE_HEADER;
 pub type Callers = Arc<RwLock<HashMap<Ipv4Addr, String>>>;
 
 /// The sign-in (PLAN.md M34), shared by every listener and replaced when
-/// the provider moves. `None`: no provider reachable, and a marked service
-/// refuses every request rather than serve one unchecked.
+/// the provider moves. `None`: no provider reachable, and nobody gets in by
+/// signing in.
 pub type SharedSignIn = Arc<RwLock<Option<crate::sign_in::SignIn>>>;
 
-/// How one listener treats its requests.
+/// How one service treats its requests.
 #[derive(Debug, Clone)]
 pub struct Policy {
-    /// Behind the sign-in.
-    pub marked: bool,
-    /// The name this listener serves. When it is the sign-in provider's —
-    /// decided per request, since the provider can appear after its own
-    /// listener started — its session cookie is its own, and stays.
+    /// The name this service is served under. When it is the sign-in
+    /// provider's — decided per request, since the provider can appear after
+    /// its own service started — its session cookie is its own, and stays.
     pub fqdn: String,
+    /// Who may in (PLAN.md M36).
+    pub access: wireserve_types::ServiceAccess,
+}
+
+/// Service address → how it treats requests. Read on every request, and
+/// replaced in place on every check-in, so a changed grant applies to the
+/// next request on a connection already open.
+pub type Policies = Arc<RwLock<HashMap<Ipv4Addr, Arc<Policy>>>>;
+
+/// Everything the listener reads per request, each part replaced on its own
+/// as check-ins bring changes.
+#[derive(Clone, Default)]
+pub struct Shared {
+    pub routes: Routes,
+    pub policies: Policies,
+    pub callers: Callers,
+    pub sign_in: SharedSignIn,
+    pub identity: Arc<RwLock<wireserve_types::IdentityHeaders>>,
+}
+
+impl Shared {
+    /// Stops answering on `vip`: its connections close, and requests on
+    /// ones already open are refused.
+    pub fn unroute(&self, vip: Ipv4Addr) {
+        self.routes.write().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&vip);
+        self.policies.write().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&vip);
+    }
 }
 
 /// The certificate each name is served with, chosen by SNI. A handshake
@@ -88,17 +113,16 @@ pub fn server_config(certs: Arc<Certs>) -> Arc<rustls::ServerConfig> {
     Arc::new(config)
 }
 
-/// One service, as the listener finds it by the address a connection
-/// arrived on.
+/// One service's backend, as the listener finds it by the address a
+/// connection arrived on.
 #[derive(Clone)]
 pub struct Route {
     router: axum::Router,
-    policy: Policy,
 }
 
 impl Route {
     /// Proxies to `upstream` in plain HTTP.
-    pub fn new(upstream: SocketAddr, policy: Policy) -> Self {
+    pub fn new(upstream: SocketAddr) -> Self {
         let proxy_policy = ProxyPolicy::new()
             // The backend sees the name it is served under, as it would behind
             // any reverse proxy; its configured base URL depends on it.
@@ -106,7 +130,7 @@ impl Route {
             .with_x_forwarded_for(XForwardedFor::Append)
             .with_public_scheme("https");
         let router = ReverseProxy::new("/", format!("http://{upstream}")).with_policy(proxy_policy).into();
-        Self { router, policy }
+        Self { router }
     }
 }
 
@@ -154,13 +178,12 @@ fn listen_fd(pid: u32, listen_pid: Option<&str>, listen_fds: Option<&str>) -> Op
 
 /// Accepts on `listener` until aborted, handing each connection to the
 /// service whose address it arrived on.
-pub fn spawn(
-    listener: TcpListener,
-    tls: Arc<rustls::ServerConfig>,
-    routes: Routes,
-    callers: Callers,
-    sign_in: SharedSignIn,
-) -> JoinHandle<()> {
+///
+/// The service's policy and the caller's name are looked up for every
+/// request, not once per connection: a grant taken away, or a node
+/// revoked, reaches a keep-alive or HTTP/2 connection at its next request.
+/// A WebSocket, once upgraded, is past every request and keeps going.
+pub fn spawn(listener: TcpListener, tls: Arc<rustls::ServerConfig>, shared: Shared) -> JoinHandle<()> {
     let acceptor = tokio_rustls::TlsAcceptor::from(tls);
     tokio::spawn(async move {
         loop {
@@ -175,9 +198,10 @@ pub fn spawn(
             // The address the agent rewrote 443 to this port on. Anything
             // else — the host's own addresses, a service no longer served
             // — is nobody's to answer.
-            let route = tcp.local_addr().ok().and_then(|a| local_v4(a.ip())).and_then(|vip| {
-                routes.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(&vip).cloned()
-            });
+            let Some(vip) = tcp.local_addr().ok().and_then(|a| local_v4(a.ip())) else {
+                continue;
+            };
+            let route = shared.routes.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(&vip).cloned();
             let Some(route) = route else {
                 continue;
             };
@@ -187,26 +211,28 @@ pub fn spawn(
             // link by a round trip on top.
             let _ = tcp.set_nodelay(true);
             let acceptor = acceptor.clone();
-            let callers = callers.clone();
-            let sign_in = sign_in.clone();
+            let shared = shared.clone();
             tokio::spawn(async move {
                 let Ok(tls) = acceptor.accept(tcp).await else {
                     return;
                 };
-                let caller = match peer.ip() {
-                    std::net::IpAddr::V4(v4) => {
-                        callers.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(&v4).cloned()
-                    }
-                    std::net::IpAddr::V6(_) => None,
-                };
+                let caller_addr = local_v4(peer.ip());
                 let service = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
-                    let misdirected = !for_this_service(&req, &route.policy.fqdn);
                     let router = route.router.clone();
-                    let sign_in = sign_in.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-                    let route = route.clone();
+                    let policy = read(&shared.policies).get(&vip).cloned();
+                    let caller = caller_addr.and_then(|a| read(&shared.callers).get(&a).cloned());
+                    let sign_in = read(&shared.sign_in).clone();
+                    let identity = read(&shared.identity).clone();
+                    let misdirected = policy.as_ref().is_some_and(|p| !for_this_service(&req, &p.fqdn));
                     prepare(req.headers_mut(), caller.as_deref());
                     req.extensions_mut().insert(ConnectInfo(peer));
                     async move {
+                        let Some(policy) = policy else {
+                            return Ok(crate::sign_in::plain(
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                "this service is no longer served here",
+                            ));
+                        };
                         if misdirected {
                             return Ok(crate::sign_in::plain(
                                 axum::http::StatusCode::MISDIRECTED_REQUEST,
@@ -214,7 +240,7 @@ pub fn spawn(
                             ));
                         }
                         let mut req = req.map(Body::new);
-                        match guard(&mut req, sign_in.as_ref(), &route.policy).await {
+                        match guard(&mut req, sign_in.as_ref(), &policy, caller_addr, &identity).await {
                             Some(denied) => Ok(denied),
                             None => router.oneshot(req).await,
                         }
@@ -226,6 +252,10 @@ pub fn spawn(
             });
         }
     })
+}
+
+fn read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// An IPv4 local address, also when a dual-stack socket reports it mapped.
@@ -267,26 +297,47 @@ fn without_port(host: &str) -> &str {
     }
 }
 
-/// The sign-in's part of a request (PLAN.md M34): `Some` is the answer to
-/// send instead of passing it on.
+/// Who gets in (PLAN.md M34, M36): `Some` is the answer to send instead of
+/// passing the request on.
+///
+/// 1. Identity headers a client sent are removed, always.
+/// 2. An open service, or a caller whose node the grants name, goes on.
+/// 3. Anyone else, where the grants name groups a sign-in can prove, is
+///    asked about: signed in with one of them, on — with who they are;
+///    signed in without, 403; not signed in, sent to sign in.
+/// 4. Anyone else is refused with 403.
+///
+/// The provider's session cookie leaves every request but the provider's
+/// own.
 async fn guard(
     req: &mut Request<Body>,
     sign_in: Option<&crate::sign_in::SignIn>,
     policy: &Policy,
+    caller: Option<Ipv4Addr>,
+    identity: &wireserve_types::IdentityHeaders,
 ) -> Option<axum::response::Response> {
-    if let Some(si) = sign_in {
-        crate::sign_in::strip_identity(req.headers_mut(), &si.target.copy_headers);
-    }
-    if policy.marked {
+    use axum::http::StatusCode;
+    crate::sign_in::strip_identity(req.headers_mut(), identity);
+    let access = &policy.access;
+    let by_device = access.open || caller.is_some_and(|c| access.sources.contains(&c));
+    if !by_device {
+        if !access.sign_in {
+            return Some(crate::sign_in::plain(StatusCode::FORBIDDEN, "this device may not reach this service"));
+        }
         let Some(si) = sign_in else {
             return Some(crate::sign_in::plain(
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::SERVICE_UNAVAILABLE,
                 "this service is behind a sign-in that cannot be reached",
             ));
         };
         let (method, uri, headers) = (req.method().clone(), req.uri().clone(), req.headers().clone());
-        match si.check(&method, &uri, &headers, &policy.fqdn).await {
-            crate::sign_in::Verdict::Allow(identity) => req.headers_mut().extend(identity),
+        match si.check(&method, &uri, &headers, &policy.fqdn, identity).await {
+            crate::sign_in::Verdict::Allow { headers, groups } => {
+                if !groups.iter().any(|g| access.sign_in_groups.contains(g)) {
+                    return Some(crate::sign_in::plain(StatusCode::FORBIDDEN, "signed in, but not allowed here"));
+                }
+                req.headers_mut().extend(headers);
+            }
             crate::sign_in::Verdict::Deny(answer) => return Some(answer),
         }
     }
@@ -339,11 +390,31 @@ mod tests {
                 fqdn: "auth.int.test".into(),
                 vip: "10.9.0.60".parse().unwrap(),
                 verify_path: "/verify".into(),
-                copy_headers: vec!["x-auth-user".into()],
                 session_cookie: "authward_session".into(),
             },
             &[],
         )
+    }
+
+    fn open(fqdn: &str) -> Policy {
+        Policy { fqdn: fqdn.into(), access: wireserve_types::ServiceAccess { open: true, ..Default::default() } }
+    }
+
+    /// Reached by 10.9.0.2 alone; anyone else may sign in with `family`.
+    fn restricted(fqdn: &str, sign_in: bool) -> Policy {
+        Policy {
+            fqdn: fqdn.into(),
+            access: wireserve_types::ServiceAccess {
+                sources: vec!["10.9.0.2".parse().unwrap()],
+                sign_in,
+                sign_in_groups: vec!["family".into()],
+                ..Default::default()
+            },
+        }
+    }
+
+    fn ids() -> wireserve_types::IdentityHeaders {
+        wireserve_types::IdentityHeaders::default()
     }
 
     fn request() -> Request<Body> {
@@ -355,33 +426,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_marked_service_without_a_reachable_sign_in_refuses() {
+    async fn a_granted_device_goes_on_and_anyone_else_is_refused_or_asked() {
+        use axum::http::StatusCode;
+        let granted = Some("10.9.0.2".parse().unwrap());
+        let other = Some("10.9.0.3".parse().unwrap());
         let mut req = request();
-        let answer = guard(&mut req, None, &Policy { marked: true, fqdn: "jellyfin.int.test".into() }).await;
-        assert_eq!(answer.expect("refused").status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(guard(&mut req, None, &restricted("jf.int.test", false), granted, &ids()).await.is_none());
+        assert!(req.headers().get("x-auth-user").is_none(), "a forged identity is removed for a device too");
+
+        let answer = guard(&mut request(), None, &restricted("jf.int.test", false), other, &ids()).await;
+        assert_eq!(answer.expect("refused").status(), StatusCode::FORBIDDEN, "no sign-in to try");
+        let answer = guard(&mut request(), None, &restricted("jf.int.test", false), None, &ids()).await;
+        assert_eq!(answer.expect("refused").status(), StatusCode::FORBIDDEN, "an unknown caller neither");
+
+        let answer = guard(&mut request(), None, &restricted("jf.int.test", true), other, &ids()).await;
+        assert_eq!(answer.expect("refused").status(), StatusCode::SERVICE_UNAVAILABLE, "the sign-in is unreachable");
     }
 
     #[tokio::test]
     async fn every_backend_but_the_providers_loses_the_cookie_and_forged_identity() {
         let si = sign_in();
         let mut req = request();
-        assert!(guard(&mut req, Some(&si), &Policy { marked: false, fqdn: "grafana.int.test".into() }).await.is_none());
+        assert!(guard(&mut req, Some(&si), &open("grafana.int.test"), None, &ids()).await.is_none());
         assert_eq!(req.headers().get("cookie").unwrap(), "theme=dark");
         assert!(req.headers().get("x-auth-user").is_none());
 
         // The provider's own service keeps its session cookie — decided per
         // request, whatever the listener was started with.
         let mut req = request();
-        assert!(guard(&mut req, Some(&si), &Policy { marked: false, fqdn: "Auth.int.test".into() }).await.is_none());
+        assert!(guard(&mut req, Some(&si), &open("Auth.int.test"), None, &ids()).await.is_none());
         assert_eq!(req.headers().get("cookie").unwrap(), "theme=dark; authward_session=s3cret");
         assert!(req.headers().get("x-auth-user").is_none(), "a forged identity is removed there too");
     }
 
     #[tokio::test]
-    async fn without_a_sign_in_nothing_is_touched() {
+    async fn without_a_sign_in_the_cookie_stays_but_a_forged_identity_does_not() {
         let mut req = request();
-        assert!(guard(&mut req, None, &Policy { marked: false, fqdn: "grafana.int.test".into() }).await.is_none());
+        assert!(guard(&mut req, None, &open("grafana.int.test"), None, &ids()).await.is_none());
         assert_eq!(req.headers().get("cookie").unwrap(), "theme=dark; authward_session=s3cret");
+        assert!(req.headers().get("x-auth-user").is_none());
     }
 
     #[test]
@@ -412,12 +495,10 @@ mod tests {
         certs.set("svc.test", Arc::new(CertifiedKey::new(vec![der.clone()], rustls::crypto::aws_lc_rs::sign::any_supported_type(&private).unwrap())));
         let listener = listener(0).unwrap();
         let port = listener.local_addr().unwrap().port();
-        let routes: Routes = Arc::default();
-        routes.write().unwrap().insert(
-            Ipv4Addr::LOCALHOST,
-            Arc::new(Route::new(upstream, Policy { marked: false, fqdn: "svc.test".into() })),
-        );
-        spawn(listener, server_config(certs), routes, Arc::default(), Arc::default());
+        let shared = Shared::default();
+        shared.routes.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(Route::new(upstream)));
+        shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(open("svc.test")));
+        spawn(listener, server_config(certs), shared.clone());
 
         let mut roots = rustls::RootCertStore::empty();
         roots.add(der).unwrap();
@@ -444,6 +525,20 @@ mod tests {
         tls.read_to_string(&mut answer).await.unwrap();
         assert!(answer.starts_with("HTTP/1.1 421"), "{answer}");
         assert!(!answer.contains("from the backend"));
+
+        // A grant taken away applies to the next request on a connection
+        // already open.
+        let mut tls = connect("127.0.0.1").await.expect("routed: served");
+        let get = b"GET / HTTP/1.1\r\nhost: svc.test\r\n\r\n";
+        tls.write_all(get).await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = tls.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+        let closed = Policy { fqdn: "svc.test".into(), access: wireserve_types::ServiceAccess::default() };
+        shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(closed));
+        tls.write_all(get).await.unwrap();
+        let n = tls.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 403"), "{}", String::from_utf8_lossy(&buf[..n]));
 
         assert!(connect("127.0.0.2").await.is_err(), "an address nobody is routed to is closed unanswered");
     }
@@ -500,7 +595,7 @@ mod tests {
         assert_eq!(cookies, ["theme=dark; authward_session=s3cret; auth_tokens=abc"]);
 
         // And the sign-in's cookie still comes out of the joined header.
-        assert!(guard(&mut req, Some(&sign_in()), &Policy { marked: false, fqdn: "observe.int.test".into() }).await.is_none());
+        assert!(guard(&mut req, Some(&sign_in()), &open("observe.int.test"), None, &ids()).await.is_none());
         let cookies: Vec<_> = req.headers().get_all("cookie").iter().collect();
         assert_eq!(cookies, ["theme=dark; auth_tokens=abc"]);
     }

@@ -394,9 +394,28 @@ pub async fn poll(
         .filter_map(|n| n.pubkey.clone())
         .collect();
 
-    let auth = services::auth_names(&conn)?;
     let tls_ready = crate::db::tls::ready(&conn)?;
-    let services = directory::services_directory(&all_services, &all_peers, &state.directory_context(&auth, &tls_ready));
+    let ctx = state.directory_context(&tls_ready);
+    let services = directory::services_directory(&all_services, &all_peers, &ctx);
+
+    // Who may reach each of this node's own services (PLAN.md M36), pending
+    // ones included, so its firewall is ready the moment approval publishes
+    // them. Sent to this node alone.
+    let rules = crate::access::read_rules(&conn)?;
+    let owner_capable = state.transit.has_capability(
+        &self_pubkey,
+        wireserve_types::CAP_SIGN_IN,
+        state.config.online_threshold_secs,
+    );
+    let provider = state.config.sign_in.as_ref().map(|si| (si.service.as_str(), si.node.as_str()));
+    let access = services::list_for_node(&conn, node.id)?
+        .iter()
+        .filter(|s| s.denied_at.is_none() || s.approved_at.is_some())
+        .map(|s| {
+            let facts = crate::access::SignInFacts { provider, owner_capable, terminated: ctx.terminates(s) };
+            crate::access::service_access(s, &node, &all_peers, &rules, &facts)
+        })
+        .collect();
 
     Ok(Json(PollResponse {
         peers,
@@ -408,5 +427,7 @@ pub async fn poll(
         exit_clients,
         mesh: Some(state.config.mesh_info()),
         naming: state.config.service_naming(),
+        access,
+        service_notices: outcome.notices,
     }))
 }

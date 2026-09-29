@@ -8,8 +8,14 @@ use wireserve_types::{PeerInfo, PortMap};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum IpcRequest {
-    /// Declares `name` with these mappings (never empty).
-    Serve { name: String, ports: Vec<PortMap> },
+    /// Declares `name` with these mappings (never empty), in `group` if it
+    /// is new (PLAN.md M36).
+    Serve {
+        name: String,
+        ports: Vec<PortMap>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
+    },
     Unserve { name: String },
     /// This node's live opt-in to carry transit traffic for other mesh
     /// peers (PLAN.md M23) — `wireserve transit on|off`. Same shape
@@ -102,6 +108,10 @@ pub struct ListView {
     /// didn't take effect.
     #[serde(default)]
     pub rejected_services: Vec<crate::state::RejectedService>,
+    /// What the coordinator said about the groups this node's declarations
+    /// named (PLAN.md M36).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_notices: Vec<wireserve_types::ServiceNotice>,
 }
 
 /// One peer as the kernel's WireGuard interface reports it.
@@ -146,11 +156,11 @@ mod tests {
 
     #[test]
     fn request_roundtrips_through_json() {
-        let req = IpcRequest::Serve { name: "plex".into(), ports: vec!["443:32400".parse().unwrap()] };
+        let req = IpcRequest::Serve { name: "plex".into(), ports: vec!["443:32400".parse().unwrap()], group: None };
         let json = serde_json::to_string(&req).unwrap();
         let back: IpcRequest = serde_json::from_str(&json).unwrap();
         match back {
-            IpcRequest::Serve { name, ports } => {
+            IpcRequest::Serve { name, ports, .. } => {
                 assert_eq!(name, "plex");
                 assert_eq!(ports[0].target, 32400);
             }

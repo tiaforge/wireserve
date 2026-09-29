@@ -8,8 +8,13 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::ports::PortMap;
 
+/// Which mesh addresses a rule admits (PLAN.md M36): `None` is every one,
+/// as before grants; `Some` only these — and an empty list none at all,
+/// though the service address still answers them with a refusal.
+pub type Sources = Option<std::sync::Arc<[Ipv4Addr]>>;
+
 /// One hole in the default-deny on the mesh interface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceRule {
     /// `vip:map.public` → `node:map.target`, and nothing else of the
     /// target port: a peer connecting straight to `node:map.target` (or
@@ -20,13 +25,13 @@ pub enum ServiceRule {
     /// instead of `node`, and the node forwards to it: the request leaves
     /// with the node's own address as its source, since whatever answers
     /// there has no route back into the mesh.
-    Mapped { vip: Ipv4Addr, node: Ipv4Addr, map: PortMap },
+    Mapped { vip: Ipv4Addr, node: Ipv4Addr, map: PortMap, sources: Sources },
     /// `vip:map.public` answered by this node's own TLS terminator
     /// (PLAN.md M33): rewritten to `vip:port`, where the terminator listens
     /// on every address (PLAN.md M35), and nothing of `map.target` is
     /// opened — the terminator reaches the backend locally. `map` is kept
     /// so the target stays reserved against every other mapping on the node.
-    Terminated { vip: Ipv4Addr, map: PortMap, port: u16 },
+    Terminated { vip: Ipv4Addr, map: PortMap, port: u16, sources: Sources },
 }
 
 /// One side of an active [`TransitForward`] pairing (PLAN.md M23): every
@@ -53,6 +58,14 @@ pub struct TransitForward {
 }
 
 impl ServiceRule {
+    /// The mesh addresses this rule admits; see [`Sources`].
+    #[must_use]
+    pub fn sources(&self) -> &Sources {
+        match self {
+            Self::Mapped { sources, .. } | Self::Terminated { sources, .. } => sources,
+        }
+    }
+
     /// For a mapping onto another address (PLAN.md M26): that address.
     #[must_use]
     pub fn remote_target(&self) -> Option<Ipv4Addr> {

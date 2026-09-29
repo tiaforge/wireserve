@@ -1621,7 +1621,6 @@ mod tests {
 
     fn service(name: &str, node: &str, vip4: Option<&str>) -> ServiceInfo {
         ServiceInfo {
-            auth: false,
             terminated: false,
             name: name.into(),
             node: node.into(),

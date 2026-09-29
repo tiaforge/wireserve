@@ -188,6 +188,8 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
         mesh: None,
         forwarding_owned: Vec::new(),
         local_routes: Vec::new(),
+        own_access: Vec::new(),
+        service_notices: Vec::new(),
     };
     let mut state = state;
     let offered = reg

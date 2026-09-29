@@ -91,25 +91,33 @@ enum Command {
     /// Approve a pending service declaration for a specific node.
     /// Approval binds to this node — it does not reserve the name for
     /// anyone else.
-    ApproveService {
-        node: String,
-        service: String,
-        /// Put it behind the sign-in (see `service-auth`). Set
-        /// before the approval, so the service never appears without it.
-        #[arg(long)]
-        auth: bool,
+    ApproveService { node: String, service: String },
+    /// Service groups (PLAN.md M36). A service is in `default` until put in
+    /// a group; a fresh mesh grants `default` to everyone.
+    Group {
+        #[command(subcommand)]
+        action: GroupAction,
     },
-    /// Put a service behind the sign-in (`on`), or take it away (`off`). Its
-    /// node's TLS terminator asks the sign-in provider (the coordinator's
-    /// `WIRESERVE_AUTH_SERVICE`, e.g. authward) about every request, and the
-    /// node opens nothing else of the service, so the sign-in cannot be
-    /// walked around.
-    ///
-    /// Only for services published on TCP 443. Refused until the service's
-    /// node runs an agent with the built-in sign-in. The mark belongs to the
-    /// name: it outlasts the service being withdrawn and declared again, and
-    /// can be set before anything declares it.
-    ServiceAuth { service: String, state: OnOff },
+    /// Who may reach which group: `everyone`, `oidc:<group>` (people in that
+    /// group at your identity provider, who prove it at the sign-in) or
+    /// `tag:<tag>` (nodes you tagged).
+    Grant {
+        #[command(subcommand)]
+        action: GrantAction,
+    },
+    /// Node tags, which grants can name: servers, shared devices. Only you
+    /// set them — a node never tags itself.
+    Tag {
+        #[command(subcommand)]
+        action: TagAction,
+    },
+    /// Who reaches a service and why, or what a node reaches.
+    Access {
+        #[arg(required_unless_present = "node", conflicts_with = "node")]
+        service: Option<String>,
+        #[arg(long)]
+        node: Option<String>,
+    },
     /// Deny a declaration, or withdraw an approval already granted.
     ///
     /// For mistakes. For a node you no longer trust use `revoke`: a
@@ -195,6 +203,35 @@ enum Command {
         #[arg(long, requires = "dns")]
         mesh_dns: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum GroupAction {
+    /// A new, empty group.
+    Create { name: String },
+    /// Refused for `default`, and while services, grants or waiting
+    /// declarations use it — its services would become public.
+    Delete { name: String },
+    List,
+    /// Put a service in a group, which takes it out of `default`. The
+    /// service need not exist yet.
+    Add { group: String, service: String },
+    /// Take a service out of a group; out of its last one, it is back in
+    /// `default`.
+    Remove { group: String, service: String },
+}
+
+#[derive(Subcommand)]
+enum GrantAction {
+    Add { source: String, group: String },
+    Remove { source: String, group: String },
+    List,
+}
+
+#[derive(Subcommand)]
+enum TagAction {
+    Add { node: String, tag: String },
+    Remove { node: String, tag: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -320,7 +357,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
                 println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\tsign-in={}{dns}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\tgroups={}{dns}",
                     sanitize_for_terminal(&s.name),
                     sanitize_for_terminal(&s.node),
                     state,
@@ -330,33 +367,140 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         .as_deref()
                         .map(sanitize_for_terminal)
                         .unwrap_or_else(|| "-".to_string()),
-                    if s.auth { "yes" } else { "-" }
+                    s.groups.iter().map(|g| sanitize_for_terminal(g)).collect::<Vec<_>>().join(",")
                 );
             }
         }
-        Command::ApproveService { node, service, auth } => {
+        Command::ApproveService { node, service } => {
             let client = build_client(&coordinator_url, &admin_token)?;
-            if auth {
-                wireserve_admin::cmd_set_service_auth(&client, &service, true)?;
-            }
             wireserve_admin::cmd_approve_service(&client, &node, &service)?;
-            if auth {
-                println!("service '{service}' approved for node '{node}', behind the sign-in");
-            } else {
-                println!("service '{service}' approved for node '{node}'");
+            println!("service '{service}' approved for node '{node}'");
+        }
+        Command::Group { action } => {
+            let client = build_client(&coordinator_url, &admin_token)?;
+            match action {
+                GroupAction::Create { name } => {
+                    if wireserve_admin::cmd_create_group(&client, &name)? {
+                        println!("group '{name}' created; put services in it with `group add {name} <service>`");
+                    } else {
+                        println!("group '{name}' already exists");
+                    }
+                }
+                GroupAction::Delete { name } => {
+                    wireserve_admin::cmd_delete_group(&client, &name)?;
+                    println!("group '{name}' deleted");
+                }
+                GroupAction::List => {
+                    for g in wireserve_admin::cmd_list_groups(&client)?.groups {
+                        let granted: Vec<String> = g.granted_to.iter().map(|s| sanitize_for_terminal(&s.to_string())).collect();
+                        println!(
+                            "{}\tgranted={}\tservices={}",
+                            sanitize_for_terminal(&g.name),
+                            if granted.is_empty() { "-".to_string() } else { granted.join(",") },
+                            if g.services.is_empty() {
+                                "-".to_string()
+                            } else {
+                                g.services.iter().map(|s| sanitize_for_terminal(s)).collect::<Vec<_>>().join(",")
+                            }
+                        );
+                    }
+                }
+                GroupAction::Add { group, service } => {
+                    let m = wireserve_admin::cmd_set_member(&client, &group, &service, true)?;
+                    println!("'{service}' is in {} from its node's next poll", m.groups.join(", "));
+                }
+                GroupAction::Remove { group, service } => {
+                    let m = wireserve_admin::cmd_set_member(&client, &group, &service, false)?;
+                    if m.groups == [wireserve_types::DEFAULT_GROUP] {
+                        println!("'{service}' is back in default — reachable by whoever default is granted to");
+                    } else {
+                        println!("'{service}' is in {}", m.groups.join(", "));
+                    }
+                }
             }
         }
-        Command::ServiceAuth { service, state } => {
-            let enabled = state == OnOff::On;
+        Command::Grant { action } => {
             let client = build_client(&coordinator_url, &admin_token)?;
-            wireserve_admin::cmd_set_service_auth(&client, &service, enabled)?;
-            if enabled {
-                println!(
-                    "'{service}' is behind the sign-in from its node's next poll; nothing else of it is \
-                     reachable"
-                );
-            } else {
-                println!("'{service}' is published without a sign-in from the next poll, to the whole mesh");
+            match action {
+                GrantAction::Add { source, group } => {
+                    if wireserve_admin::cmd_set_grant(&client, &source, &group, true)? {
+                        println!("{source} may reach every service in '{group}' from the next poll");
+                    } else {
+                        println!("{source} already may reach '{group}'");
+                    }
+                }
+                GrantAction::Remove { source, group } => {
+                    wireserve_admin::cmd_set_grant(&client, &source, &group, false)?;
+                    println!("{source} no longer reaches '{group}' through this grant, from the next poll");
+                }
+                GrantAction::List => {
+                    for g in wireserve_admin::cmd_list_grants(&client)?.grants {
+                        println!("{}\t{}", sanitize_for_terminal(&g.source.to_string()), sanitize_for_terminal(&g.group));
+                    }
+                }
+            }
+        }
+        Command::Tag { action } => {
+            let client = build_client(&coordinator_url, &admin_token)?;
+            match action {
+                TagAction::Add { node, tag } => {
+                    wireserve_admin::cmd_set_tag(&client, &node, &tag, true)?;
+                    println!("node '{node}' is tagged '{tag}'");
+                }
+                TagAction::Remove { node, tag } => {
+                    wireserve_admin::cmd_set_tag(&client, &node, &tag, false)?;
+                    println!("node '{node}' is no longer tagged '{tag}'");
+                }
+            }
+        }
+        Command::Access { service, node } => {
+            let client = build_client(&coordinator_url, &admin_token)?;
+            let clean_all = |v: &[wireserve_types::GrantSource]| -> String {
+                if v.is_empty() {
+                    "-".to_string()
+                } else {
+                    v.iter().map(|s| sanitize_for_terminal(&s.to_string())).collect::<Vec<_>>().join(", ")
+                }
+            };
+            if let Some(node) = node {
+                let r = wireserve_admin::cmd_node_access(&client, &node)?;
+                println!("{} acts as: {}", sanitize_for_terminal(&r.node), clean_all(&r.principals));
+                if r.services.is_empty() {
+                    println!("  reaches no service of another node by who it is");
+                }
+                for s in &r.services {
+                    println!("  {}\tvia {}", sanitize_for_terminal(&s.name), clean_all(&s.via));
+                }
+                if r.default_closed {
+                    println!("note: everyone -> default is not granted; services without a group reach nobody");
+                }
+            } else if let Some(service) = service {
+                let r = wireserve_admin::cmd_service_access(&client, &service)?;
+                let owner = r.node.as_deref().map_or_else(|| "nothing declares it yet".to_string(), sanitize_for_terminal);
+                println!("{} ({owner})", sanitize_for_terminal(&r.service));
+                println!("  groups:     {}", r.groups.iter().map(|g| sanitize_for_terminal(g)).collect::<Vec<_>>().join(", "));
+                println!("  granted to: {}", clean_all(&r.granted_to));
+                if r.open {
+                    println!("  reachable by every node");
+                } else {
+                    println!("  reachable by its own node, and:");
+                    if r.nodes.is_empty() {
+                        println!("    no other node");
+                    }
+                    for n in &r.nodes {
+                        println!("    {}\tvia {}", sanitize_for_terminal(&n.name), clean_all(&n.via));
+                    }
+                    if r.sign_in {
+                        let groups = r.sign_in_groups.iter().map(|g| sanitize_for_terminal(g)).collect::<Vec<_>>();
+                        println!("  anyone else: the sign-in, with one of {}", groups.join(", "));
+                    } else if !r.sign_in_groups.is_empty() {
+                        println!("  (identity-provider groups are granted, but no sign-in applies: no provider, \
+                                  no terminator serving it, or its node's agent is too old)");
+                    }
+                }
+                if r.default_closed {
+                    println!("note: everyone -> default is not granted; services without a group reach nobody");
+                }
             }
         }
         Command::DenyService {

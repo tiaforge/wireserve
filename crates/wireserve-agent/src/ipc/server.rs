@@ -42,6 +42,8 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
             exit_clients: vec![],
             mesh: None,
             naming: None,
+            access: vec![],
+            service_notices: vec![],
         });
 
     let self_name = state.public_key.as_ref().and_then(|pk| {
@@ -127,6 +129,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
         tunnel: vec![],
         services,
         rejected_services: state.rejected_services.clone(),
+        service_notices: state.service_notices.clone(),
     }
 }
 
@@ -134,12 +137,15 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
 /// shutdown (from `leave`) should be signalled after it's sent.
 async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
     match req {
-        IpcRequest::Serve { name, ports } => {
+        IpcRequest::Serve { name, ports, group } => {
             if !wireserve_types::is_valid_dns_label(&name) {
                 return (
                     IpcResponse::error(format!("invalid service name: {name}")),
                     false,
                 );
+            }
+            if let Some(g) = group.as_deref().filter(|g| !wireserve_types::is_valid_dns_label(g)) {
+                return (IpcResponse::error(format!("invalid group name: {g}")), false);
             }
             if let Err(e) = wireserve_types::validate_service_ports(&ports) {
                 return (IpcResponse::error(e), false);
@@ -216,7 +222,9 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
             // goes for a stale "waiting on approval" marker.
             state.rejected_services.retain(|r| r.name != name);
             state.pending_services.retain(|n| n != &name);
-            state.declared_services.push(ServiceDecl::new(name, ports));
+            let mut decl = ServiceDecl::new(name, ports);
+            decl.group = group;
+            state.declared_services.push(decl);
             match state.save(&ctx.state_path) {
                 Ok(()) => (IpcResponse::Ok, false),
                 Err(e) => (IpcResponse::error(e.to_string()), false),
@@ -569,6 +577,7 @@ mod tests {
             state.declared_services.push(ServiceDecl {
                 name: "plex".into(),
                 ports: vec![],
+                group: None,
             });
             state.pending_services.push("plex".into());
         }
@@ -588,6 +597,7 @@ mod tests {
             state.declared_services.push(ServiceDecl {
                 name: "plex".into(),
                 ports: vec![],
+                group: None,
             });
             // Approval is observed as the name leaving pending_services.
         }
@@ -610,7 +620,7 @@ mod tests {
 
         let (resp, _) = dispatch(
             &ctx,
-            IpcRequest::Serve { name: "plex".into(), ports: vec!["32400".parse().unwrap()] },
+            IpcRequest::Serve { name: "plex".into(), ports: vec!["32400".parse().unwrap()], group: None },
         )
         .await;
         assert!(matches!(resp, IpcResponse::Ok));
@@ -659,6 +669,7 @@ mod tests {
             state.declared_services.push(ServiceDecl {
                 name: "plex".into(),
                 ports: vec![],
+                group: None,
             });
         }
 
@@ -716,7 +727,7 @@ mod tests {
 
     fn serve_req(name: &str, ports: &[&str]) -> IpcRequest {
         let ports: Vec<PortMap> = ports.iter().map(|p| p.parse().unwrap()).collect();
-        IpcRequest::Serve { name: name.into(), ports }
+        IpcRequest::Serve { name: name.into(), ports, group: None }
     }
 
     #[tokio::test]

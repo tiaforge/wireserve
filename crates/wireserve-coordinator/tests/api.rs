@@ -28,6 +28,7 @@ fn test_config(db_path: &str) -> Config {
         net_v6_prefix: "fd00:90::/64".to_string(),
         service_domain: None,
         sign_in: None,
+        identity_headers: Default::default(),
         dns: None,
         acme: wireserve_coordinator::config::acme_from_lookup(|_| None).unwrap(),
         online_threshold_secs: 180,
@@ -3475,14 +3476,13 @@ async fn a_revoked_device_is_no_longer_an_exit_client() {
     assert!(exit_clients(&body).is_empty(), "{body}");
 }
 
-// ---- PLAN.md M29, M34: services behind the built-in sign-in ----
+// ---- PLAN.md M36: who can reach what ----
 
 fn sign_in() -> wireserve_types::SignIn {
     wireserve_types::SignIn {
         service: "auth".into(),
         node: "gate".into(),
         verify_path: "/verify".into(),
-        copy_headers: vec!["x-auth-user".into()],
         session_cookie: "authward_session".into(),
     }
 }
@@ -3498,109 +3498,154 @@ fn svc(name: &str, public: u16, target: u16) -> Value {
     json!({"name": name, "ports": [{"public": public, "target": target, "proto": "tcp"}]})
 }
 
+fn svc_in(name: &str, public: u16, target: u16, group: &str) -> Value {
+    json!({"name": name, "ports": [{"public": public, "target": target, "proto": "tcp"}], "group": group})
+}
+
 async fn poll_caps(router: &Router, bearer: &str, services: Value, capable: bool) -> Value {
     let caps: Vec<&str> = if capable { vec![wireserve_types::CAP_SIGN_IN] } else { vec![] };
     poll_full(router, bearer, json!({ "services": services, "capabilities": caps })).await.1
 }
 
-async fn set_auth(router: &Router, name: &str, enabled: bool) -> (StatusCode, Value) {
-    let req = json_request("PUT", &format!("/admin/services/{name}/auth"), Some(ADMIN), json!({ "enabled": enabled }));
-    let resp = router.clone().oneshot(req).await.unwrap();
+/// An admin call: its status, and its JSON body if it has one.
+async fn admin_call(router: &Router, method: &str, path: &str, body: Value) -> (StatusCode, Value) {
+    let resp = router.clone().oneshot(json_request(method, path, Some(ADMIN), body)).await.unwrap();
     let status = resp.status();
-    let body = if status == StatusCode::OK { json!(null) } else { body_json(resp).await };
-    (status, body)
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }
 
-/// A node running the sign-in provider as `auth` on 443 and a home node
-/// publishing `jellyfin` on 443; `home_capable` says whether the home node
-/// reports it can put the sign-in in front of a service. Returns (gate
-/// bearer, home bearer, an unrelated observer's bearer).
-async fn auth_scenario(app: &TestApp, home_capable: bool) -> (String, String, String) {
-    let bearer = |r: Value| r["bearer_token"].as_str().unwrap().to_string();
-    let t = admin_create_node(&app.router, "gate").await;
-    let gate = bearer(register_node(&app.router, &t, "gate", 51820).await);
-    let t = admin_create_node(&app.router, "home").await;
-    let home = bearer(register_node(&app.router, &t, "home", 51820).await);
-    let t = admin_create_node(&app.router, "watcher").await;
-    let watcher = bearer(register_node(&app.router, &t, "watcher", 51820).await);
-    poll_caps(&app.router, &gate, json!([svc("auth", 443, 8080)]), true).await;
-    poll_caps(&app.router, &home, json!([svc("jellyfin", 443, 8096), svc("prom", 80, 9090)]), home_capable).await;
-    (gate, home, watcher)
+/// The gate running the sign-in as `auth`, a home node publishing
+/// `jellyfin` on 443 and `prom` on 80, and a watcher publishing nothing.
+/// Returns (gate, home, watcher) as (bearer, ip4).
+async fn access_scenario(app: &TestApp) -> [(String, String); 3] {
+    let mut out = Vec::new();
+    for name in ["gate", "home", "watcher"] {
+        let t = admin_create_node(&app.router, name).await;
+        let r = register_node(&app.router, &t, name, 51820).await;
+        out.push((r["bearer_token"].as_str().unwrap().to_string(), r["ip4"].as_str().unwrap().to_string()));
+    }
+    poll_caps(&app.router, &out[0].0, json!([svc("auth", 443, 8080)]), true).await;
+    poll_caps(&app.router, &out[1].0, json!([svc("jellyfin", 443, 8096), svc("prom", 80, 9090)]), true).await;
+    out.try_into().unwrap()
 }
 
 fn directory_entry<'a>(body: &'a Value, name: &str) -> &'a Value {
     body["services"].as_array().unwrap().iter().find(|s| s["name"] == name).unwrap()
 }
 
-#[tokio::test]
-async fn a_marked_service_reaches_every_node_marked_and_the_admin_sees_it() {
-    let app = named_app();
-    let (_gate, _home, watcher) = auth_scenario(&app, true).await;
-
-    assert_eq!(set_auth(&app.router, "jellyfin", true).await.0, StatusCode::OK);
-    let (_, body) = poll_full(&app.router, &watcher, json!({})).await;
-    assert_eq!(directory_entry(&body, "jellyfin")["auth"], json!(true), "{body}");
-    assert!(directory_entry(&body, "prom").get("auth").is_none(), "absent when false: {body}");
-
-    let req = json_request("GET", "/admin/services", Some(ADMIN), json!({}));
-    let listed = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
-    let jf = listed["services"].as_array().unwrap().iter().find(|s| s["name"] == "jellyfin").unwrap().clone();
-    assert_eq!(jf["auth"], json!(true), "{listed}");
-
-    // Turning it off is never refused.
-    assert_eq!(set_auth(&app.router, "jellyfin", false).await.0, StatusCode::OK);
-    let (_, body) = poll_full(&app.router, &watcher, json!({})).await;
-    assert!(directory_entry(&body, "jellyfin").get("auth").is_none(), "{body}");
+fn access_entry<'a>(body: &'a Value, name: &str) -> &'a Value {
+    body["access"].as_array().and_then(|a| a.iter().find(|s| s["name"] == name)).unwrap_or(&Value::Null)
 }
 
 #[tokio::test]
-async fn the_mark_survives_a_withdraw_and_redeclare() {
-    // With approval off, a withdrawn and re-declared service is back at
-    // once; a mark stored on the row would have gone with it, and the
-    // service would be back open.
+async fn a_fresh_mesh_leaves_every_service_open_and_tells_only_its_owner() {
     let app = named_app();
-    let (_gate, home, watcher) = auth_scenario(&app, true).await;
-    assert_eq!(set_auth(&app.router, "jellyfin", true).await.0, StatusCode::OK);
+    let [_, (home, _), (watcher, _)] = access_scenario(&app).await;
+    let body = poll_caps(&app.router, &home, json!([svc("jellyfin", 443, 8096), svc("prom", 80, 9090)]), true).await;
+    assert_eq!(access_entry(&body, "jellyfin"), &json!({"name": "jellyfin", "open": true}), "{body}");
+    assert_eq!(access_entry(&body, "prom")["open"], json!(true));
+    let (_, body) = poll_full(&app.router, &watcher, json!({})).await;
+    assert!(body.get("access").is_none(), "nobody else's access: {body}");
+    assert!(directory_entry(&body, "jellyfin").get("auth").is_none(), "no marks any more: {body}");
+}
 
+#[tokio::test]
+async fn a_group_closes_a_service_until_something_is_granted() {
+    let app = named_app();
+    let [_, (home, home_ip), (_, watcher_ip)] = access_scenario(&app).await;
+    let services = json!([svc("jellyfin", 443, 8096), svc("prom", 80, 9090)]);
+
+    assert_eq!(admin_call(&app.router, "POST", "/admin/groups", json!({"name": "media"})).await.0, StatusCode::CREATED);
+    let (status, body) = admin_call(&app.router, "PUT", "/admin/groups/media/services/jellyfin", json!(null)).await;
+    assert_eq!((status, &body["groups"]), (StatusCode::OK, &json!(["media"])));
+    let body = poll_caps(&app.router, &home, services.clone(), true).await;
+    assert_eq!(access_entry(&body, "jellyfin")["open"], Value::Null, "closed: {body}");
+    assert_eq!(access_entry(&body, "jellyfin")["sources"], json!([home_ip]), "its own node only");
+    assert_eq!(access_entry(&body, "prom")["open"], json!(true), "the other stays in default");
+
+    // A tag and a grant to it let the watcher in.
+    assert_eq!(admin_call(&app.router, "PUT", "/admin/nodes/watcher/tags/tv", json!(null)).await.0, StatusCode::CREATED);
+    let grant = json!({"source": "tag:tv", "group": "media"});
+    assert_eq!(admin_call(&app.router, "POST", "/admin/grants", grant.clone()).await.0, StatusCode::CREATED);
+    let body = poll_caps(&app.router, &home, services.clone(), true).await;
+    let mut want = vec![home_ip.clone(), watcher_ip.clone()];
+    want.sort_by_key(|ip| ip.parse::<std::net::Ipv4Addr>().unwrap());
+    assert_eq!(access_entry(&body, "jellyfin")["sources"], json!(want), "{body}");
+
+    // An identity provider's group is only something to prove at the sign-in.
+    admin_call(&app.router, "POST", "/admin/grants", json!({"source": "oidc:family", "group": "media"})).await;
+    let body = poll_caps(&app.router, &home, services.clone(), true).await;
+    assert_eq!(access_entry(&body, "jellyfin")["sign_in_groups"], json!(["family"]), "{body}");
+
+    let (_, report) = admin_call(&app.router, "GET", "/admin/access/services/jellyfin", json!(null)).await;
+    assert_eq!(report["open"], json!(false), "{report}");
+    assert_eq!(report["nodes"], json!([{"name": "watcher", "via": ["tag:tv"]}]), "{report}");
+    let (_, report) = admin_call(&app.router, "GET", "/admin/access/nodes/watcher", json!(null)).await;
+    assert!(report["services"].as_array().unwrap().iter().any(|s| s["name"] == "jellyfin"), "{report}");
+
+    // Taking the grant away closes it again.
+    assert_eq!(admin_call(&app.router, "DELETE", "/admin/grants", grant).await.0, StatusCode::OK);
+    admin_call(&app.router, "DELETE", "/admin/grants", json!({"source": "oidc:family", "group": "media"})).await;
+    let body = poll_caps(&app.router, &home, services, true).await;
+    assert_eq!(access_entry(&body, "jellyfin")["sources"], json!([home_ip]));
+}
+
+#[tokio::test]
+async fn a_group_survives_a_withdraw_and_redeclare() {
+    // With approval off a withdrawn and re-declared service is back at
+    // once; a group stored on the row would have gone with it, and the
+    // service would be back in default, open to everyone.
+    let app = named_app();
+    let [_, (home, _), _] = access_scenario(&app).await;
+    admin_call(&app.router, "POST", "/admin/groups", json!({"name": "media"})).await;
+    admin_call(&app.router, "PUT", "/admin/groups/media/services/jellyfin", json!(null)).await;
     poll_caps(&app.router, &home, json!([svc("prom", 80, 9090)]), true).await;
-    poll_caps(&app.router, &home, json!([svc("jellyfin", 443, 8096), svc("prom", 80, 9090)]), true).await;
-    let (_, body) = poll_full(&app.router, &watcher, json!({})).await;
-    assert_eq!(directory_entry(&body, "jellyfin")["auth"], json!(true), "{body}");
+    let body = poll_caps(&app.router, &home, json!([svc("jellyfin", 443, 8096), svc("prom", 80, 9090)]), true).await;
+    assert_eq!(access_entry(&body, "jellyfin")["open"], Value::Null, "{body}");
 }
 
 #[tokio::test]
-async fn marking_is_refused_wherever_it_would_leave_the_service_open() {
-    // Without a sign-in there is nothing to put in front of it.
-    let app = test_app();
-    let (status, body) = set_auth(&app.router, "jellyfin", true).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body["error"].as_str().unwrap().contains("WIRESERVE_AUTH_SERVICE"), "{body}");
-
+async fn a_declaration_names_a_group_once_and_never_an_unknown_one() {
     let app = named_app();
-    let _ = auth_scenario(&app, true).await;
-    let (status, _) = set_auth(&app.router, "auth", true).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "the sign-in cannot sit behind itself");
-    let (status, body) = set_auth(&app.router, "prom", true).await;
-    assert_eq!(status, StatusCode::CONFLICT, "not on 443, so no terminator serves it: {body}");
+    let [_, (home, _), _] = access_scenario(&app).await;
+    let body = poll_caps(&app.router, &home, json!([svc_in("vault", 443, 8200, "infra")]), true).await;
+    assert_eq!(body["service_notices"][0]["name"], json!("vault"), "{body}");
+    assert!(body["services"].as_array().unwrap().iter().all(|s| s["name"] != "vault"), "not published: {body}");
+    assert_eq!(access_entry(&body, "vault"), &Value::Null);
 
-    // An owning agent without the built-in sign-in.
-    let app = named_app();
-    let _ = auth_scenario(&app, false).await;
-    let (status, body) = set_auth(&app.router, "jellyfin", true).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body["error"].as_str().unwrap().contains("declaring"), "{body}");
+    admin_call(&app.router, "POST", "/admin/groups", json!({"name": "infra"})).await;
+    admin_call(&app.router, "POST", "/admin/groups", json!({"name": "media"})).await;
+    let body = poll_caps(&app.router, &home, json!([svc_in("vault", 443, 8200, "infra")]), true).await;
+    assert!(body.get("service_notices").is_none(), "{body}");
+    assert_eq!(access_entry(&body, "vault")["open"], Value::Null, "in infra, not default: {body}");
+
+    // Naming another group later changes nothing, and says so.
+    let body = poll_caps(&app.router, &home, json!([svc_in("vault", 443, 8200, "media")]), true).await;
+    assert!(body["service_notices"][0]["reason"].as_str().unwrap().contains("infra"), "{body}");
+    let (_, listed) = admin_call(&app.router, "GET", "/admin/services", json!(null)).await;
+    let vault = listed["services"].as_array().unwrap().iter().find(|s| s["name"] == "vault").unwrap();
+    assert_eq!(vault["groups"], json!(["infra"]));
 }
 
 #[tokio::test]
-async fn a_name_nobody_declares_can_be_marked_ahead_of_time() {
-    // Whoever declares it next is published behind the sign-in — the safe
-    // direction to be early in.
+async fn the_sign_in_and_groups_in_use_stay_where_they_are() {
     let app = named_app();
-    let (_gate, home, watcher) = auth_scenario(&app, true).await;
-    assert_eq!(set_auth(&app.router, "immich", true).await.0, StatusCode::OK);
-    poll_caps(&app.router, &home, json!([svc("jellyfin", 443, 8096), svc("immich", 443, 2283)]), true).await;
-    let (_, body) = poll_full(&app.router, &watcher, json!({})).await;
-    assert_eq!(directory_entry(&body, "immich")["auth"], json!(true), "{body}");
+    let _ = access_scenario(&app).await;
+    admin_call(&app.router, "POST", "/admin/groups", json!({"name": "media"})).await;
+    let (status, body) = admin_call(&app.router, "PUT", "/admin/groups/media/services/auth", json!(null)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "the sign-in stays open: {body}");
+    assert_eq!(admin_call(&app.router, "DELETE", "/admin/groups/default", json!(null)).await.0, StatusCode::BAD_REQUEST);
+    admin_call(&app.router, "PUT", "/admin/groups/media/services/jellyfin", json!(null)).await;
+    let (status, body) = admin_call(&app.router, "DELETE", "/admin/groups/media", json!(null)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("jellyfin"), "{body}");
+    assert_eq!(admin_call(&app.router, "DELETE", "/admin/groups/nope", json!(null)).await.0, StatusCode::NOT_FOUND);
+    let (status, body) = admin_call(&app.router, "POST", "/admin/grants", json!({"source": "tag:x", "group": "nope"})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, _) = admin_call(&app.router, "POST", "/admin/grants", json!({"source": "oidc:a,b", "group": "media"})).await;
+    assert!(status.is_client_error(), "a comma cannot be in a group the provider sends");
+    assert_eq!(admin_call(&app.router, "PUT", "/admin/nodes/nobody/tags/tv", json!(null)).await.0, StatusCode::NOT_FOUND);
 }
 
 // ---- PLAN.md M32: the service names in public DNS ----
@@ -3796,19 +3841,16 @@ mod dns_records {
     }
 
     #[tokio::test]
-    async fn a_marked_service_terminates_like_any_other() {
+    async fn a_restricted_service_terminates_like_any_other() {
         let fake = Arc::new(FakeDns::default());
         let app = app(&fake);
         let home = node(&app, "home").await;
         poll_ready(&app, &home, json!([svc("jellyfin", 443, 8096)]), &[]).await;
-        let req = json_request("PUT", "/admin/services/jellyfin/auth", Some(ADMIN), json!({ "enabled": false }));
-        app.router.clone().oneshot(req).await.unwrap();
-        app.state.db.conn.lock().await.execute(
-            "INSERT INTO service_auth (name, marked_at) VALUES ('jellyfin', '2026-09-27T00:00:00Z')", [],
-        ).unwrap();
+        admin_call(&app.router, "POST", "/admin/groups", json!({"name": "media"})).await;
+        admin_call(&app.router, "PUT", "/admin/groups/media/services/jellyfin", json!(null)).await;
         let body = poll_ready(&app, &home, json!([svc("jellyfin", 443, 8096)]), &["jellyfin"]).await;
         assert_eq!(directory_entry(&body, "jellyfin")["terminated"], json!(true), "{body}");
-        assert_eq!(directory_entry(&body, "jellyfin")["auth"], json!(true), "{body}");
+        assert_eq!(access_entry(&body, "jellyfin")["open"], Value::Null, "{body}");
     }
 
     #[tokio::test]

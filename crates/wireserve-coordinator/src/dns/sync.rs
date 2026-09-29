@@ -153,10 +153,8 @@ pub async fn pass(state: &AppState, dns: &Dns, moving: &mut BTreeMap<String, (Ip
         let conn = state.db.conn.lock().await;
         let peers = nodes::list_all_peers(&conn)?;
         let approved = services::list_approved(&conn)?;
-        let auth = services::auth_names(&conn)?;
         let tls_ready = crate::db::tls::ready(&conn)?;
-        let directory =
-            crate::directory::services_directory(&approved, &peers, &state.directory_context(&auth, &tls_ready));
+        let directory = crate::directory::services_directory(&approved, &peers, &state.directory_context(&tls_ready));
         Ok::<_, crate::db::DbError>((desired(&directory, state.config.service_naming().as_ref()), dns_records::all(&conn)?))
     };
     // The lock is dropped here: nothing below holds it across a provider
@@ -288,7 +286,6 @@ mod tests {
 
     fn svc(name: &str, vip: &str, public: u16) -> ServiceInfo {
         ServiceInfo {
-            auth: false,
             terminated: false,
             name: name.into(),
             node: "n".into(),
@@ -300,7 +297,7 @@ mod tests {
     }
 
     fn naming() -> ServiceNaming {
-        ServiceNaming { domain: "Int.Example.com".into(), acme: None, sign_in: None }
+        ServiceNaming { domain: "Int.Example.com".into(), acme: None, sign_in: None, identity_headers: Default::default() }
     }
 
     fn ip(s: &str) -> Ipv4Addr {

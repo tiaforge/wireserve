@@ -365,12 +365,23 @@ trait FirewallBackend {
 struct ServiceRule {
     proto: Proto,   // Tcp | Udp
     port: u16,
+    sources: Option<Vec<Ipv4Addr>>,   // None: every node (M36)
 }
 ```
 
 - `rules` = this node's own currently-declared services (from the `services`
   array in the request the agent just sent, not the coordinator's response —
   a node only ever firewalls itself).
+- **Who may (M36)**: the coordinator's response narrows each rule to the
+  addresses its grants name (`PollResponse.access`), matched per packet
+  before the service address is rewritten, so a source left out meets the
+  refusal of an unpublished port and loses an open connection at its next
+  packet. It only ever narrows: a declared service with no access entry is
+  not opened at all. A restricted terminated 443 whose access says `sign_in`
+  is open to every node — its terminator decides (§6.1). The node's own
+  clients are never filtered: they reach the backend directly anyway. A
+  transit carrier can send with the addresses of the peers it carries, so a
+  grant to a transited peer trusts its carrier.
 - **Linux v1**: `NftablesBackend` via the `nft` binary's JSON API (one
   atomic `nft -j -f -` transaction per `apply()`), scoped to the WireGuard
   interface, default `DROP`. (Originally netlink via `rustables` with "no
@@ -473,24 +484,38 @@ nothing but a check-in and a challenge request, and tells the backend who is
 calling (`X-Wireserve-Node`, `X-Forwarded-For`), removing any copies a client
 sent.
 
-**A sign-in in front of chosen services (M29, M34).** An admin can mark a 443
-service; its node's terminator then asks the provider named by
-`WIRESERVE_AUTH_SERVICE` about every request — Caddy's `forward_auth`, built
-in: a headers-only copy of the request to `https://<provider>.<domain>/verify`
-on the provider's own address, verified TLS, with `X-Forwarded-Method`,
+**Who can reach what (M36), and the sign-in (M34).** Every service is in
+one or more service groups — its explicit ones, stored per *name* outside the
+service rows so a withdraw and re-declare cannot quietly drop one, or else
+the built-in `default`. A grant lets a source reach every service in a group:
+`everyone`, `tag:<tag>` (an admin's node tag) or `oidc:<group>` (an identity
+provider's group, proven by signing in). A fresh mesh has `everyone → default`,
+so nothing is restricted until an admin restricts it. Only the admin changes
+groups, grants and tags; a declaration's `group` becomes membership once, when
+a new name is first approved, and a declaration naming a group that does not
+exist is not published. The coordinator computes each service's access —
+open, or the granted nodes' addresses (always with its owner's), whether the
+sign-in applies and with which groups — and sends it to the service's owner
+alone (`PollResponse.access`), which enforces it: see §5, and the terminator
+below.
+
+A terminated service's terminator checks every request, not every
+connection: an open service, or a caller whose address the access names,
+goes on. Anyone else, where a grant names an `oidc:` group and a provider is
+configured (`WIRESERVE_AUTH_SERVICE` on `WIRESERVE_AUTH_NODE`, trusted on
+that node only), is asked about — Caddy's `forward_auth`, built in: a
+headers-only copy of the request to `https://<provider>.<domain>/verify` on
+the provider's own address, verified TLS, with `X-Forwarded-Method`,
 `X-Forwarded-Uri` and the service's own name as `Host` and `X-Forwarded-Host`
-— a request whose `Host` names another service gets 421 first. The provider
-is trusted only while `WIRESERVE_AUTH_NODE` declares it. A 2xx passes with the provider's
-identity headers copied on (and any a client sent removed first); a 401 with
-`X-Login-Url` redirects a GET; anything else is returned as is. The mark is
-only as good as the rule that the backend is unreachable except through that
-check — the trust boundary forward_auth providers document — so the owning
-node opens nothing of a marked service but its terminated 443, and nothing at
-all while its terminator does not serve it. Every terminator strips the
-provider's domain-wide session cookie from every request but the provider's
-own. Marks are stored per name, outside the service rows, so a withdraw and
-re-declare cannot quietly drop one, and the coordinator refuses a mark until
-the owning node reports `sign-in`.
+— a request whose `Host` names another service gets 421 first. A 2xx says who
+it is; one of the granted groups in its groups header passes the request on
+with the identity headers copied on, anything else is 403. A 401 with
+`X-Login-Url` redirects a GET; anything else is returned as is. The provider
+authenticates; the grants authorize. Everyone else gets 403. The identity
+headers (`WIRESERVE_AUTH_{USER,EMAIL,GROUPS}_HEADER`) are removed from every
+request on every service, and the provider's domain-wide session cookie from
+every request but the provider's own. The provider's own service is always
+open and cannot be put in a group.
 
 ### 6.2 A resolver in a full tunnel (M27)
 

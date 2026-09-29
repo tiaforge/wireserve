@@ -290,7 +290,9 @@ the old binary. The node keeps its identity and its declared services; the
 mesh drops out for the few seconds the daemon takes to restart, and its
 firewall is rebuilt deny-first as on any start. Pass a URL or a token and it
 joins again. Upgrade the coordinator first, the same way:
-`sudo ./wireserve-coordinator install` on its host.
+`sudo ./wireserve-coordinator install` on its host. It matters: an agent
+learns from the coordinator who may reach its services, and opens none of
+them until a coordinator that says so answers.
 
 ### 3. Publish a service
 
@@ -643,12 +645,57 @@ Worth knowing:
   per CA, so each node replaces its staging certificates with production
   ones within a minute, serving the staging ones until then.
 
-#### A sign-in in front of chosen services
+#### Who can reach what
 
-A service can also sit behind a sign-in — per person, with your own identity
-provider, rather than "anything on the mesh gets in". It is built into every
-node's terminator and speaks `forward_auth`, so any provider for that works;
-the defaults are [authward](https://git.tia.sh/tia/authward)'s.
+Every service is in one or more **service groups**, and a **grant** lets a
+source reach every service in a group. A source is `everyone` (every node),
+`tag:<tag>` (nodes you tagged: servers, shared devices) or `oidc:<group>`
+(people in that group at your identity provider, who prove it by signing
+in). A service in no group is in the built-in `default` group, and a fresh
+mesh grants `default` to `everyone` — which is why, until you set anything
+up, every service is reachable from every node, as it always was.
+
+```sh
+wireserve-admin group create infra
+wireserve-admin group add infra grafana        # out of default, into infra
+wireserve-admin tag add ci-runner ops
+wireserve-admin grant add tag:ops infra        # the ci-runner reaches grafana
+wireserve-admin access grafana                 # who reaches it, and why
+wireserve-admin access --node ci-runner        # what a node reaches
+wireserve-admin group list
+wireserve-admin grant list
+```
+
+Only you change groups, grants and tags. A node declaring a service may name
+an existing group once, so a new service never appears in `default` even with
+approval off:
+
+```sh
+wireserve serve vault 8200 --group infra
+```
+
+That applies to a service that has no group yet, and only when it is
+approved; after that its groups are yours, and a declaration naming another
+one changes nothing and says so in `wireserve list`. A declaration naming a
+group that does not exist is not published at all. Groups belong to the
+service **name**: they survive the service being withdrawn and declared again,
+and a name can be put in a group before anything declares it. `group delete`
+is refused while a group holds services, has grants, or a declaration is
+waiting to join it — its services would fall back into `default`.
+
+Each service's own node enforces it, for every protocol: its firewall lets
+only the granted nodes' addresses in, and cuts a connection whose grant was
+taken away at its next packet. Changes reach it within a poll and a
+terminator check-in (seconds). Removing the `everyone → default` grant
+turns the whole mesh deny-by-default; `access` says when it is gone.
+
+#### Signing in, for shared devices
+
+A grant to a tag or everyone is about the *device*. A laptop the whole family
+uses is one device, though: for HTTP services the terminator can tell its
+people apart by a sign-in. It is built into every node's terminator and
+speaks `forward_auth`, so any provider for that works; the defaults are
+[authward](https://git.tia.sh/tia/authward)'s.
 
 Run the provider as a mesh service on 443 — its login pages are then
 `https://auth.int.example.com` — and name it, and the node running it, on
@@ -661,53 +708,68 @@ WIRESERVE_AUTH_SERVICE=auth
 WIRESERVE_AUTH_NODE=gate                  # the node that runs it
 # optional, shown with their defaults
 WIRESERVE_AUTH_VERIFY_PATH=/verify
-WIRESERVE_AUTH_COPY_HEADERS="X-Auth-User X-Auth-Email X-Auth-Groups"
 WIRESERVE_AUTH_SESSION_COOKIE=authward_session
+WIRESERVE_AUTH_USER_HEADER=X-Auth-User
+WIRESERVE_AUTH_EMAIL_HEADER=X-Auth-Email
+WIRESERVE_AUTH_GROUPS_HEADER=X-Auth-Groups
 ```
 
-Then mark services:
+Then grant a group at your identity provider:
 
 ```sh
-wireserve-admin approve-service homeserver jellyfin --auth   # new services
-wireserve-admin service-auth grafana on                      # existing ones
+wireserve-admin grant add oidc:family media
 ```
 
-From the next poll, every request to a marked service first goes, headers
-only, to `https://auth.<domain>/verify` — over verified TLS on the provider's
-own address, with `X-Forwarded-Method`, `X-Forwarded-Uri`, and the
-service's own name in `Host` and `X-Forwarded-Host` (a request naming any
-other host is refused with 421 before it gets that far). A 2xx lets it through with the provider's `X-Auth-*`
-headers copied on; a 401 with `X-Login-Url` sends the browser to sign in;
-anything else is the provider's own answer. And the service's **own node
-opens nothing of it but that**: its other mappings stay closed, so nobody on
-the mesh can skip the sign-in by dialling another port.
+A request to a service in `media`, served with TLS by its node, then goes:
 
-The mark belongs to the service **name**: it survives the service being
-withdrawn and declared again, and can be set before anything declares it.
-`list-services` shows it.
+1. from a device a grant names — its own node, a tagged one: straight through,
+   the sign-in never asked;
+2. from any other device: headers only, to `https://auth.<domain>/verify`,
+   over verified TLS on the provider's own address, with `X-Forwarded-Method`,
+   `X-Forwarded-Uri` and the service's own name in `Host` and
+   `X-Forwarded-Host` (a request naming any other host is refused with 421
+   before it gets that far). Not signed in: a 401 with `X-Login-Url` sends the
+   browser to sign in. Signed in: the provider says who, and the terminator
+   decides — one of the granted groups in `X-Auth-Groups` lets it through with
+   the provider's identity headers, anything else gets 403. The provider only
+   authenticates; which groups get in is the grants' business.
+
+So the sign-in is never a per-service switch: a restricted service offers it
+exactly when a grant names an `oidc:` group, and a service in `default` never
+asks. While it does, the service's terminated 443 is open to every node — the
+terminator decides — and its other ports stay with the grants, so nobody
+walks round the sign-in by dialling another one.
 
 The provider is trusted **only on `WIRESERVE_AUTH_NODE`**: every request
-behind the sign-in goes to it, cookies included, and its answer decides who
-gets in, so the same service name declared by any other node is ignored and
-marked services refuse until the named node serves it again. Without
-`WIRESERVE_AUTH_NODE` the sign-in is off, with a warning at startup.
+behind the sign-in goes to it, cookies included, and it says who is signed
+in, so the same service name declared by any other node is ignored, and
+nobody gets in by signing in until the named node serves it again. Without
+`WIRESERVE_AUTH_NODE` the sign-in is off, with a warning at startup. The
+provider's own service stays open to every node and cannot be put in a group:
+every terminator and every browser signing in has to reach it.
 
-Worth knowing before you mark something:
+Worth knowing:
 
+- **Only HTTP can tell people apart.** Two people on one laptop send the same
+  packets; for SSH, SMB or a database the grant is the device's, and the
+  service does its own login. Tag the shared device for what everyone on it
+  may use.
 - **Native apps can't do a browser sign-in.** The Jellyfin, Immich and Home
-  Assistant apps, or anything speaking CalDAV/CardDAV, fail behind it. That
-  is why it is per service. authward's API tokens and `bypass_paths` are the
-  way through for those.
-- **Only services published on TCP 443** can be marked, and the provider
-  itself cannot be.
-- **Close the owner's LAN yourself.** The mesh admits only the terminator; a
+  Assistant apps, or anything speaking CalDAV/CardDAV, fail behind it — grant
+  their devices instead, or use authward's API tokens and `bypass_paths`.
+- **A transit carrier speaks for the peers it carries.** A phone routed
+  through a gateway arrives with its own address, which the gateway could
+  also send; a grant to a transited peer trusts its carrier.
+- **Close the owner's LAN yourself.** The mesh admits only the grants; a
   backend listening on every interface is still reachable from its own
   network. Bind it to the node's mesh address.
 - **Identity headers and the session cookie never reach a backend from a
-  client.** Every terminator removes `X-Auth-*` from every request and the
-  provider's session cookie from every request but the provider's own —
-  the cookie is scoped to the whole domain, so the browser sends it to every
-  service.
+  client.** Every terminator removes the identity headers from every request,
+  on every service, and the provider's session cookie from every request but
+  the provider's own — the cookie is scoped to the whole domain, so the
+  browser sends it to every service.
+- **A deleted node's address**, once given to a new node, keeps the old one's
+  grants until the serving node's next poll.
 
 #### If the name resolves on one network but not another
 
@@ -906,7 +968,7 @@ members of the `wireserve` group have (see "Using it without sudo"):
 | --- | --- |
 | `wireserve install [url] [--instance name]` | installs the binary + systemd unit, then joins — one command, needs root. On a node that already joined, with no URL or token: upgrades and restarts the agents instead |
 | `wireserve join [url] [token]` | one-time bootstrap, generates the keypair — prompts for either if omitted |
-| `wireserve serve <name> <[public:][address:]target[/tcp\|/udp]>...` | publish a service on its own address — on this node, or on an address it reaches |
+| `wireserve serve <name> <[public:][address:]target[/tcp\|/udp]>... [--group <g>]` | publish a service on its own address — on this node, or on an address it reaches; a new one in group `g` |
 | `wireserve unserve <name>` | withdraw one |
 | `wireserve transit on\|off` | opt in/out of carrying traffic for two other nodes that can't reach each other directly (also needs `approve-transit`) |
 | `wireserve exit on\|off` | opt in/out of sending the internet traffic of devices exported with `--exit` through this node (also needs `transit on` and approval) |
@@ -935,8 +997,12 @@ anywhere that can reach it):
 | `wireserve-admin delete-node <name>` | remove the record, free the name |
 | `wireserve-admin clear-endpoint <name>` | drop a stale advertised endpoint |
 | `wireserve-admin list-services [--pending]` | declared services and their approval state |
-| `wireserve-admin approve-service <node> <svc> [--auth]` | let a declaration reach the mesh, behind the sign-in with `--auth` |
-| `wireserve-admin service-auth <svc> on\|off` | put a service behind the sign-in, opening nothing else of it |
+| `wireserve-admin approve-service <node> <svc>` | let a declaration reach the mesh |
+| `wireserve-admin group create\|delete\|list` | service groups; a service in none is in `default` |
+| `wireserve-admin group add\|remove <group> <svc>` | put a service in a group, or take it out |
+| `wireserve-admin grant add\|remove <source> <group>`, `grant list` | let `everyone`, `tag:<tag>` or `oidc:<group>` reach a group |
+| `wireserve-admin tag add\|remove <node> <tag>` | tag a node, for grants to name |
+| `wireserve-admin access <svc>` / `access --node <node>` | who reaches a service and why, or what a node reaches |
 | `wireserve-admin deny-service <node> <svc>` | refuse one, or withdraw an approval |
 | `wireserve-admin approve-transit <name>` | let a node that opted in carry traffic for others |
 | `wireserve-admin deny-transit <name>` | withdraw that |

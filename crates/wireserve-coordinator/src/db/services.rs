@@ -105,6 +105,8 @@ impl ApprovalMode {
 pub struct UpsertOutcome {
     pub pending: Vec<ServiceRow>,
     pub denied: Vec<ServiceRow>,
+    /// What the node should know about the groups it named (PLAN.md M36).
+    pub notices: Vec<wireserve_types::ServiceNotice>,
 }
 
 pub fn list_for_node(conn: &Connection, node_id: i64) -> Result<Vec<ServiceRow>, DbError> {
@@ -195,6 +197,13 @@ fn owner_of(conn: &Connection, name: &str) -> Result<Option<i64>, DbError> {
 /// is logged and leaves the service without one — reachable nowhere —
 /// rather than failing the poll: the agent would resend the same
 /// declaration every cycle and never get a directory again.
+///
+/// Groups (PLAN.md M36): a declaration's `group` is stored on a **new** row
+/// only, and joins it once the row is approved (see
+/// [`super::grants::promote_declared_group`]). A new name naming a group
+/// that does not exist is not published at all — it must never land in
+/// `default`, where everyone reaches it — and neither kind of problem fails
+/// the poll: each becomes a notice, and the other declarations apply.
 pub fn upsert_for_node(
     conn: &mut Connection,
     node_id: i64,
@@ -221,6 +230,35 @@ pub fn upsert_for_node(
         rows.collect::<Result<Vec<_>, _>>()?
     };
 
+    // A new name naming a group it cannot join is left out entirely; since
+    // it has no row yet, leaving it out withdraws nothing.
+    let mut notices = Vec::new();
+    let explicit = super::grants::members(&tx)?;
+    let mut accepted: Vec<&ServiceDecl> = Vec::with_capacity(desired.len());
+    for d in desired {
+        let exists = current.contains(&d.name);
+        match (&d.group, exists) {
+            (None, _) => accepted.push(d),
+            (Some(group), true) => {
+                let groups = super::grants::effective_groups(&explicit, &d.name);
+                if !groups.contains(group) {
+                    let list = groups.into_iter().collect::<Vec<_>>().join(", ");
+                    notices.push(notice(&d.name, format!(
+                        "stays in {list}: a declaration names a group only the first time; an admin changes it"
+                    )));
+                }
+                accepted.push(d);
+            }
+            (Some(group), false) if !wireserve_types::is_valid_dns_label(group) => {
+                notices.push(notice(&d.name, format!("{group:?} is not a group name; not published")));
+            }
+            (Some(group), false) if !super::grants::group_exists(&tx, group)? => {
+                notices.push(notice(&d.name, format!("there is no group {group}; not published until an admin creates it")));
+            }
+            (Some(_), false) => accepted.push(d),
+        }
+    }
+
     let desired_names: Vec<&str> = desired.iter().map(|d| d.name.as_str()).collect();
 
     for name in &current {
@@ -234,7 +272,7 @@ pub fn upsert_for_node(
 
     let now = super::nodes::now_str();
     let stamp = mode.stamp();
-    for ServiceDecl { name, ports } in desired {
+    for ServiceDecl { name, ports, group } in accepted {
         // `port` and `proto` are the first mapping's target, kept only
         // because the columns are NOT NULL from migration 0001; nothing
         // reads them.
@@ -242,8 +280,8 @@ pub fn upsert_for_node(
         let (port, proto) = (first.target, first.proto);
         let ports_json = serde_json::to_string(ports).expect("PortMap always serializes");
         tx.execute(
-            "INSERT INTO services (node_id, name, port, proto, ports, declared_at, approved_at) \
-             VALUES (?1, ?2, ?3, ?4, ?7, ?5, ?6) \
+            "INSERT INTO services (node_id, name, port, proto, ports, declared_at, approved_at, declared_group) \
+             VALUES (?1, ?2, ?3, ?4, ?7, ?5, ?6, ?8) \
              ON CONFLICT(name) DO UPDATE SET \
                port = excluded.port, \
                proto = excluded.proto, \
@@ -256,9 +294,10 @@ pub fn upsert_for_node(
                  WHEN COALESCE(services.approved_at, excluded.approved_at) IS NULL \
                  THEN services.denied_reason ELSE NULL END \
              WHERE node_id = excluded.node_id",
-            rusqlite::params![node_id, name, port, proto.as_str(), now, stamp, ports_json],
+            rusqlite::params![node_id, name, port, proto.as_str(), now, stamp, ports_json, group],
         )?;
         assign_vip(&tx, node_id, name, vip_range)?;
+        super::grants::promote_declared_group(&tx, name)?;
     }
 
     // Read the verdict back inside the same transaction, so what `/poll`
@@ -281,11 +320,15 @@ pub fn upsert_for_node(
         let denied: Vec<ServiceRow> = denied
             .query_map([node_id], map_row)?
             .collect::<Result<_, _>>()?;
-        UpsertOutcome { pending, denied }
+        UpsertOutcome { pending, denied, notices }
     };
 
     tx.commit()?;
     Ok(outcome)
+}
+
+fn notice(name: &str, reason: String) -> wireserve_types::ServiceNotice {
+    wireserve_types::ServiceNotice { name: name.to_string(), reason }
 }
 
 /// Gives `name` an address from `vip_range` unless it already has one.
@@ -341,27 +384,6 @@ pub enum DenyOutcome {
     NotDeclared,
 }
 
-/// The names marked for sign-in at the proxy (PLAN.md M29), declared or not.
-pub fn auth_names(conn: &Connection) -> Result<std::collections::HashSet<String>, DbError> {
-    let mut stmt = conn.prepare("SELECT name FROM service_auth")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    Ok(rows.collect::<Result<_, _>>()?)
-}
-
-/// Marks or unmarks `name` for sign-in. Idempotent; marking again keeps the
-/// original timestamp.
-pub fn set_auth(conn: &Connection, name: &str, enabled: bool) -> Result<(), DbError> {
-    if enabled {
-        conn.execute(
-            "INSERT INTO service_auth (name, marked_at) VALUES (?1, ?2) ON CONFLICT(name) DO NOTHING",
-            rusqlite::params![name, super::nodes::now_str()],
-        )?;
-    } else {
-        conn.execute("DELETE FROM service_auth WHERE name = ?1", [name])?;
-    }
-    Ok(())
-}
-
 /// The row declaring `name`, whoever owns it.
 pub fn find_by_name(conn: &Connection, name: &str) -> Result<Option<ServiceRow>, DbError> {
     row_for_name(conn, name)
@@ -404,6 +426,7 @@ pub fn approve(conn: &Connection, node_id: i64, name: &str) -> Result<ApproveOut
         // bind-to-the-declaring-node rule, and costs nothing.
         rusqlite::params![super::nodes::now_str(), name, node_id],
     )?;
+    super::grants::promote_declared_group(&tx, name)?;
     tx.commit()?;
     Ok(ApproveOutcome::Approved)
 }

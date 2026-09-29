@@ -49,7 +49,6 @@ pub fn service_info(
     service: &ServiceRow,
     node: &NodeRow,
     online_threshold_secs: i64,
-    auth: bool,
     terminated: bool,
 ) -> ServiceInfo {
     ServiceInfo {
@@ -59,23 +58,18 @@ pub fn service_info(
         online: is_recent(node.last_seen, online_threshold_secs),
         vip4: service.vip4.clone(),
         ports: service.ports.iter().map(|m| wireserve_types::PortMap { addr: None, ..*m }).collect(),
-        auth,
         terminated,
     }
 }
 
 /// What decides, beyond a service's own row, how the directory shows it.
 pub struct DirectoryContext<'a> {
-    /// Names marked for sign-in (PLAN.md M29).
-    pub auth: &'a std::collections::HashSet<String>,
     /// Names their own node reports serving with TLS, with that node
     /// (PLAN.md M33).
     pub tls_ready: &'a std::collections::HashMap<String, i64>,
     /// Whether the coordinator publishes DNS records — without them no
     /// certificate can be issued, so nothing is terminated.
     pub dns: bool,
-    /// The service running the sign-in provider (PLAN.md M34).
-    pub sign_in_service: Option<&'a str>,
     pub online_threshold_secs: i64,
 }
 
@@ -84,8 +78,8 @@ impl DirectoryContext<'_> {
     ///
     /// Every condition fails toward the path the service already had: no
     /// records, not on TCP 443, no address of its own, or its own node not
-    /// vouching for it right now. A service behind the sign-in terminates like any other (PLAN.md
-    /// M34): the sign-in is in the terminator.
+    /// vouching for it right now. A restricted service terminates like any
+    /// other (PLAN.md M34, M36): the sign-in is in the terminator.
     #[must_use]
     pub fn terminates(&self, service: &ServiceRow) -> bool {
         self.dns
@@ -105,10 +99,7 @@ pub fn services_directory(services: &[ServiceRow], peers: &[NodeRow], ctx: &Dire
     services
         .iter()
         .filter_map(|s| {
-            peers_by_id.get(&s.node_id).map(|owner| {
-                let auth = ctx.auth.contains(&s.name);
-                service_info(s, owner, ctx.online_threshold_secs, auth, ctx.terminates(s))
-            })
+            peers_by_id.get(&s.node_id).map(|owner| service_info(s, owner, ctx.online_threshold_secs, ctx.terminates(s)))
         })
         .collect()
 }
@@ -149,7 +140,7 @@ pub fn denied_service(service: &ServiceRow) -> DeniedService {
 }
 
 #[must_use]
-pub fn admin_service_info(service: &ServiceRow, owner: &NodeRow, auth: bool) -> AdminServiceInfo {
+pub fn admin_service_info(service: &ServiceRow, owner: &NodeRow, groups: Vec<String>) -> AdminServiceInfo {
     AdminServiceInfo {
         name: service.name.clone(),
         node: owner.name.clone(),
@@ -161,7 +152,7 @@ pub fn admin_service_info(service: &ServiceRow, owner: &NodeRow, auth: bool) -> 
         approved_at: service.approved_at,
         denied_at: service.denied_at,
         denied_reason: service.denied_reason.clone(),
-        auth,
+        groups,
         dns: None,
     }
 }
@@ -230,7 +221,7 @@ mod tests {
             denied_at: None,
             denied_reason: None,
         };
-        let info = service_info(&svc, &n, 180, false, false);
+        let info = service_info(&svc, &n, 180, false);
         assert!(info.online);
     }
 
@@ -247,9 +238,9 @@ mod tests {
             denied_at: None,
             denied_reason: None,
         };
-        let fanned = service_info(&svc, &n, 180, false, false);
+        let fanned = service_info(&svc, &n, 180, false);
         assert_eq!(fanned.ports[0].addr, None);
         assert_eq!((fanned.ports[0].public, fanned.ports[0].target), (443, 80));
-        assert_eq!(admin_service_info(&svc, &n, false).ports[0].to_string(), "443:192.168.178.1:80/tcp");
+        assert_eq!(admin_service_info(&svc, &n, vec![]).ports[0].to_string(), "443:192.168.178.1:80/tcp");
     }
 }

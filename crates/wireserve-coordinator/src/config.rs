@@ -11,9 +11,11 @@ pub struct Config {
     /// The domain services are named under (PLAN.md M25), e.g.
     /// `int.example.com`. Unset leaves `<name>.wg` exactly as it was.
     pub service_domain: Option<String>,
-    /// The sign-in every terminator puts in front of marked services
-    /// (PLAN.md M34). Only with DNS records, which terminated services need.
+    /// The sign-in restricted services fall back to (PLAN.md M34, M36).
+    /// Only with DNS records, which terminated services need.
     pub sign_in: Option<wireserve_types::SignIn>,
+    /// The headers backends learn who is calling from (PLAN.md M36).
+    pub identity_headers: wireserve_types::IdentityHeaders,
     /// Where the service names are published as public DNS records
     /// (PLAN.md M32). `None` leaves DNS to the operator, as before.
     pub dns: Option<crate::dns::DnsConfig>,
@@ -189,6 +191,7 @@ impl Config {
         let dns = crate::dns::config::from_lookup(|k| std::env::var(k).ok(), service_domain.as_deref())?;
         let acme = acme_from_lookup(|k| std::env::var(k).ok())?;
         let sign_in = sign_in_from_lookup(|k| std::env::var(k).ok(), dns.is_some())?;
+        let identity_headers = identity_headers_from_lookup(|k| std::env::var(k).ok())?;
 
         Ok(Loaded {
             config: Self {
@@ -200,6 +203,7 @@ impl Config {
                 net_v6_prefix,
                 service_domain,
                 sign_in,
+                identity_headers,
                 dns,
                 acme,
                 online_threshold_secs,
@@ -257,6 +261,7 @@ impl Config {
             domain: domain.clone(),
             acme: self.dns.is_some().then(|| self.acme.clone()),
             sign_in: self.sign_in.clone(),
+            identity_headers: self.identity_headers.clone(),
         })
     }
 }
@@ -336,24 +341,48 @@ pub fn sign_in_from_lookup(
     if !verify_path.starts_with('/') || verify_path.contains(char::is_whitespace) || verify_path.contains('#') {
         return Err(ConfigError::Invalid("WIRESERVE_AUTH_VERIFY_PATH", format!("{verify_path:?} is not a path")));
     }
-    let copy_headers: Vec<String> = get("WIRESERVE_AUTH_COPY_HEADERS")
-        .unwrap_or_else(|| "X-Auth-User X-Auth-Email X-Auth-Groups".into())
-        .split([' ', ','])
-        .filter(|h| !h.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect();
-    let reserved = ["host", "cookie", "authorization", "x-wireserve-node", "content-length", "transfer-encoding", "connection"];
-    for h in &copy_headers {
-        let token = !h.is_empty() && h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
-        if !token || reserved.contains(&h.as_str()) || h.starts_with("x-forwarded-") || h == "forwarded" {
-            return Err(ConfigError::Invalid("WIRESERVE_AUTH_COPY_HEADERS", format!("{h:?} cannot be copied from the sign-in")));
-        }
-    }
     let session_cookie = get("WIRESERVE_AUTH_SESSION_COOKIE").unwrap_or_else(|| "authward_session".into());
     if !session_cookie.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
         return Err(ConfigError::Invalid("WIRESERVE_AUTH_SESSION_COOKIE", format!("{session_cookie:?} is not a cookie name")));
     }
-    Ok(Some(wireserve_types::SignIn { service, node, verify_path, copy_headers, session_cookie }))
+    Ok(Some(wireserve_types::SignIn { service, node, verify_path, session_cookie }))
+}
+
+/// The headers backends learn who is calling from (PLAN.md M36):
+/// `WIRESERVE_AUTH_USER_HEADER`, `_EMAIL_HEADER` and `_GROUPS_HEADER`,
+/// authward's names unless set. Every terminator removes them from every
+/// request a client sends, so none may be a header anything else relies
+/// on.
+pub fn identity_headers_from_lookup(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<wireserve_types::IdentityHeaders, ConfigError> {
+    let get = |key: &str| lookup(key).map(|v| v.trim().to_ascii_lowercase()).filter(|v| !v.is_empty());
+    if get("WIRESERVE_AUTH_COPY_HEADERS").is_some() {
+        tracing::warn!(
+            "WIRESERVE_AUTH_COPY_HEADERS is no longer read; the identity headers are WIRESERVE_AUTH_USER_HEADER, \
+             WIRESERVE_AUTH_EMAIL_HEADER and WIRESERVE_AUTH_GROUPS_HEADER"
+        );
+    }
+    let defaults = wireserve_types::IdentityHeaders::default();
+    let reserved = ["host", "cookie", "authorization", "x-wireserve-node", "content-length", "transfer-encoding", "connection"];
+    let pick = |key: &'static str, default: String| -> Result<String, ConfigError> {
+        let h = get(key).unwrap_or(default);
+        let token = !h.is_empty() && h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        if !token || reserved.contains(&h.as_str()) || h.starts_with("x-forwarded-") || h == "forwarded" {
+            return Err(ConfigError::Invalid(key, format!("{h:?} cannot be an identity header")));
+        }
+        Ok(h)
+    };
+    let headers = wireserve_types::IdentityHeaders {
+        user: pick("WIRESERVE_AUTH_USER_HEADER", defaults.user)?,
+        email: pick("WIRESERVE_AUTH_EMAIL_HEADER", defaults.email)?,
+        groups: pick("WIRESERVE_AUTH_GROUPS_HEADER", defaults.groups)?,
+    };
+    let [a, b, c] = headers.names();
+    if a == b || b == c || a == c {
+        return Err(ConfigError::Invalid("WIRESERVE_AUTH_USER_HEADER", "the three identity headers must differ".into()));
+    }
+    Ok(headers)
 }
 
 /// The result of [`Config::load`]: the config itself, plus which first-run
@@ -621,11 +650,8 @@ mod tests {
         assert_eq!(s.node, "homeserver");
         let no_node = |k: &str| (k == "WIRESERVE_AUTH_SERVICE").then(|| "auth".to_string());
         assert_eq!(sign_in_from_lookup(no_node, true).unwrap(), None, "no node: off, not a startup failure");
-        assert_eq!(s.copy_headers, vec!["x-auth-user", "x-auth-email", "x-auth-groups"]);
         assert!(sign_in_from_lookup(only, false).is_err(), "without DNS there is nothing to terminate");
         for (k, v) in [
-            ("WIRESERVE_AUTH_COPY_HEADERS", "X-Auth-User Cookie"),
-            ("WIRESERVE_AUTH_COPY_HEADERS", "X-Forwarded-For"),
             ("WIRESERVE_AUTH_VERIFY_PATH", "verify"),
             ("WIRESERVE_AUTH_SESSION_COOKIE", "a;b"),
             ("WIRESERVE_AUTH_NODE", "not a node"),
@@ -637,6 +663,23 @@ mod tests {
                 _ => None,
             };
             assert!(matches!(sign_in_from_lookup(l, true), Err(ConfigError::Invalid(key, _)) if key == k), "{k}={v}");
+        }
+    }
+
+    #[test]
+    fn identity_headers_default_to_authward_and_refuse_what_others_rely_on() {
+        let h = identity_headers_from_lookup(|_| None).unwrap();
+        assert_eq!(h, wireserve_types::IdentityHeaders::default());
+        let one = |k: &'static str, v: &'static str| move |key: &str| (key == k).then(|| v.to_string());
+        let h = identity_headers_from_lookup(one("WIRESERVE_AUTH_GROUPS_HEADER", "Remote-Groups")).unwrap();
+        assert_eq!(h.groups, "remote-groups");
+        for (k, v) in [
+            ("WIRESERVE_AUTH_USER_HEADER", "Cookie"),
+            ("WIRESERVE_AUTH_EMAIL_HEADER", "X-Forwarded-For"),
+            ("WIRESERVE_AUTH_GROUPS_HEADER", "not a header"),
+            ("WIRESERVE_AUTH_EMAIL_HEADER", "x-auth-user"),
+        ] {
+            assert!(identity_headers_from_lookup(one(k, v)).is_err(), "{k}={v}");
         }
     }
 

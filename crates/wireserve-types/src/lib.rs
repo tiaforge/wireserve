@@ -1,3 +1,4 @@
+pub mod access;
 pub mod api;
 pub mod firewall;
 pub mod mesh;
@@ -9,11 +10,15 @@ pub mod tls;
 pub mod token;
 pub mod validation;
 
+pub use access::{
+    is_valid_oidc_group, GrantSource, ServiceAccess, ServiceNotice, DEFAULT_GROUP, MAX_OIDC_GROUP_LEN,
+    MAX_SOURCES_PER_SERVICE,
+};
 pub use api::*;
 pub use mesh::{MeshInfo, MeshRanges};
-pub use naming::{AcmeSettings, ServiceNames, SignIn, ServiceNaming, LETS_ENCRYPT_DIRECTORY, TLS_LISTEN_PORT, TLS_PUBLIC_PORT};
+pub use naming::{AcmeSettings, IdentityHeaders, ServiceNames, SignIn, ServiceNaming, LETS_ENCRYPT_DIRECTORY, TLS_LISTEN_PORT, TLS_PUBLIC_PORT};
 pub use firewall::{
-    is_internet_v4, FirewallBackend, Forwarding, ServiceRule, TransitEndpoint, TransitForward, NOT_THE_INTERNET_V4,
+    is_internet_v4, FirewallBackend, Forwarding, ServiceRule, Sources, TransitEndpoint, TransitForward, NOT_THE_INTERNET_V4,
 };
 pub use node::{NodeKind, Proto};
 pub use ports::{

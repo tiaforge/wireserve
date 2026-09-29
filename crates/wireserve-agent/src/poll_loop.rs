@@ -232,16 +232,20 @@ async fn pinned_mesh_ranges(
 /// target. Its other mappings stay
 /// rewrites. The target is still reserved against every other mapping.
 ///
-/// A service marked for sign-in (PLAN.md M29, M34) is reached through its
-/// terminator's sign-in and nothing else: only its terminated 443 mapping
-/// is opened — every other mapping would be a door around the sign-in — and
-/// while its terminator does not serve it, nothing at all. The mark only
-/// ever narrows what this node's own declaration opens, so taking it from
-/// the coordinator keeps the rule stated in `run_once` step 3.
+/// Who may reach each service comes from `access` (PLAN.md M36), the
+/// coordinator's grants for this node's own services. It only ever narrows
+/// what this node's own declaration opens — the rule stated in `run_once`
+/// step 3 — so a service with no entry there is not opened at all, and an
+/// entry for a name this node did not declare opens nothing. A restricted
+/// service's terminated 443 is opened to every node while `sign_in` is set
+/// and the terminator serves it: the terminator decides who gets in, by
+/// device and then by sign-in. Every other mapping — and that one while the
+/// terminator is not serving — admits the granted sources alone.
 pub fn service_rules(
     declared: &[ServiceDecl],
     node_ip: Option<Ipv4Addr>,
     directory: &PollResponse,
+    access: &[wireserve_types::ServiceAccess],
     mesh: Option<&wireserve_types::MeshRanges>,
     terminating: &BTreeSet<String>,
     tls_port: u16,
@@ -256,15 +260,11 @@ pub fn service_rules(
             tracing::warn!(service = %d.name, "service has no address of its own yet; not opening it");
             continue;
         };
-        let marked = marked_for_auth(&d.name, node, directory);
-        if marked && !terminating.contains(&d.name) {
-            tracing::warn!(
-                service = %d.name,
-                "service is marked for sign-in but this node's terminator does not serve it yet; \
-                 not opening it at all rather than opening it to everyone"
-            );
+        let Some(grants) = access.iter().find(|a| a.name == d.name) else {
+            tracing::warn!(service = %d.name, "the coordinator named nobody who may reach this service; not opening it");
             continue;
-        }
+        };
+        let sources: wireserve_types::Sources = (!grants.open).then(|| grants.sources.as_slice().into());
         for map in d.ports.clone() {
             if map.addr.is_some_and(|addr| addr == node || mesh.is_some_and(|m| m.contains4(addr))) {
                 tracing::warn!(service = %d.name, port = %map, "not forwarding to a target address inside the mesh");
@@ -281,17 +281,31 @@ pub fn service_rules(
             targets.push(map);
             let tls = map.public == wireserve_types::TLS_PUBLIC_PORT && map.proto == wireserve_types::Proto::Tcp;
             let rule = if tls && terminating.contains(&d.name) {
-                ServiceRule::Terminated { vip, map, port: tls_port }
-            } else if marked {
-                // Every other door of a marked service stays shut.
-                continue;
+                // The terminator checks the rest.
+                let sources = if grants.sign_in { None } else { sources.clone() };
+                ServiceRule::Terminated { vip, map, port: tls_port, sources }
             } else {
-                ServiceRule::Mapped { vip, node, map }
+                ServiceRule::Mapped { vip, node, map, sources: sources.clone() }
             };
             rules.push(rule);
         }
     }
     rules
+}
+
+/// Keeps the access list to what this node can act on: sources inside the
+/// mesh range it pinned, at most [`wireserve_types::MAX_SOURCES_PER_SERVICE`]
+/// of them, and group names a grant could have named. Anything dropped
+/// only ever narrows who gets in.
+pub fn sanitize_access(access: &mut [wireserve_types::ServiceAccess], mesh: Option<&wireserve_types::MeshRanges>) {
+    for a in access {
+        if let Some(ranges) = mesh {
+            a.sources.retain(|ip| ranges.contains4(*ip));
+        }
+        a.sources.truncate(wireserve_types::MAX_SOURCES_PER_SERVICE);
+        a.sign_in_groups.retain(|g| wireserve_types::is_valid_oidc_group(g));
+        a.sign_in_groups.truncate(wireserve_types::MAX_SOURCES_PER_SERVICE);
+    }
 }
 
 /// The interfaces replies from this cycle's target addresses (PLAN.md M26)
@@ -361,13 +375,6 @@ fn exit_client_addrs(directory: &PollResponse) -> Vec<Ipv4Addr> {
     out.sort_unstable();
     out.dedup();
     out
-}
-
-/// Whether this node's own service `name` is marked for sign-in (PLAN.md
-/// M29), per the directory's entry for it.
-fn marked_for_auth(name: &str, node: Ipv4Addr, directory: &PollResponse) -> bool {
-    let node = node.to_string();
-    directory.services.iter().any(|s| s.name == name && s.ip4 == node && s.auth)
 }
 
 pub(crate) fn own_vip(name: &str, node: Ipv4Addr, directory: &PollResponse) -> Option<Ipv4Addr> {
@@ -675,6 +682,7 @@ where
         crate::mesh::sanitize(&mut directory, ranges);
     }
     crate::vip::sanitize(&mut directory);
+    sanitize_access(&mut directory.access, mesh_ranges.as_ref());
 
     // Approval verdicts are folded in BEFORE the firewall rules are
     // computed, and that ordering is the whole point.
@@ -696,7 +704,19 @@ where
     // buggy coordinator can close ports on a node but can never open one.
     let (declared, owned_egress, local_routes_before) = {
         let mut s = state.lock().await;
-        if apply_approval_verdicts(&mut s, &directory) {
+        let verdicts = apply_approval_verdicts(&mut s, &directory);
+        // Saved now, whatever fails later this cycle (PLAN.md M36): the
+        // terminator reads it at its next check-in, and must never enforce
+        // grants older than the firewall below.
+        let access_changed = s.own_access != directory.access || s.service_notices != directory.service_notices;
+        if access_changed {
+            s.own_access.clone_from(&directory.access);
+            s.service_notices.clone_from(&directory.service_notices);
+            for n in &s.service_notices {
+                tracing::warn!(service = %n.name.escape_debug(), reason = %n.reason.escape_debug(), "the coordinator about this service");
+            }
+        }
+        if verdicts || access_changed {
             s.save(ctx.state_path)?;
         }
         (
@@ -725,7 +745,8 @@ where
         .and_then(|link| link.port(tls_now).map(|port| (link.serving(tls_now), port)))
         .unwrap_or_default();
     let terminating = terminating_here(node_ip, &directory, &serving);
-    let rules = service_rules(&declared, node_ip, &directory, mesh_ranges.as_ref(), &terminating, tls_port);
+    let rules =
+        service_rules(&declared, node_ip, &directory, &directory.access, mesh_ranges.as_ref(), &terminating, tls_port);
     // The addresses the terminator must receive on (PLAN.md M33): routed to
     // the host itself, so they arrive at its sockets rather than looping
     // back into the mesh interface.
@@ -960,7 +981,7 @@ mod tests {
 
     #[test]
     fn build_poll_request_carries_declared_services_verbatim() {
-        let declared = vec![ServiceDecl { name: "plex".into(), ports: vec![] }];
+        let declared = vec![ServiceDecl::new("plex", vec![])];
         let dual = crate::probe::DualProbeResult {
             v4: Some("203.0.113.5:51820".into()),
             v6: None,
@@ -1001,7 +1022,6 @@ mod tests {
 
     fn published(name: &str, owner: Ipv4Addr, vip4: Option<Ipv4Addr>) -> ServiceInfo {
         ServiceInfo {
-            auth: false,
             terminated: false,
             name: name.into(),
             node: "n".into(),
@@ -1010,6 +1030,14 @@ mod tests {
             vip4: vip4.map(|v| v.to_string()),
             ports: vec![],
         }
+    }
+
+    /// Everyone may reach every declared service, as on a fresh mesh.
+    fn open_all(declared: &[ServiceDecl]) -> Vec<wireserve_types::ServiceAccess> {
+        declared
+            .iter()
+            .map(|d| wireserve_types::ServiceAccess { name: d.name.clone(), open: true, ..Default::default() })
+            .collect()
     }
 
     fn with_services(services: Vec<ServiceInfo>) -> PollResponse {
@@ -1027,13 +1055,13 @@ mod tests {
     #[test]
     fn a_service_with_an_address_gets_one_mapped_rule_per_port() {
         let declared = vec![ServiceDecl::new("dns", vec![pm("53/udp"), pm("53/tcp"), pm("8080:8000")])];
-        let rules = service_rules(&declared, Some(NODE), &with_services(vec![published("dns", NODE, Some(VIP))]), None, &BTreeSet::new(), TLS_PORT);
+        let rules = service_rules(&declared, Some(NODE), &with_services(vec![published("dns", NODE, Some(VIP))]), &open_all(&declared), None, &BTreeSet::new(), TLS_PORT);
         assert_eq!(
             rules,
             vec![
-                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("53/udp") },
-                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("53/tcp") },
-                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("8080:8000") },
+                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("53/udp"), sources: None },
+                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("53/tcp"), sources: None },
+                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("8080:8000"), sources: None },
             ]
         );
     }
@@ -1044,14 +1072,14 @@ mod tests {
         // is nothing to scope a hole to but the node's own address, open to
         // the whole mesh.
         let declared = vec![ServiceDecl::new("web", vec![pm("80:5080")])];
-        assert!(service_rules(&declared, Some(NODE), &with_services(vec![published("web", NODE, None)]), None, &BTreeSet::new(), TLS_PORT).is_empty());
-        assert!(service_rules(&declared, Some(NODE), &with_services(vec![]), None, &BTreeSet::new(), TLS_PORT).is_empty());
+        assert!(service_rules(&declared, Some(NODE), &with_services(vec![published("web", NODE, None)]), &open_all(&declared), None, &BTreeSet::new(), TLS_PORT).is_empty());
+        assert!(service_rules(&declared, Some(NODE), &with_services(vec![]), &open_all(&declared), None, &BTreeSet::new(), TLS_PORT).is_empty());
     }
 
     #[test]
     fn without_a_mesh_address_nothing_is_opened() {
         let declared = vec![ServiceDecl::new("web", vec![pm("80:5080")])];
-        assert!(service_rules(&declared, None, &with_services(vec![published("web", NODE, Some(VIP))]), None, &BTreeSet::new(), TLS_PORT).is_empty());
+        assert!(service_rules(&declared, None, &with_services(vec![published("web", NODE, Some(VIP))]), &open_all(&declared), None, &BTreeSet::new(), TLS_PORT).is_empty());
     }
 
     #[test]
@@ -1060,8 +1088,8 @@ mod tests {
         let mut dir = directory_with(&["web"], &[]);
         dir.pending_services[0].vip4 = Some(VIP.to_string());
         assert_eq!(
-            service_rules(&declared, Some(NODE), &dir, None, &BTreeSet::new(), TLS_PORT),
-            vec![ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("80:5080") }]
+            service_rules(&declared, Some(NODE), &dir, &open_all(&declared), None, &BTreeSet::new(), TLS_PORT),
+            vec![ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("80:5080"), sources: None }]
         );
     }
 
@@ -1072,40 +1100,80 @@ mod tests {
         let declared = vec![ServiceDecl::new("web", vec![pm("80:5080")])];
         let mut entry = published("web", NODE, Some(VIP));
         entry.ports = vec![pm("22:22"), pm("80:22")];
-        let rules = service_rules(&declared, Some(NODE), &with_services(vec![entry]), None, &BTreeSet::new(), TLS_PORT);
-        assert_eq!(rules, vec![ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("80:5080") }]);
+        let rules = service_rules(&declared, Some(NODE), &with_services(vec![entry]), &open_all(&declared), None, &BTreeSet::new(), TLS_PORT);
+        assert_eq!(rules, vec![ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("80:5080"), sources: None }]);
     }
 
-    // ---- behind the proxy's sign-in (PLAN.md M29) ----
+    // ---- who may reach it (PLAN.md M36) ----
 
+    const GRANTED: Ipv4Addr = Ipv4Addr::new(10, 9, 0, 7);
 
-    fn marked(name: &str, vip: Option<Ipv4Addr>) -> ServiceInfo {
-        let mut s = published(name, NODE, vip);
-        s.auth = true;
-        s.terminated = vip.is_some();
-        s
+    fn restricted(name: &str, sign_in: bool) -> wireserve_types::ServiceAccess {
+        wireserve_types::ServiceAccess {
+            name: name.into(),
+            sources: vec![NODE, GRANTED],
+            sign_in,
+            sign_in_groups: if sign_in { vec!["family".into()] } else { vec![] },
+            ..Default::default()
+        }
+    }
+
+    fn terminated_here(name: &str) -> PollResponse {
+        let mut e = published(name, NODE, Some(VIP));
+        e.terminated = true;
+        with_services(vec![e])
     }
 
     #[test]
-    fn a_marked_service_opens_its_terminated_443_and_nothing_else() {
-        // PLAN.md M34: the sign-in is in the terminator, so its 443 is the
-        // only way in; the second mapping would otherwise walk round it.
-        let declared = vec![ServiceDecl::new("jellyfin", vec![pm("443:8096"), pm("8920")])];
-        let serving = BTreeSet::from(["jellyfin".to_string()]);
-        let rules = service_rules(&declared, Some(NODE), &with_services(vec![marked("jellyfin", Some(VIP))]), None, &serving, TLS_PORT);
-        assert_eq!(rules, vec![ServiceRule::Terminated { vip: VIP, map: pm("443:8096"), port: TLS_PORT }]);
+    fn a_service_nobody_was_granted_is_not_opened() {
+        let declared = vec![ServiceDecl::new("web", vec![pm("80:5080")])];
+        let dir = with_services(vec![published("web", NODE, Some(VIP))]);
+        assert!(service_rules(&declared, Some(NODE), &dir, &[], None, &BTreeSet::new(), TLS_PORT).is_empty());
+        // An entry for a name this node never declared opens nothing either.
+        let stray = vec![wireserve_types::ServiceAccess { name: "ssh".into(), open: true, ..Default::default() }];
+        assert!(service_rules(&declared, Some(NODE), &dir, &stray, None, &BTreeSet::new(), TLS_PORT).is_empty());
     }
 
     #[test]
-    fn a_marked_service_is_not_opened_at_all_while_its_terminator_does_not_serve_it() {
+    fn a_restricted_service_admits_its_sources_on_every_port() {
+        let declared = vec![ServiceDecl::new("db", vec![pm("5432"), pm("443:8443")])];
+        let dir = with_services(vec![published("db", NODE, Some(VIP))]);
+        let rules = service_rules(&declared, Some(NODE), &dir, &[restricted("db", false)], None, &BTreeSet::new(), TLS_PORT);
+        assert_eq!(rules.len(), 2);
+        for r in &rules {
+            assert_eq!(r.sources().as_deref(), Some(&[NODE, GRANTED][..]), "{r:?}");
+        }
+    }
+
+    #[test]
+    fn a_sign_in_opens_the_terminated_443_to_everyone_and_nothing_else() {
+        // The terminator decides by device and then by sign-in; the second
+        // mapping has no terminator in front of it, so the grants hold.
         let declared = vec![ServiceDecl::new("jellyfin", vec![pm("443:8096"), pm("8920")])];
-        let rules = service_rules(&declared, Some(NODE), &with_services(vec![marked("jellyfin", Some(VIP))]), None, &BTreeSet::new(), TLS_PORT);
-        assert!(rules.is_empty(), "{rules:?}");
-        // No address of its own: the fallback would open the node's port to
-        // the whole mesh, which is exactly what the mark forbids.
         let serving = BTreeSet::from(["jellyfin".to_string()]);
-        let rules = service_rules(&declared, Some(NODE), &with_services(vec![marked("jellyfin", None)]), None, &serving, TLS_PORT);
-        assert!(rules.is_empty(), "{rules:?}");
+        let access = [restricted("jellyfin", true)];
+        let rules = service_rules(&declared, Some(NODE), &terminated_here("jellyfin"), &access, None, &serving, TLS_PORT);
+        assert!(matches!(&rules[0], ServiceRule::Terminated { sources: None, .. }), "{rules:?}");
+        assert!(matches!(&rules[1], ServiceRule::Mapped { sources: Some(_), .. }), "{rules:?}");
+
+        // Without the sign-in the terminated 443 keeps the grants too.
+        let rules = service_rules(&declared, Some(NODE), &terminated_here("jellyfin"), &[restricted("jellyfin", false)], None, &serving, TLS_PORT);
+        assert!(rules.iter().all(|r| r.sources().is_some()), "{rules:?}");
+
+        // A terminator not serving it: nothing in front of the 443 either.
+        let rules = service_rules(&declared, Some(NODE), &terminated_here("jellyfin"), &access, None, &BTreeSet::new(), TLS_PORT);
+        assert!(rules.iter().all(|r| matches!(r, ServiceRule::Mapped { sources: Some(_), .. })), "{rules:?}");
+    }
+
+    #[test]
+    fn sources_outside_the_mesh_are_dropped() {
+        let ranges = wireserve_types::MeshRanges::parse(&mesh("10.9.0.0/24")).unwrap();
+        let mut access = vec![restricted("db", true)];
+        access[0].sources.push(Ipv4Addr::new(192, 168, 1, 1));
+        access[0].sign_in_groups.push("a,b".into());
+        sanitize_access(&mut access, Some(&ranges));
+        assert_eq!(access[0].sources, [NODE, GRANTED]);
+        assert_eq!(access[0].sign_in_groups, ["family"]);
     }
 
     #[test]
@@ -1168,10 +1236,10 @@ mod tests {
             terminated_entry("plex", NODE, VIP),
             published("clash", NODE, Some(Ipv4Addr::new(10, 9, 0, 30))),
         ]);
-        let rules = service_rules(&declared, Some(NODE), &dir, None, &BTreeSet::from(["plex".to_string()]), TLS_PORT);
+        let rules = service_rules(&declared, Some(NODE), &dir, &open_all(&declared), None, &BTreeSet::from(["plex".to_string()]), TLS_PORT);
         assert_eq!(rules.len(), 2, "{rules:?}");
-        assert!(matches!(rules[0], ServiceRule::Terminated { vip, map, port } if vip == VIP && map.public == 443 && port == TLS_PORT));
-        assert!(matches!(rules[1], ServiceRule::Mapped { map, .. } if map.public == 8443));
+        assert!(matches!(&rules[0], ServiceRule::Terminated { vip, map, port, .. } if *vip == VIP && map.public == 443 && *port == TLS_PORT));
+        assert!(matches!(&rules[1], ServiceRule::Mapped { map, .. } if map.public == 8443));
         assert!(rules.iter().all(|r| r.remote_target().is_none()));
     }
 
@@ -1179,7 +1247,7 @@ mod tests {
     fn another_nodes_entry_of_the_same_name_is_not_ours() {
         let declared = vec![ServiceDecl::new("web", vec![pm("80:5080")])];
         let other = Ipv4Addr::new(10, 9, 0, 2);
-        let rules = service_rules(&declared, Some(NODE), &with_services(vec![published("web", other, Some(VIP))]), None, &BTreeSet::new(), TLS_PORT);
+        let rules = service_rules(&declared, Some(NODE), &with_services(vec![published("web", other, Some(VIP))]), &open_all(&declared), None, &BTreeSet::new(), TLS_PORT);
         assert!(rules.is_empty(), "no address of our own: {rules:?}");
     }
 
@@ -1193,20 +1261,20 @@ mod tests {
         let other = Ipv4Addr::new(10, 9, 0, 51);
         let dir = with_services(vec![published("plex", NODE, Some(VIP)), published("media", NODE, Some(other))]);
         assert_eq!(
-            service_rules(&declared, Some(NODE), &dir, None, &BTreeSet::new(), TLS_PORT),
-            vec![ServiceRule::Mapped { vip: VIP, node: NODE, map: PortMap::identity(32400, Proto::Tcp) }]
+            service_rules(&declared, Some(NODE), &dir, &open_all(&declared), None, &BTreeSet::new(), TLS_PORT),
+            vec![ServiceRule::Mapped { vip: VIP, node: NODE, map: PortMap::identity(32400, Proto::Tcp), sources: None }]
         );
     }
 
     #[test]
     fn a_mapping_onto_another_address_is_a_mapped_rule_to_it() {
         let declared = vec![ServiceDecl::new("myrouter", vec![pm("443:192.168.178.1:80"), pm("8080")])];
-        let rules = service_rules(&declared, Some(NODE), &with_services(vec![published("myrouter", NODE, Some(VIP))]), None, &BTreeSet::new(), TLS_PORT);
+        let rules = service_rules(&declared, Some(NODE), &with_services(vec![published("myrouter", NODE, Some(VIP))]), &open_all(&declared), None, &BTreeSet::new(), TLS_PORT);
         assert_eq!(
             rules,
             vec![
-                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("443:192.168.178.1:80") },
-                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("8080") },
+                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("443:192.168.178.1:80"), sources: None },
+                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("8080"), sources: None },
             ]
         );
         assert_eq!(rules[0].remote_target(), Some(Ipv4Addr::new(192, 168, 178, 1)));
@@ -1218,10 +1286,10 @@ mod tests {
         let dir = with_services(vec![published("x", NODE, Some(VIP))]);
         for target in ["443:10.9.0.33:80", &format!("443:{NODE}:80")] {
             let declared = vec![ServiceDecl::new("x", vec![pm(target)])];
-            assert!(service_rules(&declared, Some(NODE), &dir, Some(&ranges), &BTreeSet::new(), TLS_PORT).is_empty(), "{target}");
+            assert!(service_rules(&declared, Some(NODE), &dir, &open_all(&declared), Some(&ranges), &BTreeSet::new(), TLS_PORT).is_empty(), "{target}");
         }
         let declared = vec![ServiceDecl::new("x", vec![pm("443:192.168.178.1:80")])];
-        assert_eq!(service_rules(&declared, Some(NODE), &dir, Some(&ranges), &BTreeSet::new(), TLS_PORT).len(), 1);
+        assert_eq!(service_rules(&declared, Some(NODE), &dir, &open_all(&declared), Some(&ranges), &BTreeSet::new(), TLS_PORT).len(), 1);
     }
 
     #[test]
@@ -1232,12 +1300,12 @@ mod tests {
         ];
         let other = Ipv4Addr::new(10, 9, 0, 51);
         let dir = with_services(vec![published("web", NODE, Some(VIP)), published("myrouter", NODE, Some(other))]);
-        assert_eq!(service_rules(&declared, Some(NODE), &dir, None, &BTreeSet::new(), TLS_PORT).len(), 2);
+        assert_eq!(service_rules(&declared, Some(NODE), &dir, &open_all(&declared), None, &BTreeSet::new(), TLS_PORT).len(), 2);
     }
 
     #[test]
     fn nothing_undeclared_is_ever_in_a_rule() {
-        let rules = service_rules(&[], Some(NODE), &with_services(vec![published("web", NODE, Some(VIP))]), None, &BTreeSet::new(), TLS_PORT);
+        let rules = service_rules(&[], Some(NODE), &with_services(vec![published("web", NODE, Some(VIP))]), &[], None, &BTreeSet::new(), TLS_PORT);
         assert!(rules.is_empty());
     }
 
@@ -1249,6 +1317,8 @@ mod tests {
     ) -> PollResponse {
         PollResponse {
             naming: None,
+            access: vec![],
+            service_notices: vec![],
             peers: vec![],
             services: vec![],
             pending_services: pending
@@ -1299,12 +1369,12 @@ mod tests {
         // exactly that reason.
         let mut state = state_with_declared(&["plex", "git"]);
         let dir = with_services(vec![published("plex", NODE, Some(VIP)), published("git", NODE, Some(Ipv4Addr::new(10, 9, 0, 51)))]);
-        assert!(reaches(&service_rules(&state.declared_services, Some(NODE), &dir, None, &BTreeSet::new(), TLS_PORT), 32400));
+        assert!(reaches(&service_rules(&state.declared_services, Some(NODE), &dir, &open_all(&state.declared_services), None, &BTreeSet::new(), TLS_PORT), 32400));
 
         apply_approval_verdicts(&mut state, &directory_with(&[], &[("plex", None)]));
 
         assert!(
-            !reaches(&service_rules(&state.declared_services, Some(NODE), &dir, None, &BTreeSet::new(), TLS_PORT), 32400),
+            !reaches(&service_rules(&state.declared_services, Some(NODE), &dir, &open_all(&state.declared_services), None, &BTreeSet::new(), TLS_PORT), 32400),
             "a denied service's port must not survive in the rule set"
         );
     }
@@ -1324,7 +1394,7 @@ mod tests {
         assert_eq!(state.declared_services.len(), 1, "still declared");
         assert!(state.rejected_services.is_empty(), "pending is not a rejection");
         assert_eq!(state.pending_services, vec!["plex".to_string()]);
-        assert!(reaches(&service_rules(&state.declared_services, Some(NODE), &pending, None, &BTreeSet::new(), TLS_PORT), 32400));
+        assert!(reaches(&service_rules(&state.declared_services, Some(NODE), &pending, &open_all(&state.declared_services), None, &BTreeSet::new(), TLS_PORT), 32400));
     }
 
     #[test]

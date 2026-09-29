@@ -11,7 +11,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
-use crate::naming::AcmeSettings;
+use crate::naming::{AcmeSettings, IdentityHeaders};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -48,9 +48,12 @@ pub struct TlsConfig {
     pub callers: Vec<Caller>,
     /// The sign-in provider (PLAN.md M34), resolved to where it answers.
     /// `None` while none is configured, or its service is not in the
-    /// directory — a marked service is then refused, never served open.
+    /// directory on its own node — nobody gets in by signing in then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sign_in: Option<SignInTarget>,
+    /// Removed from every request, and set only by the terminator.
+    #[serde(default)]
+    pub identity_headers: IdentityHeaders,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,7 +63,6 @@ pub struct SignInTarget {
     /// Its own address; the request goes to port 443 there.
     pub vip: Ipv4Addr,
     pub verify_path: String,
-    pub copy_headers: Vec<String>,
     pub session_cookie: String,
 }
 
@@ -75,9 +77,10 @@ pub struct TlsService {
     pub vip: Ipv4Addr,
     /// Where to send the requests, in plain HTTP: the service's target.
     pub upstream: SocketAddr,
-    /// Behind the sign-in (PLAN.md M34).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub sign_in: bool,
+    /// Who may reach it (PLAN.md M36). Missing reads as closed: nobody but
+    /// through a sign-in there is none of.
+    #[serde(default)]
+    pub access: crate::ServiceAccess,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

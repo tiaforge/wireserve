@@ -13,7 +13,7 @@ use nftables::expr::{
 use nftables::schema::{Chain, NfCmd, NfListObject, NfObject, Nftables, Rule, Table};
 use nftables::stmt::{Accept, Drop, Mangle, Match, Operator, Reject, RejectType, Statement, NAT};
 use nftables::types::{NfChainPolicy, NfChainType, NfFamily, NfHook};
-use wireserve_types::{FirewallBackend, Forwarding, PortMap, Proto, ServiceRule, TransitEndpoint, TransitForward};
+use wireserve_types::{FirewallBackend, Forwarding, PortMap, Proto, ServiceRule, Sources, TransitEndpoint, TransitForward};
 
 use super::nft::{Nft, NftError};
 
@@ -555,21 +555,21 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
     objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Table(table(t)))));
 
     // (service address, where it goes — the node or the mapping's own
-    // target address, the mapping)
-    let mapped: Vec<(Ipv4Addr, Ipv4Addr, PortMap)> = rules
+    // target address, the mapping, who may reach it)
+    let mapped: Vec<(Ipv4Addr, Ipv4Addr, PortMap, &Sources)> = rules
         .iter()
-        .filter_map(|r| match *r {
-            ServiceRule::Mapped { vip, node, map, .. } => Some((vip, map.addr.unwrap_or(node), map)),
+        .filter_map(|r| match r {
+            ServiceRule::Mapped { vip, node, map, sources } => Some((*vip, map.addr.unwrap_or(*node), *map, sources)),
             ServiceRule::Terminated { .. } => None,
         })
         .collect();
     // Answered on the service address by this node's own terminator
     // (PLAN.md M33).
-    let terminated: Vec<(Ipv4Addr, PortMap)> = rules
+    let terminated: Vec<(Ipv4Addr, PortMap, &Sources)> = rules
         .iter()
-        .filter_map(|r| match *r {
-            ServiceRule::Terminated { vip, map, port } => Some((vip, terminated_map(&map, port))),
-            _ => None,
+        .filter_map(|r| match r {
+            ServiceRule::Terminated { vip, map, port, sources } => Some((*vip, terminated_map(map, *port), sources)),
+            ServiceRule::Mapped { .. } => None,
         })
         .collect();
     let has_service_addresses = !mapped.is_empty() || !terminated.is_empty();
@@ -582,7 +582,7 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
     // reach the terminator on it — and, where reverse-path filtering is
     // loose, claim a mesh source address it has not got. Only the mesh and
     // the host itself may.
-    for (vip, _) in &terminated {
+    for (vip, ..) in &terminated {
         objects.push(rule(t, CHAIN_NAME, vec![
             iifname_is_not(ifname),
             iifname_is_not("lo"),
@@ -593,7 +593,7 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
     // The terminator's own port, on every address of the host (PLAN.md
     // M35): the same, whatever the address. It answers nothing there but
     // its service addresses anyway; this keeps the LAN from even trying.
-    let ports: std::collections::BTreeSet<u16> = terminated.iter().map(|(_, m)| m.target).collect();
+    let ports: std::collections::BTreeSet<u16> = terminated.iter().map(|(_, m, _)| m.target).collect();
     for port in ports {
         objects.push(rule(t, CHAIN_NAME, vec![
             iifname_is_not(ifname),
@@ -685,15 +685,25 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
     }
 
     // ---- service addresses ----
+    // Who may (PLAN.md M36): a source the grants leave out is never
+    // rewritten or marked, and meets the refusal below like a port the
+    // address does not publish. Matched per packet, before conntrack, so
+    // taking a source away cuts its open connections too.
     objects.push(chain(t, PRE_CHAIN, NfChainType::Filter, NfHook::Prerouting, PRIO_RAW));
-    for (vip, dest, map) in &mapped {
+    let mesh_rewrites = mapped
+        .iter()
+        .map(|(vip, dest, map, sources)| (*vip, *dest, map, *sources))
+        .chain(terminated.iter().map(|(vip, map, sources)| (*vip, *vip, map, *sources)));
+    for (vip, dest, map, sources) in mesh_rewrites {
         let mut expr = vec![iifname_is(ifname)];
-        expr.extend(forward_rewrite(*vip, *dest, map));
-        objects.push(rule(t, PRE_CHAIN, expr));
-    }
-    for (vip, map) in &terminated {
-        let mut expr = vec![iifname_is(ifname)];
-        expr.extend(forward_rewrite(*vip, *vip, map));
+        match sources {
+            None => {}
+            // Nobody: no rule at all — nft has no empty set literal — and
+            // the address still refuses them below.
+            Some(list) if list.is_empty() => continue,
+            Some(list) => expr.push(in_list(payload("ip", "saddr"), list.iter().map(|a| addr(*a)).collect())),
+        }
+        expr.extend(forward_rewrite(vip, dest, map));
         objects.push(rule(t, PRE_CHAIN, expr));
     }
     // A port a service address does not publish. A mapped service's address
@@ -703,7 +713,7 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
     // here instead, once the rules above have rewritten or marked every
     // request for a published port.
     let vips: std::collections::BTreeSet<Ipv4Addr> =
-        mapped.iter().map(|(vip, ..)| *vip).chain(terminated.iter().map(|(vip, _)| *vip)).collect();
+        mapped.iter().map(|(vip, ..)| *vip).chain(terminated.iter().map(|(vip, ..)| *vip)).collect();
     let mut refuse = vec![
         iifname_is(ifname),
         in_list(payload("ip", "daddr"), vips.into_iter().map(addr).collect()),
@@ -714,13 +724,14 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
     // The node's own clients. A `route` chain, so the kernel routes the
     // packet again after its destination changed: it was headed for the
     // mesh interface (see `routes`, which routes this node's own service
-    // addresses there) and is now local.
+    // addresses there) and is now local. Never filtered by the grants: a
+    // program on this host reaches the backend directly anyway.
     objects.push(chain(t, OUT_CHAIN, NfChainType::Route, NfHook::Output, PRIO_RAW));
-    for (vip, dest, map) in &mapped {
+    for (vip, dest, map, _) in &mapped {
         objects.push(rule(t, OUT_CHAIN, forward_rewrite(*vip, *dest, map)));
     }
     // Without these a Caddy on this host's [::]:443 would answer them.
-    for (vip, map) in &terminated {
+    for (vip, map, _) in &terminated {
         objects.push(rule(t, OUT_CHAIN, forward_rewrite(*vip, *vip, map)));
     }
     // Conntrack exists from here on: carry the packet's mark onto its flow,
@@ -739,17 +750,17 @@ pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forw
     // clients that came back from a container.
     for (name, hook) in [(REV_POST_CHAIN, NfHook::Postrouting), (REV_IN_CHAIN, NfHook::Input)] {
         objects.push(chain(t, name, NfChainType::Filter, hook, PRIO_AFTER_NAT));
-        for (vip, dest, map) in &mapped {
+        for (vip, dest, map, _) in &mapped {
             objects.push(rule(t, name, reverse_rewrite(*vip, *dest, map)));
         }
-        for (vip, map) in &terminated {
+        for (vip, map, _) in &terminated {
             objects.push(rule(t, name, reverse_rewrite(*vip, *vip, map)));
         }
     }
     let remote: Vec<_> = rules
         .iter()
-        .filter_map(|r| match *r {
-            ServiceRule::Mapped { map, .. } => map.addr.map(|dest| (dest, map)),
+        .filter_map(|r| match r {
+            ServiceRule::Mapped { map, .. } => map.addr.map(|dest| (dest, *map)),
             ServiceRule::Terminated { .. } => None,
         })
         .collect();
@@ -902,6 +913,7 @@ mod tests {
             vip: VIP,
             node: NODE,
             map: map.parse().unwrap(),
+            sources: None,
         }
     }
 
@@ -1168,7 +1180,7 @@ mod tests {
     // ---- PLAN.md M33: terminated on this node ----
 
     fn terminated(map: &str) -> ServiceRule {
-        ServiceRule::Terminated { vip: VIP, map: map.parse().unwrap(), port: TLS_PORT }
+        ServiceRule::Terminated { vip: VIP, map: map.parse().unwrap(), port: TLS_PORT, sources: None }
     }
 
     #[test]
@@ -1249,6 +1261,44 @@ mod tests {
                 || text.contains(r#""key":"ip6 daddr""#);
             assert!(scoped, "forward accept with no destination: {r}");
         }
+    }
+
+    fn only(rule: ServiceRule, sources: &[&str]) -> ServiceRule {
+        let list: Sources = Some(sources.iter().map(|a| a.parse().unwrap()).collect::<Vec<Ipv4Addr>>().into());
+        match rule {
+            ServiceRule::Mapped { vip, node, map, .. } => ServiceRule::Mapped { vip, node, map, sources: list },
+            ServiceRule::Terminated { vip, map, port, .. } => ServiceRule::Terminated { vip, map, port, sources: list },
+        }
+    }
+
+    #[test]
+    fn a_restricted_service_is_rewritten_for_its_sources_alone() {
+        // PLAN.md M36: the source match comes first, so a source left out is
+        // never rewritten nor marked, and meets the refusal like any port
+        // the address does not publish.
+        let rules = [only(mapped("5432"), &["100.90.0.7", "100.90.0.1"]), only(terminated("443:8096"), &["100.90.0.7"])];
+        let batch = as_json(&apply_batch("wg0", &rules, &fwd(&[])));
+        let pre = rules_in(&batch, "svc-pre");
+        assert_eq!(pre.len(), 3, "{pre:?}");
+        for r in &pre[..2] {
+            let text = r.to_string();
+            assert!(text.contains("saddr") && text.contains("100.90.0.7"), "{text}");
+            let saddr = text.find("saddr").unwrap();
+            assert!(saddr < text.find("mangle").unwrap(), "matched before anything is rewritten: {text}");
+        }
+        assert!(pre[2].to_string().contains("tcp reset"));
+        // The node's own clients reach it unfiltered.
+        assert!(rules_in(&batch, "svc-out").iter().all(|r| !r.to_string().contains("saddr")));
+    }
+
+    #[test]
+    fn a_service_nobody_may_reach_still_refuses_them() {
+        let batch = as_json(&apply_batch("wg0", &[only(mapped("5432"), &[])], &fwd(&[])));
+        let pre = rules_in(&batch, "svc-pre");
+        assert_eq!(pre.len(), 1, "no rewrite, no empty set: {pre:?}");
+        let refusal = pre[0].to_string();
+        assert!(refusal.contains(&VIP.to_string()) && refusal.contains("tcp reset"), "{refusal}");
+        assert_eq!(rules_in(&batch, "svc-out").len(), 1, "the node itself still reaches it");
     }
 
     #[test]
@@ -1543,6 +1593,33 @@ mod tests {
         has(&format!("iifname \"wg0\" ip daddr 100.90.0.50 meta mark & {m} != {m} meta l4proto tcp reject with tcp reset"));
         has(&format!("meta mark & {m} == {m} ct mark set ct mark | {m}"));
         has(&format!("iifname \"wg0\" ct mark & {m} == {m} accept"));
+    }
+
+    #[test]
+    fn kernel_accepts_a_restricted_service() {
+        let rules = [only(mapped("5432"), &["100.90.0.7", "100.90.0.8"]), only(mapped("6379"), &[])];
+        let batch = serde_json::to_string(&apply_batch("wg0", &rules, &fwd(&[]))).unwrap();
+        let script = format!("nft -j -f - <<'JSON' || true\n{batch}\nJSON\nnft list ruleset");
+        let Some((listing, stderr)) = crate::firewall::netns::run_capturing(&script) else {
+            return;
+        };
+        if stderr.contains("Operation not permitted") {
+            for e in stderr.lines().filter(|l| l.contains("Error:")) {
+                assert!(e.contains("Could not process rule: Operation not permitted"), "unexpected nft error: {e}\n{stderr}");
+            }
+            eprintln!("NOTE: payload rewriting refused in this user namespace; checked that nft accepted the JSON");
+            return;
+        }
+        assert!(stderr.trim().is_empty(), "{stderr}");
+        let lines = normalised_lines(&listing);
+        let m = format!("0x{SERVICE_MARK:08x}");
+        let want = format!(
+            "iifname \"wg0\" ip saddr {{ 100.90.0.7, 100.90.0.8 }} ip daddr 100.90.0.50 tcp dport 5432 ip daddr set {NODE} tcp dport set 5432 meta mark set meta mark | {m}"
+        );
+        assert!(lines.iter().any(|x| x == &want), "missing `{want}` in:\n{listing}");
+        // Nobody may reach 6379 from the mesh: only the node's own rewrite.
+        let rewrites: Vec<_> = lines.iter().filter(|x| x.contains("tcp dport 6379 ip daddr set")).collect();
+        assert!(rewrites.len() == 1 && !rewrites[0].starts_with("iifname"), "{listing}");
     }
 
     #[test]

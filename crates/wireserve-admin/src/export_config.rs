@@ -738,7 +738,7 @@ mod tests {
 
     fn service(node: &str, vip4: Option<&str>, state: ServiceApprovalState) -> AdminServiceInfo {
         AdminServiceInfo {
-            auth: false,
+            groups: vec![],
             dns: None,
             name: "web".into(),
             node: node.into(),
@@ -1110,7 +1110,7 @@ mod gateway_tests {
         let home = peer("minipc", 9, Some("[2001:db8::9]:51820"));
         let flagged = vec!["minipc".to_string()];
         let services = [AdminServiceInfo {
-            auth: false,
+            groups: vec![],
             dns: None,
             name: "ssh".into(),
             node: "minipc".into(),
@@ -1216,7 +1216,7 @@ mod exit_tests {
 
     fn dns_service(name: &str, vip: &str, ports: &[&str], state: ServiceApprovalState) -> AdminServiceInfo {
         AdminServiceInfo {
-            auth: false,
+            groups: vec![],
             dns: None,
             name: name.into(),
             node: "home".into(),
@@ -1386,6 +1386,7 @@ mod exit_tests {
             via_gateway: vec![],
             exit_offering: vec![],
             exit_devices: vec![],
+            tags: Default::default(),
         };
         let usage = |o: ExportOptions<'_>| matches!(check_dns(&client, &directory, None, &o), Err(ExportConfigError::DnsUsage(_)));
         assert!(usage(ExportOptions { dns: Some("pihole"), ..Default::default() }));

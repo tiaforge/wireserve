@@ -200,6 +200,13 @@ pub fn render(view: &ListView, now: DateTime<Utc>) -> String {
         }
     }
 
+    if !view.service_notices.is_empty() {
+        out.push_str("\nFrom the coordinator:\n");
+        for n in &view.service_notices {
+            out.push_str(&format!("  {}: {}\n", clean(&n.name), reason(&n.reason)));
+        }
+    }
+
     // Transit (PLAN.md M23): silent in the common case (opted out, not
     // carrying anything) so this stays out of the way for every node that
     // never touches the feature.
@@ -311,6 +318,7 @@ mod tests {
                 name: "git".into(),
                 reason: r#"{"error":"service name 'git' is already declared by another node","conflicting_service":"git"}"#.into(),
             }],
+            service_notices: vec![],
         };
         assert_eq!(
             render(&view, now()),
@@ -409,6 +417,9 @@ Not published:
         let out = render(&view, now());
         assert!(out.contains("Exit: on, for: a"), "{out}");
         let idle = render(&ListView { transit_capable: true, exit_capable: true, ..Default::default() }, now());
+        let notice = wireserve_types::ServiceNotice { name: "vault".into(), reason: "there is no group infra\x1b[2J".into() };
+        let out = render(&ListView { service_notices: vec![notice], ..Default::default() }, now());
+        assert!(out.contains("vault: there is no group infra") && !out.contains('\x1b'), "{out}");
         assert!(idle.contains("Exit: on, no device uses this node as its exit yet"), "{idle}");
     }
 

@@ -115,7 +115,6 @@ mod tests {
 
     fn svc(name: &str, ip4: &str, vip4: Option<&str>) -> ServiceInfo {
         ServiceInfo {
-            auth: false,
             terminated: false,
             name: name.into(),
             node: "a".into(),
@@ -129,6 +128,8 @@ mod tests {
     fn directory(peers: Vec<PeerInfo>, services: Vec<ServiceInfo>) -> PollResponse {
         PollResponse {
             naming: None,
+            access: vec![],
+            service_notices: vec![],
             peers,
             services,
             pending_services: vec![],

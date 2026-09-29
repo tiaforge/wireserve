@@ -253,7 +253,6 @@ mod tests {
 
     fn svc(name: &str, ip4: &str) -> ServiceInfo {
         ServiceInfo {
-            auth: false,
             terminated: false,
             name: name.into(),
             node: "somenode".into(),
@@ -547,7 +546,6 @@ mod naming_tests {
 
     fn svc(name: &str, vip: &str, public: u16) -> ServiceInfo {
         ServiceInfo {
-            auth: false,
             terminated: false,
             name: name.into(),
             node: "somenode".into(),
@@ -559,7 +557,7 @@ mod naming_tests {
     }
 
     fn cfg_for(domain: &str) -> ServiceNaming {
-        ServiceNaming { domain: domain.into(), acme: None, sign_in: None }
+        ServiceNaming { domain: domain.into(), acme: None, sign_in: None, identity_headers: Default::default() }
     }
 
     #[test]

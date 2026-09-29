@@ -106,6 +106,11 @@ enum Command {
         name: String,
         #[arg(required = true, value_name = "PORT")]
         ports: Vec<String>,
+        /// Put a new service in this group, which an admin created, rather
+        /// than in `default`, which everyone reaches. Only the first time:
+        /// after that an admin decides its groups.
+        #[arg(long, value_name = "GROUP")]
+        group: Option<String>,
     },
     /// Queues a local service withdrawal, applied on the next poll.
     Unserve { name: String },
@@ -236,7 +241,7 @@ async fn main() {
             .await
             .map_err(Into::into)
         }
-        Command::Serve { name, ports } => cmd_serve(&instance, name, &ports).await,
+        Command::Serve { name, ports, group } => cmd_serve(&instance, name, &ports, group).await,
         Command::Unserve { name } => cmd_unserve(&instance, name).await,
         Command::Transit { action } => cmd_transit(&instance, action).await,
         Command::Exit { action } => cmd_exit(&instance, action).await,
@@ -891,10 +896,15 @@ fn parse_serve_ports(args: &[String]) -> Result<Vec<PortMap>, String> {
     args.iter().map(|a| a.parse::<PortMap>()).collect()
 }
 
-async fn cmd_serve(instance: &Instance, name: String, ports: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+async fn cmd_serve(
+    instance: &Instance,
+    name: String,
+    ports: &[String],
+    group: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let ports = parse_serve_ports(ports)?;
     wireserve_types::validate_service_ports(&ports)?;
-    let resp = client::call(&instance.socket_path(), &IpcRequest::Serve { name, ports }).await?;
+    let resp = client::call(&instance.socket_path(), &IpcRequest::Serve { name, ports, group }).await?;
     // "ok" alone overstates what just happened: the declaration is queued
     // locally and only reaches the coordinator on the next poll, and if
     // that coordinator requires approval it will sit pending until an

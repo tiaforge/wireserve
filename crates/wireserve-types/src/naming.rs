@@ -34,10 +34,40 @@ pub struct ServiceNaming {
     /// what makes a certificate for a service name obtainable at all.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub acme: Option<AcmeSettings>,
-    /// The sign-in in front of services marked for it (PLAN.md M34), built
-    /// into every node's terminator. Absent while none is configured.
+    /// The sign-in restricted services fall back to (PLAN.md M34, M36),
+    /// built into every node's terminator. Absent while none is configured.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sign_in: Option<SignIn>,
+    /// The headers a backend learns who is calling from (PLAN.md M36).
+    #[serde(default)]
+    pub identity_headers: IdentityHeaders,
+}
+
+/// The headers a terminator tells a backend who is calling in — filled
+/// from the sign-in's answer, or from the calling device's owner (PLAN.md
+/// M38) — and removes from every request a client sends, on every service,
+/// whether or not anything fills them. Named once, on the coordinator;
+/// authward's names unless set otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityHeaders {
+    pub user: String,
+    pub email: String,
+    /// Comma-separated group names.
+    pub groups: String,
+}
+
+impl Default for IdentityHeaders {
+    fn default() -> Self {
+        Self { user: "x-auth-user".into(), email: "x-auth-email".into(), groups: "x-auth-groups".into() }
+    }
+}
+
+impl IdentityHeaders {
+    /// All three, lowercase.
+    #[must_use]
+    pub fn names(&self) -> [&str; 3] {
+        [&self.user, &self.email, &self.groups]
+    }
 }
 
 /// Where the terminators ask whether a request may pass (PLAN.md M34): a
@@ -49,7 +79,7 @@ pub struct ServiceNaming {
 /// address, verified against its certificate, and only while `node` owns
 /// it — with the service's own name as `Host`, `X-Forwarded-Method`,
 /// `X-Forwarded-Uri` and cookies. A 2xx lets it
-/// through with `copy_headers` copied from the answer; a 401 carrying
+/// through with the identity headers copied from the answer; a 401 carrying
 /// `X-Login-Url` sends the browser there; anything else is returned as is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignIn {
@@ -59,9 +89,6 @@ pub struct SignIn {
     /// provider only there: whoever declares the name elsewhere is not it.
     pub node: String,
     pub verify_path: String,
-    /// The provider's identity headers. Every one is removed from the
-    /// client's request first, whether or not the provider sends it back.
-    pub copy_headers: Vec<String>,
     /// The provider's session cookie, removed from every request any
     /// terminator passes to a backend: it is scoped to the whole domain,
     /// and no backend needs it.

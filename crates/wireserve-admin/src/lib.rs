@@ -24,6 +24,8 @@ pub enum CliError {
     ExportConfig(#[from] export_config::ExportConfigError),
     #[error("denial reason is {0} bytes; the limit is {MAX_DENY_REASON_LEN}")]
     DenyReasonTooLong(usize),
+    #[error("{0}")]
+    InvalidSource(String),
 }
 
 /// Spec §3: "fail fast, don't round trip to the server for an obvious
@@ -126,10 +128,61 @@ pub fn cmd_deny_transit(client: &AdminClient, name: &str) -> Result<(), CliError
     Ok(client.deny_transit(name)?)
 }
 
-/// Puts a service behind the sign-in, or takes it away (PLAN.md M29, M34).
-pub fn cmd_set_service_auth(client: &AdminClient, service: &str, enabled: bool) -> Result<(), CliError> {
+/// A grant source as the command line writes it: `everyone`,
+/// `oidc:<group>` or `tag:<tag>`.
+pub fn parse_source(raw: &str) -> Result<wireserve_types::GrantSource, CliError> {
+    raw.parse().map_err(CliError::InvalidSource)
+}
+
+pub fn cmd_list_groups(client: &AdminClient) -> Result<wireserve_types::GroupsResponse, CliError> {
+    Ok(client.list_groups()?)
+}
+
+pub fn cmd_create_group(client: &AdminClient, name: &str) -> Result<bool, CliError> {
+    validate_name(name)?;
+    Ok(client.create_group(name)?)
+}
+
+pub fn cmd_delete_group(client: &AdminClient, name: &str) -> Result<(), CliError> {
+    validate_name(name)?;
+    Ok(client.delete_group(name)?)
+}
+
+pub fn cmd_set_member(
+    client: &AdminClient,
+    group: &str,
+    service: &str,
+    add: bool,
+) -> Result<wireserve_types::MembershipResponse, CliError> {
+    validate_name(group)?;
     validate_name(service)?;
-    Ok(client.set_service_auth(service, enabled)?)
+    Ok(client.set_member(group, service, add)?)
+}
+
+pub fn cmd_list_grants(client: &AdminClient) -> Result<wireserve_types::GrantsResponse, CliError> {
+    Ok(client.list_grants()?)
+}
+
+pub fn cmd_set_grant(client: &AdminClient, source: &str, group: &str, add: bool) -> Result<bool, CliError> {
+    validate_name(group)?;
+    let grant = wireserve_types::GrantInfo { source: parse_source(source)?, group: group.to_string() };
+    Ok(client.set_grant(&grant, add)?)
+}
+
+pub fn cmd_set_tag(client: &AdminClient, node: &str, tag: &str, add: bool) -> Result<bool, CliError> {
+    validate_name(node)?;
+    validate_name(tag)?;
+    Ok(client.set_tag(node, tag, add)?)
+}
+
+pub fn cmd_service_access(client: &AdminClient, service: &str) -> Result<wireserve_types::ServiceAccessReport, CliError> {
+    validate_name(service)?;
+    Ok(client.service_access(service)?)
+}
+
+pub fn cmd_node_access(client: &AdminClient, node: &str) -> Result<wireserve_types::NodeAccessReport, CliError> {
+    validate_name(node)?;
+    Ok(client.node_access(node)?)
 }
 
 pub fn cmd_set_via_gateway(

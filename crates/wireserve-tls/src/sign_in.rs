@@ -6,9 +6,11 @@
 //! on the provider service's own address, with `X-Forwarded-Method` and
 //! `X-Forwarded-Uri`, and the service's own name — never the client's — in
 //! `Host` and `X-Forwarded-Host`. Then:
-//! * **2xx:** the request goes on, with the provider's identity headers
-//!   (`copy_headers`) copied onto it. Every one of them was removed from the
-//!   client's request first, so a client can never supply its own.
+//! * **2xx:** the provider knows who it is; the terminator decides whether
+//!   they may in (PLAN.md M36), and if so the request goes on with the
+//!   provider's identity headers copied onto it. Every one of them was
+//!   removed from the client's request first, so a client can never supply
+//!   its own.
 //! * **401 carrying `X-Login-Url`, for a GET or HEAD:** the browser is sent
 //!   there with a 302 — it can come back to the same URL after signing in.
 //! * **anything else:** the provider's answer goes back as it is (a 401
@@ -30,6 +32,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use wireserve_types::tls::SignInTarget;
+use wireserve_types::IdentityHeaders;
 
 /// How long the provider may take to answer.
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -61,8 +64,8 @@ pub struct SignIn {
 
 /// What the check decided.
 pub enum Verdict {
-    /// Go on, with these identity headers set.
-    Allow(HeaderMap),
+    /// Signed in: these identity headers, and the groups they name.
+    Allow { headers: HeaderMap, groups: Vec<String> },
     /// Answer the client with this instead.
     Deny(Response<Body>),
 }
@@ -103,7 +106,14 @@ impl SignIn {
     /// was routed by — never the client's `Host`: providers choose their
     /// per-host rules by it, and a client could otherwise have another
     /// host's rules applied to this service.
-    pub async fn check(&self, method: &Method, uri: &Uri, headers: &HeaderMap, fqdn: &str) -> Verdict {
+    pub async fn check(
+        &self,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        fqdn: &str,
+        identity: &IdentityHeaders,
+    ) -> Verdict {
         let Ok(host) = HeaderValue::from_str(fqdn) else {
             return Verdict::Deny(plain(StatusCode::INTERNAL_SERVER_ERROR, "bad service name"));
         };
@@ -140,13 +150,18 @@ impl SignIn {
         };
         let status = resp.status();
         if status.is_success() {
-            let mut identity = HeaderMap::new();
-            for name in &self.target.copy_headers {
-                if let (Ok(n), Some(v)) = (HeaderName::from_bytes(name.as_bytes()), resp.headers().get(name.as_str())) {
-                    identity.insert(n, v.clone());
+            let mut copied = HeaderMap::new();
+            for name in identity.names() {
+                if let (Ok(n), Some(v)) = (HeaderName::from_bytes(name.as_bytes()), resp.headers().get(name)) {
+                    copied.insert(n, v.clone());
                 }
             }
-            return Verdict::Allow(identity);
+            let groups = copied
+                .get(identity.groups.as_str())
+                .and_then(|v| v.to_str().ok())
+                .map(parse_groups)
+                .unwrap_or_default();
+            return Verdict::Allow { headers: copied, groups };
         }
         let login = resp.headers().get("x-login-url").cloned();
         let replayable = matches!(*method, Method::GET | Method::HEAD);
@@ -175,11 +190,18 @@ impl SignIn {
     }
 }
 
-/// Removes every identity header the provider may send, so none a client
-/// supplied survives, whether or not the provider sends it back.
-pub fn strip_identity(headers: &mut HeaderMap, copy_headers: &[String]) {
-    for name in copy_headers {
-        headers.remove(name.as_str());
+/// A groups header's value: comma-separated names, trimmed, empty ones
+/// dropped.
+#[must_use]
+pub fn parse_groups(value: &str) -> Vec<String> {
+    value.split(',').map(str::trim).filter(|g| !g.is_empty()).map(str::to_string).collect()
+}
+
+/// Removes every identity header, so none a client supplied survives —
+/// on every request, whether or not anything fills them in again.
+pub fn strip_identity(headers: &mut HeaderMap, identity: &IdentityHeaders) {
+    for name in identity.names() {
+        headers.remove(name);
     }
 }
 
@@ -247,8 +269,14 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-auth-user", HeaderValue::from_static("admin"));
         h.insert("x-other", HeaderValue::from_static("kept"));
-        strip_identity(&mut h, &["x-auth-user".into(), "x-auth-email".into()]);
+        strip_identity(&mut h, &IdentityHeaders::default());
         assert!(h.get("x-auth-user").is_none());
         assert_eq!(h.get("x-other").unwrap(), "kept");
+    }
+
+    #[test]
+    fn groups_are_comma_separated() {
+        assert_eq!(parse_groups("family, admins,,  "), ["family", "admins"]);
+        assert!(parse_groups("").is_empty());
     }
 }

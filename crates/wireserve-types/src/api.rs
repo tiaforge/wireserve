@@ -194,10 +194,11 @@ pub const MAX_TRANSIT_WANTED_PER_POLL: usize = 64;
 /// ready yet.
 pub const CAP_TLS_TERMINATE: &str = "tls-terminate";
 
-/// `sign-in` (PLAN.md M34): this agent's terminator puts the built-in
-/// sign-in in front of a marked service, and its firewall opens nothing of a
-/// marked service but that. Required of a service's owner before an admin
-/// may mark it.
+/// `sign-in` (PLAN.md M34, M36): this agent's terminator lets a caller into
+/// a restricted service by its device's grants, or else by the groups it
+/// proves at the sign-in, and its firewall opens a restricted service's
+/// terminated 443 to everyone only while the terminator decides. Without
+/// it, a service's owner is never told to rely on the sign-in.
 pub const CAP_SIGN_IN: &str = "sign-in";
 
 /// At most this many names are read from one poll's `tls_ready`.
@@ -212,6 +213,11 @@ pub struct ServiceDecl {
     /// Public→target mappings on the service's own address; never empty
     /// (see [`crate::validate_service_ports`]).
     pub ports: Vec<PortMap>,
+    /// The service group it should join (PLAN.md M36). Honoured once: when
+    /// the service is first approved and has no group yet. After that only
+    /// an admin changes its groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 impl ServiceDecl {
@@ -219,7 +225,7 @@ impl ServiceDecl {
     /// [`crate::validate_service_ports`] first).
     #[must_use]
     pub fn new(name: impl Into<String>, ports: Vec<PortMap>) -> Self {
-        Self { name: name.into(), ports }
+        Self { name: name.into(), ports, group: None }
     }
 }
 
@@ -347,11 +353,6 @@ pub struct ServiceInfo {
     pub vip4: Option<String>,
     /// Its public→target mappings, target addresses left out (PLAN.md M26).
     pub ports: Vec<PortMap>,
-    /// Behind the sign-in (PLAN.md M29, M34): its node's terminator checks
-    /// every request with the provider, and the node opens nothing else of
-    /// it. Absent when false.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub auth: bool,
     /// Served with TLS by its own node (PLAN.md M33) right now. Absent when
     /// false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -454,6 +455,15 @@ pub struct PollResponse {
     /// untouched.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub naming: Option<crate::ServiceNaming>,
+    /// Who may reach each of THIS node's own services, pending ones
+    /// included (PLAN.md M36) — never anyone else's. An own service missing
+    /// here is closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access: Vec<crate::ServiceAccess>,
+    /// What THIS node should know about the groups its declarations named
+    /// (PLAN.md M36). A declaration with a notice may not be published.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_notices: Vec<crate::ServiceNotice>,
     /// THIS node's own declarations awaiting approval — never anyone
     /// else's.
     ///
@@ -502,11 +512,11 @@ pub struct AdminServiceInfo {
     pub denied_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub denied_reason: Option<String>,
-    /// Marked for sign-in at the proxy (PLAN.md M29). The mark belongs to
-    /// the name, not the declaration, so it survives a withdraw and
+    /// The service groups it is in (PLAN.md M36): its explicit ones, or
+    /// `default`. They belong to the name, so they survive a withdraw and
     /// re-declare.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub auth: bool,
+    #[serde(default)]
+    pub groups: Vec<String>,
     /// Where the service's public DNS record stands (PLAN.md M32). Absent
     /// when the coordinator publishes no records, or this service has no
     /// public name.
@@ -596,13 +606,6 @@ pub struct SetGatewayRequest {
     pub exit: bool,
 }
 
-/// `PUT /admin/services/{name}/auth` (PLAN.md M29) — whether a service is
-/// published behind the proxy's sign-in.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SetServiceAuthRequest {
-    pub enabled: bool,
-}
-
 /// `PUT /admin/nodes/{name}/via-gateway` (PLAN.md #134) — whether devices
 /// exported with a gateway must reach this node through it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -657,6 +660,95 @@ pub struct AdminPeersResponse {
     /// full-tunnel profile.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exit_devices: Vec<String>,
+    /// Each node's tags (PLAN.md M36), by node name; nodes without any are
+    /// left out. Admin-only: a node never learns who else is tagged what.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tags: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// `POST /admin/groups` (PLAN.md M36).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateGroupRequest {
+    pub name: String,
+}
+
+/// One service group, as `GET /admin/groups` lists it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupInfo {
+    pub name: String,
+    /// Service names explicitly in it — declared or not. For `default`,
+    /// every declared service without an explicit group.
+    pub services: Vec<String>,
+    /// Who it is granted to.
+    pub granted_to: Vec<crate::GrantSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupsResponse {
+    pub groups: Vec<GroupInfo>,
+}
+
+/// `PUT` / `DELETE /admin/groups/{group}/services/{service}`: the groups
+/// the service is in afterwards.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MembershipResponse {
+    pub service: String,
+    pub groups: Vec<String>,
+}
+
+/// A grant, as `POST` / `DELETE /admin/grants` take it and
+/// `GET /admin/grants` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantInfo {
+    pub source: crate::GrantSource,
+    pub group: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrantsResponse {
+    pub grants: Vec<GrantInfo>,
+}
+
+/// One node reaching a service, and the principals that let it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessVia {
+    pub name: String,
+    pub via: Vec<crate::GrantSource>,
+}
+
+/// `GET /admin/access/services/{name}`: who reaches a service, and why.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceAccessReport {
+    pub service: String,
+    /// The declaring node, if anything declares it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    pub groups: Vec<String>,
+    pub granted_to: Vec<crate::GrantSource>,
+    /// Everyone reaches it.
+    pub open: bool,
+    /// Nodes that reach it by who they are, when not open.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<AccessVia>,
+    /// Anyone else may try the sign-in, and gets in with one of
+    /// `sign_in_groups`.
+    pub sign_in: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sign_in_groups: Vec<String>,
+    /// `everyone -> default` has been removed: services without a group
+    /// reach nobody but their own node.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default_closed: bool,
+}
+
+/// `GET /admin/access/nodes/{name}`: what a node reaches, and why.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeAccessReport {
+    pub node: String,
+    pub principals: Vec<crate::GrantSource>,
+    pub services: Vec<AccessVia>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default_closed: bool,
 }
 
 #[cfg(test)]
@@ -702,6 +794,8 @@ mod tests {
             exit_clients: vec![],
             mesh: None,
             naming: None,
+            access: vec![],
+            service_notices: vec![],
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("pending_services"), "{json}");
@@ -735,7 +829,6 @@ mod tests {
                 transit_via: None,
             }],
             services: vec![ServiceInfo {
-                auth: false,
                 terminated: false,
                 name: "plex".into(),
                 node: "homeserver".into(),
@@ -751,6 +844,8 @@ mod tests {
             exit_clients: vec![],
             mesh: None,
             naming: None,
+            access: vec![],
+            service_notices: vec![],
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: PollResponse = serde_json::from_str(&json).unwrap();

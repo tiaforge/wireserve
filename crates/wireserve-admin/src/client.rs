@@ -14,7 +14,7 @@ use reqwest::StatusCode;
 use wireserve_types::{
     AdminPeersResponse, AdminServicesResponse, CreateNodeRequest, CreateNodeResponse,
     DenyServiceRequest, ErrorBody, NodeKind, RegisterRequest, RegisterResponse, RejoinRequest, SetGatewayRequest,
-    RejoinResponse, SetServiceAuthRequest, SetViaGatewayRequest, SetViaGatewayResponse,
+    RejoinResponse, SetViaGatewayRequest, SetViaGatewayResponse,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -219,17 +219,81 @@ impl AdminClient {
         Ok(())
     }
 
-    /// `PUT /admin/services/{name}/auth` (PLAN.md M29) — publish a service
-    /// behind the sign-in, or take it away.
-    pub fn set_service_auth(&self, service: &str, enabled: bool) -> Result<(), ClientError> {
+    /// `GET /admin/groups` (PLAN.md M36).
+    pub fn list_groups(&self) -> Result<wireserve_types::GroupsResponse, ClientError> {
+        let resp = self.http.get(self.url("/admin/groups")).bearer_auth(&self.admin_token).send()?;
+        Ok(Self::check_status(resp)?.json()?)
+    }
+
+    /// `POST /admin/groups`. `true` when it was created, `false` when it
+    /// already existed.
+    pub fn create_group(&self, name: &str) -> Result<bool, ClientError> {
         let resp = self
             .http
-            .put(self.url(&format!("/admin/services/{service}/auth")))
+            .post(self.url("/admin/groups"))
             .bearer_auth(&self.admin_token)
-            .json(&SetServiceAuthRequest { enabled })
+            .json(&wireserve_types::CreateGroupRequest { name: name.to_string() })
             .send()?;
+        Ok(Self::check_status(resp)?.status() == StatusCode::CREATED)
+    }
+
+    /// `DELETE /admin/groups/{group}`.
+    pub fn delete_group(&self, name: &str) -> Result<(), ClientError> {
+        let resp = self.http.delete(self.url(&format!("/admin/groups/{name}"))).bearer_auth(&self.admin_token).send()?;
         Self::check_status(resp)?;
         Ok(())
+    }
+
+    /// `PUT` (`add`) or `DELETE` `/admin/groups/{group}/services/{service}`:
+    /// the service's groups afterwards.
+    pub fn set_member(
+        &self,
+        group: &str,
+        service: &str,
+        add: bool,
+    ) -> Result<wireserve_types::MembershipResponse, ClientError> {
+        let url = self.url(&format!("/admin/groups/{group}/services/{service}"));
+        let req = if add { self.http.put(url) } else { self.http.delete(url) };
+        let resp = req.bearer_auth(&self.admin_token).send()?;
+        Ok(Self::check_status(resp)?.json()?)
+    }
+
+    /// `GET /admin/grants`.
+    pub fn list_grants(&self) -> Result<wireserve_types::GrantsResponse, ClientError> {
+        let resp = self.http.get(self.url("/admin/grants")).bearer_auth(&self.admin_token).send()?;
+        Ok(Self::check_status(resp)?.json()?)
+    }
+
+    /// `POST` (`add`) or `DELETE` `/admin/grants`. `true` when something
+    /// changed.
+    pub fn set_grant(&self, grant: &wireserve_types::GrantInfo, add: bool) -> Result<bool, ClientError> {
+        let url = self.url("/admin/grants");
+        let req = if add { self.http.post(url) } else { self.http.delete(url) };
+        let resp = req.bearer_auth(&self.admin_token).json(grant).send()?;
+        let status = Self::check_status(resp)?.status();
+        Ok(!add || status == StatusCode::CREATED)
+    }
+
+    /// `PUT` (`add`) or `DELETE` `/admin/nodes/{name}/tags/{tag}`. `true`
+    /// when something changed.
+    pub fn set_tag(&self, node: &str, tag: &str, add: bool) -> Result<bool, ClientError> {
+        let url = self.url(&format!("/admin/nodes/{node}/tags/{tag}"));
+        let req = if add { self.http.put(url) } else { self.http.delete(url) };
+        let status = Self::check_status(req.bearer_auth(&self.admin_token).send()?)?.status();
+        Ok(!add || status == StatusCode::CREATED)
+    }
+
+    /// `GET /admin/access/services/{name}`.
+    pub fn service_access(&self, service: &str) -> Result<wireserve_types::ServiceAccessReport, ClientError> {
+        let resp =
+            self.http.get(self.url(&format!("/admin/access/services/{service}"))).bearer_auth(&self.admin_token).send()?;
+        Ok(Self::check_status(resp)?.json()?)
+    }
+
+    /// `GET /admin/access/nodes/{name}`.
+    pub fn node_access(&self, node: &str) -> Result<wireserve_types::NodeAccessReport, ClientError> {
+        let resp = self.http.get(self.url(&format!("/admin/access/nodes/{node}"))).bearer_auth(&self.admin_token).send()?;
+        Ok(Self::check_status(resp)?.json()?)
     }
 
     /// `POST /admin/nodes/{name}/transit/approve`.

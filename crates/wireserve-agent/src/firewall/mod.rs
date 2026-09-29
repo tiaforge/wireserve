@@ -180,7 +180,7 @@ mod tests {
         startup_sequence(&mut backend).unwrap();
         backend
             .apply(
-                &[ServiceRule::Mapped { vip: VIP, node: NODE, map: wireserve_types::PortMap::identity(32400, Proto::Tcp) }],
+                &[ServiceRule::Mapped { vip: VIP, node: NODE, map: wireserve_types::PortMap::identity(32400, Proto::Tcp), sources: None }],
                 &Forwarding::default(),
             )
             .unwrap();
@@ -191,7 +191,7 @@ mod tests {
                 Call::Teardown,
                 Call::Apply(vec![], Forwarding::default()),
                 Call::Apply(
-                    vec![ServiceRule::Mapped { vip: VIP, node: NODE, map: wireserve_types::PortMap::identity(32400, Proto::Tcp) }],
+                    vec![ServiceRule::Mapped { vip: VIP, node: NODE, map: wireserve_types::PortMap::identity(32400, Proto::Tcp), sources: None }],
                     Forwarding::default()
                 ),
             ]

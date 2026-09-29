@@ -56,6 +56,35 @@ pub struct NodeRow {
     pub exit_enabled: bool,
 }
 
+#[cfg(test)]
+impl NodeRow {
+    /// A registered agent with nothing else set.
+    #[must_use]
+    pub fn for_test(id: i64, name: &str) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            kind: NodeKind::Agent,
+            pubkey: Some(format!("pk-{name}")),
+            ip4: None,
+            ip6: None,
+            endpoint_addr: None,
+            endpoint_cleared: false,
+            endpoint_addr_v4: None,
+            endpoint_addr_v6: None,
+            lan_addr: None,
+            reflexive_addr: None,
+            listen_port: None,
+            revoked: false,
+            last_seen: None,
+            transit_approved: false,
+            gateway_node_id: None,
+            export_via_gateway: false,
+            exit_enabled: false,
+        }
+    }
+}
+
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
     let kind_str: String = row.get("kind")?;
     let kind = kind_str.parse::<NodeKind>().unwrap_or_default();

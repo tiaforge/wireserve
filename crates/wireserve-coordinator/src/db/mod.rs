@@ -1,4 +1,5 @@
 pub mod dns_records;
+pub mod grants;
 pub mod nodes;
 pub mod tls;
 pub mod services;
@@ -29,6 +30,12 @@ pub enum DbError {
     Ipam(#[from] crate::ipam::IpamError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(
+        "services are marked for sign-in ({0}), which this version replaces with service groups and grants; \
+         unmark them with the previous version (wireserve-admin service-auth <name> off), upgrade, and put \
+         them in a group"
+    )]
+    LiveSignInMarks(String),
 }
 
 pub struct Db {
@@ -106,12 +113,34 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0014_dns_records.sql")),
         M::up(include_str!("../../migrations/0015_tls_ready.sql")),
         M::up(include_str!("../../migrations/0016_acme_challenges.sql")),
+        M::up(include_str!("../../migrations/0017_grants.sql")),
     ])
 }
 
 fn run_migrations(conn: &mut Connection) -> Result<(), DbError> {
+    refuse_live_marks(conn)?;
     migrations().to_latest(conn)?;
     Ok(())
+}
+
+/// Migration 0017 drops the sign-in marks. A marked service would come out
+/// of it in `default` — reachable by everyone, no sign-in — so the upgrade
+/// stops here instead, naming them, while any mark exists.
+fn refuse_live_marks(conn: &Connection) -> Result<(), DbError> {
+    let has_table: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'service_auth')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_table {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare("SELECT name FROM service_auth ORDER BY name")?;
+    let names: Vec<String> = stmt.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?;
+    if names.is_empty() {
+        return Ok(());
+    }
+    Err(DbError::LiveSignInMarks(names.join(", ")))
 }
 
 /// Write-ahead logging, plus the `synchronous` setting that normally
@@ -257,6 +286,55 @@ mod tests {
                 .is_some(),
             "a token outstanding across the upgrade must still redeem"
         );
+    }
+
+    /// A database as the installation before M36 has it: migrations up to
+    /// 0016, a node and an approved service.
+    fn database_before_grants() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        migrations().to_version(&mut conn, 16).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (name, kind, join_token_hash, join_token_used, ip4) VALUES ('home', 'agent', 'h', 1, '10.9.0.1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO services (node_id, name, port, proto, ports, declared_at, approved_at, vip4) \
+             VALUES (1, 'jellyfin', 8096, 'tcp', '[{\"public\":443,\"target\":8096,\"proto\":\"tcp\"}]', \
+                     '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z', '10.9.1.1')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn an_existing_mesh_upgrades_into_default_with_everyone_granted() {
+        let mut conn = database_before_grants();
+        run_migrations(&mut conn).unwrap();
+        let rules = crate::access::read_rules(&conn).unwrap();
+        assert!(rules.members.is_empty(), "no service gets a group of its own");
+        assert!(rules.granted("jellyfin").contains(&wireserve_types::GrantSource::Everyone));
+        let peers = crate::db::nodes::list_all_peers(&conn).unwrap();
+        let row = crate::db::services::find_by_name(&conn, "jellyfin").unwrap().unwrap();
+        let owner = crate::db::nodes::find_by_id(&conn, 1).unwrap().unwrap();
+        let facts = crate::access::SignInFacts { provider: None, owner_capable: true, terminated: true };
+        assert!(crate::access::service_access(&row, &owner, &peers, &rules, &facts).open, "reachable exactly as before");
+    }
+
+    #[test]
+    fn a_live_sign_in_mark_stops_the_upgrade_instead_of_going_public() {
+        let mut conn = database_before_grants();
+        conn.execute("INSERT INTO service_auth (name, marked_at) VALUES ('jellyfin', '2026-09-01T00:00:00Z')", [])
+            .unwrap();
+        let err = run_migrations(&mut conn).unwrap_err();
+        assert!(matches!(&err, DbError::LiveSignInMarks(names) if names == "jellyfin"), "{err}");
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 16, "nothing migrated");
+
+        conn.execute("DELETE FROM service_auth", []).unwrap();
+        run_migrations(&mut conn).unwrap();
     }
 
     #[test]

@@ -289,6 +289,7 @@ mod tests {
             dns: None,
             acme: config::acme_from_lookup(|_| None).unwrap(),
             sign_in: None,
+            identity_headers: Default::default(),
             online_threshold_secs: 180,
             rate_limit_max: 10,
             rate_limit_window_secs: 60,

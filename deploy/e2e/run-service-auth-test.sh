@@ -1,35 +1,44 @@
 #!/usr/bin/env bash
-# WireServe sign-in test (PLAN.md M29, M34): the sign-in built into every
-# node's TLS terminator, in front of a service marked for it.
+# WireServe sign-in test (PLAN.md M34, M36): who gets into a restricted
+# service, decided by the service's own terminator — by device first, then
+# by the groups a sign-in proves.
 #
-# A marked service must be reachable through its terminator's sign-in and
-# nowhere else. What this proves, against real WireGuard, a real ACME CA
-# (Pebble) and real DNS (BIND):
+# jellyfin is in group `media`, granted to `tag:tv` (the gate node) and to
+# `oidc:family` (whoever signs in with that group). The client is untagged:
+# a shared device, whose people get in by signing in. What this proves,
+# against real WireGuard, a real ACME CA (Pebble) and real DNS (BIND):
 #
-#   1. the sign-in provider and both services are served with TLS by their
-#      own nodes, and marking jellyfin reaches the directory;
-#   2. without a session the browser is sent to the login URL, and the
+#   1. the provider and both services are served with TLS by their own
+#      nodes, and the provider itself cannot be put in a group;
+#   2. without a session the client is sent to the login URL, and the
 #      backend never sees the request;
-#   3. with one, the backend sees who (X-Auth-User from the provider), not
-#      a forged X-Auth-User, and not the session cookie — other cookies kept;
-#   4. an unmarked service needs no sign-in, but loses the cookie too;
-#   5. the marked service's other port — a way round the sign-in — is
-#      closed, while the unmarked service's is open;
-#   6. a request to jellyfin's address naming another host gets 421, and
+#   3. signed in with `family`, the backend sees who (the provider's
+#      identity headers), not a forged X-Auth-User, not the session cookie —
+#      other cookies kept;
+#   4. signed in with another group: 403, backend untouched;
+#   5. the tagged gate gets in without any session: its device is granted,
+#      and the sign-in is never asked;
+#   6. grafana, still in `default`, needs no sign-in, but loses the cookie
+#      and a forged identity too;
+#   7. jellyfin's other port admits the granted gate and refuses the client;
+#   8. a request to jellyfin's address naming another host gets 421, and
 #      never reaches the backend or the sign-in;
-#   7. the provider is trusted only on its own node (WIRESERVE_AUTH_NODE):
+#   9. the provider is trusted only on its own node (WIRESERVE_AUTH_NODE):
 #      once gate withdraws `auth` and home declares it, answering every
 #      /verify with 200, jellyfin refuses instead of asking the impostor;
-#   8. `service-auth off` gives jellyfin back without a sign-in, and its
-#      other port with it.
+#  10. taking jellyfin out of `media` puts it back in `default`: no sign-in,
+#      and its other port open to everyone.
 #
 #     ( net )──┬──────────┬───────┬────────┬──────────────┬──────────────────┬──────────┐
 #          [coordinator] [bind] [pebble] [gate agent     [home agent        [client agent]
-#                                         auth 443:8080   jellyfin 443:8096 (marked) + 8920
-#                                         (stub /verify)] grafana 443:3000 + 3001]
+#                                         auth 443:8080   jellyfin 443:8096
+#                                         (stub /verify)  + 8920 (media)
+#                                         tag tv]         grafana 443:3000
+#                                                         + 3001 (default)]
 #
 # The provider is a stub (deploy/e2e/auth-stub.sh) standing in for authward's
-# /verify: it signs in `authward_session=ok`, but only when the terminator
+# /verify: it signs in `authward_session=ok` as alice in `family` and
+# `authward_session=guest` as bob in `guests`, but only when the terminator
 # forwarded the protected service's own name in X-Forwarded-Host.
 #
 # Rootful Podman, like the other harnesses that run WireGuard.
@@ -114,17 +123,24 @@ wait_for() {
     fail "timed out after ${secs}s waiting for: $what"
 }
 terminated() { [ "$(entry "$1" terminated)" = True ]; }
-marked() { [ "$(entry "$1" auth)" = True ]; }
-# HTTPS by name from the client, verified: headers and body, then the status
+# Whether home's own access list says jellyfin falls back to the sign-in.
+signs_in() {
+    podman exec "$HOME_AGENT" cat /var/lib/wireserve/agent-state.json | python3 -c "
+import json,sys
+a=next((a for a in json.load(sys.stdin).get('own_access',[]) if a['name']=='$1'), {})
+sys.exit(0 if a.get('sign_in') else 1)"
+}
+# HTTPS by name from a node, verified: headers and body, then the status
 # and redirect target.
-fetch() {
-    local host=$1; shift
+fetch_from() {
+    local from=$1 host=$2; shift 2
     local vip
     vip=$(entry "$host" vip4)
-    in_netns "$CLIENT" curl -s --max-time 10 --cacert /work/pebble-root.pem \
+    in_netns "$from" curl -s --max-time 10 --cacert /work/pebble-root.pem \
         --resolve "$host.$DOMAIN:443:$vip" -D - "$@" "https://$host.$DOMAIN/" \
         -w '\nSTATUS %{http_code} %{redirect_url}\n'
 }
+fetch() { fetch_from "$CLIENT" "$@"; }
 
 log "checking prerequisites"
 command -v podman >/dev/null || fail "podman not found on PATH"
@@ -223,59 +239,84 @@ for port in 8096 8920 3000 3001; do
     in_netns_bg "$HOME_AGENT" socat "TCP-LISTEN:$port,fork,reuseaddr" EXEC:"/e2e/echo-backend.sh $port"
 done
 
-log "1/8: all three terminated; marking jellyfin"
+log "1/10: all three terminated; jellyfin in media, for tag:tv and oidc:family"
 for s in auth jellyfin grafana; do
     wait_for "$s to be terminated" 120 terminated "$s"
 done
-admin service-auth jellyfin on || fail "service-auth was refused"
-admin list-services | grep '^jellyfin' | grep -q 'sign-in=yes' || fail "list-services does not show the mark"
-wait_for "the client to see jellyfin marked" 30 marked jellyfin
-# The terminator picks the mark up on its next check-in.
+admin group create media
+admin group add media jellyfin
+admin grant add oidc:family media
+admin grant add tag:tv media
+admin tag add node-gate tv
+if admin group add media auth 2>/dev/null; then
+    fail "the sign-in service was put in a group"
+fi
+admin list-services | grep '^jellyfin' | grep -q 'groups=media' || fail "list-services does not show jellyfin in media"
+wait_for "home to fall back to the sign-in for jellyfin" 30 signs_in jellyfin
+# The terminator picks it up on its next check-in.
 sleep 8
-pass "auth, jellyfin and grafana served by their own nodes; jellyfin marked"
+pass "auth, jellyfin and grafana served by their own nodes; jellyfin restricted"
 
-log "2/8: no session, sent to sign in"
+log "2/10: no session, sent to sign in"
 OUT=$(fetch jellyfin) || true
 echo "$OUT" | tail -1
 echo "$OUT" | grep -q '^STATUS 302 https://auth.int.test/login' || { echo "$OUT"; fail "expected a redirect to the login URL"; }
 echo "$OUT" | grep -q 'backend:' && fail "the backend was reached without a session"
 pass "redirected to the login URL; the backend never saw the request"
 
-log "3/8: with a session, the backend sees who, and not the cookie"
+log "3/10: signed in with family, the backend sees who, and not the cookie"
 OUT=$(fetch jellyfin -H 'Cookie: theme=dark; authward_session=ok; lang=de' -H 'X-Auth-User: mallory') || true
 echo "$OUT" | sed 's/^/  /'
 echo "$OUT" | grep -q '^STATUS 200' || fail "a signed-in request did not reach the backend"
 echo "$OUT" | grep -q 'backend:8096' || fail "the wrong backend answered"
 echo "$OUT" | grep -qi '^x-auth-user: alice' || fail "the backend did not get the identity header"
+echo "$OUT" | grep -qi '^x-auth-groups: family' || fail "the backend did not get the groups header"
 echo "$OUT" | grep -qi 'mallory' && fail "a forged X-Auth-User reached the backend"
 echo "$OUT" | grep -q 'authward_session' && fail "the sign-in cookie reached the backend"
 echo "$OUT" | grep -qi '^cookie: .*theme=dark' || fail "other cookies were lost"
-pass "X-Auth-User: alice; mallory and authward_session gone; theme kept"
+pass "X-Auth-User: alice, groups family; mallory and authward_session gone; theme kept"
 
-log "4/8: an unmarked service needs no sign-in, and loses the cookie too"
+log "4/10: signed in without a granted group: 403"
+OUT=$(fetch jellyfin -H 'Cookie: authward_session=guest') || true
+echo "$OUT" | tail -1
+echo "$OUT" | grep -q '^STATUS 403' || { echo "$OUT"; fail "a guest was not refused"; }
+echo "$OUT" | grep -q 'backend:' && fail "a guest reached the backend"
+pass "bob (guests) refused with 403"
+
+log "5/10: the tagged device gets in without signing in"
+OUT=$(fetch_from "$GATE" jellyfin -H 'X-Auth-User: mallory') || true
+echo "$OUT" | tail -1
+echo "$OUT" | grep -q '^STATUS 200' || { echo "$OUT"; fail "the tagged gate was asked to sign in"; }
+echo "$OUT" | grep -q 'backend:8096' || fail "the wrong backend answered"
+echo "$OUT" | grep -qi 'mallory' && fail "a forged X-Auth-User reached the backend from a granted device"
+pass "node-gate (tag tv) reached jellyfin with no session"
+
+log "6/10: a service in default needs no sign-in, and loses the cookie too"
 OUT=$(fetch grafana -H 'Cookie: authward_session=ok; theme=dark' -H 'X-Auth-User: mallory') || true
-echo "$OUT" | grep -q '^STATUS 200' || { echo "$OUT"; fail "the unmarked service asked for a sign-in"; }
-echo "$OUT" | grep -q 'authward_session' && { echo "$OUT"; fail "the sign-in cookie reached an unmarked backend"; }
-echo "$OUT" | grep -qi 'mallory' && { echo "$OUT"; fail "a forged X-Auth-User reached an unmarked backend"; }
+echo "$OUT" | grep -q '^STATUS 200' || { echo "$OUT"; fail "grafana asked for a sign-in"; }
+echo "$OUT" | grep -q 'authward_session' && { echo "$OUT"; fail "the sign-in cookie reached grafana"; }
+echo "$OUT" | grep -qi 'mallory' && { echo "$OUT"; fail "a forged X-Auth-User reached grafana"; }
 pass "grafana served without a sign-in, without the cookie or a forged identity"
 
-log "5/8: the way round the sign-in leads nowhere"
+log "7/10: jellyfin's other port follows the grants"
 JF_VIP=$(entry jellyfin vip4); GF_VIP=$(entry grafana vip4)
 in_netns "$CLIENT" curl -s --max-time 6 "http://$GF_VIP:3001/" | grep -q 'backend:3001' \
     || fail "grafana's other port is unreachable — the next check would prove nothing"
 if in_netns "$CLIENT" curl -s --max-time 6 "http://$JF_VIP:8920/" | grep -q 'backend:'; then
-    fail "jellyfin's other port was reached, around the sign-in"
+    fail "the client reached jellyfin's other port, around the sign-in"
 fi
-pass "grafana's 3001 answers; jellyfin's 8920 does not"
+in_netns "$GATE" curl -s --max-time 6 "http://$JF_VIP:8920/" | grep -q 'backend:8920' \
+    || fail "the granted gate could not reach jellyfin's other port"
+pass "8920: the gate gets in, the client does not"
 
-log "6/8: a request naming another host is misdirected"
+log "8/10: a request naming another host is misdirected"
 OUT=$(fetch jellyfin -H "Host: grafana.$DOMAIN" -H 'Cookie: authward_session=ok') || true
 echo "$OUT" | tail -1
 echo "$OUT" | grep -q '^STATUS 421' || { echo "$OUT"; fail "a foreign Host was not refused with 421"; }
 echo "$OUT" | grep -q 'backend:' && { echo "$OUT"; fail "a foreign Host reached a backend"; }
 pass "Host: grafana on jellyfin's address: 421, no backend"
 
-log "7/8: a provider on another node is not the provider"
+log "9/10: a provider on another node is not the provider"
 podman exec "$GATE" wireserve unserve auth
 auth_gone() { [ -z "$(entry auth name)" ]; }
 wait_for "auth to leave the directory" 30 auth_gone
@@ -291,11 +332,11 @@ echo "$OUT" | grep -q 'backend:' && { echo "$OUT"; fail "jellyfin was reached th
 echo "$OUT" | grep -q '^STATUS 503' || { echo "$OUT"; fail "expected jellyfin to refuse with no provider"; }
 pass "auth declared by node-home is ignored; jellyfin refuses with 503"
 
-log "8/8: service-auth off gives it back"
-admin service-auth jellyfin off
+log "10/10: out of its group, jellyfin is back in default"
+admin group remove media jellyfin | grep -q 'back in default' || fail "the admin was not told jellyfin is in default again"
 wait_for "jellyfin without a sign-in" 60 sh -c "podman run --rm --network container:$CLIENT -v $WORK:/work:ro,Z $DEBUG_IMG curl -s --max-time 5 --cacert /work/pebble-root.pem --resolve jellyfin.$DOMAIN:443:$JF_VIP https://jellyfin.$DOMAIN/ | grep -q backend:8096"
 wait_for "jellyfin's other port back" 30 sh -c "podman run --rm --network container:$CLIENT $DEBUG_IMG curl -s --max-time 3 http://$JF_VIP:8920/ | grep -q backend:8920"
-pass "unmarked again: no sign-in, and 8920 reachable"
+pass "in default again: no sign-in, and 8920 reachable"
 
 echo
 echo "=== SERVICE AUTH TEST COMPLETE ==="

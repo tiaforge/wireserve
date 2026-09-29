@@ -23,14 +23,11 @@ impl AppState {
     #[must_use]
     pub fn directory_context<'a>(
         &'a self,
-        auth: &'a std::collections::HashSet<String>,
         tls_ready: &'a std::collections::HashMap<String, i64>,
     ) -> crate::directory::DirectoryContext<'a> {
         crate::directory::DirectoryContext {
-            auth,
             tls_ready,
             dns: self.dns.is_some(),
-            sign_in_service: self.config.sign_in.as_ref().map(|s| s.service.as_str()),
             online_threshold_secs: self.config.online_threshold_secs,
         }
     }

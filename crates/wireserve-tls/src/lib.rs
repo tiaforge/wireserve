@@ -33,7 +33,7 @@ use tokio::task::JoinHandle;
 use wireserve_types::tls::{TlsConfig, TlsService};
 
 use crate::link::Link;
-use crate::serve::{Callers, Certs, Routes, SharedSignIn};
+use crate::serve::{Callers, Certs, SharedSignIn};
 use crate::store::{Store, Stored};
 
 pub struct Options {
@@ -96,9 +96,7 @@ pub async fn run(opts: Options) -> Result<(), Error> {
     let link = Link::new(&opts.socket);
     let certs = Arc::new(Certs::default());
     let tls = serve::server_config(certs.clone());
-    let callers: Callers = Arc::default();
-    let sign_in: SharedSignIn = Arc::default();
-    let routes: Routes = Arc::default();
+    let shared = serve::Shared::default();
     let listener = serve::listener(opts.port).map_err(|e| Error::Listen(opts.port, e))?;
     let port = listener.local_addr().map_err(|e| Error::Listen(opts.port, e))?.port();
     let extra_roots: Vec<rustls_pki_types::CertificateDer<'static>> = match &opts.trust_file {
@@ -117,7 +115,7 @@ pub async fn run(opts: Options) -> Result<(), Error> {
     let mut in_flight: Option<InFlight> = None;
 
     tracing::info!(socket = %link.socket().display(), port, "TLS terminator starting");
-    let accepting = serve::spawn(listener, tls, routes.clone(), callers.clone(), sign_in.clone());
+    let accepting = serve::spawn(listener, tls, shared.clone());
     let mut tick = tokio::time::interval(opts.check_in_every);
     loop {
         tick.tick().await;
@@ -138,8 +136,9 @@ pub async fn run(opts: Options) -> Result<(), Error> {
                 continue;
             }
         };
-        update_callers(&callers, &config);
-        update_sign_in(&sign_in, config.sign_in.as_ref(), &extra_roots);
+        update_callers(&shared.callers, &config);
+        update_sign_in(&shared.sign_in, config.sign_in.as_ref(), &extra_roots);
+        *shared.identity.write().unwrap_or_else(std::sync::PoisonError::into_inner) = config.identity_headers.clone();
 
         // Services that are gone: stop serving them.
         let wanted: BTreeSet<&str> = config.services.iter().map(|s| s.name.as_str()).collect();
@@ -148,7 +147,7 @@ pub async fn run(opts: Options) -> Result<(), Error> {
             if !keep {
                 tracing::info!(service = %name, "no longer serving");
                 if s.routed {
-                    routes.write().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&s.service.vip);
+                    shared.unroute(s.service.vip);
                 }
                 certs.remove(&s.service.fqdn);
             }
@@ -207,19 +206,23 @@ pub async fn run(opts: Options) -> Result<(), Error> {
 
             // Routed to as soon as there is a certificate to answer with.
             let s = served.entry(service.name.clone()).or_insert_with(|| Served { service: service.clone(), routed: false });
-            if s.service != *service {
-                if s.routed {
-                    routes.write().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&s.service.vip);
-                    s.routed = false;
-                }
-                s.service = service.clone();
+            // Another address or backend is another route; who may reach
+            // it is only its policy, replaced in place below so no request
+            // ever finds the service missing in between.
+            if (s.service.vip, s.service.upstream) != (service.vip, service.upstream) && s.routed {
+                shared.unroute(s.service.vip);
+                s.routed = false;
             }
-            if entry.cert.is_some() && !s.routed {
-                tracing::info!(service = %service.name, addr = %service.vip, upstream = %service.upstream, "serving");
-                let policy = serve::Policy { marked: service.sign_in, fqdn: service.fqdn.clone() };
-                let route = Arc::new(serve::Route::new(service.upstream, policy));
-                routes.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(service.vip, route);
-                s.routed = true;
+            s.service = service.clone();
+            if entry.cert.is_some() {
+                let policy = Arc::new(serve::Policy { fqdn: service.fqdn.clone(), access: service.access.clone() });
+                shared.policies.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(service.vip, policy);
+                if !s.routed {
+                    tracing::info!(service = %service.name, addr = %service.vip, upstream = %service.upstream, "serving");
+                    let route = Arc::new(serve::Route::new(service.upstream));
+                    shared.routes.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(service.vip, route);
+                    s.routed = true;
+                }
             }
 
             // Issue, or renew, one at a time and not while backing off.

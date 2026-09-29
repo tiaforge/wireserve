@@ -11,7 +11,9 @@ source of truth for *current status*, the spec is the source of truth for
 **Currently working on:** M36 (service groups, grants and tags; items 212+),
 then M37 (caching `/verify`) and M38 (device owners through OIDC). The plan
 is `~/.claude/plans/alright-then-lets-create-shimmying-panda.md` (not in the
-repo). Step 0 (items 212–213) is done.
+repo). Items 212–219 are done; the e2e suites for them
+(`run-grants-test.sh`, the reworked `run-service-auth-test.sh`) have not run
+yet.
 
 Everything that can be verified here now is. What remains unverified is
 scale (three nodes, not thirty), real WAN paths, and long-running
@@ -3383,3 +3385,73 @@ builds on the sign-in they concern.
     Without `WIRESERVE_AUTH_NODE` the sign-in is off, with a warning at
     startup — a coordinator configured before the setting still starts.
     `run-service-auth-test.sh` step 7.
+
+214. **Groups, grants and tags, keyed like the marks were.** Migration 0017:
+    `service_groups` (seeded `default`), `service_group_members` by service
+    **name** — a row stored on `services` would vanish with a withdraw and
+    come back in `default` — `grants` (`everyone` / `oidc` / `tag` → group,
+    seeded `everyone → default`) and `node_tags`. A name with no membership
+    is in `default`, so the existing installation upgrades into exactly
+    what it reached before. `service_auth` is dropped; `db::refuse_live_marks`
+    stops the upgrade, naming them, while any mark exists, since a marked
+    service would otherwise come out public. `default` can never be deleted,
+    and no group while it holds services, has grants or a declaration waits
+    to join it.
+
+215. **A declaration names a group once, on approval, and never an unknown
+    one.** `ServiceDecl.group` (`wireserve serve … --group g`) is stored as
+    `services.declared_group` on a **new** row only, and becomes membership
+    when that row is approved — auto-approved or by `approve` — if the name
+    has no groups yet; it is cleared either way, so an admin who later
+    empties the groups is not overruled. A pending or denied declaration
+    seeds nothing. A new name naming a group that does not exist is left out
+    of the upsert entirely, never published into `default`; that and a
+    re-declaration naming another group become `PollResponse.service_notices`
+    (shown by `wireserve list`) instead of failing the poll.
+
+216. **One function decides access, and each owner is told its own.**
+    `access::service_access` gives a service `open` (`everyone` granted) or
+    the ip4s of the nodes whose principals — `everyone`, their tags, their
+    owner's groups (M38) — match a grant, always with the owner's own
+    address; `sign_in` when it is terminated, a provider is configured, its
+    owner reports `CAP_SIGN_IN` and a grant names an `oidc:` group, with
+    those groups. The provider's own service on its own node is always open,
+    and cannot be put in a group. `/poll` sends `access` for the polling
+    node's own non-denied services only, pending ones included so the rules
+    are ready at approval; `GET /admin/access/{services,nodes}/…` explains
+    with the same function. `ServiceInfo.auth`, the marks' routes and
+    `service-auth` / `approve-service --auth` are gone.
+
+217. **The firewall admits the granted sources, per packet.** `ServiceRule`
+    carries `sources` (`None`: everyone); `forward_rewrite` in `svc-pre` gets
+    `ip saddr { … }` first, so a source left out is never rewritten nor
+    marked and meets the refusal of an unpublished port — including on its
+    open connections, since the rewrite runs before conntrack. An empty list
+    emits no rewrite (nft has no empty set literal) but keeps the address in
+    the refusal. `svc-out`, the node's own clients, is never filtered. The
+    agent saves `own_access` before the rest of the cycle, since
+    `last_directory` is saved only after all of it succeeds and the
+    terminator must never enforce older grants than the firewall; sources
+    outside the pinned mesh range are dropped. A declared service with no
+    access entry opens nothing; a `sign_in` service's terminated 443 is open
+    to every node while its terminator serves it, and every other mapping —
+    and that one otherwise — admits the sources alone.
+
+218. **The terminator checks every request: device, then sign-in.**
+    `TlsService.access` feeds a `Policy` kept in its own map and replaced in
+    place on every check-in, and `service_fn` looks the policy and the caller
+    up per request — so a grant taken away, or a node revoked, reaches an
+    open keep-alive or HTTP/2 connection at its next request (review finding
+    3; an upgraded WebSocket stays out of reach). An open service or a
+    granted caller goes on; anyone else, with `sign_in`, is asked about, and
+    one of `sign_in_groups` in the provider's groups header lets them in,
+    anything else is 403; without `sign_in`, 403. The identity headers are
+    named once (`WIRESERVE_AUTH_{USER,EMAIL,GROUPS}_HEADER`, replacing
+    `WIRESERVE_AUTH_COPY_HEADERS`), carried in `ServiceNaming` and
+    `TlsConfig`, and removed from every request on every service, provider
+    or not.
+
+219. **The admin's commands.** `group create|delete|list`,
+    `group add|remove <group> <service>`, `grant add|remove <source> <group>`,
+    `grant list`, `tag add|remove <node> <tag>`, `access <service>` and
+    `access --node <node>`; `list-services` shows `groups=`.

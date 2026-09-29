@@ -14,6 +14,9 @@ pub enum AppError {
     Forbidden(String),
     #[error("not found")]
     NotFound,
+    /// A 404 that says what is missing.
+    #[error("{0}")]
+    NoSuch(String),
     #[error("too many requests")]
     TooManyRequests,
     #[error(transparent)]
@@ -40,6 +43,7 @@ impl IntoResponse for AppError {
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             AppError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
+            AppError::NoSuch(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             AppError::TooManyRequests => {
                 (StatusCode::TOO_MANY_REQUESTS, "too many requests".to_string())
             }

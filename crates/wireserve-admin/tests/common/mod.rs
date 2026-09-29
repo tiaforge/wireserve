@@ -296,6 +296,7 @@ async fn list_peers(
         via_gateway: vec![],
         exit_offering: vec![],
         exit_devices: vec![],
+        tags: Default::default(),
     }))
 }
 

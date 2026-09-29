@@ -69,10 +69,22 @@ pub fn admin_router(state: AppState) -> Router {
         )
         .route("/admin/peers", get(admin::list_peers))
         .route("/admin/services", get(admin::list_services))
+        .route("/admin/groups", get(admin::list_groups).post(admin::create_group))
+        .route("/admin/groups/{group}", axum::routing::delete(admin::delete_group))
         .route(
-            "/admin/services/{name}/auth",
-            axum::routing::put(admin::set_service_auth),
+            "/admin/groups/{group}/services/{service}",
+            axum::routing::put(admin::add_group_member).delete(admin::remove_group_member),
         )
+        .route(
+            "/admin/grants",
+            get(admin::list_grants).post(admin::add_grant).delete(admin::remove_grant),
+        )
+        .route(
+            "/admin/nodes/{name}/tags/{tag}",
+            axum::routing::put(admin::add_tag).delete(admin::remove_tag),
+        )
+        .route("/admin/access/services/{name}", get(admin::service_access_report))
+        .route("/admin/access/nodes/{name}", get(admin::node_access_report))
         .route(
             "/admin/nodes/{name}/services/{service}/approve",
             post(admin::approve_service),

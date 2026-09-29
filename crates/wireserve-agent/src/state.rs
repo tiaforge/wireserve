@@ -100,6 +100,17 @@ pub struct AgentState {
     /// carry `routes::LOCAL_ROUTE_PROTO`, and startup sweeps them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_routes: Vec<std::net::Ipv4Addr>,
+    /// Who may reach each of this node's own services (PLAN.md M36), from
+    /// the last poll that returned any directory at all — saved before the
+    /// rest of that cycle runs, unlike `last_directory`, so the terminator
+    /// never enforces grants older than the firewall's. An own service
+    /// missing here is closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub own_access: Vec<wireserve_types::ServiceAccess>,
+    /// What the coordinator said about the groups this node's declarations
+    /// named, as of the last poll; shown by `wireserve list`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_notices: Vec<wireserve_types::ServiceNotice>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +182,25 @@ mod tests {
     }
 
     #[test]
+    fn a_state_file_from_before_grants_loads_with_nothing_granted_yet() {
+        // PLAN.md M36: written by the previous version. Its services stay
+        // closed only until the first poll brings their access.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-state.json");
+        std::fs::write(
+            &path,
+            r#"{"coordinator_url":"https://c","bearer_token":"b","private_key":null,"public_key":null,
+                "ip4":"10.9.0.1","ip6":null,"listen_port":51820,"endpoint_addr":null,
+                "declared_services":[{"name":"plex","ports":[{"public":443,"target":32400,"proto":"tcp"}]}],
+                "last_directory":null}"#,
+        )
+        .unwrap();
+        let state = AgentState::load(&path).unwrap();
+        assert_eq!(state.declared_services[0].group, None);
+        assert!(state.own_access.is_empty() && state.service_notices.is_empty());
+    }
+
+    #[test]
     fn save_then_load_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent-state.json");
@@ -182,6 +212,7 @@ mod tests {
         state.declared_services.push(ServiceDecl {
             name: "plex".into(),
             ports: vec![],
+            group: None,
         });
         state.save(&path).unwrap();
 

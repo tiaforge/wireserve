@@ -7,7 +7,7 @@ use wireserve_types::{
 };
 
 use crate::auth::AdminAuth;
-use crate::db::{nodes, services};
+use crate::db::{grants, nodes, services};
 use crate::error::AppError;
 use crate::state::AppState;
 use crate::tokengen;
@@ -267,7 +267,7 @@ pub async fn list_services(
 ) -> Result<Json<AdminServicesResponse>, AppError> {
     let conn = state.db.conn.lock().await;
     let rows = services::list_all_for_admin(&conn)?;
-    let auth = services::auth_names(&conn)?;
+    let members = crate::db::grants::members(&conn)?;
     let owners: std::collections::HashMap<i64, nodes::NodeRow> = nodes::list_all_peers(&conn)?
         .into_iter()
         .map(|n| (n.id, n))
@@ -278,7 +278,8 @@ pub async fn list_services(
             owners
                 .get(&s.node_id)
                 .map(|owner| {
-                    let mut info = crate::directory::admin_service_info(s, owner, auth.contains(&s.name));
+                    let groups = crate::db::grants::effective_groups(&members, &s.name).into_iter().collect();
+                    let mut info = crate::directory::admin_service_info(s, owner, groups);
                     if s.is_approved() {
                         info.dns = state.dns.as_ref().and_then(|d| d.state_of(&s.name));
                     }
@@ -289,65 +290,319 @@ pub async fn list_services(
     Ok(Json(AdminServicesResponse { services: out }))
 }
 
-/// `PUT /admin/services/{name}/auth` (PLAN.md M29, M34): put the built-in
-/// sign-in in front of a service, or take it away.
-///
-/// Turning it on is where everything that could leave a marked service open
-/// is refused: the mesh must have a sign-in (`WIRESERVE_AUTH_SERVICE`, which
-/// needs DNS records and so a service domain); the service must be one a
-/// terminator serves (TCP 443, an address of its own) and not the sign-in
-/// itself; and its node must report `sign-in`, since an agent without the
-/// built-in sign-in would leave the service unserved.
-///
-/// Turning it off is never refused. Nor is marking a name nothing declares:
-/// it waits, and whoever declares it is published behind the sign-in.
-pub async fn set_service_auth(
+fn check_label(what: &str, name: &str) -> Result<(), AppError> {
+    if wireserve_types::is_valid_dns_label(name) {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(format!("invalid {what} name: {name}")))
+    }
+}
+
+/// `GET /admin/groups` (PLAN.md M36): every service group, what is in it
+/// and who it is granted to.
+pub async fn list_groups(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+) -> Result<Json<wireserve_types::GroupsResponse>, AppError> {
+    let conn = state.db.conn.lock().await;
+    let rules = crate::access::read_rules(&conn)?;
+    let declared: Vec<String> = services::list_all_for_admin(&conn)?.into_iter().map(|s| s.name).collect();
+    let groups = grants::list_groups(&conn)?
+        .into_iter()
+        .map(|name| {
+            let services: Vec<String> = if name == wireserve_types::DEFAULT_GROUP {
+                let mut in_default: std::collections::BTreeSet<String> = declared
+                    .iter()
+                    .filter(|s| !rules.members.contains_key(*s))
+                    .cloned()
+                    .collect();
+                in_default.extend(rules.members.iter().filter(|(_, g)| g.contains(&name)).map(|(s, _)| s.clone()));
+                in_default.into_iter().collect()
+            } else {
+                rules.members.iter().filter(|(_, g)| g.contains(&name)).map(|(s, _)| s.clone()).collect()
+            };
+            let granted_to = rules.grants.iter().filter(|g| g.group == name).map(|g| g.source.clone()).collect();
+            wireserve_types::GroupInfo { name, services, granted_to }
+        })
+        .collect();
+    Ok(Json(wireserve_types::GroupsResponse { groups }))
+}
+
+/// `POST /admin/groups`: a new, empty service group. Creating one that
+/// exists is not an error.
+pub async fn create_group(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Json(body): Json<wireserve_types::CreateGroupRequest>,
+) -> Result<StatusCode, AppError> {
+    check_label("group", &body.name)?;
+    let conn = state.db.conn.lock().await;
+    if grants::create_group(&conn, &body.name)? {
+        tracing::info!(event = "service_group_created", group = %body.name);
+        Ok(StatusCode::CREATED)
+    } else {
+        Ok(StatusCode::OK)
+    }
+}
+
+/// `DELETE /admin/groups/{group}`. Refused for `default`, and while any
+/// service, grant or pending declaration uses the group: deleting it would
+/// drop its services back into `default`, which everyone may reach.
+pub async fn delete_group(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path(group): Path<String>,
+) -> Result<(), AppError> {
+    check_label("group", &group)?;
+    let conn = state.db.conn.lock().await;
+    match grants::delete_group(&conn, &group)? {
+        grants::DeleteGroupOutcome::Deleted => {
+            tracing::info!(event = "service_group_deleted", group = %group);
+            Ok(())
+        }
+        grants::DeleteGroupOutcome::NotFound => Err(AppError::NoSuch(format!("no group {group}"))),
+        grants::DeleteGroupOutcome::Builtin => {
+            Err(AppError::BadRequest("default is where every service without a group is; it stays".into()))
+        }
+        grants::DeleteGroupOutcome::InUse { services, grants, declared_by } => {
+            let mut why = Vec::new();
+            if !services.is_empty() {
+                why.push(format!("it holds {} (they would fall back into default)", services.join(", ")));
+            }
+            if grants > 0 {
+                why.push(format!("{grants} grant(s) name it"));
+            }
+            if !declared_by.is_empty() {
+                why.push(format!("{} declared it and wait(s) for approval", declared_by.join(", ")));
+            }
+            Err(AppError::Conflict(format!("group {group} is in use: {}", why.join("; "))))
+        }
+    }
+}
+
+/// `PUT /admin/groups/{group}/services/{service}`: puts a service name in a
+/// group, declared or not — which takes it out of `default`.
+pub async fn add_group_member(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path((group, service)): Path<(String, String)>,
+) -> Result<Json<wireserve_types::MembershipResponse>, AppError> {
+    check_label("group", &group)?;
+    check_label("service", &service)?;
+    if state.config.sign_in.as_ref().is_some_and(|si| si.service == service) {
+        return Err(AppError::BadRequest(format!(
+            "{service} is the sign-in: every terminator and every browser signing in must reach it, so it stays open"
+        )));
+    }
+    let conn = state.db.conn.lock().await;
+    match grants::add_member(&conn, &group, &service)? {
+        grants::AddMemberOutcome::NoSuchGroup => return Err(AppError::NoSuch(format!("no group {group}"))),
+        grants::AddMemberOutcome::Added => {
+            tracing::info!(event = "service_group_member_added", group = %group, service = %service);
+        }
+        grants::AddMemberOutcome::AlreadyMember => {}
+    }
+    membership(&conn, service)
+}
+
+/// `DELETE /admin/groups/{group}/services/{service}`. Removing its last
+/// group puts the service back in `default`; the answer says so by listing
+/// it.
+pub async fn remove_group_member(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path((group, service)): Path<(String, String)>,
+) -> Result<Json<wireserve_types::MembershipResponse>, AppError> {
+    check_label("group", &group)?;
+    check_label("service", &service)?;
+    let conn = state.db.conn.lock().await;
+    match grants::remove_member(&conn, &group, &service)? {
+        grants::RemoveMemberOutcome::NotMember => {
+            return Err(AppError::NoSuch(format!("{service} is not in group {group}")));
+        }
+        grants::RemoveMemberOutcome::Removed { now_default } => {
+            tracing::info!(event = "service_group_member_removed", group = %group, service = %service, now_default);
+        }
+    }
+    membership(&conn, service)
+}
+
+fn membership(
+    conn: &rusqlite::Connection,
+    service: String,
+) -> Result<Json<wireserve_types::MembershipResponse>, AppError> {
+    let groups = grants::effective_groups(&grants::members(conn)?, &service).into_iter().collect();
+    Ok(Json(wireserve_types::MembershipResponse { service, groups }))
+}
+
+/// `GET /admin/grants`.
+pub async fn list_grants(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+) -> Result<Json<wireserve_types::GrantsResponse>, AppError> {
+    let conn = state.db.conn.lock().await;
+    let grants = grants::list_grants(&conn)?
+        .into_iter()
+        .map(|g| wireserve_types::GrantInfo { source: g.source, group: g.group })
+        .collect();
+    Ok(Json(wireserve_types::GrantsResponse { grants }))
+}
+
+/// `POST /admin/grants`: lets a source reach every service in a group.
+pub async fn add_grant(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Json(body): Json<wireserve_types::GrantInfo>,
+) -> Result<StatusCode, AppError> {
+    check_label("group", &body.group)?;
+    let conn = state.db.conn.lock().await;
+    match grants::add_grant(&conn, &body.source, &body.group)? {
+        grants::AddGrantOutcome::NoSuchGroup => Err(AppError::NoSuch(format!("no group {}", body.group))),
+        grants::AddGrantOutcome::Added => {
+            tracing::info!(event = "grant_added", source = %body.source, group = %body.group);
+            Ok(StatusCode::CREATED)
+        }
+        grants::AddGrantOutcome::AlreadyGranted => Ok(StatusCode::OK),
+    }
+}
+
+/// `DELETE /admin/grants`, with the grant in the body.
+pub async fn remove_grant(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Json(body): Json<wireserve_types::GrantInfo>,
+) -> Result<(), AppError> {
+    check_label("group", &body.group)?;
+    let conn = state.db.conn.lock().await;
+    if !grants::remove_grant(&conn, &body.source, &body.group)? {
+        return Err(AppError::NoSuch(format!("{} is not granted {}", body.source, body.group)));
+    }
+    tracing::info!(event = "grant_removed", source = %body.source, group = %body.group);
+    Ok(())
+}
+
+/// `PUT /admin/nodes/{name}/tags/{tag}`: tags are admin-only, since a tag
+/// grants access — a node never tags itself.
+pub async fn add_tag(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path((name, tag)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    check_label("node", &name)?;
+    check_label("tag", &tag)?;
+    let conn = state.db.conn.lock().await;
+    let node = nodes::find_by_name(&conn, &name)?.ok_or_else(|| AppError::NoSuch(format!("no node {name}")))?;
+    if grants::add_tag(&conn, node.id, &tag)? {
+        tracing::info!(event = "node_tag_added", node_name = %name, tag = %tag);
+        Ok(StatusCode::CREATED)
+    } else {
+        Ok(StatusCode::OK)
+    }
+}
+
+/// `DELETE /admin/nodes/{name}/tags/{tag}`.
+pub async fn remove_tag(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path((name, tag)): Path<(String, String)>,
+) -> Result<(), AppError> {
+    check_label("node", &name)?;
+    check_label("tag", &tag)?;
+    let conn = state.db.conn.lock().await;
+    let node = nodes::find_by_name(&conn, &name)?.ok_or_else(|| AppError::NoSuch(format!("no node {name}")))?;
+    if !grants::remove_tag(&conn, node.id, &tag)? {
+        return Err(AppError::NoSuch(format!("{name} has no tag {tag}")));
+    }
+    tracing::info!(event = "node_tag_removed", node_name = %name, tag = %tag);
+    Ok(())
+}
+
+fn default_closed(rules: &crate::access::Rules) -> bool {
+    !rules
+        .grants
+        .iter()
+        .any(|g| g.source == wireserve_types::GrantSource::Everyone && g.group == wireserve_types::DEFAULT_GROUP)
+}
+
+/// `GET /admin/access/services/{name}`: who reaches a service and why —
+/// computed by the same function `/poll` hands its owner.
+pub async fn service_access_report(
     State(state): State<AppState>,
     _admin: AdminAuth,
     Path(name): Path<String>,
-    Json(body): Json<wireserve_types::SetServiceAuthRequest>,
-) -> Result<(), AppError> {
-    if !wireserve_types::is_valid_dns_label(&name) {
-        return Err(AppError::BadRequest(format!("invalid service name: {name}")));
-    }
+) -> Result<Json<wireserve_types::ServiceAccessReport>, AppError> {
+    check_label("service", &name)?;
     let conn = state.db.conn.lock().await;
-    if body.enabled {
-        let sign_in = state.config.sign_in.as_ref().ok_or_else(|| {
-            AppError::Conflict(
-                "this mesh has no sign-in — set WIRESERVE_AUTH_SERVICE (with WIRESERVE_SERVICE_DOMAIN \
-                 and WIRESERVE_DNS_PROVIDER) first"
-                    .into(),
-            )
-        })?;
-        if sign_in.service == name {
-            return Err(AppError::BadRequest("the sign-in service cannot sit behind itself".into()));
+    let rules = crate::access::read_rules(&conn)?;
+    let peers = nodes::list_all_peers(&conn)?;
+    let row = services::find_by_name(&conn, &name)?;
+    let owner = row.as_ref().and_then(|r| peers.iter().find(|n| n.id == r.node_id));
+    let tls_ready = crate::db::tls::ready(&conn)?;
+    let ctx = state.directory_context(&tls_ready);
+    let granted = rules.granted(&name);
+    let (open, sign_in, sign_in_groups) = match (&row, owner) {
+        (Some(row), Some(owner)) => {
+            let owner_capable = owner.pubkey.as_deref().is_some_and(|pk| {
+                state.transit.has_capability(pk, wireserve_types::CAP_SIGN_IN, state.config.online_threshold_secs)
+            });
+            let facts = crate::access::SignInFacts {
+                provider: state.config.sign_in.as_ref().map(|si| (si.service.as_str(), si.node.as_str())),
+                owner_capable,
+                terminated: ctx.terminates(row),
+            };
+            let a = crate::access::service_access(row, owner, &peers, &rules, &facts);
+            (a.open, a.sign_in, a.sign_in_groups)
         }
-        if let Some(service) = services::find_by_name(&conn, &name)? {
-            let served = service.vip4.is_some()
-                && service.ports.iter()
-                    .any(|m| m.public == wireserve_types::TLS_PUBLIC_PORT && m.proto == wireserve_types::Proto::Tcp);
-            if !served {
-                return Err(AppError::Conflict(format!(
-                    "'{name}' is not published on TCP 443 with an address of its own, so no terminator \
-                     serves it and there is nothing to put a sign-in in front of"
-                )));
-            }
-            let fresh = state.config.online_threshold_secs;
-            let capable = nodes::find_by_id(&conn, service.node_id)?
-                .and_then(|n| n.pubkey)
-                .is_some_and(|pk| state.transit.has_capability(&pk, wireserve_types::CAP_SIGN_IN, fresh));
-            if !capable {
-                return Err(AppError::Conflict(format!(
-                    "the node declaring '{name}' has not reported that its terminator puts a sign-in in \
-                     front of a service — upgrade its agent (and let it poll once) first"
-                )));
-            }
-        }
-    }
-    services::set_auth(&conn, &name, body.enabled)?;
-    tracing::info!(event = "service_auth_set", service = %name, enabled = body.enabled);
-    state.poke_dns();
-    Ok(())
+        _ => (granted.contains(&wireserve_types::GrantSource::Everyone), false, Vec::new()),
+    };
+    let nodes = if open {
+        Vec::new()
+    } else {
+        peers
+            .iter()
+            .filter_map(|n| {
+                let via: Vec<_> = rules.matching(n.id, &name).into_iter().collect();
+                (!via.is_empty()).then(|| wireserve_types::AccessVia { name: n.name.clone(), via })
+            })
+            .collect()
+    };
+    Ok(Json(wireserve_types::ServiceAccessReport {
+        service: name.clone(),
+        node: owner.map(|o| o.name.clone()),
+        groups: rules.groups_of(&name).into_iter().collect(),
+        granted_to: granted.into_iter().collect(),
+        open,
+        nodes,
+        sign_in,
+        sign_in_groups,
+        default_closed: default_closed(&rules),
+    }))
+}
+
+/// `GET /admin/access/nodes/{name}`: what a node reaches by who it is.
+pub async fn node_access_report(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path(name): Path<String>,
+) -> Result<Json<wireserve_types::NodeAccessReport>, AppError> {
+    check_label("node", &name)?;
+    let conn = state.db.conn.lock().await;
+    let node = nodes::find_by_name(&conn, &name)?.ok_or_else(|| AppError::NoSuch(format!("no node {name}")))?;
+    let rules = crate::access::read_rules(&conn)?;
+    let services = services::list_approved(&conn)?
+        .into_iter()
+        .filter(|s| s.node_id != node.id)
+        .filter_map(|s| {
+            let via: Vec<_> = rules.matching(node.id, &s.name).into_iter().collect();
+            (!via.is_empty()).then_some(wireserve_types::AccessVia { name: s.name, via })
+        })
+        .collect();
+    Ok(Json(wireserve_types::NodeAccessReport {
+        node: name,
+        principals: rules.principals(node.id).into_iter().collect(),
+        services,
+        default_closed: default_closed(&rules),
+    }))
 }
 
 /// Shared shape for the two approval endpoints: validate the service
@@ -722,6 +977,11 @@ pub async fn list_peers(
         .filter(|n| n.exit_enabled && n.gateway_node_id.is_some())
         .map(|n| n.name.clone())
         .collect();
+    let tags_by_id = grants::tags(&conn)?;
+    let tags = rows
+        .iter()
+        .filter_map(|n| Some((n.name.clone(), tags_by_id.get(&n.id)?.iter().cloned().collect())))
+        .collect();
     Ok(Json(AdminPeersResponse {
         peers,
         transit_approved,
@@ -729,5 +989,6 @@ pub async fn list_peers(
         via_gateway,
         exit_offering,
         exit_devices,
+        tags,
     }))
 }

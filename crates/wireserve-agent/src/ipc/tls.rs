@@ -108,10 +108,10 @@ async fn dispatch(ctx: &TlsContext, req: TlsRequest) -> TlsResponse {
 /// not the directory, because the directory leaves a mapping's target
 /// address out and the terminator needs it.
 ///
-/// A service marked for sign-in (PLAN.md M34) is served too, flagged, and
-/// the sign-in resolved to where it answers: the provider's service's own
-/// address, once its own node serves it with TLS — the terminator checks
-/// every request there over verified TLS.
+/// Each carries who may reach it (PLAN.md M36), and the sign-in is resolved
+/// to where it answers: the provider's service's own address, on the node
+/// named for it, once that node serves it with TLS — the terminator checks
+/// requests there over verified TLS.
 #[must_use]
 pub fn build_config(state: &AgentState) -> TlsConfig {
     let Some(directory) = &state.last_directory else {
@@ -129,20 +129,23 @@ pub fn build_config(state: &AgentState) -> TlsConfig {
     let Some(acme) = naming.acme.clone() else {
         return TlsConfig { callers, ..TlsConfig::default() };
     };
-    let own = node.to_string();
-    let marked = |name: &str| directory.services.iter().any(|s| s.name == name && s.ip4 == own && s.auth);
+    // Who may reach each one (PLAN.md M36), from the list saved before the
+    // rest of the poll cycle ran — never older than the firewall's.
+    let access = |name: &str| state.own_access.iter().find(|a| a.name == name).cloned();
     let services = state
         .declared_services
         .iter()
         .filter_map(|d| {
             let vip = crate::poll_loop::own_vip(&d.name, node, directory)?;
+            // No entry: not served at all, as the firewall opens nothing.
+            let access = access(&d.name)?;
             let map = d.ports.clone().into_iter().find(|m| m.public == TLS_PUBLIC_PORT && m.proto == Proto::Tcp)?;
             Some(TlsService {
                 name: d.name.clone(),
                 fqdn: format!("{}.{}", d.name, naming.domain),
                 vip,
                 upstream: SocketAddr::new(map.addr.unwrap_or(node).into(), map.target),
-                sign_in: marked(&d.name),
+                access,
             })
         })
         .collect();
@@ -154,11 +157,10 @@ pub fn build_config(state: &AgentState) -> TlsConfig {
             fqdn: format!("{}.{}", si.service, naming.domain),
             vip: provider.vip4.as_deref()?.parse().ok()?,
             verify_path: si.verify_path.clone(),
-            copy_headers: si.copy_headers.clone(),
             session_cookie: si.session_cookie.clone(),
         })
     });
-    TlsConfig { acme: Some(acme), services, callers, sign_in }
+    TlsConfig { acme: Some(acme), services, callers, sign_in, identity_headers: naming.identity_headers.clone() }
 }
 
 /// Publishes or withdraws a challenge value through the coordinator, for a
@@ -197,7 +199,7 @@ mod tests {
     use super::*;
     use wireserve_types::{AcmeSettings, PollResponse, ServiceDecl, ServiceNaming};
 
-    fn state(acme: bool, auth: bool) -> AgentState {
+    fn state(acme: bool, restricted: bool) -> AgentState {
         let directory: PollResponse = serde_json::from_value(serde_json::json!({
             "peers": [
                 {"name": "home", "pubkey": "pk-home", "ip4": "10.9.0.1", "ip6": ""},
@@ -205,7 +207,7 @@ mod tests {
             ],
             "services": [
                 {"name": "plex", "node": "home", "ip4": "10.9.0.1", "ports": [{"public": 443, "target": 443, "proto": "tcp"}], "online": true,
-                 "vip4": "10.9.0.50", "auth": auth},
+                 "vip4": "10.9.0.50"},
                 {"name": "prom", "node": "home", "ip4": "10.9.0.1", "ports": [{"public": 80, "target": 80, "proto": "tcp"}], "online": true,
                  "vip4": "10.9.0.51"},
                 {"name": "auth", "node": "gate", "ip4": "10.9.0.2", "ports": [{"public": 443, "target": 443, "proto": "tcp"}], "online": true,
@@ -221,10 +223,22 @@ mod tests {
                 service: "auth".into(),
                 node: "gate".into(),
                 verify_path: "/verify".into(),
-                copy_headers: vec!["x-auth-user".into()],
                 session_cookie: "authward_session".into(),
             }),
+            identity_headers: wireserve_types::IdentityHeaders::default(),
         });
+        let open = |name: &str| wireserve_types::ServiceAccess { name: name.into(), open: true, ..Default::default() };
+        let plex = if restricted {
+            wireserve_types::ServiceAccess {
+                name: "plex".into(),
+                sources: vec!["10.9.0.1".parse().unwrap()],
+                sign_in: true,
+                sign_in_groups: vec!["family".into()],
+                ..Default::default()
+            }
+        } else {
+            open("plex")
+        };
         AgentState {
             ip4: Some("10.9.0.1".into()),
             declared_services: vec![
@@ -233,6 +247,7 @@ mod tests {
                 ServiceDecl::new("router", vec!["443:192.168.1.1:80".parse().unwrap()]),
             ],
             last_directory: Some(directory),
+            own_access: vec![plex, open("prom"), open("router")],
             ..AgentState::default()
         }
     }
@@ -255,9 +270,17 @@ mod tests {
     }
 
     #[test]
-    fn a_marked_service_is_served_flagged_with_the_sign_in_resolved() {
+    fn a_service_nobody_was_granted_is_not_served() {
+        let mut st = state(true, false);
+        st.own_access.retain(|a| a.name != "plex");
+        assert!(build_config(&st).services.is_empty());
+    }
+
+    #[test]
+    fn a_restricted_service_is_served_with_its_access_and_the_sign_in_resolved() {
         let cfg = build_config(&state(true, true));
-        assert!(cfg.services[0].sign_in);
+        assert!(!cfg.services[0].access.open);
+        assert_eq!(cfg.services[0].access.sign_in_groups, ["family"]);
         let si = cfg.sign_in.expect("the provider is terminated, so it can be reached");
         assert_eq!((si.fqdn.as_str(), si.vip), ("auth.int.test", "10.9.0.60".parse().unwrap()));
 
