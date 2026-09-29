@@ -231,6 +231,15 @@ pub fn spawn(listener: TcpListener, tls: Arc<rustls::ServerConfig>, shared: Shar
                     let sign_in = read(&shared.sign_in).clone();
                     let identity = read(&shared.identity).clone();
                     let misdirected = policy.as_ref().is_some_and(|p| !for_this_service(&req, &p.fqdn));
+                    if misdirected {
+                        tracing::info!(
+                            service = policy.as_ref().map(|p| p.fqdn.as_str()).unwrap_or_default(),
+                            authority = req.uri().authority().map(|a| a.as_str()).unwrap_or_default(),
+                            host = ?req.headers().get(axum::http::header::HOST),
+                            version = ?req.version(),
+                            "misdirected request: it names another host"
+                        );
+                    }
                     prepare(req.headers_mut(), caller.as_ref().map(|c| c.node.as_str()));
                     req.extensions_mut().insert(ConnectInfo(peer));
                     async move {
