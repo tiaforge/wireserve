@@ -11,9 +11,9 @@ source of truth for *current status*, the spec is the source of truth for
 **Currently working on:** M36 (service groups, grants and tags; items 212+),
 then M37 (caching `/verify`) and M38 (device owners through OIDC). The plan
 is `~/.claude/plans/alright-then-lets-create-shimmying-panda.md` (not in the
-repo). Items 212–226 (M36–M38) are done. `run-grants-test.sh` passes
-(2026-09-29). Not run yet: the reworked `run-service-auth-test.sh` and
-`run-owner-test.sh`.
+repo). Items 212–226 (M36–M38) are done. `run-grants-test.sh`, the
+reworked `run-service-auth-test.sh` and `run-owner-test.sh` pass
+(2026-09-29).
 
 Everything that can be verified here now is. What remains unverified is
 scale (three nodes, not thirty), real WAN paths, and long-running
@@ -3547,6 +3547,6 @@ the shared laptop keeps the sign-in, the personal one no longer needs it.
 In-process, `tests/oidc_flow.rs` claims a device against an identity
 provider running in the test (discovery, JWKS, PKCE, signed ID tokens, a
 refused refresh); `deploy/e2e/run-owner-test.sh` does it against
-mock-oauth2-server, not yet run. The installer does not ask for the provider;
+mock-oauth2-server, and passes (2026-09-29). The installer does not ask for the provider;
 the settings go into `coordinator.env` by hand, where `--reconfigure` leaves
 them.

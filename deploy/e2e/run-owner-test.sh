@@ -41,8 +41,13 @@ DEBUG_IMG=wireserve-e2e-debug-tools
 MOCK_IMG=ghcr.io/navikt/mock-oauth2-server:latest
 ADMIN_TOKEN=owner-test-admin-token
 WG_PORT=51820
+# The coordinator by name, which curl is told the address of (--resolve):
+# the helper containers that play the browser have no name service of the
+# network. The provider by address, known once it runs — its issuer is the
+# address it is asked on, so the coordinator and the browser must both use it.
 PUBLIC=http://coord:47820
-ISSUER=http://mock:8080/default
+ISSUER=""
+COORD_IP=""
 WORK=""
 
 log()  { echo; echo "=== $* ==="; }
@@ -92,7 +97,9 @@ wait_for() {
     fail "timed out after ${secs}s waiting for: $what"
 }
 # The browser: curl in the laptop's network, with a cookie jar.
-browser() { in_netns "$LAPTOP" curl -s --max-time 15 -b /work/jar -c /work/jar "$@"; }
+browser() {
+    in_netns "$LAPTOP" curl -sS --max-time 15 --resolve "coord:47820:$COORD_IP" -b /work/jar -c /work/jar "$@"
+}
 
 log "checking prerequisites"
 command -v podman >/dev/null || fail "podman not found on PATH"
@@ -110,8 +117,12 @@ pass "images built"
 
 log "the identity provider, and a coordinator using it"
 podman network create --internal "$NET" >/dev/null
-podman run -d --name "$MOCK" --network "$NET" --network-alias mock \
+podman run -d --name "$MOCK" --network "$NET" \
     -e SERVER_PORT=8080 -e JSON_CONFIG='{"interactiveLogin": true}' "$MOCK_IMG" >/dev/null
+sleep 2
+ISSUER="http://$(ip_on "$MOCK" "$NET"):8080/default"
+mock_up() { in_netns "$MOCK" curl -sf --max-time 3 "$ISSUER/.well-known/openid-configuration" >/dev/null; }
+wait_for "the provider to answer" 60 mock_up
 podman run -d --name "$COORD" --network "$NET" --network-alias coord \
     -e WIRESERVE_ADMIN_TOKEN="$ADMIN_TOKEN" -e WIRESERVE_REQUIRE_SERVICE_APPROVAL=false \
     -e WIRESERVE_PUBLIC_URL="$PUBLIC" \
@@ -144,14 +155,16 @@ refused "$TV" || fail "the tv reached db"
 pass "db is in infra; nobody but home reaches it"
 
 log "1/5: the claim link leads through the provider to a confirmation"
-URL=$(admin claim-url node-laptop 2>&1 | grep -oE "$PUBLIC/claim/clm_[0-9a-f]+")
-[ -n "$URL" ] || fail "claim-url printed no link"
-AUTH=$(browser -o /dev/null -w '%{redirect_url}' "$URL")
-case "$AUTH" in "$ISSUER/authorize?"*) ;; *) fail "the link did not lead to the provider: '$AUTH'" ;; esac
-CALLBACK=$(browser -o /dev/null -w '%{redirect_url}' --data-urlencode username=alice \
-    --data-urlencode 'claims={"groups":["family"],"email":"alice@example.com"}' "$AUTH")
-case "$CALLBACK" in "$PUBLIC/claim/callback?"*) ;; *) fail "the provider did not send the browser back: '$CALLBACK'" ;; esac
-browser "$CALLBACK" > "$WORK/confirm.html"
+CLAIM_OUT=$(admin claim-url node-laptop 2>&1) || fail "claim-url failed: $CLAIM_OUT"
+URL=$(printf '%s\n' "$CLAIM_OUT" | grep -oE "$PUBLIC/claim/clm_[0-9a-f]+" || true)
+[ -n "$URL" ] || fail "claim-url printed no link: $CLAIM_OUT"
+AUTH=$(browser -o "/work/start.html" -w '%{redirect_url}' "$URL") || fail "the browser could not open the link"
+case "$AUTH" in "$ISSUER/authorize?"*) ;; *) cat "$WORK/start.html" >&2; fail "the link did not lead to the provider: '$AUTH'" ;; esac
+CALLBACK=$(browser -o "/work/login.html" -w '%{redirect_url}' --data-urlencode username=alice \
+    --data-urlencode 'claims={"groups":["family"],"email":"alice@example.com"}' "$AUTH") \
+    || fail "the browser could not post the provider's login form"
+case "$CALLBACK" in "$PUBLIC/claim/callback?"*) ;; *) cat "$WORK/login.html" >&2; fail "the provider did not send the browser back: '$CALLBACK'" ;; esac
+browser "$CALLBACK" > "$WORK/confirm.html" || fail "the browser could not come back from the provider"
 grep -q 'node-laptop' "$WORK/confirm.html" || { cat "$WORK/confirm.html"; fail "the confirmation does not name the node"; }
 grep -q 'alice@example.com' "$WORK/confirm.html" || fail "the confirmation does not name who signed in"
 TOKEN=$(sed -n 's/.*name="token" value="\([0-9a-f]*\)".*/\1/p' "$WORK/confirm.html")
