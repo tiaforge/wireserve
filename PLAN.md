@@ -11,8 +11,8 @@ source of truth for *current status*, the spec is the source of truth for
 **Currently working on:** M36 (service groups, grants and tags; items 212+),
 then M37 (caching `/verify`) and M38 (device owners through OIDC). The plan
 is `~/.claude/plans/alright-then-lets-create-shimmying-panda.md` (not in the
-repo). Items 212–226 (M36–M38) are done. Not run yet: the rootful e2e
-suites `run-grants-test.sh`, the reworked `run-service-auth-test.sh` and
+repo). Items 212–226 (M36–M38) are done. `run-grants-test.sh` passes
+(2026-09-29). Not run yet: the reworked `run-service-auth-test.sh` and
 `run-owner-test.sh`.
 
 Everything that can be verified here now is. What remains unverified is
