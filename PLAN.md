@@ -3686,3 +3686,13 @@ them.
     identity headers, the node's name) come after and are unaffected. A
     proxy in front of the terminator that legitimately forwards one of these
     to a backend behind it would now lose it; none is known.
+
+233. **The trust model is written down** (security audit 2026-09-29, finding
+    9 and the provider note). The README gains *What you trust a node with*
+    — what a joined node sees, reports unchecked, declares, and gains by an
+    approved 443 service, what it cannot do, the reach of the `wireserve`
+    group, that identity is the device's, and the coordinator's one lock — and
+    a paragraph under *Signing in* on binding sessions to the device: which
+    providers do (authward, authentik) and which describe no such thing
+    (Authelia and oauth2-proxy, from their documentation, not their code).
+    No code changed: none of these has a fix short of a different design.

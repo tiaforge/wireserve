@@ -828,6 +828,23 @@ nobody gets in by signing in until the named node serves it again. Without
 provider's own service stays open to every node and cannot be put in a group:
 every terminator and every browser signing in has to reach it.
 
+**Bind sessions to the device, or approving a service means trusting its owner
+with everyone's sessions.** The provider's cookie is scoped to the whole
+domain, so the browser sends it to every service, and whoever runs a service
+under the domain can read it there and replay it at another. wireserve can only
+tell the provider which device is asking: every terminator sends the calling
+device's mesh address as the one `X-Forwarded-For` value on the check (and the
+provider's own terminator hands it on unchanged), and a provider that binds a
+session to the address it was created from then refuses the replay. authward
+does, with `bind_session_to_client_ip` (on by default). authentik does too
+(the *User Login* stage's session binding, to the network, or the exact IP).
+Authelia and oauth2-proxy use the client address for their own access rules,
+but their documentation describes no session binding: behind them the
+exposure stays, and the answer is to be careful which nodes you approve
+services for. Sessions created before a provider starts binding stay unbound
+until they expire, and a browser on a node that hosts services looks like that
+node, not like a different device.
+
 Worth knowing:
 
 - **Only HTTP can tell people apart.** Two people on one laptop send the same
@@ -979,6 +996,40 @@ everything, as a Pi-hole or AdGuard Home does, and if it goes down, so does
 the phone's DNS until you switch the tunnel off. It must also be on the mesh
 (a service, or a node's own address): the mesh profile carries nothing else,
 so a public resolver would be asked outside the tunnel and name nothing.
+
+### What you trust a node with
+
+Every node holds a bearer token, and `wireserve-admin` approves the rest. What
+that lets a node do, and what it does not:
+
+| A node, once joined | |
+| --- | --- |
+| Sees | The whole directory: every node's name, mesh addresses, public endpoint and LAN address, and every approved service's name and ports (a service's LAN target address is left out). Do not join a machine that should not learn where the others are. |
+| Reports, unchecked | Its own endpoint, LAN and reflexive addresses. The coordinator checks their form, not their truth, so a node can make its peers send WireGuard handshake packets to addresses it names — one small fixed packet per attempt, including to addresses on the peer's own LAN. It gains no access by it. |
+| Declares services | Nothing is published without an admin's approval (the default), and only 16 may be waiting or denied at a time. A name is first come, first served; another node's name, the coordinator's own and `WIRESERVE_RESERVED_SERVICE_NAMES` cannot be taken. |
+| Owns an approved service on 443 | A real certificate for the name, every request made to it and the cookies in them — including the sign-in provider's session cookie, which is why binding sessions to the device matters (see *Signing in*). Approve such a service the way you would hand someone a login page. |
+| Cannot | Carry other nodes' traffic (transit and exit each need an admin's approval and the node's own opt-in), change groups, grants, tags or owners, publish a DNS record the zone already holds, or be told who owns a device that has never called it. |
+
+Two more things to know about a machine that runs an agent:
+
+- **The `wireserve` group is not a convenience group.** Its members can
+  `serve` (a service pointed at any address the node reaches, which an admin's
+  approval then publishes to the mesh), `unserve`, `leave`, and switch transit
+  and exit on. Treat membership as administering the node's network; give it to
+  the people who could `sudo` anyway.
+- **Identity is the device's.** Whoever can send packets from a node — another
+  local user, a container — acts with its grants and, if it is claimed, its
+  owner's identity headers. On a machine several people use, tag the machine
+  for what all of them may use, and leave the rest to each service's own login.
+
+And on the coordinator: there is one database connection behind one lock, so
+what a node does inside its allowance (`WIRESERVE_POLL_RATE_*`, the pending
+limit, the challenge limit) still queues behind everyone else's. Rate-limit by
+address at the reverse proxy too, and put `WIRESERVE_TRUSTED_PROXY` on it so the
+address the limiter and the log see is the client's. A terminator closes
+connections that say nothing, and caps each address at 128 and the node at
+4096, but a client dripping a request body slowly holds one of its own 128 for
+as long as the backend allows.
 
 ### 5. When a machine is lost or compromised
 
