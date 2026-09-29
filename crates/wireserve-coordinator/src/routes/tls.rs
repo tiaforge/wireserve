@@ -26,6 +26,15 @@ use crate::state::AppState;
 /// crashed mid-order leaves behind.
 const CHALLENGE_TTL_MINUTES: i64 = 10;
 
+/// What one node may ask for, at once and then per minute. Every new value
+/// is a write to the operator's DNS provider, and a later removal of it
+/// another; a node looping on this would spend the provider's API allowance
+/// and stop every other record and certificate with it. A real order is one
+/// value, and the terminator issues one name at a time, each waiting a minute
+/// or more for the record to propagate.
+pub const CHALLENGE_BURST: u32 = 10;
+pub const CHALLENGES_PER_MIN: u32 = 3;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChallengeBody {
@@ -39,6 +48,12 @@ pub async fn add(
     Json(body): Json<ChallengeBody>,
 ) -> Result<StatusCode, AppError> {
     let (dns, record) = authorize(&state, &node, &body).await?;
+    if let crate::rate_limit::Take::Refused { log } = state.challenge_limiter.take(node.id) {
+        if log {
+            tracing::warn!(event = "challenge_rate_limited", node_name = %node.name, fqdn = %record, "asking for challenge records faster than the per-node limit");
+        }
+        return Err(AppError::TooManyRequests);
+    }
     let expires = Utc::now() + chrono::Duration::minutes(CHALLENGE_TTL_MINUTES);
     {
         let conn = state.db.conn.lock().await;

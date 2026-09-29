@@ -295,7 +295,7 @@ mod tests {
         assert!(members(&conn).unwrap().is_empty(), "a pending declaration seeds nothing");
         assert!(matches!(delete_group(&conn, "infra").unwrap(), DeleteGroupOutcome::InUse { declared_by, .. } if declared_by == ["db"]));
 
-        approve(&conn, id, "db").unwrap();
+        approve(&conn, id, "db", "10.9.0.0/24").unwrap();
         assert_eq!(effective_groups(&members(&conn).unwrap(), "db"), BTreeSet::from(["infra".to_string()]));
 
         // An admin moves it; re-declaring with the old group changes nothing.

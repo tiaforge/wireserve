@@ -308,6 +308,13 @@ One compromised node is enough. Set
 single-operator mesh where every node is already trusted and the round trip
 is pure ceremony.
 
+A node may have at most 16 services waiting for approval or denied at a time;
+a declaration past that is not taken and `wireserve list` says why, until an
+admin has decided some of the others. A denied service holds its name but not
+an address of the mesh's range. (A poll rate limit and the address range's
+size are the coordinator's other bounds on one node; see
+`deploy/env/coordinator.env.example`.)
+
 So the flow is two steps:
 
 ```sh

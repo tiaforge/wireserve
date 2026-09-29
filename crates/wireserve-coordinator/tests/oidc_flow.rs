@@ -178,6 +178,8 @@ fn app(issuer: &str) -> App {
         require_service_approval: false,
         reflexive_rate_limit_max: 1000,
         reflexive_rate_limit_window_secs: 60,
+        poll_rate_burst: 20,
+        poll_rate_per_min: 0,
     };
     let db = Db::open(db_file.path()).unwrap();
     let state = build_state(config, db);

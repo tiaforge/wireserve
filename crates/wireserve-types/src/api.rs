@@ -196,6 +196,15 @@ pub struct RegisterResponse {
 /// sides to agree on the number up front.
 pub const MAX_SERVICES_PER_NODE: usize = 64;
 
+/// How many of a node's services may be waiting for approval, or denied, at
+/// once, where approval is required. Each holds its name for the whole mesh
+/// and, while it waits, an address of the mesh's range: with the limit at
+/// [`MAX_SERVICES_PER_NODE`] a handful of nodes could take the whole range
+/// (a /24 has 254) with declarations nobody approved, and no new node could
+/// join. A node past it is told so (a notice), and declares more once an
+/// admin has decided some of these; it is never a failed poll.
+pub const MAX_UNAPPROVED_SERVICES_PER_NODE: usize = 16;
+
 /// Upper bound on `PollRequest::transit_reachable` — how many pubkeys a
 /// transit-capable node reports itself as currently, actually reaching
 /// (PLAN.md M23). Same order of magnitude as [`MAX_SERVICES_PER_NODE`],

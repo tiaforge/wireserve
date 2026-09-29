@@ -58,6 +58,15 @@ impl IntoResponse for AppError {
                 "pubkey already registered to another node".to_string(),
             ),
             AppError::Internal(DbError::ServiceNameCollision(_)) => unreachable!("handled above"),
+            AppError::Internal(DbError::Ipam(crate::ipam::IpamError::Exhausted)) => {
+                tracing::error!("the mesh address range is full");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the mesh's address range is full; an admin must free some (revoke and delete nodes nobody uses, \
+                     or deny services) or set a larger WIRESERVE_NET_V4_CIDR before more can join"
+                        .to_string(),
+                )
+            }
             AppError::Internal(DbError::NodeNotFound) => {
                 (StatusCode::NOT_FOUND, "not found".to_string())
             }

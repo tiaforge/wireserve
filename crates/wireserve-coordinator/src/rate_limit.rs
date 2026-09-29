@@ -347,9 +347,119 @@ impl RateLimiter {
     }
 }
 
+/// What a keyed bucket says about one request.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Take {
+    Allowed,
+    /// Over budget. `log` is true for the first refusal in a minute, so a
+    /// flood is one log line a minute and not one per request.
+    Refused { log: bool },
+}
+
+/// A token bucket per key: `capacity` requests at once, refilled at a steady
+/// `per_minute`. For what an *authenticated* caller may do to the
+/// coordinator — the failed-auth limiter above never sees a valid token, so
+/// a node with a good one could otherwise ask as often as it liked, each
+/// `/poll` reading every node and service and writing under the one database
+/// lock. `per_minute` of 0 turns it off.
+pub struct TokenBuckets {
+    capacity: f64,
+    per_sec: f64,
+    max_keys: usize,
+    inner: Mutex<HashMap<i64, Bucket>>,
+}
+
+struct Bucket {
+    tokens: f64,
+    at: Instant,
+    last_logged: Option<Instant>,
+}
+
+impl TokenBuckets {
+    #[must_use]
+    pub fn new(capacity: u32, per_minute: u32) -> Self {
+        Self {
+            capacity: f64::from(capacity.max(1)),
+            per_sec: f64::from(per_minute) / 60.0,
+            max_keys: MAX_TRACKED_SOURCES,
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn take(&self, key: i64) -> Take {
+        self.take_at(key, Instant::now())
+    }
+
+    fn take_at(&self, key: i64, now: Instant) -> Take {
+        if self.per_sec <= 0.0 {
+            return Take::Allowed;
+        }
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= self.max_keys {
+            // Nodes that have been quiet long enough to be full again cost
+            // nothing to forget.
+            let (cap, rate) = (self.capacity, self.per_sec);
+            map.retain(|_, b| b.tokens + now.duration_since(b.at).as_secs_f64() * rate < cap);
+        }
+        let b = map.entry(key).or_insert(Bucket { tokens: self.capacity, at: now, last_logged: None });
+        b.tokens = (b.tokens + now.duration_since(b.at).as_secs_f64() * self.per_sec).min(self.capacity);
+        b.at = now;
+        if b.tokens >= 1.0 {
+            b.tokens -= 1.0;
+            return Take::Allowed;
+        }
+        let log = b.last_logged.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60));
+        if log {
+            b.last_logged = Some(now);
+        }
+        Take::Refused { log }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bucket_allows_its_burst_then_refills_steadily_per_key() {
+        let l = TokenBuckets::new(3, 60); // one a second
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            assert_eq!(l.take_at(1, t0), Take::Allowed);
+        }
+        assert_eq!(l.take_at(1, t0), Take::Refused { log: true });
+        assert_eq!(l.take_at(1, t0), Take::Refused { log: false }, "one log line a minute");
+        assert_eq!(l.take_at(2, t0), Take::Allowed, "another node is unaffected");
+        assert_eq!(l.take_at(1, t0 + Duration::from_millis(1100)), Take::Allowed, "a second buys one");
+        assert!(matches!(l.take_at(1, t0 + Duration::from_millis(1200)), Take::Refused { .. }));
+        // Idle for a long time: full again, and never fuller than the burst.
+        let later = t0 + Duration::from_secs(3600);
+        for _ in 0..3 {
+            assert_eq!(l.take_at(1, later), Take::Allowed);
+        }
+        assert!(matches!(l.take_at(1, later), Take::Refused { .. }));
+    }
+
+    #[test]
+    fn a_rate_of_zero_is_no_limit() {
+        let l = TokenBuckets::new(1, 0);
+        for _ in 0..1000 {
+            assert_eq!(l.take(1), Take::Allowed);
+        }
+    }
+
+    #[test]
+    fn the_table_forgets_nodes_that_are_full_again() {
+        let mut l = TokenBuckets::new(2, 60);
+        l.max_keys = 3;
+        let t0 = Instant::now();
+        for k in 0..3 {
+            l.take_at(k, t0);
+        }
+        // Long after, a new key arrives at a full table: the old ones, refilled, go.
+        l.take_at(99, t0 + Duration::from_secs(600));
+        assert!(l.inner.lock().unwrap().len() <= 3);
+    }
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()

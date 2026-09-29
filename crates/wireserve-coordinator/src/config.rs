@@ -93,6 +93,11 @@ pub struct Config {
     /// throttle by mistake.
     pub reflexive_rate_limit_max: u32,
     pub reflexive_rate_limit_window_secs: u64,
+    /// How many `/poll`s one node may make at once, and how many a minute
+    /// it may keep making — per node, after it has authenticated. 0 a minute
+    /// turns the limit off.
+    pub poll_rate_burst: u32,
+    pub poll_rate_per_min: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -175,6 +180,8 @@ impl Config {
         let require_service_approval =
             env_parse_or("WIRESERVE_REQUIRE_SERVICE_APPROVAL", true)?;
         let reflexive_rate_limit_max = env_parse_or("WIRESERVE_REFLEXIVE_RATE_LIMIT_MAX", 20u32)?;
+        let poll_rate_burst = env_parse_or("WIRESERVE_POLL_RATE_BURST", 20u32)?;
+        let poll_rate_per_min = env_parse_or("WIRESERVE_POLL_RATE_PER_MIN", 30u32)?;
         let reflexive_rate_limit_window_secs =
             env_parse_or("WIRESERVE_REFLEXIVE_RATE_LIMIT_WINDOW_SECS", 10u64)?;
 
@@ -228,6 +235,8 @@ impl Config {
                 require_service_approval,
                 reflexive_rate_limit_max,
                 reflexive_rate_limit_window_secs,
+                poll_rate_burst,
+                poll_rate_per_min,
             },
             generated,
             secrets_path,

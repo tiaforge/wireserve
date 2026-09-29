@@ -51,6 +51,9 @@ fn test_config(db_path: &str) -> Config {
         require_service_approval: false,
         reflexive_rate_limit_max: 1000,
         reflexive_rate_limit_window_secs: 60,
+        // Off for most tests, which poll far faster than any node does.
+        poll_rate_burst: 20,
+        poll_rate_per_min: 0,
     }
 }
 
@@ -1919,7 +1922,11 @@ async fn pending_declarations_count_against_the_per_node_limit() {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM services", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 64, "pending rows are real rows and are bounded");
+        assert_eq!(
+            count,
+            i64::try_from(wireserve_types::MAX_UNAPPROVED_SERVICES_PER_NODE).unwrap(),
+            "pending rows are real rows and are bounded, well below what one node may declare"
+        );
     }
 
     let too_many: Vec<Value> = (0..65)
@@ -1930,6 +1937,116 @@ async fn pending_declarations_count_against_the_per_node_limit() {
         app.router.clone().oneshot(req).await.unwrap().status(),
         StatusCode::BAD_REQUEST
     );
+}
+
+fn many(prefix: &str, n: usize) -> Value {
+    Value::Array(
+        (0..n)
+            .map(|i| json!({ "name": format!("{prefix}{i}"), "ports": [{"public": 1000 + i, "target": 1000 + i, "proto": "tcp"}] }))
+            .collect(),
+    )
+}
+
+async fn admin_vip(app: &TestApp, name: &str) -> Value {
+    let (_, listed) = admin_call(&app.router, "GET", "/admin/services", json!(null)).await;
+    listed["services"].as_array().unwrap().iter().find(|s| s["name"] == name).map_or(Value::Null, |s| s["vip4"].clone())
+}
+
+#[tokio::test]
+async fn only_so_many_unapproved_services_are_taken_and_the_rest_are_told_so() {
+    let max = wireserve_types::MAX_UNAPPROVED_SERVICES_PER_NODE;
+    let app = approval_app();
+    let bearer = {
+        let t = admin_create_node(&app.router, "n1").await;
+        register_node(&app.router, &t, "n1", 51820).await["bearer_token"].as_str().unwrap().to_string()
+    };
+    let (status, body) = poll_with(&app.router, &bearer, many("svc", max + 4)).await;
+    assert_eq!(status, StatusCode::OK, "never a failed poll");
+    assert_eq!(body["pending_services"].as_array().unwrap().len(), max, "{body}");
+    let notices = body["service_notices"].as_array().unwrap();
+    assert_eq!(notices.len(), 4, "{body}");
+    assert!(notices[0]["reason"].as_str().unwrap().contains("waiting for approval"), "{body}");
+
+    // Deciding one makes room for one: an approved service no longer counts.
+    assert_eq!(admin_post(&app.router, "/admin/nodes/n1/services/svc0/approve").await, StatusCode::OK);
+    let (_, body) = poll_with(&app.router, &bearer, many("svc", max + 4)).await;
+    assert_eq!(body["pending_services"].as_array().unwrap().len(), max, "one more was taken: {body}");
+    assert_eq!(body["service_notices"].as_array().unwrap().len(), 3, "{body}");
+
+    // What is already there is never dropped for being over: the same list again changes nothing.
+    let (_, again) = poll_with(&app.router, &bearer, many("svc", max + 4)).await;
+    assert_eq!(again["pending_services"].as_array().unwrap().len(), max);
+}
+
+#[tokio::test]
+async fn where_nothing_needs_approval_there_is_no_such_limit() {
+    let app = test_app();
+    let t = admin_create_node(&app.router, "n1").await;
+    let bearer = register_node(&app.router, &t, "n1", 51820).await["bearer_token"].as_str().unwrap().to_string();
+    let (_, body) = poll_with(&app.router, &bearer, many("svc", 40)).await;
+    assert_eq!(body["services"].as_array().unwrap().len(), 40, "{body}");
+    assert!(body.get("service_notices").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn a_denied_service_holds_no_address_and_gets_one_if_approved_after_all() {
+    let app = approval_app();
+    let t = admin_create_node(&app.router, "n1").await;
+    let bearer = register_node(&app.router, &t, "n1", 51820).await["bearer_token"].as_str().unwrap().to_string();
+    poll_with(&app.router, &bearer, many("s", 2)).await;
+    let (a, b) = (admin_vip(&app, "s0").await, admin_vip(&app, "s1").await);
+    assert!(a.is_string() && b.is_string(), "a pending one waits with its address: {a} {b}");
+
+    assert_eq!(admin_post(&app.router, "/admin/nodes/n1/services/s0/deny").await, StatusCode::OK);
+    assert_eq!(admin_vip(&app, "s0").await, Value::Null, "denied: its address is free");
+    poll_with(&app.router, &bearer, many("s", 2)).await;
+    assert_eq!(admin_vip(&app, "s0").await, Value::Null, "and re-declaring it does not take one again");
+
+    // The freed address goes to the next service that needs one.
+    poll_with(&app.router, &bearer, many("s", 3)).await;
+    assert_eq!(admin_vip(&app, "s2").await, a, "the address s0 gave up");
+
+    assert_eq!(admin_post(&app.router, "/admin/nodes/n1/services/s0/approve").await, StatusCode::OK);
+    assert!(admin_vip(&app, "s0").await.is_string(), "approved after all: it has an address at once");
+}
+
+#[tokio::test]
+async fn a_full_address_range_is_said_plainly_and_is_not_a_server_error() {
+    let mut config = test_config("");
+    config.net_v4_cidr = "100.90.0.0/30".into(); // two usable addresses
+    let app = app_with_config(config);
+    for name in ["a", "b"] {
+        let t = admin_create_node(&app.router, name).await;
+        register_node(&app.router, &t, name, 51820).await;
+    }
+    let t = admin_create_node(&app.router, "c").await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(json_request("POST", "/register", None, json!({"join_token": t, "pubkey": pubkey_for("c"), "listen_port": 51820})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = body_json(resp).await;
+    assert!(body["error"].as_str().unwrap().contains("address range is full"), "{body}");
+}
+
+#[tokio::test]
+async fn one_node_cannot_poll_faster_than_its_share_and_the_others_do_not_notice() {
+    let mut config = test_config("");
+    config.poll_rate_burst = 3;
+    config.poll_rate_per_min = 1;
+    let app = app_with_config(config);
+    let mut bearers = Vec::new();
+    for name in ["busy", "quiet"] {
+        let t = admin_create_node(&app.router, name).await;
+        bearers.push(register_node(&app.router, &t, name, 51820).await["bearer_token"].as_str().unwrap().to_string());
+    }
+    for _ in 0..3 {
+        assert_eq!(poll_with(&app.router, &bearers[0], json!([])).await.0, StatusCode::OK);
+    }
+    assert_eq!(poll_with(&app.router, &bearers[0], json!([])).await.0, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(poll_with(&app.router, &bearers[1], json!([])).await.0, StatusCode::OK, "another node has its own budget");
 }
 
 #[tokio::test]
@@ -4049,6 +4166,32 @@ mod dns_records {
         let body = poll_seen(&app, &home, &[&tv]).await;
         let ids = body["identities"].as_array().expect("the visiting device's owner");
         assert_eq!((ids.len(), ids[0]["user"].as_str()), (1, Some("bob")), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_node_cannot_spend_the_dns_providers_allowance_on_challenges() {
+        let fake = Arc::new(FakeDns::default());
+        let app = app(&fake);
+        let home = node(&app, "home").await;
+        let other = node(&app, "other").await;
+        poll_with(&app.router, &home, json!([svc("plex", 443, 32400)])).await;
+        poll_with(&app.router, &other, json!([svc("web", 443, 8443)])).await;
+
+        let burst = wireserve_coordinator::routes::tls::CHALLENGE_BURST as usize;
+        for i in 0..burst {
+            let value = format!("{i:0>43}");
+            assert_eq!(challenge(&app, &home, "POST", "plex.int.example.com", &value).await, StatusCode::CREATED, "{i}");
+            // Withdrawing each at once, the way a looping node would, changes nothing.
+            assert_eq!(challenge(&app, &home, "DELETE", "plex.int.example.com", &value).await, StatusCode::NO_CONTENT);
+        }
+        let over = format!("{:0>43}", burst);
+        assert_eq!(challenge(&app, &home, "POST", "plex.int.example.com", &over).await, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(fake.take().len(), burst, "the provider was asked exactly the burst's worth, and not for the refused one");
+
+        // Another node's own name has its own budget, and a refused request from
+        // one that was never allowed does not spend the first one's.
+        assert_eq!(challenge(&app, &other, "POST", "web.int.example.com", DIGEST).await, StatusCode::CREATED);
+        assert_eq!(challenge(&app, &other, "POST", "plex.int.example.com", DIGEST).await, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

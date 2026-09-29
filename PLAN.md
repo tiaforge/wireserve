@@ -3608,3 +3608,29 @@ them.
     each logged, where before it was told all of them unasked. That would
     need proof of a connection, which a machine the owner controls cannot
     give.
+
+230. **One authenticated node cannot exhaust the coordinator** (security audit
+    2026-09-29, finding 4). Three ways were shown by test. (a) Unapproved
+    services took addresses of the mesh's range: four nodes declaring 64 each
+    used up a /24, and `/register` then failed with a bare 500 — no new node
+    could join. Where approval is required a node now has at most
+    `MAX_UNAPPROVED_SERVICES_PER_NODE` (16) services waiting or denied; a new
+    name past that is a notice, not a failed poll, and is taken once an admin
+    has decided some. A denied service keeps its name (it still must be
+    withdrawn or its node revoked) but no longer an address: `deny` frees it,
+    `assign_vip` skips it, `approve` assigns one at once. A full range is a
+    503 that says so. (b) `/poll` had no per-node throttle, and a poll costs
+    a read of every node and service under the one database lock: with 8
+    connections flooding, a legitimate poll took about 14 times as long. A
+    token bucket per node (`TokenBuckets`, `WIRESERVE_POLL_RATE_BURST` 20 and
+    `_PER_MIN` 30, ten times a node's need; 0 turns it off) answers 429, and
+    logs once a minute per node. (c) Adding and withdrawing `/tls/challenge`
+    values in a loop reached the DNS provider without bound — 60 cycles, 60
+    writes and 60 removals — enough to spend its API allowance and stop every
+    record and certificate. A bucket per node (burst 10, 3 a minute; a real
+    order is one value and the terminator issues one name at a time, each
+    waiting a minute or more) is checked after the name is authorised and
+    before the provider is called. Not done: the database is still one
+    connection behind one lock, so what a node does inside its allowance still
+    queues everyone; and the denied and pending rows of a revoked node's
+    names stay until the node is deleted.

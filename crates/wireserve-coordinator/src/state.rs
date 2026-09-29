@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::db::Db;
-use crate::rate_limit::RateLimiter;
+use crate::rate_limit::{RateLimiter, TokenBuckets};
 use crate::transit::TransitState;
 
 #[derive(Clone)]
@@ -10,6 +10,11 @@ pub struct AppState {
     pub db: Arc<Db>,
     pub config: Arc<Config>,
     pub rate_limiter: Arc<RateLimiter>,
+    /// What one authenticated node may ask of `/poll`, per node.
+    pub poll_limiter: Arc<TokenBuckets>,
+    /// What one node may ask of `/tls/challenge` — each new value is a call
+    /// to the operator's DNS provider — per node.
+    pub challenge_limiter: Arc<TokenBuckets>,
     /// Ephemeral transit-selection state (PLAN.md M23) — see
     /// `transit::TransitState`'s module doc for why this lives in memory
     /// rather than the database.

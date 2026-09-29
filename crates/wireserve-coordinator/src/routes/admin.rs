@@ -701,7 +701,7 @@ pub async fn approve_service(
 ) -> Result<(), AppError> {
     let node_id = resolve_node_for_service(&state, &name, &service).await?;
     let conn = state.db.conn.lock().await;
-    match services::approve(&conn, node_id, &service)? {
+    match services::approve(&conn, node_id, &service, &state.config.net_v4_cidr)? {
         services::ApproveOutcome::Approved => {
             tracing::info!(event = "service_approved", node_name = %name, service = %service);
             state.poke_dns();

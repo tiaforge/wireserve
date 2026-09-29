@@ -235,8 +235,32 @@ pub fn upsert_for_node(
     let mut notices = Vec::new();
     let explicit = super::grants::members(&tx)?;
     let mut accepted: Vec<&ServiceDecl> = Vec::with_capacity(desired.len());
+    // Where approval is required, only so many of a node's services may wait
+    // for it or be denied: see `MAX_UNAPPROVED_SERVICES_PER_NODE`. Counted
+    // once, then as new names are taken.
+    let mut unapproved: usize = if mode == ApprovalMode::RequireApproval {
+        let n: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM services WHERE node_id = ?1 AND approved_at IS NULL",
+            [node_id],
+            |row| row.get(0),
+        )?;
+        usize::try_from(n).unwrap_or(usize::MAX)
+    } else {
+        0
+    };
     for d in desired {
         let exists = current.contains(&d.name);
+        if !exists && mode == ApprovalMode::RequireApproval {
+            if unapproved >= wireserve_types::MAX_UNAPPROVED_SERVICES_PER_NODE {
+                notices.push(notice(&d.name, format!(
+                    "not published: {} of this node's services are already waiting for approval or denied, which is the \
+                     limit; declare it again once an admin has decided some of them",
+                    wireserve_types::MAX_UNAPPROVED_SERVICES_PER_NODE
+                )));
+                continue;
+            }
+            unapproved += 1;
+        }
         match (&d.group, exists) {
             (None, _) => accepted.push(d),
             (Some(group), true) => {
@@ -332,13 +356,17 @@ fn notice(name: &str, reason: String) -> wireserve_types::ServiceNotice {
 }
 
 /// Gives `name` an address from `vip_range` unless it already has one.
+///
+/// Not for a denied one: it holds its name until its node withdraws it, but
+/// an address of the mesh's range is not worth holding for a service nobody
+/// reaches. It gets one if it is approved after all (`approve`).
 fn assign_vip(tx: &Connection, node_id: i64, name: &str, vip_range: &str) -> Result<(), DbError> {
-    let has: Option<String> = tx.query_row(
-        "SELECT vip4 FROM services WHERE node_id = ?1 AND name = ?2",
+    let (has, denied): (Option<String>, bool) = tx.query_row(
+        "SELECT vip4, approved_at IS NULL AND denied_at IS NOT NULL FROM services WHERE node_id = ?1 AND name = ?2",
         rusqlite::params![node_id, name],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    if has.is_some() {
+    if has.is_some() || denied {
         return Ok(());
     }
     let used = super::nodes::all_allocated_ip4(tx)?;
@@ -402,7 +430,7 @@ fn row_for_name(conn: &Connection, name: &str) -> Result<Option<ServiceRow>, DbE
 /// "approve whoever currently holds this name" operation anywhere in this
 /// codebase, at any layer. Approval binds to the pair, because a
 /// `services` row *is* that pair.
-pub fn approve(conn: &Connection, node_id: i64, name: &str) -> Result<ApproveOutcome, DbError> {
+pub fn approve(conn: &Connection, node_id: i64, name: &str, vip_range: &str) -> Result<ApproveOutcome, DbError> {
     let tx = conn.unchecked_transaction()?;
     let Some(row) = row_for_name(&tx, name)? else {
         return Ok(ApproveOutcome::NotDeclared);
@@ -426,6 +454,8 @@ pub fn approve(conn: &Connection, node_id: i64, name: &str) -> Result<ApproveOut
         // bind-to-the-declaring-node rule, and costs nothing.
         rusqlite::params![super::nodes::now_str(), name, node_id],
     )?;
+    // Approved after a denial, it has no address yet.
+    assign_vip(&tx, node_id, name, vip_range)?;
     super::grants::promote_declared_group(&tx, name)?;
     tx.commit()?;
     Ok(ApproveOutcome::Approved)
@@ -464,7 +494,7 @@ pub fn deny(
         return Ok(DenyOutcome::AlreadyDenied);
     }
     tx.execute(
-        "UPDATE services SET denied_at = ?1, denied_reason = ?2, approved_at = NULL \
+        "UPDATE services SET denied_at = ?1, denied_reason = ?2, approved_at = NULL, vip4 = NULL \
          WHERE name = ?3 AND node_id = ?4",
         rusqlite::params![super::nodes::now_str(), reason, name, node_id],
     )?;
@@ -524,7 +554,7 @@ mod tests {
         // A pending service already has its address (its owner's firewall
         // gets ready before approval).
         upsert_for_node(&mut conn, id, &[mapped("other", &["1"]), mapped("web", &["80:5080", "443:5443"])], ApprovalMode::RequireApproval, RANGE).unwrap();
-        approve(&conn, id, "web").unwrap();
+        approve(&conn, id, "web", "10.9.0.0/24").unwrap();
         upsert_for_node(&mut conn, id, &[mapped("web", &["8080:5080"])], ApprovalMode::RequireApproval, RANGE).unwrap();
         assert_eq!(vip_of(&conn, "web").unwrap(), first);
         assert_eq!(row_for_name(&conn, "web").unwrap().unwrap().ports, vec!["8080:5080".parse::<PortMap>().unwrap()]);
@@ -628,7 +658,7 @@ mod tests {
         let mut conn = db.conn.lock().await;
 
         upsert_for_node(&mut conn, id1, &[decl("plex", 1, Proto::Tcp)], ApprovalMode::RequireApproval, RANGE).unwrap();
-        assert_eq!(approve(&conn, id1, "plex").unwrap(), ApproveOutcome::Approved);
+        assert_eq!(approve(&conn, id1, "plex", "10.9.0.0/24").unwrap(), ApproveOutcome::Approved);
         assert_eq!(list_approved(&conn).unwrap().len(), 1);
 
         upsert_for_node(&mut conn, id1, &[], ApprovalMode::RequireApproval, RANGE).unwrap();
@@ -647,7 +677,7 @@ mod tests {
         upsert_for_node(&mut conn, id1, &[decl("plex", 1, Proto::Tcp)], ApprovalMode::RequireApproval, RANGE).unwrap();
 
         assert_eq!(
-            approve(&conn, id2, "plex").unwrap(),
+            approve(&conn, id2, "plex", "10.9.0.0/24").unwrap(),
             ApproveOutcome::OwnedByAnotherNode { owner_node_id: id1 }
         );
         assert!(list_approved(&conn).unwrap().is_empty(), "a refused approval must leave no trace");
@@ -660,9 +690,9 @@ mod tests {
         let mut conn = db.conn.lock().await;
         upsert_for_node(&mut conn, id, &[decl("plex", 1, Proto::Tcp)], ApprovalMode::RequireApproval, RANGE).unwrap();
 
-        approve(&conn, id, "plex").unwrap();
+        approve(&conn, id, "plex", "10.9.0.0/24").unwrap();
         let first = list_approved(&conn).unwrap()[0].approved_at;
-        assert_eq!(approve(&conn, id, "plex").unwrap(), ApproveOutcome::AlreadyApproved);
+        assert_eq!(approve(&conn, id, "plex", "10.9.0.0/24").unwrap(), ApproveOutcome::AlreadyApproved);
         assert_eq!(list_approved(&conn).unwrap()[0].approved_at, first);
     }
 
@@ -671,7 +701,7 @@ mod tests {
         let db = Db::open_in_memory_for_test();
         let id = node_with_id(&db, "n1", "h1").await;
         let conn = db.conn.lock().await;
-        assert_eq!(approve(&conn, id, "nothing").unwrap(), ApproveOutcome::NotDeclared);
+        assert_eq!(approve(&conn, id, "nothing", "10.9.0.0/24").unwrap(), ApproveOutcome::NotDeclared);
     }
 
     #[tokio::test]
@@ -683,7 +713,7 @@ mod tests {
         let id = node_with_id(&db, "n1", "h1").await;
         let mut conn = db.conn.lock().await;
         upsert_for_node(&mut conn, id, &[decl("plex", 32400, Proto::Tcp)], ApprovalMode::RequireApproval, RANGE).unwrap();
-        approve(&conn, id, "plex").unwrap();
+        approve(&conn, id, "plex", "10.9.0.0/24").unwrap();
 
         let outcome = upsert_for_node(&mut conn, id, &[decl("plex", 32401, Proto::Tcp)], ApprovalMode::RequireApproval, RANGE).unwrap();
 
@@ -750,7 +780,7 @@ mod tests {
         upsert_for_node(&mut conn, id, &[decl("plex", 1, Proto::Tcp)], ApprovalMode::RequireApproval, RANGE).unwrap();
         deny(&conn, id, "plex", Some("on reflection, no")).unwrap();
 
-        assert_eq!(approve(&conn, id, "plex").unwrap(), ApproveOutcome::Approved);
+        assert_eq!(approve(&conn, id, "plex", "10.9.0.0/24").unwrap(), ApproveOutcome::Approved);
         let rows = list_approved(&conn).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].denied_at.is_none(), "the denial must be cleared, not merely outvoted");

@@ -37,6 +37,12 @@ pub async fn poll(
     // `endpoint_addr` onto a static node and every exported `.conf`
     // afterwards would carry an `Endpoint =` line for a peer that is
     // never meant to be dialed into.
+    if let crate::rate_limit::Take::Refused { log } = state.poll_limiter.take(node.id) {
+        if log {
+            tracing::warn!(event = "poll_rate_limited", node_name = %node.name, "polling faster than the per-node limit");
+        }
+        return Err(AppError::TooManyRequests);
+    }
     if node.kind == wireserve_types::NodeKind::Static {
         return Err(AppError::Forbidden(
             "this node is registered as kind=static, which never polls (spec §9)".into(),
