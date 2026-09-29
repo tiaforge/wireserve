@@ -5,7 +5,8 @@
 //! headers only — goes to the provider's verify endpoint, over verified TLS
 //! on the provider service's own address, with `X-Forwarded-Method` and
 //! `X-Forwarded-Uri`, and the service's own name — never the client's — in
-//! `Host` and `X-Forwarded-Host`. Then:
+//! `X-Forwarded-Host`. `Host` is the provider's own name: it sits behind its
+//! own node's terminator, which answers for that name only. Then:
 //! * **2xx:** the provider knows who it is; the terminator decides whether
 //!   they may in (PLAN.md M36), and if so the request goes on with the
 //!   provider's identity headers copied onto it. Every one of them was
@@ -229,9 +230,10 @@ impl SignIn {
     /// across the check.
     ///
     /// The provider is told the service's own name — the one the connection
-    /// was routed by — never the client's `Host`: providers choose their
-    /// per-host rules by it, and a client could otherwise have another
-    /// host's rules applied to this service.
+    /// was routed by — in `X-Forwarded-Host`, never the client's `Host`:
+    /// providers choose their per-host rules by it, and a client could
+    /// otherwise have another host's rules applied to this service. `Host`
+    /// is the provider's own name, as for any request to it.
     pub async fn check(
         &self,
         method: &Method,
@@ -255,7 +257,9 @@ impl SignIn {
         }
         let path = uri.path_and_query().map_or("/", |p| p.as_str());
         let h = check.headers_mut();
-        h.insert(header::HOST, host.clone());
+        if let Ok(provider) = HeaderValue::from_str(&self.target.fqdn) {
+            h.insert(header::HOST, provider);
+        }
         h.insert("x-forwarded-host", host);
         h.insert("x-forwarded-method", HeaderValue::from_str(method.as_str()).expect("a method is a token"));
         if let Ok(v) = HeaderValue::from_str(path) {

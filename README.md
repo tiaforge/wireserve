@@ -775,9 +775,9 @@ A request to a service in `media`, served with TLS by its node, then goes:
    the sign-in never asked;
 2. from any other device: headers only, to `https://auth.<domain>/verify`,
    over verified TLS on the provider's own address, with `X-Forwarded-Method`,
-   `X-Forwarded-Uri` and the service's own name in `Host` and
-   `X-Forwarded-Host` (a request naming any other host is refused with 421
-   before it gets that far). Not signed in: a 401 with `X-Login-Url` sends the
+   `X-Forwarded-Uri` and the service's own name in `X-Forwarded-Host` (a
+   request naming any other host is refused with 421 before it gets that
+   far). Not signed in: a 401 with `X-Login-Url` sends the
    browser to sign in. Signed in: the provider says who, and the terminator
    decides — one of the granted groups in `X-Auth-Groups` lets it through with
    the provider's identity headers, anything else gets 403. The provider only

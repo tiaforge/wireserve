@@ -3370,7 +3370,12 @@ builds on the sign-in they concern.
     `/verify` — and authward chooses its per-host rules (`bypass_paths`,
     `required_group`) by that name, so a mesh peer could have another
     host's rules applied to a marked service. `SignIn::check` now sends the
-    route's fqdn as `Host` and `X-Forwarded-Host`, and every terminated
+    route's fqdn as `X-Forwarded-Host` — which authward, like any
+    forward_auth provider behind a proxy, reads first — and the provider's
+    own name as `Host`, since the provider is itself a terminated service
+    that answers for its own name only (sending the service's name there
+    was 421'd by the provider's terminator: found by
+    `run-service-auth-test.sh`, fixed 2026-09-29). Every terminated
     service answers a request whose `Host` or authority names anything else
     with **421 Misdirected Request** before the sign-in or the backend sees
     it. `run-service-auth-test.sh` step 6.

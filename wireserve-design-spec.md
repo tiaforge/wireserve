@@ -506,8 +506,9 @@ configured (`WIRESERVE_AUTH_SERVICE` on `WIRESERVE_AUTH_NODE`, trusted on
 that node only), is asked about — Caddy's `forward_auth`, built in: a
 headers-only copy of the request to `https://<provider>.<domain>/verify` on
 the provider's own address, verified TLS, with `X-Forwarded-Method`,
-`X-Forwarded-Uri` and the service's own name as `Host` and `X-Forwarded-Host`
-— a request whose `Host` names another service gets 421 first. A 2xx says who
+`X-Forwarded-Uri` and the service's own name as `X-Forwarded-Host` (`Host` is
+the provider's, whose own terminator answers for that name only) — a request
+whose `Host` names another service gets 421 first. A 2xx says who
 it is; one of the granted groups in its groups header passes the request on
 with the identity headers copied on, anything else is 403. A 401 with
 `X-Login-Url` redirects a GET; anything else is returned as is. The provider

@@ -77,7 +77,7 @@ impl IdentityHeaders {
 /// The terminator sends each request to a marked service to
 /// `https://<service>.<domain><verify_path>` first — on that service's own
 /// address, verified against its certificate, and only while `node` owns
-/// it — with the service's own name as `Host`, `X-Forwarded-Method`,
+/// it — with the service's own name as `X-Forwarded-Host`, `X-Forwarded-Method`,
 /// `X-Forwarded-Uri` and cookies. A 2xx lets it
 /// through with the identity headers copied from the answer; a 401 carrying
 /// `X-Login-Url` sends the browser there; anything else is returned as is.
