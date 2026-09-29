@@ -140,6 +140,21 @@ pub struct ServiceAccess {
     pub sign_in_groups: Vec<String>,
 }
 
+/// The person a calling device belongs to (PLAN.md M38), for a terminator
+/// to name to its backends when the device's own grants let it in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallerIdentity {
+    /// The device's mesh address.
+    pub addr: Ipv4Addr,
+    /// The owner's subject at the identity provider — what authward sends
+    /// as the user too.
+    pub user: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+}
+
 /// Something about a node's own declaration the node should know, but that
 /// does not stop the rest of its declarations — a group it cannot use, or
 /// one it named that an admin decides.

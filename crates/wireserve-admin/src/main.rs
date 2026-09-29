@@ -111,6 +111,20 @@ enum Command {
         #[command(subcommand)]
         action: TagAction,
     },
+    /// A fresh link for whoever a device belongs to: signing in with it
+    /// makes them its owner, and the node reaches what their groups at the
+    /// identity provider are granted. Works once, for ten minutes.
+    ClaimUrl {
+        node: String,
+        /// Also show it as a QR code, for a phone's camera.
+        #[arg(long)]
+        qr: bool,
+    },
+    /// A device's owner.
+    Owner {
+        #[command(subcommand)]
+        action: OwnerAction,
+    },
     /// Who reaches a service and why, or what a node reaches.
     Access {
         #[arg(required_unless_present = "node", conflicts_with = "node")]
@@ -229,6 +243,13 @@ enum GrantAction {
 }
 
 #[derive(Subcommand)]
+enum OwnerAction {
+    /// The node belongs to nobody again; its outstanding claim links stop
+    /// working.
+    Clear { node: String },
+}
+
+#[derive(Subcommand)]
 enum TagAction {
     Add { node: String, tag: String },
     Remove { node: String, tag: String },
@@ -246,6 +267,27 @@ enum OnOff {
 /// to another machine; the one moment the expiry is useful is this one.
 /// Discovering it instead from a `join` that fails half an hour later
 /// tells them only that something is wrong, not what.
+/// A claim link (PLAN.md M38), for the device's owner — to stderr, like the
+/// QR codes: it is for a person, and it is as good as their sign-in for ten
+/// minutes, so it should not end up in a pipe or a file by accident.
+fn print_claim(claim: &wireserve_types::ClaimLink, qr: bool) {
+    eprintln!();
+    eprintln!("Optional: whoever this device belongs to can claim it, and it then reaches what their");
+    eprintln!("groups are granted. Send them this link, and nobody else — it works once, until");
+    eprintln!("{}:", claim.expires_at.to_rfc3339());
+    eprintln!("  {}", sanitize_for_terminal(&claim.url));
+    if qr {
+        match wireserve_admin::qr::render(&claim.url) {
+            Ok(rendered) => {
+                eprintln!();
+                eprint!("{rendered}");
+                eprintln!("\nOr scan this with the phone's camera to claim it.");
+            }
+            Err(e) => eprintln!("(no QR code for the link: {e})"),
+        }
+    }
+}
+
 fn print_expiry(expires_at: Option<chrono::DateTime<chrono::Utc>>) {
     match expires_at {
         Some(t) => println!("  redeemable until: {}", t.to_rfc3339()),
@@ -277,6 +319,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let resp = wireserve_admin::cmd_create_node(&client, &name, kind, ttl)?;
             println!("node '{}' created — join token: {}", resp.name, resp.join_token);
             print_expiry(resp.join_token_expires_at);
+            if let Some(claim) = &resp.claim {
+                print_claim(claim, false);
+            }
             if kind == NodeKind::Agent {
                 print_install_instructions(
                     resolve_register_url_best_effort(register_url.as_deref()),
@@ -453,6 +498,16 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Command::ClaimUrl { node, qr } => {
+            let client = build_client(&coordinator_url, &admin_token)?;
+            let claim = wireserve_admin::cmd_claim_link(&client, &node)?;
+            print_claim(&claim, qr);
+        }
+        Command::Owner { action: OwnerAction::Clear { node } } => {
+            let client = build_client(&coordinator_url, &admin_token)?;
+            wireserve_admin::cmd_remove_owner(&client, &node)?;
+            println!("node '{node}' belongs to nobody now, from its next poll");
+        }
         Command::Access { service, node } => {
             let client = build_client(&coordinator_url, &admin_token)?;
             let clean_all = |v: &[wireserve_types::GrantSource]| -> String {
@@ -464,6 +519,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
             if let Some(node) = node {
                 let r = wireserve_admin::cmd_node_access(&client, &node)?;
+                if let Some(o) = &r.owner {
+                    let who = o.email.as_deref().or(o.name.as_deref()).unwrap_or(&o.sub);
+                    println!(
+                        "{} belongs to {}{}",
+                        sanitize_for_terminal(&r.node),
+                        sanitize_for_terminal(who),
+                        if o.stale { " (its groups could not be refreshed for over an hour, and count for nothing)" } else { "" }
+                    );
+                }
                 println!("{} acts as: {}", sanitize_for_terminal(&r.node), clean_all(&r.principals));
                 if r.services.is_empty() {
                     println!("  reaches no service of another node by who it is");
@@ -682,6 +746,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     "\nImport both on the device and switch on the -exit one for public Wi-Fi or \
                      to browse from home; the WireGuard app runs only one tunnel at a time."
                 );
+            }
+            if let Some(claim) = &exported.claim {
+                print_claim(claim, qr);
             }
             if refresh {
                 eprintln!(

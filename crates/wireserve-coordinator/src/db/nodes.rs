@@ -381,6 +381,8 @@ pub fn revoke(conn: &Connection, node_id: i64) -> Result<(), DbError> {
         rusqlite::params![now_str(), node_id],
     )?;
     tx.execute("DELETE FROM services WHERE node_id = ?1", [node_id])?;
+    // Its owner (PLAN.md M38) was the owner of the identity revoked.
+    super::owners::forget(&tx, node_id)?;
     tx.commit()?;
     Ok(())
 }
@@ -404,7 +406,8 @@ pub fn revoke(conn: &Connection, node_id: i64) -> Result<(), DbError> {
 /// right IP afterwards.
 ///
 /// Transit approval goes too: it was granted to the identity being
-/// replaced.
+/// replaced — and so does its owner (PLAN.md M38): the new token may go to
+/// another device.
 ///
 /// `gateway_node_id` and the node's `static_conf_peers` rows deliberately
 /// stay (PLAN.md M24). They describe how the device is *addressed*, in the
@@ -418,13 +421,16 @@ pub fn reissue_join_token(
     join_token_hash: &str,
     join_token_expires_at: Option<&str>,
 ) -> Result<(), DbError> {
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "UPDATE nodes SET join_token_hash = ?1, join_token_used = 0, join_token_expires_at = ?2, \
          bearer_token_hash = NULL, pubkey = NULL, transit_approved_at = NULL \
          WHERE id = ?3",
         rusqlite::params![join_token_hash, join_token_expires_at, node_id],
     )
     .map_err(map_unique_violation)?;
+    super::owners::forget(&tx, node_id)?;
+    tx.commit()?;
     Ok(())
 }
 

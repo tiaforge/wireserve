@@ -11,9 +11,9 @@ source of truth for *current status*, the spec is the source of truth for
 **Currently working on:** M36 (service groups, grants and tags; items 212+),
 then M37 (caching `/verify`) and M38 (device owners through OIDC). The plan
 is `~/.claude/plans/alright-then-lets-create-shimmying-panda.md` (not in the
-repo). Items 212–221 (M36, M37) are done; the e2e suites for them
-(`run-grants-test.sh`, the reworked `run-service-auth-test.sh`) have not run
-yet. M38 next.
+repo). Items 212–226 (M36–M38) are done. Not run yet: the rootful e2e
+suites `run-grants-test.sh`, the reworked `run-service-auth-test.sh` and
+`run-owner-test.sh`.
 
 Everything that can be verified here now is. What remains unverified is
 scale (three nodes, not thirty), real WAN paths, and long-running
@@ -3478,3 +3478,67 @@ a provider that says nothing is asked every time, as before.
     reached or answers 5xx, for that long past its `max-age`. The grants are
     checked on every request, cached or not — only who someone is is
     reused, never whether they may in.
+
+## M38 — devices that belong to someone
+
+A grant to an identity provider's group could only be proven by a browser
+sign-in, service by service. With the provider configured, a device can now
+belong to a person, and its grants count their groups for every protocol —
+the shared laptop keeps the sign-in, the personal one no longer needs it.
+
+222. **The coordinator is an OpenID Connect client.** `WIRESERVE_OIDC_ISSUER`,
+    `_CLIENT_ID`, `_CLIENT_SECRET` (and `_SCOPES`, `_GROUPS_CLAIM`,
+    `_REFRESH_SECS`); `WIRESERVE_PUBLIC_URL` is now a setting, not only a
+    banner line, since the provider sends browsers back to
+    `<public url>/claim/callback`. `openidconnect` 4 without its own HTTP
+    client: requests go through the workspace's reqwest 0.13, never
+    following redirects. Discovery runs for each sign-in and each refresh
+    pass, so a provider rotating its keys is picked up. Groups come from the
+    ID token (read after its signature checks out) or else userinfo for the
+    same `sub`; names a grant could not name are dropped.
+
+223. **Only an admin makes claim links.** `POST /admin/nodes/{name}/claim`
+    (`claim-url`, and `create-node` / `export-config` when the provider is
+    set): `clm_` + 32 random bytes, stored hashed, ten minutes, single use.
+    A node that could make its own could send it to anyone and collect their
+    groups.
+
+224. **Claiming is three requests, and ends with a confirmation.**
+    `GET /claim/{code}` checks the link without using it up (link previewers
+    open links) and starts the code flow with PKCE — its state in memory,
+    capped, ten minutes, tied to the browser by a `__Host-` cookie (plain name
+    on an http coordinator). A bad link counts as a failed authentication.
+    `GET /claim/callback` needs that cookie and its state, exchanges the
+    code, checks the ID token and nonce, requires a refresh token, and asks
+    "make <node> yours?" with the node's tags and current owner.
+    `POST /claim/confirm` needs the cookie and the page's token, uses the
+    link up atomically (`UPDATE … WHERE used = 0`), and stores the owner.
+    Pages escape everything and forbid framing, scripts, referrers and
+    caching.
+
+225. **Owners are kept current, and end cleanly.** Migration 0018:
+    `node_owners` (one per node, the refresh token sealed with
+    XChaCha20-Poly1305 under `WIRESERVE_OIDC_TOKEN_KEY` — generated silently
+    into `coordinator-secrets.env` — with the node id as associated data) and
+    `claims`. Every refresh interval each token is exchanged: new groups and
+    the rotated token are kept; `invalid_grant` ends the ownership; any other
+    failure marks the owner stale, and after an hour its groups count for
+    nothing until a refresh succeeds. Revoke and rejoin clear the owner and
+    its links; `owner clear` does it by hand.
+
+226. **The owner's groups are principals, and backends learn who it is.**
+    `access::read_rules` counts each owner's groups (`oidc:<group>`), so a
+    claimed device is in the firewall's sources like a tagged one. A node
+    with terminated services gets `PollResponse.identities` for the devices
+    allowed in, saved with `own_access`, sanitised (mesh addresses, no
+    control characters, usable group names), and passed to the terminator on
+    each `Caller`, which fills the identity headers for a request its device
+    got in by — the user is the provider's `sub`, as authward sends it.
+    `access --node` shows the owner.
+
+In-process, `tests/oidc_flow.rs` claims a device against an identity
+provider running in the test (discovery, JWKS, PKCE, signed ID tokens, a
+refused refresh); `deploy/e2e/run-owner-test.sh` does it against
+mock-oauth2-server, not yet run. The installer does not ask for the provider;
+the settings go into `coordinator.env` by hand, where `--reconfigure` leaves
+them.

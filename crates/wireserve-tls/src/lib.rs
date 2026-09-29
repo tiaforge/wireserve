@@ -287,6 +287,10 @@ fn update_sign_in(shared: &SharedSignIn, target: Option<&wireserve_types::tls::S
 }
 
 fn update_callers(callers: &Callers, config: &TlsConfig) {
-    let map = config.callers.iter().map(|c| (c.addr, c.node.clone())).collect();
+    let map = config
+        .callers
+        .iter()
+        .map(|c| (c.addr, serve::CallerInfo { node: c.node.clone(), owner: c.owner.clone() }))
+        .collect();
     *callers.write().unwrap_or_else(std::sync::PoisonError::into_inner) = map;
 }

@@ -130,6 +130,7 @@ mod tests {
             naming: None,
             access: vec![],
             service_notices: vec![],
+            identities: vec![],
             peers,
             services,
             pending_services: vec![],

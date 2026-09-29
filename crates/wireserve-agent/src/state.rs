@@ -111,6 +111,11 @@ pub struct AgentState {
     /// named, as of the last poll; shown by `wireserve list`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub service_notices: Vec<wireserve_types::ServiceNotice>,
+    /// Who owns the devices that may reach this node's terminated services
+    /// (PLAN.md M38), saved with `own_access`; the terminator names them to
+    /// its backends.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub own_identities: Vec<wireserve_types::CallerIdentity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

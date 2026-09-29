@@ -16,6 +16,12 @@ pub struct Config {
     pub sign_in: Option<wireserve_types::SignIn>,
     /// The headers backends learn who is calling from (PLAN.md M36).
     pub identity_headers: wireserve_types::IdentityHeaders,
+    /// Where browsers and nodes reach the coordinator, e.g.
+    /// `https://mesh.example.com` (`WIRESERVE_PUBLIC_URL`), without a
+    /// trailing slash. Needed for the claim links of device owners.
+    pub public_url: Option<String>,
+    /// Device owners through an identity provider (PLAN.md M38).
+    pub oidc: Option<OidcConfig>,
     /// Where the service names are published as public DNS records
     /// (PLAN.md M32). `None` leaves DNS to the operator, as before.
     pub dns: Option<crate::dns::DnsConfig>,
@@ -149,6 +155,7 @@ impl Config {
         let net_v6_prefix = bootstrapped.net_v6_prefix;
         let generated = bootstrapped.generated;
         let secrets_path = bootstrapped.path;
+        let bootstrapped_token_key = bootstrapped.oidc_token_key;
 
         let online_threshold_secs = env_parse_or("WIRESERVE_ONLINE_THRESHOLD_SECS", 180)?;
         let rate_limit_max = env_parse_or("WIRESERVE_RATE_LIMIT_MAX", 10)?;
@@ -192,6 +199,8 @@ impl Config {
         let acme = acme_from_lookup(|k| std::env::var(k).ok())?;
         let sign_in = sign_in_from_lookup(|k| std::env::var(k).ok(), dns.is_some())?;
         let identity_headers = identity_headers_from_lookup(|k| std::env::var(k).ok())?;
+        let public_url = public_url_from_lookup(|k| std::env::var(k).ok())?;
+        let oidc = oidc_from_lookup(|k| std::env::var(k).ok(), public_url.as_deref(), &bootstrapped_token_key)?;
 
         Ok(Loaded {
             config: Self {
@@ -204,6 +213,8 @@ impl Config {
                 service_domain,
                 sign_in,
                 identity_headers,
+                public_url,
+                oidc,
                 dns,
                 acme,
                 online_threshold_secs,
@@ -346,6 +357,121 @@ pub fn sign_in_from_lookup(
         return Err(ConfigError::Invalid("WIRESERVE_AUTH_SESSION_COOKIE", format!("{session_cookie:?} is not a cookie name")));
     }
     Ok(Some(wireserve_types::SignIn { service, node, verify_path, session_cookie }))
+}
+
+/// Signing in the owner of a device (PLAN.md M38): an OpenID Connect
+/// client of the operator's identity provider — the same one the sign-in
+/// provider uses, so group names mean the same thing on both paths.
+#[derive(Clone)]
+pub struct OidcConfig {
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub scopes: Vec<String>,
+    /// The claim the provider lists a person's groups in.
+    pub groups_claim: String,
+    /// How often each owner's groups are fetched again.
+    pub refresh_interval: std::time::Duration,
+    /// Seals refresh tokens at rest; see `bootstrap::OIDC_TOKEN_KEY`.
+    pub token_key: [u8; 32],
+    /// `<public url>/claim/callback`.
+    pub redirect_url: String,
+}
+
+impl std::fmt::Debug for OidcConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcConfig")
+            .field("issuer", &self.issuer)
+            .field("client_id", &self.client_id)
+            .field("scopes", &self.scopes)
+            .field("groups_claim", &self.groups_claim)
+            .field("refresh_interval", &self.refresh_interval)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `WIRESERVE_PUBLIC_URL`: an `http(s)://` URL, kept without a trailing
+/// slash.
+pub fn public_url_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Option<String>, ConfigError> {
+    let Some(url) = lookup("WIRESERVE_PUBLIC_URL").map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"));
+    let host = rest.map(|r| r.split('/').next().unwrap_or_default()).unwrap_or_default();
+    if host.is_empty() || url.contains(char::is_whitespace) || url.contains(['?', '#']) {
+        return Err(ConfigError::Invalid("WIRESERVE_PUBLIC_URL", format!("{url:?} is not an http(s):// URL")));
+    }
+    Ok(Some(url.trim_end_matches('/').to_string()))
+}
+
+/// The device owners' identity provider (PLAN.md M38): off unless
+/// `WIRESERVE_OIDC_ISSUER` is set, and then `_CLIENT_ID`, `_CLIENT_SECRET`
+/// and `WIRESERVE_PUBLIC_URL` are required.
+pub fn oidc_from_lookup(
+    lookup: impl Fn(&str) -> Option<String>,
+    public_url: Option<&str>,
+    token_key_hex: &str,
+) -> Result<Option<OidcConfig>, ConfigError> {
+    let get = |key: &str| lookup(key).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let Some(issuer) = get("WIRESERVE_OIDC_ISSUER") else {
+        return Ok(None);
+    };
+    if !(issuer.starts_with("https://") || issuer.starts_with("http://")) || issuer.contains(char::is_whitespace) {
+        return Err(ConfigError::Invalid("WIRESERVE_OIDC_ISSUER", format!("{issuer:?} is not an http(s):// URL")));
+    }
+    let client_id = get("WIRESERVE_OIDC_CLIENT_ID")
+        .ok_or_else(|| ConfigError::Invalid("WIRESERVE_OIDC_CLIENT_ID", "is required with WIRESERVE_OIDC_ISSUER".into()))?;
+    let client_secret = get("WIRESERVE_OIDC_CLIENT_SECRET").ok_or_else(|| {
+        ConfigError::Invalid("WIRESERVE_OIDC_CLIENT_SECRET", "is required with WIRESERVE_OIDC_ISSUER".into())
+    })?;
+    let public_url = public_url.ok_or_else(|| {
+        ConfigError::Invalid(
+            "WIRESERVE_PUBLIC_URL",
+            "is required with WIRESERVE_OIDC_ISSUER: the identity provider sends browsers back to it".into(),
+        )
+    })?;
+    let scopes: Vec<String> = get("WIRESERVE_OIDC_SCOPES")
+        .unwrap_or_else(|| "openid email profile groups offline_access".into())
+        .split([' ', ','])
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if !scopes.iter().any(|s| s == "openid") {
+        return Err(ConfigError::Invalid("WIRESERVE_OIDC_SCOPES", "must include openid".into()));
+    }
+    let groups_claim = get("WIRESERVE_OIDC_GROUPS_CLAIM").unwrap_or_else(|| "groups".into());
+    let refresh_secs: u64 = match get("WIRESERVE_OIDC_REFRESH_SECS") {
+        None => 900,
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(s) if (60..=86_400).contains(&s) => s,
+            _ => return Err(ConfigError::Invalid("WIRESERVE_OIDC_REFRESH_SECS", format!("{raw:?} is not 60..=86400"))),
+        },
+    };
+    let token_key = parse_key(token_key_hex).ok_or_else(|| {
+        ConfigError::Invalid("WIRESERVE_OIDC_TOKEN_KEY", "must be 64 hexadecimal characters (32 bytes)".into())
+    })?;
+    Ok(Some(OidcConfig {
+        issuer: issuer.trim_end_matches('/').to_string(),
+        client_id,
+        client_secret,
+        scopes,
+        groups_claim,
+        refresh_interval: std::time::Duration::from_secs(refresh_secs),
+        token_key,
+        redirect_url: format!("{public_url}/claim/callback"),
+    }))
+}
+
+fn parse_key(hex: &str) -> Option<[u8; 32]> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// The headers backends learn who is calling from (PLAN.md M36):
@@ -680,6 +806,41 @@ mod tests {
             ("WIRESERVE_AUTH_EMAIL_HEADER", "x-auth-user"),
         ] {
             assert!(identity_headers_from_lookup(one(k, v)).is_err(), "{k}={v}");
+        }
+    }
+
+    #[test]
+    fn oidc_needs_its_client_and_a_public_url() {
+        let key = "ab".repeat(32);
+        let all = |k: &str| match k {
+            "WIRESERVE_OIDC_ISSUER" => Some("https://id.example.com/".to_string()),
+            "WIRESERVE_OIDC_CLIENT_ID" => Some("wireserve".to_string()),
+            "WIRESERVE_OIDC_CLIENT_SECRET" => Some("s3cret".to_string()),
+            _ => None,
+        };
+        assert!(oidc_from_lookup(|_| None, None, &key).unwrap().is_none(), "off unless an issuer is set");
+        let o = oidc_from_lookup(all, Some("https://mesh.example.com"), &key).unwrap().unwrap();
+        assert_eq!(o.issuer, "https://id.example.com");
+        assert_eq!(o.redirect_url, "https://mesh.example.com/claim/callback");
+        assert!(o.scopes.contains(&"offline_access".to_string()));
+        assert_eq!(o.groups_claim, "groups");
+        assert_eq!(o.token_key, [0xab; 32]);
+        assert!(!format!("{o:?}").contains("s3cret"), "the secret stays out of logs");
+        assert!(oidc_from_lookup(all, None, &key).is_err(), "no public URL");
+        assert!(oidc_from_lookup(all, Some("https://m"), "short").is_err(), "a broken key");
+        let no_secret = |k: &str| if k == "WIRESERVE_OIDC_CLIENT_SECRET" { None } else { all(k) };
+        assert!(oidc_from_lookup(no_secret, Some("https://m"), &key).is_err());
+        let no_openid = |k: &str| if k == "WIRESERVE_OIDC_SCOPES" { Some("email groups".into()) } else { all(k) };
+        assert!(oidc_from_lookup(no_openid, Some("https://m"), &key).is_err());
+    }
+
+    #[test]
+    fn a_public_url_is_an_http_url() {
+        let one = |v: &'static str| move |k: &str| (k == "WIRESERVE_PUBLIC_URL").then(|| v.to_string());
+        assert_eq!(public_url_from_lookup(one("https://mesh.example.com/")).unwrap().as_deref(), Some("https://mesh.example.com"));
+        assert_eq!(public_url_from_lookup(one("http://10.0.0.5:47820")).unwrap().as_deref(), Some("http://10.0.0.5:47820"));
+        for bad in ["mesh.example.com", "https://", "https://a b", "https://m/?x"] {
+            assert!(public_url_from_lookup(one(bad)).is_err(), "{bad}");
         }
     }
 

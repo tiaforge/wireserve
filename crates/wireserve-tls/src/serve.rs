@@ -24,9 +24,16 @@ use tokio::task::JoinHandle;
 use tower::ServiceExt as _;
 use wireserve_types::tls::NODE_HEADER;
 
-/// Mesh address → node name, shared by every listener and replaced on each
-/// check-in.
-pub type Callers = Arc<RwLock<HashMap<Ipv4Addr, String>>>;
+/// A calling node: its name, and its owner (PLAN.md M38) if it has one.
+#[derive(Debug, Clone)]
+pub struct CallerInfo {
+    pub node: String,
+    pub owner: Option<wireserve_types::CallerIdentity>,
+}
+
+/// Mesh address → the node calling from it, shared by every listener and
+/// replaced on each check-in.
+pub type Callers = Arc<RwLock<HashMap<Ipv4Addr, CallerInfo>>>;
 
 /// The sign-in (PLAN.md M34), shared by every listener and replaced when
 /// the provider moves. `None`: no provider reachable, and nobody gets in by
@@ -224,7 +231,7 @@ pub fn spawn(listener: TcpListener, tls: Arc<rustls::ServerConfig>, shared: Shar
                     let sign_in = read(&shared.sign_in).clone();
                     let identity = read(&shared.identity).clone();
                     let misdirected = policy.as_ref().is_some_and(|p| !for_this_service(&req, &p.fqdn));
-                    prepare(req.headers_mut(), caller.as_deref());
+                    prepare(req.headers_mut(), caller.as_ref().map(|c| c.node.as_str()));
                     req.extensions_mut().insert(ConnectInfo(peer));
                     async move {
                         let Some(policy) = policy else {
@@ -240,7 +247,8 @@ pub fn spawn(listener: TcpListener, tls: Arc<rustls::ServerConfig>, shared: Shar
                             ));
                         }
                         let mut req = req.map(Body::new);
-                        match guard(&mut req, sign_in.as_ref(), &policy, caller_addr, &identity).await {
+                        let owner = caller.and_then(|c| c.owner);
+                        match guard(&mut req, sign_in.as_ref(), &policy, caller_addr, owner.as_ref(), &identity).await {
                             Some(denied) => Ok(denied),
                             None => router.oneshot(req).await,
                         }
@@ -301,7 +309,8 @@ fn without_port(host: &str) -> &str {
 /// passing the request on.
 ///
 /// 1. Identity headers a client sent are removed, always.
-/// 2. An open service, or a caller whose node the grants name, goes on.
+/// 2. An open service, or a caller whose node the grants name, goes on —
+///    with its owner named, if it has one (PLAN.md M38).
 /// 3. Anyone else, where the grants name groups a sign-in can prove, is
 ///    asked about: signed in with one of them, on — with who they are;
 ///    signed in without, 403; not signed in, sent to sign in.
@@ -314,13 +323,18 @@ async fn guard(
     sign_in: Option<&crate::sign_in::SignIn>,
     policy: &Policy,
     caller: Option<Ipv4Addr>,
+    owner: Option<&wireserve_types::CallerIdentity>,
     identity: &wireserve_types::IdentityHeaders,
 ) -> Option<axum::response::Response> {
     use axum::http::StatusCode;
     crate::sign_in::strip_identity(req.headers_mut(), identity);
     let access = &policy.access;
     let by_device = access.open || caller.is_some_and(|c| access.sources.contains(&c));
-    if !by_device {
+    if by_device {
+        if let Some(owner) = owner {
+            name_owner(req.headers_mut(), owner, identity);
+        }
+    } else {
         if !access.sign_in {
             return Some(crate::sign_in::plain(StatusCode::FORBIDDEN, "this device may not reach this service"));
         }
@@ -347,6 +361,21 @@ async fn guard(
         }
     }
     None
+}
+
+/// Tells the backend who the calling device belongs to, in the same
+/// headers a sign-in fills.
+fn name_owner(headers: &mut HeaderMap, owner: &wireserve_types::CallerIdentity, identity: &wireserve_types::IdentityHeaders) {
+    let mut set = |name: &str, value: &str| {
+        if let (Ok(n), Ok(v)) = (axum::http::HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) {
+            headers.insert(n, v);
+        }
+    };
+    set(&identity.user, &owner.user);
+    if let Some(email) = &owner.email {
+        set(&identity.email, email);
+    }
+    set(&identity.groups, &owner.groups.join(","));
 }
 
 /// Strips every header a client could use to claim to be someone else, and
@@ -431,15 +460,15 @@ mod tests {
         let granted = Some("10.9.0.2".parse().unwrap());
         let other = Some("10.9.0.3".parse().unwrap());
         let mut req = request();
-        assert!(guard(&mut req, None, &restricted("jf.int.test", false), granted, &ids()).await.is_none());
+        assert!(guard(&mut req, None, &restricted("jf.int.test", false), granted, None, &ids()).await.is_none());
         assert!(req.headers().get("x-auth-user").is_none(), "a forged identity is removed for a device too");
 
-        let answer = guard(&mut request(), None, &restricted("jf.int.test", false), other, &ids()).await;
+        let answer = guard(&mut request(), None, &restricted("jf.int.test", false), other, None, &ids()).await;
         assert_eq!(answer.expect("refused").status(), StatusCode::FORBIDDEN, "no sign-in to try");
-        let answer = guard(&mut request(), None, &restricted("jf.int.test", false), None, &ids()).await;
+        let answer = guard(&mut request(), None, &restricted("jf.int.test", false), None, None, &ids()).await;
         assert_eq!(answer.expect("refused").status(), StatusCode::FORBIDDEN, "an unknown caller neither");
 
-        let answer = guard(&mut request(), None, &restricted("jf.int.test", true), other, &ids()).await;
+        let answer = guard(&mut request(), None, &restricted("jf.int.test", true), other, None, &ids()).await;
         assert_eq!(answer.expect("refused").status(), StatusCode::SERVICE_UNAVAILABLE, "the sign-in is unreachable");
     }
 
@@ -447,22 +476,43 @@ mod tests {
     async fn every_backend_but_the_providers_loses_the_cookie_and_forged_identity() {
         let si = sign_in();
         let mut req = request();
-        assert!(guard(&mut req, Some(&si), &open("grafana.int.test"), None, &ids()).await.is_none());
+        assert!(guard(&mut req, Some(&si), &open("grafana.int.test"), None, None, &ids()).await.is_none());
         assert_eq!(req.headers().get("cookie").unwrap(), "theme=dark");
         assert!(req.headers().get("x-auth-user").is_none());
 
         // The provider's own service keeps its session cookie — decided per
         // request, whatever the listener was started with.
         let mut req = request();
-        assert!(guard(&mut req, Some(&si), &open("Auth.int.test"), None, &ids()).await.is_none());
+        assert!(guard(&mut req, Some(&si), &open("Auth.int.test"), None, None, &ids()).await.is_none());
         assert_eq!(req.headers().get("cookie").unwrap(), "theme=dark; authward_session=s3cret");
         assert!(req.headers().get("x-auth-user").is_none(), "a forged identity is removed there too");
     }
 
     #[tokio::test]
+    async fn a_granted_devices_owner_is_named_and_nobody_elses() {
+        let owner = wireserve_types::CallerIdentity {
+            addr: "10.9.0.2".parse().unwrap(),
+            user: "sub-alice".into(),
+            email: Some("alice@example.com".into()),
+            groups: vec!["family".into(), "admins".into()],
+        };
+        let granted = Some("10.9.0.2".parse().unwrap());
+        let mut req = request();
+        assert!(guard(&mut req, None, &restricted("jf.int.test", false), granted, Some(&owner), &ids()).await.is_none());
+        assert_eq!(req.headers()["x-auth-user"], "sub-alice", "not mallory");
+        assert_eq!(req.headers()["x-auth-email"], "alice@example.com");
+        assert_eq!(req.headers()["x-auth-groups"], "family,admins");
+
+        // A device the grants do not name gets no one's identity.
+        let other = Some("10.9.0.3".parse().unwrap());
+        let mut req = request();
+        assert!(guard(&mut req, None, &restricted("jf.int.test", false), other, Some(&owner), &ids()).await.is_some());
+    }
+
+    #[tokio::test]
     async fn without_a_sign_in_the_cookie_stays_but_a_forged_identity_does_not() {
         let mut req = request();
-        assert!(guard(&mut req, None, &open("grafana.int.test"), None, &ids()).await.is_none());
+        assert!(guard(&mut req, None, &open("grafana.int.test"), None, None, &ids()).await.is_none());
         assert_eq!(req.headers().get("cookie").unwrap(), "theme=dark; authward_session=s3cret");
         assert!(req.headers().get("x-auth-user").is_none());
     }
@@ -595,7 +645,7 @@ mod tests {
         assert_eq!(cookies, ["theme=dark; authward_session=s3cret; auth_tokens=abc"]);
 
         // And the sign-in's cookie still comes out of the joined header.
-        assert!(guard(&mut req, Some(&sign_in()), &open("observe.int.test"), None, &ids()).await.is_none());
+        assert!(guard(&mut req, Some(&sign_in()), &open("observe.int.test"), None, None, &ids()).await.is_none());
         let cookies: Vec<_> = req.headers().get_all("cookie").iter().collect();
         assert_eq!(cookies, ["theme=dark; auth_tokens=abc"]);
     }

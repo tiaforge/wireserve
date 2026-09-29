@@ -25,6 +25,13 @@ libc.workspace = true
 dns-update.workspace = true
 rpassword.workspace = true
 base64.workspace = true
+# Device owners (PLAN.md M38): an OpenID Connect client of the operator's
+# identity provider, speaking HTTP through the workspace's reqwest rather
+# than the one openidconnect would bring, and sealing refresh tokens at
+# rest.
+openidconnect = { version = "4", default-features = false }
+reqwest.workspace = true
+chacha20poly1305 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

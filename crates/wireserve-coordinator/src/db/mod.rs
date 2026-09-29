@@ -1,5 +1,6 @@
 pub mod dns_records;
 pub mod grants;
+pub mod owners;
 pub mod nodes;
 pub mod tls;
 pub mod services;
@@ -114,6 +115,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0015_tls_ready.sql")),
         M::up(include_str!("../../migrations/0016_acme_challenges.sql")),
         M::up(include_str!("../../migrations/0017_grants.sql")),
+        M::up(include_str!("../../migrations/0018_owners.sql")),
     ])
 }
 

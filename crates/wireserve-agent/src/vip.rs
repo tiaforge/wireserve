@@ -122,6 +122,7 @@ mod tests {
             naming: None,
             access: vec![],
             service_notices: vec![],
+            identities: vec![],
             peers: vec![peer("a", "10.9.0.1"), peer("b", "10.9.0.2")],
             services,
             pending_services: vec![],

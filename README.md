@@ -689,6 +689,55 @@ taken away at its next packet. Changes reach it within a poll and a
 terminator check-in (seconds). Removing the `everyone → default` grant
 turns the whole mesh deny-by-default; `access` says when it is gone.
 
+#### Devices that belong to someone
+
+With an identity provider (Pocket ID, Authentik, Keycloak, … — the same one
+your sign-in uses), a device can belong to a person, and then reaches what
+their groups are granted — no browser sign-in on the service, for SSH or a
+database as much as for a web page. Register the coordinator there as an
+OpenID Connect client with the redirect URL `<public url>/claim/callback`,
+and on the coordinator:
+
+```sh
+WIRESERVE_PUBLIC_URL=https://mesh.example.com
+WIRESERVE_OIDC_ISSUER=https://id.example.com
+WIRESERVE_OIDC_CLIENT_ID=wireserve
+WIRESERVE_OIDC_CLIENT_SECRET=…
+# optional, shown with their defaults
+WIRESERVE_OIDC_SCOPES="openid email profile groups offline_access"
+WIRESERVE_OIDC_GROUPS_CLAIM=groups
+WIRESERVE_OIDC_REFRESH_SECS=900
+```
+
+`create-node` and `export-config` then also print a **claim link** (with
+`--qr`, as a code for the phone's camera), and `claim-url <node>` makes a
+fresh one:
+
+```sh
+wireserve-admin claim-url laptop --qr
+wireserve-admin grant add oidc:family media
+wireserve-admin access --node laptop      # whose it is, and what that gives it
+wireserve-admin owner clear laptop
+```
+
+Opening the link sends the person to sign in, then asks "make `laptop`
+yours?", naming its tags and its current owner; yes makes it theirs. A link
+works once, for ten minutes, and **only you make them** — a node handing its
+own around could collect other people's groups, so none can. Signing in is
+optional: a device nobody claimed reaches what `everyone` and its tags reach,
+as before.
+
+The coordinator keeps each owner's refresh token, sealed with a key it
+generated into `coordinator-secrets.env` (`WIRESERVE_OIDC_TOKEN_KEY`), and
+fetches their groups again every `WIRESERVE_OIDC_REFRESH_SECS`: someone
+removed from a group loses what it gave them within that. If the provider
+refuses the token, the device belongs to nobody again; if the provider cannot
+be reached, the groups keep counting for an hour, then not until it answers.
+Revoking or rejoining a node clears its owner — the new identity may be
+another device. A terminator lets a claimed device's backends know who it is
+in the same `X-Auth-*` headers a sign-in fills (the user is the provider's
+`sub`).
+
 #### Signing in, for shared devices
 
 A grant to a tag or everyone is about the *device*. A laptop the whole family
@@ -1009,6 +1058,8 @@ anywhere that can reach it):
 | `wireserve-admin grant add\|remove <source> <group>`, `grant list` | let `everyone`, `tag:<tag>` or `oidc:<group>` reach a group |
 | `wireserve-admin tag add\|remove <node> <tag>` | tag a node, for grants to name |
 | `wireserve-admin access <svc>` / `access --node <node>` | who reaches a service and why, or what a node reaches |
+| `wireserve-admin claim-url <node> [--qr]` | a single-use link for whoever the device belongs to |
+| `wireserve-admin owner clear <node>` | the device belongs to nobody again |
 | `wireserve-admin deny-service <node> <svc>` | refuse one, or withdraw an approval |
 | `wireserve-admin approve-transit <name>` | let a node that opted in carry traffic for others |
 | `wireserve-admin deny-transit <name>` | withdraw that |

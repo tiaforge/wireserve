@@ -68,7 +68,7 @@ pub fn read_rules(conn: &rusqlite::Connection) -> Result<Rules, crate::db::DbErr
         grants: crate::db::grants::list_grants(conn)?,
         members: crate::db::grants::members(conn)?,
         tags: crate::db::grants::tags(conn)?,
-        owner_groups: BTreeMap::new(),
+        owner_groups: crate::db::owners::groups_by_node(conn, chrono::Utc::now())?,
     })
 }
 

@@ -247,6 +247,9 @@ fn gateway_peer(peer: &PeerInfo, allowed: &str, endpoint: Option<&str>) -> Strin
 pub struct Exported {
     pub conf: String,
     pub exit_conf: Option<String>,
+    /// A link for the device's owner to claim it with (PLAN.md M38), when
+    /// the coordinator has an identity provider. Only for a new export.
+    pub claim: Option<wireserve_types::ClaimLink>,
 }
 
 /// Where the full-tunnel profile sends DNS (PLAN.md M27), from `--dns`: an
@@ -490,7 +493,9 @@ pub fn run(
     )?;
     let dns = check_dns(admin_client, &directory, chosen, opts)?;
     let created = admin_client.create_node(name, NodeKind::Static, None)?;
-    finish(admin_client, node_facing_url, name, &created.join_token, &directory, chosen, dns)
+    let mut exported = finish(admin_client, node_facing_url, name, &created.join_token, &directory, chosen, dns)?;
+    exported.claim = created.claim;
+    Ok(exported)
 }
 
 /// How an export is shaped beyond its name.
@@ -697,7 +702,7 @@ fn finish(
         rendered.exit_text.is_some(),
     )?;
 
-    Ok(Exported { conf: rendered.text, exit_conf: rendered.exit_text })
+    Ok(Exported { conf: rendered.text, exit_conf: rendered.exit_text, claim: None })
 }
 
 #[cfg(test)]

@@ -16,6 +16,9 @@ pub struct AppState {
     pub transit: Arc<TransitState>,
     /// The public DNS sync (PLAN.md M32), when a provider is configured.
     pub dns: Option<Arc<crate::dns::Dns>>,
+    /// Device owners through the identity provider (PLAN.md M38), when one
+    /// is configured.
+    pub oidc: Option<Arc<crate::oidc::Oidc>>,
 }
 
 impl AppState {

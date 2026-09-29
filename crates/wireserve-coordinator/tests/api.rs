@@ -29,6 +29,8 @@ fn test_config(db_path: &str) -> Config {
         service_domain: None,
         sign_in: None,
         identity_headers: Default::default(),
+        public_url: None,
+        oidc: None,
         dns: None,
         acme: wireserve_coordinator::config::acme_from_lookup(|_| None).unwrap(),
         online_threshold_secs: 180,
@@ -3648,6 +3650,132 @@ async fn the_sign_in_and_groups_in_use_stay_where_they_are() {
     assert_eq!(admin_call(&app.router, "PUT", "/admin/nodes/nobody/tags/tv", json!(null)).await.0, StatusCode::NOT_FOUND);
 }
 
+// ---- PLAN.md M38: device owners ----
+
+fn oidc_app() -> TestApp {
+    let mut config = test_config("");
+    config.service_domain = Some("int.example.com".into());
+    config.public_url = Some("http://mesh.test".into());
+    // Nothing listens on the discard port: a sign-in cannot start, which is
+    // all these tests need of the provider.
+    config.oidc = Some(wireserve_coordinator::config::OidcConfig {
+        issuer: "http://127.0.0.1:9".into(),
+        client_id: "wireserve".into(),
+        client_secret: "s3cret".into(),
+        scopes: vec!["openid".into()],
+        groups_claim: "groups".into(),
+        refresh_interval: std::time::Duration::from_secs(900),
+        token_key: [7; 32],
+        redirect_url: "http://mesh.test/claim/callback".into(),
+    });
+    app_with_config(config)
+}
+
+async fn own(app: &TestApp, node: &str, sub: &str, groups: &[&str]) {
+    let conn = app.state.db.conn.lock().await;
+    let n = wireserve_coordinator::db::nodes::find_by_name(&conn, node).unwrap().unwrap();
+    wireserve_coordinator::db::owners::set(
+        &conn,
+        &wireserve_coordinator::db::owners::Owner {
+            node_id: n.id,
+            sub: sub.into(),
+            email: Some(format!("{sub}@example.com")),
+            name: None,
+            groups: groups.iter().map(|g| (*g).to_string()).collect(),
+            refresh_token_enc: "sealed".into(),
+            refreshed_at: chrono::Utc::now(),
+            stale_since: None,
+        },
+    )
+    .unwrap();
+}
+
+async fn get_page(router: &Router, path: &str) -> (StatusCode, String) {
+    let req = json_request("GET", path, None, json!(null));
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[tokio::test]
+async fn only_an_admin_makes_claim_links_and_only_with_an_identity_provider() {
+    let app = test_app();
+    admin_create_node(&app.router, "phone").await;
+    let (status, body) = admin_call(&app.router, "POST", "/admin/nodes/phone/claim", json!(null)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("WIRESERVE_OIDC_ISSUER"), "{body}");
+
+    let app = oidc_app();
+    let req = json_request("POST", "/admin/nodes", Some(ADMIN), json!({ "name": "laptop" }));
+    let created = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
+    let url = created["claim"]["url"].as_str().expect("create-node hands out a claim link");
+    assert!(url.starts_with("http://mesh.test/claim/clm_"), "{url}");
+
+    let (status, link) = admin_call(&app.router, "POST", "/admin/nodes/laptop/claim", json!(null)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(link["url"], created["claim"]["url"], "a fresh one every time");
+    assert_eq!(admin_call(&app.router, "POST", "/admin/nodes/nobody/claim", json!(null)).await.0, StatusCode::NOT_FOUND);
+
+    // No node-facing way to make one.
+    let (status, _) = get_page(&app.router, "/claim").await;
+    assert!(status.is_client_error());
+}
+
+#[tokio::test]
+async fn a_claim_link_is_checked_before_anything_is_started() {
+    let app = oidc_app();
+    admin_create_node(&app.router, "laptop").await;
+    let (_, link) = admin_call(&app.router, "POST", "/admin/nodes/laptop/claim", json!(null)).await;
+    let path = link["url"].as_str().unwrap().trim_start_matches("http://mesh.test").to_string();
+
+    let (status, page) = get_page(&app.router, &format!("/claim/clm_{}", "0".repeat(64))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{page}");
+    assert!(page.contains("not valid"));
+    let (status, _) = get_page(&app.router, "/claim/nonsense").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A real link gets as far as the identity provider, which is not there.
+    let (status, page) = get_page(&app.router, &path).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{page}");
+    // And looking did not use it up.
+    let (status, _) = get_page(&app.router, &path).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+    // Revoking the node ends its links.
+    admin_call(&app.router, "POST", "/admin/nodes/laptop/revoke", json!(null)).await;
+    let (status, _) = get_page(&app.router, &path).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Without a started sign-in, the callback and the confirmation refuse.
+    let (status, _) = get_page(&app.router, "/claim/callback?code=x&state=y").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn an_owners_groups_count_in_the_grants_until_the_owner_is_cleared() {
+    let app = oidc_app();
+    let [_, (home, home_ip), (_, watcher_ip)] = access_scenario(&app).await;
+    admin_call(&app.router, "POST", "/admin/groups", json!({"name": "media"})).await;
+    admin_call(&app.router, "PUT", "/admin/groups/media/services/jellyfin", json!(null)).await;
+    admin_call(&app.router, "POST", "/admin/grants", json!({"source": "oidc:family", "group": "media"})).await;
+    let services = json!([svc("jellyfin", 443, 8096), svc("prom", 80, 9090)]);
+
+    own(&app, "watcher", "alice", &["family"]).await;
+    let body = poll_caps(&app.router, &home, services.clone(), true).await;
+    let mut want = vec![home_ip.clone(), watcher_ip.clone()];
+    want.sort_by_key(|ip| ip.parse::<std::net::Ipv4Addr>().unwrap());
+    assert_eq!(access_entry(&body, "jellyfin")["sources"], json!(want), "the owner's device gets in: {body}");
+    let (_, report) = admin_call(&app.router, "GET", "/admin/access/nodes/watcher", json!(null)).await;
+    assert_eq!(report["owner"]["sub"], "alice", "{report}");
+    assert!(report["principals"].as_array().unwrap().contains(&json!("oidc:family")));
+
+    assert_eq!(admin_call(&app.router, "DELETE", "/admin/nodes/watcher/owner", json!(null)).await.0, StatusCode::OK);
+    let body = poll_caps(&app.router, &home, services, true).await;
+    assert_eq!(access_entry(&body, "jellyfin")["sources"], json!([home_ip]));
+    assert_eq!(admin_call(&app.router, "DELETE", "/admin/nodes/watcher/owner", json!(null)).await.0, StatusCode::NOT_FOUND);
+}
+
 // ---- PLAN.md M32: the service names in public DNS ----
 
 mod dns_records {
@@ -3851,6 +3979,30 @@ mod dns_records {
         let body = poll_ready(&app, &home, json!([svc("jellyfin", 443, 8096)]), &["jellyfin"]).await;
         assert_eq!(directory_entry(&body, "jellyfin")["terminated"], json!(true), "{body}");
         assert_eq!(access_entry(&body, "jellyfin")["open"], Value::Null, "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_terminating_node_learns_who_owns_the_devices_it_lets_in() {
+        let fake = Arc::new(FakeDns::default());
+        let app = app(&fake);
+        let home = node(&app, "home").await;
+        let _laptop = node(&app, "laptop").await;
+        let _tv = node(&app, "tv").await;
+        own(&app, "laptop", "alice", &["family"]).await;
+        own(&app, "tv", "bob", &["guests"]).await;
+        admin_call(&app.router, "POST", "/admin/groups", json!({"name": "media"})).await;
+        admin_call(&app.router, "PUT", "/admin/groups/media/services/jellyfin", json!(null)).await;
+        admin_call(&app.router, "POST", "/admin/grants", json!({"source": "oidc:family", "group": "media"})).await;
+
+        // Nothing terminated yet: nobody's identity.
+        let body = poll_ready(&app, &home, json!([svc("jellyfin", 443, 8096)]), &[]).await;
+        assert!(body.get("identities").is_none(), "{body}");
+
+        let body = poll_ready(&app, &home, json!([svc("jellyfin", 443, 8096)]), &["jellyfin"]).await;
+        let ids = body["identities"].as_array().expect("identities for a terminating node");
+        assert_eq!(ids.len(), 1, "alice's laptop only — bob's tv is not let in: {body}");
+        assert_eq!(ids[0]["user"], "alice");
+        assert_eq!(ids[0]["groups"], json!(["family"]));
     }
 
     #[tokio::test]

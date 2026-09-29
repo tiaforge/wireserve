@@ -121,7 +121,11 @@ pub fn build_config(state: &AgentState) -> TlsConfig {
     let callers = directory
         .peers
         .iter()
-        .filter_map(|p| Some(Caller { addr: p.ip4.parse().ok()?, node: p.name.clone() }))
+        .filter_map(|p| {
+            let addr = p.ip4.parse().ok()?;
+            let owner = state.own_identities.iter().find(|i| i.addr == addr).cloned();
+            Some(Caller { addr, node: p.name.clone(), owner })
+        })
         .collect();
     let (Some(naming), Some(node)) = (&directory.naming, node) else {
         return TlsConfig { callers, ..TlsConfig::default() };

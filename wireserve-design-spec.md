@@ -520,6 +520,24 @@ request on every service, and the provider's domain-wide session cookie from
 every request but the provider's own. The provider's own service is always
 open and cannot be put in a group.
 
+**Device owners (M38).** With an identity provider configured
+(`WIRESERVE_OIDC_*`), a node may belong to a person, whose groups then count
+among its principals (`oidc:<group>`) for every protocol. Only an admin makes
+a claim link (`POST /admin/nodes/{name}/claim`, also handed out by
+`create-node`): single-use, ten minutes, stored hashed. The coordinator runs
+the code flow with PKCE (`/claim/{code}`, `/claim/callback`), checks the ID
+token and its nonce, and binds the owner only after the person confirms on a
+page naming the node, its tags and its current owner (`POST /claim/confirm`,
+which uses the link up atomically). Flow state is in memory, bound to the
+browser by a cookie; the pages forbid framing, scripts and caching. The owner's
+refresh token is sealed (XChaCha20-Poly1305, key in `coordinator-secrets.env`,
+the node as associated data) and exchanged every refresh interval for current
+groups: `invalid_grant` ends the ownership, other failures leave the groups
+counting for an hour. Revoke and rejoin clear the owner. A node with
+terminated services also gets `PollResponse.identities` — the owners of the
+devices allowed in — and its terminator names them to backends in the
+identity headers.
+
 ### 6.2 A resolver in a full tunnel (M27)
 
 A phone's `DNS =` line captures every query the phone makes (PLAN.md #104),

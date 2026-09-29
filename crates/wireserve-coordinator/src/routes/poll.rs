@@ -408,7 +408,8 @@ pub async fn poll(
         state.config.online_threshold_secs,
     );
     let provider = state.config.sign_in.as_ref().map(|si| (si.service.as_str(), si.node.as_str()));
-    let access = services::list_for_node(&conn, node.id)?
+    let own_rows = services::list_for_node(&conn, node.id)?;
+    let access: Vec<wireserve_types::ServiceAccess> = own_rows
         .iter()
         .filter(|s| s.denied_at.is_none() || s.approved_at.is_some())
         .map(|s| {
@@ -416,6 +417,35 @@ pub async fn poll(
             crate::access::service_access(s, &node, &all_peers, &rules, &facts)
         })
         .collect();
+
+    // Who owns the devices its terminator lets in by their grants (PLAN.md
+    // M38), so it can name them to its backends: those allowed into any of
+    // its terminated services — every device, when one is open.
+    let terminated: Vec<&wireserve_types::ServiceAccess> = access
+        .iter()
+        .filter(|a| own_rows.iter().any(|r| r.name == a.name && ctx.terminates(r)))
+        .collect();
+    let identities = if terminated.is_empty() {
+        Vec::new()
+    } else {
+        let every = terminated.iter().any(|a| a.open);
+        let allowed: std::collections::BTreeSet<std::net::Ipv4Addr> =
+            terminated.iter().flat_map(|a| a.sources.iter().copied()).collect();
+        let now = chrono::Utc::now();
+        crate::db::owners::all(&conn)?
+            .into_iter()
+            .filter(|o| o.groups_count(now))
+            .filter_map(|o| {
+                let addr: std::net::Ipv4Addr = all_peers.iter().find(|p| p.id == o.node_id)?.ip4.as_deref()?.parse().ok()?;
+                (every || allowed.contains(&addr)).then_some(wireserve_types::CallerIdentity {
+                    addr,
+                    user: o.sub,
+                    email: o.email,
+                    groups: o.groups,
+                })
+            })
+            .collect()
+    };
 
     Ok(Json(PollResponse {
         peers,
@@ -429,5 +459,6 @@ pub async fn poll(
         naming: state.config.service_naming(),
         access,
         service_notices: outcome.notices,
+        identities,
     }))
 }

@@ -87,6 +87,10 @@ pub struct TlsService {
 pub struct Caller {
     pub addr: Ipv4Addr,
     pub node: String,
+    /// Its owner (PLAN.md M38), named to a backend when the device's grants
+    /// let it in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<crate::CallerIdentity>,
 }
 
 /// The header naming the calling node (PLAN.md M33). Always set by the

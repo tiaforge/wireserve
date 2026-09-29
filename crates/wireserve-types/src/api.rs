@@ -63,6 +63,32 @@ pub struct CreateNodeResponse {
     /// `join` fail half an hour later.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub join_token_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// A link for the device's owner to claim it with (PLAN.md M38), when
+    /// the coordinator signs owners in through an identity provider.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub claim: Option<ClaimLink>,
+}
+
+/// A single-use link that makes whoever signs in with it the owner of one
+/// node (PLAN.md M38). Only an admin gets one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimLink {
+    pub url: String,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A node's owner, as the admin sees it (PLAN.md M38).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnerInfo {
+    pub sub: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub groups: Vec<String>,
+    /// Refreshing has failed for so long that the groups count for nothing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
 }
 
 // ---- Node: address probe (dual-family endpoint self-discovery) ----
@@ -464,6 +490,11 @@ pub struct PollResponse {
     /// (PLAN.md M36). A declaration with a notice may not be published.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub service_notices: Vec<crate::ServiceNotice>,
+    /// Who owns the devices that may reach THIS node's terminated services
+    /// (PLAN.md M38), for its terminator to tell its backends. Only to a
+    /// node with a terminated service, and only those devices.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identities: Vec<crate::CallerIdentity>,
     /// THIS node's own declarations awaiting approval — never anyone
     /// else's.
     ///
@@ -745,6 +776,8 @@ pub struct ServiceAccessReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeAccessReport {
     pub node: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<OwnerInfo>,
     pub principals: Vec<crate::GrantSource>,
     pub services: Vec<AccessVia>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -796,6 +829,7 @@ mod tests {
             naming: None,
             access: vec![],
             service_notices: vec![],
+            identities: vec![],
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("pending_services"), "{json}");
@@ -846,6 +880,7 @@ mod tests {
             naming: None,
             access: vec![],
             service_notices: vec![],
+            identities: vec![],
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: PollResponse = serde_json::from_str(&json).unwrap();

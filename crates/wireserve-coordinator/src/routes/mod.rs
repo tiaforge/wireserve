@@ -32,6 +32,10 @@ pub fn node_router(state: AppState) -> Router {
         .route("/poll", post(poll::poll))
         .route("/probe", get(probe::probe))
         .route("/tls/challenge", post(tls::add).delete(tls::remove))
+        // Device owners (PLAN.md M38): pages a browser opens.
+        .route("/claim/callback", get(crate::oidc::claim::callback))
+        .route("/claim/confirm", post(crate::oidc::claim::confirm))
+        .route("/claim/{code}", get(crate::oidc::claim::start))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
@@ -85,6 +89,8 @@ pub fn admin_router(state: AppState) -> Router {
         )
         .route("/admin/access/services/{name}", get(admin::service_access_report))
         .route("/admin/access/nodes/{name}", get(admin::node_access_report))
+        .route("/admin/nodes/{name}/claim", post(admin::claim_link))
+        .route("/admin/nodes/{name}/owner", delete(admin::remove_owner))
         .route(
             "/admin/nodes/{name}/services/{service}/approve",
             post(admin::approve_service),

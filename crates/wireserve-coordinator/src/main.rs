@@ -101,6 +101,10 @@ async fn serve() {
     if let Some(dns) = state.dns.clone() {
         tokio::spawn(dns::sync::run(state.clone(), dns));
     }
+    if let Some(oidc) = state.oidc.clone() {
+        tracing::info!(issuer = %oidc.config.issuer, "device owners sign in through the identity provider");
+        tokio::spawn(wireserve_coordinator::oidc::refresh::run(state.clone(), oidc));
+    }
 
     let node_app = routes::node_router(state.clone())
         .into_make_service_with_connect_info::<SocketAddr>();
@@ -290,6 +294,8 @@ mod tests {
             acme: config::acme_from_lookup(|_| None).unwrap(),
             sign_in: None,
             identity_headers: Default::default(),
+            public_url: None,
+            oidc: None,
             online_threshold_secs: 180,
             rate_limit_max: 10,
             rate_limit_window_secs: 60,

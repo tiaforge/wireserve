@@ -290,6 +290,19 @@ impl AdminClient {
         Ok(Self::check_status(resp)?.json()?)
     }
 
+    /// `POST /admin/nodes/{name}/claim` (PLAN.md M38).
+    pub fn claim_link(&self, node: &str) -> Result<wireserve_types::ClaimLink, ClientError> {
+        let resp = self.http.post(self.url(&format!("/admin/nodes/{node}/claim"))).bearer_auth(&self.admin_token).send()?;
+        Ok(Self::check_status(resp)?.json()?)
+    }
+
+    /// `DELETE /admin/nodes/{name}/owner`.
+    pub fn remove_owner(&self, node: &str) -> Result<(), ClientError> {
+        let resp = self.http.delete(self.url(&format!("/admin/nodes/{node}/owner"))).bearer_auth(&self.admin_token).send()?;
+        Self::check_status(resp)?;
+        Ok(())
+    }
+
     /// `GET /admin/access/nodes/{name}`.
     pub fn node_access(&self, node: &str) -> Result<wireserve_types::NodeAccessReport, ClientError> {
         let resp = self.http.get(self.url(&format!("/admin/access/nodes/{node}"))).bearer_auth(&self.admin_token).send()?;

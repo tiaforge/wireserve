@@ -161,6 +161,7 @@ async fn create_node(
         join_token_expires_at: None,
         name,
         join_token: "jtk_mock".to_string(),
+        claim: None,
     }))
 }
 

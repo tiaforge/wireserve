@@ -31,7 +31,15 @@ pub async fn create_node(
     let expires_at = nodes::join_token_expiry(ttl);
 
     let conn = state.db.conn.lock().await;
-    nodes::create_node(&conn, &req.name, req.kind, &hash, expires_at.as_deref())?;
+    let node_id = nodes::create_node(&conn, &req.name, req.kind, &hash, expires_at.as_deref())?;
+    // Whoever will own it can claim it right away (PLAN.md M38).
+    let claim = match (&state.oidc, state.config.public_url.as_deref()) {
+        (Some(_), Some(public)) => {
+            let (url, expires_at) = crate::oidc::claim::new_link(&conn, public, node_id)?;
+            Some(wireserve_types::ClaimLink { url, expires_at })
+        }
+        _ => None,
+    };
 
     tracing::info!(
         event = "node_created",
@@ -46,8 +54,55 @@ pub async fn create_node(
             name: req.name,
             join_token,
             join_token_expires_at: parse_expiry(expires_at.as_deref()),
+            claim,
         }),
     ))
+}
+
+/// `POST /admin/nodes/{name}/claim` (PLAN.md M38): a single-use link,
+/// good for ten minutes, that makes whoever signs in with it the node's
+/// owner. Only an admin makes one: a node handing its own around could
+/// collect other people's groups.
+pub async fn claim_link(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path(name): Path<String>,
+) -> Result<Json<wireserve_types::ClaimLink>, AppError> {
+    check_label("node", &name)?;
+    let (Some(_), Some(public)) = (&state.oidc, state.config.public_url.as_deref()) else {
+        return Err(AppError::Conflict(
+            "device owners need an identity provider: set WIRESERVE_OIDC_ISSUER, _CLIENT_ID, _CLIENT_SECRET and \
+             WIRESERVE_PUBLIC_URL"
+                .into(),
+        ));
+    };
+    let conn = state.db.conn.lock().await;
+    let node = nodes::find_by_name(&conn, &name)?.ok_or_else(|| AppError::NoSuch(format!("no node {name}")))?;
+    if node.revoked {
+        return Err(AppError::Conflict(format!("{name} is revoked")));
+    }
+    let (url, expires_at) = crate::oidc::claim::new_link(&conn, public, node.id)?;
+    tracing::info!(event = "claim_link_created", node_name = %name);
+    Ok(Json(wireserve_types::ClaimLink { url, expires_at }))
+}
+
+/// `DELETE /admin/nodes/{name}/owner` (PLAN.md M38): the node belongs to
+/// nobody again, and its outstanding claim links stop working.
+pub async fn remove_owner(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path(name): Path<String>,
+) -> Result<(), AppError> {
+    check_label("node", &name)?;
+    let conn = state.db.conn.lock().await;
+    let node = nodes::find_by_name(&conn, &name)?.ok_or_else(|| AppError::NoSuch(format!("no node {name}")))?;
+    let had = crate::db::owners::of(&conn, node.id)?.is_some();
+    crate::db::owners::forget(&conn, node.id)?;
+    if !had {
+        return Err(AppError::NoSuch(format!("{name} has no owner")));
+    }
+    tracing::info!(event = "owner_removed", node_name = %name);
+    Ok(())
 }
 
 /// Re-parses the expiry string that was just written to the database, so
@@ -597,8 +652,16 @@ pub async fn node_access_report(
             (!via.is_empty()).then_some(wireserve_types::AccessVia { name: s.name, via })
         })
         .collect();
+    let owner = crate::db::owners::of(&conn, node.id)?.map(|o| wireserve_types::OwnerInfo {
+        stale: !o.groups_count(chrono::Utc::now()),
+        sub: o.sub,
+        email: o.email,
+        name: o.name,
+        groups: o.groups,
+    });
     Ok(Json(wireserve_types::NodeAccessReport {
         node: name,
+        owner,
         principals: rules.principals(node.id).into_iter().collect(),
         services,
         default_closed: default_closed(&rules),

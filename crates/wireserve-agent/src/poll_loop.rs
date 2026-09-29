@@ -293,6 +293,21 @@ pub fn service_rules(
     rules
 }
 
+/// Keeps the owners' identities to what a backend can be told: an address
+/// inside the mesh, a user with no control characters, groups a grant could
+/// name — the rest is dropped, which only means a backend is told less.
+pub fn sanitize_identities(ids: &mut Vec<wireserve_types::CallerIdentity>, mesh: Option<&wireserve_types::MeshRanges>) {
+    let clean = |s: &str| !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control);
+    ids.retain(|i| mesh.is_none_or(|m| m.contains4(i.addr)) && clean(&i.user));
+    ids.truncate(wireserve_types::MAX_SOURCES_PER_SERVICE);
+    for i in ids {
+        if i.email.as_deref().is_some_and(|e| !clean(e)) {
+            i.email = None;
+        }
+        i.groups.retain(|g| wireserve_types::is_valid_oidc_group(g));
+    }
+}
+
 /// Keeps the access list to what this node can act on: sources inside the
 /// mesh range it pinned, at most [`wireserve_types::MAX_SOURCES_PER_SERVICE`]
 /// of them, and group names a grant could have named. Anything dropped
@@ -683,6 +698,7 @@ where
     }
     crate::vip::sanitize(&mut directory);
     sanitize_access(&mut directory.access, mesh_ranges.as_ref());
+    sanitize_identities(&mut directory.identities, mesh_ranges.as_ref());
 
     // Approval verdicts are folded in BEFORE the firewall rules are
     // computed, and that ordering is the whole point.
@@ -708,9 +724,12 @@ where
         // Saved now, whatever fails later this cycle (PLAN.md M36): the
         // terminator reads it at its next check-in, and must never enforce
         // grants older than the firewall below.
-        let access_changed = s.own_access != directory.access || s.service_notices != directory.service_notices;
+        let access_changed = s.own_access != directory.access
+            || s.service_notices != directory.service_notices
+            || s.own_identities != directory.identities;
         if access_changed {
             s.own_access.clone_from(&directory.access);
+            s.own_identities.clone_from(&directory.identities);
             s.service_notices.clone_from(&directory.service_notices);
             for n in &s.service_notices {
                 tracing::warn!(service = %n.name.escape_debug(), reason = %n.reason.escape_debug(), "the coordinator about this service");
@@ -1319,6 +1338,7 @@ mod tests {
             naming: None,
             access: vec![],
             service_notices: vec![],
+            identities: vec![],
             peers: vec![],
             services: vec![],
             pending_services: pending

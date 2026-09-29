@@ -44,6 +44,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
             naming: None,
             access: vec![],
             service_notices: vec![],
+            identities: vec![],
         });
 
     let self_name = state.public_key.as_ref().and_then(|pk| {

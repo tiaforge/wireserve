@@ -180,6 +180,16 @@ pub fn cmd_service_access(client: &AdminClient, service: &str) -> Result<wireser
     Ok(client.service_access(service)?)
 }
 
+pub fn cmd_claim_link(client: &AdminClient, node: &str) -> Result<wireserve_types::ClaimLink, CliError> {
+    validate_name(node)?;
+    Ok(client.claim_link(node)?)
+}
+
+pub fn cmd_remove_owner(client: &AdminClient, node: &str) -> Result<(), CliError> {
+    validate_name(node)?;
+    Ok(client.remove_owner(node)?)
+}
+
 pub fn cmd_node_access(client: &AdminClient, node: &str) -> Result<wireserve_types::NodeAccessReport, CliError> {
     validate_name(node)?;
     Ok(client.node_access(node)?)

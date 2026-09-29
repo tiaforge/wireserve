@@ -21,8 +21,12 @@ use std::path::{Path, PathBuf};
 const ADMIN_TOKEN_KEY: &str = "WIRESERVE_ADMIN_TOKEN";
 const NET_V4_KEY: &str = "WIRESERVE_NET_V4_CIDR";
 const NET_V6_KEY: &str = "WIRESERVE_NET_V6_PREFIX";
+/// Seals the device owners' refresh tokens in the database (PLAN.md M38).
+/// Kept here rather than in the database it protects, so a copy of the
+/// database alone does not carry the tokens in the clear.
+pub const OIDC_TOKEN_KEY: &str = "WIRESERVE_OIDC_TOKEN_KEY";
 
-const KEYS: [&str; 3] = [ADMIN_TOKEN_KEY, NET_V4_KEY, NET_V6_KEY];
+const KEYS: [&str; 4] = [ADMIN_TOKEN_KEY, NET_V4_KEY, NET_V6_KEY, OIDC_TOKEN_KEY];
 
 #[derive(Debug, thiserror::Error)]
 pub enum BootstrapError {
@@ -36,6 +40,9 @@ pub struct Bootstrapped {
     pub admin_token: String,
     pub net_v4_cidr: String,
     pub net_v6_prefix: String,
+    /// 32 bytes, hex. Generated silently — it is not something an operator
+    /// has to know about — and so never listed in `generated`.
+    pub oidc_token_key: String,
     /// Which of the three keys were freshly generated (not found in an env
     /// var or the persisted file) on this call.
     pub generated: Vec<&'static str>,
@@ -82,6 +89,8 @@ pub fn resolve_with(
     let admin_token = resolve_one(ADMIN_TOKEN_KEY, generate_admin_token);
     let net_v4_cidr = resolve_one(NET_V4_KEY, generate_v4_cidr);
     let net_v6_prefix = resolve_one(NET_V6_KEY, generate_v6_prefix);
+    let oidc_token_key = resolve_one(OIDC_TOKEN_KEY, generate_token_key);
+    generated.retain(|k| *k != OIDC_TOKEN_KEY);
 
     if !to_append.is_empty() {
         append_to_file(&path, &to_append)?;
@@ -91,9 +100,14 @@ pub fn resolve_with(
         admin_token,
         net_v4_cidr,
         net_v6_prefix,
+        oidc_token_key,
         generated,
         path,
     })
+}
+
+fn generate_token_key() -> String {
+    crate::tokengen::generate("")
 }
 
 fn generate_admin_token() -> String {

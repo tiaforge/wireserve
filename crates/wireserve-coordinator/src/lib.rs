@@ -9,6 +9,7 @@ pub mod dns;
 pub mod error;
 pub mod install;
 pub mod ipam;
+pub mod oidc;
 pub mod rate_limit;
 pub mod reflexive;
 pub mod routes;
@@ -45,6 +46,7 @@ pub fn build_state_with_dns(
             config.global_auth_failure_window_secs,
         )),
         transit: Arc::new(transit::TransitState::default()),
+        oidc: config.oidc.clone().map(|c| Arc::new(oidc::Oidc::new(c))),
         config: Arc::new(config),
     }
 }
