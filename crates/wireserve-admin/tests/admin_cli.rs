@@ -360,6 +360,26 @@ fn list_peers_reflects_mock_directory() {
     assert_eq!(resp.peers[0].name, "homeserver");
 }
 
+#[test]
+fn tags_by_tag_inverts_the_per_node_map() {
+    let mock = MockCoordinator::start(TOKEN);
+    mock.set_tags(&[("web", &["ops", "tv"]), ("db", &["ops"])]);
+    let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
+    let resp = wireserve_admin::cmd_list_peers(&client).unwrap();
+    let by_tag = wireserve_admin::tags_by_tag(&resp);
+    assert_eq!(by_tag["ops"], vec!["db", "web"]);
+    assert_eq!(by_tag["tv"], vec!["web"]);
+    assert_eq!(by_tag.len(), 2);
+}
+
+#[test]
+fn tags_by_tag_is_empty_without_tags() {
+    let mock = MockCoordinator::start(TOKEN);
+    let client = AdminClient::new(mock.base_url.as_str(), TOKEN);
+    let resp = wireserve_admin::cmd_list_peers(&client).unwrap();
+    assert!(wireserve_admin::tags_by_tag(&resp).is_empty());
+}
+
 // ---- F8: delete-node ----
 
 #[test]

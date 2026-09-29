@@ -253,6 +253,8 @@ enum OwnerAction {
 enum TagAction {
     Add { node: String, tag: String },
     Remove { node: String, tag: String },
+    /// Every tag in use and the nodes carrying it, or just one tag's nodes.
+    List { tag: Option<String> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -496,6 +498,25 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     wireserve_admin::cmd_set_tag(&client, &node, &tag, false)?;
                     println!("node '{node}' is no longer tagged '{tag}'");
                 }
+                TagAction::List { tag } => {
+                    if let Some(tag) = &tag {
+                        check_name(tag)?;
+                    }
+                    let resp = wireserve_admin::cmd_list_peers(&client)?;
+                    let by_tag = wireserve_admin::tags_by_tag(&resp);
+                    match tag {
+                        Some(tag) => match by_tag.get(&tag) {
+                            Some(nodes) => println!("{}\t{}", sanitize_for_terminal(&tag), sanitize_for_terminal(&nodes.join(","))),
+                            None => println!("no node is tagged '{tag}'"),
+                        },
+                        None if by_tag.is_empty() => println!("no tags set"),
+                        None => {
+                            for (tag, nodes) in by_tag {
+                                println!("{}\t{}", sanitize_for_terminal(&tag), sanitize_for_terminal(&nodes.join(",")));
+                            }
+                        }
+                    }
+                }
             }
         }
         Command::ClaimUrl { node, qr } => {
@@ -647,7 +668,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // only line of defense" reasoning as export_config's
                 // renderer.
                 println!(
-                    "{}\t{}\t{}\t{}\tendpoint={}\tv4={}\tv6={}\tlan={}\treflexive={}\ttransit={}\tvia_gateway={}\texit={}",
+                    "{}\t{}\t{}\t{}\tendpoint={}\tv4={}\tv6={}\tlan={}\treflexive={}\ttransit={}\tvia_gateway={}\texit={}\ttags={}",
                     sanitize_for_terminal(&p.name),
                     sanitize_for_terminal(&p.pubkey),
                     sanitize_for_terminal(&p.ip4),
@@ -674,7 +695,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap_or_else(|| "-".to_string()),
                     transit,
                     via_gateway,
-                    exit
+                    exit,
+                    match resp.tags.get(&p.name) {
+                        Some(t) if !t.is_empty() => sanitize_for_terminal(&t.join(",")),
+                        _ => "-".to_string(),
+                    }
                 );
             }
         }

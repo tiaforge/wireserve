@@ -33,6 +33,7 @@ struct MockState {
     admin_token: String,
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
     peers: Arc<Mutex<Vec<PeerInfo>>>,
+    tags: Arc<Mutex<std::collections::BTreeMap<String, Vec<String>>>>,
 }
 
 pub struct MockCoordinator {
@@ -73,6 +74,7 @@ impl MockCoordinator {
             admin_token: admin_token.to_string(),
             requests: Arc::new(Mutex::new(Vec::new())),
             peers: Arc::new(Mutex::new(Vec::new())),
+            tags: Arc::new(Mutex::new(Default::default())),
         };
 
         let (addr_tx, addr_rx) = std::sync::mpsc::channel();
@@ -122,6 +124,11 @@ impl MockCoordinator {
             .iter()
             .map(|r| r.path.clone())
             .collect()
+    }
+
+    pub fn set_tags(&self, tags: &[(&str, &[&str])]) {
+        *self.state.tags.lock().unwrap() =
+            tags.iter().map(|(n, t)| (n.to_string(), t.iter().map(|x| x.to_string()).collect())).collect();
     }
 
     pub fn set_peers(&self, peers: Vec<PeerInfo>) {
@@ -297,7 +304,7 @@ async fn list_peers(
         via_gateway: vec![],
         exit_offering: vec![],
         exit_devices: vec![],
-        tags: Default::default(),
+        tags: state.tags.lock().unwrap().clone(),
     }))
 }
 

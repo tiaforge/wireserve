@@ -659,6 +659,7 @@ up, every service is reachable from every node, as it always was.
 wireserve-admin group create infra
 wireserve-admin group add infra grafana        # out of default, into infra
 wireserve-admin tag add ci-runner ops
+wireserve-admin tag list                       # each tag in use and its nodes
 wireserve-admin grant add tag:ops infra        # the ci-runner reaches grafana
 wireserve-admin access grafana                 # who reaches it, and why
 wireserve-admin access --node ci-runner        # what a node reaches
@@ -1057,6 +1058,7 @@ anywhere that can reach it):
 | `wireserve-admin group add\|remove <group> <svc>` | put a service in a group, or take it out |
 | `wireserve-admin grant add\|remove <source> <group>`, `grant list` | let `everyone`, `tag:<tag>` or `oidc:<group>` reach a group |
 | `wireserve-admin tag add\|remove <node> <tag>` | tag a node, for grants to name |
+| `wireserve-admin tag list [<tag>]` | every tag in use and the nodes carrying it (`list-peers` shows `tags=` per node too) |
 | `wireserve-admin access <svc>` / `access --node <node>` | who reaches a service and why, or what a node reaches |
 | `wireserve-admin claim-url <node> [--qr]` | a single-use link for whoever the device belongs to |
 | `wireserve-admin owner clear <node>` | the device belongs to nobody again |

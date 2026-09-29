@@ -175,6 +175,21 @@ pub fn cmd_set_tag(client: &AdminClient, node: &str, tag: &str, add: bool) -> Re
     Ok(client.set_tag(node, tag, add)?)
 }
 
+/// Invert the per-node tag map into tag -> nodes, both sorted. A tag has no
+/// existence apart from the nodes carrying it, so this is the list of tags.
+pub fn tags_by_tag(resp: &AdminPeersResponse) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut out: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for (node, tags) in &resp.tags {
+        for tag in tags {
+            out.entry(tag.clone()).or_default().push(node.clone());
+        }
+    }
+    for nodes in out.values_mut() {
+        nodes.sort();
+    }
+    out
+}
+
 pub fn cmd_service_access(client: &AdminClient, service: &str) -> Result<wireserve_types::ServiceAccessReport, CliError> {
     validate_name(service)?;
     Ok(client.service_access(service)?)
