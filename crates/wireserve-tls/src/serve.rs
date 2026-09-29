@@ -71,9 +71,30 @@ pub struct Shared {
     pub callers: Callers,
     pub sign_in: SharedSignIn,
     pub identity: Arc<RwLock<wireserve_types::IdentityHeaders>>,
+    /// Known devices that connected since the last check-in (PLAN.md M38):
+    /// what the agent tells the coordinator, which then names their owners
+    /// to this node and nobody else's.
+    pub seen: Arc<Mutex<std::collections::BTreeSet<Ipv4Addr>>>,
 }
 
 impl Shared {
+    /// Takes the devices seen since the last call.
+    pub fn take_seen(&self) -> Vec<Ipv4Addr> {
+        std::mem::take(&mut *self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner)).into_iter().collect()
+    }
+
+    /// Records devices as seen, up to a cap: a mesh has far fewer devices
+    /// than this.
+    pub fn note_seen(&self, addrs: impl IntoIterator<Item = Ipv4Addr>) {
+        let mut seen = self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for a in addrs {
+            if seen.len() >= wireserve_types::MAX_CALLERS_SEEN_PER_POLL {
+                break;
+            }
+            seen.insert(a);
+        }
+    }
+
     /// Stops answering on `vip`: its connections close, and requests on
     /// ones already open are refused.
     pub fn unroute(&self, vip: Ipv4Addr) {
@@ -441,6 +462,9 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                     let in_flight = InFlight::begin(&stats);
                     let policy = read(&shared.policies).get(&vip).cloned();
                     let caller = caller_addr.and_then(|a| read(&shared.callers).get(&a).cloned());
+                    if let (Some(addr), Some(_)) = (caller_addr, &caller) {
+                        shared.note_seen([addr]);
+                    }
                     let sign_in = read(&shared.sign_in).clone();
                     let identity = read(&shared.identity).clone();
                     let misdirected = policy.as_ref().is_some_and(|p| !for_this_service(&req, &p.fqdn));
@@ -927,6 +951,11 @@ mod tests {
     /// of a backend that answers `/` at once, `/slow` after 1.5s, and `/drip`
     /// a chunk every 200ms for 1.5s. Returns its port and a TLS connector.
     async fn limited(limits: Limits) -> (u16, tokio_rustls::TlsConnector) {
+        let (port, client, _) = limited_shared(limits).await;
+        (port, client)
+    }
+
+    async fn limited_shared(limits: Limits) -> (u16, tokio_rustls::TlsConnector, Shared) {
         use std::convert::Infallible;
 
         struct Drip {
@@ -978,11 +1007,11 @@ mod tests {
         let shared = Shared::default();
         shared.routes.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(Route::new(upstream)));
         shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(open("svc.test")));
-        spawn_with_limits(listener, server_config(certs), shared, limits);
+        spawn_with_limits(listener, server_config(certs), shared.clone(), limits);
         let mut roots = rustls::RootCertStore::empty();
         roots.add(der).unwrap();
         let client = tokio_rustls::TlsConnector::from(Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth()));
-        (port, client)
+        (port, client, shared)
     }
 
     fn quick() -> Limits {
@@ -1101,5 +1130,26 @@ mod tests {
         let _b = tls(port, &client).await;
         let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         assert!(client.connect(rustls_pki_types::ServerName::try_from("svc.test").unwrap(), tcp).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn only_known_devices_that_connected_are_reported_as_seen() {
+        let (port, client, shared) = limited_shared(quick()).await;
+        // 127.0.0.1 is nobody the agent named: not a device to report.
+        let mut c = tls(port, &client).await;
+        assert!(get(&mut c, "/").await.ends_with("ok"));
+        assert!(shared.take_seen().is_empty());
+
+        shared.callers.write().unwrap().insert(
+            Ipv4Addr::LOCALHOST,
+            CallerInfo { node: "laptop".into(), owner: None },
+        );
+        let mut c = tls(port, &client).await;
+        assert!(get(&mut c, "/").await.ends_with("ok"));
+        assert_eq!(shared.take_seen(), vec![Ipv4Addr::LOCALHOST]);
+        assert!(shared.take_seen().is_empty(), "taken once");
+
+        shared.note_seen((0..=255u8).flat_map(|a| (0..=3u8).map(move |b| Ipv4Addr::new(10, 9, b, a))));
+        assert_eq!(shared.take_seen().len(), wireserve_types::MAX_CALLERS_SEEN_PER_POLL, "capped");
     }
 }

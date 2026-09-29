@@ -144,6 +144,11 @@ pub fn build_poll_request(
             ready.truncate(wireserve_types::MAX_TLS_READY_PER_POLL);
             ready
         },
+        callers_seen: {
+            let mut seen = tls.callers_seen;
+            seen.truncate(wireserve_types::MAX_CALLERS_SEEN_PER_POLL);
+            seen
+        },
     }
 }
 
@@ -154,6 +159,9 @@ pub fn build_poll_request(
 pub struct TlsSelfReport {
     pub capable: bool,
     pub ready: Vec<String>,
+    /// The devices that connected to the terminator recently, whose owners
+    /// the coordinator may name to this node (PLAN.md M38).
+    pub callers_seen: Vec<Ipv4Addr>,
 }
 
 /// This node's own services the directory says are terminated here AND the
@@ -638,6 +646,7 @@ where
     let tls_report = ctx.tls.map_or_else(TlsSelfReport::default, |link| TlsSelfReport {
         capable: link.present(tls_now),
         ready: link.reported(tls_now),
+        callers_seen: link.callers_seen(tls_now),
     });
 
     // 1. send
@@ -1216,7 +1225,7 @@ mod tests {
             None,
             None,
             TransitSelfReport { capable: false, exit_capable: false, reachable: vec![], wanted: vec![] },
-            TlsSelfReport { capable: true, ready: vec!["plex".into()] },
+            TlsSelfReport { capable: true, ready: vec!["plex".into()], callers_seen: vec![] },
         );
         assert!(req.capabilities.contains(&wireserve_types::CAP_TLS_TERMINATE.to_string()));
         assert_eq!(req.tls_ready, vec!["plex".to_string()]);

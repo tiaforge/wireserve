@@ -19,6 +19,10 @@ pub struct AppState {
     /// Device owners through the identity provider (PLAN.md M38), when one
     /// is configured.
     pub oidc: Option<Arc<crate::oidc::Oidc>>,
+    /// Which `(node, device's node)` pairs have had a device owner's
+    /// identity named to the node since this process started — so that the
+    /// first time is logged, and only the first.
+    pub released: Arc<std::sync::Mutex<std::collections::HashSet<(i64, i64)>>>,
 }
 
 impl AppState {
@@ -33,6 +37,12 @@ impl AppState {
             dns: self.dns.is_some(),
             online_threshold_secs: self.config.online_threshold_secs,
         }
+    }
+
+    /// Whether this is the first time `to` is told who owns `device`'s node.
+    #[must_use]
+    pub fn first_release(&self, to: i64, device: i64) -> bool {
+        self.released.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert((to, device))
     }
 
     /// Tells the DNS sync the directory may have changed. Cheap and safe to

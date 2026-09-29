@@ -420,12 +420,18 @@ pub async fn poll(
 
     // Who owns the devices its terminator lets in by their grants (PLAN.md
     // M38), so it can name them to its backends: those allowed into any of
-    // its terminated services — every device, when one is open.
+    // its terminated services — every device, when one is open — and that
+    // the node says have connected to it. Without the second, a node with
+    // one open service would be told every owner's subject, e-mail address
+    // and groups; a node that lies about who came still gets no more than
+    // it asks for, one device at a time, each logged the first time.
     let terminated: Vec<&wireserve_types::ServiceAccess> = access
         .iter()
         .filter(|a| own_rows.iter().any(|r| r.name == a.name && ctx.terminates(r)))
         .collect();
-    let identities = if terminated.is_empty() {
+    let seen: std::collections::HashSet<std::net::Ipv4Addr> =
+        req.callers_seen.iter().take(wireserve_types::MAX_CALLERS_SEEN_PER_POLL).copied().collect();
+    let identities = if terminated.is_empty() || seen.is_empty() {
         Vec::new()
     } else {
         let every = terminated.iter().any(|a| a.open);
@@ -436,13 +442,15 @@ pub async fn poll(
             .into_iter()
             .filter(|o| o.groups_count(now))
             .filter_map(|o| {
-                let addr: std::net::Ipv4Addr = all_peers.iter().find(|p| p.id == o.node_id)?.ip4.as_deref()?.parse().ok()?;
-                (every || allowed.contains(&addr)).then_some(wireserve_types::CallerIdentity {
-                    addr,
-                    user: o.sub,
-                    email: o.email,
-                    groups: o.groups,
-                })
+                let device = all_peers.iter().find(|p| p.id == o.node_id)?;
+                let addr: std::net::Ipv4Addr = device.ip4.as_deref()?.parse().ok()?;
+                if !seen.contains(&addr) || !(every || allowed.contains(&addr)) {
+                    return None;
+                }
+                if state.first_release(node.id, device.id) {
+                    tracing::info!(event = "owner_identity_released", node_name = %node.name, device = %device.name, sub = %o.sub);
+                }
+                Some(wireserve_types::CallerIdentity { addr, user: o.sub, email: o.email, groups: o.groups })
             })
             .collect()
     };

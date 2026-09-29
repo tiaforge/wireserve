@@ -827,6 +827,11 @@ Worth knowing:
   on every service, and the provider's session cookie from every request but
   the provider's own — the cookie is scoped to the whole domain, so the
   browser sends it to every service.
+- **A node learns who owns a device only when that device calls it.** The
+  identity headers name the owner of a calling device; the coordinator tells
+  a node an owner's subject, e-mail and groups only for a device the node
+  reports having seen. The first request from a device not seen in the last
+  day may reach the backend unnamed, for a second or two.
 - **A deleted node's address**, once given to a new node, keeps the old one's
   grants until the serving node's next poll.
 

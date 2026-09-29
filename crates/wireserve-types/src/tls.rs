@@ -18,8 +18,14 @@ use crate::naming::{AcmeSettings, IdentityHeaders};
 pub enum TlsRequest {
     /// "I serve exactly these services right now, on this port; what should
     /// I serve?" The port is the one the terminator's socket really has
-    /// (PLAN.md M35): the agent rewrites a service's 443 to it.
-    CheckIn { serving: Vec<String>, port: u16 },
+    /// (PLAN.md M35): the agent rewrites a service's 443 to it. `seen` are
+    /// the known devices that connected since the last check-in.
+    CheckIn {
+        serving: Vec<String>,
+        port: u16,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        seen: Vec<Ipv4Addr>,
+    },
     /// Publish (`present`) or withdraw one `_acme-challenge` TXT value for
     /// one of this node's own service names.
     Challenge { fqdn: String, value: String, present: bool },
@@ -119,10 +125,14 @@ mod tests {
 
     #[test]
     fn requests_round_trip_and_unknown_ones_are_refused() {
-        let req = TlsRequest::CheckIn { serving: vec!["plex".into()], port: 11443 };
+        let req = TlsRequest::CheckIn { serving: vec!["plex".into()], port: 11443, seen: vec![] };
         let text = serde_json::to_string(&req).unwrap();
         assert_eq!(text, r#"{"op":"check_in","serving":["plex"],"port":11443}"#);
         assert_eq!(serde_json::from_str::<TlsRequest>(&text).unwrap(), req);
+        let with = TlsRequest::CheckIn { serving: vec![], port: 1, seen: vec!["10.9.0.3".parse().unwrap()] };
+        let text = serde_json::to_string(&with).unwrap();
+        assert_eq!(text, r#"{"op":"check_in","serving":[],"port":1,"seen":["10.9.0.3"]}"#);
+        assert_eq!(serde_json::from_str::<TlsRequest>(&text).unwrap(), with);
         assert!(serde_json::from_str::<TlsRequest>(r#"{"op":"leave"}"#).is_err());
         assert!(serde_json::from_str::<TlsRequest>(r#"{"op":"serve","name":"x"}"#).is_err());
     }

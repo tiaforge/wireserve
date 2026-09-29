@@ -3587,3 +3587,24 @@ them.
     a client dripping a request *body* or HTTP/2 header frames slowly holds
     one of its own 128 — the caps, not a timer, bound it, and one address
     cannot take the shared 4096 alone.
+
+229. **A node is told an owner's identity only once the device has called**
+    (security audit 2026-09-29, finding 3). `PollResponse.identities` named
+    every owner of a device the node's terminated services let in — on a
+    default mesh, where a service without a group is open, every owner's
+    subject, e-mail address and groups, to any node with one such service,
+    and (through the agent's state file and the terminator's `callers`) to
+    whatever ran there. Now the terminator notes which known devices connect
+    (`Shared::seen`), reports them on each check-in (`TlsRequest::CheckIn
+    { seen }`), the agent keeps them for a day (`TlsLink::callers_seen`) and
+    sends them as `PollRequest.callers_seen` (capped at 256), and the
+    coordinator names an owner only for a device in that list *and* let in.
+    A device seen for the first time wakes the poll loop (`TlsLink::wake`,
+    a second's grace to coalesce), so its owner is known in a second or two
+    and only its first requests reach the backend unnamed. The first time a
+    node is told an owner is logged (`owner_identity_released`, subject
+    only). What this does not do: the list is the node's own word, so a node
+    that lies is told as many owners as it names — one device at a time,
+    each logged, where before it was told all of them unasked. That would
+    need proof of a connection, which a machine the owner controls cannot
+    give.

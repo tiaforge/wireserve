@@ -3981,8 +3981,24 @@ mod dns_records {
         assert_eq!(access_entry(&body, "jellyfin")["open"], Value::Null, "{body}");
     }
 
+    /// One poll that declares `jellyfin` on 443, ready, and says which
+    /// devices have connected.
+    async fn poll_seen(app: &TestApp, bearer: &str, seen: &[&str]) -> Value {
+        poll_full(
+            &app.router,
+            bearer,
+            json!({ "services": [svc("jellyfin", 443, 8096)], "tls_ready": ["jellyfin"], "callers_seen": seen }),
+        )
+        .await
+        .1
+    }
+
+    fn address_of(body: &Value, node: &str) -> String {
+        body["peers"].as_array().unwrap().iter().find(|p| p["name"] == node).unwrap()["ip4"].as_str().unwrap().to_string()
+    }
+
     #[tokio::test]
-    async fn a_terminating_node_learns_who_owns_the_devices_it_lets_in() {
+    async fn a_terminating_node_learns_who_owns_the_devices_it_lets_in_and_that_have_connected() {
         let fake = Arc::new(FakeDns::default());
         let app = app(&fake);
         let home = node(&app, "home").await;
@@ -3994,15 +4010,45 @@ mod dns_records {
         admin_call(&app.router, "PUT", "/admin/groups/media/services/jellyfin", json!(null)).await;
         admin_call(&app.router, "POST", "/admin/grants", json!({"source": "oidc:family", "group": "media"})).await;
 
-        // Nothing terminated yet: nobody's identity.
-        let body = poll_ready(&app, &home, json!([svc("jellyfin", 443, 8096)]), &[]).await;
+        // Nothing terminated yet: nobody's identity, whoever connected.
+        let body = poll_full(&app.router, &home, json!({ "services": [svc("jellyfin", 443, 8096)], "callers_seen": ["100.90.0.2"] })).await.1;
+        assert!(body.get("identities").is_none(), "{body}");
+        let (laptop, tv) = (address_of(&body, "laptop"), address_of(&body, "tv"));
+
+        // Terminated, and nobody has connected: nobody's identity either.
+        let body = poll_seen(&app, &home, &[]).await;
         assert!(body.get("identities").is_none(), "{body}");
 
-        let body = poll_ready(&app, &home, json!([svc("jellyfin", 443, 8096)]), &["jellyfin"]).await;
+        // The laptop connected: alice, and only her — bob's tv is not let in,
+        // and a device never named is not looked for.
+        let body = poll_seen(&app, &home, &[&laptop]).await;
         let ids = body["identities"].as_array().expect("identities for a terminating node");
-        assert_eq!(ids.len(), 1, "alice's laptop only — bob's tv is not let in: {body}");
+        assert_eq!(ids.len(), 1, "{body}");
         assert_eq!(ids[0]["user"], "alice");
         assert_eq!(ids[0]["groups"], json!(["family"]));
+
+        let body = poll_seen(&app, &home, &[&laptop, &tv, "100.90.0.99"]).await;
+        assert_eq!(body["identities"].as_array().unwrap().len(), 1, "the tv is seen but not let in: {body}");
+    }
+
+    #[tokio::test]
+    async fn an_open_service_does_not_hand_its_node_every_owner() {
+        let fake = Arc::new(FakeDns::default());
+        let app = app(&fake);
+        let home = node(&app, "home").await;
+        let _laptop = node(&app, "laptop").await;
+        let _tv = node(&app, "tv").await;
+        own(&app, "laptop", "alice", &["admins"]).await;
+        own(&app, "tv", "bob", &["family"]).await;
+
+        // `jellyfin` is in `default`, which everyone reaches: any device may
+        // call, so any owner may be named — once its device has.
+        let body = poll_seen(&app, &home, &[]).await;
+        assert!(body.get("identities").is_none(), "no owner is told to a node no device has visited: {body}");
+        let tv = address_of(&body, "tv");
+        let body = poll_seen(&app, &home, &[&tv]).await;
+        let ids = body["identities"].as_array().expect("the visiting device's owner");
+        assert_eq!((ids.len(), ids[0]["user"].as_str()), (1, Some("bob")), "{body}");
     }
 
     #[tokio::test]

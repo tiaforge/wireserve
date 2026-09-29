@@ -133,9 +133,12 @@ pub async fn run(opts: Options) -> Result<(), Error> {
             .filter(|s| issuance.get(&s.service.fqdn).and_then(|i| i.cert.as_ref()).is_some_and(|c| c.valid_at(SystemTime::now())))
             .map(|s| s.service.name.clone())
             .collect();
-        let config = match link.check_in(serving, port).await {
+        let seen = shared.take_seen();
+        let config = match link.check_in(serving, port, seen.clone()).await {
             Ok(c) => c,
             Err(e) => {
+                // Still to be told next time.
+                shared.note_seen(seen);
                 tracing::warn!(error = %e, "could not check in with the agent; keeping what is served");
                 continue;
             }

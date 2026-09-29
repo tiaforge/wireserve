@@ -233,6 +233,10 @@ pub const MAX_TLS_READY_PER_POLL: usize = 64;
 /// At most this many capability strings are read from one poll.
 pub const MAX_CAPABILITIES_PER_POLL: usize = 16;
 
+/// At most this many device addresses are read from one poll's
+/// `callers_seen`.
+pub const MAX_CALLERS_SEEN_PER_POLL: usize = 256;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceDecl {
     pub name: String,
@@ -314,6 +318,14 @@ pub struct PollRequest {
     /// had. Capped at [`MAX_TLS_READY_PER_POLL`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tls_ready: Vec<String>,
+    /// The devices (by mesh address) that have connected to this node's
+    /// terminator recently (PLAN.md M38). The coordinator names the owner
+    /// of a device to a node only once the node says the device has been
+    /// there: a node holds no directory of everyone's e-mail address and
+    /// groups on the chance one of them calls. Capped at
+    /// [`MAX_CALLERS_SEEN_PER_POLL`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub callers_seen: Vec<std::net::Ipv4Addr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

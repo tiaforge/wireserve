@@ -660,7 +660,16 @@ async fn cmd_daemon(
                 teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, instance.hosts_label(), &socket_path, &shared_state, &state_path, false).await;
                 break;
             }
-            _ = interval.tick() => {
+            // The interval, or a device the terminator has just seen for the
+            // first time: its owner is asked after now, not at the next
+            // cycle, so its first requests wait a second or two for who it is
+            // rather than twenty. A moment's grace lets several arrive as one.
+            _ = async {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    () = tls_link.wake.notified() => tokio::time::sleep(Duration::from_secs(1)).await,
+                }
+            } => {
                 let mut ctx = poll_loop::PollContext {
                     client: &client,
                     coordinator_url: &coordinator_url,

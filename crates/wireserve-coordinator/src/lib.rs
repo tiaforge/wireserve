@@ -47,6 +47,7 @@ pub fn build_state_with_dns(
         )),
         transit: Arc::new(transit::TransitState::default()),
         oidc: config.oidc.clone().map(|c| Arc::new(oidc::Oidc::new(c))),
+        released: Arc::default(),
         config: Arc::new(config),
     }
 }
