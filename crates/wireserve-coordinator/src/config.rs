@@ -98,6 +98,10 @@ pub struct Config {
     /// turns the limit off.
     pub poll_rate_burst: u32,
     pub poll_rate_per_min: u32,
+    /// Service names nobody may newly declare (`WIRESERVE_RESERVED_SERVICE_NAMES`,
+    /// comma-separated), on top of the coordinator's own host name when it
+    /// lies under the service domain.
+    pub reserved_service_names: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -180,6 +184,7 @@ impl Config {
         let require_service_approval =
             env_parse_or("WIRESERVE_REQUIRE_SERVICE_APPROVAL", true)?;
         let reflexive_rate_limit_max = env_parse_or("WIRESERVE_REFLEXIVE_RATE_LIMIT_MAX", 20u32)?;
+        let reserved_service_names = reserved_names_from(std::env::var("WIRESERVE_RESERVED_SERVICE_NAMES").ok().as_deref())?;
         let poll_rate_burst = env_parse_or("WIRESERVE_POLL_RATE_BURST", 20u32)?;
         let poll_rate_per_min = env_parse_or("WIRESERVE_POLL_RATE_PER_MIN", 30u32)?;
         let reflexive_rate_limit_window_secs =
@@ -237,6 +242,7 @@ impl Config {
                 reflexive_rate_limit_window_secs,
                 poll_rate_burst,
                 poll_rate_per_min,
+                reserved_service_names,
             },
             generated,
             secrets_path,
@@ -256,7 +262,34 @@ impl Config {
     }
 }
 
+/// `WIRESERVE_RESERVED_SERVICE_NAMES`: service names, comma-separated.
+pub fn reserved_names_from(raw: Option<&str>) -> Result<Vec<String>, ConfigError> {
+    let mut out = Vec::new();
+    for name in raw.unwrap_or("").split(',').map(|n| n.trim().to_ascii_lowercase()).filter(|n| !n.is_empty()) {
+        if !wireserve_types::is_valid_dns_label(&name) {
+            return Err(ConfigError::Invalid("WIRESERVE_RESERVED_SERVICE_NAMES", format!("{name:?} is not a service name")));
+        }
+        out.push(name);
+    }
+    Ok(out)
+}
+
 impl Config {
+    /// Why nobody may newly declare a service called `name`, if so: it is
+    /// listed as reserved, or it is this coordinator's own host name under
+    /// the service domain (a service by that name would point it somewhere
+    /// else in public DNS).
+    #[must_use]
+    pub fn reserved_reason(&self, name: &str) -> Option<&'static str> {
+        if self.reserved_service_names.iter().any(|r| r == name) {
+            return Some("reserved by the operator");
+        }
+        let host = self.public_url.as_deref()?.split_once("://")?.1.split(['/', ':']).next()?.to_ascii_lowercase();
+        let domain = self.service_domain.as_deref()?.trim_end_matches('.').to_ascii_lowercase();
+        let label = host.strip_suffix(&format!(".{domain}"))?;
+        (label == name).then_some("the coordinator's own name")
+    }
+
     /// Whether a request that arrived from `peer` may name its client in
     /// `X-Forwarded-For`. With `trusted_proxy` set, only that address may;
     /// otherwise `trust_proxy_headers` decides for every peer alike.
@@ -678,6 +711,65 @@ pub fn is_loopback_or_private(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample() -> Config {
+        Config {
+            listen_addr: "127.0.0.1:47820".parse().unwrap(),
+            admin_listen_addr: "127.0.0.1:47821".parse().unwrap(),
+            admin_token: "t".into(),
+            db_path: "x.db".into(),
+            net_v4_cidr: "10.1.2.0/24".into(),
+            net_v6_prefix: "fdab:cdef:1234::/64".into(),
+            service_domain: None,
+            dns: None,
+            acme: acme_from_lookup(|_| None).unwrap(),
+            sign_in: None,
+            identity_headers: Default::default(),
+            public_url: None,
+            oidc: None,
+            online_threshold_secs: 180,
+            rate_limit_max: 10,
+            rate_limit_window_secs: 60,
+            trust_proxy_headers: false,
+            trusted_proxy: None,
+            join_token_ttl_secs: 1800,
+            global_auth_failure_max: 20,
+            global_auth_failure_window_secs: 60,
+            require_service_approval: true,
+            reflexive_rate_limit_max: 20,
+            reflexive_rate_limit_window_secs: 10,
+            poll_rate_burst: 20,
+            poll_rate_per_min: 0,
+            reserved_service_names: Vec::new(),
+        }
+    }
+
+    fn reserving(names: &[&str], public_url: Option<&str>, domain: Option<&str>) -> Config {
+        let mut c = sample();
+        c.reserved_service_names = names.iter().map(|n| (*n).to_string()).collect();
+        c.public_url = public_url.map(String::from);
+        c.service_domain = domain.map(String::from);
+        c
+    }
+
+    #[test]
+    fn a_name_is_reserved_when_listed_or_when_it_is_the_coordinators_own_under_the_domain() {
+        let c = reserving(&["www"], Some("https://Coord.Int.Example.com:8443/x"), Some("int.example.com."));
+        assert_eq!(c.reserved_reason("www"), Some("reserved by the operator"));
+        assert_eq!(c.reserved_reason("coord"), Some("the coordinator's own name"));
+        assert_eq!(c.reserved_reason("plex"), None);
+        // Elsewhere, or several labels deep, it is not a service name at all.
+        assert_eq!(reserving(&[], Some("https://coord.example.org"), Some("int.example.com")).reserved_reason("coord"), None);
+        assert_eq!(reserving(&[], Some("https://a.b.int.example.com"), Some("int.example.com")).reserved_reason("a"), None);
+        assert_eq!(reserving(&[], None, None).reserved_reason("coord"), None);
+    }
+
+    #[test]
+    fn the_reserved_list_is_service_names_and_nothing_else() {
+        assert_eq!(reserved_names_from(Some(" WWW, mail ,,")).unwrap(), ["www", "mail"]);
+        assert!(reserved_names_from(None).unwrap().is_empty());
+        assert!(reserved_names_from(Some("ok,not a name")).is_err());
+    }
 
     #[test]
     fn the_node_api_listens_on_loopback_unless_told_otherwise() {

@@ -658,6 +658,13 @@ pub fn all_allocated_ip4(conn: &Connection) -> Result<Vec<Ipv4Addr>, DbError> {
     Ok(out)
 }
 
+/// Every node's name.
+pub fn list_all_names(conn: &Connection) -> Result<Vec<String>, DbError> {
+    let mut stmt = conn.prepare("SELECT name FROM nodes")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 pub fn all_allocated_ip6(conn: &Connection) -> Result<Vec<Ipv6Addr>, DbError> {
     let mut stmt = conn.prepare("SELECT ip6 FROM nodes WHERE ip6 IS NOT NULL")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;

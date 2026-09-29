@@ -180,6 +180,7 @@ fn app(issuer: &str) -> App {
         reflexive_rate_limit_window_secs: 60,
         poll_rate_burst: 20,
         poll_rate_per_min: 0,
+        reserved_service_names: Vec::new(),
     };
     let db = Db::open(db_file.path()).unwrap();
     let state = build_state(config, db);

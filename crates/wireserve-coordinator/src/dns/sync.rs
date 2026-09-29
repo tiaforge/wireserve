@@ -169,8 +169,35 @@ pub async fn pass(state: &AppState, dns: &Dns, moving: &mut BTreeMap<String, (Ip
 
     let todo = plan(&want, &written, moving, Instant::now());
     let mut errors: BTreeMap<String, String> = BTreeMap::new();
+    // Names left alone because something else already holds them: shown to the
+    // admin like an error, but not a provider failure, which would slow every
+    // other name's writes with the loop's backoff.
+    let mut conflicts: BTreeMap<String, String> = BTreeMap::new();
+    let mesh = wireserve_types::MeshRanges::parse(&state.config.mesh_info());
 
     for (fqdn, addr) in &todo.write {
+        // A name this coordinator has not written yet: look first. Writing
+        // replaces every A record at the name, and withdrawing the service
+        // later deletes what was written, so an existing record would be
+        // lost the moment a node declared a service by that name.
+        if !written.contains_key(fqdn) {
+            match dns.writer.existing(fqdn).await {
+                Ok(found) => {
+                    if let Some(record) = found.iter().find(|r| !is_ours_to_replace(r, mesh.as_ref())) {
+                        conflicts.insert(
+                            fqdn.clone(),
+                            format!("the zone already has a record here ({record}) that this coordinator did not write; not overwriting it"),
+                        );
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(fqdn = %fqdn, error = %e, "could not check what a name already holds; not writing it yet");
+                    errors.insert(fqdn.clone(), format!("could not check whether the name is already in use: {e}"));
+                    continue;
+                }
+            }
+        }
         match dns.writer.set_a(fqdn, *addr).await {
             Ok(()) => {
                 let value = addr.to_string();
@@ -206,10 +233,16 @@ pub async fn pass(state: &AppState, dns: &Dns, moving: &mut BTreeMap<String, (Ip
         errors.insert("_acme-challenge".into(), "a challenge record could not be removed".into());
     }
 
+    let previous = dns.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     let status: BTreeMap<String, RecordState> = want
         .iter()
         .map(|(fqdn, w)| {
-            let st = if let Some(e) = errors.get(fqdn) {
+            let st = if let Some(e) = conflicts.get(fqdn) {
+                if previous.get(&w.service) != Some(&RecordState::Error(e.clone())) {
+                    tracing::warn!(event = "dns_name_taken", fqdn = %fqdn, service = %w.service, "{e}");
+                }
+                RecordState::Error(e.clone())
+            } else if let Some(e) = errors.get(fqdn) {
                 RecordState::Error(e.clone())
             } else if written.get(fqdn) == Some(&w.addr.to_string()) {
                 RecordState::Published
@@ -222,6 +255,17 @@ pub async fn pass(state: &AppState, dns: &Dns, moving: &mut BTreeMap<String, (Ip
     *dns.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = status;
 
     PassOutcome { failed: !errors.is_empty(), next_due: todo.next_due }
+}
+
+/// Whether an existing record (as `DnsWriter::existing` words it) may be
+/// replaced by ours: only an A record inside the mesh's own range, which is
+/// what an earlier run of this coordinator wrote and did not get to record.
+/// Any other address, a AAAA or a CNAME is somebody else's.
+fn is_ours_to_replace(record: &str, mesh: Option<&wireserve_types::MeshRanges>) -> bool {
+    let Some(ip) = record.strip_prefix("A ").and_then(|a| a.parse::<Ipv4Addr>().ok()) else {
+        return false;
+    };
+    mesh.is_some_and(|m| m.contains4(ip))
 }
 
 /// Removes the ACME challenge records whose time is up (PLAN.md M33): the

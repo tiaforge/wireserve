@@ -309,6 +309,7 @@ mod tests {
             reflexive_rate_limit_window_secs: 10,
             poll_rate_burst: 20,
             poll_rate_per_min: 0,
+            reserved_service_names: Vec::new(),
         };
         let generated = ["WIRESERVE_ADMIN_TOKEN", "WIRESERVE_NET_V4_CIDR", "WIRESERVE_NET_V6_PREFIX"];
         let path = std::path::Path::new("/var/lib/wireserve-coordinator/coordinator-secrets.env");

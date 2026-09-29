@@ -54,6 +54,7 @@ fn test_config(db_path: &str) -> Config {
         // Off for most tests, which poll far faster than any node does.
         poll_rate_burst: 20,
         poll_rate_per_min: 0,
+        reserved_service_names: Vec::new(),
     }
 }
 
@@ -1976,6 +1977,55 @@ async fn only_so_many_unapproved_services_are_taken_and_the_rest_are_told_so() {
     // What is already there is never dropped for being over: the same list again changes nothing.
     let (_, again) = poll_with(&app.router, &bearer, many("svc", max + 4)).await;
     assert_eq!(again["pending_services"].as_array().unwrap().len(), max);
+}
+
+#[tokio::test]
+async fn reserved_names_and_other_nodes_names_are_not_taken_but_ones_own_and_existing_are() {
+    let mut config = test_config("");
+    config.reserved_service_names = vec!["www".into()];
+    config.service_domain = Some("int.example.com".into());
+    config.public_url = Some("https://coord.int.example.com".into());
+    let app = app_with_config(config);
+    let mut bearers = Vec::new();
+    for name in ["minipc", "hetzner"] {
+        let t = admin_create_node(&app.router, name).await;
+        bearers.push(register_node(&app.router, &t, name, 51820).await["bearer_token"].as_str().unwrap().to_string());
+    }
+    let ports = json!([{"public": 22, "target": 22, "proto": "tcp"}]);
+    let decl = |names: &[&str]| Value::Array(names.iter().map(|n| json!({"name": n, "ports": ports})).collect());
+
+    // A node may have a service called after itself; nobody else may have one called after it.
+    let (status, body) = poll_with(&app.router, &bearers[0], decl(&["minipc", "hetzner", "www", "coord", "plex"])).await;
+    assert_eq!(status, StatusCode::OK, "never a failed poll: {body}");
+    let names: Vec<&str> = body["services"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["minipc", "plex"], "{body}");
+    let notices = body["service_notices"].as_array().unwrap();
+    assert_eq!(notices.len(), 3, "{body}");
+    for (name, why) in [("hetzner", "another node's name"), ("www", "reserved by the operator"), ("coord", "the coordinator's own name")] {
+        let n = notices.iter().find(|n| n["name"] == name).unwrap_or_else(|| panic!("{name}: {body}"));
+        assert!(n["reason"].as_str().unwrap().contains(why), "{n}");
+    }
+    let (_, body) = poll_with(&app.router, &bearers[1], decl(&["hetzner"])).await;
+    let hetzner = body["services"].as_array().unwrap().iter().find(|s| s["name"] == "hetzner").expect("published");
+    assert_eq!(hetzner["node"], "hetzner", "the node itself may: {body}");
+    assert!(body.get("service_notices").is_none(), "{body}");
+
+    // A name a node already has is never taken away for being reserved (or another's): it is
+    // not the declaration that is new. `www` was there before the operator reserved it.
+    {
+        let conn = app.state.db.conn.lock().await;
+        let id = wireserve_coordinator::db::nodes::find_by_name(&conn, "minipc").unwrap().unwrap().id;
+        conn.execute(
+            "INSERT INTO services (node_id, name, port, proto, ports, declared_at, approved_at) VALUES (?1, 'www', 22, 'tcp', '[]', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [id],
+        )
+        .unwrap();
+    }
+    let (status, body) = poll_with(&app.router, &bearers[0], decl(&["minipc", "plex", "www"])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mine: Vec<&str> = body["services"].as_array().unwrap().iter().filter(|s| s["node"] == "minipc").map(|s| s["name"].as_str().unwrap()).collect();
+    assert_eq!(mine, ["minipc", "plex", "www"], "{body}");
+    assert!(body.get("service_notices").is_none(), "{body}");
 }
 
 #[tokio::test]
@@ -3907,6 +3957,11 @@ mod dns_records {
     struct FakeDns {
         calls: Mutex<Vec<String>>,
         down: AtomicBool,
+        /// What the zone already holds, by name, as `TYPE value`.
+        zone: Mutex<std::collections::HashMap<String, Vec<String>>>,
+        /// The names it was asked about.
+        looked_up: Mutex<Vec<String>>,
+        lookup_fails: AtomicBool,
     }
 
     impl FakeDns {
@@ -3921,6 +3976,12 @@ mod dns_records {
     }
 
     impl DnsWriter for FakeDns {
+        fn existing<'a>(&'a self, fqdn: &'a str) -> wireserve_coordinator::dns::provider::ReadFuture<'a> {
+            self.looked_up.lock().unwrap().push(fqdn.to_string());
+            let fails = self.lookup_fails.load(Ordering::SeqCst);
+            let found = self.zone.lock().unwrap().get(fqdn).cloned().unwrap_or_default();
+            Box::pin(async move { if fails { Err("provider unreachable".to_string()) } else { Ok(found) } })
+        }
         fn set_a<'a>(&'a self, fqdn: &'a str, addr: std::net::Ipv4Addr) -> WriteFuture<'a> {
             self.call(format!("set {fqdn} {addr}"))
         }
@@ -4166,6 +4227,74 @@ mod dns_records {
         let body = poll_seen(&app, &home, &[&tv]).await;
         let ids = body["identities"].as_array().expect("the visiting device's owner");
         assert_eq!((ids.len(), ids[0]["user"].as_str()), (1, Some("bob")), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_name_the_zone_already_holds_is_never_overwritten_and_the_rest_carry_on() {
+        let fake = Arc::new(FakeDns::default());
+        let app = app(&fake);
+        let home = node(&app, "home").await;
+        fake.zone.lock().unwrap().insert("mail.int.example.com".into(), vec!["A 203.0.113.5".into()]);
+        fake.zone.lock().unwrap().insert("wiki.int.example.com".into(), vec!["CNAME wiki.example.net".into()]);
+        fake.zone.lock().unwrap().insert("v6.int.example.com".into(), vec!["AAAA 2001:db8::1".into()]);
+        poll_with(&app.router, &home, json!([svc("mail", 80, 8080), svc("wiki", 80, 8081), svc("v6", 80, 8082), svc("prom", 80, 9090)])).await;
+
+        let out = pass(&app).await;
+        let calls = fake.take();
+        assert_eq!(calls.iter().filter(|c| c.starts_with("set ")).count(), 1, "only prom was written: {calls:?}");
+        assert!(calls.iter().any(|c| c.starts_with("set prom.int.example.com")));
+        assert!(!out.failed, "a name someone else holds is not a provider failure, which would slow every other name");
+        for name in ["mail", "wiki", "v6"] {
+            let dns = admin_dns(&app, name).await;
+            assert_eq!(dns["state"], "error", "{name}: {dns}");
+            assert!(dns["error"].as_str().unwrap().contains("not overwriting"), "{dns}");
+        }
+        assert_eq!(admin_dns(&app, "prom").await, json!({"state": "published"}));
+
+        // It is asked again while it stays taken, and nothing is written; once the zone
+        // is clear the name is written.
+        pass(&app).await;
+        assert!(fake.take().iter().all(|c| !c.starts_with("set ")));
+        fake.zone.lock().unwrap().remove("mail.int.example.com");
+        pass(&app).await;
+        assert!(fake.take().iter().any(|c| c.starts_with("set mail.int.example.com")));
+        assert_eq!(admin_dns(&app, "mail").await, json!({"state": "published"}));
+    }
+
+    #[tokio::test]
+    async fn an_address_of_the_mesh_left_by_an_earlier_run_may_be_written_again_and_a_written_name_is_not_asked_about() {
+        let fake = Arc::new(FakeDns::default());
+        let app = app(&fake);
+        let home = node(&app, "home").await;
+        // A previous run wrote it and never recorded it: the zone holds an address of our own range.
+        fake.zone.lock().unwrap().insert("prom.int.example.com".into(), vec!["A 100.90.0.99".into()]);
+        poll_with(&app.router, &home, json!([svc("prom", 80, 9090)])).await;
+        pass(&app).await;
+        assert_eq!(admin_dns(&app, "prom").await, json!({"state": "published"}));
+        fake.take();
+        fake.looked_up.lock().unwrap().clear();
+
+        // Now it is ours: a change is written without asking again, whatever the zone says.
+        fake.zone.lock().unwrap().insert("prom.int.example.com".into(), vec!["A 203.0.113.5".into()]);
+        poll_with(&app.router, &home, json!([])).await;
+        pass(&app).await;
+        assert!(fake.looked_up.lock().unwrap().is_empty(), "names already written are not looked up");
+    }
+
+    #[tokio::test]
+    async fn a_zone_that_cannot_be_read_holds_the_name_back_instead_of_risking_it() {
+        let fake = Arc::new(FakeDns::default());
+        let app = app(&fake);
+        let home = node(&app, "home").await;
+        poll_with(&app.router, &home, json!([svc("prom", 80, 9090)])).await;
+        fake.lookup_fails.store(true, Ordering::SeqCst);
+        let out = pass(&app).await;
+        assert!(out.failed, "this one is the provider's fault, and backs off");
+        assert!(fake.take().iter().all(|c| !c.starts_with("set ")));
+        assert_eq!(admin_dns(&app, "prom").await["state"], "error");
+        fake.lookup_fails.store(false, Ordering::SeqCst);
+        assert!(!pass(&app).await.failed);
+        assert_eq!(admin_dns(&app, "prom").await, json!({"state": "published"}));
     }
 
     #[tokio::test]

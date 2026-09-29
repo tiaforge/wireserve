@@ -15,12 +15,24 @@ use super::config::{tsig_algorithm, DnsConfig, DnsProvider};
 
 pub type WriteResult = Result<(), String>;
 pub type WriteFuture<'a> = Pin<Box<dyn Future<Output = WriteResult> + Send + 'a>>;
+pub type ReadFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + 'a>>;
 
 /// Every provider call gives up after this. The sync loop retries on its
 /// next pass, so a hung API costs one pass, never the loop.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 pub trait DnsWriter: Send + Sync {
+    /// What the zone holds at `fqdn` for the record types a service name
+    /// would collide with (A, AAAA, CNAME), as `TYPE value` lines, asked of
+    /// the provider itself, not a resolver with a cache. Empty for a name
+    /// nothing is at. The sync loop asks before it first writes a name, so a
+    /// record somebody else put there is never overwritten (and, when the
+    /// service is withdrawn, deleted). A writer that cannot read says nothing
+    /// is there.
+    fn existing<'a>(&'a self, _fqdn: &'a str) -> ReadFuture<'a> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     /// Makes `fqdn` resolve to exactly `addr`, replacing whatever A records
     /// the name held.
     fn set_a<'a>(&'a self, fqdn: &'a str, addr: Ipv4Addr) -> WriteFuture<'a>;
@@ -64,6 +76,24 @@ fn describe(e: dns_update::Error) -> String {
 }
 
 impl DnsWriter for Provider {
+    fn existing<'a>(&'a self, fqdn: &'a str) -> ReadFuture<'a> {
+        Box::pin(async move {
+            let mut found = Vec::new();
+            for kind in [DnsRecordType::A, DnsRecordType::AAAA, DnsRecordType::CNAME] {
+                let records = self.updater.list_rrset(fqdn, kind, self.zone.as_str()).await.map_err(describe)?;
+                for record in records {
+                    match record {
+                        DnsRecord::A(a) => found.push(format!("A {a}")),
+                        DnsRecord::AAAA(a) => found.push(format!("AAAA {a}")),
+                        DnsRecord::CNAME(t) => found.push(format!("CNAME {t}")),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(found)
+        })
+    }
+
     fn set_a<'a>(&'a self, fqdn: &'a str, addr: Ipv4Addr) -> WriteFuture<'a> {
         Box::pin(async move {
             self.updater

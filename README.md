@@ -559,7 +559,21 @@ Nothing that is not published on 443 ever gets a certificate.
 
 The coordinator keeps one record per approved service up to date through the
 provider's API — written when the service is approved, moved when its address
-changes, removed when it is withdrawn or its node revoked.
+changes, removed when it is withdrawn or its node revoked. **It never
+overwrites a record it did not write:** before it first writes a name it asks
+the provider what the zone already holds there, and a name with an A record
+outside the mesh's range, an AAAA or a CNAME is left alone — `wireserve-admin
+list-services` shows it as an error ("not overwriting it") until the record is
+gone. A name whose zone cannot be read waits too. So a node declaring a service
+called `mail` cannot take over, or later delete, a record you already have
+under the domain.
+
+Names are also protected before they get that far. A service may be called
+after a node (`hetzner` on the node `hetzner`), but only by that node: nobody
+else may newly declare another node's name, nor the coordinator's own host name
+when it lies under the service domain, nor any name in
+`WIRESERVE_RESERVED_SERVICE_NAMES` (comma-separated). The node is told in
+`wireserve list`; a service it already has is never taken away for it.
 `wireserve-coordinator install` asks for the provider, and before saving
 writes and removes a throwaway `_wireserve-check` TXT record, so a wrong
 token shows up there rather than as names that never appear. The wizard says where each provider's token is created:

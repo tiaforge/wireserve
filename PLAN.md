@@ -3634,3 +3634,27 @@ them.
     connection behind one lock, so what a node does inside its allowance still
     queues everyone; and the denied and pending rows of a revoked node's
     names stay until the node is deleted.
+
+231. **A declared name cannot take over what the zone already holds, nor
+    another node's name** (security audit 2026-09-29, finding 5). Writing a
+    service's record replaced every A record at the name (`set_rrset`), and
+    withdrawing it later deleted what had been written — so an approved
+    `mail`, in a zone that already had a `mail`, took it and later removed it.
+    The sync loop now asks the provider (`DnsWriter::existing`, the library's
+    `list_rrset` for A, AAAA and CNAME — the provider's own answer, not a
+    resolver's cached one) before it *first* writes a name; anything but an A
+    record inside the mesh's range (what an earlier run wrote and did not get
+    to record) leaves the name alone. That is shown as the record's state
+    (`dns_name_taken` logged once per change) but is *not* a provider failure,
+    which would put every other name's writes on the loop's backoff; a zone
+    that cannot be read is one, and holds the name back. A name already
+    written is not asked about again. Names: `Config::reserved_reason` refuses
+    a new declaration of a name in `WIRESERVE_RESERVED_SERVICE_NAMES` or
+    of the coordinator's own host label under the service domain, and `/poll`
+    refuses another node's name (a node may have a service called after
+    itself, which the real mesh does: `hetzner` on `hetzner`) — each a notice
+    to the node, never a failed poll, and never for a name the node already
+    holds. Names held by pending and denied rows are still first come first
+    served: the cap of 16 per node (#230) bounds how many, and revoking the
+    node frees them. No admin command reserves a name in the database yet;
+    the environment list does.

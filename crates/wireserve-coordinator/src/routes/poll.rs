@@ -204,19 +204,49 @@ pub async fn poll(
         },
     )?;
 
-    let desired = &req.services;
-    let desired_names: std::collections::HashSet<&str> =
-        desired.iter().map(|d| d.name.as_str()).collect();
     let previous = services::list_for_node(&conn, node.id)?;
     let previous_names: std::collections::HashSet<&str> =
         previous.iter().map(|s| s.name.as_str()).collect();
+    // A name nobody may newly take: reserved, or another node's own name — a
+    // node may have a service called after itself, and nobody else may. One
+    // the node already has is left alone; it is not the declaration that is
+    // new. Told to the node as a notice, never a failed poll.
+    let node_names: std::collections::HashSet<String> =
+        nodes::list_all_names(&conn)?.into_iter().filter(|n| *n != node.name).collect();
+    let mut refused: Vec<wireserve_types::ServiceNotice> = Vec::new();
+    let desired_owned: Vec<wireserve_types::ServiceDecl> = req
+        .services
+        .iter()
+        .filter(|d| {
+            if previous_names.contains(d.name.as_str()) {
+                return true;
+            }
+            let why = state
+                .config
+                .reserved_reason(&d.name)
+                .map(str::to_string)
+                .or_else(|| node_names.contains(&d.name).then(|| "another node's name; only that node may have a service by it".to_string()));
+            match why {
+                Some(why) => {
+                    refused.push(wireserve_types::ServiceNotice { name: d.name.clone(), reason: format!("not published: {why}") });
+                    false
+                }
+                None => true,
+            }
+        })
+        .cloned()
+        .collect();
+    let desired = &desired_owned;
+    let desired_names: std::collections::HashSet<&str> =
+        desired.iter().map(|d| d.name.as_str()).collect();
 
     let mode = if state.config.require_service_approval {
         services::ApprovalMode::RequireApproval
     } else {
         services::ApprovalMode::AutoApprove
     };
-    let outcome = services::upsert_for_node(&mut conn, node.id, desired, mode, &state.config.net_v4_cidr)?;
+    let mut outcome = services::upsert_for_node(&mut conn, node.id, desired, mode, &state.config.net_v4_cidr)?;
+    outcome.notices.extend(refused);
     // Which of its services this node serves with TLS right now (PLAN.md
     // M33). Replaced wholesale, so a name left out stops being terminated
     // on this very poll; only names the node owns are kept.
