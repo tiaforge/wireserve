@@ -10,8 +10,9 @@
 #   2. `list-services` reports the record as published;
 #   3. withdrawing a service removes its record;
 #   4. revoking a node removes the records of every service it had;
-#   5. a record the operator made by hand in the same zone is never touched,
-#      and a record at a service's name is replaced (the domain is ours);
+#   5. a record the operator made by hand in the same zone is never touched
+#      — not even one at a service's name: it is left alone, `list-services`
+#      says why, and withdrawing the service does not delete it;
 #   6. a coordinator restart with the records already written changes
 #      nothing.
 #
@@ -122,8 +123,8 @@ zone "$DOMAIN" {
     update-policy { grant wireserve subdomain $DOMAIN. ANY; };
 };
 EOF
-# `keep` is the operator's own record; `prom` is a stale hand-made record at
-# a service's name, which the coordinator is expected to replace.
+# `keep` is the operator's own record; `prom` is a hand-made record at a
+# service's name, which the coordinator must leave alone (PLAN.md #231).
 cat > "$WORK/bind/$DOMAIN.zone" <<EOF
 \$TTL 300
 @     IN SOA ns.$DOMAIN. admin.$DOMAIN. 1 3600 600 86400 300
@@ -166,29 +167,39 @@ log "1. pending gets nothing; approved gets its record at its own address"
 PX=$(new_node px)
 HOME_B=$(new_node home)
 poll "$PX" "[$(svc web 443 8443)]" >/dev/null
-poll "$HOME_B" "[$(svc prom 80 9090), $(svc plex 443 32400)]" >/dev/null
+poll "$HOME_B" "[$(svc prom 80 9090), $(svc plex 443 32400), $(svc docs 80 9091)]" >/dev/null
 sleep 8
 [ -z "$(lookup web.$DOMAIN)" ] || fail "a pending service was published"
 admin approve-service px web >/dev/null
 admin approve-service home prom >/dev/null
 admin approve-service home plex >/dev/null
-WEB_VIP=$(vip_of web); PROM_VIP=$(vip_of prom); PLEX_VIP=$(vip_of plex)
-[ -n "$WEB_VIP" ] && [ -n "$PROM_VIP" ] || fail "no service addresses: $(admin list-services)"
+admin approve-service home docs >/dev/null
+WEB_VIP=$(vip_of web); PLEX_VIP=$(vip_of plex); DOCS_VIP=$(vip_of docs)
+[ -n "$WEB_VIP" ] && [ -n "$PLEX_VIP" ] && [ -n "$DOCS_VIP" ] || fail "no service addresses: $(admin list-services)"
 expect_record "web.$DOMAIN" "$WEB_VIP"
-expect_record "prom.$DOMAIN" "$PROM_VIP"
 expect_record "plex.$DOMAIN" "$PLEX_VIP"
-pass "web, prom and plex each at their own address"
-pass "prom's stale hand-made 192.0.2.99 was replaced"
+expect_record "docs.$DOMAIN" "$DOCS_VIP"
+pass "web, plex and docs each at their own address"
+# prom was approved too, and its name already held a hand-made record.
+for _ in $(seq 1 30); do
+    admin list-services | grep -q "^prom.*dns=error: .*not overwriting" && break
+    sleep 1
+done
+admin list-services | grep -q "^prom.*dns=error: .*not overwriting" \
+    || fail "prom should be reported as not overwriting the zone's record: $(admin list-services)"
+[ "$(lookup prom.$DOMAIN)" = 192.0.2.99 ] || fail "prom's hand-made record was overwritten"
+pass "prom.$DOMAIN left at the operator's 192.0.2.99, and said so"
 
 log "2. list-services reports the records"
-admin list-services | grep -q "^prom.*dns=published" || fail "no dns=published: $(admin list-services)"
+admin list-services | grep -q "^docs.*dns=published" || fail "no dns=published: $(admin list-services)"
 pass "dns=published"
 
-log "3. a withdrawn service leaves DNS"
+log "3. a withdrawn service leaves DNS — and a record that was never ours stays"
 poll "$HOME_B" "[$(svc plex 443 32400)]" >/dev/null
-expect_record "prom.$DOMAIN" ""
+expect_record "docs.$DOMAIN" ""
+[ "$(lookup prom.$DOMAIN)" = 192.0.2.99 ] || fail "withdrawing prom deleted the operator's record"
 expect_record "plex.$DOMAIN" "$PLEX_VIP"
-pass "prom removed, plex kept"
+pass "docs removed, plex kept, the hand-made prom record kept"
 
 log "4. a revoked node's services leave DNS"
 admin revoke home >/dev/null
@@ -196,9 +207,10 @@ expect_record "plex.$DOMAIN" ""
 expect_record "web.$DOMAIN" "$WEB_VIP"
 pass "plex removed with its node, web kept"
 
-log "5. the operator's own record was never touched"
+log "5. the operator's own records were never touched"
 [ "$(lookup keep.$DOMAIN)" = 192.0.2.10 ] || fail "keep.$DOMAIN changed"
-pass "keep.$DOMAIN still 192.0.2.10"
+[ "$(lookup prom.$DOMAIN)" = 192.0.2.99 ] || fail "prom.$DOMAIN changed"
+pass "keep.$DOMAIN still 192.0.2.10 and prom.$DOMAIN still 192.0.2.99"
 
 log "6. a restart with everything already written changes nothing"
 SERIAL=$(in_netns "$COORD" dig +short "@$BIND_IP" "$DOMAIN" SOA | awk '{print $3}')
