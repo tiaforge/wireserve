@@ -3569,3 +3569,21 @@ them.
     terminator, so the address is the same single value there. A forged value
     on a direct `/verify` only ever answers the forger. Not exercised by a
     harness yet.
+
+228. **The terminator does not wait on a client without end** (security audit
+    2026-09-29, finding 2). It parses TLS and HTTP from the whole mesh, and a
+    test showed an idle connection, a 3-byte TLS record and a finished
+    handshake with half a request all still open after 70 seconds — any node,
+    a phone included, could exhaust a node's sockets, and doing it to the
+    sign-in provider's terminator fails every restricted service at once.
+    `serve::Limits`: the TLS handshake in 10s; a first request begun within
+    30s of it; hyper's header-read timer (20s, HTTP/1) and HTTP/2 keep-alive
+    pings; a connection with no request being served and nothing read or
+    written for 300s closed (`Watched`) — a slow backend, a streaming answer
+    or a WebSocket is not idle by that; 128 open connections per source
+    address and 4096 in all, the rest closed unanswered before any TLS work
+    (one warning a minute). The unit gets `LimitNOFILE=16384`, above
+    systemd's 1024, which the cap would otherwise never reach. Not covered:
+    a client dripping a request *body* or HTTP/2 header frames slowly holds
+    one of its own 128 — the caps, not a timer, bound it, and one address
+    cannot take the shared 4096 alone.

@@ -8,14 +8,20 @@
 //! the edge of it: which headers a backend may believe.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::{Arc, RwLock};
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, HeaderValue, Request};
 use axum_reverse_proxy::{HostBehaviour, ProxyPolicy, ReverseProxy, XForwardedFor};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use hyper_util::server::conn::auto;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -120,6 +126,187 @@ pub fn server_config(certs: Arc<Certs>) -> Arc<rustls::ServerConfig> {
     Arc::new(config)
 }
 
+/// What keeps one client — any node of the mesh, a phone included — from
+/// holding the terminator's sockets. The terminator parses TLS and HTTP from
+/// everyone who can reach the mesh, so none of it may wait for a client
+/// without end.
+#[derive(Debug, Clone)]
+pub struct Limits {
+    /// The TLS handshake, from accept to done.
+    pub handshake: Duration,
+    /// After the handshake, the first request must have begun by then.
+    pub first_request: Duration,
+    /// A connection with no request being served, and nothing read or
+    /// written for this long, is closed: an idle keep-alive, or an HTTP/2
+    /// connection that never says anything. A streaming answer, an upgraded
+    /// WebSocket or a slow backend is not idle by this.
+    pub idle: Duration,
+    /// A whole request's headers, once they have started (HTTP/1).
+    pub header_read: Duration,
+    /// Connections open at once, all clients together. Each holds a socket
+    /// here and, while a request runs, one to its backend.
+    pub max_total: usize,
+    /// Connections open at once from one address. A browser needs a
+    /// handful; this is far above that.
+    pub max_per_source: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            handshake: Duration::from_secs(10),
+            first_request: Duration::from_secs(30),
+            idle: Duration::from_secs(300),
+            header_read: Duration::from_secs(20),
+            max_total: 4096,
+            max_per_source: 128,
+        }
+    }
+}
+
+/// The open connections, in all and per source address.
+#[derive(Default)]
+struct Conns {
+    counts: Mutex<(usize, HashMap<IpAddr, usize>)>,
+}
+
+/// One open connection's place in [`Conns`], given back on drop.
+struct Permit {
+    conns: Arc<Conns>,
+    source: IpAddr,
+}
+
+impl Conns {
+    fn acquire(self: &Arc<Self>, source: IpAddr, limits: &Limits) -> Option<Permit> {
+        let source = source.to_canonical();
+        let mut counts = self.counts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mine = counts.1.get(&source).copied().unwrap_or(0);
+        if counts.0 >= limits.max_total || mine >= limits.max_per_source {
+            return None;
+        }
+        counts.0 += 1;
+        counts.1.insert(source, mine + 1);
+        Some(Permit { conns: Arc::clone(self), source })
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let mut counts = self.conns.counts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        counts.0 = counts.0.saturating_sub(1);
+        if let Some(n) = counts.1.get_mut(&self.source) {
+            *n -= 1;
+            if *n == 0 {
+                counts.1.remove(&self.source);
+            }
+        }
+    }
+}
+
+/// What a connection's wrapper needs to know about the requests on it.
+#[derive(Default)]
+struct ConnStats {
+    /// A request has begun on it.
+    started: AtomicBool,
+    /// Requests being served: begun, no response yet.
+    in_flight: AtomicUsize,
+}
+
+/// Counts one request while it is being served.
+struct InFlight(Arc<ConnStats>);
+
+impl InFlight {
+    fn begin(stats: &Arc<ConnStats>) -> Self {
+        stats.started.store(true, Ordering::Relaxed);
+        stats.in_flight.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(stats))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A connection that gives up on a client that says nothing: no request
+/// within `first_request` of opening, or nothing read or written for `idle`
+/// while none is being served. hyper's own timers cover an HTTP/1 request's
+/// headers once they have started; this covers what they cannot — an
+/// HTTP/2 connection that never speaks, a protocol sniff that never
+/// finishes, a keep-alive left open.
+struct Watched<S> {
+    inner: S,
+    stats: Arc<ConnStats>,
+    first_request: Duration,
+    idle: Duration,
+    opened: Instant,
+    last_activity: Instant,
+    sleep: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl<S> Watched<S> {
+    fn new(inner: S, stats: Arc<ConnStats>, limits: &Limits) -> Self {
+        let now = Instant::now();
+        Self {
+            inner,
+            stats,
+            first_request: limits.first_request,
+            idle: limits.idle,
+            opened: now,
+            last_activity: now,
+            sleep: Box::pin(tokio::time::sleep(limits.first_request)),
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Watched<S> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        if let Poll::Ready(r) = Pin::new(&mut this.inner).poll_read(cx, buf) {
+            if buf.filled().len() > before {
+                this.last_activity = Instant::now();
+            }
+            return Poll::Ready(r);
+        }
+        let deadline = if !this.stats.started.load(Ordering::Relaxed) {
+            Some(this.opened + this.first_request)
+        } else if this.stats.in_flight.load(Ordering::Relaxed) == 0 {
+            Some(this.last_activity + this.idle)
+        } else {
+            None
+        };
+        let Some(deadline) = deadline else {
+            return Poll::Pending;
+        };
+        this.sleep.as_mut().reset(tokio::time::Instant::from_std(deadline));
+        match this.sleep.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "connection idle"))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let r = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if matches!(r, Poll::Ready(Ok(n)) if n > 0) {
+            this.last_activity = Instant::now();
+        }
+        r
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 /// One service's backend, as the listener finds it by the address a
 /// connection arrived on.
 #[derive(Clone)]
@@ -197,8 +384,15 @@ fn listen_fd(pid: u32, listen_pid: Option<&str>, listen_fds: Option<&str>) -> Op
 /// revoked, reaches a keep-alive or HTTP/2 connection at its next request.
 /// A WebSocket, once upgraded, is past every request and keeps going.
 pub fn spawn(listener: TcpListener, tls: Arc<rustls::ServerConfig>, shared: Shared) -> JoinHandle<()> {
+    spawn_with_limits(listener, tls, shared, Limits::default())
+}
+
+/// [`spawn`], with the connection limits given.
+pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, shared: Shared, limits: Limits) -> JoinHandle<()> {
     let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+    let conns = Arc::new(Conns::default());
     tokio::spawn(async move {
+        let mut last_refusal_logged: Option<Instant> = None;
         loop {
             let (tcp, peer) = match listener.accept().await {
                 Ok(c) => c,
@@ -218,6 +412,15 @@ pub fn spawn(listener: TcpListener, tls: Arc<rustls::ServerConfig>, shared: Shar
             let Some(route) = route else {
                 continue;
             };
+            // Only what would be answered counts against the limits, and
+            // what is over them is closed unanswered, before any TLS work.
+            let Some(permit) = conns.acquire(peer.ip(), &limits) else {
+                if last_refusal_logged.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+                    last_refusal_logged = Some(Instant::now());
+                    tracing::warn!(peer = %peer.ip(), "too many open connections; closing new ones (logged once a minute)");
+                }
+                continue;
+            };
             // Without it, Nagle holds back the tail of a response written in
             // more than one TLS record until the client ACKs the head — which
             // its delayed ACK puts off by up to 40ms here, and on a phone's
@@ -225,12 +428,17 @@ pub fn spawn(listener: TcpListener, tls: Arc<rustls::ServerConfig>, shared: Shar
             let _ = tcp.set_nodelay(true);
             let acceptor = acceptor.clone();
             let shared = shared.clone();
+            let limits = limits.clone();
             tokio::spawn(async move {
-                let Ok(tls) = acceptor.accept(tcp).await else {
+                let _permit = permit;
+                let Ok(Ok(tls)) = tokio::time::timeout(limits.handshake, acceptor.accept(tcp)).await else {
                     return;
                 };
+                let stats = Arc::new(ConnStats::default());
+                let watched = Watched::new(tls, Arc::clone(&stats), &limits);
                 let caller_addr = local_v4(peer.ip());
                 let service = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
+                    let in_flight = InFlight::begin(&stats);
                     let policy = read(&shared.policies).get(&vip).cloned();
                     let caller = caller_addr.and_then(|a| read(&shared.callers).get(&a).cloned());
                     let sign_in = read(&shared.sign_in).clone();
@@ -256,6 +464,7 @@ pub fn spawn(listener: TcpListener, tls: Arc<rustls::ServerConfig>, shared: Shar
                     prepare(req.headers_mut(), caller.as_ref().map(|c| c.node.as_str()), verify);
                     req.extensions_mut().insert(ConnectInfo(peer));
                     async move {
+                        let _in_flight = in_flight;
                         let Some(policy) = policy else {
                             return Ok(crate::sign_in::plain(
                                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -276,9 +485,10 @@ pub fn spawn(listener: TcpListener, tls: Arc<rustls::ServerConfig>, shared: Shar
                         }
                     }
                 });
-                let _ = auto::Builder::new(TokioExecutor::new())
-                    .serve_connection_with_upgrades(TokioIo::new(tls), service)
-                    .await;
+                let mut builder = auto::Builder::new(TokioExecutor::new());
+                builder.http1().timer(TokioTimer::new()).header_read_timeout(limits.header_read);
+                builder.http2().timer(TokioTimer::new()).keep_alive_interval(Some(Duration::from_secs(30))).keep_alive_timeout(Duration::from_secs(20));
+                let _ = builder.serve_connection_with_upgrades(TokioIo::new(watched), service).await;
             });
         }
     })
@@ -709,5 +919,187 @@ mod tests {
         assert!(guard(&mut req, Some(&sign_in()), &open("observe.int.test"), None, None, &ids()).await.is_none());
         let cookies: Vec<_> = req.headers().get_all("cookie").iter().collect();
         assert_eq!(cookies, ["theme=dark; auth_tokens=abc"]);
+    }
+
+    // ---- connection limits ----
+
+    /// A terminator for `svc.test` on 127.0.0.1 with these limits, in front
+    /// of a backend that answers `/` at once, `/slow` after 1.5s, and `/drip`
+    /// a chunk every 200ms for 1.5s. Returns its port and a TLS connector.
+    async fn limited(limits: Limits) -> (u16, tokio_rustls::TlsConnector) {
+        use std::convert::Infallible;
+
+        struct Drip {
+            left: u8,
+            sleep: Pin<Box<tokio::time::Sleep>>,
+        }
+        impl hyper::body::Body for Drip {
+            type Data = axum::body::Bytes;
+            type Error = Infallible;
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+                if self.left == 0 {
+                    return Poll::Ready(None);
+                }
+                if self.sleep.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                self.left -= 1;
+                let next = tokio::time::Instant::now() + Duration::from_millis(200);
+                self.sleep.as_mut().reset(next);
+                Poll::Ready(Some(Ok(hyper::body::Frame::data(axum::body::Bytes::from_static(b"x")))))
+            }
+        }
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            let app = axum::Router::new()
+                .route("/slow", axum::routing::get(|| async {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    "slow done"
+                }))
+                .route("/drip", axum::routing::get(|| async {
+                    Body::new(Drip { left: 8, sleep: Box::pin(tokio::time::sleep(Duration::from_millis(200))) })
+                }))
+                .fallback(|| async { "ok" });
+            axum::serve(backend, app).await.unwrap();
+        });
+        let key = rcgen::generate_simple_self_signed(vec!["svc.test".into()]).unwrap();
+        let der = key.cert.der().clone();
+        let private = rustls_pki_types::PrivateKeyDer::try_from(key.signing_key.serialize_der()).unwrap();
+        let certs = Arc::new(Certs::default());
+        certs.set("svc.test", Arc::new(CertifiedKey::new(vec![der.clone()], rustls::crypto::aws_lc_rs::sign::any_supported_type(&private).unwrap())));
+        let listener = listener(0).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shared = Shared::default();
+        shared.routes.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(Route::new(upstream)));
+        shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(open("svc.test")));
+        spawn_with_limits(listener, server_config(certs), shared, limits);
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(der).unwrap();
+        let client = tokio_rustls::TlsConnector::from(Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth()));
+        (port, client)
+    }
+
+    fn quick() -> Limits {
+        Limits {
+            handshake: Duration::from_millis(300),
+            first_request: Duration::from_millis(400),
+            idle: Duration::from_millis(500),
+            header_read: Duration::from_millis(300),
+            max_total: 100,
+            max_per_source: 100,
+        }
+    }
+
+    type Tls = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
+
+    async fn tls(port: u16, client: &tokio_rustls::TlsConnector) -> Tls {
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client.connect(rustls_pki_types::ServerName::try_from("svc.test").unwrap(), tcp).await.unwrap()
+    }
+
+    /// Whether the server closes the connection within `within`.
+    async fn closed_within<S: tokio::io::AsyncRead + Unpin>(s: &mut S, within: Duration) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 256];
+        let end = tokio::time::Instant::now() + within;
+        loop {
+            match tokio::time::timeout_at(end, s.read(&mut buf)).await {
+                Err(_) => return false,
+                Ok(Ok(0) | Err(_)) => return true,
+                Ok(Ok(_)) => {}
+            }
+        }
+    }
+
+    async fn get<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(s: &mut S, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        s.write_all(format!("GET {path} HTTP/1.1\r\nhost: svc.test\r\n\r\n").as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        let mut buf = [0u8; 1024];
+        let end = tokio::time::Instant::now() + Duration::from_secs(5);
+        // Until the answer's end: these bodies are short, and end in a fixed word or a chunk trailer.
+        loop {
+            let n = tokio::time::timeout_at(end, s.read(&mut buf)).await.expect("an answer").unwrap();
+            out.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&out);
+            if n == 0 || text.ends_with("ok") || text.ends_with("slow done") || text.ends_with("0\r\n\r\n") {
+                return text.to_string();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_that_never_finishes_the_handshake_is_dropped() {
+        use tokio::io::AsyncWriteExt;
+        let (port, _) = limited(quick()).await;
+        let mut silent = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut partial = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        partial.write_all(&[0x16, 0x03, 0x01]).await.unwrap();
+        assert!(closed_within(&mut silent, Duration::from_secs(3)).await, "no bytes at all");
+        assert!(closed_within(&mut partial, Duration::from_secs(3)).await, "a record header, then nothing");
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_never_sends_a_request_is_dropped() {
+        let (port, client) = limited(quick()).await;
+        let mut quiet = tls(port, &client).await;
+        assert!(closed_within(&mut quiet, Duration::from_secs(3)).await);
+    }
+
+    #[tokio::test]
+    async fn a_request_whose_headers_never_end_is_dropped_by_the_header_timeout() {
+        use tokio::io::AsyncWriteExt;
+        // The first-request deadline is out of the way: it is hyper's timer.
+        let (port, client) = limited(Limits { first_request: Duration::from_secs(60), ..quick() }).await;
+        let mut slow = tls(port, &client).await;
+        slow.write_all(b"GET / HTTP/1.1\r\nhost: svc.test\r\nx-slow: 1\r\n").await.unwrap();
+        assert!(closed_within(&mut slow, Duration::from_secs(3)).await);
+    }
+
+    #[tokio::test]
+    async fn a_keep_alive_left_idle_is_dropped_and_a_busy_one_is_not() {
+        let (port, client) = limited(quick()).await;
+        let mut c = tls(port, &client).await;
+        assert!(get(&mut c, "/").await.ends_with("ok"));
+        assert!(closed_within(&mut c, Duration::from_secs(3)).await, "idle after its answer");
+
+        // A backend slower than the idle limit is not idle: a request is being served.
+        let mut c = tls(port, &client).await;
+        assert!(get(&mut c, "/slow").await.ends_with("slow done"));
+        // An answer still streaming, with pauses shorter than the limit, keeps going.
+        let mut c = tls(port, &client).await;
+        let answer = get(&mut c, "/drip").await;
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn one_source_cannot_hold_more_than_its_share_and_others_are_not_affected() {
+        let (port, client) = limited(Limits { max_per_source: 2, first_request: Duration::from_secs(30), idle: Duration::from_secs(30), ..quick() }).await;
+        let a = tls(port, &client).await;
+        let _b = tls(port, &client).await;
+        // The third from the same address is closed before any TLS.
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let refused = client.connect(rustls_pki_types::ServerName::try_from("svc.test").unwrap(), tcp).await;
+        assert!(refused.is_err(), "over its share");
+        // Giving one back makes room again.
+        drop(a);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut again = tls(port, &client).await;
+        assert!(get(&mut again, "/").await.ends_with("ok"));
+    }
+
+    #[tokio::test]
+    async fn every_connection_together_is_capped_too() {
+        let (port, client) = limited(Limits { max_total: 2, first_request: Duration::from_secs(30), idle: Duration::from_secs(30), ..quick() }).await;
+        let _a = tls(port, &client).await;
+        let _b = tls(port, &client).await;
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        assert!(client.connect(rustls_pki_types::ServerName::try_from("svc.test").unwrap(), tcp).await.is_err());
     }
 }

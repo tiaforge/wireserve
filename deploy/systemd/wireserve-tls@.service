@@ -23,6 +23,12 @@ RestartSec=5s
 StateDirectory=wireserve-tls/%i
 StateDirectoryMode=0700
 
+# Sockets: up to 4096 open connections (`serve::Limits`), each holding one
+# here and, while a request runs, one to its backend — well inside this, and
+# above systemd's default 1024, which the connection cap would otherwise
+# never get to.
+LimitNOFILE=16384
+
 CapabilityBoundingSet=
 NoNewPrivileges=true
 ProtectSystem=strict
