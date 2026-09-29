@@ -66,6 +66,9 @@ pub enum Error {
 const FIRST_BACKOFF: Duration = Duration::from_secs(120);
 const MAX_BACKOFF: Duration = Duration::from_secs(6 * 3600);
 
+/// How often expired certificates nobody needs are swept from disk.
+const PRUNE_EVERY: Duration = Duration::from_secs(24 * 3600);
+
 /// One served service.
 struct Served {
     service: TlsService,
@@ -113,6 +116,7 @@ pub async fn run(opts: Options) -> Result<(), Error> {
     // One issuance at a time: a node with many services staggers them
     // rather than asking the CA for all at once.
     let mut in_flight: Option<InFlight> = None;
+    let mut last_prune: Option<Instant> = None;
 
     tracing::info!(socket = %link.socket().display(), port, "TLS terminator starting");
     let accepting = serve::spawn(listener, tls, shared.clone());
@@ -140,23 +144,16 @@ pub async fn run(opts: Options) -> Result<(), Error> {
         update_sign_in(&shared.sign_in, config.sign_in.as_ref(), &extra_roots);
         *shared.identity.write().unwrap_or_else(std::sync::PoisonError::into_inner) = config.identity_headers.clone();
 
-        // Services that are gone: stop serving them.
-        let wanted: BTreeSet<&str> = config.services.iter().map(|s| s.name.as_str()).collect();
-        served.retain(|name, s| {
-            let keep = wanted.contains(name.as_str());
-            if !keep {
-                tracing::info!(service = %name, "no longer serving");
-                if s.routed {
-                    shared.unroute(s.service.vip);
-                }
-                certs.remove(&s.service.fqdn);
-            }
-            keep
-        });
+        forget_gone(&mut served, &mut issuance, &certs, &shared, &config);
 
         let Some(settings) = config.acme.clone() else {
             continue;
         };
+
+        if last_prune.is_none_or(|t| t.elapsed() >= PRUNE_EVERY) {
+            last_prune = Some(Instant::now());
+            prune(&store, &settings, &config);
+        }
 
         // A finished issuance.
         if in_flight.as_ref().is_some_and(|(_, _, h)| h.is_finished()) {
@@ -273,6 +270,49 @@ pub async fn run(opts: Options) -> Result<(), Error> {
     }
 }
 
+/// Stops serving what the agent no longer asks for, and forgets its
+/// certificate state: the stored certificate stays on disk, and serving the
+/// name again loads it from there instead of finding a held certificate the
+/// resolver no longer has.
+fn forget_gone(
+    served: &mut BTreeMap<String, Served>,
+    issuance: &mut BTreeMap<String, Issuance>,
+    certs: &Certs,
+    shared: &serve::Shared,
+    config: &TlsConfig,
+) {
+    let wanted: BTreeSet<&str> = config.services.iter().map(|s| s.name.as_str()).collect();
+    served.retain(|name, s| {
+        let keep = wanted.contains(name.as_str());
+        if !keep {
+            tracing::info!(service = %name, "no longer serving");
+            if s.routed {
+                shared.unroute(s.service.vip);
+            }
+            certs.remove(&s.service.fqdn);
+            issuance.remove(&s.service.fqdn);
+        }
+        keep
+    });
+}
+
+/// Deletes stored certificates that have expired and are not the current
+/// CA's certificate for a name still served: nothing can use those, for
+/// serving or for renewal. A valid one stays, however long its name has
+/// been unserved.
+fn prune(store: &Store, settings: &wireserve_types::AcmeSettings, config: &TlsConfig) {
+    let current = store::ca_id(&settings.directory);
+    let wanted: BTreeSet<&str> = config.services.iter().map(|s| s.fqdn.as_str()).collect();
+    match store.prune_expired(SystemTime::now(), |ca, fqdn| ca == current && wanted.contains(fqdn)) {
+        Ok(removed) => {
+            for (ca, fqdn) in removed {
+                tracing::info!(fqdn = %fqdn, ca = %ca, "removed an expired certificate nothing needs");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "could not prune expired certificates"),
+    }
+}
+
 /// Replaces the sign-in client when the provider moved — only then, so its
 /// connection pool survives every check-in that changed nothing.
 fn update_sign_in(shared: &SharedSignIn, target: Option<&wireserve_types::tls::SignInTarget>, extra_roots: &[rustls_pki_types::CertificateDer<'static>]) {
@@ -293,4 +333,47 @@ fn update_callers(callers: &Callers, config: &TlsConfig) {
         .map(|c| (c.addr, serve::CallerInfo { node: c.node.clone(), owner: c.owner.clone() }))
         .collect();
     *callers.write().unwrap_or_else(std::sync::PoisonError::into_inner) = map;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    fn service(name: &str) -> TlsService {
+        TlsService {
+            name: name.into(),
+            fqdn: format!("{name}.int.test"),
+            vip: Ipv4Addr::new(100, 64, 0, 9),
+            upstream: SocketAddr::from(([127, 0, 0, 1], 8080)),
+            access: Default::default(),
+        }
+    }
+
+    #[test]
+    fn an_unserved_name_forgets_its_certificate_so_serving_it_again_loads_from_disk() {
+        let (chain, key) = store::tests::self_signed("plex.int.test", 36_500);
+        let stored = store::parse(chain.as_bytes(), key.as_bytes()).unwrap();
+        let certs = Certs::default();
+        certs.set("plex.int.test", stored.key.clone());
+        let shared = serve::Shared::default();
+        let mut served = BTreeMap::from([("plex".to_string(), Served { service: service("plex"), routed: false })]);
+        let mut issuance = BTreeMap::from([("plex.int.test".to_string(), Issuance { cert: Some(stored), ..Issuance::default() })]);
+
+        forget_gone(&mut served, &mut issuance, &certs, &shared, &TlsConfig::default());
+
+        assert!(served.is_empty());
+        assert!(issuance.is_empty(), "a held certificate the resolver lacks would never be loaded again");
+    }
+
+    #[test]
+    fn a_name_still_wanted_keeps_its_state() {
+        let (chain, key) = store::tests::self_signed("plex.int.test", 36_500);
+        let stored = store::parse(chain.as_bytes(), key.as_bytes()).unwrap();
+        let mut served = BTreeMap::from([("plex".to_string(), Served { service: service("plex"), routed: false })]);
+        let mut issuance = BTreeMap::from([("plex.int.test".to_string(), Issuance { cert: Some(stored), ..Issuance::default() })]);
+        let config = TlsConfig { services: vec![service("plex")], ..TlsConfig::default() };
+        forget_gone(&mut served, &mut issuance, &Certs::default(), &serve::Shared::default(), &config);
+        assert_eq!((served.len(), issuance.len()), (1, 1));
+    }
 }

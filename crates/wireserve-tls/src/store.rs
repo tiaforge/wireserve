@@ -101,6 +101,58 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Deletes every stored certificate that has expired and that `in_use`
+    /// does not claim, returning what went (CA id, name). An expired
+    /// certificate can be neither served nor named for renewal, so it is
+    /// needed for nothing; a valid one is kept even for a name no longer
+    /// served, since serving it again would otherwise cost an issuance.
+    /// Anything unreadable is left alone: it is not known to be unused.
+    pub fn prune_expired(&self, now: SystemTime, in_use: impl Fn(&str, &str) -> bool) -> io::Result<Vec<(String, String)>> {
+        let mut removed = Vec::new();
+        let certs = self.root.join("certs");
+        for ca in std::fs::read_dir(&certs)? {
+            let ca = ca?;
+            let Some(ca_name) = ca.file_name().to_str().map(str::to_owned) else { continue };
+            if !ca.file_type()?.is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(ca.path())? {
+                let entry = entry?;
+                let Some(fqdn) = entry.file_name().to_str().map(str::to_owned) else { continue };
+                let dir = entry.path();
+                if !entry.file_type()?.is_dir() || in_use(&ca_name, &fqdn) {
+                    continue;
+                }
+                let Ok(chain) = std::fs::read(dir.join("cert.pem")) else { continue };
+                let Some(not_after) = leaf_not_after(&chain) else { continue };
+                if now < not_after {
+                    continue;
+                }
+                for file in ["key.pem", "cert.pem"] {
+                    match std::fs::remove_file(dir.join(file)) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                // Only if nothing else is in there.
+                let _ = std::fs::remove_dir(&dir);
+                removed.push((ca_name.clone(), fqdn));
+            }
+            let _ = std::fs::remove_dir(ca.path());
+        }
+        Ok(removed)
+    }
+}
+
+fn leaf_not_after(chain_pem: &[u8]) -> Option<SystemTime> {
+    let leaf = CertificateDer::pem_slice_iter(chain_pem).next()?.ok()?;
+    let (_, cert) = x509_parser::parse_x509_certificate(leaf.as_ref()).ok()?;
+    let secs = u64::try_from(cert.validity().not_after.timestamp()).ok()?;
+    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+}
+
 /// Parses a PEM chain and key into something rustls serves, with the
 /// leaf's validity period.
 pub fn parse(chain_pem: &[u8], key_pem: &[u8]) -> io::Result<Stored> {
@@ -189,6 +241,39 @@ pub(crate) mod tests {
         assert_eq!(ca_id(""), "cbf29ce484222325");
         assert_eq!(ca_id("a"), "af63dc4c8601ec8c");
         assert_ne!(ca_id(CA), ca_id(wireserve_types::LETS_ENCRYPT_DIRECTORY));
+    }
+
+    #[test]
+    fn only_expired_certificates_nobody_claims_are_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let (old, old_key) = self_signed("old.int.test", 90);
+        let (held, held_key) = self_signed("held.int.test", 90);
+        let (live, live_key) = self_signed("live.int.test", 36_500);
+        store.save(CA, "old.int.test", &old, &old_key).unwrap();
+        store.save(CA, "held.int.test", &held, &held_key).unwrap();
+        store.save(CA, "live.int.test", &live, &live_key).unwrap();
+        let ca_dir = dir.path().join("certs").join(ca_id(CA));
+        std::fs::create_dir_all(ca_dir.join("broken.int.test")).unwrap();
+        std::fs::write(ca_dir.join("broken.int.test/cert.pem"), "not pem").unwrap();
+
+        let now = SystemTime::now();
+        let removed = store.prune_expired(now, |_, fqdn| fqdn == "held.int.test").unwrap();
+        assert_eq!(removed, vec![(ca_id(CA), "old.int.test".to_string())]);
+        assert!(!ca_dir.join("old.int.test").exists());
+        assert!(store.load(CA, "held.int.test").unwrap().is_some(), "claimed: kept though expired");
+        assert!(store.load(CA, "live.int.test").unwrap().is_some(), "valid: kept though unserved");
+        assert!(ca_dir.join("broken.int.test/cert.pem").exists(), "unreadable: not known to be unused");
+    }
+
+    #[test]
+    fn a_ca_directory_left_empty_goes_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let (chain, key) = self_signed("old.int.test", 90);
+        store.save(CA, "old.int.test", &chain, &key).unwrap();
+        store.prune_expired(SystemTime::now(), |_, _| false).unwrap();
+        assert!(!dir.path().join("certs").join(ca_id(CA)).exists());
     }
 
     #[test]
