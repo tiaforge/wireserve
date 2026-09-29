@@ -17,7 +17,7 @@ fn is_recent(last_seen: Option<chrono::DateTime<Utc>>, threshold_secs: i64) -> b
     }
 }
 
-pub fn peer_info(node: &NodeRow, online_threshold_secs: i64) -> PeerInfo {
+pub fn peer_info(node: &NodeRow, online_threshold_secs: i64, relay_base: u16) -> PeerInfo {
     let recent = is_recent(node.last_seen, online_threshold_secs);
     PeerInfo {
         name: node.name.clone(),
@@ -36,6 +36,11 @@ pub fn peer_info(node: &NodeRow, online_threshold_secs: i64) -> PeerInfo {
         // here and (deliberately) by `GET /admin/peers`, which has no
         // requester to compute it relative to.
         transit_via: None,
+        // The carry port and carrier are live facts, filled in by `/poll`.
+        relay: wireserve_types::PeerRelay {
+            port: wireserve_types::relay_port(relay_base, node.relay_slot),
+            ..Default::default()
+        },
     }
 }
 
@@ -184,27 +189,28 @@ mod tests {
             gateway_node_id: None,
             export_via_gateway: false,
             exit_enabled: false,
+            relay_slot: None,
         }
     }
 
     #[test]
     fn fresh_poll_is_online_with_handshake() {
         let n = node(Some(Utc::now()));
-        let info = peer_info(&n, 180);
+        let info = peer_info(&n, 180, wireserve_types::DEFAULT_RELAY_PORT_BASE);
         assert!(info.last_handshake.is_some());
     }
 
     #[test]
     fn stale_poll_is_offline_with_null_handshake() {
         let n = node(Some(Utc::now() - Duration::seconds(181)));
-        let info = peer_info(&n, 180);
+        let info = peer_info(&n, 180, wireserve_types::DEFAULT_RELAY_PORT_BASE);
         assert!(info.last_handshake.is_none());
     }
 
     #[test]
     fn never_polled_is_offline() {
         let n = node(None);
-        let info = peer_info(&n, 180);
+        let info = peer_info(&n, 180, wireserve_types::DEFAULT_RELAY_PORT_BASE);
         assert!(info.last_handshake.is_none());
     }
 

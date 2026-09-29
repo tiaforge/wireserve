@@ -71,6 +71,30 @@ pub trait InteropHandle {
     fn stop(&mut self);
 }
 
+/// The mesh interface's interop and, when there is one, the carry
+/// interface's (PLAN.md M39). The carry interface never forwards, so its
+/// interop never opens any.
+pub struct Interops<I> {
+    pub main: I,
+    pub carry: Option<I>,
+}
+
+impl<I: InteropHandle> InteropHandle for Interops<I> {
+    fn tick(&self, forward_wanted: ForwardWanted) {
+        self.main.tick(forward_wanted);
+        if let Some(carry) = &self.carry {
+            carry.tick(ForwardWanted::default());
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(carry) = &mut self.carry {
+            carry.stop();
+        }
+        self.main.stop();
+    }
+}
+
 /// Stand-in where there is no host-firewall interop (non-Linux).
 pub struct NoopInterop;
 

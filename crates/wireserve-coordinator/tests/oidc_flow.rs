@@ -168,6 +168,7 @@ fn app(issuer: &str) -> App {
         dns: None,
         acme: wireserve_coordinator::config::acme_from_lookup(|_| None).unwrap(),
         online_threshold_secs: 180,
+        relay_port_base: wireserve_types::DEFAULT_RELAY_PORT_BASE,
         rate_limit_max: 1000,
         rate_limit_window_secs: 60,
         trust_proxy_headers: false,

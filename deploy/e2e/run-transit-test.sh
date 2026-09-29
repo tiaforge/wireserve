@@ -10,9 +10,10 @@
 # symmetric NAT maps a different external port per *destination*, so the
 # port either one learns talking to the coordinator is useless to the
 # other — and today that pair simply has no path. A third node that
-# already reaches both, opted in as transit, routes between them through
-# WireGuard's own AllowedIPs — a real decrypt/re-encrypt at the kernel
-# layer, never a new relay protocol.
+# already reaches both, opted in as transit, relays their own end-to-end
+# WireGuard session between their carry interfaces (PLAN.md M39): it
+# forwards the session's UDP and never holds its keys, so it can neither
+# read nor forge what passes through.
 #
 #     [coordinator]──────────────( inet )──────────────────────┐
 #          │                        │                │          │
@@ -250,11 +251,23 @@ podman exec "$COORD" wireserve-admin approve-transit node1 || fail "could not ap
 log "waiting for transit selection to propagate (up to one poll interval each side)"
 sleep 20
 
-log "confirming the coordinator names agent1 as transit_via for this pair"
-NODE2_TRANSIT_VIA=$(podman exec "$AGENT4" wireserve list --json \
-    | python3 -c "import json,sys; d=json.load(sys.stdin); print(next((p.get('transit_via') or '' for p in d['peers'] if p.get('name')=='node2'), ''))")
-[ -n "$NODE2_TRANSIT_VIA" ] || fail "agent4's poll response never got a transit_via for node2"
-pass "agent4 was told to route to node2 via a transit carrier"
+log "confirming the coordinator names agent1 as the relay for this pair"
+NODE2_RELAY_VIA=$(podman exec "$AGENT4" wireserve list --json \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(((p.get('relay') or {}).get('via') or '' for p in d['peers'] if p.get('name')=='node2'), ''))")
+[ -n "$NODE2_RELAY_VIA" ] || fail "agent4's poll response never named a relay for node2"
+podman exec "$AGENT4" wireserve list | grep -q "relayed by node1" || fail "wireserve list does not say node2 is relayed by node1"
+pass "agent4 was told to reach node2 through a relay, and says so"
+
+log "counting what agent1 forwards, by protocol"
+in_netns "$AGENT1" nft -f - <<'NFT'
+table inet relayprobe {
+    chain f {
+        type filter hook forward priority -10; policy accept;
+        meta l4proto tcp counter
+        meta l4proto udp counter
+    }
+}
+NFT
 
 log "confirming a real service connection now succeeds end to end through agent1"
 if podman exec "$AGENT4" timeout 20 bash -c "exec 3<>/dev/tcp/$SVC2/12345"; then
@@ -268,19 +281,26 @@ else
     fail "agent2 still cannot reach agent4's service after transit came up"
 fi
 
-log "confirming agent2 has no kernel peer entry for agent4 at all"
+log "confirming agent1 only ever forwarded the sessions' UDP, never the TCP inside them"
+COUNTERS=$(in_netns "$AGENT1" nft list chain inet relayprobe f)
+TCP_SEEN=$(echo "$COUNTERS" | awk '/l4proto tcp/ {for (i=1;i<=NF;i++) if ($i=="packets") print $(i+1)}')
+UDP_SEEN=$(echo "$COUNTERS" | awk '/l4proto udp/ {for (i=1;i<=NF;i++) if ($i=="packets") print $(i+1)}')
+[ "$TCP_SEEN" = "0" ] || fail "agent1 forwarded $TCP_SEEN TCP packets — it saw the connections inside the relayed session"
+[ "${UDP_SEEN:-0}" -gt 0 ] || fail "agent1 forwarded no UDP at all — the connections did not go through it"
+pass "agent1 forwarded $UDP_SEEN UDP packets and 0 TCP: it relayed ciphertext only"
+in_netns "$AGENT1" nft delete table inet relayprobe
+
+log "confirming agent4's addresses sit on agent2's carry interface, not its mesh interface"
 AGENT4_PUBKEY=$(podman exec "$AGENT4" wireserve list --json \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(next((p.get('pubkey') for p in d['peers'] if p.get('name')=='node4'), ''))")
 AGENT2_PUBKEY=$(podman exec "$AGENT2" wireserve list --json \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(next((p.get('pubkey') for p in d['peers'] if p.get('name')=='node2'), ''))")
-if in_netns "$AGENT2" wg show wireserve0 allowed-ips | grep -q "$AGENT4_PUBKEY"; then
-    fail "agent2 has its own kernel peer entry for agent4 — AllowedIPs redirection did not take effect"
-fi
-pass "agent2 has no kernel peer entry for agent4 — routed entirely via agent1's entry"
-if in_netns "$AGENT2" wg show wireserve0 allowed-ips | grep -F "$SVC4" >/dev/null 2>&1; then
-    note "agent2's peer table (for reference):"
-    in_netns "$AGENT2" wg show wireserve0 allowed-ips | sed 's/^/  /'
-fi
+in_netns "$AGENT2" wg show wireserve0 allowed-ips | grep "$AGENT4_PUBKEY" | grep -q "(none)" \
+    || fail "agent2's mesh-interface entry for agent4 still routes something — it should only probe"
+in_netns "$AGENT2" wg show wireserve0-t allowed-ips | grep "$AGENT4_PUBKEY" | grep -qF "$SVC4" \
+    || fail "agent2's carry interface does not route agent4's service address"
+pass "agent4 is reached over agent2's carry interface; its mesh-interface entry only probes"
+[ -n "$AGENT2_PUBKEY" ] || fail "no pubkey for node2"
 
 log "confirming default-deny still holds for anything outside the declared pair"
 in_netns_bg "$AGENT4" nc -l -k -p 12346

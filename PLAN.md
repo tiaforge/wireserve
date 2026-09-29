@@ -8,12 +8,11 @@ this checklist lives in the session that created it — this file is the
 source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
-**Currently working on:** M36 (service groups, grants and tags; items 212+),
-then M37 (caching `/verify`) and M38 (device owners through OIDC). The plan
-is `~/.claude/plans/alright-then-lets-create-shimmying-panda.md` (not in the
-repo). Items 212–226 (M36–M38) are done. `run-grants-test.sh`, the
-reworked `run-service-auth-test.sh` and `run-owner-test.sh` pass
-(2026-09-29).
+**Currently working on:** M39–M41 — end-to-end relaying: a carry
+interface for agent pairs (M39), phones reaching NAT'd nodes through a
+carrier's public relay port (M40), and the gateway's hop-by-hop mesh
+forwarding retired (M41). The plan is
+`~/.claude/plans/wobbly-roaming-karp.md` (not in the repo). Items 234+.
 
 Everything that can be verified here now is. What remains unverified is
 scale (three nodes, not thirty), real WAN paths, and long-running
@@ -3696,3 +3695,101 @@ them.
     providers do (authward, authentik) and which describe no such thing
     (Authelia and oauth2-proxy, from their documentation, not their code).
     No code changed: none of these has a fix short of a different design.
+
+## M39 — relaying end to end: the carrier forwards what it can't read
+
+Transit (M23) was hop by hop: the carrier decrypted the pair's traffic from
+one tunnel and encrypted it into the other, so it read everything and could
+send packets as either end — which is why it needed an admin's approval at
+all. Now the two ends run their own WireGuard session and the carrier only
+forwards its UDP. A spike on 2026-09-29 (three network namespaces, plain
+`wg` and `nft`) showed it works with two NAT rules and nothing else, and
+`firewall::nftables::tests::kernel_a_carrier_relays_a_session_it_cannot_read`
+now keeps that true against the rules the agent actually writes: pings in
+both directions, and not one ICMP packet through the carrier's forward hook.
+
+234. **A second interface per node, the carry interface** (`<main>-t`,
+    `wg::carry_ifname`, cut to fit 15 characters). Same private key, no
+    address, MTU 1340 (`CARRY_MTU`: the mesh interface's 1420 less an outer
+    header, so a full packet isn't fragmented by the carrier's tunnel), and a
+    listen port the kernel picks once and `AgentState::carry_port` keeps.
+    One interface was the alternative: a relayed peer's single entry would
+    then hold the carrier as its endpoint, and probing its direct candidates
+    would mean leaving the relay each time. A second interface only for
+    *probing* was rejected too: a probe from another UDP port tests another
+    NAT mapping, so its success proves nothing for the mesh interface's
+    port. So the mesh interface keeps all NAT traversal unchanged (M21–M23,
+    #206/#207) — a relayed peer keeps its probe entry there exactly as a
+    transited one did — and the carry interface only carries. Its routes
+    name the node's mesh address as their source (`routes::RouteSet::
+    prefsrc`); both interfaces' routes move in one `routes::sync_all`,
+    removals first, so an address changing interface never meets its old
+    route (an existing route counts as added).
+235. **The carrier's rules** (`nftables::relay_rules`): for each direction
+    of a pair, `iifname <mesh> ip saddr A ip daddr <self> udp dport P_C
+    dnat to C:carry_C` and `oifname <mesh> ip saddr A ip daddr C udp dport
+    carry_C snat to <self>:P_A`, plus a forward accept for exactly that UDP.
+    The SNAT is to a fixed port — the sender's own relay port — and that is
+    what makes it work whoever dials first: C's packets to `<self>:P_A` are
+    then the *reply* of A's tracked flow, and the other way round. With
+    plain masquerade each side learned the carrier's own WireGuard port as
+    the other's endpoint and the handshake answers were lost (seen in the
+    spike). Each node's relay port is `WIRESERVE_RELAY_PORT_BASE` (41000)
+    plus its **relay slot** (migration 0019), the smallest free one on
+    creation, freed on delete, 1000 of them; `wireserve_types::relay_port`.
+    Inside the tunnel only: for agent pairs nothing is opened anywhere.
+236. **Tracked flows decide what a relay port means, so nothing may move
+    under them.** A packet that reaches a carrier before its relay rules
+    must not be tracked, or its untranslated flow would outlive the rules —
+    keepalives every 25 s keep a UDP flow alive for ever. The mesh
+    interface's default-deny drops it in the input hook, before conntrack
+    confirms it, so it isn't. The same reasoning makes the carry port
+    persistent: a port that moved on a restart would leave the carrier's
+    flow pointing at the old one, and the other side's keepalives would keep
+    it there. What this leaves: a carry port that has to change because
+    something else took it, which a carrier only recovers from when the
+    pair stops sending for the flow's timeout. Rare enough to accept; no
+    conntrack flushing (that needs `conntrack` or netlink conntrack, neither
+    a dependency today).
+237. **The carry interface has a table of its own**, `inet
+    wireserve.<carry>` (`nftables::carry_table`), written in the same
+    transaction as the mesh interface's: default-deny, the same grants on
+    the service addresses, no forwarding at all. Its own table, not an
+    interface set in the mesh table, because the host-firewall interop
+    checks a table's input and forward chains end in `iifname <if> drop`
+    (`planner::own_table_intact`) — with a table per interface a second
+    `HostInterop` for the carry interface works unchanged
+    (`firewall::Interops`). The mesh table's drops for terminated addresses
+    and the terminator's port exempt the carry interface, and it accepts the
+    carry port from the mesh (`Forwarding::relay_ends`); WireGuard drops
+    anything there no carry peer signed. The rewrites' marking, reply and
+    masquerade chains aren't tied to an interface and serve relayed flows as
+    they are. The carry name is checked before any firewall state names it:
+    one that belongs to something else is left alone and the node runs
+    without relaying.
+238. **The coordinator arranges it** (`routes/poll.rs`). An agent reports
+    `CAP_RELAY` and its `carry_port` each poll (`TransitState::
+    report_carry_port`, in memory like the rest of transit); every
+    `PeerInfo` carries a `relay` (`PeerRelay`: `port`, `carry_port`, and the
+    requester-relative `via`). A pair is relayed when either end wants help,
+    both ends are relayable and a carrier that can relay is chosen by the
+    same deterministic `select` (now `select_where`); the carrier learns it
+    from `relay_carrying`. There is **no fallback** to hop-by-hop transit
+    for agent pairs — a pair with an older node among the three stays
+    unreachable rather than readable — so every node upgrades together.
+    `transit on` / `approve-transit` keep their names and remain the
+    consent: a carrier still sees who talks to whom, and can drop it.
+239. **What remains hop by hop** until M41: a phone's gateway (#106), whose
+    `transit_via` and `transit_carrying` pairs are untouched here, and the
+    exit (M27), which stays so by design. `wireserve list` says which is
+    which: `relayed by <carrier>` for a peer, and on a carrier "relaying (end
+    to end, unreadable here)" apart from "forwarding (readable here)".
+240. **Verification.** Unit tests for the assignments, both peer maps, the
+    carrier's forwards, the rules' JSON and the carry table; kernel tests for
+    the carry interface's routes moving and back
+    (`wg::tests::kernel_a_relayed_peer_moves_to_the_carry_interface_and_back`)
+    and for the relay itself (above); coordinator tests for selection, no
+    fallback, and stable relay ports. `run-transit-test.sh` now checks the
+    relay by name, the carry interface's routes, and that the carrier
+    forwarded UDP and not one TCP packet while the services were reached —
+    not run yet (rootful podman).

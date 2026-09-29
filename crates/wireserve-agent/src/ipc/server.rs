@@ -38,6 +38,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
             pending_services: vec![],
             denied_services: vec![],
             transit_carrying: vec![],
+            relay_carrying: vec![],
             transit_awaiting_approval: false,
             exit_clients: vec![],
             mesh: None,
@@ -120,6 +121,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
         node: self_name,
         transit_capable: state.transit_capable,
         transit_carrying: directory.transit_carrying.clone(),
+        relay_carrying: directory.relay_carrying.clone(),
         // Only meaningful while opted in: the directory can be one poll
         // older than a `transit off` issued since.
         transit_awaiting_approval: state.transit_capable && directory.transit_awaiting_approval,

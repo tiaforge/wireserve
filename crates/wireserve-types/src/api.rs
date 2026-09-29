@@ -236,6 +236,28 @@ pub const CAP_TLS_TERMINATE: &str = "tls-terminate";
 /// it, a service's owner is never told to rely on the sign-in.
 pub const CAP_SIGN_IN: &str = "sign-in";
 
+/// `relay` (PLAN.md M39): this agent runs a carry interface, so sessions
+/// with it can be relayed end to end, and, when it carries, forwards only
+/// the ciphertext of other nodes' sessions. Relaying is only ever arranged
+/// between nodes that all say so.
+pub const CAP_RELAY: &str = "relay";
+
+/// How many relay slots a mesh has (PLAN.md M39): a node's relay port is
+/// the coordinator's base plus its slot, so the ports run from the base to
+/// the base plus this, less one. The same number again after them is where
+/// a carrier's relayed phone sessions leave from (PLAN.md M40).
+pub const RELAY_SLOTS: u16 = 1000;
+
+/// The default first relay port (`WIRESERVE_RELAY_PORT_BASE`).
+pub const DEFAULT_RELAY_PORT_BASE: u16 = 41000;
+
+/// A node's relay port: `base` plus its slot, or `None` for a node without
+/// one or a slot outside the range.
+#[must_use]
+pub fn relay_port(base: u16, slot: Option<u16>) -> Option<u16> {
+    slot.filter(|s| *s < RELAY_SLOTS).and_then(|s| base.checked_add(s))
+}
+
 /// At most this many names are read from one poll's `tls_ready`.
 pub const MAX_TLS_READY_PER_POLL: usize = 64;
 
@@ -335,6 +357,10 @@ pub struct PollRequest {
     /// [`MAX_CALLERS_SEEN_PER_POLL`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub callers_seen: Vec<std::net::Ipv4Addr>,
+    /// The listen port of this node's carry interface (PLAN.md M39), when
+    /// it has one. Chosen by the kernel, so reported every poll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carry_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -384,6 +410,41 @@ pub struct PeerInfo {
     /// requester to compute it relative to.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub transit_via: Option<String>,
+    /// How this peer is reached through a carrier that forwards only
+    /// ciphertext (PLAN.md M39) — see [`PeerRelay`].
+    #[serde(default, skip_serializing_if = "PeerRelay::is_empty")]
+    pub relay: PeerRelay,
+}
+
+/// A peer's part in end-to-end relaying (PLAN.md M39, M40). A carrier
+/// forwards the UDP of a WireGuard session between two other nodes without
+/// ever holding its keys: packets for this peer arrive at the carrier's
+/// mesh address on `port`, are sent on to this peer's `carry_port`, and
+/// leave the carrier from the sender's own `port`, so each side sees the
+/// other always at the same carrier address and port.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerRelay {
+    /// This peer's relay port: the same on every carrier, and stable for
+    /// as long as the peer exists. `None` on a coordinator that assigns
+    /// none, or for a peer that has none yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// The listen port of this peer's carry interface, which relayed
+    /// sessions end on. `None` for a peer that cannot be relayed to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carry_port: Option<u16>,
+    /// The pubkey of the carrier the *requester* of this poll reaches this
+    /// peer through right now, computed per (requester, peer) pair like
+    /// `transit_via`. Always `None` in `GET /admin/peers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+}
+
+impl PeerRelay {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -475,6 +536,12 @@ pub struct PollResponse {
     /// cycle.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transit_carrying: Vec<TransitPair>,
+    /// Every pair whose end-to-end session THIS node relays right now
+    /// (PLAN.md M39): it forwards their UDP between the two relay ports and
+    /// never sees inside. Both are in `peers`, which is where their
+    /// addresses and ports come from.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_carrying: Vec<TransitPair>,
     /// THIS node asked to carry transit (`transit_capable`) but no admin
     /// has approved it as a carrier, so the coordinator is ignoring the
     /// offer. A self-reported offer is never enough on its own: a carrier
@@ -844,6 +911,7 @@ mod tests {
             pending_services: vec![],
             denied_services: vec![],
             transit_carrying: vec![],
+            relay_carrying: vec![],
             transit_awaiting_approval: false,
             exit_clients: vec![],
             mesh: None,
@@ -882,6 +950,7 @@ mod tests {
                 reflexive_addr: Some("203.0.113.5:55123".into()),
                 last_handshake: None,
                 transit_via: None,
+                relay: Default::default(),
             }],
             services: vec![ServiceInfo {
                 terminated: false,
@@ -895,6 +964,7 @@ mod tests {
             pending_services: vec![],
             denied_services: vec![],
             transit_carrying: vec![],
+            relay_carrying: vec![],
             transit_awaiting_approval: false,
             exit_clients: vec![],
             mesh: None,

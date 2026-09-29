@@ -42,19 +42,51 @@ pub fn plan(old: &BTreeSet<IpAddr>, new: &BTreeSet<IpAddr>) -> (Vec<IpAddr>, Vec
 /// Makes the host routes on `ifname` go from `old` to `new` (see `plan`).
 /// Every address is tried; the first error is returned after the rest ran.
 pub fn sync(ifname: &str, old: &BTreeSet<IpAddr>, new: &BTreeSet<IpAddr>) -> io::Result<()> {
-    let index = interface_index(ifname)?;
-    let (add, remove) = plan(old, new);
+    sync_all(&[RouteSet { ifname, old, new, prefsrc: None }])
+}
+
+/// One interface's routes for [`sync_all`]: from `old` to `new`, each with
+/// `prefsrc` as its preferred source when given.
+pub struct RouteSet<'a> {
+    pub ifname: &'a str,
+    pub old: &'a BTreeSet<IpAddr>,
+    pub new: &'a BTreeSet<IpAddr>,
+    /// For an interface with no address of its own (the carry interface,
+    /// PLAN.md M39): without it a local connection would leave with some
+    /// other interface's address, which no peer accepts from this node.
+    pub prefsrc: Option<(Ipv4Addr, std::net::Ipv6Addr)>,
+}
+
+/// Moves several interfaces' routes at once: every removal first, then
+/// every addition. An address moving from one interface to the other
+/// (a peer starting or ending a relay, PLAN.md M39) would otherwise meet
+/// its old route still in place, and an existing route counts as added.
+pub fn sync_all(sets: &[RouteSet<'_>]) -> io::Result<()> {
     let mut first_err = None;
-    for addr in remove {
-        if let Err(e) = request(route_message(index, addr), false) {
-            tracing::warn!(%addr, ifname, error = %e, "could not remove the route to a departed peer");
-            first_err.get_or_insert(e);
+    let mut adds = Vec::new();
+    for set in sets {
+        let index = match interface_index(set.ifname) {
+            Ok(i) => i,
+            Err(e) => {
+                first_err.get_or_insert(e);
+                continue;
+            }
+        };
+        let (add, remove) = plan(set.old, set.new);
+        for addr in remove {
+            if let Err(e) = request(route_message(index, addr, set.prefsrc), false) {
+                tracing::warn!(%addr, ifname = set.ifname, error = %e, "could not remove the route to a departed peer");
+                first_err.get_or_insert(e);
+            }
         }
+        adds.push((set.ifname, index, add, set.prefsrc));
     }
-    for addr in add {
-        if let Err(e) = request(route_message(index, addr), true) {
-            tracing::warn!(%addr, ifname, error = %e, "could not add the route to a peer");
-            first_err.get_or_insert(e);
+    for (ifname, index, add, prefsrc) in adds {
+        for addr in add {
+            if let Err(e) = request(route_message(index, addr, prefsrc), true) {
+                tracing::warn!(%addr, ifname, error = %e, "could not add the route to a peer");
+                first_err.get_or_insert(e);
+            }
         }
     }
     first_err.map_or(Ok(()), Err)
@@ -71,10 +103,10 @@ fn interface_index(ifname: &str) -> io::Result<u32> {
 
 /// `<addr>/32` (or `/128`) `dev <index> scope link`, in the main table —
 /// the same route defguard's `add_route` built.
-fn route_message(index: u32, addr: IpAddr) -> RouteMessage {
-    let (family, len, dest) = match addr {
-        IpAddr::V4(a) => (AddressFamily::Inet, 32, RouteAddress::Inet(a)),
-        IpAddr::V6(a) => (AddressFamily::Inet6, 128, RouteAddress::Inet6(a)),
+fn route_message(index: u32, addr: IpAddr, prefsrc: Option<(Ipv4Addr, std::net::Ipv6Addr)>) -> RouteMessage {
+    let (family, len, dest, src) = match addr {
+        IpAddr::V4(a) => (AddressFamily::Inet, 32, RouteAddress::Inet(a), prefsrc.map(|(v4, _)| RouteAddress::Inet(v4))),
+        IpAddr::V6(a) => (AddressFamily::Inet6, 128, RouteAddress::Inet6(a), prefsrc.map(|(_, v6)| RouteAddress::Inet6(v6))),
     };
     let mut message = RouteMessage::default();
     message.header = RouteHeader {
@@ -88,6 +120,9 @@ fn route_message(index: u32, addr: IpAddr) -> RouteMessage {
     };
     message.attributes.push(RouteAttribute::Oif(index));
     message.attributes.push(RouteAttribute::Destination(dest));
+    if let Some(src) = src {
+        message.attributes.push(RouteAttribute::PrefSource(src));
+    }
     message
 }
 

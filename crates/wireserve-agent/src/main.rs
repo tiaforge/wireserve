@@ -518,8 +518,25 @@ async fn cmd_daemon(
     let mut wg = WgInterface::new(&ifname)?;
     let mut endpoint_tracker = wireserve_agent::wg::EndpointTracker::default();
 
+    // The carry interface relayed sessions run on (PLAN.md M39). Its name
+    // is checked before any firewall state names it: one that belongs to
+    // something else is left alone entirely, and this node then simply
+    // can't be relayed to.
+    let carry = wireserve_agent::wg::carry_ifname(&ifname);
+    let carry = match WgInterface::new(&carry).map(|c| c.classify(&private_key)) {
+        Ok(wireserve_agent::wg::Slot::Free | wireserve_agent::wg::Slot::Ours) => Some(carry),
+        Ok(wireserve_agent::wg::Slot::Foreign(reason)) => {
+            tracing::warn!(%carry, %reason, "not using the carry interface: sessions with this node can't be relayed");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(%carry, error = %e, "not using the carry interface: sessions with this node can't be relayed");
+            None
+        }
+    };
+
     #[cfg(target_os = "linux")]
-    let mut fw = firewall::nftables::NftablesBackend::new(ifname.clone())?;
+    let mut fw = firewall::nftables::NftablesBackend::new(ifname.clone())?.with_carry(carry.clone());
     #[cfg(not(target_os = "linux"))]
     let mut fw = NoopFirewall;
 
@@ -565,12 +582,30 @@ async fn cmd_daemon(
         &mut fw,
         &mut wg,
         |wg| wg.preflight(&private_key).map_err(Into::into),
-        || start_interop(&ifname, firewall::ForwardWanted::of(&state), own_table),
+        || firewall::Interops {
+            #[cfg(target_os = "linux")]
+            carry: carry.as_deref().map(|c| start_interop(c, firewall::ForwardWanted::default(), own_table.clone())),
+            #[cfg(not(target_os = "linux"))]
+            carry: carry.as_deref().map(|c| start_interop(c, firewall::ForwardWanted::default(), ())),
+            main: start_interop(&ifname, firewall::ForwardWanted::of(&state), own_table),
+        },
         |wg| {
             wg.bring_up(&private_key, ip4, ip6, listen_port)
                 .map_err(Into::<Box<dyn std::error::Error>>::into)
         },
     )?;
+    if carry.is_some() {
+        match wg.bring_up_carry(&private_key, ip4, ip6, state.carry_port) {
+            Ok(port) => {
+                tracing::info!(carry = ?carry, port, "carry interface up");
+                if state.carry_port != Some(port) {
+                    state.carry_port = Some(port);
+                    state.save(&state_path)?;
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "could not bring up the carry interface: sessions with this node can't be relayed"),
+        }
+    }
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
     // F1 (security review, round 2): exactly ONE in-memory copy of the
@@ -815,7 +850,35 @@ fn remove_leftover_interfaces(chosen: &str, previous: Option<&str>, private_key:
             Ok(Ok(())) => {}
             Ok(Err(e)) | Err(e) => tracing::warn!(ifname = %name, error = %e, "could not remove it"),
         }
+        remove_leftover_carry(&name, private_key);
         drop(claim);
+    }
+}
+
+/// Removes the carry interface (PLAN.md M39) that went with the mesh
+/// interface `main`, if it is this node's own, with its firewall.
+fn remove_leftover_carry(main: &str, private_key: &str) {
+    let name = wireserve_agent::wg::carry_ifname(main);
+    let Ok(carry) = WgInterface::new(&name) else {
+        return;
+    };
+    if carry.classify(private_key) != wireserve_agent::wg::Slot::Ours {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        firewall::host_interop::remove_for(&name);
+        // The mesh interface's table is gone already; removing it again is
+        // a no-op, and this is the one call that knows both.
+        if let Ok(fw) = firewall::nftables::NftablesBackend::new(main.to_string()) {
+            let mut fw = fw.with_carry(Some(name.clone()));
+            if let Err(e) = fw.teardown() {
+                tracing::warn!(ifname = %name, error = %e, "could not remove its firewall table");
+            }
+        }
+    }
+    if let Err(e) = wireserve_agent::routes::delete_link(&name) {
+        tracing::warn!(ifname = %name, error = %e, "could not remove a leftover carry interface");
     }
 }
 

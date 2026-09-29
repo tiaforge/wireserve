@@ -115,9 +115,12 @@ fn peer_name(view: &ListView, pubkey: &str) -> String {
 /// "last poll" staleness every other cached field in this view already
 /// has.
 fn route(p: &PeerInfo, view: &ListView) -> String {
-    match p.transit_via.as_deref() {
-        Some(via) => format!("via {}", peer_name(view, via)),
-        None => "direct".to_string(),
+    // A relay (PLAN.md M39) runs end to end: the carrier sees only
+    // ciphertext, which is worth saying next to its name.
+    match (p.relay.via.as_deref(), p.transit_via.as_deref()) {
+        (Some(via), _) => format!("relayed by {}", peer_name(view, via)),
+        (None, Some(via)) => format!("via {}", peer_name(view, via)),
+        (None, None) => "direct".to_string(),
     }
 }
 
@@ -210,20 +213,27 @@ pub fn render(view: &ListView, now: DateTime<Utc>) -> String {
     // Transit (PLAN.md M23): silent in the common case (opted out, not
     // carrying anything) so this stays out of the way for every node that
     // never touches the feature.
-    if view.transit_capable || !view.transit_carrying.is_empty() {
+    if view.transit_capable || !view.transit_carrying.is_empty() || !view.relay_carrying.is_empty() {
         out.push('\n');
         out.push_str(&format!("Transit: {}", if view.transit_capable { "on" } else { "off" }));
+        let pairs = |list: &[wireserve_types::TransitPair]| -> String {
+            list.iter()
+                .map(|pair| format!("{} <-> {}", peer_name(view, &pair.a), peer_name(view, &pair.c)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         if view.transit_awaiting_approval {
             out.push_str(", waiting for an admin to approve this node as a carrier\n");
-        } else if view.transit_carrying.is_empty() {
+        } else if view.transit_carrying.is_empty() && view.relay_carrying.is_empty() {
             out.push_str(", carrying nothing right now\n");
         } else {
-            let pairs: Vec<String> = view
-                .transit_carrying
-                .iter()
-                .map(|pair| format!("{} <-> {}", peer_name(view, &pair.a), peer_name(view, &pair.c)))
-                .collect();
-            out.push_str(&format!(", carrying: {}\n", pairs.join(", ")));
+            out.push('\n');
+            if !view.relay_carrying.is_empty() {
+                out.push_str(&format!("  relaying (end to end, unreadable here): {}\n", pairs(&view.relay_carrying)));
+            }
+            if !view.transit_carrying.is_empty() {
+                out.push_str(&format!("  forwarding (readable here): {}\n", pairs(&view.transit_carrying)));
+            }
         }
     }
 
@@ -278,6 +288,7 @@ mod tests {
             reflexive_addr: None,
             last_handshake: online.then(chrono::Utc::now),
             transit_via: None,
+            relay: Default::default(),
         }
     }
 
@@ -295,6 +306,7 @@ mod tests {
             service_domain: None,
             transit_capable: false,
             transit_carrying: vec![],
+            relay_carrying: vec![],
             transit_awaiting_approval: false,
             exit_capable: false,
             exit_clients: vec![],
@@ -428,11 +440,21 @@ Not published:
         let view = ListView {
             transit_capable: true,
             transit_carrying: vec![wireserve_types::TransitPair { a: "pk-a".into(), c: "pk-c".into() }],
-            peers: vec![peer("a", "10.1.0.1", None, true), peer("c", "10.1.0.3", None, true)],
+            relay_carrying: vec![wireserve_types::TransitPair { a: "pk-c".into(), c: "pk-x".into() }],
+            peers: vec![peer("a", "10.1.0.1", None, true), peer("c", "10.1.0.3", None, true), peer("x", "10.1.0.4", None, true)],
             ..Default::default()
         };
         let out = render(&view, now());
-        assert!(out.contains("Transit: on, carrying: a <-> c"), "{out}");
+        assert!(out.contains("relaying (end to end, unreadable here): c <-> x"), "{out}");
+        assert!(out.contains("forwarding (readable here): a <-> c"), "{out}");
+    }
+
+    #[test]
+    fn a_relayed_peer_says_so_and_names_its_carrier() {
+        let mut c = peer("c", "10.1.0.3", None, true);
+        c.relay.via = Some("pk-b".into());
+        let view = ListView { peers: vec![peer("b", "10.1.0.2", None, true), c.clone()], ..Default::default() };
+        assert_eq!(route(&c, &view), "relayed by b");
     }
 
     #[test]

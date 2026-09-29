@@ -34,6 +34,7 @@ fn test_config(db_path: &str) -> Config {
         dns: None,
         acme: wireserve_coordinator::config::acme_from_lookup(|_| None).unwrap(),
         online_threshold_secs: 180,
+        relay_port_base: wireserve_types::DEFAULT_RELAY_PORT_BASE,
         rate_limit_max: 1000,
         rate_limit_window_secs: 60,
         trust_proxy_headers: false,
@@ -2845,6 +2846,26 @@ async fn poll_full(router: &Router, bearer: &str, body: Value) -> (StatusCode, V
     (status, body_json(resp).await)
 }
 
+/// A poll from a node that can be relayed end to end (PLAN.md M39): a
+/// carry port, and the capability. Without them nothing is relayed to or
+/// through it — there is no fallback to forwarding in the clear.
+fn relay_poll(mut body: Value) -> Value {
+    body["capabilities"] = json!(["relay"]);
+    body["carry_port"] = json!(50000);
+    body
+}
+
+/// The carrier the polling node reaches `peer_name` through.
+fn carrier_for(body: &Value, peer_name: &str) -> Option<String> {
+    body["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == peer_name)
+        .and_then(|p| p["relay"]["via"].as_str())
+        .map(str::to_string)
+}
+
 fn transit_via_for(body: &Value, peer_name: &str) -> Option<String> {
     body["peers"]
         .as_array()
@@ -2871,9 +2892,11 @@ async fn transit_via_is_filled_once_a_capable_node_reports_reaching_both_wanted_
     );
     let (pk_a, pk_c, pk_b) = (pubkey_for("pk-a"), pubkey_for("pk-c"), pubkey_for("pk-b"));
     assert_eq!(admin_post(&app.router, "/admin/nodes/b/transit/approve").await, StatusCode::OK);
+    // C has polled once, so the coordinator knows it can be relayed to.
+    poll_full(&app.router, c_bearer, relay_poll(json!({ "services": [] }))).await;
 
     // A gives up reaching C directly.
-    let (status, _) = poll_full(&app.router, a_bearer, json!({ "services": [], "transit_wanted": [pk_c] })).await;
+    let (status, _) = poll_full(&app.router, a_bearer, relay_poll(json!({ "services": [], "transit_wanted": [pk_c] }))).await;
     assert_eq!(status, StatusCode::OK);
 
     // B, approved by the admin, opts in and reports it currently,
@@ -2881,7 +2904,7 @@ async fn transit_via_is_filled_once_a_capable_node_reports_reaching_both_wanted_
     let (status, b_body) = poll_full(
         &app.router,
         b_bearer,
-        json!({ "services": [], "transit_capable": true, "transit_reachable": [pk_a, pk_c] }),
+        relay_poll(json!({ "services": [], "transit_capable": true, "transit_reachable": [pk_a, pk_c] })),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -2889,9 +2912,9 @@ async fn transit_via_is_filled_once_a_capable_node_reports_reaching_both_wanted_
     // (a, c) purely from `transit_carrying` — never from a bare
     // `transit_via` on its own peer entries, which stay `None` since B
     // reaches both directly.
-    assert!(transit_via_for(&b_body, "a").is_none());
-    assert!(transit_via_for(&b_body, "c").is_none());
-    let carrying = b_body["transit_carrying"].as_array().unwrap();
+    assert!(carrier_for(&b_body, "a").is_none());
+    assert!(carrier_for(&b_body, "c").is_none());
+    let carrying = b_body["relay_carrying"].as_array().unwrap();
     assert_eq!(carrying.len(), 1);
     let pair: std::collections::HashSet<&str> =
         [carrying[0]["a"].as_str().unwrap(), carrying[0]["c"].as_str().unwrap()].into_iter().collect();
@@ -2900,18 +2923,18 @@ async fn transit_via_is_filled_once_a_capable_node_reports_reaching_both_wanted_
     // C's very next poll gets `transit_via = b` for peer a — without C
     // itself ever having reported wanting anything: A's own earlier
     // report was enough, via `either_wants`.
-    let (status, c_body) = poll_full(&app.router, c_bearer, json!({ "services": [] })).await;
+    let (status, c_body) = poll_full(&app.router, c_bearer, relay_poll(json!({ "services": [] }))).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(transit_via_for(&c_body, "a").as_deref(), Some(pk_b.as_str()));
+    assert_eq!(carrier_for(&c_body, "a").as_deref(), Some(pk_b.as_str()));
 
     // A's next poll gets the same answer for peer c — A must keep
     // resending `transit_wanted` every cycle (same "resend every poll"
     // contract as every other self-reported field, e.g. reflexive_addr)
     // for its own report not to go stale and get wiped by an empty one.
     let (status, a_body) =
-        poll_full(&app.router, a_bearer, json!({ "services": [], "transit_wanted": [pk_c] })).await;
+        poll_full(&app.router, a_bearer, relay_poll(json!({ "services": [], "transit_wanted": [pk_c] }))).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(transit_via_for(&a_body, "c").as_deref(), Some(pk_b.as_str()));
+    assert_eq!(carrier_for(&a_body, "c").as_deref(), Some(pk_b.as_str()));
 }
 
 async fn admin_peers(router: &Router) -> Value {
@@ -2931,18 +2954,19 @@ async fn transit_scenario(app: &TestApp) -> (String, String, String) {
     let a = bearer(register_node(&app.router, &ta, "pk-a", 51820).await);
     let c = bearer(register_node(&app.router, &tc, "pk-c", 51821).await);
     let b = bearer(register_node(&app.router, &tb, "pk-b", 51822).await);
+    poll_full(&app.router, &c, relay_poll(json!({ "services": [] }))).await;
     let (status, _) =
-        poll_full(&app.router, &a, json!({ "services": [], "transit_wanted": [pubkey_for("pk-c")] })).await;
+        poll_full(&app.router, &a, relay_poll(json!({ "services": [], "transit_wanted": [pubkey_for("pk-c")] }))).await;
     assert_eq!(status, StatusCode::OK);
     (a, b, c)
 }
 
 fn b_offers_transit() -> Value {
-    json!({
+    relay_poll(json!({
         "services": [],
         "transit_capable": true,
         "transit_reachable": [pubkey_for("pk-a"), pubkey_for("pk-c")],
-    })
+    }))
 }
 
 // Security review finding #1: a node's own offer to carry transit, and its
@@ -2955,11 +2979,11 @@ async fn an_unapproved_node_is_never_chosen_as_a_carrier_however_it_reports() {
 
     let (status, b_body) = poll_full(&app.router, &b, b_offers_transit()).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(b_body.get("transit_carrying").is_none(), "{b_body}");
+    assert!(b_body.get("relay_carrying").is_none(), "{b_body}");
     assert_eq!(b_body["transit_awaiting_approval"], json!(true), "the node is told why");
 
-    let (_, c_body) = poll_full(&app.router, &c, json!({ "services": [] })).await;
-    assert!(transit_via_for(&c_body, "a").is_none(), "nobody is routed through an unapproved node");
+    let (_, c_body) = poll_full(&app.router, &c, relay_poll(json!({ "services": [] }))).await;
+    assert!(carrier_for(&c_body, "a").is_none(), "nobody is routed through an unapproved node");
 }
 
 #[tokio::test]
@@ -2971,20 +2995,20 @@ async fn approving_a_node_lets_it_carry_and_denying_it_stops_selection_at_once()
     assert_eq!(admin_post(&app.router, "/admin/nodes/b/transit/approve").await, StatusCode::OK);
     let (_, b_body) = poll_full(&app.router, &b, b_offers_transit()).await;
     assert!(b_body.get("transit_awaiting_approval").is_none(), "{b_body}");
-    assert_eq!(b_body["transit_carrying"].as_array().unwrap().len(), 1);
-    let (_, c_body) = poll_full(&app.router, &c, json!({ "services": [] })).await;
-    assert_eq!(transit_via_for(&c_body, "a").as_deref(), Some(pk_b.as_str()));
+    assert_eq!(b_body["relay_carrying"].as_array().unwrap().len(), 1);
+    let (_, c_body) = poll_full(&app.router, &c, relay_poll(json!({ "services": [] }))).await;
+    assert_eq!(carrier_for(&c_body, "a").as_deref(), Some(pk_b.as_str()));
     assert_eq!(admin_peers(&app.router).await["transit_approved"], json!(["b"]));
 
     // Withdrawn: C's very next poll routes directly again, without B
     // having polled in between to refresh its own report.
     assert_eq!(admin_post(&app.router, "/admin/nodes/b/transit/deny").await, StatusCode::OK);
-    let (_, c_body) = poll_full(&app.router, &c, json!({ "services": [] })).await;
-    assert!(transit_via_for(&c_body, "a").is_none());
+    let (_, c_body) = poll_full(&app.router, &c, relay_poll(json!({ "services": [] }))).await;
+    assert!(carrier_for(&c_body, "a").is_none());
     assert!(admin_peers(&app.router).await.get("transit_approved").is_none());
 
     let (_, b_body) = poll_full(&app.router, &b, b_offers_transit()).await;
-    assert!(b_body.get("transit_carrying").is_none());
+    assert!(b_body.get("relay_carrying").is_none());
     assert_eq!(b_body["transit_awaiting_approval"], json!(true));
 }
 
@@ -3015,8 +3039,8 @@ async fn rejoin_withdraws_transit_approval_and_the_old_carrier_report() {
 
     let req = json_request("POST", "/admin/nodes/b/rejoin", Some(ADMIN), json!({}));
     let body = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
-    let (_, c_body) = poll_full(&app.router, &c, json!({ "services": [] })).await;
-    assert!(transit_via_for(&c_body, "a").is_none(), "the replaced key must stop carrying at once");
+    let (_, c_body) = poll_full(&app.router, &c, relay_poll(json!({ "services": [] }))).await;
+    assert!(carrier_for(&c_body, "a").is_none(), "the replaced key must stop carrying at once");
 
     let new_b = register_node(&app.router, body["join_token"].as_str().unwrap(), "pk-b-new", 51822).await;
     let (_, b_body) = poll_full(&app.router, new_b["bearer_token"].as_str().unwrap(), b_offers_transit()).await;
@@ -3040,7 +3064,7 @@ async fn rejoin_removes_the_old_key_from_every_other_nodes_directory_at_once() {
     let req = json_request("POST", "/admin/nodes/n1/rejoin", Some(ADMIN), json!({}));
     let body = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
 
-    let (_, n2_body) = poll_full(&app.router, n2_bearer, json!({ "services": [] })).await;
+    let (_, n2_body) = poll_full(&app.router, n2_bearer, relay_poll(json!({ "services": [] }))).await;
     let pubkeys: Vec<&str> =
         n2_body["peers"].as_array().unwrap().iter().map(|p| p["pubkey"].as_str().unwrap()).collect();
     assert!(!pubkeys.contains(&old_key.as_str()), "old key still handed out: {pubkeys:?}");
@@ -3050,7 +3074,7 @@ async fn rejoin_removes_the_old_key_from_every_other_nodes_directory_at_once() {
     );
 
     register_node(&app.router, body["join_token"].as_str().unwrap(), "n1-new", 51820).await;
-    let (_, n2_body) = poll_full(&app.router, n2_bearer, json!({ "services": [] })).await;
+    let (_, n2_body) = poll_full(&app.router, n2_bearer, relay_poll(json!({ "services": [] }))).await;
     let n1 = n2_body["peers"].as_array().unwrap().iter().find(|p| p["name"] == "n1").expect("back under its new key");
     assert_eq!(n1["pubkey"].as_str().unwrap(), pubkey_for("n1-new"));
 }
@@ -3069,7 +3093,7 @@ async fn register_and_poll_report_the_mesh_ranges() {
     });
     assert_eq!(r["mesh"], expected);
 
-    let (_, body) = poll_full(&app.router, r["bearer_token"].as_str().unwrap(), json!({ "services": [] })).await;
+    let (_, body) = poll_full(&app.router, r["bearer_token"].as_str().unwrap(), relay_poll(json!({ "services": [] }))).await;
     assert_eq!(body["mesh"], expected);
 }
 
@@ -3082,12 +3106,12 @@ async fn malformed_transit_pubkeys_are_dropped_not_rejected() {
     let (status, _) = poll_full(
         &app.router,
         bearer,
-        json!({
+        relay_poll(json!({
             "services": [],
             "transit_capable": true,
             "transit_reachable": ["not a real pubkey"],
             "transit_wanted": ["also not one"],
-        }),
+        })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "hints, not identity/addressing facts — never a 400 for the whole poll");
@@ -3104,20 +3128,93 @@ async fn revoke_removes_a_node_from_transit_consideration() {
     let b = register_node(&app.router, &tb, "pk-b", 51822).await;
     let (a_bearer, b_bearer) = (a["bearer_token"].as_str().unwrap(), b["bearer_token"].as_str().unwrap());
     let (pk_a, pk_c) = (pubkey_for("pk-a"), pubkey_for("pk-c"));
-    let _ = c["bearer_token"].as_str().unwrap();
+    poll_full(&app.router, c["bearer_token"].as_str().unwrap(), relay_poll(json!({ "services": [] }))).await;
+    assert_eq!(admin_post(&app.router, "/admin/nodes/b/transit/approve").await, StatusCode::OK);
 
-    poll_full(&app.router, a_bearer, json!({ "services": [], "transit_wanted": [pk_c] })).await;
-    poll_full(&app.router, b_bearer, json!({ "services": [], "transit_capable": true, "transit_reachable": [pk_a, pk_c] })).await;
+    poll_full(&app.router, a_bearer, relay_poll(json!({ "services": [], "transit_wanted": [pk_c] }))).await;
+    poll_full(&app.router, b_bearer, relay_poll(json!({ "services": [], "transit_capable": true, "transit_reachable": [pk_a, pk_c] }))).await;
+
+    let (_, a_body) = poll_full(&app.router, a_bearer, relay_poll(json!({ "services": [], "transit_wanted": [pk_c] }))).await;
+    assert!(carrier_for(&a_body, "c").is_some(), "relayed before the revoke: {a_body}");
 
     let revoke = json_request("POST", "/admin/nodes/b/revoke", Some(ADMIN), json!({}));
     let resp = app.router.clone().oneshot(revoke).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let (_, a_body) = poll_full(&app.router, a_bearer, json!({ "services": [], "transit_wanted": [pk_c] })).await;
+    let (_, a_body) = poll_full(&app.router, a_bearer, relay_poll(json!({ "services": [], "transit_wanted": [pk_c] }))).await;
     assert!(
-        transit_via_for(&a_body, "c").is_none(),
+        carrier_for(&a_body, "c").is_none(),
         "a revoked node's stale report must not linger as a transit candidate: {a_body}"
     );
+}
+
+// ---- End-to-end relaying (PLAN.md M39) ----
+
+fn relay_of(body: &Value, peer_name: &str) -> Value {
+    body["peers"].as_array().unwrap().iter().find(|p| p["name"] == peer_name).unwrap()["relay"].clone()
+}
+
+#[tokio::test]
+async fn nothing_is_relayed_to_a_node_that_cannot_be_and_nothing_falls_back_to_forwarding_in_the_clear() {
+    let app = test_app();
+    let (a, b, c) = transit_scenario(&app).await;
+    assert_eq!(admin_post(&app.router, "/admin/nodes/b/transit/approve").await, StatusCode::OK);
+    // C polls without the capability: an older agent, or no carry interface.
+    poll_full(&app.router, &c, json!({ "services": [] })).await;
+    let (_, b_body) = poll_full(&app.router, &b, b_offers_transit()).await;
+    assert!(b_body.get("relay_carrying").is_none() && b_body.get("transit_carrying").is_none(), "{b_body}");
+    let (_, a_body) = poll_full(&app.router, &a, relay_poll(json!({ "services": [], "transit_wanted": [pubkey_for("pk-c")] }))).await;
+    assert!(carrier_for(&a_body, "c").is_none(), "{a_body}");
+    assert!(transit_via_for(&a_body, "c").is_none(), "no hop-by-hop transit either: {a_body}");
+}
+
+#[tokio::test]
+async fn only_a_carrier_that_can_relay_end_to_end_is_chosen() {
+    let app = test_app();
+    let (a, b, c) = transit_scenario(&app).await;
+    let t0 = admin_create_node(&app.router, "aaa").await;
+    let old = register_node(&app.router, &t0, "pk-0", 51823).await;
+    let old = old["bearer_token"].as_str().unwrap();
+    for name in ["b", "aaa"] {
+        assert_eq!(admin_post(&app.router, &format!("/admin/nodes/{name}/transit/approve")).await, StatusCode::OK);
+    }
+    // An older carrier that reaches both but can't relay, and B, which can.
+    let mut offer = b_offers_transit();
+    offer.as_object_mut().unwrap().remove("capabilities");
+    offer.as_object_mut().unwrap().remove("carry_port");
+    poll_full(&app.router, old, offer).await;
+    poll_full(&app.router, &b, b_offers_transit()).await;
+    let (_, c_body) = poll_full(&app.router, &c, relay_poll(json!({ "services": [] }))).await;
+    assert_eq!(carrier_for(&c_body, "a").as_deref(), Some(pubkey_for("pk-b").as_str()));
+    let (_, a_body) = poll_full(&app.router, &a, relay_poll(json!({ "services": [], "transit_wanted": [pubkey_for("pk-c")] }))).await;
+    assert_eq!(carrier_for(&a_body, "c").as_deref(), Some(pubkey_for("pk-b").as_str()));
+}
+
+#[tokio::test]
+async fn every_node_has_its_own_stable_relay_port_and_its_reported_carry_port() {
+    let app = test_app();
+    let base = wireserve_types::DEFAULT_RELAY_PORT_BASE;
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let t2 = admin_create_node(&app.router, "n2").await;
+    let t3 = admin_create_node(&app.router, "n3").await;
+    let n1 = register_node(&app.router, &t1, "pk1", 51820).await;
+    register_node(&app.router, &t2, "pk2", 51821).await;
+    register_node(&app.router, &t3, "pk3", 51822).await;
+    let n1 = n1["bearer_token"].as_str().unwrap();
+    let (_, body) = poll_full(&app.router, n1, relay_poll(json!({ "services": [] }))).await;
+    assert_eq!(relay_of(&body, "n1"), json!({"port": base, "carry_port": 50000}));
+    assert_eq!(relay_of(&body, "n2"), json!({"port": base + 1}), "no carry port before it polls");
+    assert_eq!(relay_of(&body, "n3"), json!({"port": base + 2}));
+
+    // A deleted node's slot is the next one handed out; the rest keep theirs.
+    assert_eq!(admin_post(&app.router, "/admin/nodes/n2/revoke").await, StatusCode::OK);
+    let req = json_request("DELETE", "/admin/nodes/n2", Some(ADMIN), json!({}));
+    assert!(app.router.clone().oneshot(req).await.unwrap().status().is_success());
+    let t4 = admin_create_node(&app.router, "n4").await;
+    register_node(&app.router, &t4, "pk4", 51823).await;
+    let (_, body) = poll_full(&app.router, n1, relay_poll(json!({ "services": [] }))).await;
+    assert_eq!(relay_of(&body, "n4")["port"], json!(base + 1));
+    assert_eq!(relay_of(&body, "n3")["port"], json!(base + 2));
 }
 
 // ---- PLAN.md M24: gateway routing for static peers ----

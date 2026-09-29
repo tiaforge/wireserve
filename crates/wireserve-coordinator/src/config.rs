@@ -32,6 +32,9 @@ pub struct Config {
     /// writing the challenge records, no certificate can be issued.
     pub acme: wireserve_types::AcmeSettings,
     pub online_threshold_secs: i64,
+    /// The first relay port (PLAN.md M39, `WIRESERVE_RELAY_PORT_BASE`): a
+    /// node's relay port is this plus its slot.
+    pub relay_port_base: u16,
     pub rate_limit_max: u32,
     pub rate_limit_window_secs: u64,
     /// Security review finding S4: trust the right-most `X-Forwarded-For`
@@ -169,6 +172,7 @@ impl Config {
         let bootstrapped_token_key = bootstrapped.oidc_token_key;
 
         let online_threshold_secs = env_parse_or("WIRESERVE_ONLINE_THRESHOLD_SECS", 180)?;
+        let relay_port_base = relay_port_base_from(env_parse_or("WIRESERVE_RELAY_PORT_BASE", wireserve_types::DEFAULT_RELAY_PORT_BASE)?)?;
         let rate_limit_max = env_parse_or("WIRESERVE_RATE_LIMIT_MAX", 10)?;
         let rate_limit_window_secs = env_parse_or("WIRESERVE_RATE_LIMIT_WINDOW_SECS", 60)?;
         let trust_proxy_headers = env_parse_or("WIRESERVE_TRUST_PROXY_HEADERS", false)?;
@@ -234,6 +238,7 @@ impl Config {
                 dns,
                 acme,
                 online_threshold_secs,
+                relay_port_base,
                 rate_limit_max,
                 rate_limit_window_secs,
                 trust_proxy_headers,
@@ -264,6 +269,23 @@ impl Config {
             net_v6_prefix: self.net_v6_prefix.clone(),
         }
     }
+}
+
+/// `WIRESERVE_RELAY_PORT_BASE`: room above it for every relay port and,
+/// after them, the range a carrier's relayed phone sessions leave from
+/// (PLAN.md M40), and not a privileged port.
+fn relay_port_base_from(base: u16) -> Result<u16, ConfigError> {
+    let top = u32::from(base) + 2 * u32::from(wireserve_types::RELAY_SLOTS);
+    if base < 1024 || top > 65536 {
+        return Err(ConfigError::Invalid(
+            "WIRESERVE_RELAY_PORT_BASE",
+            format!(
+                "{base} leaves no room: relay ports run from it to {} above it, and must stay between 1024 and 65535",
+                2 * wireserve_types::RELAY_SLOTS - 1
+            ),
+        ));
+    }
+    Ok(base)
 }
 
 /// `WIRESERVE_STRIP_HEADERS`: header names, comma-separated, lowercased.
@@ -750,6 +772,7 @@ mod tests {
             public_url: None,
             oidc: None,
             online_threshold_secs: 180,
+            relay_port_base: wireserve_types::DEFAULT_RELAY_PORT_BASE,
             rate_limit_max: 10,
             rate_limit_window_secs: 60,
             trust_proxy_headers: false,

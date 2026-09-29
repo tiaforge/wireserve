@@ -116,6 +116,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0016_acme_challenges.sql")),
         M::up(include_str!("../../migrations/0017_grants.sql")),
         M::up(include_str!("../../migrations/0018_owners.sql")),
+        M::up(include_str!("../../migrations/0019_relay_slots.sql")),
     ])
 }
 

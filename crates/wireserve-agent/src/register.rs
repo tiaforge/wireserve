@@ -176,6 +176,7 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
         ip4: Some(reg.ip4),
         ip6: Some(reg.ip6),
         listen_port: Some(params.listen_port),
+        carry_port: None,
         endpoint_addr: params.endpoint_addr,
         declared_services: Vec::new(),
         last_directory: None,

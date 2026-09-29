@@ -23,6 +23,13 @@ pub struct AgentState {
     pub ip4: Option<String>,
     pub ip6: Option<String>,
     pub listen_port: Option<u16>,
+    /// The carry interface's listen port (PLAN.md M39), chosen by the kernel
+    /// the first time and kept from then on. A carrier's tracked flow for a
+    /// relayed session names it, and keepalives keep that flow alive, so a
+    /// port that moved on a restart would leave the flow pointing at the
+    /// old one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carry_port: Option<u16>,
     /// Sent as `endpoint_addr` on every `/poll` (spec §4.3 models this as
     /// resendable each cycle, "may change (dynamic DNS etc.)") — persisted
     /// here rather than hardcoded, so it survives daemon restarts and can

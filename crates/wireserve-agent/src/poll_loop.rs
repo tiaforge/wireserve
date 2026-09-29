@@ -104,6 +104,9 @@ pub struct TransitSelfReport {
     pub exit_capable: bool,
     pub reachable: Vec<String>,
     pub wanted: Vec<String>,
+    /// The carry interface's listen port (PLAN.md M39), when there is one:
+    /// what makes this node able to be relayed to, and to relay.
+    pub carry_port: Option<u16>,
 }
 
 /// Builds the request body from currently-declared services — this is the
@@ -133,12 +136,16 @@ pub fn build_poll_request(
         transit_wanted: transit.wanted,
         services: declared.to_vec(),
         capabilities: {
+            let mut caps = Vec::new();
             if tls.capable {
-                vec![wireserve_types::CAP_TLS_TERMINATE.to_string(), wireserve_types::CAP_SIGN_IN.to_string()]
-            } else {
-                Vec::new()
+                caps.extend([wireserve_types::CAP_TLS_TERMINATE.to_string(), wireserve_types::CAP_SIGN_IN.to_string()]);
             }
+            if transit.carry_port.is_some() {
+                caps.push(wireserve_types::CAP_RELAY.to_string());
+            }
+            caps
         },
+        carry_port: transit.carry_port,
         tls_ready: {
             let mut ready = tls.ready;
             ready.truncate(wireserve_types::MAX_TLS_READY_PER_POLL);
@@ -661,6 +668,7 @@ where
             exit_capable,
             reachable: transit_reachable,
             wanted: transit_wanted,
+            carry_port: ctx.wg.carry_port(),
         },
         tls_report,
     );
@@ -796,7 +804,11 @@ where
         .filter(|p| p.pubkey != self_pubkey)
         .filter_map(|p| p.transit_via.as_deref().map(|via| (p.pubkey.as_str(), via)))
         .collect();
-    ctx.endpoint_tracker.note_transit(&transit);
+    // End-to-end relays (PLAN.md M39): which peers this node reaches through
+    // a carrier that only forwards their session's ciphertext. Like a
+    // transited peer, a relayed one keeps probing its direct candidates.
+    let relay = crate::wg::relay_assignments(&directory.peers, &self_pubkey);
+    ctx.endpoint_tracker.note_transit(transit.keys().chain(relay.keys()).copied());
     // This node's own carrier role this cycle (PLAN.md M23) — built from
     // `transit_carrying`, never from `transit` above: `transit` is about
     // how *this* node reaches *its own* peers, which is never itself a
@@ -805,6 +817,14 @@ where
     // fire on this node's own response).
     let transit_forwards =
         crate::wg::transit_forwards(&directory.peers, &directory.services, &directory.transit_carrying);
+    // The pairs this node relays for (PLAN.md M39) — only ever while it
+    // opted in to carrying, the same consent as transit.
+    let relay_forwards = if transit_capable {
+        crate::wg::relay_forwards(&directory.peers, &self_pubkey, &directory.relay_carrying)
+    } else {
+        Vec::new()
+    };
+    let carry_port = ctx.wg.carry_port();
     // The devices this node is the exit for (PLAN.md M27). Only while this
     // node itself opted in — the coordinator's list is the device side of
     // the consent, never the whole of it — and only with a pinned mesh
@@ -857,6 +877,7 @@ where
             prefer_ipv6,
             &endpoint_tiers,
             &transit,
+            &relay,
         ) {
             failures.push(PollError::Wg(e));
         }
@@ -887,6 +908,9 @@ where
         let plan = crate::firewall::ip_forward::begin_egress(&egress, &owned_egress);
         let forwarding = wireserve_types::Forwarding {
             transit: transit_forwards.clone(),
+            relay: relay_forwards.clone(),
+            relay_self: node_ip,
+            relay_ends: carry_port.into_iter().collect(),
             guarded: plan.guard.iter().cloned().collect(),
             exit: exit.clone(),
             mesh_v4: mesh_ranges.as_ref().map(wireserve_types::MeshRanges::v4),
@@ -922,7 +946,7 @@ where
         let forwards_services = rules.iter().any(|r| r.remote_target().is_some());
         crate::firewall::ip_forward::set_enabled(
             &ifname,
-            !transit_forwards.is_empty() || forwards_services || !exit.is_empty(),
+            !transit_forwards.is_empty() || !relay_forwards.is_empty() || forwards_services || !exit.is_empty(),
         );
 
         // 4. rewrite the hosts-file managed block from the full directory.
@@ -1025,6 +1049,7 @@ mod tests {
                 exit_capable: true,
                 reachable: vec!["reachable-pk".into()],
                 wanted: vec!["wanted-pk".into()],
+                carry_port: None,
             },
             TlsSelfReport::default(),
         );
@@ -1212,7 +1237,7 @@ mod tests {
             &crate::probe::DualProbeResult::default(),
             None,
             None,
-            TransitSelfReport { capable: false, exit_capable: false, reachable: vec![], wanted: vec![] },
+            TransitSelfReport { capable: false, exit_capable: false, reachable: vec![], wanted: vec![], carry_port: None },
             TlsSelfReport::default(),
         );
         assert!(req.capabilities.is_empty(), "no terminator, nothing to claim");
@@ -1224,7 +1249,7 @@ mod tests {
             &crate::probe::DualProbeResult::default(),
             None,
             None,
-            TransitSelfReport { capable: false, exit_capable: false, reachable: vec![], wanted: vec![] },
+            TransitSelfReport { capable: false, exit_capable: false, reachable: vec![], wanted: vec![], carry_port: None },
             TlsSelfReport { capable: true, ready: vec!["plex".into()], callers_seen: vec![] },
         );
         assert!(req.capabilities.contains(&wireserve_types::CAP_TLS_TERMINATE.to_string()));
@@ -1368,6 +1393,7 @@ mod tests {
                 })
                 .collect(),
             transit_carrying: vec![],
+            relay_carrying: vec![],
             transit_awaiting_approval: false,
             exit_clients: vec![],
             mesh: None,

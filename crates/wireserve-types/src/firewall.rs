@@ -57,6 +57,29 @@ pub struct TransitForward {
     pub far: TransitEndpoint,
 }
 
+/// One side of a relayed pair (PLAN.md M39), as its carrier sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayEnd {
+    /// Its mesh address.
+    pub ip4: Ipv4Addr,
+    /// Its relay port: what the carrier receives its packets on, and what
+    /// the carrier sends from towards the other side.
+    pub relay_port: u16,
+    /// The listen port of its carry interface, where the session ends.
+    pub carry_port: u16,
+}
+
+/// A pair whose end-to-end session this node relays (PLAN.md M39): UDP
+/// arriving on this node's mesh address at one side's relay port goes on
+/// to that side's carry interface, appearing to come from the other
+/// side's relay port. Nothing is decrypted: this node never holds the
+/// session's keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayForward {
+    pub a: RelayEnd,
+    pub c: RelayEnd,
+}
+
 impl ServiceRule {
     /// The mesh addresses this rule admits; see [`Sources`].
     #[must_use]
@@ -86,6 +109,16 @@ pub struct Forwarding {
     /// Active transit pairs (PLAN.md M23) — empty whenever this node
     /// currently carries none, whether or not it has opted in.
     pub transit: Vec<TransitForward>,
+    /// Pairs this node relays end to end (PLAN.md M39). Needs `relay_self`.
+    pub relay: Vec<RelayForward>,
+    /// This node's own mesh address, which relayed packets arrive at and
+    /// leave from. Without it no relay rule is written.
+    pub relay_self: Option<Ipv4Addr>,
+    /// UDP ports of this node's own WireGuard interfaces that relayed
+    /// sessions arrive at through the mesh interface (PLAN.md M39): the
+    /// carry interface's listen port. WireGuard authenticates every packet
+    /// on them, so letting the mesh send there opens nothing else.
+    pub relay_ends: Vec<u16>,
     /// Interfaces whose IPv4 forwarding this agent turned on so replies
     /// from a service's target address can reach the mesh (PLAN.md M26).
     /// Nothing else may be forwarded from them: before the agent turned

@@ -1005,7 +1005,7 @@ pub async fn list_peers(
     let rows = nodes::list_all_peers(&conn)?;
     let peers = rows
         .iter()
-        .map(|n| crate::directory::peer_info(n, state.config.online_threshold_secs))
+        .map(|n| crate::directory::peer_info(n, state.config.online_threshold_secs, state.config.relay_port_base))
         .collect();
     let transit_approved = rows
         .iter()

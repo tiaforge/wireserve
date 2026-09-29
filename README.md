@@ -1053,10 +1053,19 @@ nothing port-forwarded to either — can end up with no direct path at all:
 a symmetric NAT maps a different external port per destination, so
 whatever WireServe's own NAT-traversal already learned for one peer is
 useless for reaching a different one. When that happens, a third node
-that already reaches both can carry the connection: WireGuard itself
-decrypts and re-encrypts at the kernel layer and forwards it on, the same
-way any router forwards a packet — no separate relay server, no new
-protocol, and the coordinator never sees the traffic.
+that already reaches both **relays** their connection: the two run their
+own WireGuard session with each other, end to end, and the carrier only
+forwards its encrypted UDP. It never holds the session's keys, so it can
+neither read what passes through nor send anything as either end. No
+separate relay server, no new protocol, and the coordinator never sees
+the traffic.
+
+This runs on a second WireGuard interface on every node, the **carry
+interface** (`wireserve0-t` next to `wireserve0`), with the same key, no
+address of its own and a port the kernel picks once and the node keeps.
+Nothing needs opening for it: relayed sessions arrive through the mesh,
+and WireServe's own firewall and its handling of ufw and firewalld cover
+it the way they cover the mesh interface.
 
 **A node carries traffic only with two approvals, and has neither by
 default.** Its own operator opts in, so a node with a data cap, say, is
@@ -1070,34 +1079,40 @@ wireserve-admin approve-transit homeserver   # on the admin side: trusted to
 wireserve-admin deny-transit homeserver      # withdraw it again
 ```
 
-The admin half is there because of what a carrier can do. Unlike an
-ordinary connection, which is end-to-end between the two nodes involved,
-a carrier sees the mesh-layer plaintext of whatever pairs route through
-it, and can send packets that appear to come from either end. What a node
+A carrier cannot read or forge a relayed session, but it still sees who
+talks to whom, when and how much, and it can drop the traffic. What a node
 says about itself (that it is willing, which peers it reaches) cannot be
 verified, so without approval a single compromised node could offer to
-carry every pair in the mesh. Until it is approved, `wireserve
-list` on that node says `Transit: on, waiting for an admin to approve
-this node as a carrier`. Revoking or rejoining a node withdraws its
-approval, and `list-peers` shows who currently has one
+carry every pair in the mesh and learn all of that. Until it is approved,
+`wireserve list` on that node says `Transit: on, waiting for an admin to
+approve this node as a carrier`. Revoking or rejoining a node withdraws
+its approval, and `list-peers` shows who currently has one
 (`transit=approved`).
 
 `wireserve list` shows the outcome, both for a peer this node can't
-reach directly and for what this node is carrying on others' behalf:
+reach directly and for what this node is relaying on others' behalf:
 
 ```
 PEER    ADDRESS   ENDPOINT  HANDSHAKE  ROUTE
-laptop  10.1.0.5  -         never      via homeserver
+laptop  10.1.0.5  -         never      relayed by homeserver
 
-Transit: on, carrying: laptop <-> phone
+Transit: on
+  relaying (end to end, unreadable here): laptop <-> desktop
 ```
 
-`direct` is the ordinary case; `via <name>` means this node is one end of
-a pair being routed through a carrier. Only a single hop is ever used —
-the carrier must already, currently reach both ends itself — and nothing
-here is a substitute for a real port-forward or a working reflexive
-address when one is available; it only ever engages once every other path
-has failed.
+`direct` is the ordinary case; `relayed by <name>` means this node is one
+end of a pair relayed by a carrier. Only a single hop is ever used — the
+carrier must already, currently reach both ends itself — and the two ends
+keep trying their direct candidates the whole time, moving off the relay
+as soon as one answers. Relaying needs all three nodes on this version;
+with an older one among them the pair simply stays unreachable, never
+falling back to forwarding in the clear.
+
+Each node has a **relay port**, `41000` plus a number the coordinator
+assigns it for life (`WIRESERVE_RELAY_PORT_BASE` moves the range). A
+carrier receives a node's relayed packets on that port of its mesh
+address, inside the tunnel, so for relaying between agents nothing is
+ever opened on the internet.
 
 ## Command reference
 
@@ -1111,7 +1126,7 @@ members of the `wireserve` group have (see "Using it without sudo"):
 | `wireserve join [url] [token]` | one-time bootstrap, generates the keypair — prompts for either if omitted |
 | `wireserve serve <name> <[public:][address:]target[/tcp\|/udp]>... [--group <g>]` | publish a service on its own address — on this node, or on an address it reaches; a new one in group `g` |
 | `wireserve unserve <name>` | withdraw one |
-| `wireserve transit on\|off` | opt in/out of carrying traffic for two other nodes that can't reach each other directly (also needs `approve-transit`) |
+| `wireserve transit on\|off` | opt in/out of relaying for two other nodes that can't reach each other directly (also needs `approve-transit`) |
 | `wireserve exit on\|off` | opt in/out of sending the internet traffic of devices exported with `--exit` through this node (also needs `transit on` and approval) |
 | `wireserve list [--json]` | services (name, address, ports, owner, state), peers (with each one's route — direct or via a carrier) and anything not published, from the last poll |
 | `wireserve leave` | tear down interface, firewall, hosts block |
@@ -1297,6 +1312,11 @@ decides what is actually reachable:
   interface, because a trusted zone would otherwise let mesh peers route
   through this host. A zone you bound the interface to yourself is left
   alone (the agent logs that it did).
+
+The carry interface (`wireserve0-t`, see
+[relaying](#6-route-through-another-node-when-nat-blocks-a-direct-path)) gets
+the same openings under its own name, with its own table, and never any for
+forwarded traffic.
 
 All of it is scoped to exactly the mesh interface, and only to traffic
 addressed to this host: nothing is opened on any other interface, and

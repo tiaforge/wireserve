@@ -10,7 +10,7 @@ use defguard_wireguard_rs::key::Key;
 use defguard_wireguard_rs::net::IpAddrMask;
 use defguard_wireguard_rs::peer::Peer;
 use defguard_wireguard_rs::{InterfaceConfiguration, Kernel, WGApi, WireguardInterfaceApi};
-use wireserve_types::{PeerInfo, ServiceInfo, TransitEndpoint, TransitForward, TransitPair};
+use wireserve_types::{PeerInfo, RelayEnd, RelayForward, ServiceInfo, TransitEndpoint, TransitForward, TransitPair};
 
 /// Why `bring_up` can fail before it has touched anything.
 #[derive(Debug, thiserror::Error)]
@@ -671,8 +671,8 @@ impl EndpointTracker {
 
     /// Records which peers this cycle's directory routes via a carrier, for
     /// the next cycle's [`Self::peers_wanting_transit`].
-    pub fn note_transit(&mut self, transit: &TransitAssignments<'_>) {
-        self.transited = transit.keys().map(|k| (*k).to_string()).collect();
+    pub fn note_transit<'a>(&mut self, transited: impl IntoIterator<Item = &'a str>) {
+        self.transited = transited.into_iter().map(str::to_string).collect();
     }
 }
 
@@ -804,6 +804,56 @@ fn wan_port(p: &PeerInfo) -> Option<u16> {
 /// node itself as something to route via itself).
 pub type TransitAssignments<'a> = HashMap<&'a str, &'a str>;
 
+/// Where a relayed peer's session goes (PLAN.md M39): to its carrier's
+/// mesh address, on the peer's own relay port. The carrier sends it on to
+/// the peer's carry interface without being able to read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayRoute {
+    pub carrier: Ipv4Addr,
+    pub port: u16,
+}
+
+/// Relayed peer's pubkey → its [`RelayRoute`], this cycle.
+pub type RelayAssignments<'a> = HashMap<&'a str, RelayRoute>;
+
+/// This node's relay assignments, from each peer's `relay.via` in a
+/// `/poll` response. Only a peer with a relay port whose carrier is
+/// another peer in the same response, with a usable IPv4 address, counts:
+/// anything else is a stale or inconsistent directory, and the peer is
+/// then simply reached directly — never routed somewhere half-known.
+#[must_use]
+pub fn relay_assignments<'a>(peers: &'a [PeerInfo], self_pubkey: &str) -> RelayAssignments<'a> {
+    peers
+        .iter()
+        .filter(|p| p.pubkey != self_pubkey)
+        .filter_map(|p| {
+            let via = p.relay.via.as_deref()?;
+            if via == self_pubkey || via == p.pubkey {
+                return None;
+            }
+            let carrier = peers.iter().find(|c| c.pubkey == via)?.ip4.parse().ok()?;
+            Some((p.pubkey.as_str(), RelayRoute { carrier, port: p.relay.port? }))
+        })
+        .collect()
+}
+
+/// The name of the carry interface that goes with `main` (PLAN.md M39):
+/// `main` plus `-t`, cut short so the whole stays within the kernel's 15
+/// characters.
+#[must_use]
+pub fn carry_ifname(main: &str) -> String {
+    const SUFFIX: &str = "-t";
+    let base: String = main.chars().take(15 - SUFFIX.len()).collect();
+    format!("{base}{SUFFIX}")
+}
+
+/// The carry interface's MTU. Its packets travel inside the mesh
+/// interface's own, so they are an outer header shorter than the mesh
+/// interface's 1420: 20 (IPv4) + 8 (UDP) + 32 (WireGuard) is 60, and 80
+/// leaves room for an IPv6 outer header too. Larger ones would be
+/// fragmented by the carrier's tunnel on every full-size packet.
+pub const CARRY_MTU: u32 = 1340;
+
 /// Builds the desired kernel peer set (keyed by pubkey) from a `/poll`
 /// response's `peers` array, skipping this node's own entry (peers
 /// includes self — PLAN.md decisions log #12) and any entry whose pubkey
@@ -853,6 +903,7 @@ pub type TransitAssignments<'a> = HashMap<&'a str, &'a str>;
 /// excludes both endpoints from candidacy, but a stale/adversarial
 /// coordinator could send it) leaves both peers with only probes,
 /// safely, since pass 1 gives neither any `AllowedIPs`.
+#[allow(clippy::too_many_arguments)]
 pub fn desired_peers(
     peers: &[PeerInfo],
     services: &[ServiceInfo],
@@ -860,6 +911,7 @@ pub fn desired_peers(
     prefer_ipv6: bool,
     endpoint_tiers: &HashMap<String, EndpointTier>,
     transit: &TransitAssignments<'_>,
+    relay: &RelayAssignments<'_>,
     resolve: &dyn Fn(&str) -> Option<std::net::SocketAddr>,
 ) -> HashMap<Key, Peer> {
     let mut desired = HashMap::new();
@@ -872,7 +924,7 @@ pub fn desired_peers(
             continue;
         };
         let mut peer = Peer::new(key.clone());
-        if !transit.contains_key(p.pubkey.as_str()) {
+        if !transit.contains_key(p.pubkey.as_str()) && !relay.contains_key(p.pubkey.as_str()) {
             peer.allowed_ips = peer_allowed_ips(&p.ip4, &p.ip6);
             peer.allowed_ips.extend(
                 owned_vips(services, &p.name).map(|vip| IpAddrMask::host(IpAddr::V4(vip))),
@@ -914,6 +966,37 @@ pub fn desired_peers(
     desired
 }
 
+/// The carry interface's peers (PLAN.md M39): one per relayed peer, with
+/// the addresses its main-interface entry gave up (see `desired_peers`),
+/// dialled at its carrier. Its main entry stays behind as a probe, so a
+/// direct path can still handshake and end the relay.
+pub fn desired_carry_peers(
+    peers: &[PeerInfo],
+    services: &[ServiceInfo],
+    self_pubkey: &str,
+    relay: &RelayAssignments<'_>,
+) -> HashMap<Key, Peer> {
+    let mut desired = HashMap::new();
+    for p in peers {
+        if p.pubkey == self_pubkey {
+            continue;
+        }
+        let Some(route) = relay.get(p.pubkey.as_str()) else {
+            continue;
+        };
+        let Ok(key) = Key::try_from(p.pubkey.as_str()) else {
+            continue;
+        };
+        let mut peer = Peer::new(key.clone());
+        peer.allowed_ips = peer_allowed_ips(&p.ip4, &p.ip6);
+        peer.allowed_ips.extend(owned_vips(services, &p.name).map(|vip| IpAddrMask::host(IpAddr::V4(vip))));
+        peer.endpoint = Some(std::net::SocketAddr::from((route.carrier, route.port)));
+        peer.persistent_keepalive_interval = Some(25);
+        desired.insert(key, peer);
+    }
+    desired
+}
+
 /// The addresses of the services `node` owns.
 fn owned_vips<'a>(services: &'a [ServiceInfo], node: &'a str) -> impl Iterator<Item = Ipv4Addr> + 'a {
     services
@@ -942,6 +1025,26 @@ pub fn transit_forwards(peers: &[PeerInfo], services: &[ServiceInfo], carrying: 
     carrying
         .iter()
         .filter_map(|pair| Some(TransitForward { near: endpoint(&pair.a)?, far: endpoint(&pair.c)? }))
+        .collect()
+}
+
+/// The pairs this node relays this cycle (PLAN.md M39), from
+/// `PollResponse::relay_carrying` and the two peers' own entries. A pair
+/// naming a peer this node doesn't know, or one without an IPv4 address,
+/// relay port or carry port, is dropped: there is nothing safe to guess.
+#[must_use]
+pub fn relay_forwards(peers: &[PeerInfo], self_pubkey: &str, carrying: &[TransitPair]) -> Vec<RelayForward> {
+    let end = |pubkey: &str| -> Option<RelayEnd> {
+        if pubkey == self_pubkey {
+            return None;
+        }
+        let p = peers.iter().find(|p| p.pubkey == pubkey)?;
+        Some(RelayEnd { ip4: p.ip4.parse().ok()?, relay_port: p.relay.port?, carry_port: p.relay.carry_port? })
+    };
+    carrying
+        .iter()
+        .filter(|pair| pair.a != pair.c)
+        .filter_map(|pair| Some(RelayForward { a: end(&pair.a)?, c: end(&pair.c)? }))
         .collect()
 }
 
@@ -1032,6 +1135,21 @@ pub struct WgInterface {
     /// What `routes::sync` last installed, so it only runs on a change.
     routed: BTreeSet<IpAddr>,
     resolver: crate::endpoint_dns::EndpointResolver,
+    /// The carry interface relayed sessions run on (PLAN.md M39), once
+    /// `bring_up_carry` made it.
+    carry: Option<Carry>,
+}
+
+/// The carry interface: the same private key as the mesh interface, no
+/// address of its own (its routes name the node's mesh address as their
+/// source), and a port the kernel picked.
+struct Carry {
+    api: WGApi<Kernel>,
+    ifname: String,
+    port: u16,
+    src: (Ipv4Addr, Ipv6Addr),
+    applied: HashMap<Key, Peer>,
+    routed: BTreeSet<IpAddr>,
 }
 
 impl WgInterface {
@@ -1044,7 +1162,70 @@ impl WgInterface {
             applied: HashMap::new(),
             routed: BTreeSet::new(),
             resolver: crate::endpoint_dns::EndpointResolver::default(),
+            carry: None,
         })
+    }
+
+    /// Creates the carry interface next to this one (PLAN.md M39) and
+    /// returns its listen port. Refused, like `bring_up`, for a name held
+    /// by an interface that isn't this node's own. An existing one of ours
+    /// keeps its port, so a restart doesn't move every relayed session.
+    ///
+    /// `port` is the one it had before, from the node's state: kept, so a
+    /// carrier's tracked flows for this node's relayed sessions stay right
+    /// (see `AgentState::carry_port`). Only when something else holds it
+    /// now does the kernel pick another.
+    pub fn bring_up_carry(
+        &mut self,
+        private_key_b64: &str,
+        ip4: Ipv4Addr,
+        ip6: Ipv6Addr,
+        port: Option<u16>,
+    ) -> Result<u16, BringUpError> {
+        let mut carry = WgInterface::new(carry_ifname(&self.ifname))?;
+        let existing = match carry.classify(private_key_b64) {
+            Slot::Free => None,
+            Slot::Ours => carry.api.read_interface_data().ok().map(|h| h.listen_port).filter(|p| *p != 0),
+            Slot::Foreign(reason) => {
+                return Err(BringUpError::InterfaceConflict { ifname: carry.ifname.clone(), reason });
+            }
+        };
+        carry.api.create_interface()?;
+        let configure = |port: u16| {
+            carry.api.configure_interface(&InterfaceConfiguration {
+                name: carry.ifname.clone(),
+                prvkey: private_key_b64.to_string(),
+                addresses: Vec::new(),
+                port,
+                peers: Vec::new(),
+                mtu: Some(CARRY_MTU),
+                fwmark: None,
+            })
+        };
+        let wanted = existing.or(port).unwrap_or(0);
+        if let Err(e) = configure(wanted) {
+            if wanted == 0 {
+                return Err(e.into());
+            }
+            tracing::warn!(port = wanted, error = %e, "the carry interface's port is taken; the kernel picks another");
+            configure(0)?;
+        }
+        let port = carry.api.read_interface_data()?.listen_port;
+        self.carry = Some(Carry {
+            api: carry.api,
+            ifname: carry.ifname,
+            port,
+            src: (ip4, ip6),
+            applied: HashMap::new(),
+            routed: BTreeSet::new(),
+        });
+        Ok(port)
+    }
+
+    /// The carry interface's listen port, once it is up.
+    #[must_use]
+    pub fn carry_port(&self) -> Option<u16> {
+        self.carry.as_ref().map(|c| c.port)
     }
 
     /// This interface's name — for callers (the poll loop) that need to
@@ -1199,6 +1380,7 @@ impl WgInterface {
     /// defaults on both the freshly-built `desired` value and whatever
     /// was stored in `self.applied` on a previous cycle), so the
     /// comparison only ever reflects the fields this code actually sets.
+    #[allow(clippy::too_many_arguments)]
     pub fn reconcile(
         &mut self,
         peers: &[PeerInfo],
@@ -1207,7 +1389,12 @@ impl WgInterface {
         prefer_ipv6: bool,
         endpoint_tiers: &HashMap<String, EndpointTier>,
         transit: &TransitAssignments<'_>,
+        relay: &RelayAssignments<'_>,
     ) -> Result<(), WireguardInterfaceError> {
+        // Without a carry interface nothing can be relayed: every peer is
+        // then reached directly, whatever the coordinator said.
+        let none = RelayAssignments::new();
+        let relay = if self.carry.is_some() { relay } else { &none };
         // Hostname endpoints are looked up here, bounded, before the pure
         // build below reads them — never inside it (see `endpoint_dns`).
         let endpoints: Vec<String> = peers
@@ -1219,15 +1406,36 @@ impl WgInterface {
         self.resolver.retain(endpoints.iter().map(String::as_str));
         let resolver = &self.resolver;
         let desired =
-            desired_peers(peers, services, self_pubkey, prefer_ipv6, endpoint_tiers, transit, &|e| resolver.get(e));
+            desired_peers(peers, services, self_pubkey, prefer_ipv6, endpoint_tiers, transit, relay, &|e| resolver.get(e));
 
+        // A peer moving onto the carry interface leaves this one first, and
+        // one moving back leaves the carry interface first: the same address
+        // in two peers' `AllowedIPs` on one host would do no harm, but
+        // there is no reason to have it even for a moment.
         let to_remove = peers_to_remove(self.applied.keys(), &desired);
         for key in &to_remove {
             self.api.remove_peer(key)?;
         }
+        let carry_desired = self
+            .carry
+            .as_ref()
+            .map(|_| desired_carry_peers(peers, services, self_pubkey, relay))
+            .unwrap_or_default();
+        if let Some(carry) = &mut self.carry {
+            for key in peers_to_remove(carry.applied.keys(), &carry_desired) {
+                carry.api.remove_peer(&key)?;
+                carry.applied.remove(&key);
+            }
+        }
         let to_configure = peers_to_configure(&self.applied, &desired);
         for peer in &to_configure {
             self.api.configure_peer(peer)?;
+        }
+        if let Some(carry) = &mut self.carry {
+            for peer in peers_to_configure(&carry.applied, &carry_desired) {
+                carry.api.configure_peer(&peer)?;
+            }
+            carry.applied = carry_desired;
         }
 
         // Install a route for every peer's address.
@@ -1254,13 +1462,30 @@ impl WgInterface {
         // steady-state path.
         let self_name = peers.iter().find(|p| p.pubkey == self_pubkey).map(|p| p.name.as_str());
         let routes = desired_routes(&desired, self_name.into_iter().flat_map(|n| owned_vips(services, n)));
-        if routes != self.routed {
+        let carry_routes = self
+            .carry
+            .as_ref()
+            .map(|c| desired_routes(&c.applied, std::iter::empty()))
+            .unwrap_or_default();
+        let carry_changed = self.carry.as_ref().is_some_and(|c| c.routed != carry_routes);
+        if routes != self.routed || carry_changed {
             // A route that couldn't be set is logged (by `sync`) and retried
             // on the next cycle, not fatal: failing here would leave
             // `applied` stale and reconfigure every peer next cycle, which
-            // resets WireGuard's own endpoint roaming (see above).
-            match crate::routes::sync(&self.ifname, &self.routed, &routes) {
-                Ok(()) => self.routed = routes,
+            // resets WireGuard's own endpoint roaming (see above). Both
+            // interfaces in one go, so an address changing interface loses
+            // its old route before it gets the new one.
+            let mut sets = vec![crate::routes::RouteSet { ifname: &self.ifname, old: &self.routed, new: &routes, prefsrc: None }];
+            if let Some(c) = &self.carry {
+                sets.push(crate::routes::RouteSet { ifname: &c.ifname, old: &c.routed, new: &carry_routes, prefsrc: Some(c.src) });
+            }
+            match crate::routes::sync_all(&sets) {
+                Ok(()) => {
+                    self.routed = routes;
+                    if let Some(c) = &mut self.carry {
+                        c.routed = carry_routes;
+                    }
+                }
                 Err(e) => tracing::warn!(ifname = %self.ifname, error = %e, "peer routes are incomplete"),
             }
         }
@@ -1272,9 +1497,13 @@ impl WgInterface {
     /// Deletes the interface, and with it its addresses and routes. Not
     /// defguard's `remove_interface`; see `routes::delete_link` for why.
     pub fn teardown(&mut self) -> Result<(), WireguardInterfaceError> {
+        // The carry interface first, and whatever happens to it the mesh
+        // interface still goes.
+        let carry = self.carry.take().map(|c| crate::routes::delete_link(&c.ifname));
         crate::routes::delete_link(&self.ifname)?;
         self.applied.clear();
         self.routed.clear();
+        carry.transpose()?;
         Ok(())
     }
 }
@@ -1304,6 +1533,7 @@ mod tests {
             reflexive_addr: None,
             last_handshake: None,
             transit_via: None,
+            relay: Default::default(),
         }
     }
 
@@ -1353,7 +1583,7 @@ mod tests {
         let self_key = key_b64(1);
         let other_key = key_b64(2);
         let peers = vec![peer("me", &self_key), peer("other", &other_key)];
-        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &HashMap::new(), &crate::endpoint_dns::literal_only);
+        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &HashMap::new(), &HashMap::new(), &crate::endpoint_dns::literal_only);
         assert_eq!(desired.len(), 1);
     }
 
@@ -1365,8 +1595,92 @@ mod tests {
             peer("bad", "not-a-real-base64-key"),
             peer("good", &good_key),
         ];
-        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &HashMap::new(), &crate::endpoint_dns::literal_only);
+        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &HashMap::new(), &HashMap::new(), &crate::endpoint_dns::literal_only);
         assert_eq!(desired.len(), 1);
+    }
+
+    // ---- end-to-end relay (PLAN.md M39) ----
+
+    fn relay_directory() -> (String, String, String, Vec<PeerInfo>) {
+        let (self_key, b_key, c_key) = (key_b64(1), key_b64(2), key_b64(3));
+        let mut me = peer("me", &self_key);
+        me.ip4 = "100.90.0.1".into();
+        let mut b = peer("b", &b_key);
+        b.ip4 = "100.90.0.2".into();
+        b.relay.port = Some(41001);
+        b.relay.carry_port = Some(50002);
+        let mut c = peer("c", &c_key);
+        c.ip4 = "100.90.0.3".into();
+        c.ip6 = "fd00:90::3".into();
+        c.relay = wireserve_types::PeerRelay { port: Some(41002), carry_port: Some(50003), via: Some(b_key.clone()) };
+        (self_key, b_key, c_key, vec![me, b, c])
+    }
+
+    #[test]
+    fn carry_ifname_appends_the_suffix_within_the_kernels_limit() {
+        assert_eq!(carry_ifname("wireserve0"), "wireserve0-t");
+        assert_eq!(carry_ifname("a-very-long-nam"), "a-very-long-n-t");
+        assert!(carry_ifname("a-very-long-nam").len() <= 15);
+    }
+
+    #[test]
+    fn a_relayed_peer_is_dialled_at_its_carrier_on_its_own_relay_port() {
+        let (self_key, _, c_key, peers) = relay_directory();
+        let relay = relay_assignments(&peers, &self_key);
+        assert_eq!(relay.get(c_key.as_str()), Some(&RelayRoute { carrier: "100.90.0.2".parse().unwrap(), port: 41002 }));
+        assert_eq!(relay.len(), 1);
+    }
+
+    #[test]
+    fn a_relay_naming_an_unknown_or_self_or_the_peer_itself_as_carrier_is_ignored() {
+        let (self_key, _, c_key, mut peers) = relay_directory();
+        for via in [key_b64(9), self_key.clone(), c_key.clone()] {
+            peers[2].relay.via = Some(via);
+            assert!(relay_assignments(&peers, &self_key).is_empty());
+        }
+        peers[2].relay.via = Some(key_b64(2));
+        peers[2].relay.port = None;
+        assert!(relay_assignments(&peers, &self_key).is_empty(), "no relay port, nothing to dial");
+    }
+
+    #[test]
+    fn a_relayed_peer_keeps_a_probe_on_the_mesh_interface_and_its_addresses_move_to_the_carry_interface() {
+        let (self_key, b_key, c_key, peers) = relay_directory();
+        let services = [service("web", "c", Some("100.90.0.50"))];
+        let relay = relay_assignments(&peers, &self_key);
+        let main = desired_peers(&peers, &services, &self_key, false, &HashMap::new(), &HashMap::new(), &relay, &crate::endpoint_dns::literal_only);
+        let c = &main[&Key::try_from(c_key.as_str()).unwrap()];
+        assert!(c.allowed_ips.is_empty(), "the probe routes nothing");
+        let b = &main[&Key::try_from(b_key.as_str()).unwrap()];
+        assert_eq!(b.allowed_ips.len(), 2, "unlike transit, nothing is folded into the carrier: {:?}", b.allowed_ips);
+
+        let carry = desired_carry_peers(&peers, &services, &self_key, &relay);
+        assert_eq!(carry.len(), 1);
+        let c = &carry[&Key::try_from(c_key.as_str()).unwrap()];
+        assert_eq!(c.endpoint, Some("100.90.0.2:41002".parse().unwrap()));
+        let ips: Vec<String> = c.allowed_ips.iter().map(ToString::to_string).collect();
+        assert_eq!(ips, ["100.90.0.3/32", "fd00:90::3/128", "100.90.0.50/32"]);
+        assert_eq!(c.persistent_keepalive_interval, Some(25));
+    }
+
+    #[test]
+    fn relay_forwards_take_both_ends_from_the_directory_and_drop_what_is_incomplete() {
+        let (self_key, b_key, c_key, mut peers) = relay_directory();
+        let a_key = key_b64(4);
+        let mut a = peer("a", &a_key);
+        a.ip4 = "100.90.0.4".into();
+        a.relay = wireserve_types::PeerRelay { port: Some(41004), carry_port: Some(50004), via: None };
+        peers.push(a);
+        let pair = |x: &str, y: &str| TransitPair { a: x.into(), c: y.into() };
+        let fwd = relay_forwards(&peers, &self_key, &[pair(&a_key, &c_key)]);
+        assert_eq!(fwd, [RelayForward {
+            a: RelayEnd { ip4: "100.90.0.4".parse().unwrap(), relay_port: 41004, carry_port: 50004 },
+            c: RelayEnd { ip4: "100.90.0.3".parse().unwrap(), relay_port: 41002, carry_port: 50003 },
+        }]);
+        assert!(relay_forwards(&peers, &self_key, &[pair(&a_key, &self_key)]).is_empty(), "never this node itself");
+        assert!(relay_forwards(&peers, &self_key, &[pair(&a_key, &key_b64(9))]).is_empty(), "unknown peer");
+        peers[1].relay.carry_port = None;
+        assert!(relay_forwards(&peers, &self_key, &[pair(&a_key, &b_key)]).is_empty(), "no carry port");
     }
 
     // ---- transit (PLAN.md M23) ----
@@ -1382,7 +1696,7 @@ mod tests {
         c.endpoint_addr = Some("203.0.113.9:51820".into());
         let peers = vec![peer("b", &b_key), c];
         let transit: TransitAssignments<'_> = HashMap::from([(c_key.as_str(), b_key.as_str())]);
-        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &transit, &crate::endpoint_dns::literal_only);
+        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &transit, &HashMap::new(), &crate::endpoint_dns::literal_only);
         assert_eq!(desired.len(), 2);
         let probe = desired.get(&Key::try_from(c_key.as_str()).unwrap()).unwrap();
         assert!(probe.allowed_ips.is_empty());
@@ -1402,7 +1716,7 @@ mod tests {
         c.ip6 = String::new();
         let services = [service("web", "c", Some("100.90.0.53"))];
         let transit: TransitAssignments<'_> = HashMap::from([(c_key.as_str(), b_key.as_str())]);
-        let desired = desired_peers(&[b, c], &services, &self_key, false, &HashMap::new(), &transit, &crate::endpoint_dns::literal_only);
+        let desired = desired_peers(&[b, c], &services, &self_key, false, &HashMap::new(), &transit, &HashMap::new(), &crate::endpoint_dns::literal_only);
         let via = desired.get(&Key::try_from(b_key.as_str()).unwrap()).unwrap();
         let ips: Vec<String> = via.allowed_ips.iter().map(ToString::to_string).collect();
         assert_eq!(ips, ["100.90.0.2/32", "100.90.0.3/32", "100.90.0.53/32"]);
@@ -1419,7 +1733,7 @@ mod tests {
         c.ip4 = "100.90.0.3".into();
         c.ip6 = String::new();
         let transit: TransitAssignments<'_> = HashMap::from([(c_key.as_str(), b_key.as_str())]);
-        let desired = desired_peers(&[b, c], &[], &self_key, false, &HashMap::new(), &transit, &crate::endpoint_dns::literal_only);
+        let desired = desired_peers(&[b, c], &[], &self_key, false, &HashMap::new(), &transit, &HashMap::new(), &crate::endpoint_dns::literal_only);
         let via = desired.get(&Key::try_from(b_key.as_str()).unwrap()).unwrap();
         let ips: Vec<String> = via.allowed_ips.iter().map(ToString::to_string).collect();
         assert_eq!(ips, ["100.90.0.2/32", "100.90.0.3/32"]);
@@ -1432,7 +1746,7 @@ mod tests {
         let unknown_via = key_b64(9);
         let peers = vec![peer("c", &c_key)];
         let transit: TransitAssignments<'_> = HashMap::from([(c_key.as_str(), unknown_via.as_str())]);
-        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &transit, &crate::endpoint_dns::literal_only);
+        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &transit, &HashMap::new(), &crate::endpoint_dns::literal_only);
         assert!(desired.values().all(|p| p.allowed_ips.is_empty()));
     }
 
@@ -1443,7 +1757,7 @@ mod tests {
         let peers = vec![peer("b", &b_key), peer("c", &c_key)];
         // A stale/adversarial coordinator naming each as the other's via.
         let transit: TransitAssignments<'_> = HashMap::from([(b_key.as_str(), c_key.as_str()), (c_key.as_str(), b_key.as_str())]);
-        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &transit, &crate::endpoint_dns::literal_only);
+        let desired = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &transit, &HashMap::new(), &crate::endpoint_dns::literal_only);
         // Both probe entries exist, and neither was folded into the other.
         assert_eq!(desired.len(), 2);
         assert!(desired.values().all(|p| p.allowed_ips.is_empty()));
@@ -1460,7 +1774,7 @@ mod tests {
         c.ip4 = "100.90.0.3".into();
         c.ip6 = String::new();
         let transit: TransitAssignments<'_> = HashMap::from([(c_key.as_str(), b_key.as_str())]);
-        let desired = desired_peers(&[b, c], &[], &self_key, false, &HashMap::new(), &transit, &crate::endpoint_dns::literal_only);
+        let desired = desired_peers(&[b, c], &[], &self_key, false, &HashMap::new(), &transit, &HashMap::new(), &crate::endpoint_dns::literal_only);
         let routes: Vec<String> =
             desired_routes(&desired, std::iter::empty()).iter().map(ToString::to_string).collect();
         assert_eq!(routes, ["100.90.0.2", "100.90.0.3"]);
@@ -1580,16 +1894,16 @@ mod tests {
         // history at all (the other side may be the one that asked).
         let now = std::time::Instant::now();
         let mut tracker = EndpointTracker::default();
-        let (c_key, b_key) = (key_b64(3), key_b64(2));
+        let c_key = key_b64(3);
         tracker.resolve(&c_key, lan_only("192.168.1.50"), None, now);
-        tracker.note_transit(&HashMap::from([(c_key.as_str(), b_key.as_str())]));
+        tracker.note_transit([c_key.as_str()]);
         let now_utc = chrono::Utc::now();
         assert_eq!(tracker.peers_wanting_transit(&HashMap::new(), now_utc, now), vec![c_key.as_str()]);
 
         let direct = HashMap::from([(c_key.clone(), Some(now_utc))]);
         assert!(tracker.peers_wanting_transit(&direct, now_utc, now).is_empty());
 
-        tracker.note_transit(&HashMap::new());
+        tracker.note_transit([]);
         assert!(tracker.peers_wanting_transit(&HashMap::new(), now_utc, now).is_empty());
     }
 
@@ -1643,7 +1957,7 @@ mod tests {
             service("old", "other", None),
             service("mine", "me", Some("100.90.0.52")),
         ];
-        let desired = desired_peers(&[peer("me", &self_key), other], &services, &self_key, false, &HashMap::new(), &HashMap::new(), &crate::endpoint_dns::literal_only);
+        let desired = desired_peers(&[peer("me", &self_key), other], &services, &self_key, false, &HashMap::new(), &HashMap::new(), &HashMap::new(), &crate::endpoint_dns::literal_only);
         let peer = desired.values().next().unwrap();
         let ips: Vec<String> = peer.allowed_ips.iter().map(ToString::to_string).collect();
         assert_eq!(ips, ["100.90.0.2/32", "fd00:90::2/128", "100.90.0.50/32", "100.90.0.51/32"]);
@@ -1656,7 +1970,7 @@ mod tests {
         other.ip4 = "100.90.0.2".into();
         other.ip6 = String::new();
         let services = [service("web", "other", Some("100.90.0.50"))];
-        let desired = desired_peers(&[other], &services, &self_key, false, &HashMap::new(), &HashMap::new(), &crate::endpoint_dns::literal_only);
+        let desired = desired_peers(&[other], &services, &self_key, false, &HashMap::new(), &HashMap::new(), &HashMap::new(), &crate::endpoint_dns::literal_only);
         let own: Vec<Ipv4Addr> = vec!["100.90.0.60".parse().unwrap()];
         let routes: Vec<String> = desired_routes(&desired, own.into_iter()).iter().map(ToString::to_string).collect();
         assert_eq!(routes, ["100.90.0.2", "100.90.0.50", "100.90.0.60"]);
@@ -1820,14 +2134,14 @@ mod tests {
         other.endpoint_addr_v4 = Some("203.0.113.5:51820".into());
         other.endpoint_addr_v6 = Some("[2001:db8::1]:51820".into());
 
-        let desired_v4 = desired_peers(&[other.clone()], &[], &self_key, false, &HashMap::new(), &HashMap::new(), &crate::endpoint_dns::literal_only);
+        let desired_v4 = desired_peers(&[other.clone()], &[], &self_key, false, &HashMap::new(), &HashMap::new(), &HashMap::new(), &crate::endpoint_dns::literal_only);
         let key = defguard_wireguard_rs::key::Key::try_from(key_b64(2).as_str()).unwrap();
         assert_eq!(
             desired_v4[&key].endpoint,
             Some("203.0.113.5:51820".parse().unwrap())
         );
 
-        let desired_v6 = desired_peers(&[other], &[], &self_key, true, &HashMap::new(), &HashMap::new(), &crate::endpoint_dns::literal_only);
+        let desired_v6 = desired_peers(&[other], &[], &self_key, true, &HashMap::new(), &HashMap::new(), &HashMap::new(), &crate::endpoint_dns::literal_only);
         assert_eq!(
             desired_v6[&key].endpoint,
             Some("[2001:db8::1]:51820".parse::<std::net::SocketAddr>().unwrap())
@@ -2406,7 +2720,7 @@ mod tests {
 
         let mut p = peer("peer", &key_b64(9));
         p.endpoint_addr = Some("10.99.0.1:51820".into());
-        wg.reconcile(std::slice::from_ref(&p), &[], &own.public_key().to_string(), false, &HashMap::new(), &HashMap::new()).unwrap();
+        wg.reconcile(std::slice::from_ref(&p), &[], &own.public_key().to_string(), false, &HashMap::new(), &HashMap::new(), &HashMap::new()).unwrap();
 
         // What `list` reads: the configured endpoint, and no handshake
         // yet — not a handshake in 1970, which is how the kernel says it.
@@ -2426,7 +2740,7 @@ mod tests {
         assert!(routes.contains("100.90.0.5 dev wgtest"), "{routes}");
         assert!(routes.contains("fd00:90::5 dev wgtest"), "{routes}");
 
-        wg.reconcile(&[], &[], &own.public_key().to_string(), false, &HashMap::new(), &HashMap::new()).unwrap();
+        wg.reconcile(&[], &[], &own.public_key().to_string(), false, &HashMap::new(), &HashMap::new(), &HashMap::new()).unwrap();
         let routes = sh("ip -4 route show table all; ip -6 route show table all");
         assert!(!routes.contains("100.90.0.5") && !routes.contains("fd00:90::5"), "departed peer's route removed: {routes}");
         wg.teardown().unwrap();
@@ -2462,7 +2776,7 @@ mod tests {
             service("web", "peer", Some("100.90.0.50")),
             service("mine", "me", Some("100.90.0.51")),
         ];
-        wg.reconcile(&peers, &services, &own_pub, false, &HashMap::new(), &HashMap::new()).unwrap();
+        wg.reconcile(&peers, &services, &own_pub, false, &HashMap::new(), &HashMap::new(), &HashMap::new()).unwrap();
 
         let routes = sh("ip -4 route show table all");
         assert!(routes.contains("100.90.0.50 dev wgtest"), "{routes}");
@@ -2473,7 +2787,7 @@ mod tests {
             assert!(!allowed.contains("100.90.0.51"), "our own address is no peer's: {allowed}");
         }
 
-        wg.reconcile(&peers, &[], &own_pub, false, &HashMap::new(), &HashMap::new()).unwrap();
+        wg.reconcile(&peers, &[], &own_pub, false, &HashMap::new(), &HashMap::new(), &HashMap::new()).unwrap();
         let routes = sh("ip -4 route show table all");
         assert!(!routes.contains("100.90.0.50") && !routes.contains("100.90.0.51"), "{routes}");
 
@@ -2523,8 +2837,8 @@ mod tests {
         // Both sides transited via a carrier neither has an entry for.
         let a_transit: TransitAssignments<'_> = HashMap::from([(b_pub.as_str(), via.as_str())]);
         let b_transit: TransitAssignments<'_> = HashMap::from([(a_pub.as_str(), via.as_str())]);
-        a.reconcile(&peers, &[], &a_pub, false, &HashMap::new(), &a_transit).unwrap();
-        b.reconcile(&peers, &[], &b_pub, false, &HashMap::new(), &b_transit).unwrap();
+        a.reconcile(&peers, &[], &a_pub, false, &HashMap::new(), &a_transit, &HashMap::new()).unwrap();
+        b.reconcile(&peers, &[], &b_pub, false, &HashMap::new(), &b_transit, &HashMap::new()).unwrap();
 
         let handshaked = |ifname: &str| tunnel_peers(ifname).unwrap().iter().any(|t| t.last_handshake.is_some());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -2537,12 +2851,62 @@ mod tests {
 
         // The transit ends on B's side: A's addresses move back onto its own
         // entry, whose configured endpoint is unchanged (and wrong).
-        b.reconcile(&peers, &[], &b_pub, false, &HashMap::new(), &HashMap::new()).unwrap();
+        b.reconcile(&peers, &[], &b_pub, false, &HashMap::new(), &HashMap::new(), &HashMap::new()).unwrap();
         let after = tunnel_peers("wgtestb").unwrap();
         assert_eq!(after[0].endpoint.as_deref(), Some("127.0.0.1:51820"), "the roamed endpoint must survive");
 
         a.teardown().unwrap();
         b.teardown().unwrap();
+    }
+
+    /// The carry interface (PLAN.md M39) on a real kernel: it comes up with
+    /// the port it is given and the carry MTU, a relayed peer's addresses
+    /// and route move onto it — the route with the node's own address as
+    /// its source, since the interface has none — and back again when the
+    /// relay ends; teardown removes it with the mesh interface.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_a_relayed_peer_moves_to_the_carry_interface_and_back() {
+        if !crate::firewall::netns::reexec("wg::tests::kernel_a_relayed_peer_moves_to_the_carry_interface_and_back") {
+            return;
+        }
+        let sh = |script: &str| {
+            let out = std::process::Command::new("sh").args(["-euc", script]).output().unwrap();
+            assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap()
+        };
+        sh("ip link set lo up");
+        let own = clamp_private_key(&Key::generate());
+        let own_pub = own.public_key().to_string();
+        let mut wg = WgInterface::new("wgtest").unwrap();
+        wg.bring_up(&own.to_string(), "100.90.0.1".parse().unwrap(), "fd00:90::1".parse().unwrap(), 51820).unwrap();
+        let port = wg.bring_up_carry(&own.to_string(), "100.90.0.1".parse().unwrap(), "fd00:90::1".parse().unwrap(), Some(50123)).unwrap();
+        assert_eq!(port, 50123);
+        assert_eq!(wg.carry_port(), Some(50123));
+        assert!(sh("ip -o link show wgtest-t").contains("mtu 1340"));
+
+        let (_, _, _, mut peers) = relay_directory();
+        peers[0].pubkey = own_pub.clone();
+        let relay = relay_assignments(&peers, &own_pub);
+        wg.reconcile(&peers, &[], &own_pub, false, &HashMap::new(), &HashMap::new(), &relay).unwrap();
+        let routes = sh("ip -4 route show; ip -6 route show");
+        assert!(routes.contains("100.90.0.3 dev wgtest-t scope link src 100.90.0.1"), "{routes}");
+        assert!(routes.contains("fd00:90::3 dev wgtest-t"), "{routes}");
+        assert!(!routes.contains("100.90.0.3 dev wgtest "), "{routes}");
+        let carry = tunnel_peers("wgtest-t").unwrap();
+        assert_eq!(carry.len(), 1);
+        assert_eq!(carry[0].endpoint.as_deref(), Some("100.90.0.2:41002"));
+
+        // The relay ends: back onto the mesh interface.
+        wg.reconcile(&peers, &[], &own_pub, false, &HashMap::new(), &HashMap::new(), &HashMap::new()).unwrap();
+        let routes = sh("ip -4 route show");
+        assert!(routes.contains("100.90.0.3 dev wgtest "), "{routes}");
+        assert!(!routes.contains("wgtest-t"), "{routes}");
+        assert!(tunnel_peers("wgtest-t").unwrap().is_empty());
+
+        wg.teardown().unwrap();
+        let links = sh("ip -o link show");
+        assert!(!links.contains("wgtest"), "{links}");
     }
 
     /// NAT-hairpin fix (PLAN.md decisions log #85), end to end: when the
@@ -2571,7 +2935,7 @@ mod tests {
 
         let mut endpoint_tiers = HashMap::new();
         endpoint_tiers.insert(p.pubkey.clone(), EndpointTier::Lan);
-        wg.reconcile(std::slice::from_ref(&p), &[], &own.public_key().to_string(), false, &endpoint_tiers, &HashMap::new()).unwrap();
+        wg.reconcile(std::slice::from_ref(&p), &[], &own.public_key().to_string(), false, &endpoint_tiers, &HashMap::new(), &HashMap::new()).unwrap();
 
         let tunnel = tunnel_peers("wgtest").unwrap();
         assert_eq!(
@@ -2609,7 +2973,7 @@ mod tests {
 
         let mut endpoint_tiers = HashMap::new();
         endpoint_tiers.insert(p.pubkey.clone(), EndpointTier::Reflexive);
-        wg.reconcile(std::slice::from_ref(&p), &[], &own.public_key().to_string(), false, &endpoint_tiers, &HashMap::new()).unwrap();
+        wg.reconcile(std::slice::from_ref(&p), &[], &own.public_key().to_string(), false, &endpoint_tiers, &HashMap::new(), &HashMap::new()).unwrap();
 
         let tunnel = tunnel_peers("wgtest2").unwrap();
         assert_eq!(

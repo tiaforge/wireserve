@@ -150,6 +150,7 @@ pub async fn poll(
         .cloned()
         .collect();
     state.transit.report_capabilities(&self_pubkey, &capabilities);
+    state.transit.report_carry_port(&self_pubkey, req.carry_port);
 
     // Same observed-source-address fallback as `/register` (spec §4.2),
     // re-applied on every poll rather than frozen at join time — see
@@ -288,7 +289,7 @@ pub async fn poll(
 
     let mut peers: Vec<wireserve_types::PeerInfo> = all_peers
         .iter()
-        .map(|n| directory::peer_info(n, state.config.online_threshold_secs))
+        .map(|n| directory::peer_info(n, state.config.online_threshold_secs, state.config.relay_port_base))
         .collect();
 
     // Second pass (PLAN.md M23): `transit_via` is requester-relative —
@@ -327,6 +328,28 @@ pub async fn poll(
         gw.transit_approved.then_some(gw.id)
     };
 
+    // End-to-end relaying (PLAN.md M39). A node takes part only while its
+    // own latest poll says it can: a carry port, and the capability.
+    let fresh = state.config.online_threshold_secs;
+    for peer in &mut peers {
+        peer.relay.carry_port = state.transit.carry_port(&peer.pubkey, fresh);
+    }
+    let relayable: std::collections::HashSet<String> = peers
+        .iter()
+        .filter(|p| p.relay.port.is_some() && p.relay.carry_port.is_some())
+        .map(|p| p.pubkey.clone())
+        .collect();
+    let can_carry = |pk: &str| state.transit.has_capability(pk, wireserve_types::CAP_RELAY, fresh);
+    // The carrier for a pair that can't reach each other directly: only
+    // ever one relaying end to end. There is no fallback to forwarding the
+    // pair's traffic in the clear — every node upgrades together.
+    let relay_carrier = |a: &str, c: &str| -> Option<String> {
+        if !relayable.contains(a) || !relayable.contains(c) || !state.transit.either_wants(a, c) {
+            return None;
+        }
+        state.transit.select_where(a, c, fresh, &can_carry)
+    };
+
     for (peer, row) in peers.iter_mut().zip(all_peers.iter()) {
         if peer.pubkey == self_pubkey {
             continue;
@@ -348,12 +371,7 @@ pub async fn poll(
             peer.transit_via = live_by_id.get(&gw_id).and_then(|g| g.pubkey.clone());
             continue;
         }
-        if state.transit.either_wants(&self_pubkey, &peer.pubkey) {
-            peer.transit_via = state
-                .transit
-                .select(&self_pubkey, &peer.pubkey, state.config.online_threshold_secs)
-                .filter(|via| via != &self_pubkey);
-        }
+        peer.relay.via = relay_carrier(&self_pubkey, &peer.pubkey).filter(|via| via != &self_pubkey);
     }
 
     // This requester's own carrier role this cycle (PLAN.md M23): every
@@ -365,7 +383,8 @@ pub async fn poll(
     // both endpoints directly, so its own peer-a/peer-c entries never
     // need routing help and so never carry `transit_via` themselves).
     let all_pubkeys: Vec<&str> = all_peers.iter().filter_map(|n| n.pubkey.as_deref()).collect();
-    let mut transit_carrying = Vec::new();
+    let mut transit_carrying: Vec<wireserve_types::TransitPair> = Vec::new();
+    let mut relay_carrying = Vec::new();
     for (i, &x) in all_pubkeys.iter().enumerate() {
         if x == self_pubkey {
             continue;
@@ -374,10 +393,8 @@ pub async fn poll(
             if y == self_pubkey {
                 continue;
             }
-            if state.transit.either_wants(x, y)
-                && state.transit.select(x, y, state.config.online_threshold_secs).as_deref() == Some(self_pubkey.as_str())
-            {
-                transit_carrying.push(wireserve_types::TransitPair { a: x.to_string(), c: y.to_string() });
+            if relay_carrier(x, y).as_deref() == Some(self_pubkey.as_str()) {
+                relay_carrying.push(wireserve_types::TransitPair { a: x.to_string(), c: y.to_string() });
             }
         }
     }
@@ -497,6 +514,7 @@ pub async fn poll(
         pending_services: outcome.pending.iter().map(directory::pending_service).collect(),
         denied_services: outcome.denied.iter().map(directory::denied_service).collect(),
         transit_carrying,
+        relay_carrying,
         transit_awaiting_approval,
         exit_clients,
         mesh: Some(state.config.mesh_info()),

@@ -297,6 +297,7 @@ mod tests {
             public_url: None,
             oidc: None,
             online_threshold_secs: 180,
+            relay_port_base: wireserve_types::DEFAULT_RELAY_PORT_BASE,
             rate_limit_max: 10,
             rate_limit_window_secs: 60,
             trust_proxy_headers: false,

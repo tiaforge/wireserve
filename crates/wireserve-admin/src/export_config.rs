@@ -728,6 +728,7 @@ mod tests {
             reflexive_addr: None,
             last_handshake: None,
             transit_via: None,
+            relay: Default::default(),
         }
     }
 
@@ -962,6 +963,7 @@ mod gateway_tests {
             reflexive_addr: None,
             last_handshake: None,
             transit_via: None,
+            relay: Default::default(),
         }
     }
 
@@ -1198,6 +1200,7 @@ mod exit_tests {
             reflexive_addr: None,
             last_handshake: None,
             transit_via: None,
+            relay: Default::default(),
         }
     }
 

@@ -33,6 +33,8 @@ pub struct TransitState {
     /// What each node last said it can do (`PollRequest::capabilities`),
     /// and when. Same lifetime and staleness rule as the rest of this.
     capabilities: Mutex<HashMap<String, CapabilityReport>>,
+    /// Each node's carry interface port (PLAN.md M39), from its last poll.
+    carry_ports: Mutex<HashMap<String, (u16, DateTime<Utc>)>>,
 }
 
 /// One node's last capability report, and when it came.
@@ -66,6 +68,13 @@ impl TransitState {
     /// answer with no coordination between them.
     #[must_use]
     pub fn select(&self, a: &str, c: &str, fresh_secs: i64) -> Option<String> {
+        self.select_where(a, c, fresh_secs, &|_| true)
+    }
+
+    /// [`Self::select`] among the carriers `eligible` accepts — for a relay
+    /// (PLAN.md M39), only those that can relay end to end.
+    #[must_use]
+    pub fn select_where(&self, a: &str, c: &str, fresh_secs: i64, eligible: &dyn Fn(&str) -> bool) -> Option<String> {
         let by_pubkey = self.by_pubkey.lock().expect("transit state mutex poisoned");
         let now = Utc::now();
         let mut candidates: Vec<&String> = by_pubkey
@@ -77,6 +86,7 @@ impl TransitState {
                     && (now - report.reported_at).num_seconds() < fresh_secs
                     && report.reachable.contains(a)
                     && report.reachable.contains(c)
+                    && eligible(pubkey)
             })
             .map(|(pubkey, _)| pubkey)
             .collect();
@@ -172,6 +182,31 @@ impl TransitState {
         })
     }
 
+    /// Records this poll's carry port, or its absence.
+    pub fn report_carry_port(&self, pubkey: &str, port: Option<u16>) {
+        let mut ports = self.carry_ports.lock().expect("transit state mutex poisoned");
+        match port.filter(|p| *p != 0) {
+            Some(p) => ports.insert(pubkey.to_string(), (p, Utc::now())),
+            None => ports.remove(pubkey),
+        };
+    }
+
+    /// The carry port this node last reported, if it can be relayed to: it
+    /// said so in a poll no older than `fresh_secs`.
+    #[must_use]
+    pub fn carry_port(&self, pubkey: &str, fresh_secs: i64) -> Option<u16> {
+        if !self.has_capability(pubkey, wireserve_types::CAP_RELAY, fresh_secs) {
+            return None;
+        }
+        let now = Utc::now();
+        self.carry_ports
+            .lock()
+            .ok()?
+            .get(pubkey)
+            .filter(|(_, at)| (now - *at).num_seconds() <= fresh_secs)
+            .map(|(p, _)| *p)
+    }
+
     /// Drops a node's report — on revoke and rejoin, so it can never be
     /// selected as transit and never shows up as wanting anything
     /// afterward.
@@ -181,6 +216,7 @@ impl TransitState {
         drop(by_pubkey);
         self.exit_offered_at.lock().expect("transit state mutex poisoned").remove(pubkey);
         self.capabilities.lock().expect("transit state mutex poisoned").remove(pubkey);
+        self.carry_ports.lock().expect("transit state mutex poisoned").remove(pubkey);
     }
 }
 

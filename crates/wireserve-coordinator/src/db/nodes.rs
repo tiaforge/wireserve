@@ -51,6 +51,9 @@ pub struct NodeRow {
     /// instead of holding a direct `[Peer]` for it. Deliberately absent from
     /// `PeerInfo`, so no agent ever sees it.
     pub export_via_gateway: bool,
+    /// Its relay slot (PLAN.md M39): its relay port is the configured base
+    /// plus this. `None` once every slot is taken.
+    pub relay_slot: Option<u16>,
     /// For a `kind=static` node: its last export included the full-tunnel
     /// profile, so its gateway is its exit (PLAN.md M27).
     pub exit_enabled: bool,
@@ -81,6 +84,7 @@ impl NodeRow {
             gateway_node_id: None,
             export_via_gateway: false,
             exit_enabled: false,
+            relay_slot: None,
         }
     }
 }
@@ -109,6 +113,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
         gateway_node_id: row.get("gateway_node_id")?,
         export_via_gateway: row.get("export_via_gateway")?,
         exit_enabled: row.get("exit_enabled")?,
+        relay_slot: row.get("relay_slot")?,
     })
 }
 
@@ -165,9 +170,11 @@ pub fn create_node(
     join_token_expires_at: Option<&str>,
 ) -> Result<i64, DbError> {
     conn.execute(
-        "INSERT INTO nodes (name, kind, join_token_hash, join_token_used, join_token_expires_at) \
-         VALUES (?1, ?2, ?3, 0, ?4)",
-        rusqlite::params![name, kind.as_str(), join_token_hash, join_token_expires_at],
+        "INSERT INTO nodes (name, kind, join_token_hash, join_token_used, join_token_expires_at, relay_slot) \
+         VALUES (?1, ?2, ?3, 0, ?4, (\
+             SELECT MIN(s) FROM (SELECT 0 AS s UNION ALL SELECT relay_slot + 1 FROM nodes WHERE relay_slot IS NOT NULL) \
+             WHERE s < ?5 AND s NOT IN (SELECT relay_slot FROM nodes WHERE relay_slot IS NOT NULL)))",
+        rusqlite::params![name, kind.as_str(), join_token_hash, join_token_expires_at, wireserve_types::RELAY_SLOTS],
     )
     .map_err(map_unique_violation)?;
     Ok(conn.last_insert_rowid())
