@@ -11,9 +11,9 @@ source of truth for *current status*, the spec is the source of truth for
 **Currently working on:** M36 (service groups, grants and tags; items 212+),
 then M37 (caching `/verify`) and M38 (device owners through OIDC). The plan
 is `~/.claude/plans/alright-then-lets-create-shimmying-panda.md` (not in the
-repo). Items 212–219 are done; the e2e suites for them
+repo). Items 212–221 (M36, M37) are done; the e2e suites for them
 (`run-grants-test.sh`, the reworked `run-service-auth-test.sh`) have not run
-yet.
+yet. M38 next.
 
 Everything that can be verified here now is. What remains unverified is
 scale (three nodes, not thirty), real WAN paths, and long-running
@@ -3455,3 +3455,26 @@ builds on the sign-in they concern.
     `group add|remove <group> <service>`, `grant add|remove <source> <group>`,
     `grant list`, `tag add|remove <node> <tag>`, `access <service>` and
     `access --node <node>`; `list-services` shows `groups=`.
+
+## M37 — the sign-in's answers, reused as the provider allows
+
+Every request from a device the grants do not name asked the provider
+again, a round trip over the mesh each. authward now says how long its
+answer holds (`Cache-Control: max-age`, `Vary: cookie, host,
+x-forwarded-host[, …]`), in plain HTTP any forward_auth provider can speak;
+a provider that says nothing is asked every time, as before.
+
+220. **Kept only per person, and only when asked to.** A 2xx is reused when
+    it names a user (a path the provider lets anyone through says nothing
+    about who is asking), carries `max-age` above zero and neither
+    `no-store` nor `no-cache`, and a `Vary` that is not `*` and names the
+    cookie or `Authorization` — otherwise one person's answer could reach
+    another. The key is the service's name and the value of every `Vary`
+    header exactly as sent, hashed (SHA-256): no cookie is stored. At most
+    10 000 answers, an hour at most, per provider; replaced with it.
+
+221. **A stale answer only while the provider is down.** `stale-if-error`
+    lets a kept answer stand in when the provider times out, cannot be
+    reached or answers 5xx, for that long past its `max-age`. The grants are
+    checked on every request, cached or not — only who someone is is
+    reused, never whether they may in.

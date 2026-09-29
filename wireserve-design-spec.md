@@ -511,7 +511,10 @@ the provider's own address, verified TLS, with `X-Forwarded-Method`,
 it is; one of the granted groups in its groups header passes the request on
 with the identity headers copied on, anything else is 403. A 401 with
 `X-Login-Url` redirects a GET; anything else is returned as is. The provider
-authenticates; the grants authorize. Everyone else gets 403. The identity
+authenticates; the grants authorize. A 2xx naming a user is reused while the
+provider's `Cache-Control: max-age` allows, keyed by the hashed values of its
+`Vary` headers, which must include the cookie or `Authorization` (M37);
+`stale-if-error` covers a provider that is down. Everyone else gets 403. The identity
 headers (`WIRESERVE_AUTH_{USER,EMAIL,GROUPS}_HEADER`) are removed from every
 request on every service, and the provider's domain-wide session cookie from
 every request but the provider's own. The provider's own service is always

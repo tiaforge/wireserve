@@ -15,7 +15,9 @@
 #   3. signed in with `family`, the backend sees who (the provider's
 #      identity headers), not a forged X-Auth-User, not the session cookie —
 #      other cookies kept;
-#   4. signed in with another group: 403, backend untouched;
+#   4. signed in with another group: 403, backend untouched — and an answer
+#      the provider marks cacheable is reused for the same cookie only
+#      (PLAN.md M37);
 #   5. the tagged gate gets in without any session: its device is granted,
 #      and the sign-in is never asked;
 #   6. grafana, still in `default`, needs no sign-in, but loses the cookie
@@ -100,7 +102,7 @@ in_netns() {
 in_netns_bg() {
     local target=$1; shift
     podman run -d --name "wireserve-sa-helper-$$-$RANDOM" --network "container:$target" \
-        -v "$PWD/deploy/e2e:/e2e:ro" "$DEBUG_IMG" "$@" >/dev/null
+        -v "$PWD/deploy/e2e:/e2e:ro" -v "$WORK:/work:Z" "$DEBUG_IMG" "$@" >/dev/null
 }
 ip_on() {
     podman inspect "$1" --format "{{(index .NetworkSettings.Networks \"$2\").IPAddress}}"
@@ -282,6 +284,18 @@ echo "$OUT" | tail -1
 echo "$OUT" | grep -q '^STATUS 403' || { echo "$OUT"; fail "a guest was not refused"; }
 echo "$OUT" | grep -q 'backend:' && fail "a guest reached the backend"
 pass "bob (guests) refused with 403"
+
+log "4b/10: a signed-in answer is reused while the provider allows it"
+asked() { wc -l < "$WORK/verify.count" 2>/dev/null || echo 0; }
+BEFORE=$(asked)
+for _ in 1 2 3; do
+    OUT=$(fetch jellyfin -H 'Cookie: authward_session=ok; n=cache') || true
+    echo "$OUT" | grep -q '^STATUS 200' || { echo "$OUT"; fail "a signed-in request failed"; }
+done
+[ "$(( $(asked) - BEFORE ))" -eq 1 ] || fail "three requests with one cookie asked the provider $(( $(asked) - BEFORE )) times"
+OUT=$(fetch jellyfin -H 'Cookie: authward_session=guest; n=cache') || true
+echo "$OUT" | grep -q '^STATUS 403' || { echo "$OUT"; fail "another cookie got the cached answer"; }
+pass "three requests, one /verify; another cookie is asked about afresh"
 
 log "5/10: the tagged device gets in without signing in"
 OUT=$(fetch_from "$GATE" jellyfin -H 'X-Auth-User: mallory') || true

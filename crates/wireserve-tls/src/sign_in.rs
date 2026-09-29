@@ -19,10 +19,18 @@
 //! The provider's session cookie is scoped to the whole domain, so the
 //! browser sends it to every service; no backend needs it, and none gets it
 //! — except the provider itself, whose cookie it is.
+//!
+//! A 2xx naming someone is reused while the provider says it may be (PLAN.md
+//! M37): `Cache-Control: max-age`, and a `Vary` naming the request headers
+//! the answer depends on — which must include the cookie or
+//! `Authorization`, or one person's answer could reach another. Nothing
+//! else is kept, and nothing is kept without the provider asking: plain
+//! forward_auth providers are asked every time, as before.
 
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
@@ -36,6 +44,13 @@ use wireserve_types::IdentityHeaders;
 
 /// How long the provider may take to answer.
 const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The longest an answer is reused fresh, or kept for a provider that is
+/// down, whatever the provider says.
+const MAX_CACHE_AGE: Duration = Duration::from_secs(3600);
+
+/// At most this many answers are kept.
+const CACHE_ENTRIES: usize = 10_000;
 
 /// Resolves every name to one address: the provider's own.
 #[derive(Clone, Copy)]
@@ -60,6 +75,117 @@ impl tower::Service<Name> for Fixed {
 pub struct SignIn {
     pub target: SignInTarget,
     client: Client<hyper_rustls::HttpsConnector<HttpConnector<Fixed>>, Body>,
+    cache: Arc<Mutex<Cache>>,
+}
+
+/// How long an answer may be reused, and what it depends on — from the
+/// provider's own `Cache-Control` and `Vary`.
+#[derive(Debug, PartialEq, Eq)]
+struct Caching {
+    max_age: Duration,
+    stale_if_error: Duration,
+    vary: Vec<HeaderName>,
+}
+
+/// The answers kept (PLAN.md M37), for one provider.
+#[derive(Default)]
+struct Cache {
+    /// Per service name: the request headers the provider's last cacheable
+    /// answer said it depends on — what a request is looked up by.
+    vary: HashMap<String, Vec<HeaderName>>,
+    entries: HashMap<[u8; 32], Entry>,
+}
+
+struct Entry {
+    headers: HeaderMap,
+    groups: Vec<String>,
+    fresh_until: Instant,
+    /// Past `fresh_until`, still used while the provider cannot be asked.
+    usable_until: Instant,
+}
+
+impl Cache {
+    fn lookup(&self, fqdn: &str, sent: &HeaderMap, now: Instant, provider_down: bool) -> Option<Verdict> {
+        let vary = self.vary.get(fqdn)?;
+        let e = self.entries.get(&key(fqdn, vary, sent))?;
+        let usable = now < e.fresh_until || (provider_down && now < e.usable_until);
+        usable.then(|| Verdict::Allow { headers: e.headers.clone(), groups: e.groups.clone() })
+    }
+
+    fn store(&mut self, fqdn: &str, sent: &HeaderMap, c: Caching, headers: &HeaderMap, groups: &[String], now: Instant) {
+        if self.entries.len() >= CACHE_ENTRIES {
+            self.entries.retain(|_, e| e.usable_until > now);
+        }
+        if self.entries.len() >= CACHE_ENTRIES {
+            if let Some(oldest) = self.entries.iter().min_by_key(|(_, e)| e.usable_until).map(|(k, _)| *k) {
+                self.entries.remove(&oldest);
+            }
+        }
+        let fresh_until = now + c.max_age;
+        let entry = Entry {
+            headers: headers.clone(),
+            groups: groups.to_vec(),
+            fresh_until,
+            usable_until: fresh_until + c.stale_if_error,
+        };
+        self.entries.insert(key(fqdn, &c.vary, sent), entry);
+        self.vary.insert(fqdn.to_string(), c.vary);
+    }
+}
+
+/// The request a cached answer stands for: the service, and the value of
+/// every header the provider varies on, exactly as sent — hashed, so no
+/// cookie is ever kept.
+fn key(fqdn: &str, vary: &[HeaderName], sent: &HeaderMap) -> [u8; 32] {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(fqdn.as_bytes());
+    for name in vary {
+        h.update([0]);
+        h.update(name.as_str().as_bytes());
+        for value in sent.get_all(name) {
+            h.update([1]);
+            h.update(value.as_bytes());
+        }
+    }
+    h.finalize().into()
+}
+
+/// Whether, and for how long, a 2xx may be reused: `max-age` above zero,
+/// neither `no-store` nor `no-cache`, and a `Vary` that is not `*` and names
+/// the cookie or `Authorization` — an answer that does not depend on who is
+/// asking must never be kept per person.
+fn caching(headers: &HeaderMap) -> Option<Caching> {
+    let directives: Vec<String> = headers
+        .get_all(header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|d| d.trim().to_ascii_lowercase())
+        .collect();
+    let seconds = |name: &str| {
+        directives.iter().find_map(|d| d.strip_prefix(name)?.strip_prefix('=')?.trim_matches('"').parse::<u64>().ok())
+    };
+    if directives.iter().any(|d| d == "no-store" || d == "no-cache") {
+        return None;
+    }
+    let max_age = Duration::from_secs(seconds("max-age").filter(|s| *s > 0)?).min(MAX_CACHE_AGE);
+    let stale_if_error = Duration::from_secs(seconds("stale-if-error").unwrap_or(0)).min(MAX_CACHE_AGE);
+    let mut vary = Vec::new();
+    for value in headers.get_all(header::VARY) {
+        for name in value.to_str().ok()?.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            if name == "*" {
+                return None;
+            }
+            vary.push(HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes()).ok()?);
+        }
+    }
+    if !vary.iter().any(|n| n == header::COOKIE || n == header::AUTHORIZATION) {
+        return None;
+    }
+    vary.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    vary.dedup();
+    Some(Caching { max_age, stale_if_error, vary })
 }
 
 /// What the check decided.
@@ -94,7 +220,7 @@ impl SignIn {
             .enable_http1()
             .wrap_connector(http);
         let client = Client::builder(TokioExecutor::new()).pool_idle_timeout(Duration::from_secs(60)).build(https);
-        Self { target, client }
+        Self { target, client, cache: Arc::default() }
     }
 
     /// Asks the provider about a request to the service `fqdn`. `headers`
@@ -137,17 +263,31 @@ impl SignIn {
         }
         h.insert("x-forwarded-proto", HeaderValue::from_static("https"));
 
+        let sent = check.headers().clone();
+        let cached = |provider_down: bool| {
+            self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).lookup(fqdn, &sent, Instant::now(), provider_down)
+        };
+        if let Some(hit) = cached(false) {
+            return hit;
+        }
         let resp = match tokio::time::timeout(TIMEOUT, self.client.request(check)).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 tracing::warn!(provider = %self.target.fqdn, error = %e, "sign-in unreachable");
-                return Verdict::Deny(plain(StatusCode::BAD_GATEWAY, "sign-in unreachable"));
+                return cached(true).unwrap_or_else(|| Verdict::Deny(plain(StatusCode::BAD_GATEWAY, "sign-in unreachable")));
             }
             Err(_) => {
                 tracing::warn!(provider = %self.target.fqdn, "sign-in did not answer in time");
-                return Verdict::Deny(plain(StatusCode::GATEWAY_TIMEOUT, "sign-in did not answer"));
+                return cached(true)
+                    .unwrap_or_else(|| Verdict::Deny(plain(StatusCode::GATEWAY_TIMEOUT, "sign-in did not answer")));
             }
         };
+        if resp.status().is_server_error() {
+            if let Some(hit) = cached(true) {
+                tracing::warn!(provider = %self.target.fqdn, status = %resp.status(), "sign-in failed; using its last answer");
+                return hit;
+            }
+        }
         let status = resp.status();
         if status.is_success() {
             let mut copied = HeaderMap::new();
@@ -161,6 +301,19 @@ impl SignIn {
                 .and_then(|v| v.to_str().ok())
                 .map(parse_groups)
                 .unwrap_or_default();
+            // Only an answer naming someone: a 2xx for a path the provider
+            // lets anyone through says nothing about who is asking.
+            let named = copied.get(identity.user.as_str()).is_some_and(|v| !v.is_empty());
+            if let (true, Some(c)) = (named, caching(resp.headers())) {
+                self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).store(
+                    fqdn,
+                    &sent,
+                    c,
+                    &copied,
+                    &groups,
+                    Instant::now(),
+                );
+            }
             return Verdict::Allow { headers: copied, groups };
         }
         let login = resp.headers().get("x-login-url").cloned();
@@ -272,6 +425,79 @@ mod tests {
         strip_identity(&mut h, &IdentityHeaders::default());
         assert!(h.get("x-auth-user").is_none());
         assert_eq!(h.get("x-other").unwrap(), "kept");
+    }
+
+    fn answer(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(*k, HeaderValue::from_static(v));
+        }
+        h
+    }
+
+    #[test]
+    fn only_what_the_provider_allows_per_person_is_kept() {
+        let authward = answer(&[("cache-control", "max-age=60"), ("vary", "cookie, host, x-forwarded-host")]);
+        let c = caching(&authward).expect("authward's answer is cacheable");
+        assert_eq!(c.max_age, Duration::from_secs(60));
+        assert_eq!(c.stale_if_error, Duration::ZERO);
+        assert_eq!(c.vary.iter().map(HeaderName::as_str).collect::<Vec<_>>(), ["cookie", "host", "x-forwarded-host"]);
+
+        let stale = answer(&[("cache-control", "private, max-age=30, stale-if-error=300"), ("vary", "Authorization")]);
+        assert_eq!(caching(&stale).unwrap().stale_if_error, Duration::from_secs(300));
+        let long = answer(&[("cache-control", "max-age=999999"), ("vary", "cookie")]);
+        assert_eq!(caching(&long).unwrap().max_age, MAX_CACHE_AGE, "capped");
+
+        for refused in [
+            answer(&[]),
+            answer(&[("cache-control", "max-age=60")]),
+            answer(&[("cache-control", "max-age=60"), ("vary", "host")]),
+            answer(&[("cache-control", "max-age=60"), ("vary", "*")]),
+            answer(&[("cache-control", "max-age=60, no-store"), ("vary", "cookie")]),
+            answer(&[("cache-control", "no-cache, max-age=60"), ("vary", "cookie")]),
+            answer(&[("cache-control", "max-age=0"), ("vary", "cookie")]),
+            answer(&[("vary", "cookie")]),
+        ] {
+            assert!(caching(&refused).is_none(), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn an_answer_is_reused_for_the_same_person_only_and_stale_only_while_the_provider_is_down() {
+        let mut cache = Cache::default();
+        let now = Instant::now();
+        let alice = answer(&[("cookie", "authward_session=a; theme=dark"), ("host", "jf.int.test")]);
+        let bob = answer(&[("cookie", "authward_session=b; theme=dark"), ("host", "jf.int.test")]);
+        let c = caching(&answer(&[("cache-control", "max-age=60, stale-if-error=60"), ("vary", "cookie, host")])).unwrap();
+        let who = answer(&[("x-auth-user", "alice")]);
+        assert!(cache.lookup("jf.int.test", &alice, now, false).is_none(), "nothing learnt yet");
+        cache.store("jf.int.test", &alice, c, &who, &["family".into()], now);
+
+        let Some(Verdict::Allow { headers, groups }) = cache.lookup("jf.int.test", &alice, now, false) else {
+            panic!("alice's answer is kept");
+        };
+        assert_eq!((headers.get("x-auth-user").unwrap(), groups.as_slice()), (&HeaderValue::from_static("alice"), &["family".to_string()][..]));
+        assert!(cache.lookup("jf.int.test", &bob, now, false).is_none(), "never bob's");
+        assert!(cache.lookup("other.int.test", &alice, now, false).is_none(), "nor another service's");
+
+        let later = now + Duration::from_secs(90);
+        assert!(cache.lookup("jf.int.test", &alice, later, false).is_none(), "stale: asked again");
+        assert!(cache.lookup("jf.int.test", &alice, later, true).is_some(), "unless the provider is down");
+        assert!(cache.lookup("jf.int.test", &alice, now + Duration::from_secs(121), true).is_none(), "and not for ever");
+    }
+
+    #[test]
+    fn the_cache_stays_bounded() {
+        let mut cache = Cache::default();
+        let now = Instant::now();
+        for i in 0..CACHE_ENTRIES + 5 {
+            let sent = answer(&[]);
+            let mut sent = sent;
+            sent.insert("cookie", HeaderValue::from_str(&format!("s={i}")).unwrap());
+            let c = Caching { max_age: Duration::from_secs(60), stale_if_error: Duration::ZERO, vary: vec![header::COOKIE] };
+            cache.store("jf.int.test", &sent, c, &HeaderMap::new(), &[], now);
+        }
+        assert!(cache.entries.len() <= CACHE_ENTRIES);
     }
 
     #[test]

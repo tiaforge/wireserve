@@ -37,6 +37,8 @@ socket2 = { version = "0.6", features = ["all"] }
 # verified against the public roots Mozilla ships.
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "logging", "aws-lc-rs"] }
 webpki-roots = "1"
+# Keys of the /verify cache (PLAN.md M37): never the raw cookie.
+sha2.workspace = true
 libc.workspace = true
 rand.workspace = true
 

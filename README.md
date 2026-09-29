@@ -734,6 +734,12 @@ A request to a service in `media`, served with TLS by its node, then goes:
    the provider's identity headers, anything else gets 403. The provider only
    authenticates; which groups get in is the grants' business.
 
+A provider that says its answer holds (`Cache-Control: max-age=…` and a `Vary`
+naming the cookie, as authward does) is not asked again for the same cookie
+until it expires, and with `stale-if-error` a signed-in browser keeps working
+through a short outage of the provider. Nothing is kept for a provider that
+says nothing.
+
 So the sign-in is never a per-service switch: a restricted service offers it
 exactly when a grant names an `oidc:` group, and a service in `default` never
 asks. While it does, the service's terminated 443 is open to every node — the
