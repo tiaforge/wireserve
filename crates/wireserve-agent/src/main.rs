@@ -575,8 +575,25 @@ async fn cmd_daemon(
     let learned =
         wireserve_agent::reflexive::learn(&coordinator_url, listen_port, wireserve_agent::reflexive::PROBE_TIMEOUT).await;
     let own_reflexive_addr = learned.addr;
-    let own_dialable_v4 = learned.dialable;
-    tracing::info!(reflexive_addr = ?own_reflexive_addr, dialable = ?own_dialable_v4, "one-shot reflexive-address probe");
+    let public_on_own_interface = own_reflexive_addr
+        .as_deref()
+        .and_then(|a| a.parse::<std::net::SocketAddrV4>().ok())
+        .is_some_and(|a| {
+            wireserve_agent::wg::interfaces_with_address(std::net::IpAddr::V4(*a.ip()), "").is_ok_and(|found| !found.is_empty())
+        });
+    let own_dialable_v4 = wireserve_agent::reflexive::dialable_verdict(
+        learned.dialable,
+        public_on_own_interface,
+        state.endpoint_addr.is_some(),
+    );
+    tracing::info!(
+        reflexive_addr = ?own_reflexive_addr,
+        second_answer = ?learned.dialable,
+        public_on_own_interface,
+        endpoint_configured = state.endpoint_addr.is_some(),
+        dialable = ?own_dialable_v4,
+        "one-shot reflexive-address probe"
+    );
 
     // Where the interop restores our own table from, if something else on
     // the host removes it (see `nftables::SharedRuleset`).

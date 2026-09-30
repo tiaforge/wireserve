@@ -473,12 +473,16 @@ list-services`) and port, but has no `.wg` name resolution.
 phone talks to each one directly — WireGuard between the two, as between
 agents. How depends on the node:
 
-- **A node that accepts inbound WireGuard** (a VPS, a home server with a port
-  forward) is dialled at its own endpoint. Each agent finds this out itself
-  when it starts: the coordinator answers its startup probe a second time,
-  from a port the node never sent anything to, and that answer only gets in
-  where the node's router or firewall lets unsolicited traffic in.
-  `list-peers` shows the result (`dialable=yes|no`).
+- **A node that accepts inbound WireGuard** is dialled at its own endpoint:
+  one whose public IPv4 is on its own interface (a VPS), or one you gave an
+  `--endpoint-addr` because you set up a port forward for it. Each agent
+  also checks at startup that unsolicited traffic gets in at all — the
+  coordinator answers its probe a second time, from a port the node never
+  sent anything to — and counts as not dialable if it doesn't. That check
+  alone can't say "yes": its answer comes from an address the node talks to
+  anyway, and many home and carrier NATs let exactly that in while dropping
+  a phone. `list-peers` shows the result (`dialable=yes|no`). A node that
+  agents reach only by hole-punching is relayed for phones.
 - **A node behind a NAT nothing gets through** (a home server without a port
   forward, CGNAT) is reached through a **carrier**: an approved node with a
   public IPv4 address that currently reaches it. The phone dials the

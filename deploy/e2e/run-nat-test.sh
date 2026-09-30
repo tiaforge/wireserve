@@ -248,15 +248,19 @@ echo "node2 mesh address: $AGENT2_MESH"
 
 log "each node tested whether it is dialable from outside (PLAN.md M40)"
 # The coordinator answers the startup probe a second time from a port the
-# node never sent to: only a NAT or firewall that lets unsolicited traffic
-# in delivers it. agent1 has a port-forward and agent2 an endpoint-
-# independent mapping; agent3's symmetric NAT drops it.
+# node never sent to. Getting it is necessary but not enough: it comes from
+# the coordinator's address, which a NAT filtering by address lets in while
+# dropping a phone. So a node also needs its public address on its own
+# interface, or an --endpoint-addr its operator set up. agent1 has the
+# latter; agent2's NAT does let anyone in, but nothing on agent2 can tell
+# that from filtering by address, so it counts as not dialable — relayed,
+# which works either way; agent3's symmetric NAT drops even the answer.
 PEERS=$(podman exec "$COORD" wireserve-admin list-peers)
-for want in "node1:yes" "node2:yes" "node3:no"; do
+for want in "node1:yes" "node2:no" "node3:no"; do
     echo "$PEERS" | grep "^${want%%:*}	" | grep -q "dialable=${want#*:}" \
         || { echo "$PEERS"; fail "${want%%:*} should report dialable=${want#*:}"; }
 done
-pass "the port-forwarded and endpoint-independent nodes are dialable, the symmetric one is not"
+pass "only the port-forwarded node counts as dialable"
 
 log "declaring a service on each of agent1 and agent2"
 podman exec "$AGENT1" wireserve serve svc-one 12345
