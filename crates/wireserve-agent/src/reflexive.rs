@@ -58,35 +58,12 @@ pub async fn learn_reflexive_addr(coordinator_url: &str, listen_port: u16, timeo
 pub struct Learned {
     /// The reflexive `ip:port`.
     pub addr: Option<String>,
-    /// Whether the coordinator's second answer, from a port this node never
-    /// sent to, reached `listen_port` (PLAN.md M40). Only a NAT or firewall
-    /// that lets some unsolicited traffic in lets it through — see
-    /// [`dialable_verdict`] for why that alone isn't enough. `None` when it
-    /// could not be told: no answer at all, or a coordinator that answers once.
+    /// Whether unsolicited traffic reaches `listen_port` (PLAN.md M40): the
+    /// coordinator's second answer, from a port this node never sent to,
+    /// arrived. Only a NAT or firewall that lets inbound traffic in lets it
+    /// through — a phone could dial this node directly. `None` when it could
+    /// not be told: no answer at all, or a coordinator that answers once.
     pub dialable: Option<bool>,
-}
-
-/// Whether a phone could dial this node directly (PLAN.md M40), from the
-/// probe's second answer and what else the node knows about itself.
-///
-/// The second answer alone proves too much: it comes from the coordinator's
-/// address, which this node talks to all the time, so a NAT that filters by
-/// sender *address* (common behind CGNAT and DS-Lite) lets it in while
-/// dropping a phone's first packet — found on a real mesh. It is still a
-/// reliable "no". A "yes" also needs a reason to believe nothing filters by
-/// address: the node's public address is on one of its own interfaces (no
-/// NAT at all), or its operator configured the endpoint (`--endpoint-addr`),
-/// which means a port forward they set up.
-#[must_use]
-pub fn dialable_verdict(second_answer: Option<bool>, public_on_own_interface: bool, endpoint_configured: bool) -> Option<bool> {
-    let vouched = public_on_own_interface || endpoint_configured;
-    match second_answer {
-        Some(false) => Some(false),
-        Some(true) => Some(vouched),
-        // Couldn't tell: only a node without a NAT, or with a configured
-        // forward, is left to the coordinator's older rule.
-        None => if vouched { None } else { Some(false) },
-    }
 }
 
 /// [`learn_reflexive_addr`], and whether this node is dialable from outside.
@@ -165,17 +142,6 @@ async fn try_learn(coordinator_url: &str, listen_port: u16, timeout: Duration) -
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_a_node_without_a_nat_or_with_a_configured_forward_is_dialable() {
-        // Behind a NAT that filters by address: the answer got in, a phone won't.
-        assert_eq!(dialable_verdict(Some(true), false, false), Some(false));
-        assert_eq!(dialable_verdict(Some(true), true, false), Some(true), "a VPS");
-        assert_eq!(dialable_verdict(Some(true), false, true), Some(true), "a port forward");
-        assert_eq!(dialable_verdict(Some(false), true, true), Some(false), "a firewall said no");
-        assert_eq!(dialable_verdict(None, false, false), Some(false));
-        assert_eq!(dialable_verdict(None, true, false), None);
-    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UdpSocket;
     use wireserve_types::reflexive::{parse_request, REQUEST_LEN};

@@ -3909,16 +3909,3 @@ were the only places a node still read traffic it merely forwarded.
     width of the terminal it draws on (`TIOCGWINSZ` on stderr; no terminal,
     no limit), and a code that can't be drawn never loses the export: the
     config is printed as without `--qr`, with the reason.
-
-251. **"Dialable" needs more than the second answer** (2026-09-30, found on
-    the real mesh: a phone got minipc's IPv4 endpoint, where only agents'
-    hole-punching gets through). The second answer comes from the
-    coordinator's address, which the node talks to all the time, so a NAT
-    that filters by sender address — minipc's DS-Lite/CGNAT, and many home
-    routers — lets it in and drops a phone. It remains a reliable "no". A
-    "yes" (`reflexive::dialable_verdict`) now also needs the node's public
-    address on one of its own interfaces (no NAT) or an operator-set
-    `--endpoint-addr` (a port forward). An endpoint-independent NAT that
-    admits anyone is relayed now too; nothing on the node can tell it from
-    one that filters by address, and the relay works either way. #243's
-    "known misclassification" is gone rather than documented.
