@@ -3928,3 +3928,11 @@ were the only places a node still read traffic it merely forwarded.
     where to make sure, for these. (A coordinator in a container on the
     carrier's host isn't recognised; its check still can't see a firewall
     in front of the host.)
+
+253. **Confirmed on the real mesh** (2026-09-30): the S25 on mobile data
+    reaches lego2 and minipc through strato's public relay ports, with
+    strato as coordinator and carrier. Nothing had to be opened by hand:
+    ufw rules added for 41001/41003 counted 0 packets and were removed
+    again — the relay's DNAT takes the packets before ufw's input chain, and
+    the interop opens its forward chain — and Strato's own firewall does not
+    block them.
