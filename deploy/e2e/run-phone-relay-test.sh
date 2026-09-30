@@ -249,15 +249,17 @@ podman exec "$PHONE" wg-quick up wg0 || fail "the official-client config would n
 
 in_netns_stdin "$CARRIER" nft -f - <<'NFT'
 table inet relayprobe {
+    # Postrouting, not forward: the host-firewall interop puts accepts at the
+    # head of every forward chain it finds, ahead of any counter.
     chain f {
-        type filter hook forward priority -10; policy accept;
-        meta l4proto tcp counter
-        meta l4proto udp counter
+        type filter hook postrouting priority 400; policy accept;
+        oifname "wireserve0" meta l4proto tcp counter
+        oifname "wireserve0" meta l4proto udp counter
     }
 }
 NFT
 
-svc_addr() { podman exec "$1" getent hosts "$2" | awk '{print $1}'; }
+svc_addr() { podman exec "$1" getent hosts "$2" | awk 'NR == 1 {print $1}'; }
 SVC_HOME=$(svc_addr "$CARRIER" svc-home.wg)
 [ -n "$SVC_HOME" ] || fail "svc-home.wg does not resolve"
 in_netns_bg "$HOME_AGENT" nc -l -k -p 12345
@@ -270,8 +272,8 @@ pass "svc-home reached"
 
 log "5/9: the carrier forwarded only the session's UDP"
 COUNTERS=$(in_netns "$CARRIER" nft list chain inet relayprobe f)
-TCP_SEEN=$(echo "$COUNTERS" | awk '/l4proto tcp/ {for (i=1;i<=NF;i++) if ($i=="packets") print $(i+1)}')
-UDP_SEEN=$(echo "$COUNTERS" | awk '/l4proto udp/ {for (i=1;i<=NF;i++) if ($i=="packets") print $(i+1)}')
+TCP_SEEN=$(echo "$COUNTERS" | awk '/l4proto tcp counter/ {for (i=1;i<=NF;i++) if ($i=="packets") print $(i+1)}')
+UDP_SEEN=$(echo "$COUNTERS" | awk '/l4proto udp counter/ {for (i=1;i<=NF;i++) if ($i=="packets") print $(i+1)}')
 [ "$TCP_SEEN" = "0" ] || fail "the carrier forwarded $TCP_SEEN TCP packets — it saw inside the session"
 [ "${UDP_SEEN:-0}" -gt 0 ] || fail "the carrier forwarded no UDP — the connection did not go through it"
 pass "$UDP_SEEN UDP packets and 0 TCP through the carrier"

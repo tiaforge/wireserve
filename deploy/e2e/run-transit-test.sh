@@ -227,7 +227,7 @@ podman exec "$COORD" wireserve-admin approve-service node2 svc-two || fail "coul
 podman exec "$COORD" wireserve-admin approve-service node4 svc-four || fail "could not approve svc-four"
 sleep 12
 
-svc_addr() { podman exec "$1" getent hosts "$2" | awk '{print $1}'; }
+svc_addr() { podman exec "$1" getent hosts "$2" | awk 'NR == 1 {print $1}'; }
 SVC2=$(svc_addr "$AGENT4" svc-two.wg)
 SVC4=$(svc_addr "$AGENT2" svc-four.wg)
 [ -n "$SVC2" ] && [ -n "$SVC4" ] || fail "a service name does not resolve (svc-two=$SVC2 svc-four=$SVC4)"
@@ -267,10 +267,12 @@ pass "agent4 was told to reach node2 through a relay, and says so"
 log "counting what agent1 forwards, by protocol"
 in_netns_stdin "$AGENT1" nft -f - <<'NFT'
 table inet relayprobe {
+    # Postrouting, not forward: the host-firewall interop puts accepts at the
+    # head of every forward chain it finds, ahead of any counter.
     chain f {
-        type filter hook forward priority -10; policy accept;
-        meta l4proto tcp counter
-        meta l4proto udp counter
+        type filter hook postrouting priority 400; policy accept;
+        oifname "wireserve0" meta l4proto tcp counter
+        oifname "wireserve0" meta l4proto udp counter
     }
 }
 NFT
@@ -291,8 +293,8 @@ fi
 
 log "confirming agent1 only ever forwarded the sessions' UDP, never the TCP inside them"
 COUNTERS=$(in_netns "$AGENT1" nft list chain inet relayprobe f)
-TCP_SEEN=$(echo "$COUNTERS" | awk '/l4proto tcp/ {for (i=1;i<=NF;i++) if ($i=="packets") print $(i+1)}')
-UDP_SEEN=$(echo "$COUNTERS" | awk '/l4proto udp/ {for (i=1;i<=NF;i++) if ($i=="packets") print $(i+1)}')
+TCP_SEEN=$(echo "$COUNTERS" | awk '/l4proto tcp counter/ {for (i=1;i<=NF;i++) if ($i=="packets") print $(i+1)}')
+UDP_SEEN=$(echo "$COUNTERS" | awk '/l4proto udp counter/ {for (i=1;i<=NF;i++) if ($i=="packets") print $(i+1)}')
 [ "$TCP_SEEN" = "0" ] || fail "agent1 forwarded $TCP_SEEN TCP packets — it saw the connections inside the relayed session"
 [ "${UDP_SEEN:-0}" -gt 0 ] || fail "agent1 forwarded no UDP at all — the connections did not go through it"
 pass "agent1 forwarded $UDP_SEEN UDP packets and 0 TCP: it relayed ciphertext only"
