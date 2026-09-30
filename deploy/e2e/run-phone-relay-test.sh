@@ -84,6 +84,12 @@ in_netns() {
     podman run --rm --name "wireserve-pr-helper-$$-$RANDOM" \
         --network "container:$target" --cap-add=NET_ADMIN "$DEBUG_IMG" "$@"
 }
+# For a command that reads a heredoc: `podman run` passes stdin on only with -i.
+in_netns_stdin() {
+    local target=$1; shift
+    podman run --rm -i --name "wireserve-pr-helper-$$-$RANDOM" \
+        --network "container:$target" --cap-add=NET_ADMIN "$DEBUG_IMG" "$@"
+}
 in_netns_bg() {
     local target=$1; shift
     podman run -d --name "wireserve-pr-helper-$$-$RANDOM" \
@@ -197,7 +203,7 @@ echo "homeserver's relay port: $RELAY_PORT"
 log "2/9: with the relay port blocked upstream, the export stops and says what to open"
 # A cloud firewall in front of the carrier: it drops the port before
 # anything on the carrier sees it.
-in_netns "$CARRIER" nft -f - <<NFT
+in_netns_stdin "$CARRIER" nft -f - <<NFT
 table ip cloudfw {
     chain pre {
         type filter hook prerouting priority -400; policy accept;
@@ -205,6 +211,8 @@ table ip cloudfw {
     }
 }
 NFT
+in_netns "$CARRIER" nft list table ip cloudfw | grep -q "udp dport $RELAY_PORT drop" \
+    || fail "the simulated cloud firewall is not in place — this check would prove nothing"
 if admin export-config phone --register-url "http://127.0.0.1:47820" >"$OUT/closed.conf" 2>"$OUT/closed.log"; then
     cat "$OUT/closed.log"
     fail "the export went ahead with the relay port closed"
@@ -239,7 +247,7 @@ podman exec "$PHONE" mkdir -p /etc/wireguard
 podman exec -i "$PHONE" tee /etc/wireguard/wg0.conf < "$OUT/phone.conf" >/dev/null
 podman exec "$PHONE" wg-quick up wg0 || fail "the official-client config would not come up"
 
-in_netns "$CARRIER" nft -f - <<'NFT'
+in_netns_stdin "$CARRIER" nft -f - <<'NFT'
 table inet relayprobe {
     chain f {
         type filter hook forward priority -10; policy accept;

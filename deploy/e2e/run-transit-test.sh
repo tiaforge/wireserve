@@ -79,6 +79,12 @@ in_netns() {
     podman run --rm --name "wireserve-transit-helper-$$-$RANDOM" \
         --network "container:$target" --cap-add=NET_ADMIN "$DEBUG_IMG" "$@"
 }
+# For a command that reads a heredoc: `podman run` passes stdin on only with -i.
+in_netns_stdin() {
+    local target=$1; shift
+    podman run --rm -i --name "wireserve-transit-helper-$$-$RANDOM" \
+        --network "container:$target" --cap-add=NET_ADMIN "$DEBUG_IMG" "$@"
+}
 in_netns_bg() {
     local target=$1; shift
     podman run -d --name "wireserve-transit-helper-$$-$RANDOM" \
@@ -259,7 +265,7 @@ podman exec "$AGENT4" wireserve list | grep -q "relayed by node1" || fail "wires
 pass "agent4 was told to reach node2 through a relay, and says so"
 
 log "counting what agent1 forwards, by protocol"
-in_netns "$AGENT1" nft -f - <<'NFT'
+in_netns_stdin "$AGENT1" nft -f - <<'NFT'
 table inet relayprobe {
     chain f {
         type filter hook forward priority -10; policy accept;
@@ -268,6 +274,8 @@ table inet relayprobe {
     }
 }
 NFT
+in_netns "$AGENT1" nft list table inet relayprobe >/dev/null \
+    || fail "the counting table is not in place — the UDP-only check would prove nothing"
 
 log "confirming a real service connection now succeeds end to end through agent1"
 if podman exec "$AGENT4" timeout 20 bash -c "exec 3<>/dev/tcp/$SVC2/12345"; then
