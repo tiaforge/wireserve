@@ -11,9 +11,9 @@ source of truth for *current status*, the spec is the source of truth for
 **Currently working on:** nothing in progress. M39–M41 (end-to-end
 relaying: carry interface, phone relays through a carrier's public port, the
 gateway retired; items 234–249) are done; plan
-`~/.claude/plans/wobbly-roaming-karp.md` (not in the repo). Their e2e suites
-(`run-transit-test.sh`, `run-phone-relay-test.sh`, `run-exit-test.sh`,
-`run-nat-test.sh`) have not been run since.
+`~/.claude/plans/wobbly-roaming-karp.md` (not in the repo).
+`run-phone-relay-test.sh` passes (2026-09-30); `run-transit-test.sh`,
+`run-exit-test.sh` and `run-nat-test.sh` have not been run since.
 
 Everything that can be verified here now is. What remains unverified is
 scale (three nodes, not thirty), real WAN paths, and long-running
@@ -3894,4 +3894,7 @@ were the only places a node still read traffic it merely forwarded.
     stopping the export, the relay, 0 TCP through the carrier, a roam,
     default-deny, `relay-ports`, refresh), `run-exit-test.sh` (`--exit
     node-gw`, no covering route), and `run-nat-test.sh`'s new dialability
-    check.
+    check. **2026-09-30: `run-phone-relay-test.sh` passes**, after three
+    harness fixes: heredocs need `podman run -i`; the interop's accepts sit
+    ahead of any counter in a forward chain, so the test counts in
+    postrouting; `getent hosts` can repeat a name.
