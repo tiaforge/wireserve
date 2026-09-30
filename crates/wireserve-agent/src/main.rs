@@ -522,9 +522,29 @@ async fn cmd_daemon(
     // is checked before any firewall state names it: one that belongs to
     // something else is left alone entirely, and this node then simply
     // can't be relayed to.
+    //
+    // Its name is claimed like the mesh interface's: every agent's interop
+    // removes tagged rules for a name no running agent claims, and that
+    // includes this agent's own mesh-interface worker, which deleted the
+    // carry's rules as fast as the carry's worker put them back — each
+    // round a burst of nftables events and firewall-cmd calls, which kept
+    // firewalld busy for as long as the agent ran.
     let carry = wireserve_agent::wg::carry_ifname(&ifname);
     let carry = match WgInterface::new(&carry).map(|c| c.classify(&private_key)) {
-        Ok(wireserve_agent::wg::Slot::Free | wireserve_agent::wg::Slot::Ours) => Some(carry),
+        Ok(wireserve_agent::wg::Slot::Free | wireserve_agent::wg::Slot::Ours) => match lock::IfnameClaim::take(&carry) {
+            Ok(Ok(claim)) => {
+                claim.hold();
+                Some(carry)
+            }
+            Ok(Err(holder)) => {
+                tracing::warn!(%carry, %holder, "not using the carry interface: sessions with this node can't be relayed");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(%carry, error = %e, "not using the carry interface: sessions with this node can't be relayed");
+                None
+            }
+        },
         Ok(wireserve_agent::wg::Slot::Foreign(reason)) => {
             tracing::warn!(%carry, %reason, "not using the carry interface: sessions with this node can't be relayed");
             None
