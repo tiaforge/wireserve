@@ -492,6 +492,34 @@ fn plan_routes(admin_client: &AdminClient, opts: &ExportOptions<'_>, exit: Optio
     for r in &plan.relayed {
         eprintln!("{}: relayed by {} at {} (end to end — {} can't read it)", r.node, r.carrier, r.endpoint, r.carrier);
     }
+    // What the config depends on outside the mesh, said every time: a port
+    // a firewall in front of the carrier must let in. Checked ones are
+    // named too, so the list is complete, not only what went wrong.
+    let mut needed: Vec<String> = plan
+        .relayed
+        .iter()
+        .map(|r| {
+            let (addr, port) = r.endpoint.rsplit_once(':').unwrap_or((&r.endpoint, "?"));
+            let state = match (r.open, r.unverifiable_here) {
+                (_, true) => format!(
+                    "NOT CHECKED: the coordinator runs on {}, so a check from it never leaves the machine — \
+                     make sure it is open in any firewall in front of {}",
+                    r.carrier, r.carrier
+                ),
+                (Some(true), _) => "seen open from outside".to_string(),
+                _ => "not seen open".to_string(),
+            };
+            format!("  UDP {port} inbound on {} ({addr}), for {}: {state}", r.carrier, r.node)
+        })
+        .collect();
+    needed.sort();
+    needed.dedup();
+    if !needed.is_empty() {
+        eprintln!("this config relies on these ports being open from the internet (see `wireserve-admin relay-ports`):");
+        for line in &needed {
+            eprintln!("{line}");
+        }
+    }
     Ok(plan)
 }
 

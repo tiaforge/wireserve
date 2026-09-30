@@ -3333,6 +3333,21 @@ async fn a_dialable_node_is_dialled_directly_and_one_that_is_not_is_relayed_thro
 }
 
 #[tokio::test]
+async fn a_node_that_never_said_whether_it_is_dialable_is_relayed_not_guessed_at() {
+    // Offline, or an older agent: its last recorded endpoint (here a public
+    // one) is no evidence a phone gets through — often it is a home NAT's.
+    let app = test_app();
+    let (gw, _minipc) = phone_scenario(&app).await;
+    let t = admin_create_node(&app.router, "fedora").await;
+    let fedora = register_node(&app.router, &t, "fedora", 51820).await["bearer_token"].as_str().unwrap().to_string();
+    poll_full(&app.router, &fedora, json!({ "services": [], "endpoint_addr_v4": "198.51.100.3:51820" })).await;
+    let plan = plan_with_the_check_answered(&app, &gw).await;
+    assert_eq!(plan["direct"], json!(["gw"]), "{plan}");
+    let relayed: Vec<&str> = plan["relayed"].as_array().unwrap().iter().map(|r| r["node"].as_str().unwrap()).collect();
+    assert!(relayed.contains(&"fedora") && relayed.contains(&"minipc"), "{plan}");
+}
+
+#[tokio::test]
 async fn nothing_reaches_a_node_no_carrier_qualifies_for_and_the_plan_says_why() {
     let app = test_app();
     let (_gw, _minipc) = phone_scenario(&app).await;

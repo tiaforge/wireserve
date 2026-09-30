@@ -3909,3 +3909,22 @@ were the only places a node still read traffic it merely forwarded.
     width of the terminal it draws on (`TIOCGWINSZ` on stderr; no terminal,
     no limit), and a code that can't be drawn never loses the export: the
     config is printed as without `--qr`, with the reason.
+
+251. **No guessing for a node that never said** (2026-09-30, found on the
+    real mesh). An offline node (or an older agent) has no dialability
+    report, and the plan fell back to its last recorded endpoint — a home
+    NAT's address, shared with the node behind it, so the phone got a dead
+    entry for fedora-workstation carrying minipc's address. Only a node that
+    reported itself dialable is dialled now; every other one is relayed,
+    preferring a carrier that reaches it right now but not requiring one,
+    since an offline node's relay works once it is back.
+252. **A port check on the coordinator's own host proves nothing.** With the
+    coordinator on the carrier, its datagram to the carrier's public address
+    never leaves the machine and read "open" past a provider's firewall;
+    the export then never said which port to open. Such a port is not
+    checked (`is_own_address`: binding to it works) and is marked
+    `unverifiable_here`, and the export now lists every port the config
+    relies on, each with what is known about it — `NOT CHECKED` with
+    where to make sure, for these. (A coordinator in a container on the
+    carrier's host isn't recognised; its check still can't see a firewall
+    in front of the host.)

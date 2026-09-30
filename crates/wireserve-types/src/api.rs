@@ -780,9 +780,14 @@ pub struct RelayPlanEntry {
     /// `<carrier public IPv4>:<the node's relay port>`, the `Endpoint =`.
     pub endpoint: String,
     /// Whether the port was seen open from outside; `None` when it could
-    /// not be checked in time.
+    /// not be checked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open: Option<bool>,
+    /// The carrier is the coordinator's own host, so a check from here
+    /// never leaves the machine and can't see a firewall in front of it:
+    /// not checked, and the operator is told to make sure by hand.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unverifiable_here: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -479,9 +479,11 @@ agents. How depends on the node:
   from a port the node never sent anything to, and that answer only gets in
   where the node's router or firewall lets unsolicited traffic in.
   `list-peers` shows the result (`dialable=yes|no`).
-- **A node behind a NAT nothing gets through** (a home server without a port
-  forward, CGNAT) is reached through a **carrier**: an approved node with a
-  public IPv4 address that currently reaches it. The phone dials the
+- **Every other node** — behind a NAT nothing gets through (a home server
+  without a port forward, CGNAT), or one that hasn't said, because it is
+  offline or runs an older agent — is reached through a **carrier**: an
+  approved node with a public IPv4 address, preferably one that reaches it
+  right now. An offline node's relay works once it is back. The phone dials the
   carrier's public address on that node's **relay port**, and the carrier
   sends the packets on to the node without being able to read them — the
   session is the phone's and the node's, the carrier holds no key to it.
@@ -494,7 +496,11 @@ wireserve-admin export-config myphone --qr
 
 Before writing anything the export checks, from outside, that every relay
 port it needs is open, since that is the one thing that may need doing by
-hand (see "What each machine needs open"). A closed one stops it:
+hand (see "What each machine needs open"), and it lists every port the
+config relies on each time. A port on the coordinator's own host can't be
+checked — the check would never leave the machine — so it is listed as
+`NOT CHECKED`: make sure it is open in any firewall in front of that host
+(a cloud provider's panel, say). A closed one stops the export:
 
 ```
 these relay ports must be reachable from the internet first:
