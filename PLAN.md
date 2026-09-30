@@ -12,8 +12,8 @@ source of truth for *current status*, the spec is the source of truth for
 relaying: carry interface, phone relays through a carrier's public port, the
 gateway retired; items 234–249) are done; plan
 `~/.claude/plans/wobbly-roaming-karp.md` (not in the repo).
-`run-phone-relay-test.sh` passes (2026-09-30); `run-transit-test.sh`,
-`run-exit-test.sh` and `run-nat-test.sh` have not been run since.
+`run-phone-relay-test.sh`, `run-transit-test.sh`, `run-exit-test.sh` and
+`run-nat-test.sh` all pass (2026-09-30).
 
 Everything that can be verified here now is. What remains unverified is
 scale (three nodes, not thirty), real WAN paths, and long-running
@@ -3897,4 +3897,6 @@ were the only places a node still read traffic it merely forwarded.
     check. **2026-09-30: `run-phone-relay-test.sh` passes**, after three
     harness fixes: heredocs need `podman run -i`; the interop's accepts sit
     ahead of any counter in a forward chain, so the test counts in
-    postrouting; `getent hosts` can repeat a name.
+    postrouting; `getent hosts` can repeat a name. `run-transit-test.sh`
+    (carrier forwarded UDP only), `run-exit-test.sh` and `run-nat-test.sh`
+    (dialability) pass too.
