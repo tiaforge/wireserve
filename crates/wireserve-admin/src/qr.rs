@@ -9,11 +9,10 @@
 //! **The binding constraint is terminal width, not QR capacity.** A QR code
 //! is `4 * version + 17` modules square plus a 4-module quiet zone each side,
 //! and half-block characters only halve the *vertical* extent — horizontally
-//! it is still one column per module. So a code that fits comfortably inside
-//! byte capacity (2953 bytes at version 40) would need 185 columns to print
-//! and could not be scanned off a normal terminal at all. [`MAX_COLUMNS`] is
-//! what actually decides whether `--qr` is offered, and the caller is pointed
-//! at `--out` when a conf exceeds it.
+//! it is still one column per module. So the code is checked against the
+//! terminal's actual width ([`terminal_columns`]): a config lists every node
+//! (PLAN.md M40), so it grows with the mesh, and a phone scans a big code off
+//! a wide terminal fine — only a code whose lines would wrap is refused.
 //!
 //! Colors are written explicitly rather than relying on the terminal's own
 //! foreground and background. A scanner needs dark modules on a light field;
@@ -26,36 +25,48 @@ use qrcodegen::{QrCode, QrCodeEcc};
 /// code. Four is the spec minimum.
 const QUIET_ZONE: usize = 4;
 
-/// The widest code worth printing, in terminal columns including the quiet
-/// zone. 116 columns admits up to a version-22 code (105 modules), which is
-/// roughly 1.1 kB of payload — comfortably more than a gateway-routed conf
-/// needs, and about the point past which a phone camera stops resolving
-/// modules off a screen anyway.
-pub const MAX_COLUMNS: usize = 116;
-
 #[derive(Debug, thiserror::Error)]
 pub enum QrError {
     #[error(
-        "config is {bytes} bytes — too large for a QR code that fits a terminal \
-         (needs {columns} columns, limit {MAX_COLUMNS}). Write it to a file with \
-         --out and transfer that instead."
+        "the QR code needs {columns} columns and this terminal has {available} — widen the \
+         window or zoom out, or write the config to a file with --out and transfer that"
     )]
-    TooWide { bytes: usize, columns: usize },
+    TooWide { columns: usize, available: usize },
     #[error("config is {0} bytes, which exceeds what any QR code can carry")]
     TooLong(usize),
+}
+
+/// How many columns the terminal on stderr has, where the code is drawn;
+/// `None` when stderr is no terminal, and nothing then wraps a line.
+#[must_use]
+pub fn terminal_columns() -> Option<usize> {
+    // SAFETY: TIOCGWINSZ writes one `winsize` into the struct passed, and
+    // fails harmlessly on a descriptor that is no terminal.
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        (libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0).then_some(usize::from(ws.ws_col))
+    }
 }
 
 /// Renders `text` as a QR code drawn with half-block characters, one string
 /// ready to print. Low error correction is deliberate: the code is on a
 /// screen for seconds, not printed on a label that will be scuffed, and
 /// lower ECC means a smaller code and so a narrower terminal.
+///
+/// As wide as it has to be: a config lists every node, so it grows with the
+/// mesh, and a phone scans a large code off a screen fine. Only a code wider
+/// than the terminal is refused, since its lines would wrap into noise.
 pub fn render(text: &str) -> Result<String, QrError> {
+    render_within(text, terminal_columns())
+}
+
+fn render_within(text: &str, available: Option<usize>) -> Result<String, QrError> {
     let code = QrCode::encode_text(text, QrCodeEcc::Low)
         .map_err(|_| QrError::TooLong(text.len()))?;
     let size = code.size() as usize;
     let columns = size + 2 * QUIET_ZONE;
-    if columns > MAX_COLUMNS {
-        return Err(QrError::TooWide { bytes: text.len(), columns });
+    if let Some(available) = available.filter(|a| columns > *a) {
+        return Err(QrError::TooWide { columns, available });
     }
 
     // `dark(x, y)` reads one module, treating everything outside the code as
@@ -146,39 +157,39 @@ mod tests {
     }
 
     #[test]
-    fn a_realistic_gateway_conf_fits() {
-        // [Interface] plus a gateway peer and two direct peers — the shape a
-        // gateway-routed export actually produces.
+    fn a_code_wider_than_the_terminal_is_refused_and_one_that_fits_is_drawn() {
+        // A config with a handful of relayed nodes: about 1.3 kB, too wide
+        // for the old fixed limit of 116 columns.
         let conf = format!(
-            "[Interface]\nPrivateKey = {k}\nAddress = 10.1.0.7/32, fd12:3456:789a::7/128\n\n{peers}",
+            "[Interface]\nPrivateKey = {k}\nAddress = 10.1.0.7/32, fd12:3456:789a::7/128\nMTU = 1340\n\n{peers}",
             k = "A".repeat(44),
-            peers = (0..3)
+            peers = (0..6)
                 .map(|i| format!(
                     "[Peer]\nPublicKey = {k}\nAllowedIPs = 10.1.0.{i}/32, fd12:3456:789a::{i}/128\n\
-                     Endpoint = node{i}.example.com:51820\nPersistentKeepalive = 25\n\n",
+                     Endpoint = 85.215.231.166:4100{i}\nPersistentKeepalive = 25\n\n",
                     k = "B".repeat(44)
                 ))
                 .collect::<String>()
         );
-        let rendered = render(&conf).expect("a 3-peer conf must fit");
+        let rendered = render_within(&conf, Some(200)).expect("fits a 200-column terminal");
         let width = plain(&rendered)[0].chars().count();
-        assert!(width <= MAX_COLUMNS, "{width} columns");
-    }
-
-    #[test]
-    fn an_oversized_conf_is_refused_rather_than_rendered_unscannable() {
-        let huge = "x".repeat(4000);
-        match render(&huge) {
-            Err(QrError::TooWide { .. } | QrError::TooLong(_)) => {}
-            Ok(_) => panic!("a 4000-byte conf must not render"),
+        assert!(width > 116 && width <= 200, "{width} columns");
+        match render_within(&conf, Some(116)) {
+            Err(QrError::TooWide { columns, available: 116 }) => assert_eq!(columns, width),
+            other => panic!("{:?}", other.map(|_| ())),
         }
+        assert!(render_within(&conf, None).is_ok(), "no terminal, nothing wraps");
     }
 
     #[test]
-    fn the_refusal_names_the_size_and_points_at_the_file_path() {
-        let err = render(&"x".repeat(1800)).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("1800"), "{msg}");
+    fn more_than_any_qr_code_holds_is_refused() {
+        assert!(matches!(render_within(&"x".repeat(4000), None), Err(QrError::TooLong(4000))));
+    }
+
+    #[test]
+    fn the_refusal_says_how_wide_and_points_at_the_file_path() {
+        let msg = render_within(&"x".repeat(1800), Some(80)).unwrap_err().to_string();
+        assert!(msg.contains("80"), "{msg}");
         assert!(msg.contains("--out"), "{msg}");
     }
 }

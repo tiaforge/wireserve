@@ -728,14 +728,19 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 wireserve_admin::cmd_export_config(&client, &register_url, &name, &opts)?
             };
             let conf = &exported.conf;
-            // The QRs are rendered before anything is written, so a config
-            // too wide to scan fails without leaving a half-done export behind.
-            let rendered_qr = if qr { Some(wireserve_admin::qr::render(conf)?) } else { None };
-            let rendered_exit_qr = match (&exported.exit_conf, qr) {
-                (Some(exit_conf), true) => Some(wireserve_admin::qr::render(exit_conf)?),
-                _ => None,
-            };
+            // By now the export has happened — a refresh has already retired
+            // the old key — so a code that can't be drawn must not lose the
+            // config: it is printed instead, as without --qr.
+            let rendered_qr = qr.then(|| wireserve_admin::qr::render(conf));
+            let rendered_exit_qr = exported.exit_conf.as_ref().filter(|_| qr).map(|c| wireserve_admin::qr::render(c));
+            let qr_failed = [&rendered_qr, &rendered_exit_qr].iter().any(|r| matches!(r, Some(Err(_))));
             match &out {
+                None if qr_failed => {
+                    print!("{conf}");
+                    if let Some(exit_conf) = &exported.exit_conf {
+                        print!("\n# ---- full tunnel ----\n{exit_conf}");
+                    }
+                }
                 Some(path) => {
                     write_conf_file(path, conf)?;
                     if let Some(exit_conf) = &exported.exit_conf {
@@ -747,7 +752,18 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 None => print!("{conf}"),
             }
             for (label, rendered) in [("", rendered_qr), (" (full tunnel)", rendered_exit_qr)] {
-                let Some(rendered) = rendered else { continue };
+                let rendered = match rendered {
+                    None => continue,
+                    Some(Ok(r)) => r,
+                    Some(Err(e)) => {
+                        eprintln!(
+                            "\nno QR code{label}: {e}. The config is {} — nothing is lost, and this \
+                             export does not need running again.",
+                            if out.is_some() { "in the file" } else { "printed above" }
+                        );
+                        continue;
+                    }
+                };
                 // stderr: the config on stdout is the program's output and
                 // stays pipeable, the code is for a human looking at it.
                 eprintln!();

@@ -3900,3 +3900,12 @@ were the only places a node still read traffic it merely forwarded.
     postrouting; `getent hosts` can repeat a name. `run-transit-test.sh`
     (carrier forwarded UDP only), `run-exit-test.sh` and `run-nat-test.sh`
     (dialability) pass too.
+
+250. **The QR code is as wide as the terminal allows** (2026-09-30, found on
+    the real mesh). A config now lists every node, so the fixed 116-column
+    limit from the gateway days refused a 1.3 kB one — after a `--refresh`
+    had already retired the old key, and without printing the new config
+    anywhere, which left the phone cut off. `qr::render` now checks the
+    width of the terminal it draws on (`TIOCGWINSZ` on stderr; no terminal,
+    no limit), and a code that can't be drawn never loses the export: the
+    config is printed as without `--qr`, with the reason.
