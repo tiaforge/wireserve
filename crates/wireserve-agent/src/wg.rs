@@ -840,12 +840,25 @@ pub fn carry_ifname(main: &str) -> String {
     format!("{base}{SUFFIX}")
 }
 
+/// The mesh interface's MTU, 20 below WireGuard's usual 1420. WireGuard pads
+/// what it encrypts to a multiple of 16, up to the interface's MTU, so with
+/// 1420 a relayed packet of 1400 (`CARRY_MTU` plus its own outer header)
+/// went out padded to 1408, and as 1468 on the wire: 20 (IPv4) + 8 (UDP) +
+/// 32 (WireGuard) is 60. DS-Lite carries 1460 (Vodafone cable, measured on
+/// the real mesh), so every full-size relayed packet to or from such a node
+/// was fragmented, and the fragments crossed the provider's NAT only some
+/// of the time: connections opened, but TLS and SSH stalled for minutes.
+/// At 1400 the padding stops at 1400 and the packet is 1460 on the wire
+/// (1480 over IPv6).
+pub const MESH_MTU: u32 = 1400;
+
 /// The carry interface's MTU. Its packets travel inside the mesh
-/// interface's own, so they are an outer header shorter than the mesh
-/// interface's 1420: 20 (IPv4) + 8 (UDP) + 32 (WireGuard) is 60, and 80
-/// leaves room for an IPv6 outer header too. Larger ones would be
-/// fragmented by the carrier's tunnel on every full-size packet.
-pub const CARRY_MTU: u32 = 1340;
+/// interface's own, between mesh addresses, which are IPv4 (`relay_assignments`),
+/// so they are one IPv4 outer header (60, see `MESH_MTU`) shorter: a full
+/// one exactly fills a mesh packet. Larger ones would be fragmented by the
+/// carrier's tunnel on every full-size packet. A phone's relayed config
+/// uses the same 1340 (`export_config::render_conf`).
+pub const CARRY_MTU: u32 = MESH_MTU - 60;
 
 /// Builds the desired kernel peer set (keyed by pubkey) from a `/poll`
 /// response's `peers` array, skipping this node's own entry (peers
@@ -1285,7 +1298,7 @@ impl WgInterface {
             ],
             port: listen_port,
             peers: Vec::new(),
-            mtu: None,
+            mtu: Some(MESH_MTU),
             fwmark: None,
         };
         self.api.configure_interface(&config)?;
@@ -2689,6 +2702,7 @@ mod tests {
         let port = wg.bring_up_carry(&own.to_string(), "100.90.0.1".parse().unwrap(), "fd00:90::1".parse().unwrap(), Some(50123)).unwrap();
         assert_eq!(port, 50123);
         assert_eq!(wg.carry_port(), Some(50123));
+        assert!(sh("ip -o link show wgtest").contains("mtu 1400"));
         assert!(sh("ip -o link show wgtest-t").contains("mtu 1340"));
 
         let (_, _, _, mut peers) = relay_directory();

@@ -183,7 +183,7 @@ fn iifname_is(ifname: &str) -> Statement<'static> {
 
 /// `ct state { established, related }`. RELATED alongside ESTABLISHED:
 /// ICMP errors tied to a tracked flow — packet-too-big for path MTU
-/// discovery in particular, which WireGuard's 1420 MTU makes routine — are
+/// discovery in particular, which WireGuard's reduced MTU makes routine — are
 /// RELATED and would otherwise be dropped.
 fn established_or_related() -> Statement<'static> {
     Statement::Match(Match {

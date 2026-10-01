@@ -3936,3 +3936,19 @@ were the only places a node still read traffic it merely forwarded.
     again — the relay's DNAT takes the packets before ufw's input chain, and
     the interop opens its forward chain — and Strato's own firewall does not
     block them.
+
+254. **The mesh interface's MTU is 1400** (2026-10-01, found on the real
+    mesh: lego2 and the S25 lost minipc for minutes at a time, while TCP
+    connections still opened and SSH's greeting came through; TLS and SSH's
+    key exchange stalled). WireGuard pads what it encrypts to a multiple of
+    16, up to the interface's MTU, which #234's 1340 didn't count: a full
+    relayed packet of 1400 went out of a 1420 mesh interface padded to
+    1408, as 1468 on the wire. minipc sits behind Vodafone's DS-Lite, whose
+    IPv4 carries 1460 (measured: "Frag needed, mtu = 1460" from
+    `192.0.0.2`), so every full-size relayed packet to or from it was
+    fragmented, and the fragments crossed the provider's NAT only some of
+    the time. `wg::MESH_MTU` = 1400 caps the padding at 1400, i.e. 1460 on
+    the wire (1480 over IPv6); `CARRY_MTU` stays 1340, now derived from it,
+    and so does a phone's relayed config. Set on every start, so an
+    interface kept from an older build changes too. Every node should get
+    it: the carrier pads on its own mesh interface.
