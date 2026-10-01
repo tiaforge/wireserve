@@ -364,13 +364,35 @@ pub struct EndpointPeerState {
 pub const ENDPOINT_GRACE_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long a confirmed tier stays confirmed without a newer handshake. A
 /// live session handshakes afresh about every two minutes (it rekeys when
-/// sending on a key older than 120s, and the 25s keepalive keeps it
-/// sending), and never lasts past 180s without one — plus a grace window
-/// for when the poll happens to see it. Without this a confirmed tier fell
-/// back to `Wan` at the first poll that saw no newer handshake, which on a
-/// live session is nearly every one.
+/// sending on a key older than 120s, and the keepalive keeps it sending),
+/// and never lasts past 180s without one — plus a grace window for when the
+/// poll happens to see it. Without this a confirmed tier fell back to `Wan`
+/// at the first poll that saw no newer handshake, which on a live session
+/// is nearly every one. A path that dies is noticed sooner, by its silence
+/// ([`PEER_SILENT_MAX`]); this only catches a peer that keeps sending
+/// without ever completing a handshake.
 pub const ENDPOINT_CONFIRMED_MAX: std::time::Duration =
     std::time::Duration::from_secs(180).saturating_add(ENDPOINT_GRACE_WINDOW);
+/// How long a peer may send nothing at all before its path counts as dead.
+/// Every agent sends a keepalive at the latest [`AGENT_KEEPALIVE_SECS`]
+/// after its last packet, so a live path delivers something at least that
+/// often: this is three of them, so two lost in a row don't count, and it
+/// still covers a peer on an older build that keeps alive every 25s. The
+/// handshake can't tell sooner: WireGuard only renews it every two minutes,
+/// which is what made a dead direct path take four minutes to be given up.
+pub const PEER_SILENT_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often the daemon reads the kernel's receive counters between polls
+/// (`main.rs`), so a path that went quiet is noticed within this of
+/// [`PEER_SILENT_MAX`], and the poll that asks for a relay runs at once.
+pub const LIVENESS_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// The keepalive towards another agent, on both interfaces. It bounds how
+/// soon a dead path can be told from a quiet one ([`PEER_SILENT_MAX`]), and
+/// costs one 32-byte packet per peer this often.
+pub const AGENT_KEEPALIVE_SECS: u16 = 10;
+/// The keepalive towards a phone or any other static peer: every packet
+/// can wake its radio, so it stays at the usual 25s.
+pub const STATIC_KEEPALIVE_SECS: u16 = 25;
+
 /// The first backoff before retrying a tier that just failed.
 pub const ENDPOINT_RETRY_BACKOFF_INITIAL: std::time::Duration = std::time::Duration::from_secs(120);
 /// The cap the backoff doubles up to on repeated failures — bounds the
@@ -430,12 +452,17 @@ fn next_tier_round(candidates: &PeerTierCandidates<'_>, after: EndpointTier) -> 
 /// of a NAT hole-punch from ever sending at the same time. It keeps
 /// dialling its ranked candidates, taking turns each grace window, until
 /// one handshakes.
+///
+/// `silent`: nothing has arrived from the peer for [`PEER_SILENT_MAX`]. A
+/// confirmed tier is then given up at once rather than when its last
+/// handshake ages past [`ENDPOINT_CONFIRMED_MAX`].
 #[must_use]
 pub fn resolve_endpoint_candidate(
     candidates: PeerTierCandidates<'_>,
     kernel_last_handshake: Option<chrono::DateTime<chrono::Utc>>,
     state: Option<EndpointPeerState>,
     transited: bool,
+    silent: bool,
     now: std::time::Instant,
 ) -> (EndpointTier, Option<EndpointPeerState>) {
     if RANKED_TIERS.iter().all(|&t| candidate_value(&candidates, t).is_none()) {
@@ -463,11 +490,12 @@ pub fn resolve_endpoint_candidate(
     if let Some(s) = &state {
         if RANKED_TIERS.contains(&s.current) {
             if let (Some(_value), true) = (candidate_value(&candidates, s.current), per_tier.contains_key(&s.current)) {
-                let advanced = match (kernel_last_handshake, s.baseline_handshake) {
-                    (Some(h), Some(baseline)) => h > baseline,
-                    (Some(_), None) => true,
-                    (None, _) => false,
-                };
+                let advanced = !silent
+                    && match (kernel_last_handshake, s.baseline_handshake) {
+                        (Some(h), Some(baseline)) => h > baseline,
+                        (Some(_), None) => true,
+                        (None, _) => false,
+                    };
                 let tier = s.current;
                 if advanced {
                     per_tier.get_mut(&tier).unwrap().backoff = ENDPOINT_RETRY_BACKOFF_INITIAL;
@@ -482,7 +510,8 @@ pub fn resolve_endpoint_candidate(
                         }),
                     );
                 }
-                let still_confirmed = s.confirmed_at.is_some_and(|c| now.duration_since(c) < ENDPOINT_CONFIRMED_MAX);
+                let still_confirmed =
+                    !silent && s.confirmed_at.is_some_and(|c| now.duration_since(c) < ENDPOINT_CONFIRMED_MAX);
                 if still_confirmed || now.duration_since(s.switched_at) < ENDPOINT_GRACE_WINDOW {
                     return (
                         tier,
@@ -577,6 +606,18 @@ pub struct EndpointTracker {
     /// The peers last cycle's directory routed via a carrier (PLAN.md
     /// M23) — see [`Self::peers_wanting_transit`].
     transited: std::collections::HashSet<String>,
+    /// Each peer's receive counter as last read, and when it last moved —
+    /// see [`Self::observe_rx`].
+    rx: HashMap<String, RxSeen>,
+    /// The tracked peers already found silent, so each going quiet wakes
+    /// the poll loop once.
+    silent_noted: std::collections::HashSet<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RxSeen {
+    bytes: u64,
+    changed_at: std::time::Instant,
 }
 
 impl EndpointTracker {
@@ -589,7 +630,8 @@ impl EndpointTracker {
     ) -> EndpointTier {
         let state = self.states.remove(pubkey);
         let transited = self.transited.contains(pubkey);
-        let (tier, new_state) = resolve_endpoint_candidate(candidates, kernel_last_handshake, state, transited, now);
+        let silent = self.silent(pubkey, now);
+        let (tier, new_state) = resolve_endpoint_candidate(candidates, kernel_last_handshake, state, transited, silent, now);
         if let Some(new_state) = new_state {
             self.states.insert(pubkey.to_string(), new_state);
         }
@@ -602,6 +644,64 @@ impl EndpointTracker {
     pub fn prune<'a>(&mut self, current: impl Iterator<Item = &'a str>) {
         let keep: std::collections::HashSet<&str> = current.collect();
         self.states.retain(|k, _| keep.contains(k.as_str()));
+        self.rx.retain(|k, _| keep.contains(k.as_str()));
+        self.silent_noted.retain(|k| keep.contains(k.as_str()));
+    }
+
+    /// Records each peer's receive counter (`rx` = pubkey and the kernel's
+    /// `rx_bytes`). A peer seen for the first time counts as heard from
+    /// now, so a restart or a new peer gets a full [`PEER_SILENT_MAX`]
+    /// before it can count as silent.
+    ///
+    /// Returns whether a peer whose endpoint is tracked has just gone
+    /// silent: the caller polls at once, so the relay is asked for now
+    /// rather than at the next interval. Only tracked peers count — another
+    /// agent, never a phone, whose quiet is normal and which no relay could
+    /// help anyway.
+    pub fn observe_rx<'a>(&mut self, rx: impl IntoIterator<Item = (&'a str, u64)>, now: std::time::Instant) -> bool {
+        for (pubkey, bytes) in rx {
+            match self.rx.get_mut(pubkey) {
+                Some(seen) if seen.bytes == bytes => {}
+                Some(seen) => *seen = RxSeen { bytes, changed_at: now },
+                None => {
+                    self.rx.insert(pubkey.to_string(), RxSeen { bytes, changed_at: now });
+                }
+            }
+        }
+        let mut newly = false;
+        for pubkey in self.states.keys() {
+            if self.silent(pubkey, now) {
+                if self.silent_noted.insert(pubkey.clone()) {
+                    tracing::info!(peer = %pubkey, "nothing received from this peer for {}s; its path counts as dead", PEER_SILENT_MAX.as_secs());
+                    newly = true;
+                }
+            } else {
+                self.silent_noted.remove(pubkey);
+            }
+        }
+        newly
+    }
+
+    /// Whether nothing has arrived from `pubkey` for [`PEER_SILENT_MAX`]. A
+    /// peer never observed is not silent: nothing is known about it.
+    #[must_use]
+    pub fn silent(&self, pubkey: &str, now: std::time::Instant) -> bool {
+        self.rx.get(pubkey).is_some_and(|seen| now.duration_since(seen.changed_at) >= PEER_SILENT_MAX)
+    }
+
+    /// [`transit_reachable_peers`], less every peer that has gone silent:
+    /// a carrier whose own path to a peer died must stop offering it at
+    /// once, not when the last handshake ages out.
+    #[must_use]
+    pub fn reachable_peers<'a>(
+        &self,
+        handshakes: &'a HashMap<String, Option<chrono::DateTime<chrono::Utc>>>,
+        now_utc: chrono::DateTime<chrono::Utc>,
+        now: std::time::Instant,
+    ) -> Vec<&'a str> {
+        let mut alive = transit_reachable_peers(handshakes, now_utc);
+        alive.retain(|pk| !self.silent(pk, now));
+        alive
     }
 
     /// Every pubkey with real tracked history (it once had a ranked
@@ -645,6 +745,12 @@ impl EndpointTracker {
     ///   briefly moves this peer off `Wan`, which would drop the transit
     ///   and black-hole the pair for a grace window each time.
     ///
+    /// - **silent** (see [`Self::silent`]): its path is dead, whatever its
+    ///   tier and however recent its last handshake. Asked for at once,
+    ///   without the `Wan` grace window: the direct candidates go on being
+    ///   dialled through the probe entry, and the first direct handshake
+    ///   ends the relay again.
+    ///
     /// A peer with no tracked history that isn't transited never counts:
     /// the ordinary plain-WAN-works-fine case must never request transit
     /// help for free.
@@ -654,15 +760,17 @@ impl EndpointTracker {
         now_utc: chrono::DateTime<chrono::Utc>,
         now: std::time::Instant,
     ) -> Vec<&'a str> {
-        let fresh: std::collections::HashSet<&str> = transit_reachable_peers(handshakes, now_utc).into_iter().collect();
+        let alive: std::collections::HashSet<&str> = self.reachable_peers(handshakes, now_utc, now).into_iter().collect();
         let wan_given_up = self
             .states
             .iter()
             .filter(|(_, s)| s.current == EndpointTier::Wan && now.duration_since(s.switched_at) >= ENDPOINT_GRACE_WINDOW)
             .map(|(k, _)| k.as_str());
+        let silent = self.states.keys().map(String::as_str).filter(|pk| self.silent(pk, now));
         let mut wanted: Vec<&str> = wan_given_up
             .chain(self.transited.iter().map(String::as_str))
-            .filter(|pk| !fresh.contains(pk))
+            .chain(silent)
+            .filter(|pk| !alive.contains(pk))
             .collect();
         wanted.sort_unstable();
         wanted.dedup();
@@ -679,10 +787,10 @@ impl EndpointTracker {
 /// How fresh a kernel `last_handshake` must be to count as "currently,
 /// actually reachable" for transit purposes (PLAN.md M23) — comfortably
 /// above WireGuard's own ~120s `REKEY_AFTER_TIME` ceiling under
-/// continuous 25s keepalive traffic (see `desired_peers`'s
+/// continuous keepalive traffic (see `desired_peers`'s
 /// `persistent_keepalive_interval`), so a genuinely live connection is
-/// never misreported, while still catching a dropped peer within a
-/// handful of poll cycles.
+/// never misreported. A path that died within it is caught by its silence
+/// instead ([`EndpointTracker::reachable_peers`]).
 pub const TRANSIT_REACHABLE_HANDSHAKE_MAX: std::time::Duration = std::time::Duration::from_secs(150);
 
 /// This node's own ground truth for "I actually reach this peer right
@@ -923,7 +1031,9 @@ pub fn desired_peers(
         }
         // This node likely roams networks (dynamic DNS, NAT rebinding) —
         // same reasoning as spec §9's export-config PersistentKeepalive.
-        peer.persistent_keepalive_interval = Some(25);
+        // Towards another agent also what tells a dead path from a quiet
+        // one (`PEER_SILENT_MAX`).
+        peer.persistent_keepalive_interval = Some(keepalive_for(p));
         desired.insert(key, peer);
     }
 
@@ -955,10 +1065,21 @@ pub fn desired_carry_peers(
         peer.allowed_ips = peer_allowed_ips(&p.ip4, &p.ip6);
         peer.allowed_ips.extend(owned_vips(services, &p.name).map(|vip| IpAddrMask::host(IpAddr::V4(vip))));
         peer.endpoint = Some(std::net::SocketAddr::from((route.carrier, route.port)));
-        peer.persistent_keepalive_interval = Some(25);
+        peer.persistent_keepalive_interval = Some(AGENT_KEEPALIVE_SECS);
         desired.insert(key, peer);
     }
     desired
+}
+
+/// The keepalive towards `p`: [`AGENT_KEEPALIVE_SECS`] for another agent,
+/// [`STATIC_KEEPALIVE_SECS`] for a phone. Only an agent reports a carry
+/// port, a LAN address or a reflexive address; a static peer never does.
+fn keepalive_for(p: &PeerInfo) -> u16 {
+    if p.relay.carry_port.is_some() || p.lan_addr.is_some() || p.reflexive_addr.is_some() {
+        AGENT_KEEPALIVE_SECS
+    } else {
+        STATIC_KEEPALIVE_SECS
+    }
 }
 
 /// The addresses of the services `node` owns.
@@ -1057,6 +1178,7 @@ pub fn tunnel_peers(ifname: &str) -> Result<Vec<crate::ipc::protocol::TunnelPeer
                 .last_handshake
                 .filter(|t| *t > std::time::SystemTime::UNIX_EPOCH)
                 .map(chrono::DateTime::<chrono::Utc>::from),
+            rx_bytes: p.rx_bytes,
         })
         .collect())
 }
@@ -1598,7 +1720,22 @@ mod tests {
         assert_eq!(c.endpoint, Some("100.90.0.2:41002".parse().unwrap()));
         let ips: Vec<String> = c.allowed_ips.iter().map(ToString::to_string).collect();
         assert_eq!(ips, ["100.90.0.3/32", "fd00:90::3/128", "100.90.0.50/32"]);
-        assert_eq!(c.persistent_keepalive_interval, Some(25));
+        assert_eq!(c.persistent_keepalive_interval, Some(AGENT_KEEPALIVE_SECS));
+    }
+
+    #[test]
+    fn another_agent_is_kept_alive_more_often_than_a_phone() {
+        let (self_key, b_key, _, mut peers) = relay_directory();
+        let phone_key = key_b64(4);
+        peers.push(peer("phone", &phone_key));
+        let mut nat = peer("nat", &key_b64(5));
+        nat.reflexive_addr = Some("203.0.113.5:40404".into());
+        peers.push(nat);
+        let main = desired_peers(&peers, &[], &self_key, false, &HashMap::new(), &HashMap::new(), &crate::endpoint_dns::literal_only);
+        let keepalive = |k: &str| main[&Key::try_from(k).unwrap()].persistent_keepalive_interval;
+        assert_eq!(keepalive(&b_key), Some(AGENT_KEEPALIVE_SECS), "an agent with a carry port");
+        assert_eq!(keepalive(&key_b64(5)), Some(AGENT_KEEPALIVE_SECS), "an agent with only a reflexive address");
+        assert_eq!(keepalive(&phone_key), Some(STATIC_KEEPALIVE_SECS));
     }
 
     #[test]
@@ -1748,6 +1885,50 @@ mod tests {
 
         tracker.note_transit([]);
         assert!(tracker.peers_wanting_transit(&HashMap::new(), now_utc, now).is_empty());
+    }
+
+    #[test]
+    fn a_peer_is_silent_once_its_counter_stops_for_the_whole_window() {
+        let now = std::time::Instant::now();
+        let mut tracker = EndpointTracker::default();
+        tracker.observe_rx([("pk-a", 100)], now);
+        assert!(!tracker.silent("pk-a", now + PEER_SILENT_MAX / 2));
+        assert!(!tracker.silent("pk-never-seen", now + PEER_SILENT_MAX * 2), "nothing known is not silent");
+        tracker.observe_rx([("pk-a", 164)], now + PEER_SILENT_MAX / 2);
+        assert!(!tracker.silent("pk-a", now + PEER_SILENT_MAX), "a moving counter restarts the window");
+        tracker.observe_rx([("pk-a", 164)], now + PEER_SILENT_MAX);
+        assert!(tracker.silent("pk-a", now + PEER_SILENT_MAX / 2 + PEER_SILENT_MAX));
+    }
+
+    #[test]
+    fn a_tracked_peer_going_silent_wakes_the_poll_once_and_a_phone_never_does() {
+        let now = std::time::Instant::now();
+        let mut tracker = EndpointTracker::default();
+        tracker.resolve("pk-agent", reflexive_only("203.0.113.5:40404"), None, now);
+        assert!(!tracker.observe_rx([("pk-agent", 10), ("pk-phone", 10)], now));
+        let later = now + PEER_SILENT_MAX;
+        assert!(tracker.observe_rx([("pk-agent", 10), ("pk-phone", 10)], later), "the agent went quiet");
+        assert!(!tracker.observe_rx([("pk-agent", 10), ("pk-phone", 10)], later + LIVENESS_CHECK_INTERVAL), "only once");
+        assert!(!tracker.observe_rx([("pk-agent", 20), ("pk-phone", 10)], later + LIVENESS_CHECK_INTERVAL * 2));
+        let again = later + LIVENESS_CHECK_INTERVAL * 2 + PEER_SILENT_MAX;
+        assert!(tracker.observe_rx([("pk-agent", 20), ("pk-phone", 10)], again), "heard from, then quiet again");
+    }
+
+    #[test]
+    fn a_silent_peer_wants_a_relay_at_once_despite_a_recent_handshake() {
+        let now = std::time::Instant::now();
+        let now_utc = chrono::Utc::now();
+        let mut tracker = EndpointTracker::default();
+        let pk = key_b64(3);
+        tracker.resolve(&pk, reflexive_only("203.0.113.5:40404"), None, now);
+        tracker.observe_rx([(pk.as_str(), 10)], now);
+        let handshakes = HashMap::from([(pk.clone(), Some(now_utc))]);
+        assert!(tracker.peers_wanting_transit(&handshakes, now_utc, now).is_empty());
+        assert_eq!(tracker.reachable_peers(&handshakes, now_utc, now), vec![pk.as_str()]);
+
+        let quiet = now + PEER_SILENT_MAX;
+        assert_eq!(tracker.peers_wanting_transit(&handshakes, now_utc, quiet), vec![pk.as_str()]);
+        assert!(tracker.reachable_peers(&handshakes, now_utc, quiet).is_empty(), "a carrier stops offering it");
     }
 
     fn service(name: &str, node: &str, vip4: Option<&str>) -> ServiceInfo {
@@ -2205,7 +2386,7 @@ mod tests {
     #[test]
     fn no_candidate_on_any_tier_is_plain_wan_untracked() {
         let now = std::time::Instant::now();
-        let (tier, state) = resolve_endpoint_candidate(PeerTierCandidates::default(), None, None, false, now);
+        let (tier, state) = resolve_endpoint_candidate(PeerTierCandidates::default(), None, None, false, false, now);
         assert_eq!(tier, EndpointTier::Wan);
         assert!(state.is_none());
     }
@@ -2213,7 +2394,7 @@ mod tests {
     #[test]
     fn first_cycle_on_a_matching_lan_optimistically_tries_lan() {
         let now = std::time::Instant::now();
-        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, now);
+        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, false, now);
         assert_eq!(tier, EndpointTier::Lan);
         assert!(state.is_some());
     }
@@ -2222,10 +2403,10 @@ mod tests {
     fn a_handshake_after_switching_confirms_the_tier_and_resets_its_backoff() {
         let now = std::time::Instant::now();
         let t0 = chrono::Utc::now();
-        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), None, false, now);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), None, false, false, now);
         // A genuinely newer handshake than the baseline taken at switch time.
         let newer = t0 + chrono::Duration::seconds(5);
-        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(newer), state, false, now + std::time::Duration::from_secs(1));
+        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(newer), state, false, false, now + std::time::Duration::from_secs(1));
         assert_eq!(tier, EndpointTier::Lan);
         assert_eq!(state.unwrap().per_tier[&EndpointTier::Lan].backoff, ENDPOINT_RETRY_BACKOFF_INITIAL);
     }
@@ -2236,12 +2417,12 @@ mod tests {
         // most polls see no newer one: that must not fail a confirmed tier.
         let now = std::time::Instant::now();
         let t0 = chrono::Utc::now();
-        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, now);
-        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), state, false, now + GRACE / 2);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, false, now);
+        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), state, false, false, now + GRACE / 2);
         assert_eq!(tier, EndpointTier::Lan);
-        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), state, false, now + GRACE * 2);
+        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), state, false, false, now + GRACE * 2);
         assert_eq!(tier, EndpointTier::Lan);
-        let (tier, _) = resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), state, false, now + GRACE * 3);
+        let (tier, _) = resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), state, false, false, now + GRACE * 3);
         assert_eq!(tier, EndpointTier::Lan);
     }
 
@@ -2249,15 +2430,26 @@ mod tests {
     fn a_confirmed_tier_falls_back_once_its_handshakes_stop() {
         let now = std::time::Instant::now();
         let t0 = chrono::Utc::now();
-        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, now);
-        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), state, false, now + GRACE / 2);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, false, now);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), state, false, false, now + GRACE / 2);
         let confirmed_at = now + GRACE / 2;
         let (tier, state) =
-            resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), state, false, confirmed_at + ENDPOINT_CONFIRMED_MAX / 2);
+            resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), state, false, false, confirmed_at + ENDPOINT_CONFIRMED_MAX / 2);
         assert_eq!(tier, EndpointTier::Lan);
         let (tier, _) =
-            resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), state, false, confirmed_at + ENDPOINT_CONFIRMED_MAX);
+            resolve_endpoint_candidate(lan_only("192.168.1.50"), Some(t0), state, false, false, confirmed_at + ENDPOINT_CONFIRMED_MAX);
         assert_eq!(tier, EndpointTier::Wan);
+    }
+
+    #[test]
+    fn a_confirmed_tier_is_given_up_as_soon_as_the_peer_falls_silent() {
+        let now = std::time::Instant::now();
+        let t0 = chrono::Utc::now();
+        let (_, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), None, None, false, false, now);
+        let (tier, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), Some(t0), state, false, false, now + GRACE / 2);
+        assert_eq!(tier, EndpointTier::Reflexive);
+        let (tier, _) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), Some(t0), state, false, true, now + GRACE);
+        assert_eq!(tier, EndpointTier::Wan, "long before ENDPOINT_CONFIRMED_MAX");
     }
 
     #[test]
@@ -2265,8 +2457,8 @@ mod tests {
         // Both sides of a hole-punch have to be sending at once; a backoff
         // on either would make that a matter of luck.
         let now = std::time::Instant::now();
-        let (_, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), None, None, true, now);
-        let (tier, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), None, state, true, now + GRACE);
+        let (_, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), None, None, true, false, now);
+        let (tier, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), None, state, true, false, now + GRACE);
         assert_eq!(tier, EndpointTier::Reflexive);
         let state = state.unwrap();
         assert_eq!(state.per_tier[&EndpointTier::Reflexive].next_retry_at, None);
@@ -2277,21 +2469,21 @@ mod tests {
     fn a_transited_peer_takes_turns_between_its_candidates() {
         let both = PeerTierCandidates { lan: Some("192.168.1.50"), reflexive: Some("203.0.113.5:40404") };
         let now = std::time::Instant::now();
-        let (tier, state) = resolve_endpoint_candidate(both, None, None, true, now);
+        let (tier, state) = resolve_endpoint_candidate(both, None, None, true, false, now);
         assert_eq!(tier, EndpointTier::Lan);
-        let (tier, state) = resolve_endpoint_candidate(both, None, state, true, now + GRACE);
+        let (tier, state) = resolve_endpoint_candidate(both, None, state, true, false, now + GRACE);
         assert_eq!(tier, EndpointTier::Reflexive);
-        let (tier, _) = resolve_endpoint_candidate(both, None, state, true, now + GRACE * 2);
+        let (tier, _) = resolve_endpoint_candidate(both, None, state, true, false, now + GRACE * 2);
         assert_eq!(tier, EndpointTier::Lan);
     }
 
     #[test]
     fn a_peer_becoming_transited_retries_a_backed_off_candidate_at_once() {
         let now = std::time::Instant::now();
-        let (_, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), None, None, false, now);
-        let (tier, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), None, state, false, now + GRACE);
+        let (_, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), None, None, false, false, now);
+        let (tier, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), None, state, false, false, now + GRACE);
         assert_eq!(tier, EndpointTier::Wan);
-        let (tier, _) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), None, state, true, now + GRACE * 2);
+        let (tier, _) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), None, state, true, false, now + GRACE * 2);
         assert_eq!(tier, EndpointTier::Reflexive);
     }
 
@@ -2301,26 +2493,26 @@ mod tests {
         // the endpoint must not move off the address that just worked.
         let now = std::time::Instant::now();
         let t0 = chrono::Utc::now();
-        let (_, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), None, None, true, now);
-        let (tier, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), Some(t0), state, true, now + GRACE / 2);
+        let (_, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), None, None, true, false, now);
+        let (tier, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), Some(t0), state, true, false, now + GRACE / 2);
         assert_eq!(tier, EndpointTier::Reflexive);
-        let (tier, _) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), Some(t0), state, false, now + GRACE * 3);
+        let (tier, _) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:40404"), Some(t0), state, false, false, now + GRACE * 3);
         assert_eq!(tier, EndpointTier::Reflexive);
     }
 
     #[test]
     fn still_within_the_grace_window_stays_put_awaiting_a_handshake() {
         let now = std::time::Instant::now();
-        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, now);
-        let (tier, _) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, false, now + GRACE / 2);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, false, now);
+        let (tier, _) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, false, false, now + GRACE / 2);
         assert_eq!(tier, EndpointTier::Lan);
     }
 
     #[test]
     fn no_handshake_within_the_grace_window_falls_back_to_wan_and_schedules_a_retry() {
         let now = std::time::Instant::now();
-        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, now);
-        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, false, now + GRACE);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, false, now);
+        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, false, false, now + GRACE);
         assert_eq!(tier, EndpointTier::Wan);
         let state = state.unwrap();
         let lan = &state.per_tier[&EndpointTier::Lan];
@@ -2331,33 +2523,33 @@ mod tests {
     #[test]
     fn wan_retries_the_tier_once_the_backoff_elapses_not_before() {
         let now = std::time::Instant::now();
-        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, now);
-        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, false, now + GRACE);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, false, now);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, false, false, now + GRACE);
         // Not due yet.
-        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, false, now + GRACE + std::time::Duration::from_secs(1));
+        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, false, false, now + GRACE + std::time::Duration::from_secs(1));
         assert_eq!(tier, EndpointTier::Wan);
         // Due.
-        let (tier, _) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, false, now + GRACE + ENDPOINT_RETRY_BACKOFF_INITIAL);
+        let (tier, _) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, false, false, now + GRACE + ENDPOINT_RETRY_BACKOFF_INITIAL);
         assert_eq!(tier, EndpointTier::Lan);
     }
 
     #[test]
     fn backoff_doubles_up_to_the_cap_on_repeated_failures() {
         let now = std::time::Instant::now();
-        let (_, mut state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, now);
+        let (_, mut state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, false, now);
         let mut t = now;
         let mut last_backoff = ENDPOINT_RETRY_BACKOFF_INITIAL;
         for _ in 0..10 {
             // Fail the grace window.
             t += GRACE;
-            let (_, s) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, false, t);
+            let (_, s) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, false, false, t);
             let s = s.unwrap();
             let lan = s.per_tier[&EndpointTier::Lan].clone();
             assert!(lan.backoff <= ENDPOINT_RETRY_BACKOFF_MAX);
             last_backoff = lan.backoff;
             // Retry once due, so the next iteration fails from Lan again.
             t = lan.next_retry_at.unwrap();
-            let (_, s) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, Some(s), false, t);
+            let (_, s) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, Some(s), false, false, t);
             state = s;
         }
         assert_eq!(last_backoff, ENDPOINT_RETRY_BACKOFF_MAX, "must have capped by now");
@@ -2366,13 +2558,13 @@ mod tests {
     #[test]
     fn a_peer_roaming_to_a_different_lan_address_resets_to_a_fresh_optimistic_attempt() {
         let now = std::time::Instant::now();
-        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, now);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, None, false, false, now);
         // Fall back to Wan first, so the roam is a real behavior change,
         // not just staying on Lan by coincidence.
-        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, false, now + GRACE);
+        let (_, state) = resolve_endpoint_candidate(lan_only("192.168.1.50"), None, state, false, false, now + GRACE);
         assert_eq!(state.as_ref().unwrap().current, EndpointTier::Wan);
 
-        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.2.50"), None, state, false, now + GRACE + std::time::Duration::from_secs(1));
+        let (tier, state) = resolve_endpoint_candidate(lan_only("192.168.2.50"), None, state, false, false, now + GRACE + std::time::Duration::from_secs(1));
         assert_eq!(tier, EndpointTier::Lan, "a new address gets a fresh optimistic attempt");
         assert_eq!(state.unwrap().per_tier[&EndpointTier::Lan].backoff, ENDPOINT_RETRY_BACKOFF_INITIAL);
     }
@@ -2380,11 +2572,11 @@ mod tests {
     #[test]
     fn a_peer_roaming_to_a_different_reflexive_address_resets_to_a_fresh_optimistic_attempt() {
         let now = std::time::Instant::now();
-        let (_, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:55123"), None, None, false, now);
-        let (_, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:55123"), None, state, false, now + GRACE);
+        let (_, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:55123"), None, None, false, false, now);
+        let (_, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:55123"), None, state, false, false, now + GRACE);
         assert_eq!(state.as_ref().unwrap().current, EndpointTier::Wan);
 
-        let (tier, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:60000"), None, state, false, now + GRACE + std::time::Duration::from_secs(1));
+        let (tier, state) = resolve_endpoint_candidate(reflexive_only("203.0.113.5:60000"), None, state, false, false, now + GRACE + std::time::Duration::from_secs(1));
         assert_eq!(tier, EndpointTier::Reflexive);
         assert_eq!(state.unwrap().per_tier[&EndpointTier::Reflexive].backoff, ENDPOINT_RETRY_BACKOFF_INITIAL);
     }
@@ -2399,11 +2591,11 @@ mod tests {
     fn lan_failing_its_grace_window_advances_to_reflexive_in_the_same_cycle() {
         let now = std::time::Instant::now();
         let candidates = lan_and_reflexive("192.168.1.50", "203.0.113.5:55123");
-        let (tier, state) = resolve_endpoint_candidate(candidates, None, None, false, now);
+        let (tier, state) = resolve_endpoint_candidate(candidates, None, None, false, false, now);
         assert_eq!(tier, EndpointTier::Lan);
 
         // Lan never confirms within its own grace window.
-        let (tier, state) = resolve_endpoint_candidate(candidates, None, state, false, now + GRACE);
+        let (tier, state) = resolve_endpoint_candidate(candidates, None, state, false, false, now + GRACE);
         assert_eq!(
             tier,
             EndpointTier::Reflexive,
@@ -2421,12 +2613,12 @@ mod tests {
     fn reflexive_also_failing_falls_back_to_wan_with_independent_backoff_timers() {
         let now = std::time::Instant::now();
         let candidates = lan_and_reflexive("192.168.1.50", "203.0.113.5:55123");
-        let (_, state) = resolve_endpoint_candidate(candidates, None, None, false, now);
+        let (_, state) = resolve_endpoint_candidate(candidates, None, None, false, false, now);
         // Lan fails -> advances to Reflexive this same cycle.
-        let (tier, state) = resolve_endpoint_candidate(candidates, None, state, false, now + GRACE);
+        let (tier, state) = resolve_endpoint_candidate(candidates, None, state, false, false, now + GRACE);
         assert_eq!(tier, EndpointTier::Reflexive);
         // Reflexive, now active, also fails its own grace window.
-        let (tier, state) = resolve_endpoint_candidate(candidates, None, state, false, now + GRACE + GRACE);
+        let (tier, state) = resolve_endpoint_candidate(candidates, None, state, false, false, now + GRACE + GRACE);
         assert_eq!(tier, EndpointTier::Wan);
         let state = state.unwrap();
         assert_eq!(
@@ -2548,6 +2740,7 @@ mod tests {
                 pubkey: p.pubkey.clone(),
                 endpoint: Some("10.99.0.1:51820".into()),
                 last_handshake: None,
+                rx_bytes: 0,
             }]
         );
 

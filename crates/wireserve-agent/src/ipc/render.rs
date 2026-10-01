@@ -321,8 +321,9 @@ mod tests {
                     pubkey: "pk-strato".into(),
                     endpoint: Some("85.215.231.166:51820".into()),
                     last_handshake: Some(now() - chrono::Duration::seconds(74)),
+                    rx_bytes: 0,
                 },
-                TunnelPeer { pubkey: "pk-newbie".into(), endpoint: Some("198.51.100.7:51820".into()), last_handshake: None },
+                TunnelPeer { pubkey: "pk-newbie".into(), endpoint: Some("198.51.100.7:51820".into()), last_handshake: None, rx_bytes: 0 },
             ],
             services: vec![svc("openobserve", "strato", Some("10.1.0.3"), &["80:5080"]), mine, unaddressed],
             rejected_services: vec![RejectedService {

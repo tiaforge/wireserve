@@ -3952,3 +3952,32 @@ were the only places a node still read traffic it merely forwarded.
     and so does a phone's relayed config. Set on every start, so an
     interface kept from an older build changes too. Every node should get
     it: the carrier pads on its own mesh interface.
+
+255. **A dead direct path is relayed within about a minute** (2026-10-01,
+    asked for on the real mesh: lego2 waited about four minutes for strato
+    to take over when its punched path to minipc died). The handshake was
+    the only liveness signal, and WireGuard renews it only every two
+    minutes: a confirmed tier held for `ENDPOINT_CONFIRMED_MAX` (210s) after
+    the last poll that saw one, then `Wan` got its own 30s grace window,
+    then the request waited for a poll. Now:
+    - **Silence is death.** `EndpointTracker::observe_rx` keeps each
+      peer's kernel `rx_bytes` (now in `TunnelPeer`) and when it last
+      moved; nothing for `PEER_SILENT_MAX` (30s) makes a peer silent. A
+      silent peer's confirmed tier is given up at once, it is wanted for a
+      relay at once (no `Wan` grace: the probe entry goes on dialling, and
+      the first direct handshake ends the relay as before), and a carrier
+      stops offering it (`reachable_peers`). A peer never observed is not
+      silent, so a restart gives everyone a full window.
+    - **Checked every 5s** (`LIVENESS_CHECK_INTERVAL`), between polls, in
+      the daemon's select; the first tracked peer to go silent triggers a
+      poll at once. Only tracked peers (another agent) count: a phone's
+      quiet is normal.
+    - **Agents keep each other alive every 10s** (`AGENT_KEEPALIVE_SECS`,
+      both interfaces); phones stay at 25s (`STATIC_KEEPALIVE_SECS`), since
+      every packet can wake their radio. An agent is a peer with a carry
+      port, LAN or reflexive address. 30s is three keepalives, so two lost
+      in a row don't count, and covers a peer still on 25s.
+    From a dead path to a relay request: 30-35s; the other end and the
+    carrier follow at their next poll. A flapping direct path now switches
+    more often, each time for about a minute instead of four; if that
+    bothers, hold a direct path for a while before ending the relay.

@@ -127,6 +127,9 @@ pub struct TunnelPeer {
     /// `None` until the first handshake.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_handshake: Option<chrono::DateTime<chrono::Utc>>,
+    /// Bytes received from this peer, as the kernel counts them.
+    #[serde(default)]
+    pub rx_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

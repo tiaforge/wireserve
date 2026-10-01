@@ -658,15 +658,19 @@ where
     // endpoint-tier resolution, hoisted up here and reused rather than
     // read twice, so it can also go out in THIS cycle's own request
     // rather than lagging a cycle behind.
+    //
+    // The receive counters go to the tracker on the way: a peer that has
+    // gone silent is neither offered as reachable nor left unrelayed.
+    let tunnel = crate::wg::tunnel_peers(&ifname).unwrap_or_default();
+    let liveness_now = std::time::Instant::now();
+    ctx.endpoint_tracker.observe_rx(tunnel.iter().map(|t| (t.pubkey.as_str(), t.rx_bytes)), liveness_now);
     let handshakes: std::collections::HashMap<String, Option<chrono::DateTime<chrono::Utc>>> =
-        crate::wg::tunnel_peers(&ifname)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|t| (t.pubkey, t.last_handshake))
-            .collect();
+        tunnel.into_iter().map(|t| (t.pubkey, t.last_handshake)).collect();
     let now_utc = chrono::Utc::now();
     let transit_reachable: Vec<String> = if transit_capable {
-        let mut r: Vec<String> = crate::wg::transit_reachable_peers(&handshakes, now_utc)
+        let mut r: Vec<String> = ctx
+            .endpoint_tracker
+            .reachable_peers(&handshakes, now_utc, liveness_now)
             .into_iter()
             .map(String::from)
             .collect();
@@ -679,7 +683,7 @@ where
     // help even if it can't offer it.
     let mut transit_wanted: Vec<String> = ctx
         .endpoint_tracker
-        .peers_wanting_transit(&handshakes, now_utc, std::time::Instant::now())
+        .peers_wanting_transit(&handshakes, now_utc, liveness_now)
         .into_iter()
         .map(String::from)
         .collect();

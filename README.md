@@ -1084,6 +1084,13 @@ Nothing needs opening for it: relayed sessions arrive through the mesh,
 and WireServe's own firewall and its handling of ufw and firewalld cover
 it the way they cover the mesh interface.
 
+**When the relay takes over.** Agents keep each other alive every 10
+seconds, so a direct path that dies goes quiet. After 30 seconds without a
+single packet from the peer, checked every 5 seconds, the node asks for a
+relay at once, and the relay is usually up within the next poll, about a
+minute after the path died. The node goes on trying the direct path
+underneath, and the first direct handshake ends the relay again.
+
 **A node carries traffic only with two approvals, and has neither by
 default.** Its own operator opts in, so a node with a data cap, say, is
 never used; and the mesh admin approves it as a carrier:
@@ -1270,7 +1277,8 @@ itself, and behind NAT the port a router maps for WireGuard's UDP is not
 that one. The recorded endpoint is then wrong, and two nodes behind one
 router get recorded identically. It self-corrects, because WireGuard
 replaces a peer's endpoint with the real source of the first packet it
-receives, so any node that speaks within the 25-second keepalive is found.
+receives, so any node that speaks within its keepalive (10 seconds between
+agents, 25 for a phone) is found.
 Set `--endpoint-addr` on nodes that have a stable reachable address rather
 than relying on the guess.
 

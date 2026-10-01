@@ -688,6 +688,10 @@ async fn cmd_daemon(
 
     let hosts_path = paths::hosts_path();
     let mut interval = tokio::time::interval(Duration::from_secs(poll_interval_secs));
+    // Between polls, the kernel's receive counters: a peer whose path goes
+    // quiet is noticed within seconds, not at the next poll.
+    let mut liveness = tokio::time::interval(wireserve_agent::wg::LIVENESS_CHECK_INTERVAL);
+    liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // F9 follow-up: how many 401s in a row it takes before the daemon
     // concludes it has really been revoked. A single 401 could also be a
@@ -733,6 +737,17 @@ async fn cmd_daemon(
                     () = tls_link.wake.notified() => tokio::time::sleep(Duration::from_secs(1)).await,
                     // A port check answered: the coordinator is waiting on it.
                     () = port_checks.wake.notified() => {}
+                    // A peer's path just went dead: ask for its relay now.
+                    () = async {
+                        loop {
+                            liveness.tick().await;
+                            let tunnel = wireserve_agent::wg::tunnel_peers(wg.ifname()).unwrap_or_default();
+                            let rx = tunnel.iter().map(|t| (t.pubkey.as_str(), t.rx_bytes));
+                            if endpoint_tracker.observe_rx(rx, std::time::Instant::now()) {
+                                break;
+                            }
+                        }
+                    } => {}
                 }
             } => {
                 let mut ctx = poll_loop::PollContext {
