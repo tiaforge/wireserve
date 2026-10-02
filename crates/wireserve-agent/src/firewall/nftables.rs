@@ -2024,7 +2024,8 @@ mod tests {
              nsenter -t {relayed} -n sh -euc 'ip link set lo up; ip addr add 100.90.0.8/32 dev r0; ip link set r0 up; ip route add 100.90.0.0/24 via 100.90.0.2 dev r0 onlink'
              nsenter -t {lan} -n sh -euc 'ip link set lo up; ip addr add 192.168.1.2/24 dev l0; ip link set l0 up'
              echo 0 > /proc/sys/net/ipv4/conf/all/forwarding
-             for i in wg0 wg0-t lan0; do echo 1 > /proc/sys/net/ipv4/conf/$i/forwarding; done"
+             echo 0 > /proc/sys/net/ipv4/conf/wg0-t/forwarding
+             for i in wg0 lan0; do echo 1 > /proc/sys/net/ipv4/conf/$i/forwarding; done"
         );
         let out = std::process::Command::new("sh").args(["-euc", &setup]).output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -2065,11 +2066,16 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
         let through_mesh = fetch(direct);
+        // IPv4 forwards only what arrives on an interface that forwards: the
+        // agent turns the carry interface's switch on too (PLAN.md #279).
+        let carry_not_forwarding = fetch(relayed);
+        crate::firewall::ip_forward::set_enabled("wg0-t", true);
         let through_carry = fetch(relayed);
         let _ = server.kill();
         let _ = server.wait();
         stop(hosts);
         assert_eq!(through_mesh, "hello", "a direct peer reaches the LAN target");
+        assert_eq!(carry_not_forwarding, "", "without the carry interface forwarding, nothing gets through it");
         assert_eq!(through_carry, "hello", "a relayed peer reaches it the same way");
     }
 

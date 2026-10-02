@@ -53,14 +53,15 @@
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
-/// Whether *this process* was the one that last turned forwarding on for
-/// this interface — so a later call to disable it only ever writes `0`
-/// if this daemon itself is the one that wrote the `1`, never clobbering
-/// a forwarding posture some other process or a previous run left
-/// behind. Same "don't own state we didn't set" discipline as the
-/// host-firewall-interop code.
-static ENABLED_BY_US: AtomicBool = AtomicBool::new(false);
+/// The interfaces *this process* last turned forwarding on for — so a
+/// later call to disable one only ever writes `0` if this daemon itself
+/// is the one that wrote the `1`, never clobbering a forwarding posture
+/// some other process or a previous run left behind. Same "don't own
+/// state we didn't set" discipline as the host-firewall-interop code. Per
+/// interface: the carry interface (PLAN.md #279) has its own.
+static ENABLED_BY_US: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 /// Enables or disables forwarding on `ifname` alone. Called once per poll
 /// cycle with `enabled = !transit_forwards.is_empty()` — idempotent, so
@@ -76,11 +77,12 @@ static ENABLED_BY_US: AtomicBool = AtomicBool::new(false);
 /// IPv6 transit the next time that happened.
 #[cfg(target_os = "linux")]
 pub fn set_enabled(ifname: &str, enabled: bool) {
+    let mut ours = ENABLED_BY_US.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if enabled {
         write_flag("ipv4", ifname, true);
         write_v6_flag(ifname, true);
-        ENABLED_BY_US.store(true, Ordering::Relaxed);
-    } else if ENABLED_BY_US.swap(false, Ordering::Relaxed) {
+        ours.insert(ifname.to_string());
+    } else if ours.remove(ifname) {
         write_flag("ipv4", ifname, false);
         write_v6_flag(ifname, false);
     }
@@ -427,11 +429,11 @@ mod tests {
         assert_eq!(read(all_v4), all_baseline, "the global switch must never be written, whatever it started at");
 
         // Only disables what this process itself enabled.
-        ENABLED_BY_US.store(false, std::sync::atomic::Ordering::Relaxed);
+        ENABLED_BY_US.lock().unwrap().remove("wgtest");
         set_enabled("wgtest", false);
         assert_eq!(read(wgtest_v4), "1", "must not clobber a posture this process didn't set");
 
-        ENABLED_BY_US.store(true, std::sync::atomic::Ordering::Relaxed);
+        ENABLED_BY_US.lock().unwrap().insert("wgtest".into());
         set_enabled("wgtest", false);
         assert_eq!(read(wgtest_v4), "0");
         assert_eq!(read(all_v4), all_baseline, "still never written, even on the disable path");

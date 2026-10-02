@@ -4236,3 +4236,17 @@ as agreed with the user. Nothing deployed; no e2e suite covers these paths.
     kernel tests now use `unshare -n` (a user namespace refuses the payload
     writes), and the test's clients route via the host's address, since the
     veths standing in for WireGuard interfaces do ARP.
+
+279. **The carry interface forwards, too, when a service needs it**
+    (`ip_forward::set_enabled`, `poll_loop`). #278 opened the carry table
+    for a service's flows, but IPv4 forwards only what arrives on an
+    interface whose own `forwarding` is on, and the agent only ever turned
+    on the mesh interface's: on a host that doesn't forward globally (no
+    Docker or Podman), a relayed peer still never reached a LAN target.
+    #278's kernel test hid it by switching all three interfaces on by hand.
+    Now the carry interface's switch follows the same condition as the
+    mesh interface's forwarding to a service's target, and whether this
+    process turned an interface on is kept per interface (one flag for the
+    process had been enough while there was one interface). The kernel test
+    leaves the carry interface off, sees nothing get through, then switches
+    it on with `set_enabled` as the agent does.

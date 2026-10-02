@@ -1291,6 +1291,12 @@ impl WgInterface {
         self.carry.as_ref().map(|c| c.port)
     }
 
+    /// The carry interface's name, once it is up.
+    #[must_use]
+    pub fn carry_name(&self) -> Option<&str> {
+        self.carry.as_ref().map(|c| c.ifname.as_str())
+    }
+
     /// This interface's name — for callers (the poll loop) that need to
     /// pass it to a free function like `local_lan_ifaces`/`tunnel_peers`
     /// without duplicating the string themselves.

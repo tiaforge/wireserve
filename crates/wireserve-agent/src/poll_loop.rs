@@ -849,6 +849,7 @@ where
         Vec::new()
     };
     let carry_port = ctx.wg.carry_port();
+    let carry_name = ctx.wg.carry_name().map(str::to_string);
     // Phones this node relays through its public address (PLAN.md M40), and
     // the relay ports' ranges — a carrier's alone, like the relays above.
     let relay_public: Vec<wireserve_types::PublicRelay> = if transit_capable {
@@ -998,6 +999,13 @@ where
             &ifname,
             !relay_forwards.is_empty() || !relay_public.is_empty() || forwards_services || !exit.is_empty(),
         );
+        // A relayed peer's request for such a service arrives on the carry
+        // interface, and IPv4 forwards only what arrives on an interface
+        // that forwards (PLAN.md #279). Nothing else is ever forwarded from
+        // it: its table drops all but a service's own flows.
+        if let Some(carry) = &carry_name {
+            crate::firewall::ip_forward::set_enabled(carry, forwards_services);
+        }
 
         // 4. rewrite the hosts-file managed block from the full directory.
         let naming = crate::hosts::Naming::new(directory.naming.as_ref());
