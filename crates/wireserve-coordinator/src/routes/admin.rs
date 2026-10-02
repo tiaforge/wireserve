@@ -1180,9 +1180,16 @@ pub async fn list_peers(
         .filter(|n| n.exit_enabled && n.exit_node_id.is_some())
         .map(|n| n.name.clone())
         .collect();
+    // Released service addresses still held for devices (PLAN.md #273).
+    let mut held_addresses: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    for hold in crate::db::services::holds(&conn)? {
+        for device in hold.devices {
+            held_addresses.entry(device).or_default().push(hold.vip4.to_string());
+        }
+    }
     // A device's `.conf` is a snapshot (PLAN.md M40): stale once a node
-    // joined after it was written, or a carrier or exit it names no longer
-    // qualifies.
+    // joined after it was written, a carrier or exit it names no longer
+    // qualifies, or an address in it was released.
     let live: std::collections::HashMap<i64, &nodes::NodeRow> = rows.iter().map(|n| (n.id, n)).collect();
     let relays = nodes::all_static_relays(&conn)?;
     let qualifies = |id: i64| live.get(&id).is_some_and(|n| n.transit_approved);
@@ -1199,7 +1206,7 @@ pub async fn list_peers(
             // Never recorded since the gateway went (PLAN.md M41): its
             // `.conf` still sends the mesh to a gateway that forwards nothing.
             let never = d.exported_at.is_none();
-            never || newer_node || lost_carrier || lost_exit
+            never || newer_node || lost_carrier || lost_exit || held_addresses.contains_key(&d.name)
         })
         .map(|n| n.name.clone())
         .collect();
@@ -1218,6 +1225,7 @@ pub async fn list_peers(
         transit_approved,
         transit_offering,
         stale_devices,
+        held_addresses,
         exit_offering,
         exit_devices,
         tags,

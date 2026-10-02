@@ -355,11 +355,73 @@ fn notice(name: &str, reason: String) -> wireserve_types::ServiceNotice {
     wireserve_types::ServiceNotice { name: name.to_string(), reason }
 }
 
+/// A released service address still held back (PLAN.md #273, migration
+/// 0021), and the devices holding it: every live phone whose `.conf` may
+/// still route it to the node that had it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hold {
+    pub vip4: std::net::Ipv4Addr,
+    /// The node that had it; `None` once that node is gone.
+    pub node_id: Option<i64>,
+    /// Device names, sorted.
+    pub devices: Vec<String>,
+}
+
+/// Every address still held, and by whom. A held address is released for
+/// good once no live device was exported before its release — never
+/// exported counts as before — and its row is removed then.
+pub fn holds(conn: &Connection) -> Result<Vec<Hold>, DbError> {
+    let released: Vec<(String, Option<i64>, String)> = {
+        let mut stmt = conn.prepare("SELECT vip4, node_id, released_at FROM released_service_addresses ORDER BY vip4")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    if released.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Phones whose `.conf` works: registered, not revoked. A revoked or
+    // rejoined one's key is gone from every node.
+    let devices: Vec<(String, Option<DateTime<Utc>>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT name, exported_at FROM nodes WHERE kind = 'static' AND revoked = 0 AND pubkey IS NOT NULL ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))?;
+        rows.map(|r| r.map(|(n, e)| (n, e.as_deref().and_then(parse_dt)))).collect::<Result<_, _>>()?
+    };
+    let mut out = Vec::new();
+    for (vip4, node_id, released_at) in released {
+        // Unparseable: held for as long as any device exists, rather than
+        // let go on a guess. The trigger stamps milliseconds, so an export
+        // within the same millisecond counts as before.
+        let released_at = parse_dt(&released_at);
+        let holders: Vec<String> = devices
+            .iter()
+            .filter(|(_, exported)| match (exported, released_at) {
+                (Some(e), Some(r)) => e.timestamp_millis() <= r.timestamp_millis(),
+                _ => true,
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
+        match (holders.is_empty(), vip4.parse()) {
+            (false, Ok(vip4)) => out.push(Hold { vip4, node_id, devices: holders }),
+            _ => {
+                conn.execute("DELETE FROM released_service_addresses WHERE vip4 = ?1", [&vip4])?;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Gives `name` an address from `vip_range` unless it already has one.
 ///
 /// Not for a denied one: it holds its name until its node withdraws it, but
 /// an address of the mesh's range is not worth holding for a service nobody
 /// reaches. It gets one if it is approved after all (`approve`).
+///
+/// A held address (PLAN.md #273) goes to nobody but the node that had it,
+/// which takes its own back first: phones that are not up to date send it
+/// to that node anyway. When only held addresses are left, the service gets
+/// none, and the log names the devices to refresh.
 fn assign_vip(tx: &Connection, node_id: i64, name: &str, vip_range: &str) -> Result<(), DbError> {
     let (has, denied): (Option<String>, bool) = tx.query_row(
         "SELECT vip4, approved_at IS NULL AND denied_at IS NOT NULL FROM services WHERE node_id = ?1 AND name = ?2",
@@ -369,14 +431,31 @@ fn assign_vip(tx: &Connection, node_id: i64, name: &str, vip_range: &str) -> Res
     if has.is_some() || denied {
         return Ok(());
     }
-    let used = super::nodes::all_allocated_ip4(tx)?;
-    match crate::ipam::allocate_v4(vip_range, &used) {
+    let mut used = super::nodes::all_allocated_ip4(tx)?;
+    let holds = holds(tx)?;
+    let own = holds.iter().filter(|h| h.node_id == Some(node_id) && !used.contains(&h.vip4)).map(|h| h.vip4).min();
+    used.extend(holds.iter().map(|h| h.vip4));
+    match own.map_or_else(|| crate::ipam::allocate_v4(vip_range, &used), Ok) {
         Ok(vip) => {
             tx.execute(
                 "UPDATE services SET vip4 = ?1 WHERE node_id = ?2 AND name = ?3",
                 rusqlite::params![vip.to_string(), node_id, name],
             )?;
+            tx.execute("DELETE FROM released_service_addresses WHERE vip4 = ?1", [vip.to_string()])?;
             tracing::info!(event = "service_address_assigned", service = %name, vip4 = %vip);
+        }
+        Err(crate::ipam::IpamError::Exhausted) if !holds.is_empty() => {
+            let mut devices: Vec<&str> = holds.iter().flat_map(|h| h.devices.iter().map(String::as_str)).collect();
+            devices.sort_unstable();
+            devices.dedup();
+            tracing::warn!(
+                service = %name,
+                range = %vip_range,
+                held = holds.len(),
+                devices = %devices.join(","),
+                "no address left for a service but ones held back for devices not exported since they were released; \
+                 `export-config --refresh` or delete those devices to free them. It stays reachable at its node's address only"
+            );
         }
         Err(e) => tracing::warn!(
             service = %name,
@@ -570,6 +649,151 @@ mod tests {
         upsert_for_node(&mut conn, id, &[], ApprovalMode::AutoApprove, RANGE).unwrap();
         upsert_for_node(&mut conn, id, &[mapped("api", &["80:6080"])], ApprovalMode::AutoApprove, RANGE).unwrap();
         assert_eq!(vip_of(&conn, "api").unwrap(), vip, "the freed address is the first free one again");
+    }
+
+    // ---- held addresses (PLAN.md #273) ----
+
+    /// A registered phone, exported now unless `exported` is false.
+    async fn device(db: &Db, name: &str, exported: bool) -> i64 {
+        let conn = db.conn.lock().await;
+        let id = create_node(&conn, name, NodeKind::Static, &format!("h-{name}"), None).unwrap();
+        apply_redemption(
+            &conn,
+            id,
+            &Redemption {
+                pubkey: &format!("pk-{id}"),
+                ip4: format!("100.90.0.{}", 200 + id).parse().unwrap(),
+                ip6: format!("fd00:90::{}", 200 + id).parse().unwrap(),
+                listen_port: None,
+                endpoint_addr: None,
+                endpoint_addr_v4: None,
+                endpoint_addr_v6: None,
+                lan_addr: None,
+                reflexive_addr: None,
+                bearer_token_hash: &format!("bearer-{name}"),
+            },
+        )
+        .unwrap();
+        drop(conn);
+        if exported {
+            export(db, id).await;
+        }
+        id
+    }
+
+    async fn export(db: &Db, id: i64) {
+        // The release trigger stamps milliseconds: keep each step apart.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        crate::db::nodes::record_export(&mut *db.conn.lock().await, id, None, &[]).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    fn held(conn: &Connection) -> Vec<(String, Option<i64>, Vec<String>)> {
+        holds(conn).unwrap().into_iter().map(|h| (h.vip4.to_string(), h.node_id, h.devices)).collect()
+    }
+
+    #[tokio::test]
+    async fn a_released_address_waits_for_the_phones_exported_before_it() {
+        let db = Db::open_in_memory_for_test();
+        let x = node_with_id(&db, "x", "hx").await; // .1
+        let y = node_with_id(&db, "y", "hy").await; // .2
+        upsert_for_node(&mut *db.conn.lock().await, x, &[mapped("a", &["80"])], ApprovalMode::AutoApprove, RANGE).unwrap();
+        let a = vip_of(&*db.conn.lock().await, "a").unwrap();
+        let phone = device(&db, "phone", true).await;
+        upsert_for_node(&mut *db.conn.lock().await, x, &[], ApprovalMode::AutoApprove, RANGE).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let late = device(&db, "late", true).await;
+
+        let mut conn = db.conn.lock().await;
+        assert_eq!(held(&conn), [(a.clone(), Some(x), vec!["phone".to_string()])], "only the phone exported before");
+        upsert_for_node(&mut conn, y, &[mapped("b", &["80"])], ApprovalMode::AutoApprove, RANGE).unwrap();
+        assert_ne!(vip_of(&conn, "b").unwrap(), a, "another node's service does not get it");
+        drop(conn);
+
+        export(&db, phone).await;
+        let mut conn = db.conn.lock().await;
+        assert!(held(&conn).is_empty(), "exported again: let go");
+        upsert_for_node(&mut conn, y, &[mapped("b", &["80"]), mapped("c", &["80"])], ApprovalMode::AutoApprove, RANGE).unwrap();
+        assert_eq!(vip_of(&conn, "c").unwrap(), a, "free for anyone now");
+        let _ = late;
+    }
+
+    #[tokio::test]
+    async fn its_own_node_takes_a_held_address_back_first() {
+        let db = Db::open_in_memory_for_test();
+        let x = node_with_id(&db, "x", "hx").await;
+        upsert_for_node(&mut *db.conn.lock().await, x, &[mapped("a", &["80"]), mapped("z", &["80"])], ApprovalMode::AutoApprove, RANGE).unwrap();
+        let (a, z) = {
+            let conn = db.conn.lock().await;
+            (vip_of(&conn, "a").unwrap(), vip_of(&conn, "z").unwrap())
+        };
+        device(&db, "phone", true).await;
+        let mut conn = db.conn.lock().await;
+        upsert_for_node(&mut conn, x, &[mapped("z", &["80"])], ApprovalMode::AutoApprove, RANGE).unwrap();
+        upsert_for_node(&mut conn, x, &[mapped("z", &["80"]), mapped("b", &["80"])], ApprovalMode::AutoApprove, RANGE).unwrap();
+        assert_eq!(vip_of(&conn, "b").unwrap(), a);
+        assert!(held(&conn).is_empty(), "taken back, no longer held");
+        let _ = z;
+    }
+
+    #[tokio::test]
+    async fn a_device_never_exported_or_revoked_counts_as_it_should() {
+        let db = Db::open_in_memory_for_test();
+        let x = node_with_id(&db, "x", "hx").await;
+        upsert_for_node(&mut *db.conn.lock().await, x, &[mapped("a", &["80"])], ApprovalMode::AutoApprove, RANGE).unwrap();
+        let never = device(&db, "never", false).await;
+        upsert_for_node(&mut *db.conn.lock().await, x, &[], ApprovalMode::AutoApprove, RANGE).unwrap();
+        let conn = db.conn.lock().await;
+        assert_eq!(held(&conn)[0].2, ["never"], "never exported: its .conf may hold anything");
+        crate::db::nodes::revoke(&conn, never).unwrap();
+        assert!(held(&conn).is_empty(), "a revoked device's key is gone everywhere");
+    }
+
+    #[tokio::test]
+    async fn only_an_approved_services_address_is_held() {
+        let db = Db::open_in_memory_for_test();
+        let x = node_with_id(&db, "x", "hx").await;
+        device(&db, "phone", true).await;
+        let mut conn = db.conn.lock().await;
+        upsert_for_node(&mut conn, x, &[mapped("p", &["80"])], ApprovalMode::RequireApproval, RANGE).unwrap();
+        upsert_for_node(&mut conn, x, &[], ApprovalMode::RequireApproval, RANGE).unwrap();
+        assert!(held(&conn).is_empty(), "pending: no device was ever given it");
+
+        upsert_for_node(&mut conn, x, &[mapped("q", &["80"])], ApprovalMode::RequireApproval, RANGE).unwrap();
+        approve(&conn, x, "q", RANGE).unwrap();
+        let q = vip_of(&conn, "q").unwrap();
+        deny(&conn, x, "q", None).unwrap();
+        assert_eq!(held(&conn), [(q, Some(x), vec!["phone".to_string()])], "denied after approval");
+    }
+
+    #[tokio::test]
+    async fn a_deleted_nodes_addresses_are_held_and_nobody_takes_them_back() {
+        let db = Db::open_in_memory_for_test();
+        let x = node_with_id(&db, "x", "hx").await;
+        upsert_for_node(&mut *db.conn.lock().await, x, &[mapped("a", &["80"])], ApprovalMode::AutoApprove, RANGE).unwrap();
+        let a = vip_of(&*db.conn.lock().await, "a").unwrap();
+        device(&db, "phone", true).await;
+        let conn = db.conn.lock().await;
+        crate::db::nodes::revoke(&conn, x).unwrap();
+        assert_eq!(held(&conn), [(a.clone(), Some(x), vec!["phone".to_string()])], "revoked: its services go, and are held");
+        crate::db::nodes::delete_node(&conn, x).unwrap();
+        assert_eq!(held(&conn), [(a, None, vec!["phone".to_string()])], "deleted: held for nobody in particular");
+    }
+
+    #[tokio::test]
+    async fn a_range_left_with_only_held_addresses_gives_none() {
+        let db = Db::open_in_memory_for_test();
+        let x = node_with_id(&db, "x", "hx").await; // .1
+        let y = node_with_id(&db, "y", "hy").await; // .2
+        let range = "100.90.0.0/29"; // .1 to .6
+        upsert_for_node(&mut *db.conn.lock().await, x, &[mapped("a", &["1"]), mapped("b", &["2"]), mapped("c", &["3"])], ApprovalMode::AutoApprove, range).unwrap();
+        device(&db, "phone", true).await; // takes no address of this range
+        let mut conn = db.conn.lock().await;
+        upsert_for_node(&mut conn, x, &[], ApprovalMode::AutoApprove, range).unwrap();
+        upsert_for_node(&mut conn, y, &[mapped("d", &["1"])], ApprovalMode::AutoApprove, range).unwrap();
+        assert_eq!(vip_of(&conn, "d").as_deref(), Some("100.90.0.6"));
+        upsert_for_node(&mut conn, y, &[mapped("d", &["1"]), mapped("e", &["1"])], ApprovalMode::AutoApprove, range).unwrap();
+        assert_eq!(vip_of(&conn, "e"), None, "never one held for a phone");
     }
 
     #[tokio::test]

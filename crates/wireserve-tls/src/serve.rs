@@ -588,6 +588,11 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                     let max_upgrades = limits.max_upgrades_per_forwarded_client;
                     let upgrade_slots = Arc::clone(&upgrade_slots);
                     let upgrade = !verify && crate::upgrade::wanted(&req);
+                    // Anything else asking to switch goes on as a plain
+                    // request (PLAN.md #271).
+                    if !upgrade {
+                        crate::upgrade::ignore(req.headers_mut());
+                    }
                     prepare(req.headers_mut(), caller.as_ref().map(|c| c.node.as_str()), verify, forwarder, &strip);
                     req.extensions_mut().insert(ConnectInfo(peer));
                     let shared = shared.clone();
@@ -1830,5 +1835,125 @@ mod tests {
             next_text(&mut ws).await;
             open.push(ws);
         }
+    }
+
+    /// A backend that switches protocols for anything asking — and answers
+    /// `101` with `accept` as its `Sec-WebSocket-Accept`, if given — and then
+    /// echoes whatever request arrives inside the switched connection as its
+    /// body. A plain request it answers `plain` with the request's head.
+    async fn switching_backend(accept: Option<&'static str>) -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn head(tcp: &mut tokio::net::TcpStream) -> Option<String> {
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = tcp.read(&mut buf).await.ok()?;
+                if n == 0 {
+                    return None;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            Some(String::from_utf8_lossy(&got).to_lowercase())
+        }
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut tcp, _) = backend.accept().await.unwrap();
+                tokio::spawn(async move {
+                    while let Some(first) = head(&mut tcp).await {
+                        if !first.contains("\r\nupgrade:") {
+                            let body = format!("plain\n{first}");
+                            let answer = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+                            tcp.write_all(answer.as_bytes()).await.unwrap();
+                            continue;
+                        }
+                        let accept = accept.map(|a| format!("sec-websocket-accept: {a}\r\n")).unwrap_or_default();
+                        let switch = format!("HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: websocket\r\n{accept}\r\n");
+                        tcp.write_all(switch.as_bytes()).await.unwrap();
+                        if let Some(inside) = head(&mut tcp).await {
+                            let body = format!("tunnelled\n{inside}");
+                            let answer = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+                            let _ = tcp.write_all(answer.as_bytes()).await;
+                        }
+                        return;
+                    }
+                });
+            }
+        });
+        upstream
+    }
+
+    /// Reads from `s` until `done` holds for what came, it closes, or 3s pass.
+    async fn read_until<S: tokio::io::AsyncRead + Unpin>(s: &mut S, done: impl Fn(&str) -> bool) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        let end = tokio::time::Instant::now() + Duration::from_secs(3);
+        while let Ok(Ok(n)) = tokio::time::timeout_at(end, s.read(&mut buf)).await {
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+            if done(&String::from_utf8_lossy(&out)) {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&out).to_string()
+    }
+
+    #[tokio::test]
+    async fn another_upgrade_reaches_the_backend_as_a_plain_request_and_tunnels_nothing() {
+        use tokio::io::AsyncWriteExt;
+        let (port, client, _) = in_front_of(switching_backend(None).await, quick());
+        let mut s = tls(port, &client).await;
+        s.write_all(
+            b"GET /public HTTP/1.1\r\nhost: svc.test\r\nupgrade: h2c\r\nconnection: Upgrade, HTTP2-Settings\r\n\
+              http2-settings: AAMAAABkAAQAoAAAAAIAAAAA\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let answer = read_until(&mut s, |t| t.contains("\r\n\r\n") && t.ends_with("\r\n\r\n") && t.contains("plain")).await;
+        assert!(answer.starts_with("HTTP/1.1 200"), "a plain answer, no switch: {answer}");
+        assert!(answer.contains("plain\n"), "{answer}");
+        assert!(!answer.contains("upgrade:") && !answer.contains("http2-settings"), "neither reached the backend: {answer}");
+
+        // The connection is still an ordinary one: the next request is
+        // looked at like any other, its forged identity removed.
+        s.write_all(b"GET /admin HTTP/1.1\r\nhost: svc.test\r\nremote-user: admin\r\nx-wireserve-node: someone-else\r\n\r\n").await.unwrap();
+        let next = read_until(&mut s, |t| t.contains("get /admin") && t.ends_with("\r\n\r\n")).await;
+        assert!(next.contains("plain\n"), "{next}");
+        assert!(!next.contains("tunnelled"), "{next}");
+        assert!(!next.contains("remote-user: admin") && !next.contains("someone-else"), "{next}");
+    }
+
+    #[tokio::test]
+    async fn a_switch_that_is_not_this_websockets_answer_is_refused() {
+        use tokio::io::AsyncWriteExt;
+        const KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+        for accept in [None, Some("bm90IHRoZSByaWdodCBhbnN3ZXI=")] {
+            let (port, client, _) = in_front_of(switching_backend(accept).await, quick());
+            let mut s = tls(port, &client).await;
+            let ask = format!(
+                "GET / HTTP/1.1\r\nhost: svc.test\r\nupgrade: websocket\r\nconnection: upgrade\r\n\
+                 sec-websocket-version: 13\r\nsec-websocket-key: {KEY}\r\n\r\n"
+            );
+            s.write_all(ask.as_bytes()).await.unwrap();
+            let answer = read_until(&mut s, |t| t.contains("\r\n\r\n")).await;
+            assert!(answer.starts_with("HTTP/1.1 502"), "{accept:?}: {answer}");
+            s.write_all(b"GET /admin HTTP/1.1\r\nhost: svc.test\r\nremote-user: admin\r\n\r\n").await.unwrap();
+            let next = read_until(&mut s, |t| t.contains("tunnelled") || t.ends_with("\r\n\r\n")).await;
+            assert!(!next.contains("tunnelled"), "{accept:?}: nothing passes through: {next}");
+        }
+        // The right answer does switch.
+        let (port, client, _) = in_front_of(switching_backend(Some("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")).await, quick());
+        let mut s = tls(port, &client).await;
+        let ask = format!(
+            "GET / HTTP/1.1\r\nhost: svc.test\r\nupgrade: websocket\r\nconnection: upgrade\r\n\
+             sec-websocket-version: 13\r\nsec-websocket-key: {KEY}\r\n\r\n"
+        );
+        s.write_all(ask.as_bytes()).await.unwrap();
+        let answer = read_until(&mut s, |t| t.contains("\r\n\r\n")).await;
+        assert!(answer.starts_with("HTTP/1.1 101"), "{answer}");
     }
 }

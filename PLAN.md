@@ -4104,3 +4104,51 @@ Reviewed with the user before deploying (2026-10-02); three tightenings:
     upgrade request until the bytes stop (the slot rides in the bridge
     task). Ordinary requests end on their own and are not counted. Both
     fixed, not settings, until a deployment needs one.
+
+## Security audit 2026-10-02 — three fixes
+
+An audit of M39–M43 found nothing high; three medium findings, fixed here
+as agreed with the user. Nothing deployed; no e2e suite covers these paths.
+
+271. **Only a WebSocket is upgraded** (`wireserve_tls::upgrade`). M42
+    tunnelled any `Upgrade` the backend answered with a 101, and past it
+    nothing the client sent was looked at: a test with a backend that
+    switches to `h2c` got `remote-user: admin`, a forged
+    `X-Wireserve-Node` and any path through, the sign-in never asked. Now
+    `wanted` takes exactly `Upgrade: websocket`, version 13 and a key of 16
+    bytes; any other upgrade is ignored (RFC 9110 §7.8) — `Upgrade` and the
+    `upgrade` token go, and the request is served as a plain one (settled
+    with the user, over refusing it: a client offering `h2c` on every
+    request still works). A backend's 101 counts only with `Upgrade:
+    websocket`, `upgrade` in `Connection` and the `Sec-WebSocket-Accept`
+    the key calls for; anything else is a 502 and the backend connection
+    is dropped. `sha1` and `base64` are direct dependencies now (both were
+    in the lock already).
+272. **No certificate for a name the zone holds for somebody else**
+    (`routes::tls::not_held_elsewhere`). #231 made the DNS sync leave such
+    a name alone, but the challenge path still published its TXT record,
+    so a node with an approved service called `mail` could get a trusted
+    certificate for a real `mail.<domain>` elsewhere. The provider is asked
+    before a new challenge value is published, by the sync's own rule
+    (`is_ours_to_replace`): live, since a challenge can come before the
+    sync's first look at a name, and its findings don't outlive a restart.
+    Taken: 403. The provider can't be read: 409, nothing published. A value
+    already held is only refreshed, without asking.
+273. **A released service address is held for the phones that may still
+    route it** (migration 0021, `db::services::holds`). Configs are
+    snapshots (#248) and addresses were handed out lowest-free, so a
+    withdrawn address could go to another node's service at once while
+    older phones still sent it to the node that had it — which could answer
+    for the new service. Triggers on `services` record every release of an
+    approved service's address (withdrawn, denied after approval, revoked,
+    node deleted — the cascade fires them too), so no code path can forget
+    one. Such an address goes to nobody else while a live device (not
+    revoked, registered) was exported before the release, or never; its
+    own node takes it back first, and a node deleted afterwards loses that
+    claim (ids are reused). A range left with only held addresses gives the
+    service none, and the log names the devices to refresh — never a
+    silent reuse. `list-peers` shows `holds=` per device, and such a
+    device is `stale=yes`. Node addresses are left out (the user's call):
+    nothing is served on a node's own address, so a stale phone sending one
+    to the wrong node reaches nothing. Releases from before the migration
+    aren't known; every phone needs a `--refresh` after M41 anyway.

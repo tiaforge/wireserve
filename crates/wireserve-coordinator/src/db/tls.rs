@@ -96,6 +96,17 @@ pub fn add_challenge(
     Ok(AddOutcome::Added)
 }
 
+/// Whether `value` is already held at `fqdn` — asked again, it is only
+/// refreshed.
+pub fn has_challenge(conn: &Connection, fqdn: &str, value: &str) -> Result<bool, DbError> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM acme_challenges WHERE fqdn = ?1 AND value = ?2",
+        rusqlite::params![fqdn, value],
+        |row| row.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 /// Marks a value done: the DNS sync removes it on its next pass. Only the
 /// node that added it may.
 pub fn expire_challenge(conn: &Connection, fqdn: &str, value: &str, node_id: i64) -> Result<bool, DbError> {

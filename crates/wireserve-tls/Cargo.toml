@@ -40,6 +40,10 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 webpki-roots = "1"
 # Keys of the /verify cache (PLAN.md M37): never the raw cookie.
 sha2.workspace = true
+# A WebSocket backend's `Sec-WebSocket-Accept`, checked before the
+# connection is handed over (RFC 6455 §4.2.2).
+sha1 = "0.10"
+base64.workspace = true
 libc.workspace = true
 rand.workspace = true
 

@@ -520,7 +520,11 @@ device uses any more and may be closed again.
 **The config is a snapshot.** A node that joins later isn't in it, nor is
 one no carrier reaches at the time of the export (the export says so).
 `list-peers` marks such devices `stale=yes`; `--refresh` (below) brings one
-up to date. Two phones don't reach each other: neither has anything the
+up to date. A withdrawn (or revoked, or deleted) service's address is held
+back meanwhile: an older config still sends it to the node that had it, so no
+other node's service gets it until every device exported before is exported
+again or deleted. `list-peers` shows those addresses as `holds=`; a node
+that declares a service again takes its own back. Two phones don't reach each other: neither has anything the
 other could dial.
 
 **Re-issuing a config** keeps the device's name and mesh address:
@@ -577,7 +581,8 @@ outside the mesh's range, an AAAA or a CNAME is left alone — `wireserve-admin
 list-services` shows it as an error ("not overwriting it") until the record is
 gone. A name whose zone cannot be read waits too. So a node declaring a service
 called `mail` cannot take over, or later delete, a record you already have
-under the domain.
+under the domain — nor get a certificate for it: the ACME challenge for such a
+name is refused the same way.
 
 Names are also protected before they get that far. A service may be called
 after a node (`hetzner` on the node `hetzner`), but only by that node: nobody
@@ -651,6 +656,12 @@ Worth knowing:
 
 - **Every 443 service name becomes public** in the Certificate Transparency
   logs, one certificate per name.
+- **WebSockets go through; other upgrades don't.** A WebSocket reaches the
+  backend as it answers it, and stays open while its caller is still let in.
+  Any other `Upgrade` (`h2c`, say) is ignored and the request served as a
+  plain one: past a switch nothing more is checked, so a protocol that
+  carries further requests would carry them past the sign-in. A backend's
+  `101` that isn't a WebSocket's answer to that very request is refused (502).
 - **Only the service's 443 mapping changes.** Its other ports stay ordinary
   mappings, and its target port stays closed to the mesh.
 - **Port 443 stays free on the node** for nginx, Caddy or Stalwart. The
@@ -1177,7 +1188,7 @@ anywhere that can reach it):
 | --- | --- |
 | `wireserve-admin create-node <name>` | create a node, print a join token |
 | `wireserve-admin export-config <name> [--exit [node]] [--dns <svc\|ip>] [--mesh-dns] [--allow-unverified] [--refresh] [--qr]` | create (or re-issue) a static peer's `.conf`: every node end to end, directly or through a carrier's relay port; `--exit` adds a full-tunnel profile, `--mesh-dns` names the resolver in the mesh profile too |
-| `wireserve-admin list-peers` | the full directory, with each agent's `dialable=` and each device's `stale=` |
+| `wireserve-admin list-peers` | the full directory, with each agent's `dialable=` and each device's `stale=` and `holds=` |
 | `wireserve-admin relay-ports` | every public relay port phones use: where it must be open, which node and devices, whether it was open, which may be closed |
 | `wireserve-admin revoke <name>` | cut a node off, keep its name reserved |
 | `wireserve-admin rejoin <name>` | fresh join token, same name and address; the old key stops working at once |

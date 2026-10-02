@@ -7,8 +7,9 @@
 //! arrangement Tailscale uses for `*.ts.net`. The coordinator is the one
 //! deciding which names a node may prove control of: its own, approved,
 //! published on TCP 443 with an address of their own, and under the service
-//! domain. Anything else would let one node obtain a certificate for
-//! another's name.
+//! domain — and not held in the zone by a record this coordinator did not
+//! write (PLAN.md #272). Anything else would let one node obtain a
+//! certificate for another's name, or for a host outside the mesh.
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -54,6 +55,10 @@ pub async fn add(
         }
         return Err(AppError::TooManyRequests);
     }
+    let held = tls::has_challenge(&*state.db.conn.lock().await, &record, &body.value)?;
+    if !held {
+        not_held_elsewhere(&state, &dns, &node, &body.fqdn).await?;
+    }
     let expires = Utc::now() + chrono::Duration::minutes(CHALLENGE_TTL_MINUTES);
     {
         let conn = state.db.conn.lock().await;
@@ -93,6 +98,33 @@ pub async fn remove(
         state.poke_dns();
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Whether the zone holds `fqdn` for somebody else (PLAN.md #272): any
+/// record but an A inside the mesh's range — the same rule the DNS sync
+/// uses before it first writes a name, asked here because a challenge can
+/// come before the sync has looked, and its findings do not outlive a
+/// restart. A name the provider cannot be asked about is not published:
+/// a certificate is not worth the guess.
+async fn not_held_elsewhere(
+    state: &AppState,
+    dns: &crate::dns::Dns,
+    node: &crate::db::nodes::NodeRow,
+    fqdn: &str,
+) -> Result<(), AppError> {
+    let fqdn = fqdn.trim_end_matches('.').to_ascii_lowercase();
+    let found = dns.writer.existing(&fqdn).await.map_err(|e| {
+        tracing::warn!(node_name = %node.name, fqdn = %fqdn, error = %e, "could not check a name before publishing its challenge");
+        AppError::Conflict(format!("could not check whether {fqdn} is already in use, so its challenge is not published: {e}"))
+    })?;
+    let mesh = wireserve_types::MeshRanges::parse(&state.config.mesh_info());
+    if let Some(record) = found.iter().find(|r| !crate::dns::sync::is_ours_to_replace(r, mesh.as_ref())) {
+        tracing::warn!(event = "challenge_name_taken", node_name = %node.name, fqdn = %fqdn, record = %record, "refused a challenge for a name the zone holds for somebody else");
+        return Err(AppError::Forbidden(format!(
+            "{fqdn}: the zone already has a record here ({record}) that this coordinator did not write, so no certificate is issued for it"
+        )));
+    }
+    Ok(())
 }
 
 /// Who may prove control of `body.fqdn`: see the module doc. Returns the

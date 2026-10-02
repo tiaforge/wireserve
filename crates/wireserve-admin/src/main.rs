@@ -640,6 +640,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             for p in resp.peers {
                 let transit = if resp.transit_approved.contains(&p.name) { "approved" } else { "-" };
                 let stale = if resp.stale_devices.contains(&p.name) { "yes" } else { "-" };
+                // Released service addresses this device still holds back
+                // (PLAN.md #273), until it is exported again.
+                let holds = resp
+                    .held_addresses
+                    .get(&p.name)
+                    .map_or_else(|| "-".to_string(), |a| sanitize_for_terminal(&a.join(",")));
                 let dialable = match resp.dialable.get(&p.name) {
                     Some(true) => "yes",
                     Some(false) => "no",
@@ -660,7 +666,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // only line of defense" reasoning as export_config's
                 // renderer.
                 println!(
-                    "{}\t{}\t{}\t{}\tendpoint={}\tv4={}\tv6={}\tlan={}\treflexive={}\ttransit={}\tdialable={}\tstale={}\texit={}\ttags={}",
+                    "{}\t{}\t{}\t{}\tendpoint={}\tv4={}\tv6={}\tlan={}\treflexive={}\ttransit={}\tdialable={}\tstale={}\texit={}\ttags={}\tholds={}",
                     sanitize_for_terminal(&p.name),
                     sanitize_for_terminal(&p.pubkey),
                     sanitize_for_terminal(&p.ip4),
@@ -692,7 +698,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     match resp.tags.get(&p.name) {
                         Some(t) if !t.is_empty() => sanitize_for_terminal(&t.join(",")),
                         _ => "-".to_string(),
-                    }
+                    },
+                    holds,
                 );
             }
         }

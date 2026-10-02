@@ -3438,6 +3438,45 @@ async fn a_device_is_stale_until_exported_and_again_once_a_node_joins_after_it()
 }
 
 #[tokio::test]
+async fn a_released_service_address_is_held_for_a_device_until_it_is_exported_again() {
+    // PLAN.md #273: the phone's `.conf` still routes the address to minipc.
+    let app = test_app();
+    let (gw, minipc) = phone_scenario(&app).await;
+    let svc = json!([{ "name": "files", "ports": [{ "public": 443, "target": 8443, "proto": "tcp" }] }]);
+    poll_full(&app.router, &minipc, phone_era_poll(false, "198.51.100.3:51820", json!({ "services": svc }))).await;
+    admin_post(&app.router, "/admin/nodes/minipc/services/files/approve").await;
+    let vip = admin_get(&app.router, "/admin/services").await["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "files")
+        .unwrap()["vip4"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    record_export(&app.router, "phone", json!({})).await;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    poll_full(&app.router, &minipc, phone_era_poll(false, "198.51.100.3:51820", json!({}))).await;
+
+    let peers = admin_peers(&app.router).await;
+    assert_eq!(peers["held_addresses"], json!({ "phone": [vip] }), "{peers}");
+    assert_eq!(peers["stale_devices"], json!(["phone"]));
+    // Another node's new service does not get it.
+    let other = json!([{ "name": "wiki", "ports": [{ "public": 443, "target": 8080, "proto": "tcp" }] }]);
+    poll_full(&app.router, &gw, phone_era_poll(true, "203.0.113.2:51820", json!({ "services": other }))).await;
+    admin_post(&app.router, "/admin/nodes/gw/services/wiki/approve").await;
+    let services = admin_get(&app.router, "/admin/services").await;
+    let wiki = services["services"].as_array().unwrap().iter().find(|s| s["name"] == "wiki").unwrap();
+    assert_ne!(wiki["vip4"].as_str().unwrap(), vip, "{services}");
+
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    record_export(&app.router, "phone", json!({})).await;
+    let peers = admin_peers(&app.router).await;
+    assert!(peers.get("held_addresses").is_none() && peers.get("stale_devices").is_none(), "{peers}");
+}
+
+#[tokio::test]
 async fn a_carrier_or_exit_is_not_deleted_while_a_device_relies_on_it() {
     let app = test_app();
     let (_gw, _minipc) = phone_scenario(&app).await;
@@ -4168,6 +4207,44 @@ mod dns_records {
         pass(&app).await;
         let calls = fake.take();
         assert!(calls.contains(&format!("remove-txt _acme-challenge.plex.int.example.com {DIGEST}")), "{calls:?}");
+    }
+
+    #[tokio::test]
+    async fn no_challenge_for_a_name_the_zone_holds_for_somebody_else() {
+        // PLAN.md #272: the sync leaves such a name alone, and so must the
+        // certificate — whether or not the sync has looked yet.
+        let fake = Arc::new(FakeDns::default());
+        let app = app(&fake);
+        let home = node(&app, "home").await;
+        fake.zone.lock().unwrap().insert("mail.int.example.com".into(), vec!["A 203.0.113.5".into()]);
+        fake.zone.lock().unwrap().insert("wiki.int.example.com".into(), vec!["CNAME wiki.example.net".into()]);
+        fake.zone.lock().unwrap().insert("v6.int.example.com".into(), vec!["AAAA 2001:db8::1".into()]);
+        fake.zone.lock().unwrap().insert("prom.int.example.com".into(), vec!["A 100.90.0.99".into()]);
+        poll_with(
+            &app.router,
+            &home,
+            json!([svc("mail", 443, 8443), svc("wiki", 443, 8080), svc("v6", 443, 8081), svc("prom", 443, 9090), svc("plex", 443, 32400)]),
+        )
+        .await;
+        for fqdn in ["mail.int.example.com", "wiki.int.example.com", "v6.int.example.com"] {
+            assert_eq!(challenge(&app, &home, "POST", fqdn, DIGEST).await, StatusCode::FORBIDDEN, "{fqdn}");
+        }
+        assert!(fake.take().is_empty(), "nothing written for a name that is taken");
+        // One of ours from an earlier run, inside the mesh range, and a name
+        // with nothing at it.
+        assert_eq!(challenge(&app, &home, "POST", "prom.int.example.com", DIGEST).await, StatusCode::CREATED);
+        assert_eq!(challenge(&app, &home, "POST", "plex.int.example.com", DIGEST).await, StatusCode::CREATED);
+        assert!(fake.looked_up.lock().unwrap().contains(&"plex.int.example.com".to_string()), "asked, not assumed");
+
+        // Asked again for a value already held: refreshed without asking.
+        fake.lookup_fails.store(true, Ordering::SeqCst);
+        assert_eq!(challenge(&app, &home, "POST", "plex.int.example.com", DIGEST).await, StatusCode::OK);
+        // A new value while the provider cannot say: not published.
+        let other = DIGEST.replace('A', "B");
+        assert_ne!(other, DIGEST);
+        fake.take();
+        assert_eq!(challenge(&app, &home, "POST", "plex.int.example.com", &other).await, StatusCode::CONFLICT);
+        assert!(fake.take().is_empty(), "nothing written on a guess");
     }
 
     #[tokio::test]

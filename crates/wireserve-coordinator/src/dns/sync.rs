@@ -261,7 +261,7 @@ pub async fn pass(state: &AppState, dns: &Dns, moving: &mut BTreeMap<String, (Ip
 /// replaced by ours: only an A record inside the mesh's own range, which is
 /// what an earlier run of this coordinator wrote and did not get to record.
 /// Any other address, a AAAA or a CNAME is somebody else's.
-fn is_ours_to_replace(record: &str, mesh: Option<&wireserve_types::MeshRanges>) -> bool {
+pub(crate) fn is_ours_to_replace(record: &str, mesh: Option<&wireserve_types::MeshRanges>) -> bool {
     let Some(ip) = record.strip_prefix("A ").and_then(|a| a.parse::<Ipv4Addr>().ok()) else {
         return false;
     };

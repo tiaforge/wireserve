@@ -854,6 +854,12 @@ pub struct AdminPeersResponse {
     /// qualifies. `export-config --refresh` brings one up to date.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stale_devices: Vec<String>,
+    /// Released service addresses each device still holds back (PLAN.md
+    /// #273): its `.conf` may route them to the node that had them, so no
+    /// other node's service gets them until it is exported again or
+    /// deleted. Such a device is stale too.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub held_addresses: std::collections::BTreeMap<String, Vec<String>>,
     /// Names of the nodes whose most recent poll offered to be an exit
     /// (`wireserve exit on`, PLAN.md M27), approved for transit or
     /// not — the export checks both.
