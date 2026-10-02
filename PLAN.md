@@ -4068,3 +4068,24 @@ and could not tell which public name was asked for.
     sees from `127.0.0.1`/`svc.test` to `203.0.113.9, 127.0.0.1`/
     `files.example.com`; `set_forwarded` appends; the coordinator parses
     the setting. No e2e.
+
+Reviewed with the user before deploying (2026-10-02); three tightenings:
+
+266. **A forwarding node's owner is never named.** By device, its requests
+    would carry its owner's identity headers (M38) — every internet visitor
+    named as whoever owns the proxy's host. It speaks for someone else, so
+    `guard` gets no owner for it. A sign-in still names whoever signed in;
+    `X-Wireserve-Node` still names the node, which is true.
+267. **Only the client the proxy saw** (`vouched_for`). Of its
+    `X-Forwarded-For`, only the last entry is kept: a proxy that appends
+    (nginx's `$proxy_add_x_forwarded_for`) passes on whatever its client
+    claimed before it, and backends believe the first entry (Seafile:
+    `split(',')[0]`). Not an IP address: dropped, and the backend sees the
+    node alone, as before M43. The verify path is untouched.
+268. **`X-Forwarded-Host` is one host name**, with an optional port as
+    `Host` may carry (RFC 9110 §7.2): labels of letters, digits and
+    hyphens. Several values, a list, a path, an empty port, an IPv6
+    literal or a trailing dot: dropped, and the proxy names the request's
+    own `Host`. Apps build absolute URLs — reset links — from it.
+    Still open: the trust follows a node *name* (a deleted node's name can
+    be registered again) and covers every service; to be talked about next.

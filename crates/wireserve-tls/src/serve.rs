@@ -539,7 +539,9 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                         let mut req = req.map(Body::new);
                         // As the client asked, for asking again while it is open.
                         let asked = upgrade.then(|| Arc::new(as_asked(&req)));
-                        let owner = caller.and_then(|c| c.owner);
+                        // A forwarding node speaks for someone else: its owner
+                        // says nothing about who is calling (PLAN.md M43).
+                        let owner = if forwarder { None } else { caller.and_then(|c| c.owner) };
                         match guard(&mut req, sign_in.as_ref(), &policy, caller_addr, owner.as_ref(), &identity).await {
                             Some(denied) => Ok(denied),
                             None => match asked {
@@ -768,20 +770,76 @@ fn is_untrusted(name: &str, verify: bool, forwarder: bool, extra: &[String]) -> 
 /// nothing to borrow.
 ///
 /// `forwarder`: the caller is a node named in `WIRESERVE_FORWARDING_NODES`
-/// (PLAN.md M43), whose `X-Forwarded-For` and `X-Forwarded-Host` stay: the
-/// proxy appends this connection's peer to the first and keeps the second,
-/// so the backend sees the client the forwarding node saw, and the name
-/// it was asked for. The operator's own `extra` list still removes them.
+/// (PLAN.md M43), whose `X-Forwarded-For` and `X-Forwarded-Host` stay, cut
+/// down to what the node itself can vouch for ([`vouched_for`]): the proxy
+/// appends this connection's peer to the first and keeps the second, so the
+/// backend sees the client the forwarding node saw, and the name it was
+/// asked for. The operator's own `extra` list still removes them.
 pub fn prepare(headers: &mut HeaderMap, caller: Option<&str>, verify: bool, forwarder: bool, extra: &[String]) {
     let doomed: Vec<axum::http::HeaderName> =
         headers.keys().filter(|n| is_untrusted(n.as_str(), verify, forwarder, extra)).cloned().collect();
     for name in doomed {
         headers.remove(name);
     }
+    if forwarder && !verify {
+        vouched_for(headers);
+    }
     if let Some(node) = caller.and_then(|n| HeaderValue::from_str(n).ok()) {
         headers.insert(NODE_HEADER, node);
     }
     join_cookies(headers);
+}
+
+/// What a forwarding node can vouch for, and nothing it merely passed on
+/// (PLAN.md M43):
+///
+/// - `X-Forwarded-For`: only its last entry — the client the node's proxy
+///   saw. Whatever came before it, a proxy that appends (nginx's
+///   `$proxy_add_x_forwarded_for`) took from the client unchecked, and
+///   backends believe the first entry. Not an IP address: dropped, and the
+///   backend sees the node alone.
+/// - `X-Forwarded-Host`: one value, a host name with an optional port, as
+///   `Host` may carry; anything else is dropped, and the proxy names the
+///   request's own `Host` instead.
+fn vouched_for(headers: &mut HeaderMap) {
+    let xff = axum::http::HeaderName::from_static("x-forwarded-for");
+    let last = headers
+        .get_all(&xff)
+        .iter()
+        .next_back()
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit(',').next())
+        .map(str::trim)
+        .and_then(|ip| ip.parse::<IpAddr>().ok());
+    headers.remove(&xff);
+    if let Some(ip) = last.and_then(|ip| HeaderValue::from_str(&ip.to_string()).ok()) {
+        headers.insert(xff, ip);
+    }
+
+    let xfh = axum::http::HeaderName::from_static("x-forwarded-host");
+    let mut values = headers.get_all(&xfh).iter();
+    let single = match (values.next(), values.next()) {
+        (Some(v), None) => v.to_str().ok().filter(|v| is_host(v)).map(str::to_owned),
+        _ => None,
+    };
+    headers.remove(&xfh);
+    if let Some(v) = single.and_then(|v| HeaderValue::from_str(&v).ok()) {
+        headers.insert(xfh, v);
+    }
+}
+
+/// A host name, with an optional port: letters, digits and hyphens in
+/// labels of 1 to 63, none starting or ending with a hyphen, 253 in all.
+fn is_host(value: &str) -> bool {
+    let (name, port) = match value.rsplit_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (value, None),
+    };
+    let port_ok = port.is_none_or(|p| !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok());
+    let label_ok = |l: &str| {
+        !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    port_ok && !name.is_empty() && name.len() <= 253 && name.split('.').all(label_ok)
 }
 
 /// Browsers speaking HTTP/2 send each cookie as a header of its own, and the
@@ -1119,6 +1177,73 @@ mod tests {
         prepare(&mut h, Some("edge"), false, true, &["x-forwarded-host".to_string()]);
         assert!(h.get("x-forwarded-host").is_none());
         assert_eq!(h["x-forwarded-for"], "203.0.113.9");
+    }
+
+    #[test]
+    fn a_forwarding_node_vouches_only_for_the_client_it_saw() {
+        let forwarded = |pairs: &[(&'static str, &'static str)]| {
+            let mut h = HeaderMap::new();
+            for (k, v) in pairs {
+                h.append(axum::http::HeaderName::from_static(k), HeaderValue::from_static(v));
+            }
+            prepare(&mut h, Some("edge"), false, true, &[]);
+            let get = |n: &str| h.get_all(n).iter().map(|v| v.to_str().unwrap().to_string()).collect::<Vec<_>>();
+            (get("x-forwarded-for"), get("x-forwarded-host"))
+        };
+        // A proxy that appends: the client's own claim goes, what the proxy saw stays.
+        assert_eq!(forwarded(&[("x-forwarded-for", "1.2.3.4, 203.0.113.9")]).0, ["203.0.113.9"]);
+        assert_eq!(forwarded(&[("x-forwarded-for", "1.2.3.4"), ("x-forwarded-for", " 2001:db8::7 ")]).0, ["2001:db8::7"]);
+        for junk in ["", "unknown", "203.0.113.9:4444", "1.2.3.4, ", "<script>"] {
+            assert!(forwarded(&[("x-forwarded-for", junk)]).0.is_empty(), "{junk:?}");
+        }
+
+        assert_eq!(forwarded(&[("x-forwarded-host", "files.example.com")]).1, ["files.example.com"]);
+        assert_eq!(forwarded(&[("x-forwarded-host", "files.example.com:8443")]).1, ["files.example.com:8443"]);
+        for junk in [
+            "files.example.com, evil.example", "evil.example/path", "files.example.com:", "files.example.com:99999",
+            "-bad.example", "a..b", "files.example.com.", "[::1]:443", "user@evil.example", "",
+        ] {
+            assert!(forwarded(&[("x-forwarded-host", junk)]).1.is_empty(), "{junk:?}");
+        }
+        assert!(forwarded(&[("x-forwarded-host", "a.example"), ("x-forwarded-host", "b.example")]).1.is_empty(), "two of them");
+
+        // The provider's verify path keeps what the calling terminator set, as it is.
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", HeaderValue::from_static("10.9.0.3, 10.9.0.4"));
+        prepare(&mut h, Some("edge"), true, true, &[]);
+        assert_eq!(h["x-forwarded-for"], "10.9.0.3, 10.9.0.4");
+    }
+
+    #[tokio::test]
+    async fn a_forwarding_nodes_owner_is_never_named() {
+        let owner = wireserve_types::CallerIdentity {
+            addr: Ipv4Addr::LOCALHOST,
+            user: "sub-tia".into(),
+            email: Some("tia@example.com".into()),
+            groups: vec!["admins".into()],
+        };
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            let app = axum::Router::new().fallback(|h: HeaderMap| async move {
+                format!("user={}", h.get("x-auth-user").map(|v| v.to_str().unwrap()).unwrap_or(""))
+            });
+            axum::serve(backend, app).await.unwrap();
+        });
+        let (port, client, shared) = in_front_of(upstream, quick());
+        shared.callers.write().unwrap().insert(Ipv4Addr::LOCALHOST, CallerInfo { node: "edge".into(), owner: Some(owner) });
+        let ask = || async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut c = tls(port, &client).await;
+            c.write_all(b"GET / HTTP/1.1\r\nhost: svc.test\r\nconnection: close\r\n\r\n").await.unwrap();
+            let mut answer = String::new();
+            c.read_to_string(&mut answer).await.unwrap();
+            answer
+        };
+        assert!(ask().await.ends_with("user=sub-tia"), "an ordinary node is named by its owner");
+        shared.forwarders.write().unwrap().push("edge".into());
+        let answer = ask().await;
+        assert!(answer.ends_with("user="), "a forwarding node speaks for someone else: {answer}");
     }
 
     #[tokio::test]
