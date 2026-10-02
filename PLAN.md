@@ -4089,3 +4089,18 @@ Reviewed with the user before deploying (2026-10-02); three tightenings:
     own `Host`. Apps build absolute URLs — reset links — from it.
     Still open: the trust follows a node *name* (a deleted node's name can
     be registered again) and covers every service; to be talked about next.
+
+269. **A forwarding node's share of the connections is 1024**
+    (`Limits::max_per_forwarder`), not 128: its one address is everyone
+    its proxy serves, and each WebSocket through it holds a connection of
+    its own — a hundred Seafile tabs filled 128. A quarter of `max_total`,
+    so whatever comes through it, every other caller keeps the rest.
+    Decided at accept, by the same address-to-node lookup
+    (`Shared::forwarding_node`); the refusal log names the node.
+270. **32 WebSockets per client of a forwarding node**
+    (`max_upgrades_per_forwarded_client`), by the address it vouched for
+    (#267) — or, without one, the node's own — so one internet client
+    cannot take the node's whole share; over it, 429. Counted from the
+    upgrade request until the bytes stop (the slot rides in the bridge
+    task). Ordinary requests end on their own and are not counted. Both
+    fixed, not settings, until a deployment needs one.

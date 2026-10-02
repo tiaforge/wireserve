@@ -101,6 +101,12 @@ impl Shared {
         }
     }
 
+    /// The forwarding node (PLAN.md M43) calling from `addr`, if it is one.
+    pub fn forwarding_node(&self, addr: IpAddr) -> Option<String> {
+        let node = read(&self.callers).get(&local_v4(addr)?)?.node.clone();
+        read(&self.forwarders).iter().any(|f| f.eq_ignore_ascii_case(&node)).then_some(node)
+    }
+
     /// Stops answering on `vip`: its connections close, and requests on
     /// ones already open are refused.
     pub fn unroute(&self, vip: Ipv4Addr) {
@@ -178,6 +184,14 @@ pub struct Limits {
     /// Connections open at once from one address. A browser needs a
     /// handful; this is far above that.
     pub max_per_source: usize,
+    /// The same for a forwarding node (PLAN.md M43), whose one address is
+    /// everyone its proxy serves: a quarter of `max_total`, so whatever
+    /// comes through it, every other caller keeps the rest.
+    pub max_per_forwarder: usize,
+    /// WebSockets (any upgrade) open at once for one client of a forwarding
+    /// node, by the address it vouched for: its share of the node's
+    /// connections. A person with a few tabs needs a handful.
+    pub max_upgrades_per_forwarded_client: usize,
     /// How often an upgraded connection's caller is asked about again
     /// (PLAN.md M42): what a grant taken away waits at most to close it.
     pub recheck: Duration,
@@ -192,6 +206,8 @@ impl Default for Limits {
             header_read: Duration::from_secs(20),
             max_total: 4096,
             max_per_source: 128,
+            max_per_forwarder: 1024,
+            max_upgrades_per_forwarded_client: 32,
             recheck: Duration::from_secs(30),
         }
     }
@@ -210,11 +226,13 @@ struct Permit {
 }
 
 impl Conns {
-    fn acquire(self: &Arc<Self>, source: IpAddr, limits: &Limits) -> Option<Permit> {
+    /// A place for one more connection from `source`, if it has fewer than
+    /// `per_source` open and all together fewer than `limits.max_total`.
+    fn acquire(self: &Arc<Self>, source: IpAddr, per_source: usize, limits: &Limits) -> Option<Permit> {
         let source = source.to_canonical();
         let mut counts = self.counts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mine = counts.1.get(&source).copied().unwrap_or(0);
-        if counts.0 >= limits.max_total || mine >= limits.max_per_source {
+        if counts.0 >= limits.max_total || mine >= per_source {
             return None;
         }
         counts.0 += 1;
@@ -231,6 +249,47 @@ impl Drop for Permit {
             *n -= 1;
             if *n == 0 {
                 counts.1.remove(&self.source);
+            }
+        }
+    }
+}
+
+/// Upgraded connections open per client of a forwarding node (PLAN.md M43),
+/// by the address the node vouched for.
+#[derive(Default)]
+struct UpgradeSlots {
+    by_client: Mutex<HashMap<IpAddr, usize>>,
+}
+
+/// One upgraded connection's place in [`UpgradeSlots`], given back on drop.
+struct UpgradeSlot {
+    slots: Arc<UpgradeSlots>,
+    client: IpAddr,
+}
+
+impl UpgradeSlots {
+    fn acquire(self: &Arc<Self>, client: IpAddr, max: usize) -> Option<UpgradeSlot> {
+        let client = client.to_canonical();
+        let mut by_client = self.by_client.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let open = by_client.entry(client).or_insert(0);
+        if *open >= max {
+            if *open == 0 {
+                by_client.remove(&client);
+            }
+            return None;
+        }
+        *open += 1;
+        Some(UpgradeSlot { slots: Arc::clone(self), client })
+    }
+}
+
+impl Drop for UpgradeSlot {
+    fn drop(&mut self) {
+        let mut by_client = self.slots.by_client.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(n) = by_client.get_mut(&self.client) {
+            *n -= 1;
+            if *n == 0 {
+                by_client.remove(&self.client);
             }
         }
     }
@@ -434,6 +493,7 @@ pub fn spawn(listener: TcpListener, tls: Arc<rustls::ServerConfig>, shared: Shar
 pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, shared: Shared, limits: Limits) -> JoinHandle<()> {
     let acceptor = tokio_rustls::TlsAcceptor::from(tls);
     let conns = Arc::new(Conns::default());
+    let upgrade_slots = Arc::new(UpgradeSlots::default());
     tokio::spawn(async move {
         let mut last_refusal_logged: Option<Instant> = None;
         loop {
@@ -457,10 +517,16 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
             };
             // Only what would be answered counts against the limits, and
             // what is over them is closed unanswered, before any TLS work.
-            let Some(permit) = conns.acquire(peer.ip(), &limits) else {
+            let forwarding_node = shared.forwarding_node(peer.ip());
+            let per_source = if forwarding_node.is_some() { limits.max_per_forwarder } else { limits.max_per_source };
+            let Some(permit) = conns.acquire(peer.ip(), per_source, &limits) else {
                 if last_refusal_logged.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
                     last_refusal_logged = Some(Instant::now());
-                    tracing::warn!(peer = %peer.ip(), "too many open connections; closing new ones (logged once a minute)");
+                    tracing::warn!(
+                        peer = %peer.ip(),
+                        forwarding_node = forwarding_node.as_deref().unwrap_or_default(),
+                        "too many open connections; closing new ones (logged once a minute)"
+                    );
                 }
                 continue;
             };
@@ -478,6 +544,7 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                 .with_retries(4);
             let _ = socket2::SockRef::from(&tcp).set_tcp_keepalive(&keepalive);
             let acceptor = acceptor.clone();
+            let upgrade_slots = Arc::clone(&upgrade_slots);
             let shared = shared.clone();
             let limits = limits.clone();
             tokio::spawn(async move {
@@ -498,7 +565,7 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                     let sign_in = read(&shared.sign_in).clone();
                     let identity = read(&shared.identity).clone();
                     let strip = read(&shared.strip).clone();
-                    let forwarder = caller.as_ref().is_some_and(|c| read(&shared.forwarders).iter().any(|f| f.eq_ignore_ascii_case(&c.node)));
+                    let forwarder = shared.forwarding_node(peer.ip()).is_some();
                     let misdirected = policy.as_ref().is_some_and(|p| !for_this_service(&req, &p.fqdn));
                     if misdirected {
                         tracing::info!(
@@ -518,6 +585,8 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                     });
                     let router = if verify { route.verify_router.clone() } else { route.router.clone() };
                     let (upstream, recheck) = (route.upstream, limits.recheck);
+                    let max_upgrades = limits.max_upgrades_per_forwarded_client;
+                    let upgrade_slots = Arc::clone(&upgrade_slots);
                     let upgrade = !verify && crate::upgrade::wanted(&req);
                     prepare(req.headers_mut(), caller.as_ref().map(|c| c.node.as_str()), verify, forwarder, &strip);
                     req.extensions_mut().insert(ConnectInfo(peer));
@@ -546,11 +615,31 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                             Some(denied) => Ok(denied),
                             None => match asked {
                                 Some(asked) => {
+                                    // A forwarding node's client, by the address it
+                                    // vouched for — or, without one, the node's own.
+                                    let slot = if forwarder {
+                                        let client = req
+                                            .headers()
+                                            .get("x-forwarded-for")
+                                            .and_then(|v| v.to_str().ok())
+                                            .and_then(|v| v.parse::<IpAddr>().ok())
+                                            .unwrap_or(peer.ip());
+                                        let Some(slot) = upgrade_slots.acquire(client, max_upgrades) else {
+                                            tracing::info!(%client, "too many WebSockets open for one client of a forwarding node");
+                                            return Ok(crate::sign_in::plain(
+                                                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                                                "too many connections open from your address",
+                                            ));
+                                        };
+                                        Some(slot)
+                                    } else {
+                                        None
+                                    };
                                     let again = move || {
                                         let (shared, asked) = (shared.clone(), Arc::clone(&asked));
                                         async move { still_admitted(&shared, vip, caller_addr, &asked).await }
                                     };
-                                    let answer = crate::upgrade::proxy(req, upstream, peer, recheck, again).await;
+                                    let answer = crate::upgrade::proxy(req, upstream, peer, recheck, again, slot).await;
                                     if answer.status() == axum::http::StatusCode::SWITCHING_PROTOCOLS {
                                         stats.upgraded.store(true, Ordering::Relaxed);
                                     }
@@ -1376,6 +1465,8 @@ mod tests {
             header_read: Duration::from_millis(300),
             max_total: 100,
             max_per_source: 100,
+            max_per_forwarder: 100,
+            max_upgrades_per_forwarded_client: 100,
             recheck: Duration::from_millis(300),
         }
     }
@@ -1563,10 +1654,20 @@ mod tests {
 
     /// A WebSocket to `path` on the terminator, offering `chat`.
     async fn ws(port: u16, client: &tokio_rustls::TlsConnector, path: &str) -> Result<(Ws, tungstenite::handshake::client::Response), tungstenite::Error> {
+        ws_for(port, client, path, "6.6.6.6").await
+    }
+
+    /// [`ws`], claiming to be for `xff`.
+    async fn ws_for(
+        port: u16,
+        client: &tokio_rustls::TlsConnector,
+        path: &str,
+        xff: &str,
+    ) -> Result<(Ws, tungstenite::handshake::client::Response), tungstenite::Error> {
         use tungstenite::client::IntoClientRequest;
         let mut req = format!("wss://svc.test{path}").into_client_request().unwrap();
         req.headers_mut().insert("sec-websocket-protocol", "chat, superchat".parse().unwrap());
-        req.headers_mut().insert("x-forwarded-for", "6.6.6.6".parse().unwrap());
+        req.headers_mut().insert("x-forwarded-for", xff.parse().unwrap());
         req.headers_mut().insert("cookie", "theme=dark".parse().unwrap());
         tokio_tungstenite::client_async(req, tls(port, client).await).await
     }
@@ -1679,5 +1780,55 @@ mod tests {
         next_text(&mut ws2).await;
         shared.unroute(Ipv4Addr::LOCALHOST);
         assert!(ws_closed_within(&mut ws2, Duration::from_secs(3)).await, "unrouted");
+    }
+
+    fn forwarding(shared: &Shared) {
+        shared.callers.write().unwrap().insert(Ipv4Addr::LOCALHOST, CallerInfo { node: "edge".into(), owner: None });
+        shared.forwarders.write().unwrap().push("edge".into());
+    }
+
+    #[tokio::test]
+    async fn a_forwarding_node_has_a_larger_share_of_the_connections() {
+        let limits = Limits { max_per_source: 2, max_per_forwarder: 4, first_request: Duration::from_secs(30), idle: Duration::from_secs(30), ..quick() };
+        let (port, client, shared) = limited_shared(limits).await;
+        forwarding(&shared);
+        let mut open = Vec::new();
+        for _ in 0..4 {
+            open.push(tls(port, &client).await);
+        }
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let refused = client.connect(rustls_pki_types::ServerName::try_from("svc.test").unwrap(), tcp).await;
+        assert!(refused.is_err(), "over even a forwarding node's share");
+    }
+
+    #[tokio::test]
+    async fn one_client_of_a_forwarding_node_cannot_hold_all_its_websockets() {
+        let limits = Limits { max_upgrades_per_forwarded_client: 2, ..quick() };
+        let (port, client, shared) = in_front_of(ws_backend().await, limits);
+        forwarding(&shared);
+        let (mut a, _) = ws_for(port, &client, "/", "203.0.113.9").await.expect("first");
+        next_text(&mut a).await;
+        let (_b, _) = ws_for(port, &client, "/", "198.51.100.1, 203.0.113.9").await.expect("second, same client");
+        match ws_for(port, &client, "/", "203.0.113.9").await {
+            Err(tungstenite::Error::Http(resp)) => assert_eq!(resp.status(), 429),
+            other => panic!("expected 429, got {:?}", other.map(|(_, r)| r.status())),
+        }
+        let (mut other, _) = ws_for(port, &client, "/", "203.0.113.10").await.expect("another client is not affected");
+        next_text(&mut other).await;
+
+        // A socket closed gives its place back.
+        a.close(None).await.unwrap();
+        drop(a);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        ws_for(port, &client, "/", "203.0.113.9").await.expect("room again");
+
+        // Without a forwarding node there is no such cap: its own share decides.
+        shared.forwarders.write().unwrap().clear();
+        let mut open = Vec::new();
+        for _ in 0..3 {
+            let (mut ws, _) = ws_for(port, &client, "/", "203.0.113.9").await.expect("an ordinary caller");
+            next_text(&mut ws).await;
+            open.push(ws);
+        }
     }
 }
