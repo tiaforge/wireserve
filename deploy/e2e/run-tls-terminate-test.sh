@@ -329,7 +329,12 @@ for c in $(podman ps -q --filter "name=wireserve-tt-helper"); do
 done
 in_netns_bg "$HOME_AGENT" python3 /e2e/ws-backend.py 32400
 cp deploy/e2e/ws-client.py "$WORK/ws-client.py"
-CLIENT_IP=$(podman exec "$CLIENT" wireserve list --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["node"]["ip4"])')
+# The client's mesh address, as the home node knows it.
+CLIENT_IP=$(podman exec "$HOME_AGENT" wireserve list --json | python3 -c "
+import json, sys
+m = [p['ip4'] for p in json.load(sys.stdin).get('peers', []) if p.get('name') == 'node-client']
+print(m[0] if m else '')")
+[ -n "$CLIENT_IP" ] || fail "the home node does not list node-client"
 ws_ok() { in_netns "$CLIENT" python3 /work/ws-client.py "wss://plex.$DOMAIN/live?x=1" "$PLEX_VIP" /work/pebble-root.pem; }
 wait_for "the WebSocket backend" 20 ws_ok
 OUT=$(ws_ok) || true
