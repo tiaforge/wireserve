@@ -4249,7 +4249,8 @@ as agreed with the user. Nothing deployed; no e2e suite covers these paths.
     process turned an interface on is kept per interface (one flag for the
     process had been enough while there was one interface). The kernel test
     leaves the carry interface off, sees nothing get through, then switches
-    it on with `set_enabled` as the agent does.
+    it on with `set_enabled` as the agent does. **Passes as root**
+    (2026-10-02, run by the user).
 
 280. **The host firewall is opened for the carry interface's service
     flows, too** (`firewall::Interops::tick`). The carry interface's
