@@ -914,7 +914,8 @@ Worth knowing:
   domain counts as another site, since a node's own 443 service is one of
   them. Following a link, reads (which the browser keeps from the other page)
   and programs that aren't browsers are unaffected, and so is the sign-in
-  provider's own service. A service that must take such requests — itself a
+  provider's own service. Through a forwarding node, the public name it was
+  asked for counts as the service's own. A service that must take such requests — itself a
   sign-in client answered by form POST, say — goes in
   `WIRESERVE_CROSS_SITE_SERVICES` on the coordinator.
 - **A node learns who owns a device only when that device calls it.** The

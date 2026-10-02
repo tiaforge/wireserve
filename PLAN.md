@@ -4209,3 +4209,12 @@ as agreed with the user. Nothing deployed; no e2e suite covers these paths.
       `TlsService::cross_site` — both, as the user chose.
     Applies to every request, signed-in ones too: a same-site page gets the
     authward cookie sent along.
+
+277. **Through a forwarding node, the public name is the service's own
+    origin** (found right after #276, before any deploy). A Caddy serving
+    `files.tia.sh` into `files.home.tia.sh` (M43) has browsers whose
+    `Origin` is `https://files.tia.sh`: #276 refused every WebSocket
+    through it — Seafile's among them — and every POST from a browser too
+    old to send `Sec-Fetch-Site`. For a forwarding node, the
+    `X-Forwarded-Host` it vouched for (#268: one plain host name, kept only
+    for such a node) counts as the service's own name as well.

@@ -618,7 +618,7 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                         // provider's own pages are exempt: its provider
                         // answers by form POST from elsewhere.
                         let provider = sign_in.as_ref().is_some_and(|si| si.target.fqdn.eq_ignore_ascii_case(&policy.fqdn));
-                        if !policy.cross_site && !provider && started_elsewhere(&req, &policy.fqdn, upgrade) {
+                        if !policy.cross_site && !provider && started_elsewhere(&req, &policy.fqdn, upgrade, forwarder) {
                             tracing::info!(
                                 service = %policy.fqdn,
                                 peer = %peer.ip(),
@@ -886,12 +886,20 @@ fn is_untrusted(name: &str, verify: bool, forwarder: bool, extra: &[String]) -> 
 /// among them. Following a link stays allowed, and so do reads, which the
 /// browser keeps from the other page. A client that is not a browser
 /// sends neither header, and is never refused here.
-fn started_elsewhere<B>(req: &Request<B>, fqdn: &str, websocket: bool) -> bool {
+///
+/// `forwarder`: the caller is a forwarding node (PLAN.md M43), whose
+/// browsers are on the public name it was asked for — the
+/// `X-Forwarded-Host` it vouched for, which `prepare` kept only then — so
+/// that name's pages are the service's own too.
+fn started_elsewhere<B>(req: &Request<B>, fqdn: &str, websocket: bool, forwarder: bool) -> bool {
     use axum::http::Method;
     let headers = req.headers();
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(|v| v.trim().to_ascii_lowercase());
+    let public = header("x-forwarded-host").filter(|_| forwarder);
     let own_origin = |origin: &str| {
-        origin.strip_prefix("https://").is_some_and(|host| host.eq_ignore_ascii_case(fqdn))
+        origin
+            .strip_prefix("https://")
+            .is_some_and(|host| host.eq_ignore_ascii_case(fqdn) || public.as_deref().is_some_and(|p| host.eq_ignore_ascii_case(p)))
     };
     let origin = header("origin");
     let elsewhere = match header("sec-fetch-site").as_deref() {
@@ -2062,7 +2070,7 @@ mod tests {
             b.body(()).unwrap()
         };
         let own = "svc.test";
-        let refused = |method: &str, headers: &[(&str, &str)], ws: bool| started_elsewhere(&req(method, headers), own, ws);
+        let refused = |method: &str, headers: &[(&str, &str)], ws: bool| started_elsewhere(&req(method, headers), own, ws, false);
         // A form another site submits, or its fetch.
         assert!(refused("POST", &[("sec-fetch-site", "cross-site")], false));
         assert!(refused("DELETE", &[("sec-fetch-site", "same-site")], false), "another service on the domain is another site");
@@ -2082,6 +2090,16 @@ mod tests {
         assert!(!refused("POST", &[], false), "no browser headers: a program");
         assert!(!refused("GET", &[("sec-fetch-site", "same-origin"), ("origin", "https://svc.test")], true));
         assert!(!refused("GET", &[], true));
+
+        // Through a forwarding node (PLAN.md M43): the public name it
+        // vouched for is the service's own origin, and nobody else's is.
+        let public = [("x-forwarded-host", "files.example.com"), ("origin", "https://files.example.com")];
+        assert!(!started_elsewhere(&req("GET", &public), own, true, true), "the public page's WebSocket");
+        assert!(!started_elsewhere(&req("POST", &public), own, false, true), "an older browser's POST from it");
+        assert!(started_elsewhere(&req("GET", &public), own, true, false), "only a forwarding node's word counts");
+        let elsewhere = [("x-forwarded-host", "files.example.com"), ("origin", "https://evil.example")];
+        assert!(started_elsewhere(&req("GET", &elsewhere), own, true, true));
+        assert!(started_elsewhere(&req("POST", &[("sec-fetch-site", "cross-site"), public[0], public[1]]), own, false, true));
     }
 
     /// Sends `method` to `/` with `headers` and a small body; the status line.
@@ -2129,5 +2147,28 @@ mod tests {
         provider.target.fqdn = "svc.test".into();
         *shared.sign_in.write().unwrap() = Some(provider);
         assert!(send(&mut s, "POST", &cross).await.starts_with("HTTP/1.1 200"));
+    }
+
+    #[tokio::test]
+    async fn a_websocket_from_the_public_page_a_forwarding_node_serves_is_its_own() {
+        // A Caddy on files.example.com proxying to svc.test (PLAN.md M43):
+        // the browser's Origin is the public name.
+        use tungstenite::client::IntoClientRequest;
+        let (port, client, shared) = in_front_of(ws_backend().await, quick());
+        let open = |origin: &'static str| {
+            let mut req = "wss://svc.test/".into_client_request().unwrap();
+            req.headers_mut().insert("origin", origin.parse().unwrap());
+            req.headers_mut().insert("x-forwarded-host", "files.example.com".parse().unwrap());
+            req
+        };
+        let refused = tokio_tungstenite::client_async(open("https://files.example.com"), tls(port, &client).await).await;
+        assert!(refused.is_err(), "not a forwarding node: its X-Forwarded-Host is removed, and the origin is foreign");
+        forwarding(&shared);
+        let (mut ws, _) = tokio_tungstenite::client_async(open("https://files.example.com"), tls(port, &client).await)
+            .await
+            .expect("the public page's own WebSocket");
+        next_text(&mut ws).await;
+        let elsewhere = tokio_tungstenite::client_async(open("https://evil.example"), tls(port, &client).await).await;
+        assert!(elsewhere.is_err(), "anyone else's page still is not");
     }
 }
