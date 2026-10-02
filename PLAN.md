@@ -4035,8 +4035,8 @@ headers, and a backend's refusal reached the client as a 502.
     counted against `max_per_source`; a device without access refused
     before the backend; a grant taken away and an unrouted service closing
     an open socket. The idle, forwarding and refusal tests fail against
-    the M33 path. `run-tls-terminate-test.sh` step 10 (rootful podman, not
-    run yet): a WebSocket from the client node over verified TLS, with
+    the M33 path. `run-tls-terminate-test.sh` step 10 (**passes**, 2026-10-02,
+    with steps 1–9): a WebSocket from the client node over verified TLS, with
     `chat` chosen, `X-Wireserve-Node: node-client`, the client's mesh
     address in `X-Forwarded-For`, and an echo; `ws-backend.py` and
     `ws-client.py` were checked against bookworm's websockets 10.4.
