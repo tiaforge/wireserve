@@ -78,8 +78,10 @@ pub trait InteropHandle {
 }
 
 /// The mesh interface's interop and, when there is one, the carry
-/// interface's (PLAN.md M39). The carry interface never forwards, so its
-/// interop never opens any.
+/// interface's (PLAN.md M39). The carry interface forwards nothing but a
+/// service's own flows to its target (PLAN.md #278–#280), so its interop
+/// opens the services' openings when the mesh interface's does, and never
+/// transit, exit or relay ones: nothing of those arrives on it.
 pub struct Interops<I> {
     pub main: I,
     pub carry: Option<I>,
@@ -89,7 +91,7 @@ impl<I: InteropHandle> InteropHandle for Interops<I> {
     fn tick(&self, forward_wanted: ForwardWanted) {
         self.main.tick(forward_wanted);
         if let Some(carry) = &self.carry {
-            carry.tick(ForwardWanted::default());
+            carry.tick(ForwardWanted { services: forward_wanted.services, ..ForwardWanted::default() });
         }
     }
 
@@ -194,6 +196,31 @@ mod tests {
     use super::fake::{Call, FakeFirewallBackend};
     use super::startup_sequence;
     use wireserve_types::{FirewallBackend, Forwarding, Proto, ServiceRule};
+
+    #[test]
+    fn the_carry_interfaces_interop_opens_only_what_a_service_forwards() {
+        use super::{ForwardWanted, InteropHandle, Interops};
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Default)]
+        struct Recorder(Arc<Mutex<Vec<ForwardWanted>>>);
+        impl InteropHandle for Recorder {
+            fn tick(&self, forward_wanted: ForwardWanted) {
+                self.0.lock().unwrap().push(forward_wanted);
+            }
+            fn stop(&mut self) {}
+        }
+        let (main, carry) = (Recorder::default(), Recorder::default());
+        let both = Interops { main: main.clone(), carry: Some(carry.clone()) };
+        let everything = ForwardWanted { transit: true, services: true, exit: true, relay: true };
+        both.tick(everything);
+        both.tick(ForwardWanted { transit: true, services: false, exit: true, relay: true });
+        assert_eq!(*main.0.lock().unwrap(), [everything, ForwardWanted { transit: true, services: false, exit: true, relay: true }]);
+        assert_eq!(
+            *carry.0.lock().unwrap(),
+            [ForwardWanted { services: true, ..ForwardWanted::default() }, ForwardWanted::default()],
+            "a relayed peer's request for a service's target is forwarded from the carry interface (PLAN.md #280)"
+        );
+    }
 
     #[test]
     fn startup_sequence_tears_down_then_applies_empty_ruleset() {

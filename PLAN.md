@@ -4250,3 +4250,14 @@ as agreed with the user. Nothing deployed; no e2e suite covers these paths.
     process had been enough while there was one interface). The kernel test
     leaves the carry interface off, sees nothing get through, then switches
     it on with `set_enabled` as the agent does.
+
+280. **The host firewall is opened for the carry interface's service
+    flows, too** (`firewall::Interops::tick`). The carry interface's
+    host-firewall interop (#237) was always told to open nothing, so on a
+    host whose own firewall drops what it forwards — ufw's default forward
+    policy, Docker's `FORWARD DROP`, firewalld — a relayed peer's request
+    for a LAN target was still dropped after #278 and #279. (A container's
+    published port got through: Docker's own rules accept it from any
+    interface.) It now gets the services' openings whenever the mesh
+    interface's does — `iifname <carry> ct mark & SERVICE_MARK` and its
+    reply — and never transit, exit or relay ones, which nothing on it needs.
