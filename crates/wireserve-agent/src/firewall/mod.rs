@@ -329,13 +329,25 @@ mod tests {
 /// Nothing touches the host's firewall and no root is needed — but not
 /// every environment allows unprivileged user namespaces (some CI
 /// containers don't), so callers get `None` there and skip, loudly.
+///
+/// Run as root, it is a network namespace alone (`unshare -n`): a user
+/// namespace would leave out what only real root may do — the service
+/// addresses' payload rewrites — and an unmapped owner's test binary could
+/// not even be executed in it.
 #[cfg(all(test, target_os = "linux"))]
 pub mod netns {
     use std::process::Command;
 
+    /// `unshare`'s flags: a network namespace, and a user namespace unless
+    /// this already is root.
+    fn flags() -> &'static str {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 { "-n" } else { "-rn" }
+    }
+
     pub fn available() -> bool {
         Command::new("unshare")
-            .args(["-rn", "true"])
+            .args([flags(), "true"])
             .status()
             .is_ok_and(|s| s.success())
             && super::nft::NFT_CANDIDATES
@@ -358,7 +370,7 @@ pub mod netns {
             return false;
         }
         let status = Command::new("unshare")
-            .arg("-rn")
+            .arg(flags())
             .arg(std::env::current_exe().unwrap())
             .args(["--exact", path, "--nocapture"])
             .env(IN_NETNS, "1")
@@ -375,7 +387,7 @@ pub mod netns {
             eprintln!("SKIPPED: unprivileged network namespaces or nft unavailable");
             return None;
         }
-        let out = Command::new("unshare").args(["-rn", "sh", "-euc", script]).output().expect("spawn unshare");
+        let out = Command::new("unshare").args([flags(), "sh", "-euc", script]).output().expect("spawn unshare");
         Some((String::from_utf8(out.stdout).unwrap(), String::from_utf8(out.stderr).unwrap()))
     }
 
@@ -388,7 +400,7 @@ pub mod netns {
             return None;
         }
         let out = Command::new("unshare")
-            .args(["-rn", "sh", "-euc", script])
+            .args([flags(), "sh", "-euc", script])
             .output()
             .expect("spawn unshare");
         assert!(
