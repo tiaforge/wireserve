@@ -4380,6 +4380,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "axum-reverse-proxy",
+ "futures-util",
  "http-body-util",
  "hyper",
  "hyper-rustls",
@@ -4399,6 +4400,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite 0.29.0",
  "tower",
  "tracing",
  "webpki-roots",

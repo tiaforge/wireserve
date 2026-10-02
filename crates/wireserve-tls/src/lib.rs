@@ -23,6 +23,7 @@ pub mod link;
 pub mod serve;
 pub mod sign_in;
 pub mod store;
+mod upgrade;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;

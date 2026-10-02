@@ -28,7 +28,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc
 rustls-pki-types = "1"
 # The upstream is plain HTTP on this very node, so no TLS client features.
 axum-reverse-proxy = { version = "2.2", default-features = false }
-hyper = { version = "1", features = ["server", "http1", "http2"] }
+# `client`: an upgrade goes to the backend on its own connection (PLAN.md M42).
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio", "http1", "http2", "client-legacy"] }
 http-body-util = "0.1"
 tower = { workspace = true, features = ["util"] }
@@ -46,3 +47,5 @@ rand.workspace = true
 tempfile = "3"
 rcgen = "0.14"
 time = "0.3"
+tokio-tungstenite = "0.29"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }

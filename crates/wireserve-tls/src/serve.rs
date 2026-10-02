@@ -4,8 +4,9 @@
 //! address it arrived on, and each request to its backend in plain HTTP.
 //!
 //! The proxying itself is `axum-reverse-proxy` over hyper — hop-by-hop
-//! headers, WebSocket upgrades, HTTP/2, trailers. What is ours is only
-//! the edge of it: which headers a backend may believe.
+//! headers, HTTP/2, trailers. What is ours is the edge of it — which
+//! headers a backend may believe — and upgrades: a WebSocket goes to its
+//! backend as bytes, through [`crate::upgrade`] (PLAN.md M42).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -161,8 +162,10 @@ pub struct Limits {
     pub first_request: Duration,
     /// A connection with no request being served, and nothing read or
     /// written for this long, is closed: an idle keep-alive, or an HTTP/2
-    /// connection that never says anything. A streaming answer, an upgraded
-    /// WebSocket or a slow backend is not idle by this.
+    /// connection that never says anything. A streaming answer or a slow
+    /// backend is not idle by this, and an upgraded connection — a
+    /// WebSocket — never is: an app may leave one quiet for as long as it
+    /// likes. TCP keepalives find a client that has gone.
     pub idle: Duration,
     /// A whole request's headers, once they have started (HTTP/1).
     pub header_read: Duration,
@@ -172,6 +175,9 @@ pub struct Limits {
     /// Connections open at once from one address. A browser needs a
     /// handful; this is far above that.
     pub max_per_source: usize,
+    /// How often an upgraded connection's caller is asked about again
+    /// (PLAN.md M42): what a grant taken away waits at most to close it.
+    pub recheck: Duration,
 }
 
 impl Default for Limits {
@@ -183,6 +189,7 @@ impl Default for Limits {
             header_read: Duration::from_secs(20),
             max_total: 4096,
             max_per_source: 128,
+            recheck: Duration::from_secs(30),
         }
     }
 }
@@ -233,6 +240,8 @@ struct ConnStats {
     started: AtomicBool,
     /// Requests being served: begun, no response yet.
     in_flight: AtomicUsize,
+    /// It switched protocols (PLAN.md M42): no more requests, and never idle.
+    upgraded: AtomicBool,
 }
 
 /// Counts one request while it is being served.
@@ -254,13 +263,17 @@ impl Drop for InFlight {
 
 /// A connection that gives up on a client that says nothing: no request
 /// within `first_request` of opening, or nothing read or written for `idle`
-/// while none is being served. hyper's own timers cover an HTTP/1 request's
-/// headers once they have started; this covers what they cannot — an
-/// HTTP/2 connection that never speaks, a protocol sniff that never
-/// finishes, a keep-alive left open.
+/// while none is being served and it has not been upgraded. hyper's own
+/// timers cover an HTTP/1 request's headers once they have started; this
+/// covers what they cannot — an HTTP/2 connection that never speaks, a
+/// protocol sniff that never finishes, a keep-alive left open.
+///
+/// It holds the connection's place in the limits: hyper hands it on to an
+/// upgraded connection, so a WebSocket counts for as long as it is open.
 struct Watched<S> {
     inner: S,
     stats: Arc<ConnStats>,
+    _permit: Permit,
     first_request: Duration,
     idle: Duration,
     opened: Instant,
@@ -269,11 +282,12 @@ struct Watched<S> {
 }
 
 impl<S> Watched<S> {
-    fn new(inner: S, stats: Arc<ConnStats>, limits: &Limits) -> Self {
+    fn new(inner: S, stats: Arc<ConnStats>, permit: Permit, limits: &Limits) -> Self {
         let now = Instant::now();
         Self {
             inner,
             stats,
+            _permit: permit,
             first_request: limits.first_request,
             idle: limits.idle,
             opened: now,
@@ -293,7 +307,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for Watched<S> {
             }
             return Poll::Ready(r);
         }
-        let deadline = if !this.stats.started.load(Ordering::Relaxed) {
+        let deadline = if this.stats.upgraded.load(Ordering::Relaxed) {
+            None
+        } else if !this.stats.started.load(Ordering::Relaxed) {
             Some(this.opened + this.first_request)
         } else if this.stats.in_flight.load(Ordering::Relaxed) == 0 {
             Some(this.last_activity + this.idle)
@@ -334,6 +350,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
 /// connection arrived on.
 #[derive(Clone)]
 pub struct Route {
+    upstream: SocketAddr,
     router: axum::Router,
     /// For the provider's verify path: the calling terminator's
     /// `X-Forwarded-For` (the device's address) goes to the provider as it
@@ -353,7 +370,7 @@ impl Route {
         let verify_policy = proxy_policy.clone().with_x_forwarded_for(XForwardedFor::Preserve);
         let router = ReverseProxy::new("/", format!("http://{upstream}")).with_policy(proxy_policy).into();
         let verify_router = ReverseProxy::new("/", format!("http://{upstream}")).with_policy(verify_policy).into();
-        Self { router, verify_router }
+        Self { upstream, router, verify_router }
     }
 }
 
@@ -404,8 +421,8 @@ fn listen_fd(pid: u32, listen_pid: Option<&str>, listen_fds: Option<&str>) -> Op
 ///
 /// The service's policy and the caller's name are looked up for every
 /// request, not once per connection: a grant taken away, or a node
-/// revoked, reaches a keep-alive or HTTP/2 connection at its next request.
-/// A WebSocket, once upgraded, is past every request and keeps going.
+/// revoked, reaches a keep-alive or HTTP/2 connection at its next request,
+/// and an upgraded one — a WebSocket — within [`Limits::recheck`].
 pub fn spawn(listener: TcpListener, tls: Arc<rustls::ServerConfig>, shared: Shared) -> JoinHandle<()> {
     spawn_with_limits(listener, tls, shared, Limits::default())
 }
@@ -449,19 +466,27 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
             // its delayed ACK puts off by up to 40ms here, and on a phone's
             // link by a round trip on top.
             let _ = tcp.set_nodelay(true);
+            // What finds a client gone without a word — a phone off the
+            // mesh — once nothing else would: an upgraded connection is
+            // never idle by our own timer.
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(Duration::from_secs(60))
+                .with_interval(Duration::from_secs(15))
+                .with_retries(4);
+            let _ = socket2::SockRef::from(&tcp).set_tcp_keepalive(&keepalive);
             let acceptor = acceptor.clone();
             let shared = shared.clone();
             let limits = limits.clone();
             tokio::spawn(async move {
-                let _permit = permit;
                 let Ok(Ok(tls)) = tokio::time::timeout(limits.handshake, acceptor.accept(tcp)).await else {
                     return;
                 };
                 let stats = Arc::new(ConnStats::default());
-                let watched = Watched::new(tls, Arc::clone(&stats), &limits);
+                let watched = Watched::new(tls, Arc::clone(&stats), permit, &limits);
                 let caller_addr = local_v4(peer.ip());
                 let service = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
                     let in_flight = InFlight::begin(&stats);
+                    let stats = Arc::clone(&stats);
                     let policy = read(&shared.policies).get(&vip).cloned();
                     let caller = caller_addr.and_then(|a| read(&shared.callers).get(&a).cloned());
                     if let (Some(addr), Some(_)) = (caller_addr, &caller) {
@@ -488,8 +513,11 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                             && req.uri().path() == si.target.verify_path
                     });
                     let router = if verify { route.verify_router.clone() } else { route.router.clone() };
+                    let (upstream, recheck) = (route.upstream, limits.recheck);
+                    let upgrade = !verify && crate::upgrade::wanted(&req);
                     prepare(req.headers_mut(), caller.as_ref().map(|c| c.node.as_str()), verify, &strip);
                     req.extensions_mut().insert(ConnectInfo(peer));
+                    let shared = shared.clone();
                     async move {
                         let _in_flight = in_flight;
                         let Some(policy) = policy else {
@@ -505,10 +533,25 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                             ));
                         }
                         let mut req = req.map(Body::new);
+                        // As the client asked, for asking again while it is open.
+                        let asked = upgrade.then(|| Arc::new(as_asked(&req)));
                         let owner = caller.and_then(|c| c.owner);
                         match guard(&mut req, sign_in.as_ref(), &policy, caller_addr, owner.as_ref(), &identity).await {
                             Some(denied) => Ok(denied),
-                            None => router.oneshot(req).await,
+                            None => match asked {
+                                Some(asked) => {
+                                    let again = move || {
+                                        let (shared, asked) = (shared.clone(), Arc::clone(&asked));
+                                        async move { still_admitted(&shared, vip, caller_addr, &asked).await }
+                                    };
+                                    let answer = crate::upgrade::proxy(req, upstream, peer, recheck, again).await;
+                                    if answer.status() == axum::http::StatusCode::SWITCHING_PROTOCOLS {
+                                        stats.upgraded.store(true, Ordering::Relaxed);
+                                    }
+                                    Ok(answer)
+                                }
+                                None => router.oneshot(req).await,
+                            },
                         }
                     }
                 });
@@ -519,6 +562,41 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
             });
         }
     })
+}
+
+/// A request's method, target, version and headers, without its body.
+fn as_asked<B>(req: &Request<B>) -> Request<()> {
+    let mut asked = Request::new(());
+    *asked.method_mut() = req.method().clone();
+    *asked.uri_mut() = req.uri().clone();
+    *asked.version_mut() = req.version();
+    *asked.headers_mut() = req.headers().clone();
+    asked
+}
+
+/// Whether the caller of an upgraded connection would still be let in,
+/// asked as its request was (PLAN.md M42): its service still served here
+/// under the name it asked for, and `guard` still letting it through. A
+/// sign-in provider that cannot answer right now closes nothing — its
+/// trouble is not the caller's; a refusal does.
+async fn still_admitted(shared: &Shared, vip: Ipv4Addr, caller_addr: Option<Ipv4Addr>, asked: &Request<()>) -> bool {
+    if read(&shared.routes).get(&vip).is_none() {
+        return false;
+    }
+    let Some(policy) = read(&shared.policies).get(&vip).cloned() else {
+        return false;
+    };
+    if !for_this_service(asked, &policy.fqdn) {
+        return false;
+    }
+    let owner = caller_addr.and_then(|a| read(&shared.callers).get(&a).cloned()).and_then(|c| c.owner);
+    let sign_in = read(&shared.sign_in).clone();
+    let identity = read(&shared.identity).clone();
+    let mut req = as_asked(asked).map(|()| Body::empty());
+    match guard(&mut req, sign_in.as_ref(), &policy, caller_addr, owner.as_ref(), &identity).await {
+        None => true,
+        Some(denied) => denied.status().is_server_error(),
+    }
 }
 
 fn read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
@@ -1062,6 +1140,13 @@ mod tests {
                 .fallback(|| async { "ok" });
             axum::serve(backend, app).await.unwrap();
         });
+        in_front_of(upstream, limits)
+    }
+
+    /// A terminator for `svc.test` on 127.0.0.1 with these limits, in front
+    /// of `upstream`.
+    fn in_front_of(upstream: SocketAddr, limits: Limits) -> (u16, tokio_rustls::TlsConnector, Shared) {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let key = rcgen::generate_simple_self_signed(vec!["svc.test".into()]).unwrap();
         let der = key.cert.der().clone();
         let private = rustls_pki_types::PrivateKeyDer::try_from(key.signing_key.serialize_der()).unwrap();
@@ -1087,6 +1172,7 @@ mod tests {
             header_read: Duration::from_millis(300),
             max_total: 100,
             max_per_source: 100,
+            recheck: Duration::from_millis(300),
         }
     }
 
@@ -1216,5 +1302,178 @@ mod tests {
 
         shared.note_seen((0..=255u8).flat_map(|a| (0..=3u8).map(move |b| Ipv4Addr::new(10, 9, b, a))));
         assert_eq!(shared.take_seen().len(), wireserve_types::MAX_CALLERS_SEEN_PER_POLL, "capped");
+    }
+
+    // ---- WebSockets (PLAN.md M42) ----
+
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::{self, Message};
+
+    /// A WebSocket backend: its first message tells what reached it — the
+    /// forwarding headers, the caller's name and any cookie — and after that
+    /// it echoes. It picks the `chat` subprotocol when offered and sets a
+    /// cookie on its 101; `/deny` it refuses with a 403 of its own.
+    async fn ws_backend() -> SocketAddr {
+        use tungstenite::handshake::server::{ErrorResponse, Request as WsRequest, Response as WsResponse};
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (tcp, _) = backend.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut seen = String::new();
+                    #[allow(clippy::result_large_err)] // tungstenite's own type
+                    let callback = |req: &WsRequest, mut resp: WsResponse| -> Result<WsResponse, ErrorResponse> {
+                        if req.uri().path() == "/deny" {
+                            let mut no = ErrorResponse::new(Some("not you".into()));
+                            *no.status_mut() = tungstenite::http::StatusCode::FORBIDDEN;
+                            return Err(no);
+                        }
+                        for name in ["x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "x-wireserve-node", "cookie", "host"] {
+                            let values: Vec<&str> = req.headers().get_all(name).iter().map(|v| v.to_str().unwrap()).collect();
+                            seen.push_str(&format!("{name}={}\n", values.join("|")));
+                        }
+                        let offered = req.headers().get("sec-websocket-protocol").and_then(|v| v.to_str().ok()).unwrap_or("");
+                        if offered.split(',').any(|p| p.trim() == "chat") {
+                            resp.headers_mut().insert("sec-websocket-protocol", "chat".parse().unwrap());
+                        }
+                        resp.headers_mut().insert("set-cookie", "ws=1; Secure".parse().unwrap());
+                        Ok(resp)
+                    };
+                    let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(tcp, callback).await else {
+                        return;
+                    };
+                    ws.send(Message::text(seen)).await.unwrap();
+                    while let Some(Ok(msg)) = ws.next().await {
+                        if (msg.is_text() || msg.is_binary()) && ws.send(msg).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        upstream
+    }
+
+    type Ws = tokio_tungstenite::WebSocketStream<Tls>;
+
+    /// A WebSocket to `path` on the terminator, offering `chat`.
+    async fn ws(port: u16, client: &tokio_rustls::TlsConnector, path: &str) -> Result<(Ws, tungstenite::handshake::client::Response), tungstenite::Error> {
+        use tungstenite::client::IntoClientRequest;
+        let mut req = format!("wss://svc.test{path}").into_client_request().unwrap();
+        req.headers_mut().insert("sec-websocket-protocol", "chat, superchat".parse().unwrap());
+        req.headers_mut().insert("x-forwarded-for", "6.6.6.6".parse().unwrap());
+        req.headers_mut().insert("cookie", "theme=dark".parse().unwrap());
+        tokio_tungstenite::client_async(req, tls(port, client).await).await
+    }
+
+    async fn next_text(ws: &mut Ws) -> String {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.expect("a message").expect("open").expect("no error");
+        msg.to_text().unwrap().to_owned()
+    }
+
+    /// Whether the server ends the WebSocket within `within`.
+    async fn ws_closed_within(ws: &mut Ws, within: Duration) -> bool {
+        let end = tokio::time::Instant::now() + within;
+        loop {
+            match tokio::time::timeout_at(end, ws.next()).await {
+                Err(_) => return false,
+                Ok(None | Some(Err(_)) | Some(Ok(Message::Close(_)))) => return true,
+                Ok(Some(Ok(_))) => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_websocket_reaches_its_backend_with_the_backends_own_answer() {
+        let (port, client, _) = in_front_of(ws_backend().await, quick());
+        let (mut ws, answer) = ws(port, &client, "/socket?room=1").await.expect("upgraded");
+        assert_eq!(answer.headers()["sec-websocket-protocol"], "chat", "the backend's choice");
+        assert_eq!(answer.headers()["set-cookie"], "ws=1; Secure", "the backend's own 101 headers");
+        let seen = next_text(&mut ws).await;
+        assert!(seen.contains("x-forwarded-for=127.0.0.1\n"), "from the connection, not 6.6.6.6: {seen}");
+        assert!(seen.contains("x-forwarded-proto=https\n"), "{seen}");
+        assert!(seen.contains("x-forwarded-host=svc.test\n"), "{seen}");
+        assert!(seen.contains("host=svc.test\n"), "{seen}");
+        assert!(seen.contains("cookie=theme=dark\n"), "{seen}");
+
+        ws.send(Message::text("hello")).await.unwrap();
+        assert_eq!(next_text(&mut ws).await, "hello");
+        ws.send(Message::binary(vec![0u8, 1, 2, 255])).await.unwrap();
+        let back = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+        assert_eq!(back.into_data().as_ref(), &[0u8, 1, 2, 255]);
+    }
+
+    #[tokio::test]
+    async fn a_backends_refusal_reaches_the_client_as_it_is() {
+        let (port, client, _) = in_front_of(ws_backend().await, quick());
+        match ws(port, &client, "/deny").await {
+            Err(tungstenite::Error::Http(resp)) => {
+                assert_eq!(resp.status(), 403, "not a 502");
+                // Its body as sent; tungstenite reads it raw, chunked or not.
+                let body = String::from_utf8_lossy(resp.body().as_deref().unwrap_or_default()).into_owned();
+                assert!(body.contains("not you"), "{body}");
+            }
+            other => panic!("expected the backend's 403, got {:?}", other.map(|(_, r)| r.status())),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_quiet_websocket_is_not_idle() {
+        let (port, client, _) = in_front_of(ws_backend().await, quick());
+        let (mut ws, _) = ws(port, &client, "/").await.expect("upgraded");
+        next_text(&mut ws).await;
+        // Three times the idle limit without a byte either way.
+        assert!(!ws_closed_within(&mut ws, Duration::from_millis(1500)).await, "closed as idle");
+        ws.send(Message::text("still here")).await.unwrap();
+        assert_eq!(next_text(&mut ws).await, "still here");
+    }
+
+    #[tokio::test]
+    async fn an_open_websocket_holds_its_place_in_the_limits() {
+        let limits = Limits { max_per_source: 2, ..quick() };
+        let (port, client, _) = in_front_of(ws_backend().await, limits);
+        let (mut a, _) = ws(port, &client, "/").await.expect("upgraded");
+        next_text(&mut a).await;
+        let _b = tls(port, &client).await;
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let refused = client.connect(rustls_pki_types::ServerName::try_from("svc.test").unwrap(), tcp).await;
+        assert!(refused.is_err(), "the WebSocket still counts once upgraded");
+    }
+
+    #[tokio::test]
+    async fn a_device_not_let_in_never_reaches_a_websocket_backend() {
+        let (port, client, shared) = in_front_of(ws_backend().await, quick());
+        let closed = Policy { fqdn: "svc.test".into(), access: wireserve_types::ServiceAccess::default() };
+        shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(closed));
+        match ws(port, &client, "/").await {
+            Err(tungstenite::Error::Http(resp)) => assert_eq!(resp.status(), 403),
+            other => panic!("expected 403, got {:?}", other.map(|(_, r)| r.status())),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_open_websocket_closes_once_its_caller_is_no_longer_let_in() {
+        let granted = Policy {
+            fqdn: "svc.test".into(),
+            access: wireserve_types::ServiceAccess { sources: vec![Ipv4Addr::LOCALHOST], ..Default::default() },
+        };
+        let (port, client, shared) = in_front_of(ws_backend().await, quick());
+        shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(granted.clone()));
+        let (mut ws1, _) = ws(port, &client, "/").await.expect("granted");
+        next_text(&mut ws1).await;
+        assert!(!ws_closed_within(&mut ws1, Duration::from_millis(800)).await, "still granted: stays open");
+
+        // The grant taken away.
+        let closed = Policy { fqdn: "svc.test".into(), access: wireserve_types::ServiceAccess::default() };
+        shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(closed));
+        assert!(ws_closed_within(&mut ws1, Duration::from_secs(3)).await, "the grant is gone");
+
+        // The service no longer served here.
+        shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(granted));
+        let (mut ws2, _) = ws(port, &client, "/").await.expect("granted again");
+        next_text(&mut ws2).await;
+        shared.unroute(Ipv4Addr::LOCALHOST);
+        assert!(ws_closed_within(&mut ws2, Duration::from_secs(3)).await, "unrouted");
     }
 }

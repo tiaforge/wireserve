@@ -3023,7 +3023,8 @@ every HTTPS service depends on, no wildcard key on one box.
     `Host` preserved and `X-Forwarded-*` set from the connection. What is
     ours is the edge: every forwarding header and `X-Wireserve-Node` a client
     sent is removed before the proxy sets them afresh, and `X-Wireserve-Node`
-    names the node the mesh source address belongs to.
+    names the node the mesh source address belongs to. (WebSocket upgrades
+    are ours since M42, #256.)
 
 184. **The key stays on the node, the DNS credential on the coordinator.**
     The terminator generates key and CSR; the coordinator publishes the
@@ -3450,7 +3451,8 @@ builds on the sign-in they concern.
     place on every check-in, and `service_fn` looks the policy and the caller
     up per request — so a grant taken away, or a node revoked, reaches an
     open keep-alive or HTTP/2 connection at its next request (review finding
-    3; an upgraded WebSocket stays out of reach). An open service or a
+    3; an upgraded WebSocket is asked about again every 30s since M42,
+    #261). An open service or a
     granted caller goes on; anyone else, with `sign_in`, is asked about, and
     one of `sign_in_groups` in the provider's groups header lets them in,
     anything else is 403; without `sign_in`, 403. The identity headers are
@@ -3579,8 +3581,9 @@ them.
     `serve::Limits`: the TLS handshake in 10s; a first request begun within
     30s of it; hyper's header-read timer (20s, HTTP/1) and HTTP/2 keep-alive
     pings; a connection with no request being served and nothing read or
-    written for 300s closed (`Watched`) — a slow backend, a streaming answer
-    or a WebSocket is not idle by that; 128 open connections per source
+    written for 300s closed (`Watched`) — a slow backend or a streaming
+    answer is not idle by that (a WebSocket was meant not to be either, and
+    was: #258); 128 open connections per source
     address and 4096 in all, the rest closed unanswered before any TLS work
     (one warning a minute). The unit gets `LimitNOFILE=16384`, above
     systemd's 1024, which the cap would otherwise never reach. Not covered:
@@ -3981,3 +3984,59 @@ were the only places a node still read traffic it merely forwarded.
     carrier follow at their next poll. A flapping direct path now switches
     more often, each time for about a minute instead of four; if that
     bothers, hold a direct path for a while before ending the relay.
+
+## M42 — WebSockets through the terminator, as the backend answers them
+
+M33 left WebSockets to `axum-reverse-proxy`, and nothing ever tested one.
+Reading the code (2026-10-02) found them working only in part: a WebSocket
+quiet for five minutes was closed as idle, the backend got no forwarding
+headers, and a backend's refusal reached the client as a 502.
+
+256. **An upgrade is ours, proxied as bytes** (`wireserve_tls::upgrade`).
+    An HTTP/1.1 request with `Upgrade` and `Connection: upgrade`, past
+    `prepare` and `guard` like any other, goes to the backend on its own
+    hyper client connection; the backend's answer comes back as it is — a
+    101 with every header it set (subprotocol, extensions, `Set-Cookie`), or
+    a 401/403/redirect with its body. The backend has 30s to answer. Once
+    both sides switch, `copy_bidirectional` carries the bytes: nothing is
+    re-framed, so `permessage-deflate` (which the library had to strip)
+    works, and any other upgrade token does too. The provider's verify path
+    stays on the library's router.
+257. **The forwarding headers as on any request:** `X-Forwarded-For` (the
+    peer), `X-Forwarded-Proto: https` and `X-Forwarded-Host`, set from the
+    connection — the library's WebSocket path set none, and `prepare` had
+    removed the client's. Hop-by-hop headers go both ways, `Upgrade` and
+    `Connection: upgrade` excepted on the way in.
+258. **An upgraded connection is never idle.** The request ended with its
+    101, so `Watched` saw a connection with nothing in flight and closed it
+    after `idle` (300s) without traffic — an app that doesn't ping lost its
+    socket. `ConnStats::upgraded`, set on a 101, takes it off the idle
+    timer. In its place every accepted socket gets TCP keepalives (60s, then
+    every 15s, 4 tries), which find a client that went away without a word.
+259. **An open WebSocket keeps its place in the limits.** hyper's
+    connection future ends at the upgrade, and with it went the connection's
+    permit — upgraded sockets were not counted at all. The permit now lives
+    in `Watched`, which hyper hands on to the upgraded connection.
+260. **HTTP/2:** no RFC 8441 extended CONNECT. A browser that negotiated h2
+    opens an HTTP/1.1 connection of its own for a WebSocket (ALPN still
+    offers `http/1.1`).
+261. **Asked again while open.** Every `Limits::recheck` (30s) the request
+    as the client sent it goes through `guard` again: the service no
+    longer served here, its name no longer the one asked for, a grant
+    taken away, a node revoked or a sign-in no longer valid closes the
+    connection. A provider that cannot answer (a 5xx from `guard`) closes
+    nothing; its trouble is not the caller's. This closes the gap #218
+    left open.
+262. **Verification.** Unit tests against a real TLS listener and a
+    tungstenite backend: subprotocol and `Set-Cookie` from the backend's
+    101, forwarding headers from the connection (a forged
+    `X-Forwarded-For` gone), text and binary echo; the backend's own 403;
+    a WebSocket quiet for three idle periods kept; one open WebSocket
+    counted against `max_per_source`; a device without access refused
+    before the backend; a grant taken away and an unrouted service closing
+    an open socket. The idle, forwarding and refusal tests fail against
+    the M33 path. `run-tls-terminate-test.sh` step 10 (rootful podman, not
+    run yet): a WebSocket from the client node over verified TLS, with
+    `chat` chosen, `X-Wireserve-Node: node-client`, the client's mesh
+    address in `X-Forwarded-For`, and an echo; `ws-backend.py` and
+    `ws-client.py` were checked against bookworm's websockets 10.4.
