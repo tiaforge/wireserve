@@ -172,6 +172,7 @@ pub fn build_config(state: &AgentState) -> TlsConfig {
         sign_in,
         identity_headers: naming.identity_headers.clone(),
         strip_headers: naming.strip_headers.clone(),
+        forwarding_nodes: naming.forwarding_nodes.clone(),
     }
 }
 
@@ -239,6 +240,7 @@ mod tests {
             }),
             identity_headers: wireserve_types::IdentityHeaders::default(),
             strip_headers: Vec::new(),
+            forwarding_nodes: Vec::new(),
         });
         let open = |name: &str| wireserve_types::ServiceAccess { name: name.into(), open: true, ..Default::default() };
         let plex = if restricted {

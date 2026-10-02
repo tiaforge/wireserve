@@ -69,6 +69,7 @@ async fn the_shipped_filter_matches_every_failed_authentication_the_coordinator_
         sign_in: None,
         identity_headers: Default::default(),
         strip_headers: Vec::new(),
+        forwarding_nodes: Vec::new(),
         public_url: None,
         oidc: None,
         dns: None,

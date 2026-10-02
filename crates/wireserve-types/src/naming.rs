@@ -47,6 +47,12 @@ pub struct ServiceNaming {
     /// calling or where from.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub strip_headers: Vec<String>,
+    /// Nodes whose requests may name their own client (PLAN.md M43,
+    /// `WIRESERVE_FORWARDING_NODES`): an operator's reverse proxy — a Caddy
+    /// on a public host — whose `X-Forwarded-For` and `X-Forwarded-Host`
+    /// the terminators keep instead of removing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwarding_nodes: Vec<String>,
 }
 
 /// The headers a terminator tells a backend who is calling in — filled

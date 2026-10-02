@@ -74,6 +74,9 @@ pub struct Shared {
     pub identity: Arc<RwLock<wireserve_types::IdentityHeaders>>,
     /// Further headers removed from every request (`WIRESERVE_STRIP_HEADERS`).
     pub strip: Arc<RwLock<Vec<String>>>,
+    /// Calling nodes, by name, whose `X-Forwarded-For` and
+    /// `X-Forwarded-Host` are kept (`WIRESERVE_FORWARDING_NODES`, PLAN.md M43).
+    pub forwarders: Arc<RwLock<Vec<String>>>,
     /// Known devices that connected since the last check-in (PLAN.md M38):
     /// what the agent tells the coordinator, which then names their owners
     /// to this node and nobody else's.
@@ -495,6 +498,7 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                     let sign_in = read(&shared.sign_in).clone();
                     let identity = read(&shared.identity).clone();
                     let strip = read(&shared.strip).clone();
+                    let forwarder = caller.as_ref().is_some_and(|c| read(&shared.forwarders).iter().any(|f| f.eq_ignore_ascii_case(&c.node)));
                     let misdirected = policy.as_ref().is_some_and(|p| !for_this_service(&req, &p.fqdn));
                     if misdirected {
                         tracing::info!(
@@ -515,7 +519,7 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                     let router = if verify { route.verify_router.clone() } else { route.router.clone() };
                     let (upstream, recheck) = (route.upstream, limits.recheck);
                     let upgrade = !verify && crate::upgrade::wanted(&req);
-                    prepare(req.headers_mut(), caller.as_ref().map(|c| c.node.as_str()), verify, &strip);
+                    prepare(req.headers_mut(), caller.as_ref().map(|c| c.node.as_str()), verify, forwarder, &strip);
                     req.extensions_mut().insert(ConnectInfo(peer));
                     let shared = shared.clone();
                     async move {
@@ -730,17 +734,25 @@ const UNTRUSTED_EXACT: &[&str] = &[
 const UNTRUSTED_PREFIX: &[&str] = &["x-forwarded-", "x-original-", "x-remote-", "x-auth-request-", "x-webauth-", "x-authentik-", "x-authelia-"];
 /// What only the calling terminator sets, and the provider's own reads.
 const VERIFY_KEEPS: &[&str] = &["x-forwarded-host", "x-forwarded-for", "x-forwarded-uri", "x-forwarded-method"];
+/// What a forwarding node — the operator's own reverse proxy — says about
+/// its client (PLAN.md M43): where the client is, and the name it asked
+/// for. Never who it is.
+const FORWARDER_KEEPS: &[&str] = &["x-forwarded-for", "x-forwarded-host"];
 
-fn is_untrusted(name: &str, verify: bool, extra: &[String]) -> bool {
+fn is_untrusted(name: &str, verify: bool, forwarder: bool, extra: &[String]) -> bool {
     if name == NODE_HEADER {
         return true;
     }
     if verify && VERIFY_KEEPS.contains(&name) {
         return false;
     }
-    UNTRUSTED_EXACT.contains(&name)
-        || UNTRUSTED_PREFIX.iter().any(|p| name.starts_with(p))
-        || extra.iter().any(|e| e == name)
+    if extra.iter().any(|e| e == name) {
+        return true;
+    }
+    if forwarder && FORWARDER_KEEPS.contains(&name) {
+        return false;
+    }
+    UNTRUSTED_EXACT.contains(&name) || UNTRUSTED_PREFIX.iter().any(|p| name.starts_with(p))
 }
 
 /// Strips every header a client could use to claim to be someone else, and
@@ -754,9 +766,15 @@ fn is_untrusted(name: &str, verify: bool, extra: &[String]) -> bool {
 /// provider may bind a session to. Both stay there. Anyone may send it, but asking `/verify`
 /// directly only ever answers the asker — it opens no backend — so there is
 /// nothing to borrow.
-pub fn prepare(headers: &mut HeaderMap, caller: Option<&str>, verify: bool, extra: &[String]) {
+///
+/// `forwarder`: the caller is a node named in `WIRESERVE_FORWARDING_NODES`
+/// (PLAN.md M43), whose `X-Forwarded-For` and `X-Forwarded-Host` stay: the
+/// proxy appends this connection's peer to the first and keeps the second,
+/// so the backend sees the client the forwarding node saw, and the name
+/// it was asked for. The operator's own `extra` list still removes them.
+pub fn prepare(headers: &mut HeaderMap, caller: Option<&str>, verify: bool, forwarder: bool, extra: &[String]) {
     let doomed: Vec<axum::http::HeaderName> =
-        headers.keys().filter(|n| is_untrusted(n.as_str(), verify, extra)).cloned().collect();
+        headers.keys().filter(|n| is_untrusted(n.as_str(), verify, forwarder, extra)).cloned().collect();
     for name in doomed {
         headers.remove(name);
     }
@@ -1029,7 +1047,7 @@ mod tests {
             h.insert(axum::http::HeaderName::from_static(keep), HeaderValue::from_static("kept"));
         }
         // `x-corp-user` is the operator's own addition.
-        prepare(&mut h, None, false, &["x-corp-user".to_string()]);
+        prepare(&mut h, None, false, false, &["x-corp-user".to_string()]);
         let left: Vec<&str> = h.keys().map(|k| k.as_str()).collect();
         assert!(left.iter().all(|k| !spoof.contains(k)), "still there: {left:?}");
         assert_eq!(h.len(), 5, "everything else is untouched: {left:?}");
@@ -1040,7 +1058,7 @@ mod tests {
         for name in ["x-corp-user", "x-forwarded-host", "x-forwarded-for", "x-forwarded-uri", "x-forwarded-method", "x-forwarded-proto", "x-forwarded-user", "remote-user"] {
             h.insert(axum::http::HeaderName::from_static(name), HeaderValue::from_static("v"));
         }
-        prepare(&mut h, None, true, &[]);
+        prepare(&mut h, None, true, false, &[]);
         let mut left: Vec<&str> = h.keys().map(|k| k.as_str()).collect();
         left.sort_unstable();
         assert_eq!(left, ["x-corp-user", "x-forwarded-for", "x-forwarded-host", "x-forwarded-method", "x-forwarded-uri"]);
@@ -1054,21 +1072,82 @@ mod tests {
         h.insert(NODE_HEADER, HeaderValue::from_static("admin-laptop"));
         h.insert("cookie", HeaderValue::from_static("a=b"));
         h.insert("x-forwarded-host", HeaderValue::from_static("jellyfin.int.test"));
-        prepare(&mut h, Some("phone"), false, &[]);
+        prepare(&mut h, Some("phone"), false, false, &[]);
         assert!(h.get("x-forwarded-host").is_none());
         assert!(h.get("x-forwarded-for").is_none() && h.get("forwarded").is_none());
         assert_eq!(h.get(NODE_HEADER).unwrap(), "phone");
         assert_eq!(h.get("cookie").unwrap(), "a=b");
 
         h.insert("x-forwarded-host", HeaderValue::from_static("jellyfin.int.test"));
-        prepare(&mut h, None, true, &[]);
+        prepare(&mut h, None, true, false, &[]);
         assert_eq!(h.get("x-forwarded-host").unwrap(), "jellyfin.int.test", "kept for the provider's verify endpoint");
         h.insert("x-forwarded-for", HeaderValue::from_static("10.9.0.3"));
-        prepare(&mut h, None, true, &[]);
+        prepare(&mut h, None, true, false, &[]);
         assert_eq!(h.get("x-forwarded-for").unwrap(), "10.9.0.3", "the calling device, for the provider's verify endpoint");
-        prepare(&mut h, None, false, &[]);
+        prepare(&mut h, None, false, false, &[]);
         assert!(h.get("x-forwarded-for").is_none(), "anywhere else a client's is removed");
         assert!(h.get(NODE_HEADER).is_none(), "an unknown caller is named by nobody");
+    }
+
+    #[test]
+    fn a_forwarding_node_may_name_its_client_and_nothing_more() {
+        let sent = |h: &mut HeaderMap| {
+            for (k, v) in [
+                ("x-forwarded-for", "203.0.113.9"),
+                ("x-forwarded-host", "files.example.com"),
+                ("x-forwarded-proto", "http"),
+                ("x-real-ip", "6.6.6.6"),
+                ("remote-user", "admin"),
+            ] {
+                h.insert(axum::http::HeaderName::from_static(k), HeaderValue::from_static(v));
+            }
+        };
+        let mut h = HeaderMap::new();
+        sent(&mut h);
+        prepare(&mut h, Some("edge"), false, true, &[]);
+        let mut left: Vec<&str> = h.keys().map(|k| k.as_str()).collect();
+        left.sort_unstable();
+        assert_eq!(left, ["x-forwarded-for", "x-forwarded-host", NODE_HEADER]);
+
+        // Anyone else's go, and the operator's own list wins over the forwarding node.
+        let mut h = HeaderMap::new();
+        sent(&mut h);
+        prepare(&mut h, Some("laptop"), false, false, &[]);
+        assert!(h.get("x-forwarded-for").is_none() && h.get("x-forwarded-host").is_none());
+        let mut h = HeaderMap::new();
+        sent(&mut h);
+        prepare(&mut h, Some("edge"), false, true, &["x-forwarded-host".to_string()]);
+        assert!(h.get("x-forwarded-host").is_none());
+        assert_eq!(h["x-forwarded-for"], "203.0.113.9");
+    }
+
+    #[tokio::test]
+    async fn a_forwarding_nodes_client_reaches_the_backend_and_anyone_elses_claim_does_not() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            let app = axum::Router::new().fallback(|h: HeaderMap| async move {
+                let get = |n: &str| h.get(n).map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+                format!("xff={} xfh={}", get("x-forwarded-for"), get("x-forwarded-host"))
+            });
+            axum::serve(backend, app).await.unwrap();
+        });
+        let (port, client, shared) = in_front_of(upstream, quick());
+        shared.callers.write().unwrap().insert(Ipv4Addr::LOCALHOST, CallerInfo { node: "edge".into(), owner: None });
+        let ask = || async {
+            let mut c = tls(port, &client).await;
+            c.write_all(b"GET / HTTP/1.1\r\nhost: svc.test\r\nx-forwarded-for: 203.0.113.9\r\nx-forwarded-host: files.example.com\r\nconnection: close\r\n\r\n").await.unwrap();
+            let mut answer = String::new();
+            c.read_to_string(&mut answer).await.unwrap();
+            answer
+        };
+        let answer = ask().await;
+        assert!(answer.ends_with("xff=127.0.0.1 xfh=svc.test"), "not yet a forwarding node: {answer}");
+
+        shared.forwarders.write().unwrap().push("Edge".into());
+        let answer = ask().await;
+        assert!(answer.ends_with("xff=203.0.113.9, 127.0.0.1 xfh=files.example.com"), "{answer}");
     }
 
     #[tokio::test]
@@ -1078,7 +1157,7 @@ mod tests {
         for crumb in ["theme=dark", "authward_session=s3cret", "auth_tokens=abc"] {
             req.headers_mut().append("cookie", HeaderValue::from_static(crumb));
         }
-        prepare(req.headers_mut(), None, false, &[]);
+        prepare(req.headers_mut(), None, false, false, &[]);
         let cookies: Vec<_> = req.headers().get_all("cookie").iter().collect();
         assert_eq!(cookies, ["theme=dark; authward_session=s3cret; auth_tokens=abc"]);
 

@@ -76,15 +76,24 @@ fn strip_hop_by_hop(headers: &mut HeaderMap, keep_upgrade: bool) {
     }
 }
 
-/// The forwarding headers the ordinary proxy sets, set the same way: from
-/// the connection, never from the client, whose copies `prepare` removed.
+/// The forwarding headers the ordinary proxy sets, set the same way: the
+/// peer appended to `X-Forwarded-For`, and `X-Forwarded-Host` kept if
+/// there. `prepare` removed a client's copies, unless it is a forwarding
+/// node (PLAN.md M43).
 fn set_forwarded(headers: &mut HeaderMap, peer: SocketAddr) {
-    if let Ok(v) = HeaderValue::from_str(&peer.ip().to_canonical().to_string()) {
-        headers.insert(HeaderName::from_static("x-forwarded-for"), v);
+    let xff = HeaderName::from_static("x-forwarded-for");
+    let peer = peer.ip().to_canonical().to_string();
+    let before: Vec<&str> = headers.get_all(&xff).iter().filter_map(|v| v.to_str().ok()).collect();
+    let chain = if before.is_empty() { peer } else { format!("{}, {peer}", before.join(", ")) };
+    if let Ok(v) = HeaderValue::from_str(&chain) {
+        headers.insert(xff, v);
     }
     headers.insert(HeaderName::from_static("x-forwarded-proto"), HeaderValue::from_static("https"));
-    if let Some(host) = headers.get(header::HOST).cloned() {
-        headers.insert(HeaderName::from_static("x-forwarded-host"), host);
+    let xfh = HeaderName::from_static("x-forwarded-host");
+    if !headers.contains_key(&xfh) {
+        if let Some(host) = headers.get(header::HOST).cloned() {
+            headers.insert(xfh, host);
+        }
     }
 }
 
@@ -223,5 +232,14 @@ mod tests {
         assert_eq!(h["x-forwarded-for"], "10.9.0.7");
         assert_eq!(h["x-forwarded-proto"], "https");
         assert_eq!(h["x-forwarded-host"], "chat.int.test");
+
+        // What a forwarding node said stays, the peer after its client.
+        let mut h = HeaderMap::new();
+        h.insert("host", HeaderValue::from_static("chat.int.test"));
+        h.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.9"));
+        h.insert("x-forwarded-host", HeaderValue::from_static("chat.example.com"));
+        set_forwarded(&mut h, "10.9.0.7:5555".parse().unwrap());
+        assert_eq!(h["x-forwarded-for"], "203.0.113.9, 10.9.0.7");
+        assert_eq!(h["x-forwarded-host"], "chat.example.com");
     }
 }

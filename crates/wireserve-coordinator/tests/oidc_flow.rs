@@ -183,6 +183,7 @@ fn app(issuer: &str) -> App {
         poll_rate_per_min: 0,
         reserved_service_names: Vec::new(),
         strip_headers: Vec::new(),
+        forwarding_nodes: Vec::new(),
     };
     let db = Db::open(db_file.path()).unwrap();
     let state = build_state(config, db);

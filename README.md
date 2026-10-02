@@ -883,6 +883,11 @@ Worth knowing:
   `Remote-User` and its kin, `X-Real-IP`, `True-Client-IP` and the like. A
   backend that trusts a header of its own naming adds it to
   `WIRESERVE_STRIP_HEADERS` on the coordinator.
+- **A reverse proxy of your own can name its client.** A node listed in
+  `WIRESERVE_FORWARDING_NODES` on the coordinator — a Caddy on a public host
+  proxying into the mesh — keeps its `X-Forwarded-For` (the terminator
+  appends the node's own address) and its `X-Forwarded-Host`; every other
+  caller's are still removed. Nothing about *who* is calling is ever kept.
 - **A node learns who owns a device only when that device calls it.** The
   identity headers name the owner of a calling device; the coordinator tells
   a node an owner's subject, e-mail and groups only for a device the node

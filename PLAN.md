@@ -4040,3 +4040,31 @@ headers, and a backend's refusal reached the client as a 502.
     `chat` chosen, `X-Wireserve-Node: node-client`, the client's mesh
     address in `X-Forwarded-For`, and an echo; `ws-backend.py` and
     `ws-client.py` were checked against bookworm's websockets 10.4.
+
+## M43 — a proxy of the operator's own may name its client
+
+A Caddy on a public host proxying into the mesh (`reverse_proxy
+https://files.home.tia.sh`) reached the backend as itself: the terminator
+removes every `X-Forwarded-*` a caller sends and sets them from the
+connection, so Seafile saw the Caddy node's mesh address for every visitor,
+and could not tell which public name was asked for.
+
+263. **`WIRESERVE_FORWARDING_NODES`** (coordinator; node names,
+    comma-separated, validated as labels) travels in `ServiceNaming` and
+    `TlsConfig` like `WIRESERVE_STRIP_HEADERS`. A request whose caller (by
+    mesh address, the `callers` map) is one of them keeps its
+    `X-Forwarded-For` and `X-Forwarded-Host`; the proxy appends the peer to
+    the first (`client, node`) and keeps the second. On upgrades
+    (`upgrade::set_forwarded`) the same. Node names are one namespace with
+    phones (`nodes.name UNIQUE`), so a name means one device.
+264. **Only where, never who.** `X-Forwarded-Proto` is still always set
+    afresh (`https`), every identity header still goes, and the operator's
+    `WIRESERVE_STRIP_HEADERS` still removes the two if listed. The `Host`
+    check (421 for another name) is unchanged: the proxy must send the
+    service's own name as `Host` and the public one in `X-Forwarded-Host`.
+265. **Verification.** Unit tests: `prepare` keeps exactly the two for a
+    forwarding node and the operator's list wins; through a real TLS
+    listener, a caller becoming a forwarding node changes what the backend
+    sees from `127.0.0.1`/`svc.test` to `203.0.113.9, 127.0.0.1`/
+    `files.example.com`; `set_forwarded` appends; the coordinator parses
+    the setting. No e2e.
