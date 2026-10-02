@@ -119,6 +119,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0019_relay_slots.sql")),
         M::up(include_str!("../../migrations/0020_phone_relays.sql")),
         M::up(include_str!("../../migrations/0021_released_service_addresses.sql")),
+        M::up(include_str!("../../migrations/0022_owner_emails_verified.sql")),
     ])
 }
 

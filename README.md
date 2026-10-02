@@ -771,6 +771,11 @@ own around could collect other people's groups, so none can. Signing in is
 optional: a device nobody claimed reaches what `everyone` and its tags reach,
 as before.
 
+An owner's e-mail is kept only when the provider marks it verified, and every
+refresh takes it afresh from the provider's ID token. It reaches backends as
+the owner's e-mail header, and one that knows people by e-mail would otherwise
+take whoever typed your address into their profile for you.
+
 The coordinator keeps each owner's refresh token, sealed with a key it
 generated into `coordinator-secrets.env` (`WIRESERVE_OIDC_TOKEN_KEY`), and
 fetches their groups again every `WIRESERVE_OIDC_REFRESH_SECS`: someone

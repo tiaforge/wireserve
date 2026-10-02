@@ -4152,3 +4152,30 @@ as agreed with the user. Nothing deployed; no e2e suite covers these paths.
     nothing is served on a node's own address, so a stale phone sending one
     to the wrong node reaches nothing. Releases from before the migration
     aren't known; every phone needs a `--refresh` after M41 anyway.
+
+## Security audit 2026-10-02, second pass — two fixes
+
+274. **The relay ports' drop spares this host's own UDP**
+    (`nftables::apply_batch_with`). The input-chain drop for the relay
+    ports (#242) had no conntrack state, and 41000–41999 lies inside
+    Linux's ephemeral range (32768–60999): on every node with `transit
+    on`, a reply to its own UDP sent from one of those ports — a DNS
+    lookup, NTP — was dropped on every interface but the mesh's, about one
+    in thirty. Now `ct state new` only: an untranslated relay packet is
+    never anything but new, and dropped it leaves no flow to establish.
+    `kernel_a_reply_to_this_hosts_own_udp_on_a_relay_port_arrives` sends a
+    lookup from relay port 41010 through a namespace and gets its answer,
+    while a datagram nobody asked for on 41011 is still dropped; it fails
+    without the fix.
+275. **A device owner's e-mail only when verified** (`oidc::verified_email`,
+    migration 0022). The claim took the ID token's `email` unchecked, and it
+    went to backends as the owner's e-mail header on every request from the
+    device: someone handed a claim link could type an admin's address into
+    their profile and be taken for the admin by any backend that knows
+    people by e-mail (Seafile). authward refuses the same. Now only
+    `email_verified: true` counts, at the claim and on every refresh that
+    brings an ID token — a later change or lost verification follows; a
+    refresh without one leaves the stored value. The emails stored so far
+    are cleared (nothing says they were verified); the next refresh brings
+    a verified one back. The user header stays the subject, as authward's.
+    Settled with the user: verified emails only, rather than none.

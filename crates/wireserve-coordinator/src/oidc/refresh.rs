@@ -54,7 +54,10 @@ pub async fn pass(state: &AppState, oidc: &Oidc) {
                         groups = %r.groups.join(","),
                     );
                 }
-                owners::refreshed(&conn, owner.node_id, &owner.sub, &r.groups, &oidc.seal(owner.node_id, &r.refresh_token))
+                // The email follows the provider's latest word on it, when
+                // it sent one (PLAN.md #275).
+                let email = r.email.map(|e| e.unwrap_or_default());
+                owners::refreshed(&conn, owner.node_id, &owner.sub, &r.groups, &oidc.seal(owner.node_id, &r.refresh_token), email.as_deref())
             }
             Err(RefreshError::Refused) => {
                 tracing::warn!(event = "owner_dropped", node_id = owner.node_id, sub = %owner.sub, reason = "refused");

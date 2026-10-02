@@ -41,11 +41,13 @@ struct Idp {
     codes: HashMap<String, (String, String, String, Vec<String>)>,
     groups_now: Vec<String>,
     refuse_refresh: bool,
+    /// The email in its tokens is not marked verified (PLAN.md #275).
+    unverified_email: bool,
 }
 
 type Shared = Arc<Mutex<Idp>>;
 
-fn id_token(issuer: &str, sub: &str, groups: &[String], nonce: Option<&str>) -> String {
+fn id_token(issuer: &str, sub: &str, groups: &[String], nonce: Option<&str>, verified: bool) -> String {
     let key = CoreRsaPrivateSigningKey::from_pem(KEY, None).unwrap();
     let now = chrono::Utc::now();
     let mut claims = IdTokenClaims::<Groups, CoreGenderClaim>::new(
@@ -54,7 +56,8 @@ fn id_token(issuer: &str, sub: &str, groups: &[String], nonce: Option<&str>) -> 
         now + chrono::Duration::minutes(5),
         now,
         StandardClaims::new(SubjectIdentifier::new(sub.into()))
-            .set_email(Some(EndUserEmail::new(format!("{sub}@example.com")))),
+            .set_email(Some(EndUserEmail::new(format!("{sub}@example.com"))))
+            .set_email_verified(Some(verified)),
         Groups { groups: groups.to_vec() },
     );
     if let Some(n) = nonce {
@@ -113,12 +116,12 @@ async fn token(State(idp): State<Shared>, Form(form): Form<HashMap<String, Strin
             if digest != challenge {
                 return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "invalid_grant"}))).into_response();
             }
-            tokens(id_token(&issuer, &sub, &groups, Some(&nonce)), "rt-1")
+            tokens(id_token(&issuer, &sub, &groups, Some(&nonce), !idp.unverified_email), "rt-1")
         }
         Some("refresh_token") if idp.refuse_refresh => {
             (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "invalid_grant"}))).into_response()
         }
-        Some("refresh_token") => tokens(id_token(&issuer, "alice", &idp.groups_now, None), "rt-2"),
+        Some("refresh_token") => tokens(id_token(&issuer, "alice", &idp.groups_now, None, !idp.unverified_email), "rt-2"),
         _ => StatusCode::BAD_REQUEST.into_response(),
     }
 }
@@ -301,6 +304,7 @@ async fn a_device_is_claimed_confirmed_and_its_owners_groups_kept_current() {
         wireserve_coordinator::db::owners::of(&conn, node.id).unwrap().expect("laptop has an owner")
     };
     assert_eq!((owner.sub.as_str(), owner.groups.as_slice()), ("alice", &["family".to_string()][..]));
+    assert_eq!(owner.email.as_deref(), Some("alice@example.com"), "verified, so kept");
     assert_eq!(oidc.open(owner.node_id, &owner.refresh_token_enc).as_deref(), Some("rt-1"));
     assert!(!owner.refresh_token_enc.contains("rt-1"), "sealed at rest");
 
@@ -338,4 +342,38 @@ async fn a_return_that_does_not_match_its_start_is_refused() {
     let (_, callback) = signed_in(&app, &idp, "alice", &["family"]).await;
     let (other_cookie, _) = signed_in(&app, &idp, "mallory", &["family"]).await;
     assert_eq!(call(&app.router, "GET", &callback, Some(&other_cookie), None).await.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn only_an_email_the_provider_verified_is_kept() {
+    // PLAN.md #275: the owner's email reaches backends as an identity
+    // header; an unverified one is whatever the person typed.
+    let idp = start_idp().await;
+    let issuer = idp.lock().unwrap().issuer.clone();
+    let app = app(&issuer);
+    call(&app.router, "POST", "/admin/nodes", None, None).await;
+    idp.lock().unwrap().unverified_email = true;
+
+    let (cookie, callback) = signed_in(&app, &idp, "alice", &["family"]).await;
+    let page = text(call(&app.router, "GET", &callback, Some(&cookie), None).await).await;
+    assert!(!page.contains("alice@example.com"), "not even shown: {page}");
+    let token = page.split("name=\"token\" value=\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+    let resp = call(&app.router, "POST", "/claim/confirm", Some(&cookie), Some(&format!("token={token}"))).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let owner = || async {
+        let conn = app.state.db.conn.lock().await;
+        let node = wireserve_coordinator::db::nodes::find_by_name(&conn, "laptop").unwrap().unwrap();
+        wireserve_coordinator::db::owners::of(&conn, node.id).unwrap().expect("laptop has an owner")
+    };
+    assert_eq!(owner().await.email, None, "claimed, but the email is not kept");
+
+    // Verified later: a refresh brings it.
+    let oidc = app.state.oidc.clone().unwrap();
+    idp.lock().unwrap().unverified_email = false;
+    wireserve_coordinator::oidc::refresh::pass(&app.state, &oidc).await;
+    assert_eq!(owner().await.email.as_deref(), Some("alice@example.com"));
+    // No longer verified (changed at the provider): a refresh clears it.
+    idp.lock().unwrap().unverified_email = true;
+    wireserve_coordinator::oidc::refresh::pass(&app.state, &oidc).await;
+    assert_eq!(owner().await.email, None);
 }

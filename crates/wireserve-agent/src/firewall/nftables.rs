@@ -722,6 +722,12 @@ pub(crate) fn apply_batch_with(
     // before conntrack confirms it, so no flow is left behind that its
     // sender's keepalives would keep alive untranslated once the rule comes.
     // A port under a check is left to the agent's listener.
+    //
+    // Only new flows (PLAN.md #274): the relay ports lie inside Linux's
+    // ephemeral range, so this host's own UDP — a DNS lookup, NTP — goes out
+    // from one of them now and then, and its reply arrives here as part of
+    // an established flow. An untranslated relay packet is never anything
+    // but new: dropped, it leaves no flow to be established by.
     if let Some(((lo, hi), _)) = forwarding.relay_ranges {
         let mut expr = not_mesh();
         expr.push(is(payload("udp", "dport"), port_range(lo, hi)));
@@ -734,6 +740,11 @@ pub(crate) fn apply_batch_with(
                 op: Operator::NEQ,
             }));
         }
+        expr.push(Statement::Match(Match {
+            left: ct("state", None),
+            right: Expression::List(vec![Expression::String("new".into())]),
+            op: Operator::IN,
+        }));
         expr.push(Statement::Drop(None::<Drop>));
         objects.push(rule(t, CHAIN_NAME, expr));
     }
@@ -1700,7 +1711,7 @@ mod tests {
             format!("oifname \"wg0\" meta l4proto udp ct mark & {r} == {r} snat ip to 100.90.0.2:42000-42999"),
             format!("iifname \"eth0\" oifname \"wg0\" ct mark & {r} == {r} ip daddr 100.90.0.4 udp dport 51820 accept"),
             format!("iifname \"eth0\" ct mark & {r} == {r} drop"),
-            "iifname != \"wg0\" iifname != \"lo\" udp dport 41000-41999 udp dport != 41005 drop".to_string(),
+            "iifname != \"wg0\" iifname != \"lo\" udp dport 41000-41999 udp dport != 41005 ct state new drop".to_string(),
         ] {
             assert!(lines.contains(&want), "missing `{want}` in:\n{listing}");
         }
@@ -1907,6 +1918,67 @@ mod tests {
         assert!(to_internet, "the client must reach the internet host, masqueraded");
         assert!(!to_lan, "an exit must not forward to a private address");
         assert!(!into_mesh, "the guarded interface must not let anything new into the mesh");
+    }
+
+    /// The relay ports' drop (PLAN.md #274) spares this host's own UDP: a
+    /// reply to a lookup sent from a relay port arrives, and a packet nobody
+    /// asked for on one is still dropped.
+    #[test]
+    fn kernel_a_reply_to_this_hosts_own_udp_on_a_relay_port_arrives() {
+        if !crate::firewall::netns::reexec(
+            "firewall::nftables::tests::kernel_a_reply_to_this_hosts_own_udp_on_a_relay_port_arrives",
+        ) {
+            return;
+        }
+        let mut outside = std::process::Command::new("unshare").args(["-n", "sleep", "60"]).spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let pid = outside.id();
+        let setup = format!(
+            "ip link set lo up
+             ip link add eth0 type veth peer name o0 && ip link set o0 netns {pid}
+             ip addr add 203.0.113.1/24 dev eth0 && ip link set eth0 up
+             nsenter -t {pid} -n sh -euc 'ip link set lo up; ip addr add 203.0.113.2/24 dev o0; ip link set o0 up'"
+        );
+        let out = std::process::Command::new("sh").args(["-euc", &setup]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let forwarding = Forwarding { relay_ranges: Some(((41000, 41999), (42000, 42999))), ..Forwarding::default() };
+        let script = nft_script(&[apply_batch("wg0", &[], &forwarding)]);
+        let out = std::process::Command::new("sh").args(["-euc", &script]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        // Outside: a resolver that answers whatever arrives, and later sends
+        // a datagram to a relay port unasked.
+        let mut echo = std::process::Command::new("nsenter")
+            .args(["-t", &pid.to_string(), "-n", "python3", "-c"])
+            .arg(
+                "import socket\n\
+                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n\
+                 s.bind(('203.0.113.2', 53))\n\
+                 while True:\n    d, a = s.recvfrom(64)\n    s.sendto(d, a)\n",
+            )
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // This host: a lookup from relay port 41010.
+        let socket = std::net::UdpSocket::bind("203.0.113.1:41010").unwrap();
+        socket.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        socket.send_to(b"lookup", "203.0.113.2:53").unwrap();
+        let mut buf = [0u8; 64];
+        let answered = socket.recv_from(&mut buf).is_ok_and(|(n, _)| &buf[..n] == b"lookup");
+        // Unasked, to another relay port something listens on.
+        let listener = std::net::UdpSocket::bind("203.0.113.1:41011").unwrap();
+        listener.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+        let _ = std::process::Command::new("nsenter")
+            .args(["-t", &pid.to_string(), "-n", "python3", "-c"])
+            .arg("import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b'unasked', ('203.0.113.1', 41011))")
+            .status();
+        let unasked_arrived = listener.recv_from(&mut buf).is_ok();
+        let _ = echo.kill();
+        let _ = echo.wait();
+        let _ = outside.kill();
+        let _ = outside.wait();
+        assert!(answered, "the reply to this host's own lookup must arrive");
+        assert!(!unasked_arrived, "a new flow to a relay port is still dropped");
     }
 
     // ---- end-to-end relay (PLAN.md M39) ----

@@ -96,16 +96,29 @@ pub fn set(conn: &Connection, owner: &Owner) -> Result<(), DbError> {
 /// A successful refresh: new groups, the (possibly rotated) token, fresh.
 /// Only while the node still has that same owner — a claim may have
 /// replaced it while the refresh was in flight.
-pub fn refreshed(conn: &Connection, node_id: i64, sub: &str, groups: &[String], token_enc: &str) -> Result<(), DbError> {
+///
+/// `email`: the refreshed ID token's verified email (PLAN.md #275) — `""`
+/// when it has none, which clears the one stored; `None` when there was no
+/// ID token, which leaves it.
+pub fn refreshed(
+    conn: &Connection,
+    node_id: i64,
+    sub: &str,
+    groups: &[String],
+    token_enc: &str,
+    email: Option<&str>,
+) -> Result<(), DbError> {
     conn.execute(
-        "UPDATE node_owners SET groups = ?1, refresh_token_enc = ?2, refreshed_at = ?3, stale_since = NULL \
+        "UPDATE node_owners SET groups = ?1, refresh_token_enc = ?2, refreshed_at = ?3, stale_since = NULL, \
+         email = CASE WHEN ?6 IS NULL THEN email ELSE NULLIF(?6, '') END \
          WHERE node_id = ?4 AND sub = ?5",
         rusqlite::params![
             serde_json::to_string(groups).expect("strings serialize"),
             token_enc,
             super::nodes::now_str(),
             node_id,
-            sub
+            sub,
+            email
         ],
     )?;
     Ok(())
@@ -224,9 +237,9 @@ mod tests {
         set(&conn, &owner(a, "bob", &["guests"])).unwrap();
         assert_eq!(of(&conn, a).unwrap().unwrap().sub, "bob", "one owner, the latest");
 
-        refreshed(&conn, a, "alice", &["admins".into()], "x").unwrap();
+        refreshed(&conn, a, "alice", &["admins".into()], "x", None).unwrap();
         assert_eq!(of(&conn, a).unwrap().unwrap().groups, ["guests"], "a refresh for a replaced owner changes nothing");
-        refreshed(&conn, a, "bob", &["family".into()], "rotated").unwrap();
+        refreshed(&conn, a, "bob", &["family".into()], "rotated", None).unwrap();
         let o = of(&conn, a).unwrap().unwrap();
         assert_eq!((o.groups.as_slice(), o.refresh_token_enc.as_str()), (&["family".to_string()][..], "rotated"));
 
@@ -235,8 +248,19 @@ mod tests {
         assert!(o.groups_count(Utc::now()), "stale, but not for long yet");
         assert!(!o.groups_count(Utc::now() + Duration::hours(2)));
         assert!(groups_by_node(&conn, Utc::now() + Duration::hours(2)).unwrap().is_empty());
-        refreshed(&conn, a, "bob", &["family".into()], "again").unwrap();
+        refreshed(&conn, a, "bob", &["family".into()], "again", None).unwrap();
         assert!(of(&conn, a).unwrap().unwrap().stale_since.is_none());
+
+        // The email follows the refreshed ID token (PLAN.md #275): none
+        // there leaves it, a verified one replaces it, none verified clears it.
+        let email = |conn: &Connection| of(conn, a).unwrap().unwrap().email;
+        let before = email(&conn);
+        refreshed(&conn, a, "bob", &["family".into()], "t", None).unwrap();
+        assert_eq!(email(&conn), before);
+        refreshed(&conn, a, "bob", &["family".into()], "t", Some("bob@example.com")).unwrap();
+        assert_eq!(email(&conn).as_deref(), Some("bob@example.com"));
+        refreshed(&conn, a, "bob", &["family".into()], "t", Some("")).unwrap();
+        assert_eq!(email(&conn), None);
     }
 
     #[tokio::test]

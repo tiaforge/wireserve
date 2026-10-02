@@ -57,6 +57,7 @@ pub enum OidcError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     pub sub: String,
+    /// Only one the provider marks verified (PLAN.md #275).
     pub email: Option<String>,
     pub name: Option<String>,
     pub groups: Vec<String>,
@@ -68,6 +69,23 @@ pub struct Identity {
 pub struct Refreshed {
     pub groups: Vec<String>,
     pub refresh_token: String,
+    /// The verified email of the refreshed ID token (PLAN.md #275): `None`
+    /// when the provider sent no ID token, which says nothing either way.
+    pub email: Option<Option<String>>,
+}
+
+/// The ID token's email, if the provider marks it verified (PLAN.md #275).
+/// An unverified one is whatever the person typed into their profile, and
+/// it goes to backends as the owner's email header: one that keys on email
+/// would take them for whoever's address they typed. authward refuses it
+/// the same way.
+fn verified_email<AC: openidconnect::AdditionalClaims, GC: openidconnect::GenderClaim>(
+    claims: &openidconnect::IdTokenClaims<AC, GC>,
+) -> Option<String> {
+    match (claims.email(), claims.email_verified()) {
+        (Some(email), Some(true)) => Some(email.to_string()),
+        _ => None,
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -180,7 +198,7 @@ impl Oidc {
             .claims(&client.id_token_verifier(), &pending.nonce)
             .map_err(|e| OidcError::Invalid(format!("ID token: {e}")))?;
         let sub = claims.subject().to_string();
-        let email = claims.email().map(|e| e.to_string());
+        let email = verified_email(claims);
         let name = claims
             .name()
             .and_then(|n| n.get(None))
@@ -209,7 +227,7 @@ impl Oidc {
             Err(e) => return Err(RefreshError::Failed(describe(&e))),
         };
         let rotated = tokens.refresh_token().map_or_else(|| refresh_token.to_string(), |t| t.secret().clone());
-        let jwt = match tokens.id_token() {
+        let (jwt, email) = match tokens.id_token() {
             Some(id_token) => {
                 // A refreshed ID token carries no nonce of ours to check.
                 let claims = id_token
@@ -218,13 +236,13 @@ impl Oidc {
                 if claims.subject().as_str() != sub {
                     return Err(RefreshError::Failed("the refreshed ID token names someone else".into()));
                 }
-                id_token.to_string()
+                (id_token.to_string(), Some(verified_email(claims)))
             }
-            None => String::new(),
+            None => (String::new(), None),
         };
         let groups =
             self.groups(&client, &jwt, tokens.access_token(), sub).await.map_err(|e| RefreshError::Failed(e.to_string()))?;
-        Ok(Refreshed { groups, refresh_token: rotated })
+        Ok(Refreshed { groups, refresh_token: rotated, email })
     }
 
     /// The groups claim, from the ID token already checked (`jwt`) when it
