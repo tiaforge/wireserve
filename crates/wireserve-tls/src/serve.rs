@@ -56,6 +56,9 @@ pub struct Policy {
     pub fqdn: String,
     /// Who may in (PLAN.md M36).
     pub access: wireserve_types::ServiceAccess,
+    /// Takes requests other sites start (PLAN.md #276,
+    /// `WIRESERVE_CROSS_SITE_SERVICES`).
+    pub cross_site: bool,
 }
 
 /// Service address → how it treats requests. Read on every request, and
@@ -610,6 +613,25 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                                 "this address serves another name",
                             ));
                         }
+                        // A page on another site may not act here as the
+                        // device it runs on (PLAN.md #276). The sign-in
+                        // provider's own pages are exempt: its provider
+                        // answers by form POST from elsewhere.
+                        let provider = sign_in.as_ref().is_some_and(|si| si.target.fqdn.eq_ignore_ascii_case(&policy.fqdn));
+                        if !policy.cross_site && !provider && started_elsewhere(&req, &policy.fqdn, upgrade) {
+                            tracing::info!(
+                                service = %policy.fqdn,
+                                peer = %peer.ip(),
+                                method = %req.method(),
+                                origin = ?req.headers().get(axum::http::header::ORIGIN),
+                                site = ?req.headers().get("sec-fetch-site"),
+                                "refused a request another site started"
+                            );
+                            return Ok(crate::sign_in::plain(
+                                axum::http::StatusCode::FORBIDDEN,
+                                "a page on another site may not do this here",
+                            ));
+                        }
                         let mut req = req.map(Body::new);
                         // As the client asked, for asking again while it is open.
                         let asked = upgrade.then(|| Arc::new(as_asked(&req)));
@@ -851,6 +873,39 @@ fn is_untrusted(name: &str, verify: bool, forwarder: bool, extra: &[String]) -> 
     UNTRUSTED_EXACT.contains(&name) || UNTRUSTED_PREFIX.iter().any(|p| name.starts_with(p))
 }
 
+/// Whether `req` was started by a page on another site, and asks for more
+/// than a look (PLAN.md #276): a POST, PUT, DELETE or the like, or a
+/// WebSocket (`websocket`, as [`crate::upgrade::wanted`] found it).
+///
+/// Admission here is by device, and a browser sends whatever any open page
+/// asks for through the device's tunnel — the device's grants and owner
+/// with it, which no SameSite rule holds back, since no cookie is
+/// involved. The browser does say who started a request: `Sec-Fetch-Site`
+/// (every current browser) or, without it, `Origin`. `same-site` counts as
+/// another site: every service shares the parent domain, a node's own
+/// among them. Following a link stays allowed, and so do reads, which the
+/// browser keeps from the other page. A client that is not a browser
+/// sends neither header, and is never refused here.
+fn started_elsewhere<B>(req: &Request<B>, fqdn: &str, websocket: bool) -> bool {
+    use axum::http::Method;
+    let headers = req.headers();
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(|v| v.trim().to_ascii_lowercase());
+    let own_origin = |origin: &str| {
+        origin.strip_prefix("https://").is_some_and(|host| host.eq_ignore_ascii_case(fqdn))
+    };
+    let origin = header("origin");
+    let elsewhere = match header("sec-fetch-site").as_deref() {
+        Some("cross-site" | "same-site") => true,
+        Some(_) => false,
+        None => origin.as_deref().is_some_and(|o| !own_origin(o)),
+    };
+    // A WebSocket must come from this service's own pages, whatever else
+    // the browser says.
+    let foreign_socket = websocket && origin.as_deref().is_some_and(|o| !own_origin(o));
+    let acts = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    (elsewhere && (acts || websocket)) || foreign_socket
+}
+
 /// Strips every header a client could use to claim to be someone else, and
 /// names the calling node. The forwarding headers are then set afresh by
 /// the proxy from the connection itself — never appended to what the client
@@ -970,7 +1025,7 @@ mod tests {
     }
 
     fn open(fqdn: &str) -> Policy {
-        Policy { fqdn: fqdn.into(), access: wireserve_types::ServiceAccess { open: true, ..Default::default() } }
+        Policy { fqdn: fqdn.into(), access: wireserve_types::ServiceAccess { open: true, ..Default::default() }, cross_site: false }
     }
 
     /// Reached by 10.9.0.2 alone; anyone else may sign in with `family`.
@@ -983,6 +1038,7 @@ mod tests {
                 sign_in_groups: vec!["family".into()],
                 ..Default::default()
             },
+            cross_site: false,
         }
     }
 
@@ -1128,7 +1184,7 @@ mod tests {
         let mut buf = vec![0u8; 4096];
         let n = tls.read(&mut buf).await.unwrap();
         assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
-        let closed = Policy { fqdn: "svc.test".into(), access: wireserve_types::ServiceAccess::default() };
+        let closed = Policy { fqdn: "svc.test".into(), access: wireserve_types::ServiceAccess::default(), cross_site: false };
         shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(closed));
         tls.write_all(get).await.unwrap();
         let n = tls.read(&mut buf).await.unwrap();
@@ -1754,7 +1810,7 @@ mod tests {
     #[tokio::test]
     async fn a_device_not_let_in_never_reaches_a_websocket_backend() {
         let (port, client, shared) = in_front_of(ws_backend().await, quick());
-        let closed = Policy { fqdn: "svc.test".into(), access: wireserve_types::ServiceAccess::default() };
+        let closed = Policy { fqdn: "svc.test".into(), access: wireserve_types::ServiceAccess::default(), cross_site: false };
         shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(closed));
         match ws(port, &client, "/").await {
             Err(tungstenite::Error::Http(resp)) => assert_eq!(resp.status(), 403),
@@ -1767,6 +1823,7 @@ mod tests {
         let granted = Policy {
             fqdn: "svc.test".into(),
             access: wireserve_types::ServiceAccess { sources: vec![Ipv4Addr::LOCALHOST], ..Default::default() },
+            cross_site: false,
         };
         let (port, client, shared) = in_front_of(ws_backend().await, quick());
         shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(granted.clone()));
@@ -1775,7 +1832,7 @@ mod tests {
         assert!(!ws_closed_within(&mut ws1, Duration::from_millis(800)).await, "still granted: stays open");
 
         // The grant taken away.
-        let closed = Policy { fqdn: "svc.test".into(), access: wireserve_types::ServiceAccess::default() };
+        let closed = Policy { fqdn: "svc.test".into(), access: wireserve_types::ServiceAccess::default(), cross_site: false };
         shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(closed));
         assert!(ws_closed_within(&mut ws1, Duration::from_secs(3)).await, "the grant is gone");
 
@@ -1955,5 +2012,122 @@ mod tests {
         s.write_all(ask.as_bytes()).await.unwrap();
         let answer = read_until(&mut s, |t| t.contains("\r\n\r\n")).await;
         assert!(answer.starts_with("HTTP/1.1 101"), "{answer}");
+    }
+
+    // ---- requests another site starts (PLAN.md #276) ----
+
+    /// A WebSocket to `path`, as a browser on another site would open it:
+    /// with `origin`, and `Sec-Fetch-Site` when given.
+    async fn ws_from(
+        port: u16,
+        client: &tokio_rustls::TlsConnector,
+        origin: &str,
+        site: Option<&str>,
+    ) -> Result<(Ws, tungstenite::handshake::client::Response), tungstenite::Error> {
+        use tungstenite::client::IntoClientRequest;
+        let mut req = "wss://svc.test/".into_client_request().unwrap();
+        req.headers_mut().insert("origin", origin.parse().unwrap());
+        if let Some(site) = site {
+            req.headers_mut().insert("sec-fetch-site", site.parse().unwrap());
+            req.headers_mut().insert("sec-fetch-mode", "websocket".parse().unwrap());
+        }
+        tokio_tungstenite::client_async(req, tls(port, client).await).await
+    }
+
+    #[tokio::test]
+    async fn a_websocket_another_site_opens_is_refused_and_the_services_own_page_is_not() {
+        let (port, client, _) = in_front_of(ws_backend().await, quick());
+        for (origin, site) in [
+            ("https://evil.example", Some("cross-site")),
+            ("https://evil.svc.test", Some("same-site")),
+            ("https://evil.example", None),
+            ("null", None),
+        ] {
+            let refused = ws_from(port, &client, origin, site).await;
+            assert!(refused.is_err(), "{origin} {site:?}: must not reach the backend");
+        }
+        let (mut own, _) = ws_from(port, &client, "https://svc.test", Some("same-origin")).await.expect("its own page");
+        next_text(&mut own).await;
+        let (mut program, _) = ws(port, &client, "/").await.expect("no browser headers at all: a program, not a page");
+        next_text(&mut program).await;
+    }
+
+    #[test]
+    fn what_another_site_may_start_here() {
+        let req = |method: &str, headers: &[(&str, &str)]| {
+            let mut b = Request::builder().method(method).uri("/");
+            for (k, v) in headers {
+                b = b.header(*k, *v);
+            }
+            b.body(()).unwrap()
+        };
+        let own = "svc.test";
+        let refused = |method: &str, headers: &[(&str, &str)], ws: bool| started_elsewhere(&req(method, headers), own, ws);
+        // A form another site submits, or its fetch.
+        assert!(refused("POST", &[("sec-fetch-site", "cross-site")], false));
+        assert!(refused("DELETE", &[("sec-fetch-site", "same-site")], false), "another service on the domain is another site");
+        assert!(refused("POST", &[("origin", "https://evil.example")], false), "an older browser: Origin alone");
+        assert!(refused("POST", &[("origin", "null")], false));
+        // A WebSocket from anywhere but the service's own pages.
+        assert!(refused("GET", &[("sec-fetch-site", "cross-site")], true));
+        assert!(refused("GET", &[("origin", "https://evil.svc.test")], true));
+        assert!(refused("GET", &[("sec-fetch-site", "same-origin"), ("origin", "https://evil.example")], true), "the origin decides a socket");
+        // Allowed: following a link, a look, the service's own pages, a program.
+        assert!(!refused("GET", &[("sec-fetch-site", "cross-site"), ("sec-fetch-mode", "navigate")], false));
+        assert!(!refused("HEAD", &[("sec-fetch-site", "cross-site")], false));
+        assert!(!refused("OPTIONS", &[("sec-fetch-site", "cross-site")], false), "a preflight asks the backend, it changes nothing");
+        assert!(!refused("POST", &[("sec-fetch-site", "same-origin"), ("origin", "https://svc.test")], false));
+        assert!(!refused("POST", &[("sec-fetch-site", "none")], false), "typed in, or a bookmark");
+        assert!(!refused("POST", &[("origin", "https://SVC.test")], false));
+        assert!(!refused("POST", &[], false), "no browser headers: a program");
+        assert!(!refused("GET", &[("sec-fetch-site", "same-origin"), ("origin", "https://svc.test")], true));
+        assert!(!refused("GET", &[], true));
+    }
+
+    /// Sends `method` to `/` with `headers` and a small body; the status line.
+    async fn send<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(s: &mut S, method: &str, headers: &[(&str, &str)]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut head = format!("{method} / HTTP/1.1\r\nhost: svc.test\r\ncontent-length: 2\r\n");
+        for (k, v) in headers {
+            head.push_str(&format!("{k}: {v}\r\n"));
+        }
+        head.push_str("\r\nhi");
+        s.write_all(head.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await.expect("an answer").unwrap();
+        String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or_default().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_form_another_site_submits_never_reaches_the_backend() {
+        let (port, client) = limited(quick()).await;
+        let mut s = tls(port, &client).await;
+        let cross = [("sec-fetch-site", "cross-site"), ("sec-fetch-mode", "navigate"), ("origin", "https://evil.example")];
+        assert!(send(&mut s, "POST", &cross).await.starts_with("HTTP/1.1 403"));
+        assert!(send(&mut s, "POST", &[("sec-fetch-site", "same-site"), ("origin", "https://evil.svc.test")]).await.starts_with("HTTP/1.1 403"));
+        assert!(send(&mut s, "GET", &cross[..2]).await.starts_with("HTTP/1.1 200"), "following a link from elsewhere");
+        assert!(send(&mut s, "POST", &[("sec-fetch-site", "same-origin"), ("origin", "https://svc.test")]).await.starts_with("HTTP/1.1 200"));
+        assert!(send(&mut s, "POST", &[]).await.starts_with("HTTP/1.1 200"), "a program");
+    }
+
+    #[tokio::test]
+    async fn a_service_let_open_to_other_sites_and_the_sign_in_provider_take_them() {
+        let (port, client, shared) = limited_shared(quick()).await;
+        let cross = [("sec-fetch-site", "cross-site"), ("origin", "https://idp.example")];
+        let mut s = tls(port, &client).await;
+        assert!(send(&mut s, "POST", &cross).await.starts_with("HTTP/1.1 403"));
+
+        // WIRESERVE_CROSS_SITE_SERVICES names it.
+        let mut opened = open("svc.test");
+        opened.cross_site = true;
+        shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(opened));
+        assert!(send(&mut s, "POST", &cross).await.starts_with("HTTP/1.1 200"));
+
+        // The sign-in provider's own service: its provider answers by form POST.
+        shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(open("svc.test")));
+        let mut provider = sign_in();
+        provider.target.fqdn = "svc.test".into();
+        *shared.sign_in.write().unwrap() = Some(provider);
+        assert!(send(&mut s, "POST", &cross).await.starts_with("HTTP/1.1 200"));
     }
 }

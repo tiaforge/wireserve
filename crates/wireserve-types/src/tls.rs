@@ -94,6 +94,10 @@ pub struct TlsService {
     /// through a sign-in there is none of.
     #[serde(default)]
     pub access: crate::ServiceAccess,
+    /// Takes requests a page on another site starts (PLAN.md #276):
+    /// otherwise a POST or a WebSocket from one is refused.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cross_site: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

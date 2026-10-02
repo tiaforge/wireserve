@@ -4179,3 +4179,33 @@ as agreed with the user. Nothing deployed; no e2e suite covers these paths.
     are cleared (nothing says they were verified); the next refresh brings
     a verified one back. The user header stays the subject, as authward's.
     Settled with the user: verified emails only, rather than none.
+
+## Requests another site starts
+
+276. **A page on another site may not act as the device it runs on**
+    (`wireserve_tls::serve::started_elsewhere`). Found in the second audit
+    pass, explained to the user with an example: ttyd on
+    `shell.<domain>`, granted to a laptop, and a blog open on that laptop
+    whose script opens `wss://shell.<domain>/ws` — the browser sends it
+    through the laptop's tunnel, the terminator admits the laptop (and
+    names its owner, M38), and ttyd, which checks no `Origin` by default,
+    hands the page a shell. Admission by device is ambient: no cookie, so
+    no SameSite rule; the names are public (DNS, CT logs). A test opening a
+    WebSocket with `Origin: https://evil.example` reached the backend
+    before this. Now, decided with the user:
+    - Refused (403) when `Sec-Fetch-Site` is `cross-site` or `same-site`
+      — every service shares the parent domain, a node's own among them —
+      or, without it (older browsers), `Origin` isn't
+      `https://<service>`: any method but GET, HEAD and OPTIONS, and any
+      WebSocket. A WebSocket's `Origin` must be the service's own whatever
+      else the browser says.
+    - Allowed: following a link, reads — the browser keeps the answer from
+      the other page, and dashboards that embed images keep working (the
+      user's choice over refusing them) — the service's own pages, typed
+      URLs, and clients that send neither header.
+    - Exempt: the sign-in provider's own service (its provider may answer
+      by form POST), and `WIRESERVE_CROSS_SITE_SERVICES` (coordinator,
+      service names), carried as `ServiceNaming::cross_site_services` and
+      `TlsService::cross_site` — both, as the user chose.
+    Applies to every request, signed-in ones too: a same-site page gets the
+    authward cookie sent along.

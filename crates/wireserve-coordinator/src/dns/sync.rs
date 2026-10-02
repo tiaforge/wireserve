@@ -341,7 +341,7 @@ mod tests {
     }
 
     fn naming() -> ServiceNaming {
-        ServiceNaming { domain: "Int.Example.com".into(), acme: None, sign_in: None, identity_headers: Default::default(), strip_headers: Vec::new(), forwarding_nodes: Vec::new() }
+        ServiceNaming { domain: "Int.Example.com".into(), acme: None, sign_in: None, identity_headers: Default::default(), strip_headers: Vec::new(), forwarding_nodes: Vec::new(), cross_site_services: Vec::new() }
     }
 
     fn ip(s: &str) -> Ipv4Addr {

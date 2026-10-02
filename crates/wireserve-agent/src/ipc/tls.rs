@@ -151,6 +151,7 @@ pub fn build_config(state: &AgentState) -> TlsConfig {
                 vip,
                 upstream: SocketAddr::new(map.addr.unwrap_or(node).into(), map.target),
                 access,
+                cross_site: naming.cross_site_services.contains(&d.name),
             })
         })
         .collect();
@@ -241,6 +242,7 @@ mod tests {
             identity_headers: wireserve_types::IdentityHeaders::default(),
             strip_headers: Vec::new(),
             forwarding_nodes: Vec::new(),
+            cross_site_services: Vec::new(),
         });
         let open = |name: &str| wireserve_types::ServiceAccess { name: name.into(), open: true, ..Default::default() };
         let plex = if restricted {
@@ -276,6 +278,14 @@ mod tests {
         assert_eq!(plex.vip, "10.9.0.50".parse::<Ipv4Addr>().unwrap());
         assert_eq!(plex.upstream, "10.9.0.1:32400".parse::<SocketAddr>().unwrap());
         assert_eq!(cfg.callers.len(), 2);
+    }
+
+    #[test]
+    fn a_service_named_open_to_other_sites_is_served_so() {
+        assert!(!build_config(&state(true, false)).services[0].cross_site);
+        let mut st = state(true, false);
+        st.last_directory.as_mut().unwrap().naming.as_mut().unwrap().cross_site_services = vec!["plex".into()];
+        assert!(build_config(&st).services[0].cross_site, "WIRESERVE_CROSS_SITE_SERVICES names it (PLAN.md #276)");
     }
 
     #[test]

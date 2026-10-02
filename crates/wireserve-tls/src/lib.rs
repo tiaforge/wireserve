@@ -218,7 +218,11 @@ pub async fn run(opts: Options) -> Result<(), Error> {
             }
             s.service = service.clone();
             if entry.cert.is_some() {
-                let policy = Arc::new(serve::Policy { fqdn: service.fqdn.clone(), access: service.access.clone() });
+                let policy = Arc::new(serve::Policy {
+                    fqdn: service.fqdn.clone(),
+                    access: service.access.clone(),
+                    cross_site: service.cross_site,
+                });
                 shared.policies.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(service.vip, policy);
                 if !s.routed {
                     tracing::info!(service = %service.name, addr = %service.vip, upstream = %service.upstream, "serving");
@@ -353,6 +357,7 @@ mod tests {
             vip: Ipv4Addr::new(100, 64, 0, 9),
             upstream: SocketAddr::from(([127, 0, 0, 1], 8080)),
             access: Default::default(),
+            cross_site: false,
         }
     }
 

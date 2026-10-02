@@ -187,6 +187,7 @@ fn app(issuer: &str) -> App {
         reserved_service_names: Vec::new(),
         strip_headers: Vec::new(),
         forwarding_nodes: Vec::new(),
+        cross_site_services: Vec::new(),
     };
     let db = Db::open(db_file.path()).unwrap();
     let state = build_state(config, db);

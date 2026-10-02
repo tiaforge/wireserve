@@ -906,6 +906,17 @@ Worth knowing:
   and an `X-Forwarded-Host` that is one plain host name; every other
   caller's are still removed. Nothing about *who* is calling is ever kept,
   and such a node's owner is never named: it speaks for someone else.
+- **Another site's page cannot act here as your device.** A terminator lets
+  a device in by its grants and names its owner, and a browser sends whatever
+  any page open on it asks for through the tunnel — no cookie, so no SameSite
+  rule holds it back. So a POST, PUT or DELETE, or a WebSocket, that a page on
+  another site started is refused with 403; another service under the same
+  domain counts as another site, since a node's own 443 service is one of
+  them. Following a link, reads (which the browser keeps from the other page)
+  and programs that aren't browsers are unaffected, and so is the sign-in
+  provider's own service. A service that must take such requests — itself a
+  sign-in client answered by form POST, say — goes in
+  `WIRESERVE_CROSS_SITE_SERVICES` on the coordinator.
 - **A node learns who owns a device only when that device calls it.** The
   identity headers name the owner of a calling device; the coordinator tells
   a node an owner's subject, e-mail and groups only for a device the node

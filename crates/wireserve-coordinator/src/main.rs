@@ -314,6 +314,7 @@ mod tests {
             reserved_service_names: Vec::new(),
             strip_headers: Vec::new(),
             forwarding_nodes: Vec::new(),
+            cross_site_services: Vec::new(),
         };
         let generated = ["WIRESERVE_ADMIN_TOKEN", "WIRESERVE_NET_V4_CIDR", "WIRESERVE_NET_V6_PREFIX"];
         let path = std::path::Path::new("/var/lib/wireserve-coordinator/coordinator-secrets.env");

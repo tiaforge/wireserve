@@ -58,6 +58,7 @@ fn test_config(db_path: &str) -> Config {
         reserved_service_names: Vec::new(),
         strip_headers: Vec::new(),
         forwarding_nodes: Vec::new(),
+        cross_site_services: Vec::new(),
     }
 }
 

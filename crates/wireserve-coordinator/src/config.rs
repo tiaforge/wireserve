@@ -21,6 +21,9 @@ pub struct Config {
     /// Nodes whose forwarding headers the terminators keep
     /// (`WIRESERVE_FORWARDING_NODES`, PLAN.md M43).
     pub forwarding_nodes: Vec<String>,
+    /// Services that take requests other sites start
+    /// (`WIRESERVE_CROSS_SITE_SERVICES`, PLAN.md #276).
+    pub cross_site_services: Vec<String>,
     /// Where browsers and nodes reach the coordinator, e.g.
     /// `https://mesh.example.com` (`WIRESERVE_PUBLIC_URL`), without a
     /// trailing slash. Needed for the claim links of device owners.
@@ -222,6 +225,7 @@ impl Config {
         let identity_headers = identity_headers_from_lookup(|k| std::env::var(k).ok())?;
         let strip_headers = strip_headers_from(std::env::var("WIRESERVE_STRIP_HEADERS").ok().as_deref())?;
         let forwarding_nodes = forwarding_nodes_from(std::env::var("WIRESERVE_FORWARDING_NODES").ok().as_deref())?;
+        let cross_site_services = cross_site_services_from(std::env::var("WIRESERVE_CROSS_SITE_SERVICES").ok().as_deref())?;
         let public_url = public_url_from_lookup(|k| std::env::var(k).ok())?;
         let oidc = oidc_from_lookup(|k| std::env::var(k).ok(), public_url.as_deref(), &bootstrapped_token_key)?;
 
@@ -238,6 +242,7 @@ impl Config {
                 identity_headers,
                 strip_headers,
                 forwarding_nodes,
+                cross_site_services,
                 public_url,
                 oidc,
                 dns,
@@ -324,6 +329,21 @@ pub fn forwarding_nodes_from(raw: Option<&str>) -> Result<Vec<String>, ConfigErr
     Ok(out)
 }
 
+/// `WIRESERVE_CROSS_SITE_SERVICES` (PLAN.md #276): service names,
+/// comma-separated, validated as labels.
+pub fn cross_site_services_from(raw: Option<&str>) -> Result<Vec<String>, ConfigError> {
+    let mut out: Vec<String> = Vec::new();
+    for name in raw.unwrap_or("").split(',').map(|n| n.trim().to_ascii_lowercase()).filter(|n| !n.is_empty()) {
+        if !wireserve_types::is_valid_dns_label(&name) {
+            return Err(ConfigError::Invalid("WIRESERVE_CROSS_SITE_SERVICES", format!("{name:?} is not a service name")));
+        }
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    Ok(out)
+}
+
 /// `WIRESERVE_RESERVED_SERVICE_NAMES`: service names, comma-separated.
 pub fn reserved_names_from(raw: Option<&str>) -> Result<Vec<String>, ConfigError> {
     let mut out = Vec::new();
@@ -379,6 +399,7 @@ impl Config {
             identity_headers: self.identity_headers.clone(),
             strip_headers: self.strip_headers.clone(),
             forwarding_nodes: self.forwarding_nodes.clone(),
+            cross_site_services: self.cross_site_services.clone(),
         })
     }
 }
@@ -808,6 +829,7 @@ mod tests {
             reserved_service_names: Vec::new(),
             strip_headers: Vec::new(),
             forwarding_nodes: Vec::new(),
+            cross_site_services: Vec::new(),
         }
     }
 
@@ -838,6 +860,9 @@ mod tests {
         assert_eq!(forwarding_nodes_from(Some(" Strato, strato ,edge,")).unwrap(), ["strato", "edge"]);
         assert!(forwarding_nodes_from(None).unwrap().is_empty());
         assert!(forwarding_nodes_from(Some("not a node")).is_err());
+        assert_eq!(cross_site_services_from(Some(" Wiki,wiki ,erp,")).unwrap(), ["wiki", "erp"]);
+        assert!(cross_site_services_from(None).unwrap().is_empty());
+        assert!(cross_site_services_from(Some("not a name")).is_err());
         for bad in ["host", "Content-Length", "a b", "x:y"] {
             assert!(strip_headers_from(Some(bad)).is_err(), "{bad}");
         }

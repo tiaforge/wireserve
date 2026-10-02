@@ -53,6 +53,11 @@ pub struct ServiceNaming {
     /// the terminators keep instead of removing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forwarding_nodes: Vec<String>,
+    /// Services that take requests other sites start (PLAN.md #276,
+    /// `WIRESERVE_CROSS_SITE_SERVICES`): an app that is itself a sign-in
+    /// client and gets its answer as a form POST from the provider, say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cross_site_services: Vec<String>,
 }
 
 /// The headers a terminator tells a backend who is calling in — filled
