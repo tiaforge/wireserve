@@ -4218,3 +4218,16 @@ as agreed with the user. Nothing deployed; no e2e suite covers these paths.
     old to send `Sec-Fetch-Site`. For a forwarding node, the
     `X-Forwarded-Host` it vouched for (#268: one plain host name, kept only
     for such a node) counts as the service's own name as well.
+
+278. **A relayed peer reaches a service that is forwarded, too**
+    (`nftables::carry_table`). The carry interface's table (#237) dropped
+    everything forwarded from it, so a relayed agent never reached a
+    mapping onto a container's published port or a LAN address (M26) —
+    only services answered on the host itself, and 443 services, whose
+    terminator connects to the backend on its own. On the real mesh that is
+    lego2 and minipc whenever their direct path is down. The carry table
+    now accepts a service's own flows (`ct mark & SERVICE_MARK`) ahead of
+    its drop, exactly as the mesh table does, whenever there is a mapped
+    service. `kernel_a_mapped_service_is_reached_through_the_carry_interface_too`
+    sends a connection through each interface to a LAN target; it needs
+    real root for the payload rewrites, and skips without.

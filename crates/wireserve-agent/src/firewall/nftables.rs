@@ -967,9 +967,11 @@ pub(crate) fn apply_batch_with(
 /// through a relayed session gets exactly what the same peer would get
 /// over the mesh interface — its grants on the service addresses, replies
 /// to this node's own connections, and a refusal for everything else. It
-/// never forwards. The rewrites' marking, reply and masquerade chains in
-/// the mesh interface's table aren't tied to an interface, so they serve
-/// these flows too.
+/// forwards nothing but a service's own flows (PLAN.md #278), as the mesh
+/// interface's table does: a mapping onto a container's published port or
+/// a LAN address is forwarded to it. The rewrites' marking, reply and
+/// masquerade chains in the mesh interface's table aren't tied to an
+/// interface, so they serve these flows too.
 fn carry_table(
     carry: &str,
     mapped: &[(Ipv4Addr, Ipv4Addr, PortMap, &Sources)],
@@ -993,6 +995,9 @@ fn carry_table(
     objects.push(rule(t, CHAIN_NAME, vec![iifname_is(carry), Statement::Drop(None::<Drop>)]));
 
     objects.push(chain(t, FORWARD_CHAIN, NfChainType::Filter, NfHook::Forward, 0));
+    if !mapped.is_empty() {
+        objects.push(rule(t, FORWARD_CHAIN, vec![iifname_is(carry), has_mark(ct("mark", None)), accept()]));
+    }
     objects.push(rule(t, FORWARD_CHAIN, vec![iifname_is(carry), Statement::Drop(None::<Drop>)]));
 
     if !has_service_addresses {
@@ -1981,6 +1986,89 @@ mod tests {
         assert!(!unasked_arrived, "a new flow to a relay port is still dropped");
     }
 
+    /// A service mapped onto another address (PLAN.md M26) is reached from
+    /// the carry interface the same way as from the mesh interface: a
+    /// relayed peer (M39) has the same grants as a direct one (#278).
+    ///
+    /// Needs real root: an unprivileged namespace refuses the address
+    /// rewrites' payload writes, and then this skips. Run the test binary
+    /// itself under sudo to take it.
+    #[test]
+    fn kernel_a_mapped_service_is_reached_through_the_carry_interface_too() {
+        if !crate::firewall::netns::reexec(
+            "firewall::nftables::tests::kernel_a_mapped_service_is_reached_through_the_carry_interface_too",
+        ) {
+            return;
+        }
+        let mut hosts = Vec::new();
+        for _ in 0..3 {
+            hosts.push(std::process::Command::new("unshare").args(["-n", "sleep", "60"]).spawn().unwrap());
+        }
+        let stop = |hosts: Vec<std::process::Child>| {
+            for mut h in hosts {
+                let _ = h.kill();
+                let _ = h.wait();
+            }
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (direct, relayed, lan) = (hosts[0].id(), hosts[1].id(), hosts[2].id());
+        let setup = format!(
+            "ip link set lo up
+             ip link add wg0 type veth peer name d0 && ip link set d0 netns {direct}
+             ip link add wg0-t type veth peer name r0 && ip link set r0 netns {relayed}
+             ip link add lan0 type veth peer name l0 && ip link set l0 netns {lan}
+             ip addr add 100.90.0.2/32 dev wg0 && ip link set wg0 up && ip route add 100.90.0.7/32 dev wg0
+             ip link set wg0-t up && ip route add 100.90.0.8/32 dev wg0-t src 100.90.0.2
+             ip addr add 192.168.1.1/24 dev lan0 && ip link set lan0 up
+             nsenter -t {direct} -n sh -euc 'ip link set lo up; ip addr add 100.90.0.7/32 dev d0; ip link set d0 up; ip route add 100.90.0.0/24 dev d0'
+             nsenter -t {relayed} -n sh -euc 'ip link set lo up; ip addr add 100.90.0.8/32 dev r0; ip link set r0 up; ip route add 100.90.0.0/24 dev r0'
+             nsenter -t {lan} -n sh -euc 'ip link set lo up; ip addr add 192.168.1.2/24 dev l0; ip link set l0 up'
+             echo 0 > /proc/sys/net/ipv4/conf/all/forwarding
+             for i in wg0 wg0-t lan0; do echo 1 > /proc/sys/net/ipv4/conf/$i/forwarding; done"
+        );
+        let out = std::process::Command::new("sh").args(["-euc", &setup]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        // 100.90.0.50:80 is 192.168.1.2:8080 on the LAN.
+        let rule = ServiceRule::Mapped { vip: VIP, node: NODE, map: "80:192.168.1.2:8080".parse().unwrap(), sources: None };
+        let forwarding = Forwarding { guarded: vec!["lan0".into()], ..Forwarding::default() };
+        let script = nft_script(&[apply_batch_with("wg0", Some("wg0-t"), &[rule], &forwarding)]);
+        let out = std::process::Command::new("sh").args(["-euc", &script]).output().unwrap();
+        if String::from_utf8_lossy(&out.stderr).contains("Operation not permitted") {
+            eprintln!("SKIPPED: the address rewrites need real root (run the test binary under sudo)");
+            stop(hosts);
+            return;
+        }
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        let mut server = std::process::Command::new("nsenter")
+            .args(["-t", &lan.to_string(), "-n", "python3", "-c"])
+            .arg(
+                "import socket\n\
+                 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n\
+                 s.bind(('192.168.1.2', 8080)); s.listen()\n\
+                 while True:\n    c, _ = s.accept(); c.sendall(b'hello'); c.close()\n",
+            )
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let fetch = |from: u32| {
+            let out = std::process::Command::new("nsenter")
+                .args(["-t", &from.to_string(), "-n", "python3", "-c"])
+                .arg(format!("import socket; s = socket.create_connection(('{VIP}', 80), timeout=2); print(s.recv(16).decode())"))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let through_mesh = fetch(direct);
+        let through_carry = fetch(relayed);
+        let _ = server.kill();
+        let _ = server.wait();
+        stop(hosts);
+        assert_eq!(through_mesh, "hello", "a direct peer reaches the LAN target");
+        assert_eq!(through_carry, "hello", "a relayed peer reaches it the same way");
+    }
+
     // ---- end-to-end relay (PLAN.md M39) ----
 
     fn relay_pair() -> RelayForward {
@@ -2048,7 +2136,21 @@ mod tests {
         let input = in_table("wireserve.wg0-t", "wireserve-in");
         assert_eq!(input.first().unwrap(), &json!([iif("wg0-t"), established(), {"accept": null}]));
         assert_eq!(input.last().unwrap(), &json!([iif("wg0-t"), {"drop": null}]));
-        assert_eq!(in_table("wireserve.wg0-t", "wireserve-fwd"), [json!([iif("wg0-t"), {"drop": null}])], "it never forwards");
+        // A mapped service's own flows go on to its target (PLAN.md #278),
+        // and nothing else.
+        assert_eq!(
+            in_table("wireserve.wg0-t", "wireserve-fwd"),
+            [
+                json!([iif("wg0-t"), has_mark(json!({"ct": {"key": "mark"}})), {"accept": null}]),
+                json!([iif("wg0-t"), {"drop": null}]),
+            ]
+        );
+        let none = as_json(&apply_batch_with("wg0", Some("wg0-t"), &[terminated("443:32400")], &fwd(&[])));
+        let forwards: Vec<&Value> = none["nftables"].as_array().unwrap().iter()
+            .filter_map(|o| o.pointer("/add/rule"))
+            .filter(|r| r["table"] == "wireserve.wg0-t" && r["chain"] == "wireserve-fwd")
+            .collect();
+        assert_eq!(forwards.len(), 1, "without a mapped service it forwards nothing: {forwards:?}");
         let pre = serde_json::to_string(&in_table("wireserve.wg0-t", "svc-pre")).unwrap();
         assert!(pre.contains("100.90.0.7") && pre.contains("wg0-t"), "the same grant: {pre}");
         // The mesh interface's own table is unchanged by it.
