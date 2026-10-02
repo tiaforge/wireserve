@@ -4230,4 +4230,9 @@ as agreed with the user. Nothing deployed; no e2e suite covers these paths.
     its drop, exactly as the mesh table does, whenever there is a mapped
     service. `kernel_a_mapped_service_is_reached_through_the_carry_interface_too`
     sends a connection through each interface to a LAN target; it needs
-    real root for the payload rewrites, and skips without.
+    real root for the payload rewrites, and skips without. **Run as root
+    2026-10-02 (user):** fails without the fix on exactly the relayed
+    peer, passes with it. Getting there took two harness fixes: as root the
+    kernel tests now use `unshare -n` (a user namespace refuses the payload
+    writes), and the test's clients route via the host's address, since the
+    veths standing in for WireGuard interfaces do ARP.
