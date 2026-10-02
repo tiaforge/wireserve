@@ -2020,8 +2020,8 @@ mod tests {
              ip addr add 100.90.0.2/32 dev wg0 && ip link set wg0 up && ip route add 100.90.0.7/32 dev wg0
              ip link set wg0-t up && ip route add 100.90.0.8/32 dev wg0-t src 100.90.0.2
              ip addr add 192.168.1.1/24 dev lan0 && ip link set lan0 up
-             nsenter -t {direct} -n sh -euc 'ip link set lo up; ip addr add 100.90.0.7/32 dev d0; ip link set d0 up; ip route add 100.90.0.0/24 dev d0'
-             nsenter -t {relayed} -n sh -euc 'ip link set lo up; ip addr add 100.90.0.8/32 dev r0; ip link set r0 up; ip route add 100.90.0.0/24 dev r0'
+             nsenter -t {direct} -n sh -euc 'ip link set lo up; ip addr add 100.90.0.7/32 dev d0; ip link set d0 up; ip route add 100.90.0.0/24 via 100.90.0.2 dev d0 onlink'
+             nsenter -t {relayed} -n sh -euc 'ip link set lo up; ip addr add 100.90.0.8/32 dev r0; ip link set r0 up; ip route add 100.90.0.0/24 via 100.90.0.2 dev r0 onlink'
              nsenter -t {lan} -n sh -euc 'ip link set lo up; ip addr add 192.168.1.2/24 dev l0; ip link set l0 up'
              echo 0 > /proc/sys/net/ipv4/conf/all/forwarding
              for i in wg0 wg0-t lan0; do echo 1 > /proc/sys/net/ipv4/conf/$i/forwarding; done"
@@ -2029,6 +2029,10 @@ mod tests {
         let out = std::process::Command::new("sh").args(["-euc", &setup]).output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 
+        // The veths stand in for WireGuard interfaces, which have no ARP:
+        // the clients route through the host's address (Linux answers ARP
+        // for it on any interface), never on-link to the service address,
+        // which nothing would answer for.
         // 100.90.0.50:80 is 192.168.1.2:8080 on the LAN.
         let rule = ServiceRule::Mapped { vip: VIP, node: NODE, map: "80:192.168.1.2:8080".parse().unwrap(), sources: None };
         let forwarding = Forwarding { guarded: vec!["lan0".into()], ..Forwarding::default() };
