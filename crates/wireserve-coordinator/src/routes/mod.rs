@@ -85,6 +85,7 @@ pub fn admin_router(state: AppState) -> Router {
         .route("/admin/access/services/{name}", get(admin::service_access_report))
         .route("/admin/access/nodes/{name}", get(admin::node_access_report))
         .route("/admin/nodes/{name}/claim", post(admin::claim_link))
+        .route("/admin/owners", get(admin::owners_status))
         .route("/admin/nodes/{name}/owner", delete(admin::remove_owner))
         .route(
             "/admin/nodes/{name}/services/{service}/approve",

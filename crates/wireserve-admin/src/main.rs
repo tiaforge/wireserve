@@ -353,6 +353,14 @@ enum OwnerAction {
         /// The device's name
         node: String,
     },
+    /// Whether device owners work: the login server, checked now, the
+    /// grants that use people's groups, and whose devices are whose
+    // PLAN.md M47. Says what to do next where something is missing.
+    Status {
+        /// Print the coordinator's response as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -613,6 +621,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let client = build_client(&coordinator_url, &admin_token)?;
             wireserve_admin::cmd_remove_owner(&client, &node)?;
             println!("node '{node}' belongs to nobody now, from its next poll");
+        }
+        Command::Owner { action: OwnerAction::Status { json } } => {
+            let client = build_client(&coordinator_url, &admin_token)?;
+            let status = wireserve_admin::cmd_owners_status(&client)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                print!("{}", wireserve_admin::listing::owners(&status, chrono::Utc::now()));
+            }
         }
         Command::Node { action: NodeAction::Access { name: node } } => {
             let client = build_client(&coordinator_url, &admin_token)?;

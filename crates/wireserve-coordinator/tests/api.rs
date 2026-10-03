@@ -3725,7 +3725,7 @@ async fn only_an_admin_makes_claim_links_and_only_with_an_identity_provider() {
     admin_create_node(&app.router, "phone").await;
     let (status, body) = admin_call(&app.router, "POST", "/admin/nodes/phone/claim", json!(null)).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body["error"].as_str().unwrap().contains("WIRESERVE_OIDC_ISSUER"), "{body}");
+    assert!(body["error"].as_str().unwrap().contains("setup owners"), "{body}");
 
     let app = oidc_app();
     let req = json_request("POST", "/admin/nodes", Some(ADMIN), json!({ "name": "laptop" }));
@@ -4268,4 +4268,26 @@ mod dns_records {
         let (_, body) = poll_full(&app.router, &watcher, json!({})).await;
         assert!(body["services"].as_array().unwrap().iter().all(|s| s.get("terminated").is_none()), "{body}");
     }
+}
+
+#[tokio::test]
+async fn owner_status_names_the_provider_its_trouble_and_the_people_groups_granted() {
+    let app = test_app();
+    let (status, body) = admin_call(&app.router, "GET", "/admin/owners", json!(null)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("provider").is_none(), "no provider: {body}");
+    assert_eq!(body["owners"], json!([]));
+
+    let app = oidc_app();
+    let (status, _) =
+        admin_call(&app.router, "POST", "/admin/grants", json!({"source": "oidc:family", "group": "default"})).await;
+    assert!(status.is_success());
+    let (status, body) = admin_call(&app.router, "GET", "/admin/owners", json!(null)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["provider"]["redirect_url"], "http://mesh.test/claim/callback");
+    assert!(body["provider"]["problem"].as_str().is_some_and(|p| p.contains("discovery")), "nothing listens on :9: {body}");
+    assert_eq!(body["granted_groups"], json!(["family"]));
+
+    let req = json_request("GET", "/admin/owners", None, json!(null));
+    assert_eq!(app.router.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
 }

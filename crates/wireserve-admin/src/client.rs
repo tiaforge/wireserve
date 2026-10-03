@@ -294,6 +294,12 @@ impl AdminClient {
         Ok(Self::check_status(resp)?.json()?)
     }
 
+    /// `GET /admin/owners` (PLAN.md M47).
+    pub fn owners_status(&self) -> Result<wireserve_types::OwnersStatus, ClientError> {
+        let resp = self.http.get(self.url("/admin/owners")).bearer_auth(&self.admin_token).send()?;
+        Ok(Self::check_status(resp)?.json()?)
+    }
+
     /// `DELETE /admin/nodes/{name}/owner`.
     pub fn remove_owner(&self, node: &str) -> Result<(), ClientError> {
         let resp = self.http.delete(self.url(&format!("/admin/nodes/{node}/owner"))).bearer_auth(&self.admin_token).send()?;

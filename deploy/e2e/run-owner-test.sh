@@ -20,7 +20,7 @@
 #      lets the laptop reach db — while the unclaimed tv is refused;
 #   3. the link works once;
 #   4. the coordinator refreshes alice's groups with her refresh token and
-#      keeps her as the owner;
+#      keeps her as the owner, and `owner status` says so;
 #   5. `owner clear` takes it all away again.
 #
 # Rootful Podman, like the other harnesses that rewrite service addresses.
@@ -191,6 +191,11 @@ podman logs "$COORD" 2>&1 | grep -E 'owner refresh failed|owner_dropped' && fail
 admin node access node-laptop | grep -q 'belongs to alice@example.com' || fail "alice lost the laptop on refresh"
 reaches "$LAPTOP" || fail "the laptop lost db on refresh"
 pass "refreshed without losing anything"
+admin owner status | tee "$WORK/status.out"
+grep -q '(answering)' "$WORK/status.out" || fail "owner status: the provider is not answering"
+grep -q 'oidc:family' "$WORK/status.out" || fail "owner status does not name the granted group"
+grep -qE '^node-laptop +alice@example.com +family' "$WORK/status.out" || fail "owner status does not list alice's laptop"
+pass "owner status: provider answering, oidc:family granted, alice owns node-laptop (PLAN.md M47)"
 
 log "5/5: owner clear takes it away"
 admin owner clear node-laptop

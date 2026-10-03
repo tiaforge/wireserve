@@ -187,6 +187,12 @@ impl Oidc {
         Err(OidcError::Provider(format!("discovery: {last}")))
     }
 
+    /// Whether the provider's discovery document can be fetched and names
+    /// the configured issuer, for `owner status` (PLAN.md M47).
+    pub async fn check(&self) -> Result<(), String> {
+        self.discover().await.map(|_| ()).map_err(|e| e.to_string())
+    }
+
     /// Where to send the browser to sign in, and what its return must match.
     pub async fn begin(&self) -> Result<(String, Pending), OidcError> {
         let client = self.client().await?;

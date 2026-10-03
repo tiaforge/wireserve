@@ -71,8 +71,8 @@ pub async fn claim_link(
     check_label("node", &name)?;
     let (Some(_), Some(public)) = (&state.oidc, state.config.public_url.as_deref()) else {
         return Err(AppError::Conflict(
-            "device owners need an identity provider: set WIRESERVE_OIDC_ISSUER, _CLIENT_ID, _CLIENT_SECRET and \
-             WIRESERVE_PUBLIC_URL"
+            "device owners are off; on the coordinator's machine, `sudo wireserve-coordinator setup owners` \
+             sets them up"
                 .into(),
         ));
     };
@@ -84,6 +84,59 @@ pub async fn claim_link(
     let (url, expires_at) = crate::oidc::claim::new_link(&conn, public, node.id)?;
     tracing::info!(event = "claim_link_created", node_name = %name);
     Ok(Json(wireserve_types::ClaimLink { url, expires_at }))
+}
+
+/// `GET /admin/owners` (PLAN.md M47): the provider, checked just now, and
+/// every owned node — what `wireserve-admin owner status` shows.
+pub async fn owners_status(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+) -> Result<Json<wireserve_types::OwnersStatus>, AppError> {
+    // The provider is asked before the database is locked: it may take
+    // its time, and nothing else should wait for it.
+    let provider = match &state.oidc {
+        Some(oidc) => {
+            let c = &oidc.config;
+            Some(wireserve_types::OwnersProvider {
+                issuer: c.issuer.clone(),
+                redirect_url: c.redirect_url.clone(),
+                groups_claim: c.groups_claim.clone(),
+                scopes: c.scopes.clone(),
+                refresh_secs: c.refresh_interval.as_secs(),
+                problem: oidc.check().await.err(),
+            })
+        }
+        None => None,
+    };
+    let conn = state.db.conn.lock().await;
+    let now = chrono::Utc::now();
+    let mut owners = Vec::new();
+    for o in crate::db::owners::all(&conn)? {
+        let Some(node) = nodes::find_by_id(&conn, o.node_id)? else { continue };
+        owners.push(wireserve_types::OwnedNode {
+            node: node.name,
+            owner: wireserve_types::OwnerInfo {
+                sub: o.sub.clone(),
+                email: o.email.clone(),
+                name: o.name.clone(),
+                groups: o.groups.clone(),
+                stale: !o.groups_count(now),
+            },
+            refreshed_at: o.refreshed_at,
+            failing_since: o.stale_since,
+        });
+    }
+    owners.sort_by(|a, b| a.node.cmp(&b.node));
+    let mut granted_groups: Vec<String> = grants::list_grants(&conn)?
+        .into_iter()
+        .filter_map(|g| match g.source {
+            wireserve_types::GrantSource::Oidc(name) => Some(name),
+            _ => None,
+        })
+        .collect();
+    granted_groups.sort();
+    granted_groups.dedup();
+    Ok(Json(wireserve_types::OwnersStatus { provider, owners, granted_groups }))
 }
 
 /// `DELETE /admin/nodes/{name}/owner` (PLAN.md M38): the node belongs to

@@ -91,6 +91,43 @@ pub struct OwnerInfo {
     pub stale: bool,
 }
 
+/// `GET /admin/owners` (PLAN.md M47): whether device owners work, and
+/// whose devices are whose.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnersStatus {
+    /// The identity provider, or `None` when none is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<OwnersProvider>,
+    pub owners: Vec<OwnedNode>,
+    /// The `oidc:` groups some grant names: an owner's groups count only
+    /// through these.
+    pub granted_groups: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnersProvider {
+    pub issuer: String,
+    /// What has to be registered at the provider.
+    pub redirect_url: String,
+    pub groups_claim: String,
+    pub scopes: Vec<String>,
+    pub refresh_secs: u64,
+    /// Why its discovery document could not be fetched just now; `None`
+    /// when it could.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnedNode {
+    pub node: String,
+    pub owner: OwnerInfo,
+    pub refreshed_at: chrono::DateTime<chrono::Utc>,
+    /// Refreshing has failed since then; the groups count for an hour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failing_since: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 // ---- Node: address probe (dual-family endpoint self-discovery) ----
 
 /// `GET /probe` response: the bare source address the coordinator saw

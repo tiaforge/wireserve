@@ -206,6 +206,10 @@ pub fn cmd_remove_owner(client: &AdminClient, node: &str) -> Result<(), CliError
     Ok(client.remove_owner(node)?)
 }
 
+pub fn cmd_owners_status(client: &AdminClient) -> Result<wireserve_types::OwnersStatus, CliError> {
+    Ok(client.owners_status()?)
+}
+
 pub fn cmd_node_access(client: &AdminClient, node: &str) -> Result<wireserve_types::NodeAccessReport, CliError> {
     validate_name(node)?;
     Ok(client.node_access(node)?)

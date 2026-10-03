@@ -5,8 +5,8 @@
 use chrono::{DateTime, Utc};
 use wireserve_types::term::{ago, clean, fields, table};
 use wireserve_types::{
-    AdminPeersResponse, AdminServiceInfo, DnsRecordState, GrantsResponse, GroupsResponse, PeerInfo, RelayPortsResponse,
-    ServiceApprovalState,
+    AdminPeersResponse, AdminServiceInfo, DnsRecordState, GrantsResponse, GroupsResponse, OwnersStatus, PeerInfo,
+    RelayPortsResponse, ServiceApprovalState,
 };
 
 /// `-` for nothing, else the cleaned items joined by commas.
@@ -208,6 +208,73 @@ pub fn nodes(resp: &AdminPeersResponse, now: DateTime<Utc>) -> String {
     table(&header, &rows)
 }
 
+/// `owner status` (PLAN.md M47): the login server, the grants that use
+/// people's groups and the owners, each with what to do when it's missing.
+#[must_use]
+pub fn owners(status: &OwnersStatus, now: DateTime<Utc>) -> String {
+    let Some(p) = &status.provider else {
+        return "Device owners are off: devices don't belong to anyone, and access goes by the device.\n\
+                To let access follow people, on the coordinator's machine run:\n\
+                \x20 sudo wireserve-coordinator setup owners\n"
+            .to_string();
+    };
+    let mut out = String::new();
+    let server = match &p.problem {
+        None => format!("{}  (answering)", clean(&p.issuer)),
+        Some(why) => format!("{}  NOT ANSWERING: {}", clean(&p.issuer), clean(why)),
+    };
+    let granted = if status.granted_groups.is_empty() {
+        "none yet; owners' groups count only through one, e.g. `wireserve-admin grant add oidc:family media`".to_string()
+    } else {
+        status.granted_groups.iter().map(|g| format!("oidc:{}", clean(g))).collect::<Vec<_>>().join(", ")
+    };
+    out.push_str(&fields(&[
+        ("login server", server),
+        ("redirect URL", format!("{}  (registered there)", clean(&p.redirect_url))),
+        ("groups", format!("from the `{}` claim, refreshed every {}", clean(&p.groups_claim), every(p.refresh_secs))),
+        ("grants", granted),
+    ]));
+    out.push('\n');
+    if status.owners.is_empty() {
+        out.push_str("No device belongs to anyone yet. Hand one to its person with:\n");
+        out.push_str("  wireserve-admin owner link <device> --qr\n");
+        return out;
+    }
+    let rows: Vec<Vec<String>> = status
+        .owners
+        .iter()
+        .map(|o| {
+            let who = o.owner.email.as_deref().or(o.owner.name.as_deref()).unwrap_or(&o.owner.sub);
+            let note = match (o.owner.stale, o.failing_since) {
+                (true, _) => "refresh failing for over an hour; its groups count for nothing".to_string(),
+                (false, Some(since)) => format!("refresh failing since {}; groups count for an hour", ago(since, now)),
+                (false, None) => String::new(),
+            };
+            vec![clean(&o.node), clean(who), list(&o.owner.groups), ago(o.refreshed_at, now), note]
+        })
+        .collect();
+    let mut rows = rows;
+    let mut header = vec!["DEVICE", "OWNER", "GROUPS", "REFRESHED"];
+    if rows.iter().all(|r| r.last().is_some_and(String::is_empty)) {
+        for r in &mut rows {
+            r.pop();
+        }
+    } else {
+        header.push("NOTE");
+    }
+    out.push_str(&table(&header, &rows));
+    out
+}
+
+/// `15 min`, `1 h`, `90 s`.
+fn every(secs: u64) -> String {
+    match secs {
+        s if s % 3600 == 0 => format!("{} h", s / 3600),
+        s if s % 60 == 0 => format!("{} min", s / 60),
+        s => format!("{s} s"),
+    }
+}
+
 /// `node show`: one node, every field.
 #[must_use]
 pub fn node(resp: &AdminPeersResponse, p: &PeerInfo, now: DateTime<Utc>) -> String {
@@ -379,5 +446,47 @@ phone   10.1.0.3  -                     never   -         yes       -           
             "CARRIER  PORT       ADDRESS         NODE   STATE   CHECKED  USED BY\n\
              strato   udp/51901  85.215.231.166  lego2  CLOSED  never    none, safe to close\n"
         );
+    }
+
+    #[test]
+    fn owner_status_says_what_is_missing() {
+        use wireserve_types::{OwnedNode, OwnerInfo, OwnersProvider};
+        let now = Utc::now();
+        let off = OwnersStatus { provider: None, owners: vec![], granted_groups: vec![] };
+        assert!(owners(&off, now).contains("sudo wireserve-coordinator setup owners"));
+
+        let provider = OwnersProvider {
+            issuer: "https://id.example.com".into(),
+            redirect_url: "https://mesh.example.com/claim/callback".into(),
+            groups_claim: "groups".into(),
+            scopes: vec!["openid".into()],
+            refresh_secs: 900,
+            problem: None,
+        };
+        let empty = OwnersStatus { provider: Some(provider.clone()), owners: vec![], granted_groups: vec![] };
+        let out = owners(&empty, now);
+        assert!(out.contains("(answering)") && out.contains("every 15 min"), "{out}");
+        assert!(out.contains("grant add oidc:family media") && out.contains("owner link <device>"), "{out}");
+
+        let alice = OwnedNode {
+            node: "laptop".into(),
+            owner: OwnerInfo { sub: "a1".into(), email: Some("alice@example.com".into()), name: None, groups: vec!["family".into()], stale: false },
+            refreshed_at: now - chrono::Duration::minutes(3),
+            failing_since: None,
+        };
+        let bob = OwnedNode {
+            node: "tv".into(),
+            owner: OwnerInfo { sub: "b2".into(), email: None, name: Some("Bob".into()), groups: vec![], stale: false },
+            refreshed_at: now - chrono::Duration::minutes(20),
+            failing_since: Some(now - chrono::Duration::minutes(5)),
+        };
+        let down = OwnersProvider { problem: Some("discovery: connection refused".into()), ..provider };
+        let full = OwnersStatus { provider: Some(down), owners: vec![alice.clone(), bob], granted_groups: vec!["family".into()] };
+        let out = owners(&full, now);
+        assert!(out.contains("NOT ANSWERING: discovery: connection refused") && out.contains("oidc:family"), "{out}");
+        assert!(out.contains("laptop  alice@example.com  family  3m ago"), "{out}");
+        assert!(out.contains("refresh failing since 5m ago"), "{out}");
+        let fine = OwnersStatus { owners: vec![alice], ..full };
+        assert!(!owners(&fine, now).contains("NOTE"), "no note, no column");
     }
 }
