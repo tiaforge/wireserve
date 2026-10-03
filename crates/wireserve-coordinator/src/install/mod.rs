@@ -149,8 +149,8 @@ pub struct InstallArgs {
     /// The HTTPS web server (reverse proxy) runs on this machine.
     #[arg(long, conflicts_with_all = ["web_server_at", "listen_on"])]
     pub web_server_here: bool,
-    /// The web server runs on another machine, at this address. Only it
-    /// may tell the coordinator where a request really came from.
+    /// The web server runs on another machine, at this address
+    // Only it may tell the coordinator where a request really came from.
     #[arg(long, value_name = "IP", requires = "listen_on")]
     pub web_server_at: Option<IpAddr>,
     /// With --web-server-at: this machine's LAN address, which the
@@ -176,14 +176,14 @@ pub struct InstallArgs {
     /// No sign-in.
     #[arg(long)]
     pub no_auth_service: bool,
-    /// The node that runs the sign-in service. Every sign-in goes there,
-    /// and a service of the same name on any other node is ignored.
+    /// The node that runs the sign-in service
+    // Every sign-in goes there, and a service of the same name on any other
+    // node is ignored.
     #[arg(long, value_name = "NODE", conflicts_with = "no_auth_service")]
     pub auth_node: Option<String>,
-    /// Let the coordinator write each service's public DNS record through
-    /// this provider (rfc2136, cloudflare, desec, hetzner, porkbun). Its
-    /// credentials are read from the WIRESERVE_DNS_* environment variables,
-    /// or asked for at a terminal.
+    /// Publish services' DNS records through this provider: rfc2136, cloudflare, desec, hetzner, porkbun
+    // Its credentials are read from the WIRESERVE_DNS_* environment
+    // variables, or asked for at a terminal.
     #[arg(long, value_name = "PROVIDER", conflicts_with = "no_dns")]
     pub dns_provider: Option<String>,
     /// Leave DNS records to you.

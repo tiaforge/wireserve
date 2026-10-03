@@ -26,7 +26,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "wireserve-coordinator",
     version,
-    about = "The WireServe coordinator. With no command, runs the server."
+    about = "The WireServe coordinator; with no command, runs the server"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -35,10 +35,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Sets the coordinator up on this machine: asks a few questions,
-    /// installs this binary (and the wireserve-admin next to it), creates
-    /// the wireserve-coordinator user, and starts the service. On a machine
-    /// where it is already installed, upgrades it instead. Needs root.
+    /// Install or upgrade the coordinator as a systemd service (needs root)
+    // Asks a few questions, installs this binary (and the wireserve-admin
+    // next to it), creates the wireserve-coordinator user, and starts the
+    // service. Where it is already installed, upgrades it instead.
     Install(Box<wireserve_coordinator::install::InstallArgs>),
     /// Used by `install`, as the admin user, to save wireserve-admin's
     /// settings in their home.

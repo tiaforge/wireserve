@@ -13,6 +13,7 @@ use wireserve_types::{FirewallBackend, PortMap};
 #[derive(Parser)]
 #[command(
     name = "wireserve",
+    about = "Joins this machine to a WireServe mesh and publishes its services",
     allow_external_subcommands = true,
     override_usage = "wireserve [OPTIONS] <SERVICE> [PORT]... [--group GROUP]\n       \
                       wireserve [OPTIONS] <SERVICE> off\n       \
@@ -20,11 +21,10 @@ use wireserve_types::{FirewallBackend, PortMap};
     after_help = SERVICE_HELP
 )]
 struct Cli {
-    /// Which agent instance to act on. Each instance is a separate node
-    /// with its own state, interface, firewall rules and hosts-file block,
-    /// so one host can run several agents side by side (one per mesh, for
-    /// instance). The default instance uses the paths a single agent
-    /// always has.
+    /// The agent instance to act on, for several meshes on one host
+    // Each instance is a separate node with its own state, interface,
+    // firewall rules and hosts-file block. The default instance uses the
+    // paths a single agent always has.
     #[arg(long, global = true, env = "WIRESERVE_INSTANCE", default_value = paths::DEFAULT_INSTANCE, value_parser = parse_instance)]
     instance: Instance,
     #[command(subcommand)]
@@ -33,62 +33,48 @@ struct Cli {
 
 const SERVICE_HELP: &str = "\
 Services:
-  wireserve <SERVICE> [PORT]...   Publish SERVICE from this node, or change its ports: the
-                                  ports given replace the ones it had. Applied on the next poll.
-  wireserve <SERVICE> off         Stop publishing SERVICE and free its name. Whatever answers
-                                  behind it keeps running.
-  wireserve <SERVICE>             Show SERVICE as of the last poll.
+  <SERVICE> <PORT>...  Publish a service, or replace its ports
+  <SERVICE> off        Stop publishing a service
+  <SERVICE>            Show a service
 
-  Each PORT is [PUBLIC:][ADDRESS:]TARGET[/tcp|/udp]: <service>.wg:PUBLIC reaches TARGET on
-  this node, or on ADDRESS when given — an IPv4 address this node reaches, such as a router
-  on its LAN, which then sees the connection come from this node (TCP unless given; a bare
-  port maps to itself).
-
-  --group GROUP puts a new service in this group, which an admin created, rather than in
-  `default`, which everyone reaches. Only the first time: after that an admin decides its
-  groups.
+  PORT is [PUBLIC:][ADDRESS:]TARGET[/tcp|/udp]. ADDRESS is an IPv4 address on
+  this node's network; without it, TARGET is a port on this node.
 
   wireserve web 80:5080
-  wireserve dns 53/udp 53/tcp 8080:8000
-  wireserve myrouter 443:192.168.178.1:80
-  wireserve web off
-
-  A service can't be named after a command, or `off`.";
+  wireserve dns 53/udp 53/tcp
+  wireserve router 443:192.168.1.1:80
+  wireserve web off";
 
 /// Shared by `join` and `install` — the latter does everything the former
 /// does, plus installs the binary and systemd unit around it, so both
 /// take exactly the same bootstrap arguments.
 #[derive(clap::Args)]
 struct JoinArgs {
-    /// Prompted for if omitted and running interactively.
+    /// The coordinator's URL; asked for if left out
     coordinator_url: Option<String>,
-    /// The join token, or `-` to read it from stdin. Security review
-    /// S7: a token passed directly on the command line lands in shell
-    /// history and is visible to any local user via `ps` for as long
-    /// as the process is alive — prefer `-` (piped in) or
-    /// `--join-token-file` when that matters.
+    /// The join token, or `-` to read it from stdin; asked for if left out
+    // Security review S7: a token passed directly on the command line lands
+    // in shell history and is visible to any local user via `ps` for as
+    // long as the process is alive — hence `-`, the file and the prompt.
     join_token: Option<String>,
-    /// Read the join token from this file instead of the command line
-    /// or stdin (S7) — trailing whitespace/newline is trimmed.
-    #[arg(long, conflicts_with = "join_token")]
+    /// Read the join token from this file
+    #[arg(long, value_name = "FILE", conflicts_with = "join_token")]
     join_token_file: Option<std::path::PathBuf>,
-    /// The UDP port WireGuard listens on. Without it: this instance's
-    /// previous port on a re-join, otherwise the first free one from
-    /// 51820 up that no other instance on this host has.
-    #[arg(long)]
+    /// The UDP port WireGuard listens on [default: the first free one from 51820]
+    // On a re-join, this instance's previous port; never one another
+    // instance on this host has.
+    #[arg(long, value_name = "PORT")]
     listen_port: Option<u16>,
-    /// The `host:port` other peers dial this node on — a public address,
-    /// a DNS name or a port forward's outside end. Without it the
-    /// coordinator learns one from the address this node polls from and
-    /// from its startup probe, which a node with a fixed public address or
-    /// a forwarded port can do better than.
+    /// The address other nodes reach this one at, if the coordinator can't tell
+    // Without it the coordinator learns one from the address this node
+    // polls from and from its startup probe; a fixed public address or a
+    // forwarded port does better.
     #[arg(long = "endpoint", value_name = "HOST:PORT")]
     endpoint_addr: Option<String>,
-    /// Allow a plain http:// coordinator URL to a non-loopback host.
-    /// Refused otherwise: the join token, this node's bearer token and
-    /// the peer directory would all cross the network unprotected. Only
-    /// for a coordinator reached over a network you trust end to end;
-    /// remembered for the daemon.
+    /// Allow a coordinator URL over plain http on a network you trust
+    // Refused otherwise for a non-loopback host: the join token, this
+    // node's bearer token and the peer directory would all cross the
+    // network unprotected. Remembered for the daemon.
     #[arg(long)]
     allow_plaintext_http: bool,
 }
@@ -97,95 +83,87 @@ struct JoinArgs {
 struct InstallArgs {
     #[command(flatten)]
     join: JoinArgs,
-    /// The port this instance's TLS terminator listens on (PLAN.md M35).
-    /// Without it: the one it has, or 11443 for the default instance and
-    /// the first free one above for a named instance. Clients still use
-    /// 443; the agent rewrites it to this port.
-    #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+    /// The local port HTTPS is served on [default: 11443]
+    // PLAN.md M35: clients still use 443, which the agent rewrites to this
+    // port. Without it: the one it has, or the first free one above 11443
+    // for a named instance.
+    #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
     tls_port: Option<u16>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// One-time bootstrap: redeem a join token issued by `wireserve-admin
-    /// node create`, generating this node's keypair locally.
+    /// Join a mesh with a token from `wireserve-admin node create`
+    // The keypair is generated locally; only the public key leaves.
     Join(JoinArgs),
-    /// Installs the binary to /usr/local/bin, installs and enables the
-    /// right systemd unit for this instance (plain, or the `@.service`
-    /// template for a named instance), then joins — everything
-    /// `wireserve-admin node create`'s printed command needs, in one
-    /// step. Also creates the `wireserve` group whose members can run the
-    /// other commands without sudo. Needs root, and Linux/systemd
-    /// (Quadlet/podman deployments install by hand, per `deploy/quadlet/`).
+    /// Install wireserve as a systemd service and join a mesh (needs root)
+    // Installs the binary to /usr/local/bin and the right unit for this
+    // instance (plain, or the `@.service` template for a named instance),
+    // creates the `wireserve` group whose members can run the other
+    // commands without sudo, then joins. Linux/systemd only: Quadlet/podman
+    // deployments install by hand, per `deploy/quadlet/`.
     Install(InstallArgs),
-    /// Runs the poll loop and IPC server. This is the long-running daemon.
+    /// Run the agent in the foreground
     Daemon {
-        #[arg(long, default_value_t = 20)]
+        /// Seconds between polls of the coordinator
+        #[arg(long, value_name = "SECS", default_value_t = 20)]
         poll_interval_secs: u64,
-        /// The WireGuard interface to run on. Without it, the instance
-        /// keeps the name it used last, or picks the first free one of
-        /// wireserve0..wireserve15. A name given here is pinned: used
-        /// exactly, on this and every later start, or the daemon refuses
-        /// to start. `auto` removes a pin.
+        /// The WireGuard interface to use, kept for later starts; `auto` to let it choose again
+        // Without it, the instance keeps the name it used last, or picks the
+        // first free one of wireserve0..wireserve15. A name given here is
+        // pinned: used exactly, on this and every later start, or the daemon
+        // refuses to start.
         #[arg(long, value_parser = parse_ifname_flag)]
         ifname: Option<ifname::Flag>,
     },
-    /// Opts this node in or out of carrying transit traffic for other mesh
-    /// peers that can't reach each other directly (PLAN.md M23) — a live
-    /// operational toggle, same shape as `wireserve <service> off`: takes
-    /// effect next poll, no rejoin. Off by default; a node with metered/capped
-    /// traffic should simply never turn it on. Opting in is only half:
-    /// the coordinator ignores the offer until an admin also approves
-    /// this node with `wireserve-admin transit approve`.
+    /// Relay traffic for nodes that can't reach each other (also needs an admin's approval)
+    // PLAN.md M23. A live toggle: takes effect next poll, no rejoin. Off by
+    // default; a node with metered traffic should never turn it on.
     Transit {
         #[command(subcommand)]
         action: Toggle,
     },
-    /// Opts this node in or out of being the exit for the devices that use
-    /// it as their gateway (PLAN.md M27): their full-tunnel profile sends
-    /// all of their internet traffic here, and it leaves under this host's
-    /// own public address. Off by default. Only half the consent: a device
-    /// uses it only once an admin exports it with
-    /// `wireserve-admin device create --exit`, and the node must already be
-    /// a gateway (`transit on`, approved).
+    /// Let devices send all their internet traffic out through this node
+    // PLAN.md M27. A device uses it only once an admin exports it with
+    // `wireserve-admin device create --exit`, and the node must already be
+    // an approved carrier (`transit on`).
     Exit {
         #[command(subcommand)]
         action: Toggle,
     },
-    /// Shows this node's services, peers and anything not published, from
-    /// the daemon's cache of the last poll — no network call.
+    /// Show this node's services and peers
+    // From the daemon's cache of the last poll — no network call.
     Status {
-        /// Print the cached view as JSON instead, for scripts.
+        /// Print JSON
         #[arg(long)]
         json: bool,
     },
-    /// Tears down the interface, firewall, and hosts-file block.
+    /// Remove this node's interface, firewall rules and hosts entries, and stop the agent
     Leave,
-    /// Runs this node's TLS terminator (PLAN.md M33): serves each of its
-    /// services published on TCP 443 with TLS on the service's own address,
-    /// with a certificate it obtains itself. Run by the `wireserve-tls`
-    /// unit, as its own unprivileged user, beside the daemon, on the socket
-    /// `wireserve-tls.socket` holds for it (PLAN.md M35). `tls-serve` is
-    /// its name from before M44, still in hand-installed units.
+    /// Run the TLS terminator
+    // PLAN.md M33/M35: serves each of this node's services published on TCP
+    // 443 with TLS on the service's own address, with a certificate it
+    // obtains itself. Run by the `wireserve-tls` unit, as its own
+    // unprivileged user, on the socket `wireserve-tls.socket` holds for it.
+    // `tls-serve` is its name from before M44, still in hand-installed units.
     #[command(hide = true, alias = "tls-serve")]
     TlsDaemon {
-        /// Where certificates and the ACME account are kept. Defaults to
-        /// the unit's state directory.
+        /// Where certificates and the ACME account are kept
         #[arg(long, value_name = "DIR", env = "STATE_DIRECTORY")]
         state_dir: Option<std::path::PathBuf>,
-        /// Trust this CA for the ACME server itself — a test CA such as
-        /// Pebble. Never needed for Let's Encrypt.
+        // Trust this CA for the ACME server itself — a test CA such as
+        // Pebble. Never needed for Let's Encrypt.
         #[arg(long, value_name = "PEM", env = "WIRESERVE_ACME_CA_FILE", hide = true)]
         acme_ca_file: Option<std::path::PathBuf>,
-        /// Trust this CA too when checking the sign-in provider's
-        /// certificate — a test CA. Never needed with a public CA.
+        // Trust this CA too when checking the sign-in provider's
+        // certificate — a test CA. Never needed with a public CA.
         #[arg(long, value_name = "PEM", env = "WIRESERVE_TLS_TRUST_FILE", hide = true)]
         trust_file: Option<std::path::PathBuf>,
         #[arg(long, default_value_t = 5, hide = true)]
         check_in_secs: u64,
-        /// The port to listen on when not started by `wireserve-tls.socket`,
-        /// which otherwise decides it. Service addresses' 443 is rewritten to
-        /// whichever it is.
+        // The port to listen on when not started by `wireserve-tls.socket`,
+        // which otherwise decides it. Service addresses' 443 is rewritten to
+        // whichever it is.
         #[arg(long, env = "WIRESERVE_TLS_PORT", default_value_t = wireserve_types::TLS_LISTEN_PORT, hide = true)]
         port: u16,
     },
@@ -195,19 +173,28 @@ enum Command {
     Service(Vec<String>),
 }
 
-/// `wireserve <service> [PORT]...` (PLAN.md M44): the service is the
-/// command. Parsed separately from [`Cli`], from the words clap hands
-/// [`Command::Service`].
+// `wireserve <service> [PORT]...` (PLAN.md M44): the service is the
+// command. Parsed separately from [`Cli`], from the words clap hands
+// [`Command::Service`].
+/// Publish, change, withdraw or show one of this node's services
 #[derive(Parser, Debug, PartialEq)]
-#[command(name = "wireserve <service>", no_binary_name = true)]
+#[command(
+    name = "wireserve <service>",
+    no_binary_name = true,
+    override_usage = "wireserve <SERVICE> [PORT]... [--group GROUP]\n       wireserve <SERVICE> off",
+    after_help = SERVICE_HELP
+)]
 struct ServiceArgs {
+    /// The service's name
     name: String,
-    /// Each a port mapping, or the single word `off`.
+    /// The ports to publish, or `off` to stop publishing
     #[arg(value_name = "PORT")]
     ports: Vec<String>,
+    /// Put a new service in this group instead of `default`
+    // Only the first time: after that an admin decides its groups.
     #[arg(long, value_name = "GROUP")]
     group: Option<String>,
-    /// Also accepted after the service name.
+    /// The agent instance to act on
     #[arg(long, value_parser = parse_instance)]
     instance: Option<Instance>,
 }
@@ -239,7 +226,9 @@ impl ServiceArgs {
 
 #[derive(Subcommand)]
 enum Toggle {
+    /// Turn it on
     On,
+    /// Turn it off
     Off,
 }
 

@@ -4,26 +4,21 @@ use wireserve_admin::config;
 use wireserve_types::NodeKind;
 
 #[derive(Parser)]
-#[command(name = "wireserve-admin")]
+#[command(name = "wireserve-admin", about = "Manages a WireServe mesh through its coordinator")]
 struct Cli {
-    /// Coordinator base URL (e.g. https://wireserve.example.com), or set
-    /// WIRESERVE_COORDINATOR_URL.
-    #[arg(long, global = true)]
+    /// The coordinator's admin URL [env: WIRESERVE_COORDINATOR_URL]
+    #[arg(long, value_name = "URL", global = true, display_order = 100)]
     coordinator_url: Option<String>,
-    /// Admin bearer token, or set WIRESERVE_ADMIN_TOKEN, or write one to
-    /// ~/.config/wireserve-admin/admin_token.
-    #[arg(long, global = true)]
+    /// The admin token [env: WIRESERVE_ADMIN_TOKEN]
+    // Or written to ~/.config/wireserve-admin/admin_token.
+    #[arg(long, value_name = "TOKEN", global = true, display_order = 100)]
     admin_token: Option<String>,
-    /// Base URL of the coordinator's NODE-FACING listener (where
-    /// /register lives) — a different address/port from
-    /// --coordinator-url, which talks to the admin listener. Spec §4.0
-    /// requires the two to be bound separately. Used by `device create` and
-    /// `device refresh` (required) and by `node create`/`node rejoin`
-    /// (optional — fills in the
-    /// exact `wireserve join` command they print). Or set
-    /// WIRESERVE_REGISTER_URL, or write one to
-    /// ~/.config/wireserve-admin/register_url.
-    #[arg(long, global = true)]
+    /// The coordinator's URL as nodes reach it [env: WIRESERVE_REGISTER_URL]
+    // The node-facing listener (where /register lives), bound apart from
+    // the admin one (spec §4.0). Required by `device create|refresh`;
+    // `node create|rejoin` use it to fill in the `wireserve install`
+    // command they print. Or written to ~/.config/wireserve-admin/register_url.
+    #[arg(long, value_name = "URL", global = true, display_order = 100)]
     register_url: Option<String>,
 
     #[command(subcommand)]
@@ -32,47 +27,45 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Nodes: create, rejoin, revoke, delete, list.
+    /// Add, remove and list nodes
     Node {
         #[command(subcommand)]
         action: NodeAction,
     },
-    /// Declared services and their approval.
+    /// Approve and list services
     Service {
         #[command(subcommand)]
         action: ServiceAction,
     },
-    /// Nodes that carry traffic for others: relays and exits.
+    /// Allow nodes to relay traffic for others
     Transit {
         #[command(subcommand)]
         action: TransitAction,
     },
-    /// Agent-less devices, such as phones: a WireGuard .conf for each
-    /// (spec §9).
+    /// WireGuard configs for devices without the agent, such as phones
+    // Spec §9.
     Device {
         #[command(subcommand)]
         action: DeviceAction,
     },
-    /// Service groups (PLAN.md M36). A service is in `default` until put in
-    /// a group; a fresh mesh grants `default` to everyone.
+    /// Group services; a service is in `default` until put in another
+    // PLAN.md M36. A fresh mesh grants `default` to everyone.
     Group {
         #[command(subcommand)]
         action: GroupAction,
     },
-    /// Who may reach which group: `everyone`, `oidc:<group>` (people in that
-    /// group at your identity provider, who prove it at the sign-in) or
-    /// `tag:<tag>` (nodes you tagged).
+    /// Who may reach which group
     Grant {
         #[command(subcommand)]
         action: GrantAction,
     },
-    /// Node tags, which grants can name: servers, shared devices. Only you
-    /// set them — a node never tags itself.
+    /// Tag nodes, so grants can name them
+    // Only an admin sets tags — a node never tags itself.
     Tag {
         #[command(subcommand)]
         action: TagAction,
     },
-    /// A device's owner.
+    /// Who a device belongs to
     Owner {
         #[command(subcommand)]
         action: OwnerAction,
@@ -81,55 +74,67 @@ enum Command {
 
 #[derive(Subcommand)]
 enum NodeAction {
-    /// Create a node record and issue a one-time join token (spec §4.1).
+    /// Create a node and print its join token
+    // Spec §4.1.
     Create {
+        /// The node's name
         name: String,
+        /// `static` for a peer without the agent; prefer `device create`
         #[arg(long, default_value = "agent", value_parser = ["agent", "static"])]
         kind: String,
-        /// Seconds the join token stays redeemable, overriding the
-        /// coordinator's default (30 minutes). Use 0 for no expiry.
-        #[arg(long)]
+        /// Seconds the join token stays valid, 0 for no expiry
+        // Without it, the coordinator's default (WIRESERVE_JOIN_TOKEN_TTL_SECS,
+        // 30 minutes unless set).
+        #[arg(long, value_name = "SECS")]
         ttl: Option<u64>,
-        /// Which agent instance this node will run as on its host —
-        /// only needed when it's an additional instance alongside
-        /// another agent already running there. Never sent to the
-        /// coordinator; it only fills in `--instance` on the printed
-        /// `wireserve install` command.
+        /// The agent instance it will run as, for the printed install command
+        // Only needed for an additional instance beside another agent on
+        // the same host. Never sent to the coordinator.
         #[arg(long)]
         instance: Option<String>,
     },
-    /// Issue a fresh join token for an existing node record (spec §4.5).
+    /// Print a new join token for an existing node
+    // Spec §4.5.
     Rejoin {
+        /// The node's name
         name: String,
-        /// Seconds the join token stays redeemable, overriding the
-        /// coordinator's default (30 minutes). Use 0 for no expiry.
-        #[arg(long)]
+        /// Seconds the join token stays valid, 0 for no expiry
+        #[arg(long, value_name = "SECS")]
         ttl: Option<u64>,
-        /// Same as `node create --instance` — fills in `--instance` on
-        /// the printed `wireserve install` command.
+        /// The agent instance it runs as, for the printed install command
         #[arg(long)]
         instance: Option<String>,
     },
-    /// Revoke a node — its bearer token stops working on its very next
-    /// poll, and its services are removed (spec §4.4).
-    Revoke { name: String },
-    /// Permanently delete a node record and free its name. Refused while
-    /// the node is still active — revoke it first.
-    Delete { name: String },
-    /// The full node directory (spec §4.5.1).
-    List,
-    /// What a node reaches, and why.
-    Access { name: String },
-    /// Clear a node's advertised endpoint address. Use when a node has
-    /// lost the public address other peers were dialing (a dropped port
-    /// forward, a move behind CGNAT) and is still advertising it. The
-    /// node reports a new one on its next poll if it still has one set
-    /// locally.
-    ClearEndpoint {
+    /// Cut a node off the mesh, keeping its name
+    // Spec §4.4: its bearer token stops working on its very next poll, and
+    // its services are removed.
+    Revoke {
+        /// The node's name
         name: String,
-        /// Clear only one actively-probed candidate, leaving the explicit
-        /// override and the other family untouched. Omit to clear
-        /// everything (the explicit override plus both candidates).
+    },
+    /// Delete a revoked node and free its name
+    // Refused while the node is still active.
+    Delete {
+        /// The node's name
+        name: String,
+    },
+    /// List all nodes
+    // Spec §4.5.1.
+    List,
+    /// Show which services a node reaches, and why
+    Access {
+        /// The node's name
+        name: String,
+    },
+    /// Forget the public address a node advertises
+    // For a node that lost the address peers were dialing (a dropped port
+    // forward, a move behind CGNAT). It reports a new one on its next poll
+    // if it still has one set locally.
+    ClearEndpoint {
+        /// The node's name
+        name: String,
+        /// Forget only the address it was found at over this IP version
+        // Leaves the explicit override and the other family untouched.
         #[arg(long, value_parser = ["v4", "v6"])]
         family: Option<String>,
     },
@@ -137,163 +142,215 @@ enum NodeAction {
 
 #[derive(Subcommand)]
 enum ServiceAction {
-    /// Every declared service and its approval state.
+    /// List services and whether they are approved
     List {
-        /// Show only declarations waiting on approval.
+        /// Only those waiting for approval
         #[arg(long)]
         pending: bool,
     },
-    /// Approve a pending service declaration for a specific node.
-    /// Approval binds to this node — it does not reserve the name for
-    /// anyone else.
+    /// Approve a service, published by the given node only
+    // Approval binds to this node — it does not reserve the name for
+    // anyone else.
     Approve {
+        /// The service's name
         service: String,
-        /// The node that declared it.
+        /// The node that publishes it
         #[arg(long, required = true)]
         node: String,
     },
-    /// Deny a declaration, or withdraw an approval already granted.
-    ///
-    /// For mistakes. For a node you no longer trust use `node revoke`: a
-    /// denied service still holds its globally-unique name until the
-    /// declaring node withdraws it, and a compromised node will not.
+    /// Refuse a service, or withdraw its approval
+    // For mistakes. For a node you no longer trust use `node revoke`: a
+    // denied service still holds its globally-unique name until the
+    // declaring node withdraws it, and a compromised node will not.
     Deny {
+        /// The service's name
         service: String,
-        /// The node that declared it.
+        /// The node that publishes it
         #[arg(long, required = true)]
         node: String,
+        /// Shown to the node
         #[arg(long)]
         reason: Option<String>,
     },
-    /// Who reaches a service, and why.
-    Access { name: String },
+    /// Show who reaches a service, and why
+    Access {
+        /// The service's name
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum TransitAction {
-    /// Allow a node to carry traffic for others: relay the sessions of peers
-    /// that can't reach each other directly, and of phones through its
-    /// public relay ports, and — with `wireserve exit on` — be a device's
-    /// exit. The node must also opt in itself (`wireserve transit on`). A
-    /// relay can't read or forge what it relays, but sees who talks to whom
-    /// and can drop it; an exit reads everything it sends on. Revoke and
-    /// rejoin both withdraw the approval.
-    Approve { name: String },
-    /// Withdraw a node's approval to carry traffic. Takes effect for new
-    /// carrier choices at once; the pairs it carried move off it on their
-    /// next poll, and devices relying on it need refreshing.
-    Deny { name: String },
-    /// Every public relay port phones use or used (PLAN.md M40): on which
-    /// carrier and address it must be open, which node it leads to, which
-    /// devices rely on it, and whether it was last seen open. A port no
-    /// device relies on any more may be closed again.
+    /// Allow a node to relay for others, and to be an exit
+    // The node must also opt in itself (`wireserve transit on`, and `exit
+    // on` to be an exit). A relay can't read or forge what it relays, but
+    // sees who talks to whom and can drop it; an exit reads everything it
+    // sends on. Revoke and rejoin both withdraw the approval.
+    Approve {
+        /// The node's name
+        name: String,
+    },
+    /// Withdraw that approval
+    // New carrier choices at once; the pairs it carried move off it on
+    // their next poll, and devices relying on it need refreshing.
+    Deny {
+        /// The node's name
+        name: String,
+    },
+    /// List the public relay ports devices use, and whether they are open
+    // PLAN.md M40: on which carrier and address each must be open, which
+    // node it leads to and which devices rely on it. A port no device
+    // relies on any more may be closed again.
     Ports,
 }
 
 #[derive(Subcommand)]
 enum DeviceAction {
-    /// Create an agent-less, consumer-only device, such as a phone, and
-    /// write its WireGuard .conf (spec §9).
+    /// Add a device and write its WireGuard config
+    // Spec §9: an agent-less, consumer-only peer, such as a phone.
     Create(DeviceArgs),
-    /// Re-issue the config for a device that already exists, keeping its
-    /// name and mesh address. Only the keypair changes, so the device must
-    /// reimport.
-    ///
-    /// Destructive from its first request: the old key stops working
-    /// immediately, and the device is briefly absent from the mesh while
-    /// the new one is redeemed. Refuses outright if the name belongs to an
-    /// agent node.
+    /// Replace a device's key and write its new config; the old one stops working
+    // Keeps its name and mesh address. Destructive from its first request:
+    // the device is briefly absent from the mesh while the new key is
+    // redeemed. Refuses outright if the name belongs to an agent node.
     Refresh(DeviceArgs),
 }
 
 #[derive(clap::Args)]
 struct DeviceArgs {
+    /// The device's name
     name: String,
-    #[arg(long)]
+    /// Write the config to this file instead of printing it
+    #[arg(long, value_name = "FILE")]
     out: Option<std::path::PathBuf>,
-    /// Also print the config as a QR code to scan with the WireGuard app.
-    /// Refuses rather than print an unscannably wide code; use --out for
-    /// a config too large to fit a terminal.
+    /// Also show the config as a QR code for the WireGuard app
+    // Refuses rather than print an unscannably wide code; use --out for a
+    // config too large to fit a terminal.
     #[arg(long)]
     qr: bool,
-    /// Also write a full-tunnel profile, with the same key and address:
-    /// switched on in the WireGuard app, it sends all of the device's
-    /// internet traffic out through the named node — which reads it, as
-    /// any exit does — for public Wi-Fi or a home connection abroad. The
-    /// mesh stays end to end in it. IPv4 only; the device's IPv6 is
-    /// dropped rather than leaked around the tunnel. The node must run
-    /// `wireserve exit on`; without a name, the one node that qualifies
-    /// is picked. Needs --dns, and --out or --qr, since there are two
-    /// files.
+    /// Also write a profile that sends all internet traffic through NODE
+    // A full tunnel with the same key and address, switched on in the
+    // WireGuard app for public Wi-Fi or a home connection abroad. NODE
+    // reads that traffic, as any exit does; the mesh stays end to end.
+    // IPv4 only: the device's IPv6 is dropped rather than leaked. NODE must
+    // run `wireserve exit on`; without a name, the one node that qualifies
+    // is picked. Needs --dns, and --out or --qr, since there are two files.
     #[arg(long, requires = "dns", value_name = "NODE", num_args = 0..=1, default_missing_value = "")]
     exit: Option<String>,
-    /// Write the config even if a carrier's relay port could not be seen
-    /// open from outside — for a port you know is open, or a check that
-    /// can't reach it from the coordinator's network.
+    /// Write the config even if a relay port can't be confirmed open
+    // For a port you know is open, or a check that can't reach it from the
+    // coordinator's network.
     #[arg(long)]
     allow_unverified: bool,
-    /// The resolver to name: an approved service by name (a Pi-hole you
-    /// publish on 53, say, which then also answers the mesh's own names),
-    /// or an IPv4 address such as 9.9.9.9. Goes into the full-tunnel
-    /// profile with --exit, into the mesh profile with --mesh-dns.
+    /// The DNS server for --exit or --mesh-dns: a service name or an IPv4 address
+    // A service by name (a Pi-hole published on 53, say, which then also
+    // answers the mesh's own names), or an address such as 9.9.9.9.
     #[arg(long, value_name = "SERVICE|IPV4")]
     dns: Option<String>,
-    /// Put the --dns resolver into the mesh profile as well, so every
-    /// service has a name on the device, not only the HTTP ones. The
-    /// resolver must be on the mesh and must answer everything: while
-    /// this tunnel is on, ALL of the device's DNS goes to it, and if it
-    /// is down the device has no DNS until the tunnel is switched off.
+    /// Also use --dns in the mesh profile; all of the device's DNS then goes to it
+    // So every service has a name on the device, not only the HTTP ones.
+    // The resolver must be on the mesh and answer everything: if it is
+    // down, the device has no DNS until the tunnel is switched off.
     #[arg(long, requires = "dns")]
     mesh_dns: bool,
 }
 
 #[derive(Subcommand)]
 enum GroupAction {
-    /// A new, empty group.
-    Create { name: String },
-    /// Refused for `default`, and while services, grants or waiting
-    /// declarations use it — its services would become public.
-    Delete { name: String },
+    /// Create an empty group
+    Create {
+        /// The group's name
+        name: String,
+    },
+    /// Delete an unused group
+    // Refused for `default`, and while services, grants or waiting
+    // declarations use it — its services would become public.
+    Delete {
+        /// The group's name
+        name: String,
+    },
+    /// List groups, their grants and services
     List,
-    /// Put a service in a group, which takes it out of `default`. The
-    /// service need not exist yet.
-    Add { group: String, service: String },
-    /// Take a service out of a group; out of its last one, it is back in
-    /// `default`.
-    Remove { group: String, service: String },
+    /// Put a service in a group, taking it out of `default`
+    // The service need not exist yet.
+    Add {
+        /// The group's name
+        group: String,
+        /// The service's name
+        service: String,
+    },
+    /// Take a service out of a group
+    // Out of its last one, it is back in `default`.
+    Remove {
+        /// The group's name
+        group: String,
+        /// The service's name
+        service: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum GrantAction {
-    Add { source: String, group: String },
-    Remove { source: String, group: String },
+    /// Let SOURCE reach every service in a group
+    Add {
+        /// `everyone`, `oidc:<group>` or `tag:<tag>`
+        source: String,
+        /// The group's name
+        group: String,
+    },
+    /// Remove a grant
+    Remove {
+        /// `everyone`, `oidc:<group>` or `tag:<tag>`
+        source: String,
+        /// The group's name
+        group: String,
+    },
+    /// List grants
     List,
 }
 
 #[derive(Subcommand)]
 enum OwnerAction {
-    /// A fresh link for whoever a device belongs to: signing in with it
-    /// makes them its owner, and the node reaches what their groups at the
-    /// identity provider are granted. Works once, for ten minutes.
+    /// Print a sign-in link that makes whoever uses it the device's owner
+    // The node then reaches what their groups at the identity provider are
+    // granted. Works once, for ten minutes.
     Link {
+        /// The device's name
         node: String,
-        /// Also show it as a QR code, for a phone's camera.
+        /// Also show it as a QR code
         #[arg(long)]
         qr: bool,
     },
-    /// The node belongs to nobody again; its outstanding claim links stop
-    /// working.
-    Clear { node: String },
+    /// Remove a device's owner
+    // Its outstanding claim links stop working too.
+    Clear {
+        /// The device's name
+        node: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum TagAction {
-    Add { node: String, tag: String },
-    Remove { node: String, tag: String },
-    /// Every tag in use and the nodes carrying it, or just one tag's nodes.
-    List { tag: Option<String> },
+    /// Tag a node
+    Add {
+        /// The node's name
+        node: String,
+        /// The tag
+        tag: String,
+    },
+    /// Remove a tag from a node
+    Remove {
+        /// The node's name
+        node: String,
+        /// The tag
+        tag: String,
+    },
+    /// List tags and their nodes
+    List {
+        /// Only this tag
+        tag: Option<String>,
+    },
 }
-
 
 /// Prints the join token's deadline immediately under the token itself.
 ///
