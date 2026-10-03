@@ -605,7 +605,7 @@ fn parse_key(hex: &str) -> Option<[u8; 32]> {
 
 /// The headers backends learn who is calling from (PLAN.md M36):
 /// `WIRESERVE_AUTH_USER_HEADER`, `_EMAIL_HEADER` and `_GROUPS_HEADER`,
-/// authward's names unless set. Every terminator removes them from every
+/// authward's names unless set, and `_GROUPS_SEPARATOR` (PLAN.md M47). Every terminator removes them from every
 /// request a client sends, so none may be a header anything else relies
 /// on.
 pub fn identity_headers_from_lookup(
@@ -632,6 +632,13 @@ pub fn identity_headers_from_lookup(
         user: pick("WIRESERVE_AUTH_USER_HEADER", defaults.user)?,
         email: pick("WIRESERVE_AUTH_EMAIL_HEADER", defaults.email)?,
         groups: pick("WIRESERVE_AUTH_GROUPS_HEADER", defaults.groups)?,
+        groups_separator: match lookup("WIRESERVE_AUTH_GROUPS_SEPARATOR").map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+            None => defaults.groups_separator,
+            Some(v) => match v.chars().collect::<Vec<_>>().as_slice() {
+                [c] if wireserve_types::GROUPS_SEPARATORS.contains(c) => *c,
+                _ => return Err(ConfigError::Invalid("WIRESERVE_AUTH_GROUPS_SEPARATOR", format!("{v:?} is not , or |"))),
+            },
+        },
     };
     let [a, b, c] = headers.names();
     if a == b || b == c || a == c {
@@ -1006,7 +1013,11 @@ mod tests {
         let one = |k: &'static str, v: &'static str| move |key: &str| (key == k).then(|| v.to_string());
         let h = identity_headers_from_lookup(one("WIRESERVE_AUTH_GROUPS_HEADER", "Remote-Groups")).unwrap();
         assert_eq!(h.groups, "remote-groups");
+        let h = identity_headers_from_lookup(one("WIRESERVE_AUTH_GROUPS_SEPARATOR", " | ")).unwrap();
+        assert_eq!(h.groups_separator, '|');
         for (k, v) in [
+            ("WIRESERVE_AUTH_GROUPS_SEPARATOR", ";"),
+            ("WIRESERVE_AUTH_GROUPS_SEPARATOR", ",|"),
             ("WIRESERVE_AUTH_USER_HEADER", "Cookie"),
             ("WIRESERVE_AUTH_EMAIL_HEADER", "X-Forwarded-For"),
             ("WIRESERVE_AUTH_GROUPS_HEADER", "not a header"),

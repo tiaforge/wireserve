@@ -17,7 +17,7 @@ pub use access::{
 };
 pub use api::*;
 pub use mesh::{MeshInfo, MeshRanges};
-pub use naming::{AcmeSettings, IdentityHeaders, ServiceNames, SignIn, ServiceNaming, LETS_ENCRYPT_DIRECTORY, TLS_LISTEN_PORT, TLS_PUBLIC_PORT};
+pub use naming::{AcmeSettings, IdentityHeaders, ServiceNames, GROUPS_SEPARATORS, SignIn, ServiceNaming, LETS_ENCRYPT_DIRECTORY, TLS_LISTEN_PORT, TLS_PUBLIC_PORT};
 pub use firewall::{
     is_internet_v4, FirewallBackend, Forwarding, PublicRelay, RelayEnd, RelayForward, ServiceRule, Sources,
     NOT_THE_INTERNET_V4,

@@ -331,7 +331,7 @@ impl SignIn {
             let groups = copied
                 .get(identity.groups.as_str())
                 .and_then(|v| v.to_str().ok())
-                .map(parse_groups)
+                .map(|v| identity.split_groups(v))
                 .unwrap_or_default();
             // Only an answer naming someone: a 2xx for a path the provider
             // lets anyone through says nothing about who is asking.
@@ -373,13 +373,6 @@ impl SignIn {
         }
         Verdict::Deny(r)
     }
-}
-
-/// A groups header's value: comma-separated names, trimmed, empty ones
-/// dropped.
-#[must_use]
-pub fn parse_groups(value: &str) -> Vec<String> {
-    value.split(',').map(str::trim).filter(|g| !g.is_empty()).map(str::to_string).collect()
 }
 
 /// Removes every identity header, so none a client supplied survives —
@@ -558,11 +551,5 @@ mod tests {
             cache.store("jf.int.test", &sent, c, &HeaderMap::new(), &[], now);
         }
         assert!(cache.entries.len() <= CACHE_ENTRIES);
-    }
-
-    #[test]
-    fn groups_are_comma_separated() {
-        assert_eq!(parse_groups("family, admins,,  "), ["family", "admins"]);
-        assert!(parse_groups("").is_empty());
     }
 }

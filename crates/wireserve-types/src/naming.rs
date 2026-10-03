@@ -69,13 +69,35 @@ pub struct ServiceNaming {
 pub struct IdentityHeaders {
     pub user: String,
     pub email: String,
-    /// Comma-separated group names.
+    /// Group names, separated by `groups_separator`.
     pub groups: String,
+    /// `,` (authward, Authelia) or `|` (Authentik), PLAN.md M47. A node
+    /// too old to know it splits on `,`, which turns `a|b` into one group
+    /// no grant names: it fails closed.
+    #[serde(default = "comma", skip_serializing_if = "is_comma")]
+    pub groups_separator: char,
 }
+
+fn comma() -> char {
+    ','
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
+fn is_comma(c: &char) -> bool {
+    *c == ','
+}
+
+/// The separators a groups header may use.
+pub const GROUPS_SEPARATORS: [char; 2] = [',', '|'];
 
 impl Default for IdentityHeaders {
     fn default() -> Self {
-        Self { user: "x-auth-user".into(), email: "x-auth-email".into(), groups: "x-auth-groups".into() }
+        Self {
+            user: "x-auth-user".into(),
+            email: "x-auth-email".into(),
+            groups: "x-auth-groups".into(),
+            groups_separator: comma(),
+        }
     }
 }
 
@@ -84,6 +106,23 @@ impl IdentityHeaders {
     #[must_use]
     pub fn names(&self) -> [&str; 3] {
         [&self.user, &self.email, &self.groups]
+    }
+
+    /// A groups header's value: names split on the separator, trimmed,
+    /// empty ones dropped. Only the configured separator splits — a group
+    /// called `x|admins` stays one group where the separator is `,`, and
+    /// never becomes `admins`.
+    #[must_use]
+    pub fn split_groups(&self, value: &str) -> Vec<String> {
+        value.split(self.groups_separator).map(str::trim).filter(|g| !g.is_empty()).map(str::to_string).collect()
+    }
+
+    /// The groups header's value for `groups`. A name holding the separator
+    /// could not be read back as itself, so it is left out.
+    #[must_use]
+    pub fn join_groups(&self, groups: &[String]) -> String {
+        let sep = self.groups_separator.to_string();
+        groups.iter().filter(|g| !g.contains(self.groups_separator)).map(String::as_str).collect::<Vec<_>>().join(&sep)
     }
 }
 
@@ -199,5 +238,41 @@ impl<'a> ServiceNames<'a> {
     #[must_use]
     pub fn address(&self, s: &ServiceInfo) -> Option<Ipv4Addr> {
         own_address(s).parse().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn groups_split_on_the_configured_separator_only() {
+        let comma = IdentityHeaders::default();
+        assert_eq!(comma.split_groups("family, admins,,  "), ["family", "admins"]);
+        assert!(comma.split_groups("").is_empty());
+        assert_eq!(comma.split_groups("x|admins"), ["x|admins"], "never admins");
+        let pipe = IdentityHeaders { groups_separator: '|', ..IdentityHeaders::default() };
+        assert_eq!(pipe.split_groups("family|admins"), ["family", "admins"]);
+        assert_eq!(pipe.split_groups("a,b"), ["a,b"]);
+    }
+
+    #[test]
+    fn a_group_holding_the_separator_is_left_out_when_joined() {
+        let pipe = IdentityHeaders { groups_separator: '|', ..IdentityHeaders::default() };
+        let groups = vec!["family".to_string(), "x|admins".to_string(), "ops".to_string()];
+        assert_eq!(pipe.join_groups(&groups), "family|ops");
+        assert_eq!(IdentityHeaders::default().join_groups(&groups), "family,x|admins,ops");
+    }
+
+    #[test]
+    fn the_separator_is_left_out_of_the_wire_unless_it_is_a_pipe() {
+        let json = serde_json::to_string(&IdentityHeaders::default()).unwrap();
+        assert!(!json.contains("groups_separator"), "{json}");
+        let old: IdentityHeaders =
+            serde_json::from_str(r#"{"user":"u","email":"e","groups":"g"}"#).unwrap();
+        assert_eq!(old.groups_separator, ',');
+        let pipe = IdentityHeaders { groups_separator: '|', ..IdentityHeaders::default() };
+        let back: IdentityHeaders = serde_json::from_str(&serde_json::to_string(&pipe).unwrap()).unwrap();
+        assert_eq!(back, pipe);
     }
 }

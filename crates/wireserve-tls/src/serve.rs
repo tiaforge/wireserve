@@ -834,7 +834,7 @@ fn name_owner(headers: &mut HeaderMap, owner: &wireserve_types::CallerIdentity, 
     if let Some(email) = &owner.email {
         set(&identity.email, email);
     }
-    set(&identity.groups, &owner.groups.join(","));
+    set(&identity.groups, &identity.join_groups(&owner.groups));
 }
 
 /// Headers a proxy or an identity-aware front end sets and a backend may
