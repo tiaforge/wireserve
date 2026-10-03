@@ -106,6 +106,7 @@ tcp_line() { podman exec "$1" timeout 15 bash -c "exec 3<>/dev/tcp/$2/$3; head -
 
 log "checking prerequisites"
 command -v podman >/dev/null || fail "podman not found on PATH"
+command -v jq >/dev/null || fail "jq not found on PATH (reads wireserve-admin --json)"
 command -v python3 >/dev/null || fail "python3 not found on PATH"
 modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available"
 [ "$(podman info --format '{{.Host.Security.Rootless}}')" = false ] \
@@ -249,7 +250,7 @@ grep -qx "AllowedIPs = 0.0.0.0/0, ::/0" "$OUT/phone-exit.conf" || fail "the exit
 grep -qE "AllowedIPs = [0-9.]+/2[0-9]" "$OUT/phone.conf" && fail "the mesh profile still sends a mesh range to one peer"
 grep -qx "DNS = $DNS_VIP" "$OUT/phone-exit.conf" || fail "the resolver is not the dns service's address"
 grep -q "^DNS" "$OUT/phone.conf" && fail "the mesh profile must not name a resolver (PLAN.md #104)"
-admin node list | grep '^phone' | grep -q 'exit=yes' || fail "node list does not show the phone's exit"
+admin node list --json | jq -e '.exit_devices | index("phone")' >/dev/null || fail "node list does not show the phone's exit"
 pass "same key; everything on the gateway and a resolver in the second profile only"
 
 log "bringing the phone up on the full-tunnel profile"

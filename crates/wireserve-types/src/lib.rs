@@ -6,6 +6,7 @@ pub mod naming;
 pub mod node;
 pub mod ports;
 pub mod reflexive;
+pub mod term;
 pub mod tls;
 pub mod token;
 pub mod validation;

@@ -2,58 +2,14 @@
 //! aligned tables. `status --json` prints the view itself, for scripts.
 //! `wireserve <service>` shows one service's part of the same view.
 //!
-//! Nearly every string here came from the coordinator, which renders it
-//! into the operator's terminal; like `wireserve-admin`'s listings, every
-//! control character is escaped rather than printed, so no field can move
-//! the cursor, recolour the screen or forge a line of output.
+//! Nearly every string here came from the coordinator; `term::clean`
+//! escapes every control character in it, as `wireserve-admin` does.
 
 use chrono::{DateTime, Utc};
+use wireserve_types::term::{ago, clean, table};
 use wireserve_types::{ErrorBody, PeerInfo, PortMap, Reach};
 
 use crate::ipc::protocol::{ListView, LocalServiceView};
-
-/// Escapes every control character (`\n`, `\r`, ESC, …) in `s`.
-fn clean(s: &str) -> String {
-    s.chars()
-        .flat_map(|c| -> Box<dyn Iterator<Item = char>> {
-            if c.is_control() {
-                Box::new(c.escape_default())
-            } else {
-                Box::new(std::iter::once(c))
-            }
-        })
-        .collect()
-}
-
-/// Left-aligned columns two spaces apart, sized to their widest cell; the
-/// last column is not padded.
-fn table(header: &[&str], rows: &[Vec<String>]) -> String {
-    let width = |i: usize| {
-        rows.iter()
-            .map(|r| r[i].chars().count())
-            .chain([header[i].len()])
-            .max()
-            .unwrap_or(0)
-    };
-    let widths: Vec<usize> = (0..header.len()).map(width).collect();
-    let line = |cells: Vec<&str>| {
-        let mut out = String::new();
-        for (i, cell) in cells.iter().enumerate() {
-            if i + 1 == cells.len() {
-                out.push_str(cell);
-            } else {
-                out.push_str(cell);
-                out.push_str(&" ".repeat(widths[i] - cell.chars().count() + 2));
-            }
-        }
-        out.trim_end().to_string() + "\n"
-    };
-    let mut out = line(header.to_vec());
-    for r in rows {
-        out.push_str(&line(r.iter().map(String::as_str).collect()));
-    }
-    out
-}
 
 fn ports(maps: &[PortMap]) -> String {
     maps.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ")
@@ -91,17 +47,6 @@ fn service_row(s: &LocalServiceView, domain: Option<&str>) -> Vec<String> {
         None => format!("{}.wg", clean(&s.name)),
     };
     vec![host, address, ports(&maps), node, service_state(s).into(), service_access(s).into()]
-}
-
-/// `4s ago`, `3m ago`, `5h ago`, `2d ago`.
-fn ago(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
-    let secs = (now - then).num_seconds().max(0);
-    match secs {
-        0..=59 => format!("{secs}s ago"),
-        60..=3599 => format!("{}m ago", secs / 60),
-        3600..=86_399 => format!("{}h ago", secs / 3600),
-        _ => format!("{}d ago", secs / 86_400),
-    }
 }
 
 /// This node's own name for whichever peer `view.peers` lists under

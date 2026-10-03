@@ -84,8 +84,8 @@ What to know first:
   read them.
 - **An address change waits 20 seconds** before it is written, so a name
   that swings and swings back never reaches resolver caches.
-  `wireserve-admin service list` shows each record as `dns=published`,
-  `dns=pending` or the provider's error.
+  `wireserve-admin service list` shows each record in its DNS column as
+  `published`, `pending` or `error`, with the provider's error as a note.
 
 ## HTTPS on the service's own node
 

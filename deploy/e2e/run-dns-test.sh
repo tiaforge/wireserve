@@ -81,7 +81,12 @@ poll() {
 }
 svc() { echo "{\"name\":\"$1\",\"port\":$3,\"proto\":\"tcp\",\"ports\":[{\"public\":$2,\"target\":$3,\"proto\":\"tcp\"}]}"; }
 vip_of() {
-    admin service list | awk -v n="$1" '$1 == n { print $4 }'
+    admin service list --json | jq -r --arg n "$1" '.services[] | select(.name == $n) | .vip4 // empty'
+}
+# Where service NAME's record stands: `published`, `pending` or `error: <why>`.
+dns_of() {
+    admin service list --json \
+        | jq -r --arg n "$1" '.services[] | select(.name == $n) | .dns | if .state == "error" then "error: \(.error)" else .state // "-" end'
 }
 # Waits until `lookup NAME` prints exactly WANT (empty for "no record").
 expect_record() {
@@ -96,6 +101,7 @@ expect_record() {
 
 log "checking prerequisites"
 command -v podman >/dev/null || fail "podman not found on PATH"
+command -v jq >/dev/null || fail "jq not found on PATH (reads wireserve-admin --json)"
 command -v python3 >/dev/null || fail "python3 not found on PATH"
 pass "podman and python3 are present"
 
@@ -182,17 +188,17 @@ expect_record "docs.$DOMAIN" "$DOCS_VIP"
 pass "web, plex and docs each at their own address"
 # prom was approved too, and its name already held a hand-made record.
 for _ in $(seq 1 30); do
-    admin service list | grep -q "^prom.*dns=error: .*not overwriting" && break
+    dns_of prom | grep -q '^error: .*not overwriting' && break
     sleep 1
 done
-admin service list | grep -q "^prom.*dns=error: .*not overwriting" \
+dns_of prom | grep -q '^error: .*not overwriting' \
     || fail "prom should be reported as not overwriting the zone's record: $(admin service list)"
 [ "$(lookup prom.$DOMAIN)" = 192.0.2.99 ] || fail "prom's hand-made record was overwritten"
 pass "prom.$DOMAIN left at the operator's 192.0.2.99, and said so"
 
 log "2. service list reports the records"
-admin service list | grep -q "^docs.*dns=published" || fail "no dns=published: $(admin service list)"
-pass "dns=published"
+[ "$(dns_of docs)" = published ] || fail "docs's record is not published: $(admin service list)"
+pass "docs's record is published"
 
 log "3. a withdrawn service leaves DNS — and a record that was never ours stays"
 poll "$HOME_B" "[$(svc plex 443 32400)]" >/dev/null

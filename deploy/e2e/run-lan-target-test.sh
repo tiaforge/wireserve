@@ -163,7 +163,7 @@ log "serving the device's port 80 on 443"
 podman exec "$OWNER" wireserve myrouter "443:$DEVICE_IP:80"
 sleep 8
 admin service approve myrouter --node node-owner || fail "could not approve myrouter"
-admin service list | grep myrouter | grep -q "443:$DEVICE_IP:80/tcp" \
+admin service list | grep '^myrouter ' | grep -q "443:$DEVICE_IP:80/tcp" \
     || fail "the approver does not see the target address"
 pass "the approver sees 443:$DEVICE_IP:80/tcp"
 sleep 12

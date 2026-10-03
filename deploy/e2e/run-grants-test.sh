@@ -101,6 +101,11 @@ explain() {
 }
 reaches() { [ -n "$(ask "$1" "$2" "$3")" ]; }
 refused() { [ -z "$(ask "$1" "$2" "$3")" ]; }
+# The groups service NAME is listed in, one per line; nothing when unlisted.
+groups_of() {
+    admin service list --json | jq -r --arg n "$1" '.services[] | select(.name == $n) | .groups[]'
+}
+
 wait_for() {
     local what=$1 secs=$2; shift 2
     for _ in $(seq 1 "$secs"); do
@@ -112,6 +117,7 @@ wait_for() {
 
 log "checking prerequisites"
 command -v podman >/dev/null || fail "podman not found on PATH"
+command -v jq >/dev/null || fail "jq not found on PATH (reads wireserve-admin --json)"
 modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available"
 [ "$(podman info --format '{{.Host.Security.Rootless}}')" = false ] \
     || fail "needs rootful podman (service-address rewrites are refused in a user namespace): sudo $0"
@@ -197,13 +203,13 @@ in_netns_bg "$HOME_AGENT" socat TCP-LISTEN:8200,fork,reuseaddr SYSTEM:'read x; e
 wait_for "vault to resolve on b" 60 sh -c "podman exec $CLIENT_B getent hosts vault.wg"
 wait_for "a to reach vault" 30 reaches "$CLIENT_A" vault 8200
 refused "$CLIENT_B" vault 8200 || fail "vault landed in default"
-admin service list | grep '^vault' | grep -q 'groups=infra' || fail "vault is not listed in infra"
+groups_of vault | grep -qx infra || fail "vault is not listed in infra"
 podman exec "$HOME_AGENT" wireserve vault 8200 --group media
 wait_for "the notice about vault" 30 sh -c "podman exec $HOME_AGENT wireserve status | grep -q 'vault: stays in infra'"
-admin service list | grep '^vault' | grep -q 'groups=infra' || fail "a declaration moved vault"
+[ "$(groups_of vault)" = infra ] || fail "a declaration moved vault"
 podman exec "$HOME_AGENT" wireserve ghost 9000 --group nope
 wait_for "the notice about ghost" 30 sh -c "podman exec $HOME_AGENT wireserve status | grep -q 'ghost: there is no group nope'"
-admin service list | grep -q '^ghost' && fail "a service naming an unknown group was published"
+[ -n "$(groups_of ghost)" ] && fail "a service naming an unknown group was published"
 pass "vault joined infra and stayed there; ghost was not published"
 
 log "6/6: groups in use stay, and access explains"

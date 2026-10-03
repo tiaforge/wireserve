@@ -4419,3 +4419,37 @@ writes every name to the zone anyway.
     grants e2e (step 3) checks that each client's `status` matches what its
     firewall lets through, and the base e2e's status line expects `yes`.
     Not yet run in e2e.
+
+## M46 — tables, not tabs
+
+`wireserve-admin`'s listings separated their fields with tabs. A tab moves to
+the next multiple of eight columns, so a service name or a port list longer
+than that pushed every later field out of line. `node list` printed 15
+fields per line, most of them as `key=value`. `wireserve status` already
+padded its columns.
+
+290. **One table for both CLIs** (2026-10-03). `wireserve_types::term` has
+    `table`, `columns` (no header), `fields` (`key: value` for one record),
+    `clean` and `ago`, moved out of the agent's `render.rs`. Each column is
+    as wide as its widest cell plus two spaces, and the last one is not
+    padded, so a long reason or error leaves the rest alone. The admin's
+    `sanitize_for_terminal` only escaped `\r` and `\n`. It is gone, and
+    `clean` escapes every control character, tabs and ESC included.
+291. **Listings** (`wireserve-admin`'s `listing.rs`): `service list` (the DNS
+    column only when the coordinator publishes records, NOTE only when a
+    denial reason or DNS error needs it), `group list`, `grant list`, `tag
+    list` and `transit ports` each print a table with a header. `node list`
+    shows NODE ADDRESS ENDPOINT SEEN TRANSIT EXIT TAGS, plus a NOTE column
+    for stale devices. TRANSIT is `on`, `approved` or `unapproved`, drawing
+    on `transit_offering`, which the old list never showed. **`node show
+    <name>`** has every field, one per line. `node access` and `service
+    access` line up their `via` column.
+292. **`--json` for scripts** on every list command, printing the
+    coordinator's response as it is (`tag list` prints its tag → nodes map).
+    The tables are for people and may change. The e2e scripts that parsed
+    `key=value` fields (proxy, nat, dns, exit, grants, service-auth and
+    phone-relay) now read `--json` with `jq`, and check for it at startup.
+    lan-target still greps the table on purpose, since what it checks is
+    what an approver sees.
+293. **Verification.** Unit tests for `term` and for each listing. Not yet
+    run in e2e.

@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use wireserve_admin::client::AdminClient;
 use wireserve_admin::config;
+use wireserve_types::term::{clean, columns};
 use wireserve_types::NodeKind;
 
 #[derive(Parser)]
@@ -119,8 +120,18 @@ enum NodeAction {
         name: String,
     },
     /// List all nodes
-    // Spec §4.5.1.
-    List,
+    // Spec §4.5.1. The columns an admin looks for at a glance; `node show`
+    // has every field.
+    List {
+        /// Print the coordinator's response as JSON, for scripts
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show every field of one node
+    Show {
+        /// The node's name
+        name: String,
+    },
     /// Show which services a node reaches, and why
     Access {
         /// The node's name
@@ -147,6 +158,9 @@ enum ServiceAction {
         /// Only those waiting for approval
         #[arg(long)]
         pending: bool,
+        /// Print the coordinator's response as JSON, for scripts
+        #[arg(long)]
+        json: bool,
     },
     /// Approve a service, published by the given node only
     // Approval binds to this node — it does not reserve the name for
@@ -201,7 +215,11 @@ enum TransitAction {
     // PLAN.md M40: on which carrier and address each must be open, which
     // node it leads to and which devices rely on it. A port no device
     // relies on any more may be closed again.
-    Ports,
+    Ports {
+        /// Print the coordinator's response as JSON, for scripts
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -270,7 +288,11 @@ enum GroupAction {
         name: String,
     },
     /// List groups, their grants and services
-    List,
+    List {
+        /// Print the coordinator's response as JSON, for scripts
+        #[arg(long)]
+        json: bool,
+    },
     /// Put a service in a group, taking it out of `default`
     // The service need not exist yet.
     Add {
@@ -306,7 +328,11 @@ enum GrantAction {
         group: String,
     },
     /// List grants
-    List,
+    List {
+        /// Print the coordinator's response as JSON, for scripts
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -349,6 +375,9 @@ enum TagAction {
     List {
         /// Only this tag
         tag: Option<String>,
+        /// Print each tag's nodes as JSON, for scripts
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -366,7 +395,7 @@ fn print_claim(claim: &wireserve_types::ClaimLink, qr: bool) {
     eprintln!("Optional: whoever this device belongs to can claim it, and it then reaches what their");
     eprintln!("groups are granted. Send them this link, and nobody else — it works once, until");
     eprintln!("{}:", claim.expires_at.to_rfc3339());
-    eprintln!("  {}", sanitize_for_terminal(&claim.url));
+    eprintln!("  {}", clean(&claim.url));
     if qr {
         match wireserve_admin::qr::render(&claim.url) {
             Ok(rendered) => {
@@ -461,50 +490,18 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 None => println!("node '{name}' endpoint cleared"),
             }
         }
-        Command::Service { action: ServiceAction::List { pending } } => {
+        Command::Service { action: ServiceAction::List { pending, json } } => {
             let client = build_client(&coordinator_url, &admin_token)?;
-            let resp = wireserve_admin::cmd_list_services(&client)?;
-            for s in resp.services {
-                if pending && s.state != wireserve_types::ServiceApprovalState::Pending {
-                    continue;
-                }
-                let state = match s.state {
-                    wireserve_types::ServiceApprovalState::Pending => "pending",
-                    wireserve_types::ServiceApprovalState::Approved => "approved",
-                    wireserve_types::ServiceApprovalState::Denied => "denied",
-                };
-                // Same S2 defense in depth as `node list`: every field is
-                // sanitized, and denied_reason especially — it is the one
-                // field here an operator typed and a database round-tripped.
-                // `<address>\t<mapping,...>` (in `wireserve <service>` syntax): where the
-                // name resolves and what it serves there; `-` for a service
-                // the range had no address left for.
-                let address = s.vip4.as_deref().unwrap_or("-");
-                let ports = s.ports.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
-                // Only present when the coordinator publishes records
-                // (PLAN.md M32); the provider's error text is sanitized like
-                // everything else that came off the wire.
-                let dns = match &s.dns {
-                    None => String::new(),
-                    Some(wireserve_types::DnsRecordState::Published) => "\tdns=published".to_string(),
-                    Some(wireserve_types::DnsRecordState::Pending) => "\tdns=pending".to_string(),
-                    Some(wireserve_types::DnsRecordState::Error(e)) => {
-                        format!("\tdns=error: {}", sanitize_for_terminal(e))
-                    }
-                };
-                println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\tgroups={}{dns}",
-                    sanitize_for_terminal(&s.name),
-                    sanitize_for_terminal(&s.node),
-                    state,
-                    sanitize_for_terminal(address),
-                    ports,
-                    s.denied_reason
-                        .as_deref()
-                        .map(sanitize_for_terminal)
-                        .unwrap_or_else(|| "-".to_string()),
-                    s.groups.iter().map(|g| sanitize_for_terminal(g)).collect::<Vec<_>>().join(",")
-                );
+            let mut resp = wireserve_admin::cmd_list_services(&client)?;
+            if pending {
+                resp.services.retain(|s| s.state == wireserve_types::ServiceApprovalState::Pending);
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else if resp.services.is_empty() {
+                println!("{}", if pending { "no service is waiting for approval" } else { "no services" });
+            } else {
+                print!("{}", wireserve_admin::listing::services(&resp.services));
             }
         }
         Command::Service { action: ServiceAction::Approve { service, node } } => {
@@ -526,19 +523,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     wireserve_admin::cmd_delete_group(&client, &name)?;
                     println!("group '{name}' deleted");
                 }
-                GroupAction::List => {
-                    for g in wireserve_admin::cmd_list_groups(&client)?.groups {
-                        let granted: Vec<String> = g.granted_to.iter().map(|s| sanitize_for_terminal(&s.to_string())).collect();
-                        println!(
-                            "{}\tgranted={}\tservices={}",
-                            sanitize_for_terminal(&g.name),
-                            if granted.is_empty() { "-".to_string() } else { granted.join(",") },
-                            if g.services.is_empty() {
-                                "-".to_string()
-                            } else {
-                                g.services.iter().map(|s| sanitize_for_terminal(s)).collect::<Vec<_>>().join(",")
-                            }
-                        );
+                GroupAction::List { json } => {
+                    let resp = wireserve_admin::cmd_list_groups(&client)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&resp)?);
+                    } else {
+                        print!("{}", wireserve_admin::listing::groups(&resp));
                     }
                 }
                 GroupAction::Add { group, service } => {
@@ -569,9 +559,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     wireserve_admin::cmd_set_grant(&client, &source, &group, false)?;
                     println!("{source} no longer reaches '{group}' through this grant, from the next poll");
                 }
-                GrantAction::List => {
-                    for g in wireserve_admin::cmd_list_grants(&client)?.grants {
-                        println!("{}\t{}", sanitize_for_terminal(&g.source.to_string()), sanitize_for_terminal(&g.group));
+                GrantAction::List { json } => {
+                    let resp = wireserve_admin::cmd_list_grants(&client)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&resp)?);
+                    } else if resp.grants.is_empty() {
+                        println!("no grants: every service is reached by its own node alone");
+                    } else {
+                        print!("{}", wireserve_admin::listing::grants(&resp));
                     }
                 }
             }
@@ -587,23 +582,24 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     wireserve_admin::cmd_set_tag(&client, &node, &tag, false)?;
                     println!("node '{node}' is no longer tagged '{tag}'");
                 }
-                TagAction::List { tag } => {
+                TagAction::List { tag, json } => {
                     if let Some(tag) = &tag {
                         check_name(tag)?;
                     }
                     let resp = wireserve_admin::cmd_list_peers(&client)?;
-                    let by_tag = wireserve_admin::tags_by_tag(&resp);
-                    match tag {
-                        Some(tag) => match by_tag.get(&tag) {
-                            Some(nodes) => println!("{}\t{}", sanitize_for_terminal(&tag), sanitize_for_terminal(&nodes.join(","))),
-                            None => println!("no node is tagged '{tag}'"),
-                        },
-                        None if by_tag.is_empty() => println!("no tags set"),
-                        None => {
-                            for (tag, nodes) in by_tag {
-                                println!("{}\t{}", sanitize_for_terminal(&tag), sanitize_for_terminal(&nodes.join(",")));
-                            }
+                    let mut by_tag = wireserve_admin::tags_by_tag(&resp);
+                    if let Some(tag) = &tag {
+                        by_tag.retain(|t, _| t == tag);
+                    }
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&by_tag)?);
+                    } else if by_tag.is_empty() {
+                        match tag {
+                            Some(tag) => println!("no node is tagged '{tag}'"),
+                            None => println!("no tags set"),
                         }
+                    } else {
+                        print!("{}", wireserve_admin::listing::tags(&by_tag));
                     }
                 }
             }
@@ -625,18 +621,18 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let who = o.email.as_deref().or(o.name.as_deref()).unwrap_or(&o.sub);
                 println!(
                     "{} belongs to {}{}",
-                    sanitize_for_terminal(&r.node),
-                    sanitize_for_terminal(who),
+                    clean(&r.node),
+                    clean(who),
                     if o.stale { " (its groups could not be refreshed for over an hour, and count for nothing)" } else { "" }
                 );
             }
-            println!("{} acts as: {}", sanitize_for_terminal(&r.node), sources(&r.principals));
+            println!("{} acts as: {}", clean(&r.node), sources(&r.principals));
             if r.services.is_empty() {
                 println!("  reaches no service of another node by who it is");
             }
-            for s in &r.services {
-                println!("  {}\tvia {}", sanitize_for_terminal(&s.name), sources(&s.via));
-            }
+            let rows: Vec<Vec<String>> =
+                r.services.iter().map(|s| vec![format!("  {}", clean(&s.name)), format!("via {}", sources(&s.via))]).collect();
+            print!("{}", columns(&rows));
             if r.default_closed {
                 println!("note: everyone -> default is not granted; services without a group reach nobody");
             }
@@ -644,9 +640,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Service { action: ServiceAction::Access { name: service } } => {
             let client = build_client(&coordinator_url, &admin_token)?;
             let r = wireserve_admin::cmd_service_access(&client, &service)?;
-            let owner = r.node.as_deref().map_or_else(|| "nothing declares it yet".to_string(), sanitize_for_terminal);
-            println!("{} ({owner})", sanitize_for_terminal(&r.service));
-            println!("  groups:     {}", r.groups.iter().map(|g| sanitize_for_terminal(g)).collect::<Vec<_>>().join(", "));
+            let owner = r.node.as_deref().map_or_else(|| "nothing declares it yet".to_string(), clean);
+            println!("{} ({owner})", clean(&r.service));
+            println!("  groups:     {}", r.groups.iter().map(|g| clean(g)).collect::<Vec<_>>().join(", "));
             println!("  granted to: {}", sources(&r.granted_to));
             if r.open {
                 println!("  reachable by every node");
@@ -655,11 +651,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if r.nodes.is_empty() {
                     println!("    no other node");
                 }
-                for n in &r.nodes {
-                    println!("    {}\tvia {}", sanitize_for_terminal(&n.name), sources(&n.via));
-                }
+                let rows: Vec<Vec<String>> =
+                    r.nodes.iter().map(|n| vec![format!("    {}", clean(&n.name)), format!("via {}", sources(&n.via))]).collect();
+                print!("{}", columns(&rows));
                 if r.sign_in {
-                    let groups = r.sign_in_groups.iter().map(|g| sanitize_for_terminal(g)).collect::<Vec<_>>();
+                    let groups = r.sign_in_groups.iter().map(|g| clean(g)).collect::<Vec<_>>();
                     println!("  anyone else: the sign-in, with one of {}", groups.join(", "));
                 } else if !r.sign_in_groups.is_empty() {
                     println!("  (identity-provider groups are granted, but no sign-in applies: no provider, \
@@ -694,103 +690,34 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             wireserve_admin::cmd_deny_transit(&client, &name)?;
             println!("node '{name}' may no longer carry transit traffic");
         }
-        Command::Transit { action: TransitAction::Ports } => {
+        Command::Transit { action: TransitAction::Ports { json } } => {
             let client = build_client(&coordinator_url, &admin_token)?;
             let resp = wireserve_admin::cmd_relay_ports(&client)?;
-            if resp.ports.is_empty() {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else if resp.ports.is_empty() {
                 println!("no public relay ports: no device reaches a node through a carrier");
-            }
-            for p in resp.ports {
-                let state = match p.open {
-                    Some(true) => "open",
-                    Some(false) => "CLOSED",
-                    None => "unchecked",
-                };
-                let devices = if p.devices.is_empty() {
-                    "no device uses it — safe to close".to_string()
-                } else {
-                    format!("used by {}", sanitize_for_terminal(&p.devices.join(", ")))
-                };
-                println!(
-                    "{}\tudp/{}\taddress={}\tnode={}\t{}\tchecked={}\t{}",
-                    sanitize_for_terminal(&p.carrier),
-                    p.port,
-                    p.address.as_deref().map(sanitize_for_terminal).unwrap_or_else(|| "-".into()),
-                    p.node.as_deref().map(sanitize_for_terminal).unwrap_or_else(|| "-".into()),
-                    state,
-                    p.checked_at.map_or_else(|| "never".to_string(), |t| t.format("%Y-%m-%d").to_string()),
-                    devices,
-                );
+            } else {
+                print!("{}", wireserve_admin::listing::relay_ports(&resp));
             }
         }
-        Command::Node { action: NodeAction::List } => {
+        Command::Node { action: NodeAction::List { json } } => {
             let client = build_client(&coordinator_url, &admin_token)?;
             let resp = wireserve_admin::cmd_list_peers(&client)?;
-            for p in resp.peers {
-                let transit = if resp.transit_approved.contains(&p.name) { "approved" } else { "-" };
-                let stale = if resp.stale_devices.contains(&p.name) { "yes" } else { "-" };
-                // Released service addresses this device still holds back
-                // (PLAN.md #273), until it is exported again.
-                let holds = resp
-                    .held_addresses
-                    .get(&p.name)
-                    .map_or_else(|| "-".to_string(), |a| sanitize_for_terminal(&a.join(",")));
-                let dialable = match resp.dialable.get(&p.name) {
-                    Some(true) => "yes",
-                    Some(false) => "no",
-                    None => "-",
-                };
-                // "offering" for a node that runs `exit on`, "yes" for a
-                // device whose last export has the full-tunnel profile.
-                let exit = if resp.exit_devices.contains(&p.name) {
-                    "yes"
-                } else if resp.exit_offering.contains(&p.name) {
-                    "offering"
-                } else {
-                    "-"
-                };
-                // S2 defense in depth: a peer field containing a newline
-                // could otherwise spoof extra lines of terminal output —
-                // same "don't trust the coordinator's validation as the
-                // only line of defense" reasoning as export_config's
-                // renderer.
-                println!(
-                    "{}\t{}\t{}\t{}\tendpoint={}\tv4={}\tv6={}\tlan={}\treflexive={}\ttransit={}\tdialable={}\tstale={}\texit={}\ttags={}\tholds={}",
-                    sanitize_for_terminal(&p.name),
-                    sanitize_for_terminal(&p.pubkey),
-                    sanitize_for_terminal(&p.ip4),
-                    sanitize_for_terminal(&p.ip6),
-                    p.endpoint_addr
-                        .as_deref()
-                        .map(sanitize_for_terminal)
-                        .unwrap_or_else(|| "-".to_string()),
-                    p.endpoint_addr_v4
-                        .as_deref()
-                        .map(sanitize_for_terminal)
-                        .unwrap_or_else(|| "-".to_string()),
-                    p.endpoint_addr_v6
-                        .as_deref()
-                        .map(sanitize_for_terminal)
-                        .unwrap_or_else(|| "-".to_string()),
-                    p.lan_addr
-                        .as_deref()
-                        .map(sanitize_for_terminal)
-                        .unwrap_or_else(|| "-".to_string()),
-                    p.reflexive_addr
-                        .as_deref()
-                        .map(sanitize_for_terminal)
-                        .unwrap_or_else(|| "-".to_string()),
-                    transit,
-                    dialable,
-                    stale,
-                    exit,
-                    match resp.tags.get(&p.name) {
-                        Some(t) if !t.is_empty() => sanitize_for_terminal(&t.join(",")),
-                        _ => "-".to_string(),
-                    },
-                    holds,
-                );
+            if json {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else if resp.peers.is_empty() {
+                println!("no nodes yet: add one with `node create <name>`");
+            } else {
+                print!("{}", wireserve_admin::listing::nodes(&resp, chrono::Utc::now()));
             }
+        }
+        Command::Node { action: NodeAction::Show { name } } => {
+            check_name(&name)?;
+            let client = build_client(&coordinator_url, &admin_token)?;
+            let resp = wireserve_admin::cmd_list_peers(&client)?;
+            let peer = resp.peers.iter().find(|p| p.name == name).ok_or_else(|| format!("no node named '{name}' on the mesh"))?;
+            print!("{}", wireserve_admin::listing::node(&resp, peer, chrono::Utc::now()));
         }
         Command::Device { action } => {
             let (refresh, DeviceArgs { name, out, qr, exit, allow_unverified, dns, mesh_dns }) = match action {
@@ -899,14 +826,8 @@ fn sources(v: &[wireserve_types::GrantSource]) -> String {
     if v.is_empty() {
         "-".to_string()
     } else {
-        v.iter().map(|s| sanitize_for_terminal(&s.to_string())).collect::<Vec<_>>().join(", ")
+        v.iter().map(|s| clean(&s.to_string())).collect::<Vec<_>>().join(", ")
     }
-}
-
-/// Replaces embedded newlines/carriage returns with a visible escape
-/// rather than letting them fake extra lines of terminal output (S2).
-fn sanitize_for_terminal(s: &str) -> String {
-    s.replace('\r', "\\r").replace('\n', "\\n")
 }
 
 /// Spec §3: fail fast on an obviously invalid name before resolving config
@@ -1106,12 +1027,6 @@ mod tests {
         assert!(contents.contains("PrivateKey = secret"));
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "exported .conf contains a private key and must be mode 600");
-    }
-
-    #[test]
-    fn sanitize_for_terminal_escapes_newlines() {
-        assert_eq!(sanitize_for_terminal("a\nb\rc"), "a\\nb\\rc");
-        assert_eq!(sanitize_for_terminal("plain"), "plain");
     }
 
     #[test]

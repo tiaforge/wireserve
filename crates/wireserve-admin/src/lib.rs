@@ -1,6 +1,7 @@
 pub mod client;
 pub mod config;
 pub mod export_config;
+pub mod listing;
 pub mod qr;
 
 use client::{AdminClient, ClientError};

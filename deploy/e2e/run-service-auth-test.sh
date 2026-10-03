@@ -146,6 +146,7 @@ fetch() { fetch_from "$CLIENT" "$@"; }
 
 log "checking prerequisites"
 command -v podman >/dev/null || fail "podman not found on PATH"
+command -v jq >/dev/null || fail "jq not found on PATH (reads wireserve-admin --json)"
 command -v python3 >/dev/null || fail "python3 not found on PATH"
 modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available"
 [ "$(podman info --format '{{.Host.Security.Rootless}}')" = false ] \
@@ -253,7 +254,8 @@ admin tag add node-gate tv
 if admin group add media auth 2>/dev/null; then
     fail "the sign-in service was put in a group"
 fi
-admin service list | grep '^jellyfin' | grep -q 'groups=media' || fail "service list does not show jellyfin in media"
+admin service list --json | jq -e '.services[] | select(.name == "jellyfin") | .groups | index("media")' >/dev/null \
+    || fail "service list does not show jellyfin in media"
 wait_for "home to fall back to the sign-in for jellyfin" 30 signs_in jellyfin
 # The terminator picks it up on its next check-in.
 sleep 8

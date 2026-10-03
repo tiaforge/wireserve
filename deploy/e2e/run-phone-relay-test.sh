@@ -102,6 +102,7 @@ admin() { podman exec "$COORD" wireserve-admin "$@"; }
 
 log "checking prerequisites"
 command -v podman >/dev/null || fail "podman not found on PATH"
+command -v jq >/dev/null || fail "jq not found on PATH (reads wireserve-admin --json)"
 command -v python3 >/dev/null || fail "python3 not found on PATH"
 modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available"
 [ "$(podman info --format '{{.Host.Security.Rootless}}')" = false ] \
@@ -180,9 +181,9 @@ sleep 15
 pass "both agents registered and polling"
 
 log "1/9: each agent knows whether it is dialable"
-PEERS=$(admin node list)
-echo "$PEERS" | grep '^node-carrier' | grep -q 'dialable=yes' || { echo "$PEERS"; fail "the carrier on a public address did not find itself dialable"; }
-echo "$PEERS" | grep '^node-home' | grep -q 'dialable=no' || { echo "$PEERS"; fail "the node behind NAT did not find itself undialable"; }
+PEERS=$(admin node list --json)
+[ "$(echo "$PEERS" | jq '.dialable["node-carrier"]')" = true ] || { echo "$PEERS"; fail "the carrier on a public address did not find itself dialable"; }
+[ "$(echo "$PEERS" | jq '.dialable["node-home"]')" = false ] || { echo "$PEERS"; fail "the node behind NAT did not find itself undialable"; }
 pass "carrier dialable, homeserver not"
 
 log "declaring a service on homeserver"
@@ -219,7 +220,7 @@ if admin device create phone --register-url "http://127.0.0.1:47820" >"$OUT/clos
 fi
 grep -q "open UDP $RELAY_PORT inbound on node-carrier ($CARRIER_IP)" "$OUT/closed.log" \
     || { cat "$OUT/closed.log"; fail "the refusal does not name the port and address to open"; }
-admin node list | grep -q '^phone' && fail "the refused export created the node anyway"
+admin node list --json | jq -e 'any(.peers[]; .name == "phone")' >/dev/null && fail "the refused export created the node anyway"
 pass "refused before creating anything, naming UDP $RELAY_PORT on $CARRIER_IP"
 in_netns "$CARRIER" nft delete table ip cloudfw
 
@@ -294,11 +295,12 @@ fi
 pass "an undeclared port stays refused"
 
 log "8/9: relay-ports names the port, its device, and that it is open"
-PORTS=$(admin transit ports)
-echo "$PORTS"
-echo "$PORTS" | grep "udp/$RELAY_PORT" | grep -q "address=$CARRIER_IP" || fail "relay-ports does not list the port with its address"
-echo "$PORTS" | grep "udp/$RELAY_PORT" | grep -q "open" || fail "relay-ports does not say it is open"
-echo "$PORTS" | grep "udp/$RELAY_PORT" | grep -q "used by phone" || fail "relay-ports does not name the phone"
+admin transit ports
+PORT=$(admin transit ports --json | jq -c --argjson p "$RELAY_PORT" '.ports[] | select(.port == $p)')
+echo "$PORT"
+[ "$(echo "$PORT" | jq -r .address)" = "$CARRIER_IP" ] || fail "relay-ports does not list the port with its address"
+[ "$(echo "$PORT" | jq .open)" = true ] || fail "relay-ports does not say it is open"
+echo "$PORT" | jq -e '.devices | index("phone")' >/dev/null || fail "relay-ports does not name the phone"
 pass "listed, open, used by the phone"
 
 log "9/9: a refresh keeps the phone's address"

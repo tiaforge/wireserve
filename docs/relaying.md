@@ -45,8 +45,9 @@ verified, so without approval a single compromised node could offer to
 carry every pair in the mesh and learn all of that. Until it is approved,
 `wireserve status` on that node says `Transit: on, waiting for an admin to
 approve this node as a carrier`. Revoking or rejoining a node withdraws
-its approval, and `node list` shows who currently has one
-(`transit=approved`).
+its approval, and `node list` shows who currently has one in its TRANSIT
+column: `on` when the node has switched it on too, `approved` when it has
+not, `unapproved` for a node that offers without approval.
 
 `wireserve status` shows the outcome, both for a peer this node can't
 reach directly and for what this node is relaying on others' behalf:

@@ -84,6 +84,7 @@ ip_on() {
 
 log "checking prerequisites"
 command -v podman >/dev/null || fail "podman not found on PATH"
+command -v jq >/dev/null || fail "jq not found on PATH (reads wireserve-admin --json)"
 command -v python3 >/dev/null || fail "python3 not found on PATH"
 modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available"
 [ "$(podman info --format '{{.Host.Security.Rootless}}')" = false ] \
@@ -222,7 +223,7 @@ podman exec "$AGENT3" wireserve join "http://$COORD_IP:47820" --allow-plaintext-
 pass "all three nodes registered from behind NAT"
 
 log "what endpoint did the coordinator record for each node?"
-podman exec "$COORD" wireserve-admin node list | while read -r line; do echo "  $line"; done
+podman exec "$COORD" wireserve-admin node list | sed 's/^/  /'
 
 for a in "$AGENT1" "$AGENT2" "$AGENT3"; do
     podman exec -d "$a" wireserve daemon --poll-interval-secs 5
@@ -251,9 +252,9 @@ log "each node tested whether it is dialable from outside (PLAN.md M40)"
 # node never sent to: only a NAT or firewall that lets unsolicited traffic
 # in delivers it. agent1 has a port-forward and agent2 an endpoint-
 # independent mapping; agent3's symmetric NAT drops it.
-PEERS=$(podman exec "$COORD" wireserve-admin node list)
-for want in "node1:yes" "node2:yes" "node3:no"; do
-    echo "$PEERS" | grep "^${want%%:*}	" | grep -q "dialable=${want#*:}" \
+PEERS=$(podman exec "$COORD" wireserve-admin node list --json)
+for want in "node1:true" "node2:true" "node3:false"; do
+    [ "$(echo "$PEERS" | jq --arg n "${want%%:*}" '.dialable[$n]')" = "${want#*:}" ] \
         || { echo "$PEERS"; fail "${want%%:*} should report dialable=${want#*:}"; }
 done
 pass "the port-forwarded and endpoint-independent nodes are dialable, the symmetric one is not"
@@ -319,14 +320,15 @@ log "comparing the endpoint the coordinator recorded against the real one"
 # WireGuard's UDP is unrelated to it. So for any node behind NAT this
 # value is a guess, and this check prints how good a guess it was.
 echo "  recorded by the coordinator:"
-podman exec "$COORD" wireserve-admin node list | awk '{ for (i = 1; i <= NF; i++) if (index($i, "endpoint=") == 1) printf "    %-8s %s\n", $1, $i }'
+podman exec "$COORD" wireserve-admin node list --json \
+    | jq -r '.peers[] | "    \(.name)  \(.endpoint_addr // "-")"'
 echo "  actually observed by agent1, learned from received packets:"
 in_netns "$AGENT1" wg show wireserve0 endpoints | awk '{printf "    %s\n", $0}'
 
-DUPES=$(podman exec "$COORD" wireserve-admin node list | awk '{ for (i = 1; i <= NF; i++) if (index($i, "endpoint=") == 1) print $i }' \
-    | grep -v 'endpoint=-$' | sort | uniq -d)
+DUPES=$(podman exec "$COORD" wireserve-admin node list --json | jq -r '.peers[].endpoint_addr // empty' \
+    | sort | uniq -d)
 if [ -n "$DUPES" ]; then
-    note "two nodes were recorded at the SAME endpoint: ${DUPES#endpoint=}"
+    note "two nodes were recorded at the SAME endpoint: $DUPES"
     note "agent2 and agent3 share a NAT and both report listen_port $WG_PORT, so the"
     note "fallback produced one address for both. At most one is reachable there."
     note "This is survivable only because WireGuard replaces the endpoint with the"
@@ -404,12 +406,12 @@ fi
 # NAT, like agent3's, the reflexive port is useless to anyone but the
 # coordinator; that case is M23's transit, run-transit-test.sh.)
 list_peers_field() {
-    podman exec "$COORD" wireserve-admin node list \
-        | awk -v name="$1" -v prefix="$2" '$1 == name { for (i = 1; i <= NF; i++) if (index($i, prefix) == 1) print substr($i, length(prefix) + 1) }'
+    podman exec "$COORD" wireserve-admin node list --json \
+        | jq -r --arg n "$1" --arg f "$2" '.peers[] | select(.name == $n) | .[$f] // "-"'
 }
 
 log "confirming the reflexive responder learned a real NAT-mapped port, not the naive guess"
-NODE2_REFLEXIVE=$(list_peers_field node2 "reflexive=")
+NODE2_REFLEXIVE=$(list_peers_field node2 reflexive_addr)
 if [ -z "$NODE2_REFLEXIVE" ] || [ "$NODE2_REFLEXIVE" = "-" ]; then
     fail "coordinator recorded no reflexive_addr for node2 — the one-shot probe did not succeed"
 fi

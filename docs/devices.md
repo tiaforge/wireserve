@@ -24,7 +24,7 @@ agents. How depends on the node:
   when it starts: the coordinator answers its startup probe a second time,
   from a port the node never sent anything to, and that answer only gets in
   where the node's router or firewall lets unsolicited traffic in.
-  `node list` shows the result (`dialable=yes|no`).
+  `node show <name>` shows the result (`dialable: yes|no`).
 - **Every other node** — behind a NAT nothing gets through (a home server
   without a port forward, CGNAT), or one that hasn't said, because it is
   offline or runs an older agent — is reached through a **carrier**: an
@@ -65,11 +65,11 @@ device uses any more and may be closed again.
 
 **The config is a snapshot.** A node that joins later isn't in it, nor is
 one no carrier reaches at the time of the export (the export says so).
-`node list` marks such devices `stale=yes`; `device refresh` (below) brings one
+`node list` notes such devices as stale; `device refresh` (below) brings one
 up to date. A withdrawn (or revoked, or deleted) service's address is held
 back meanwhile: an older config still sends it to the node that had it, so no
 other node's service gets it until every device exported before is exported
-again or deleted. `node list` shows those addresses as `holds=`; a node
+again or deleted. `node show <device>` lists those addresses under `holds`; a node
 that declares a service again takes its own back. Two phones don't reach each other: neither has anything the
 other could dial.
 
