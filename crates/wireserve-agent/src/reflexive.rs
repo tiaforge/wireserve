@@ -77,6 +77,48 @@ pub async fn learn(coordinator_url: &str, listen_port: u16, timeout: Duration) -
     }
 }
 
+/// How long the daemon's startup waits for a coordinator it can't reach
+/// before it gives up on the check (see [`learn_waiting`]).
+pub const UNREACHABLE_WAIT_MAX: Duration = Duration::from_secs(60);
+/// How long between tries while the coordinator can't be reached.
+const UNREACHABLE_RETRY: Duration = Duration::from_secs(5);
+
+/// [`learn`], tried again for up to `max_wait` while the coordinator can't
+/// be reached at all, for the daemon's startup. The check can only run
+/// before the interface takes `listen_port`, so a coordinator that was down
+/// just then (restarting, or killed for memory, as on the real mesh on
+/// 2026-10-03) used to leave the node without its NAT-mapped port until its
+/// next restart — and its NATed peers then hole-punched towards the wrong
+/// port, and were relayed for good. Waiting costs nothing: the node can't
+/// poll for its peers without the coordinator either.
+///
+/// Only an unreachable coordinator is waited for: one that answers over
+/// IPv6 while this check, which is IPv4-only, fails means this node has no
+/// IPv4 to learn, and waiting would only delay every start.
+pub async fn learn_waiting(coordinator_url: &str, listen_port: u16, timeout: Duration, max_wait: Duration) -> Learned {
+    let deadline = tokio::time::Instant::now() + max_wait;
+    let mut said = false;
+    loop {
+        match try_learn(coordinator_url, listen_port, timeout).await {
+            Ok(learned) => return learned,
+            Err(ReflexiveProbeError::FetchProbeResponse(e))
+                if tokio::time::Instant::now() + UNREACHABLE_RETRY < deadline
+                    && crate::probe::fetch_probe_response(coordinator_url, crate::probe::Family::V6, timeout).await.is_err() =>
+            {
+                if !said {
+                    tracing::info!(error = %e, "the coordinator can't be reached; waiting up to {}s for it before learning this node's NAT-mapped address", max_wait.as_secs());
+                    said = true;
+                }
+                tokio::time::sleep(UNREACHABLE_RETRY).await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "reflexive-address probe did not succeed — continuing without it; peers behind a NAT can't dial this node first until the agent restarts");
+                return Learned::default();
+            }
+        }
+    }
+}
+
 /// How long to wait for the coordinator's second answer once the first came:
 /// both are sent together, so anything later is lost, not late.
 const SECOND_ANSWER_WAIT: Duration = Duration::from_millis(800);

@@ -592,8 +592,13 @@ async fn cmd_daemon(
     // The same probe tells whether this node is dialable from outside
     // (PLAN.md M40), from whether the coordinator's second answer, from a
     // port this node never sent to, gets in.
-    let learned =
-        wireserve_agent::reflexive::learn(&coordinator_url, listen_port, wireserve_agent::reflexive::PROBE_TIMEOUT).await;
+    let learned = wireserve_agent::reflexive::learn_waiting(
+        &coordinator_url,
+        listen_port,
+        wireserve_agent::reflexive::PROBE_TIMEOUT,
+        wireserve_agent::reflexive::UNREACHABLE_WAIT_MAX,
+    )
+    .await;
     let own_reflexive_addr = learned.addr;
     let own_dialable_v4 = learned.dialable;
     tracing::info!(reflexive_addr = ?own_reflexive_addr, dialable = ?own_dialable_v4, "one-shot reflexive-address probe");
@@ -676,6 +681,7 @@ async fn cmd_daemon(
         state_path: state_path.clone(),
         instance: instance.name().to_string(),
         ifname: ifname.clone(),
+        reflexive_unknown: own_reflexive_addr.is_none(),
         shutdown: shutdown_tx,
     };
     let socket_path = instance.socket_path();
@@ -692,6 +698,15 @@ async fn cmd_daemon(
     // quiet is noticed within seconds, not at the next poll.
     let mut liveness = tokio::time::interval(wireserve_agent::wg::LIVENESS_CHECK_INTERVAL);
     liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // What quiet peers are nudged from (`wg::NUDGE_AFTER`): this node's mesh
+    // address, so their WireGuard takes it as this node's.
+    let nudge_socket = match tokio::net::UdpSocket::bind((ip4, 0)).await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not open the socket quiet peers are nudged from: a peer that keeps alive less often than this node may count as unreachable and be relayed");
+            None
+        }
+    };
 
     // F9 follow-up: how many 401s in a row it takes before the daemon
     // concludes it has really been revoked. A single 401 could also be a
@@ -743,8 +758,12 @@ async fn cmd_daemon(
                             liveness.tick().await;
                             let tunnel = wireserve_agent::wg::tunnel_peers(wg.ifname()).unwrap_or_default();
                             let rx = tunnel.iter().map(|t| (t.pubkey.as_str(), t.rx_bytes));
-                            if endpoint_tracker.observe_rx(rx, std::time::Instant::now()) {
+                            let now = std::time::Instant::now();
+                            if endpoint_tracker.observe_rx(rx, now) {
                                 break;
+                            }
+                            if let Some(socket) = &nudge_socket {
+                                wireserve_agent::wg::nudge(socket, &endpoint_tracker.peers_to_nudge(now)).await;
                             }
                         }
                     } => {}

@@ -385,6 +385,24 @@ pub const PEER_SILENT_MAX: std::time::Duration = std::time::Duration::from_secs(
 /// (`main.rs`), so a path that went quiet is noticed within this of
 /// [`PEER_SILENT_MAX`], and the poll that asks for a relay runs at once.
 pub const LIVENESS_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a direct agent peer may stay quiet before it is nudged: sent one
+/// datagram through the tunnel, to its mesh address. Any data packet makes
+/// the peer's WireGuard answer with a keepalive within 10 seconds, whatever
+/// its own keepalive setting — the kernel's passive keepalive, in every
+/// version — even though nothing on the peer listens and its firewall drops
+/// it. The peer's own keepalive can't be relied on: the kernel restarts its
+/// countdown whenever anything arrives from this side, so a peer keeping
+/// alive less often than this node never sends one at all (measured: 10s
+/// against 25s, the 25s side stays silent until the next handshake, every
+/// two minutes). One nudge per check while quiet: three go out before
+/// [`PEER_SILENT_MAX`], so two lost answers don't count.
+pub const NUDGE_AFTER: std::time::Duration = LIVENESS_CHECK_INTERVAL;
+// The third nudge's answer (the kernel's passive keepalive, within 10s) still
+// arrives before the peer counts as silent.
+const _: () = assert!(NUDGE_AFTER.as_secs() + 2 * LIVENESS_CHECK_INTERVAL.as_secs() + 10 < PEER_SILENT_MAX.as_secs());
+/// The port a nudge is sent to: discard. The datagram only has to reach the
+/// peer's WireGuard; what its host does with it after that doesn't matter.
+pub const NUDGE_PORT: u16 = 9;
 /// The keepalive towards another agent, on both interfaces. It bounds how
 /// soon a dead path can be told from a quiet one ([`PEER_SILENT_MAX`]), and
 /// costs one 32-byte packet per peer this often.
@@ -612,6 +630,9 @@ pub struct EndpointTracker {
     /// The tracked peers already found silent, so each going quiet wakes
     /// the poll loop once.
     silent_noted: std::collections::HashSet<String>,
+    /// Every other agent this node reaches directly, by pubkey, with its
+    /// mesh address — see [`Self::peers_to_nudge`].
+    nudge: HashMap<String, Ipv4Addr>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -684,9 +705,40 @@ impl EndpointTracker {
 
     /// Whether nothing has arrived from `pubkey` for [`PEER_SILENT_MAX`]. A
     /// peer never observed is not silent: nothing is known about it.
+    ///
+    /// Nor is a relayed peer. Its entry on this interface is only a probe
+    /// (see `desired_peers`): it routes nothing, so it can't be nudged, and
+    /// keepalives alone go quiet on one side whenever the two ends keep
+    /// alive at different intervals (see [`NUDGE_AFTER`]). Its direct path
+    /// is judged by its handshake alone; if that turns out to be dead once
+    /// the relay ends, the nudges find out within [`PEER_SILENT_MAX`].
     #[must_use]
     pub fn silent(&self, pubkey: &str, now: std::time::Instant) -> bool {
-        self.rx.get(pubkey).is_some_and(|seen| now.duration_since(seen.changed_at) >= PEER_SILENT_MAX)
+        !self.transited.contains(pubkey)
+            && self.rx.get(pubkey).is_some_and(|seen| now.duration_since(seen.changed_at) >= PEER_SILENT_MAX)
+    }
+
+    /// Records every other agent this node reaches directly this cycle, with
+    /// its mesh address: the peers [`Self::peers_to_nudge`] chooses from.
+    pub fn note_direct_agents<'a>(&mut self, agents: impl IntoIterator<Item = (&'a str, Ipv4Addr)>) {
+        self.nudge = agents.into_iter().map(|(pk, ip)| (pk.to_string(), ip)).collect();
+    }
+
+    /// The mesh addresses of the direct agent peers nothing has arrived from
+    /// for [`NUDGE_AFTER`]: each is sent a datagram, so its WireGuard answers
+    /// (see [`NUDGE_AFTER`]). A peer never observed is left alone, like in
+    /// [`Self::silent`].
+    #[must_use]
+    pub fn peers_to_nudge(&self, now: std::time::Instant) -> Vec<Ipv4Addr> {
+        let mut out: Vec<Ipv4Addr> = self
+            .nudge
+            .iter()
+            .filter(|(pk, _)| !self.transited.contains(pk.as_str()))
+            .filter(|(pk, _)| self.rx.get(pk.as_str()).is_some_and(|seen| now.duration_since(seen.changed_at) >= NUDGE_AFTER))
+            .map(|(_, ip)| *ip)
+            .collect();
+        out.sort_unstable();
+        out
     }
 
     /// [`transit_reachable_peers`], less every peer that has gone silent:
@@ -779,8 +831,18 @@ impl EndpointTracker {
 
     /// Records which peers this cycle's directory routes via a carrier, for
     /// the next cycle's [`Self::peers_wanting_transit`].
-    pub fn note_transit<'a>(&mut self, transited: impl IntoIterator<Item = &'a str>) {
-        self.transited = transited.into_iter().map(str::to_string).collect();
+    ///
+    /// A peer whose relay just ended starts a fresh [`PEER_SILENT_MAX`]: its
+    /// probe entry may have been quiet for minutes (see [`Self::silent`]),
+    /// and it only now carries traffic and gets nudged.
+    pub fn note_transit<'a>(&mut self, transited: impl IntoIterator<Item = &'a str>, now: std::time::Instant) {
+        let transited: std::collections::HashSet<String> = transited.into_iter().map(str::to_string).collect();
+        for ended in self.transited.difference(&transited) {
+            if let Some(seen) = self.rx.get_mut(ended) {
+                seen.changed_at = now;
+            }
+        }
+        self.transited = transited;
     }
 }
 
@@ -1072,13 +1134,36 @@ pub fn desired_carry_peers(
 }
 
 /// The keepalive towards `p`: [`AGENT_KEEPALIVE_SECS`] for another agent,
-/// [`STATIC_KEEPALIVE_SECS`] for a phone. Only an agent reports a carry
-/// port, a LAN address or a reflexive address; a static peer never does.
+/// [`STATIC_KEEPALIVE_SECS`] for a phone.
 fn keepalive_for(p: &PeerInfo) -> u16 {
-    if p.relay.carry_port.is_some() || p.lan_addr.is_some() || p.reflexive_addr.is_some() {
+    if is_agent(p) {
         AGENT_KEEPALIVE_SECS
     } else {
         STATIC_KEEPALIVE_SECS
+    }
+}
+
+/// Whether `p` is another agent rather than a phone or other static peer.
+/// Every agent registers a listen port and no static peer has one, so that
+/// decides; a carry port, LAN or reflexive address also only ever comes
+/// from an agent, for a coordinator too old to list the port. The listen
+/// port is the one that doesn't come and go: the carry port drops out of the
+/// directory whenever the coordinator hasn't heard the node lately (a
+/// restart forgets it), and the reflexive address when its startup check
+/// failed — and either used to drop the keepalive to 25s on one side only.
+#[must_use]
+pub fn is_agent(p: &PeerInfo) -> bool {
+    p.relay.listen_port.is_some() || p.relay.carry_port.is_some() || p.lan_addr.is_some() || p.reflexive_addr.is_some()
+}
+
+/// Sends one nudge (see [`NUDGE_AFTER`]) to each of `targets` from `socket`,
+/// bound to this node's mesh address so the peer's WireGuard accepts it as
+/// this node's. Best-effort: a failed send is the same as a lost answer.
+pub async fn nudge(socket: &tokio::net::UdpSocket, targets: &[Ipv4Addr]) {
+    for ip in targets {
+        if let Err(e) = socket.send_to(&[0], (*ip, NUDGE_PORT)).await {
+            tracing::debug!(peer = %ip, error = %e, "could not nudge a quiet peer");
+        }
     }
 }
 
@@ -1882,14 +1967,14 @@ mod tests {
         let mut tracker = EndpointTracker::default();
         let c_key = key_b64(3);
         tracker.resolve(&c_key, lan_only("192.168.1.50"), None, now);
-        tracker.note_transit([c_key.as_str()]);
+        tracker.note_transit([c_key.as_str()], now);
         let now_utc = chrono::Utc::now();
         assert_eq!(tracker.peers_wanting_transit(&HashMap::new(), now_utc, now), vec![c_key.as_str()]);
 
         let direct = HashMap::from([(c_key.clone(), Some(now_utc))]);
         assert!(tracker.peers_wanting_transit(&direct, now_utc, now).is_empty());
 
-        tracker.note_transit([]);
+        tracker.note_transit([], now);
         assert!(tracker.peers_wanting_transit(&HashMap::new(), now_utc, now).is_empty());
     }
 
@@ -1935,6 +2020,52 @@ mod tests {
         let quiet = now + PEER_SILENT_MAX;
         assert_eq!(tracker.peers_wanting_transit(&handshakes, now_utc, quiet), vec![pk.as_str()]);
         assert!(tracker.reachable_peers(&handshakes, now_utc, quiet).is_empty(), "a carrier stops offering it");
+    }
+
+    #[test]
+    fn a_relayed_peer_is_judged_by_its_handshake_and_gets_a_fresh_window_when_the_relay_ends() {
+        let now = std::time::Instant::now();
+        let now_utc = chrono::Utc::now();
+        let mut tracker = EndpointTracker::default();
+        let pk = key_b64(3);
+        tracker.resolve(&pk, reflexive_only("203.0.113.5:40404"), None, now);
+        tracker.observe_rx([(pk.as_str(), 10)], now);
+        tracker.note_transit([pk.as_str()], now);
+        // Its probe entry only keeps alive, and may hear nothing for minutes.
+        let quiet = now + PEER_SILENT_MAX * 4;
+        assert!(!tracker.observe_rx([(pk.as_str(), 10)], quiet), "a relayed peer never wakes the poll");
+        assert!(!tracker.silent(&pk, quiet));
+        let handshakes = HashMap::from([(pk.clone(), Some(now_utc))]);
+        assert!(tracker.peers_wanting_transit(&handshakes, now_utc, quiet).is_empty(), "its fresh handshake ends the relay");
+
+        tracker.note_transit([], quiet);
+        assert!(!tracker.silent(&pk, quiet + PEER_SILENT_MAX / 2), "the direct path gets a whole window");
+        assert!(tracker.silent(&pk, quiet + PEER_SILENT_MAX), "and is dead once that passes in silence");
+    }
+
+    #[test]
+    fn only_a_quiet_direct_agent_is_nudged() {
+        let now = std::time::Instant::now();
+        let mut tracker = EndpointTracker::default();
+        let (a, b, c, d): (Ipv4Addr, Ipv4Addr, Ipv4Addr, Ipv4Addr) =
+            ("10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap(), "10.0.0.3".parse().unwrap(), "10.0.0.4".parse().unwrap());
+        tracker.note_direct_agents([("pk-quiet", a), ("pk-chatty", b), ("pk-relayed", c), ("pk-never-seen", d)]);
+        tracker.note_transit(["pk-relayed"], now);
+        tracker.observe_rx([("pk-quiet", 1), ("pk-chatty", 1), ("pk-relayed", 1), ("pk-phone", 1)], now);
+        assert!(tracker.peers_to_nudge(now + NUDGE_AFTER / 2).is_empty());
+        let later = now + NUDGE_AFTER;
+        tracker.observe_rx([("pk-quiet", 1), ("pk-chatty", 2), ("pk-relayed", 1), ("pk-phone", 1)], later);
+        assert_eq!(tracker.peers_to_nudge(later), vec![a]);
+    }
+
+    #[test]
+    fn every_agent_is_kept_alive_at_the_agent_interval_whatever_the_coordinator_forgot() {
+        let mut agent = peer("strato", &key_b64(2));
+        agent.relay.listen_port = Some(51820);
+        assert!(agent.lan_addr.is_none() && agent.reflexive_addr.is_none() && agent.relay.carry_port.is_none());
+        assert_eq!(keepalive_for(&agent), AGENT_KEEPALIVE_SECS);
+        let phone = peer("s25", &key_b64(3));
+        assert_eq!(keepalive_for(&phone), STATIC_KEEPALIVE_SECS);
     }
 
     fn service(name: &str, node: &str, vip4: Option<&str>) -> ServiceInfo {

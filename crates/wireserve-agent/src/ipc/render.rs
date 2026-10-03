@@ -193,6 +193,14 @@ pub fn render(view: &ListView, now: DateTime<Utc>) -> String {
         out.push_str(&table(&["PEER", "ADDRESS", "ENDPOINT", "HANDSHAKE", "ROUTE"], &rows));
     }
 
+    if view.reflexive_unknown {
+        out.push_str(
+            "\nThis node's NAT-mapped IPv4 port is unknown: its startup check couldn't reach the \
+             coordinator's UDP responder. Peers behind a NAT can't reach it until it reaches them, \
+             and may be relayed. Restart the agent once the coordinator answers.\n",
+        );
+    }
+
     if !view.rejected_services.is_empty() {
         out.push_str("\nNot published:\n");
         for r in &view.rejected_services {
@@ -303,6 +311,7 @@ mod tests {
             ifname: "wireserve0".into(),
             node: Some("lego2".into()),
             service_domain: None,
+            reflexive_unknown: false,
             transit_capable: false,
             relay_carrying: vec![],
             relay_public: vec![],
@@ -383,6 +392,13 @@ Not published:
         let view = ListView { peers: vec![c], ..Default::default() };
         let out = render(&view, now());
         assert!(out.contains("relayed by pk-does-…"), "{out}");
+    }
+
+    #[test]
+    fn an_unknown_nat_mapped_port_is_said_only_when_the_check_failed() {
+        assert!(!render(&ListView::default(), now()).contains("NAT-mapped"));
+        let out = render(&ListView { reflexive_unknown: true, ..Default::default() }, now());
+        assert!(out.contains("NAT-mapped IPv4 port is unknown"), "{out}");
     }
 
     #[test]

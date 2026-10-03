@@ -96,6 +96,11 @@ pub struct ListView {
     /// the same name the hosts file writes. Absent means `.wg`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_domain: Option<String>,
+    /// This node's startup check found no NAT-mapped IPv4 address (PLAN.md
+    /// M22): peers behind a NAT then hole-punch towards the wrong port, and
+    /// can't reach it before it reaches them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reflexive_unknown: bool,
     /// The coordinator's view of every peer, as of the last poll.
     pub peers: Vec<PeerInfo>,
     /// The kernel's view of the same peers, read when `list` asked: the

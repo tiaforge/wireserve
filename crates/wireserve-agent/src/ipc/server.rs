@@ -21,6 +21,9 @@ pub struct AgentContext {
     pub state_path: PathBuf,
     pub instance: String,
     pub ifname: String,
+    /// Whether the startup check found no NAT-mapped address — see
+    /// `ListView::reflexive_unknown`.
+    pub reflexive_unknown: bool,
     /// Signalled when `leave` is requested, so the daemon's main loop (which
     /// owns the live WireGuard interface / firewall backend) can perform
     /// the actual teardown — the IPC handler itself only queues the
@@ -118,6 +121,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
         exit_capable: state.exit_capable,
         exit_clients: directory.exit_clients.clone(),
         service_domain: directory.naming.as_ref().map(|n| n.domain.clone()),
+        reflexive_unknown: ctx.reflexive_unknown,
         peers: directory.peers,
         tunnel: vec![],
         services,
@@ -457,6 +461,7 @@ mod tests {
                 state_path,
                 instance: "default".into(),
                 ifname: "wireserve0".into(),
+                reflexive_unknown: false,
                 shutdown: tx,
             },
             dir,

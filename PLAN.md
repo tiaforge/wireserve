@@ -4262,3 +4262,47 @@ as agreed with the user. Nothing deployed; no e2e suite covers these paths.
     interface.) It now gets the services' openings whenever the mesh
     interface's does — `iifname <carry> ct mark & SERVICE_MARK` and its
     reply — and never transit, exit or relay ones, which nothing on it needs.
+
+281. **A quiet peer is nudged, not taken for dead** (2026-10-03, seen on the
+    real mesh: lego2<->strato kept switching to a relay through hetzner every
+    two to four minutes, and lego2 called hetzner dead on the same rhythm).
+    #255 assumed every agent sends a keepalive at least every 10s. The kernel
+    restarts a peer's keepalive countdown whenever anything *arrives* from
+    it, so of two ends keeping alive at different intervals the slower one
+    never sends one: measured in a user namespace, 10s against 25s, the 10s
+    side hears nothing until the next handshake, every two minutes, and
+    called the path dead 30s after each. Equal 10s intervals kept both sides
+    hearing, even at 120ms latency; unequal ones came from a peer on an
+    older build (25s for everyone), and from `keepalive_for` reading fields
+    that come and go with the coordinator's memory (a carry port it forgot
+    on a restart, a reflexive address a failed startup check never learned).
+    - **Nudges** (`wg::NUDGE_AFTER`, `EndpointTracker::peers_to_nudge`):
+      every 5s check, a direct agent peer nothing has arrived from for 5s
+      is sent one byte to its mesh address, UDP port 9, from this node's
+      own mesh address. Any data packet makes the peer's WireGuard send a
+      keepalive within 10s (passive keepalive, every kernel version),
+      whatever its own setting and though its firewall drops the datagram.
+      Measured: the starved 10s side heard something at least every 16s
+      once nudged. Three nudges go out before `PEER_SILENT_MAX`, so two
+      lost answers still don't count (a `const` assertion holds that).
+    - **A relayed peer is judged by its handshake** (`silent`): its main
+      entry is a probe with no `AllowedIPs`, so it can't be nudged, and
+      keepalives alone starve one side as above — the relay stayed up on a
+      fresh direct handshake. As before #255, a fresh handshake ends the
+      relay; the peer then gets a fresh `PEER_SILENT_MAX`
+      (`note_transit`), and the nudges tell within it whether the direct
+      path really carries.
+    - **Every agent gets the agent keepalive** (`wg::is_agent`): a
+      registered listen port decides, which every agent has and no static
+      peer does, with the old fields kept for an older coordinator.
+    - **The startup check waits for an unreachable coordinator**
+      (`reflexive::learn_waiting`, up to 60s, every 5s). lego2 and strato
+      both started while the coordinator was down (killed for memory), so
+      lego2 never learned that its router maps 51820 to 13430; minipc,
+      behind DS-Lite, punched towards 51820 and lego2 never reached it. It
+      waits only while the coordinator answers over neither family: one
+      answering over IPv6 alone means there is no IPv4 to learn.
+      `wireserve list` says when the address is unknown.
+    Unit tests only; not yet deployed. Peers' observed addresses as the
+    lasting answer to a stale or missing reflexive address are proposed,
+    not built.

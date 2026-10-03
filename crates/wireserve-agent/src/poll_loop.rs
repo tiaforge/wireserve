@@ -840,7 +840,16 @@ where
     // a carrier that only forwards their session's ciphertext. Like a
     // transited peer, a relayed one keeps probing its direct candidates.
     let relay = crate::wg::relay_assignments(&directory.peers, &self_pubkey);
-    ctx.endpoint_tracker.note_transit(relay.keys().copied());
+    ctx.endpoint_tracker.note_transit(relay.keys().copied(), std::time::Instant::now());
+    // The agents reached directly, which the daemon nudges when they go
+    // quiet (`wg::NUDGE_AFTER`).
+    ctx.endpoint_tracker.note_direct_agents(
+        directory
+            .peers
+            .iter()
+            .filter(|p| p.pubkey != self_pubkey && !relay.contains_key(p.pubkey.as_str()) && crate::wg::is_agent(p))
+            .filter_map(|p| Some((p.pubkey.as_str(), p.ip4.parse().ok()?))),
+    );
     // The pairs this node relays for (PLAN.md M39) — only ever while it
     // opted in to carrying, the same consent as transit.
     let relay_forwards = if transit_capable {
