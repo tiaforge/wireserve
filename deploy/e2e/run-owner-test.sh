@@ -161,11 +161,13 @@ URL=$(printf '%s\n' "$CLAIM_OUT" | grep -oE "$PUBLIC/claim/clm_[0-9a-f]+" || tru
 AUTH=$(browser -o "/work/start.html" -w '%{redirect_url}' "$URL") || fail "the browser could not open the link"
 case "$AUTH" in "$ISSUER/authorize?"*) ;; *) cat "$WORK/start.html" >&2; fail "the link did not lead to the provider: '$AUTH'" ;; esac
 CALLBACK=$(browser -o "/work/login.html" -w '%{redirect_url}' --data-urlencode username=alice \
-    --data-urlencode 'claims={"groups":["family"],"email":"alice@example.com"}' "$AUTH") \
+    --data-urlencode 'claims={"groups":["family"],"email":"alice@example.com","email_verified":true}' "$AUTH") \
     || fail "the browser could not post the provider's login form"
 case "$CALLBACK" in "$PUBLIC/claim/callback?"*) ;; *) cat "$WORK/login.html" >&2; fail "the provider did not send the browser back: '$CALLBACK'" ;; esac
 browser "$CALLBACK" > "$WORK/confirm.html" || fail "the browser could not come back from the provider"
 grep -q 'node-laptop' "$WORK/confirm.html" || { cat "$WORK/confirm.html"; fail "the confirmation does not name the node"; }
+# Only an e-mail the provider marks verified is kept (PLAN.md #275), so the
+# mock's login says it is, as a real provider does for a confirmed address.
 grep -q 'alice@example.com' "$WORK/confirm.html" || fail "the confirmation does not name who signed in"
 TOKEN=$(sed -n 's/.*name="token" value="\([0-9a-f]*\)".*/\1/p' "$WORK/confirm.html")
 [ -n "$TOKEN" ] || fail "no confirmation token on the page"
