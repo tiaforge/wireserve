@@ -3,3 +3,5 @@
 *.sqlite
 *.sqlite3
 .env
+wireserve.db-shm
+wireserve.db-wal
