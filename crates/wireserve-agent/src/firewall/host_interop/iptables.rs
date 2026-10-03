@@ -129,6 +129,7 @@ pub fn opening_spec(ifname: &str, opening: Opening) -> Vec<String> {
             spec.extend(["-i".into(), ifname.into()]);
             spec.extend(mark(relay));
         }
+        Opening::RelayCheck => spec.extend(mark(crate::firewall::nftables::CHECK_MARK)),
     }
     spec
 }

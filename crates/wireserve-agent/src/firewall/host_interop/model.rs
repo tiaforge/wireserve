@@ -110,13 +110,19 @@ pub enum Opening {
     RelayRequest,
     /// `iifname <if> ct mark & R == R` on `FORWARD`: its reply.
     RelayReply,
+    /// `ct mark & C == C` on `INPUT`: the coordinator's probe of a relay
+    /// port under a check (PLAN.md M40), which our own table marked — from
+    /// outside, so the one `INPUT` opening not pinned to the mesh interface,
+    /// and pinned instead to a flow only our table marks, on a port only
+    /// while a check runs.
+    RelayCheck,
 }
 
 impl Opening {
     #[must_use]
     pub fn hook(self) -> Hook {
         match self {
-            Self::Input => Hook::Input,
+            Self::Input | Self::RelayCheck => Hook::Input,
             Self::Hairpin
             | Self::ServiceRequest
             | Self::ServiceReply
@@ -131,7 +137,13 @@ impl Opening {
     #[must_use]
     pub fn wanted(hook: Hook, forward: ForwardWanted) -> Vec<Self> {
         match hook {
-            Hook::Input => vec![Self::Input],
+            Hook::Input => {
+                let mut out = vec![Self::Input];
+                if forward.relay_check {
+                    out.push(Self::RelayCheck);
+                }
+                out
+            }
             Hook::Forward => {
                 let mut out = Vec::new();
                 if forward.transit {

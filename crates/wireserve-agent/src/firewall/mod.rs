@@ -41,6 +41,12 @@ pub struct ForwardWanted {
     /// internet → mesh and back, for flows our table marked with the relay
     /// bit only.
     pub relay: bool,
+    /// This node may be asked to check one of its public relay ports
+    /// (PLAN.md M40): the coordinator's probe, which this node's own table
+    /// marks with `nftables::CHECK_MARK`, reaches the agent's listener on the
+    /// INPUT hook. Not forwarding, and so not part of [`Self::any`]: it opens
+    /// no `FORWARD` chain.
+    pub relay_check: bool,
 }
 
 impl ForwardWanted {
@@ -61,6 +67,10 @@ impl ForwardWanted {
             exit: state.exit_capable,
             relay: state.transit_capable
                 && state.last_directory.as_ref().is_some_and(|d| !d.relay_public.is_empty()),
+            // Only a carrier is ever asked to check a port. The opening lets
+            // in nothing until a check is under way, since only then does
+            // our table mark anything with the bit it matches.
+            relay_check: state.transit_capable,
         }
     }
 }
@@ -211,10 +221,10 @@ mod tests {
         }
         let (main, carry) = (Recorder::default(), Recorder::default());
         let both = Interops { main: main.clone(), carry: Some(carry.clone()) };
-        let everything = ForwardWanted { transit: true, services: true, exit: true, relay: true };
+        let everything = ForwardWanted { transit: true, services: true, exit: true, relay: true, relay_check: false };
         both.tick(everything);
-        both.tick(ForwardWanted { transit: true, services: false, exit: true, relay: true });
-        assert_eq!(*main.0.lock().unwrap(), [everything, ForwardWanted { transit: true, services: false, exit: true, relay: true }]);
+        both.tick(ForwardWanted { transit: true, services: false, exit: true, relay: true, relay_check: false });
+        assert_eq!(*main.0.lock().unwrap(), [everything, ForwardWanted { transit: true, services: false, exit: true, relay: true, relay_check: false }]);
         assert_eq!(
             *carry.0.lock().unwrap(),
             [ForwardWanted { services: true, ..ForwardWanted::default() }, ForwardWanted::default()],

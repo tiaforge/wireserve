@@ -5,8 +5,10 @@
 //! behavior live.
 //!
 //! Safety properties, each pinned by a test below:
-//! - every INPUT-hook accept we add matches exactly `iifname == <ifname>`;
-//!   nothing is ever opened for outgoing traffic;
+//! - every INPUT-hook accept we add matches exactly `iifname == <ifname>`,
+//!   or — on a carrier, for a relay port check (PLAN.md M40) — exactly a
+//!   flow our own table marked as the coordinator's probe; nothing is ever
+//!   opened for outgoing traffic;
 //! - every FORWARD-hook object — an accept, or one of the guard's
 //!   exceptions — additionally requires `oifname == <ifname>` (hairpin
 //!   traffic back onto this same interface, for a transit-capable node,
@@ -33,7 +35,7 @@ use super::model::{
     Hook, IpVersion, IptablesObservation, IptablesVariant, NftView, Observed, Opening, RuleInfo,
     FIREWALLD_TABLE, GUARD_CHAIN, IPTABLES_TABLES, TAG_PREFIX,
 };
-use crate::firewall::nftables::{EXIT_MARK, RELAY_MARK, SERVICE_MARK};
+use crate::firewall::nftables::{CHECK_MARK, EXIT_MARK, RELAY_MARK, SERVICE_MARK};
 
 const TRUSTED: &str = "trusted";
 
@@ -65,6 +67,7 @@ pub fn opening_matches(ifname: &str, opening: Opening) -> Vec<Value> {
         Opening::ExitReply => vec![oifname_match(ifname), mark_match(EXIT_MARK)],
         Opening::RelayRequest => vec![oifname_match(ifname), mark_match(RELAY_MARK)],
         Opening::RelayReply => vec![iifname_match(ifname), mark_match(RELAY_MARK)],
+        Opening::RelayCheck => vec![mark_match(CHECK_MARK)],
     }
 }
 

@@ -4306,3 +4306,34 @@ as agreed with the user. Nothing deployed; no e2e suite covers these paths.
     Unit tests only; not yet deployed. Peers' observed addresses as the
     lasting answer to a stale or missing reflexive address are proposed,
     not built.
+
+282. **A relay port check gets through the host's own firewall** (2026-10-03,
+    seen on the real mesh: `export-config s25` on hetzner reported UDP
+    41001/41003/41005 unreachable with the cloud firewall open; the relay
+    itself worked with `--allow-unverified`). A check (M40) has the carrier
+    listen on the port itself, so the coordinator's probe meets the host's
+    INPUT hook — and ufw's `deny (incoming)` — while the port's real traffic
+    is translated in prerouting and forwarded, and only ever needed the
+    FORWARD openings the agent already makes. The check blamed a firewall
+    outside the host for one inside it.
+    - **`nftables::CHECK_MARK`** (`0x0800_0000`): `relay-pre` marks the
+      first packet of a flow from anywhere but the mesh to a port under a
+      check (`relay_checks`, only while one runs); the mark stays with the
+      flow.
+    - **`Opening::RelayCheck`**: `ct mark & C == C accept` on INPUT, in
+      every foreign input chain and iptables `INPUT` the mesh interface's
+      own opening goes into, on a carrier only (`ForwardWanted::relay_check`
+      = `transit_capable`; not part of `any()`, so no FORWARD chain becomes
+      routable through it). The one INPUT opening not pinned to the mesh
+      interface — pinned instead to a mark only our table sets, on a port
+      only while a check runs, so it lets nothing in between checks. Kept in
+      place rather than added per check, so a check doesn't race the
+      reconcile and the host firewall isn't rewritten for each.
+    - Not covered: firewalld, whose own table can't be written to and whose
+      rich rules can't match a ct mark (README says what to do there).
+    Kernel test (`kernel_a_relay_port_check_gets_through_a_host_firewall_that_drops_everything`):
+    a policy-drop input chain stops the probe; with the opening it
+    arrives on the checked port and not on another relay port; without the
+    marking rule it stays dropped (checked by switching the rule off).
+    Planner tests: inserted beside every mesh opening, none on FORWARD,
+    settles, comes out when no longer a carrier. Not run in the podman e2e.

@@ -11,12 +11,13 @@ use super::model::*;
 use super::planner::*;
 use super::ruleset;
 
-const NONE: ForwardWanted = ForwardWanted { transit: false, services: false, exit: false, relay: false };
-const TRANSIT: ForwardWanted = ForwardWanted { transit: true, services: false, exit: false, relay: false };
-const SERVICES: ForwardWanted = ForwardWanted { transit: false, services: true, exit: false, relay: false };
-const BOTH: ForwardWanted = ForwardWanted { transit: true, services: true, exit: false, relay: false };
-const EXIT: ForwardWanted = ForwardWanted { transit: true, services: false, exit: true, relay: false };
-const ALL: ForwardWanted = ForwardWanted { transit: true, services: true, exit: true, relay: true };
+const NONE: ForwardWanted = ForwardWanted { transit: false, services: false, exit: false, relay: false, relay_check: false };
+const TRANSIT: ForwardWanted = ForwardWanted { transit: true, services: false, exit: false, relay: false, relay_check: false };
+const SERVICES: ForwardWanted = ForwardWanted { transit: false, services: true, exit: false, relay: false, relay_check: false };
+const BOTH: ForwardWanted = ForwardWanted { transit: true, services: true, exit: false, relay: false, relay_check: false };
+const EXIT: ForwardWanted = ForwardWanted { transit: true, services: false, exit: true, relay: false, relay_check: false };
+const ALL: ForwardWanted = ForwardWanted { transit: true, services: true, exit: true, relay: true, relay_check: false };
+const CHECK: ForwardWanted = ForwardWanted { relay_check: true, ..NONE };
 
 const STRATO_LIKE: &[u8] = include_bytes!("../../../tests/fixtures/nft/strato_like.json");
 const NATIVE: &[u8] = include_bytes!("../../../tests/fixtures/nft/native.json");
@@ -192,6 +193,59 @@ fn iptables_line_is_exact_and_interface_scoped() {
         iptables_line("wg0", Opening::Input),
         "-A INPUT -i wg0 -m comment --comment \"wireserve:wg0\" -j ACCEPT"
     );
+}
+
+#[test]
+fn the_relay_check_line_is_exact_and_matches_only_the_check_mark() {
+    assert_eq!(
+        iptables_line("wg0", Opening::RelayCheck),
+        "-A INPUT -m connmark --mark 0x8000000/0x8000000 -m comment --comment \"wireserve:wg0\" -j ACCEPT"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Relay port checks (PLAN.md M40) — the one INPUT opening not pinned to
+// the mesh interface, pinned instead to the mark our table sets
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_carrier_opens_each_input_chain_for_its_port_checks_and_nothing_else() {
+    let rc = |a: &Action| matches!(a, Action::NftInsert { opening: Opening::RelayCheck, .. } | Action::IptablesInsert { opening: Opening::RelayCheck, .. });
+    assert!(!plan_reconcile(&ufw_forward(), "wg0", NONE).iter().any(rc), "only a carrier gets it");
+
+    let obs = ufw_forward();
+    let actions = plan_reconcile(&obs, "wg0", CHECK);
+    let nft_for = |want: Opening| -> Vec<ChainRef> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::NftInsert { chain, opening, .. } if *opening == want => Some(chain.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert!(!nft_for(Opening::RelayCheck).is_empty());
+    assert_eq!(nft_for(Opening::RelayCheck), nft_for(Opening::Input), "every chain the mesh is let into, and no other");
+    let ipt: Vec<_> = actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::IptablesInsert { target, opening: Opening::RelayCheck, .. } => Some(target.version),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ipt, [IpVersion::V4, IpVersion::V6], "ufw's INPUT, both families: {actions:#?}");
+    assert!(
+        !actions.iter().any(|a| matches!(a,
+            Action::NftInsert { opening, .. } | Action::IptablesInsert { opening, .. } if opening.hook() == Hook::Forward)),
+        "a check opens no FORWARD chain: {actions:#?}"
+    );
+
+    let installed = simulate(&obs, &actions);
+    assert_eq!(plan_reconcile(&installed, "wg0", CHECK), vec![], "it settles");
+    let off = plan_reconcile(&installed, "wg0", NONE);
+    assert!(off.iter().all(|a| matches!(a, Action::NftDelete { .. } | Action::IptablesDelete { .. })), "{off:#?}");
+    assert_eq!(off.len(), actions.iter().filter(|a| rc(a)).count(), "no longer a carrier: each check opening comes out, nothing else: {off:#?}");
+    assert_eq!(simulate(&installed, &plan_removal(&installed, "wg0")), obs, "removal restores the exact prior state");
 }
 
 #[test]

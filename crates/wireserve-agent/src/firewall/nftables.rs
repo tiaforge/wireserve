@@ -68,6 +68,16 @@ pub const EXIT_MARK: u32 = 0x0200_0000;
 /// exactly these flows, and the guard on the public interface lets them in.
 pub const RELAY_MARK: u32 = 0x0400_0000;
 
+/// The conntrack mark bit that says "this is the coordinator's probe of a
+/// relay port under a check" (PLAN.md M40). Set only on a port a check is
+/// running on, from anywhere but the mesh; the host firewalls' input chains
+/// let exactly these flows through to the agent's listener, which is what a
+/// check has to reach — the port's real traffic is forwarded, and never
+/// meets the input hook. Without it the host's own firewall (ufw's default
+/// `deny (incoming)`) dropped the probe, and the check blamed a firewall
+/// outside the host for a port that worked.
+pub const CHECK_MARK: u32 = 0x0800_0000;
+
 #[derive(Debug, thiserror::Error)]
 pub enum NftablesError {
     #[error("nftables error: {0}")]
@@ -837,6 +847,21 @@ pub(crate) fn apply_batch_with(
         let (nat, fwd) = public_relay_rules(t, ifname, public, me, &forwarding.relay_public, phones);
         relay_nat.extend(nat);
         objects.extend(fwd);
+    }
+    // The coordinator's probe of a port under a check (PLAN.md M40) is marked
+    // for the host firewalls' input chains (see `CHECK_MARK`). A nat chain
+    // sees a flow's first packet only, and the mark stays with the flow.
+    if forwarding.relay_ranges.is_some() && !forwarding.relay_checks.is_empty() {
+        let mut expr = not_mesh();
+        expr.push(Statement::Match(Match {
+            left: payload("udp", "dport"),
+            right: Expression::Named(NamedExpression::Set(
+                forwarding.relay_checks.iter().map(|p| SetItem::Element(Expression::Number(u32::from(*p)))).collect(),
+            )),
+            op: Operator::EQ,
+        }));
+        expr.push(add_bit(ct("mark", None), CHECK_MARK));
+        relay_nat.push(rule(t, RELAY_PRE_CHAIN, expr));
     }
     if !relay_nat.is_empty() {
         relay_nat.splice(0..0, [
@@ -1717,6 +1742,7 @@ mod tests {
             format!("iifname \"eth0\" oifname \"wg0\" ct mark & {r} == {r} ip daddr 100.90.0.4 udp dport 51820 accept"),
             format!("iifname \"eth0\" ct mark & {r} == {r} drop"),
             "iifname != \"wg0\" iifname != \"lo\" udp dport 41000-41999 udp dport != 41005 ct state new drop".to_string(),
+            format!("iifname != \"wg0\" iifname != \"lo\" udp dport 41005 ct mark set ct mark | 0x{CHECK_MARK:08x}"),
         ] {
             assert!(lines.contains(&want), "missing `{want}` in:\n{listing}");
         }
@@ -1928,6 +1954,67 @@ mod tests {
     /// The relay ports' drop (PLAN.md #274) spares this host's own UDP: a
     /// reply to a lookup sent from a relay port arrives, and a packet nobody
     /// asked for on one is still dropped.
+    /// A relay port check (PLAN.md M40) on a host whose own firewall drops
+    /// everything incoming, as ufw's `deny (incoming)` does: the probe from
+    /// outside reaches the listener only once the host firewall holds the
+    /// interop's `RelayCheck` opening, and only on the port under a check.
+    /// Before, the check failed on such a host though the relay itself
+    /// worked: its traffic is forwarded and never meets the input hook.
+    #[test]
+    fn kernel_a_relay_port_check_gets_through_a_host_firewall_that_drops_everything() {
+        use crate::firewall::host_interop::model::{ChainRef, Family, Opening};
+        use crate::firewall::host_interop::nft_ops::insert_accept;
+        if !crate::firewall::netns::reexec(
+            "firewall::nftables::tests::kernel_a_relay_port_check_gets_through_a_host_firewall_that_drops_everything",
+        ) {
+            return;
+        }
+        let mut outside = std::process::Command::new("unshare").args(["-n", "sleep", "60"]).spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let pid = outside.id();
+        let setup = format!(
+            "ip link set lo up
+             ip link add eth0 type veth peer name o0 && ip link set o0 netns {pid}
+             ip addr add 203.0.113.1/24 dev eth0 && ip link set eth0 up
+             nsenter -t {pid} -n sh -euc 'ip link set lo up; ip addr add 203.0.113.2/24 dev o0; ip link set o0 up'
+             nft add table inet ufwlike
+             nft add chain inet ufwlike input '{{ type filter hook input priority 0; policy drop; }}'"
+        );
+        let out = std::process::Command::new("sh").args(["-euc", &setup]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let forwarding = Forwarding {
+            relay_ranges: Some(((41000, 41999), (42000, 42999))),
+            relay_checks: vec![41005],
+            ..Forwarding::default()
+        };
+        let apply = |batches: &[Nftables<'_>]| {
+            let out = std::process::Command::new("sh").args(["-euc", &nft_script(batches)]).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        apply(&[apply_batch("wg0", &[], &forwarding)]);
+
+        let probe = |port: u16| -> bool {
+            let listener = std::net::UdpSocket::bind(("203.0.113.1", port)).unwrap();
+            listener.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+            let _ = std::process::Command::new("nsenter")
+                .args(["-t", &pid.to_string(), "-n", "python3", "-c"])
+                .arg(format!("import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b'nonce', ('203.0.113.1', {port}))"))
+                .status();
+            let mut buf = [0u8; 16];
+            listener.recv_from(&mut buf).is_ok()
+        };
+        let before = probe(41005);
+        let chain = ChainRef { family: Family::Inet, table: "ufwlike".into(), chain: "input".into() };
+        apply(&[insert_accept(&chain, "wg0", Opening::RelayCheck)]);
+        let after = probe(41005);
+        let unchecked = probe(41006);
+        let _ = outside.kill();
+        let _ = outside.wait();
+        assert!(!before, "the host firewall drops the probe without the opening");
+        assert!(after, "the probe of the port under a check reaches the listener");
+        assert!(!unchecked, "a relay port no check runs on stays closed");
+    }
+
     #[test]
     fn kernel_a_reply_to_this_hosts_own_udp_on_a_relay_port_arrives() {
         if !crate::firewall::netns::reexec(

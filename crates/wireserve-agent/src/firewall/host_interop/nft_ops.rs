@@ -11,7 +11,7 @@ use nftables::stmt::{Accept, Counter, Drop, Match, Operator, Statement};
 use nftables::types::{NfChainPolicy, NfChainType, NfFamily, NfHook};
 
 use super::model::{guard_table, tag, ChainRef, Family, ForwardWanted, Opening, GUARD_CHAIN};
-use crate::firewall::nftables::{EXIT_MARK, RELAY_MARK, SERVICE_MARK};
+use crate::firewall::nftables::{CHECK_MARK, EXIT_MARK, RELAY_MARK, SERVICE_MARK};
 
 fn nf_family(family: Family) -> NfFamily {
     match family {
@@ -64,6 +64,7 @@ fn opening_matches(ifname: &str, opening: Opening) -> Vec<Statement<'static>> {
         Opening::ExitReply => vec![oifname_is(ifname), mark_is(EXIT_MARK)],
         Opening::RelayRequest => vec![oifname_is(ifname), mark_is(RELAY_MARK)],
         Opening::RelayReply => vec![iifname_is(ifname), mark_is(RELAY_MARK)],
+        Opening::RelayCheck => vec![mark_is(CHECK_MARK)],
     }
 }
 
@@ -196,7 +197,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const TRANSIT: ForwardWanted = ForwardWanted { transit: true, services: false, exit: false, relay: false };
+    const TRANSIT: ForwardWanted = ForwardWanted { transit: true, services: false, exit: false, relay: false, relay_check: false };
 
     fn chain() -> ChainRef {
         ChainRef {
@@ -401,7 +402,7 @@ mod tests {
     /// expects, so they settle instead of being replaced every reconcile.
     #[test]
     fn kernel_service_openings_round_trip_and_settle() {
-        let both = ForwardWanted { transit: true, services: true, exit: true, relay: true };
+        let both = ForwardWanted { transit: true, services: true, exit: true, relay: true, relay_check: false };
         let forward = ChainRef { family: Family::Inet, table: "filter".into(), chain: "forward".into() };
         let setup = "nft -f - <<'EOF'\n\
             table inet filter {\n  chain input {\n    type filter hook input priority 0; policy drop;\n  }\n  \

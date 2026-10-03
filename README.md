@@ -1418,6 +1418,17 @@ firewall-cmd --get-zone-of-interface=wireserve0
 `sudo ufw allow in on wireserve0` or similar manual exceptions are not
 needed and can be removed.
 
+A carrier (`transit on`) also gets one input accept that is not tied to
+the mesh interface: `ct mark & 0x8000000 == 0x8000000` (iptables:
+`-m connmark --mark 0x8000000/0x8000000`). Only the agent's own table sets
+that bit, and only on the public relay port a `wireserve-admin
+export-config` is checking at that moment, so the coordinator's probe gets
+through the host's own firewall and the check measures the firewalls
+outside the host — the cloud firewall or router — which are the only ones
+to open by hand. firewalld is not covered: on a firewalld host, open the
+port being checked with `firewall-cmd --add-port=<port>/udp` for the
+duration, or pass `--allow-unverified`.
+
 In a container (Docker/Podman with host networking) the same happens on
 the host, except for firewalld, which the container can't reach; the agent
 logs the command to run on the host instead.
