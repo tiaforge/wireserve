@@ -154,10 +154,7 @@ impl Oidc {
     /// The client, from the provider's discovery document — fetched every
     /// time, so a provider rotating its keys is picked up.
     async fn client(&self) -> Result<Client, OidcError> {
-        let issuer = IssuerUrl::new(self.config.issuer.clone()).map_err(|e| OidcError::Provider(e.to_string()))?;
-        let metadata = CoreProviderMetadata::discover_async(issuer, &self.caller())
-            .await
-            .map_err(|e| OidcError::Provider(format!("discovery: {e}")))?;
+        let metadata = self.discover().await?;
         let redirect = RedirectUrl::new(self.config.redirect_url.clone()).map_err(|e| OidcError::Provider(e.to_string()))?;
         Ok(CoreClient::from_provider_metadata(
             metadata,
@@ -165,6 +162,29 @@ impl Oidc {
             Some(ClientSecret::new(self.config.client_secret.clone())),
         )
         .set_redirect_uri(redirect))
+    }
+
+    /// The provider's discovery document. Its issuer must be the configured
+    /// one, compared as a string, and providers differ on a trailing slash:
+    /// Authentik's ends in one, Keycloak's and Pocket ID's do not. Both forms
+    /// fetch the same document, so a mismatch in the slash alone is tried
+    /// the other way once, rather than making people type it exactly.
+    async fn discover(&self) -> Result<CoreProviderMetadata, OidcError> {
+        let configured = self.config.issuer.as_str();
+        let toggled = match configured.strip_suffix('/') {
+            Some(bare) => bare.to_string(),
+            None => format!("{configured}/"),
+        };
+        let mut last = String::new();
+        for candidate in [configured, toggled.as_str()] {
+            let issuer = IssuerUrl::new(candidate.to_string()).map_err(|e| OidcError::Provider(e.to_string()))?;
+            match CoreProviderMetadata::discover_async(issuer, &self.caller()).await {
+                Ok(m) => return Ok(m),
+                Err(e @ openidconnect::DiscoveryError::Validation(_)) => last = e.to_string(),
+                Err(e) => return Err(OidcError::Provider(format!("discovery: {e}"))),
+            }
+        }
+        Err(OidcError::Provider(format!("discovery: {last}")))
     }
 
     /// Where to send the browser to sign in, and what its return must match.

@@ -378,3 +378,16 @@ async fn only_an_email_the_provider_verified_is_kept() {
     wireserve_coordinator::oidc::refresh::pass(&app.state, &oidc).await;
     assert_eq!(owner().await.email, None);
 }
+
+#[tokio::test]
+async fn an_issuer_differing_only_in_a_trailing_slash_is_found() {
+    // Authentik's issuers end in a slash and Keycloak's do not; whichever
+    // way it was typed, the claim reaches the provider's sign-in.
+    let idp = start_idp().await;
+    let issuer = idp.lock().unwrap().issuer.clone();
+    let app = app(&format!("{issuer}/"));
+    call(&app.router, "POST", "/admin/nodes", None, None).await;
+    let (cookie, callback) = signed_in(&app, &idp, "alice", &["family"]).await;
+    let resp = call(&app.router, "GET", &callback, Some(&cookie), None).await;
+    assert_eq!(resp.status(), StatusCode::OK, "{}", text(resp).await);
+}

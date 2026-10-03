@@ -578,7 +578,9 @@ pub fn oidc_from_lookup(
         ConfigError::Invalid("WIRESERVE_OIDC_TOKEN_KEY", "must be 64 hexadecimal characters (32 bytes)".into())
     })?;
     Ok(Some(OidcConfig {
-        issuer: issuer.trim_end_matches('/').to_string(),
+        // As given: the provider's discovery document must name exactly
+        // this issuer, and some end theirs in a slash (`Oidc::discover`).
+        issuer,
         client_id,
         client_secret,
         scopes,
@@ -1025,7 +1027,7 @@ mod tests {
         };
         assert!(oidc_from_lookup(|_| None, None, &key).unwrap().is_none(), "off unless an issuer is set");
         let o = oidc_from_lookup(all, Some("https://mesh.example.com"), &key).unwrap().unwrap();
-        assert_eq!(o.issuer, "https://id.example.com");
+        assert_eq!(o.issuer, "https://id.example.com/", "kept as given: Authentik's issuers end in a slash");
         assert_eq!(o.redirect_url, "https://mesh.example.com/claim/callback");
         assert!(o.scopes.contains(&"offline_access".to_string()));
         assert_eq!(o.groups_claim, "groups");
