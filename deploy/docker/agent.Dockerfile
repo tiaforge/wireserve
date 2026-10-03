@@ -29,7 +29,7 @@
 # because there each container IS the node under test.)
 #
 # Host firewalls: the agent also makes ufw/iptables and other nftables
-# tables on the host let the mesh interface through (see README, "Other
+# tables on the host let the mesh interface through (see docs/firewall.md, "Other
 # firewalls on the host"), which with --network host happens on the host
 # itself — hence `nftables` and `iptables` in the image. firewalld is the
 # exception: it is driven over the host's D-Bus, which the container can't
