@@ -1,4 +1,9 @@
-# wireserve
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/wireserve-lockup-dark.svg">
+    <img src="docs/assets/wireserve-lockup-light.svg" alt="wireserve" width="360">
+  </picture>
+</h1>
 
 **Every service you self-host, on every device you own: by name, encrypted
 end to end, on infrastructure you control.**
