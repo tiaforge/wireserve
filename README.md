@@ -1,31 +1,52 @@
 # wireserve
 
-A self-hosted WireGuard mesh for publishing services between your own
-machines. You run one coordinator, and every machine that joins can reach
-the others directly and publish services under names like `plex.wg`. No
-traffic goes through the coordinator, and it never sees a private key.
+**Every service you self-host, on every device you own: by name, encrypted
+end to end, on infrastructure you control.**
 
-## Features
+wireserve turns your machines into a private WireGuard mesh and puts your
+services on it by name. Publish Plex on your home server with one command,
+and `plex.wg` works on your laptop, your phone and every other machine you
+have added. Nothing is opened to the internet, there are no WireGuard
+configs to write and no third-party account. You run the coordinator
+yourself, and it never sees your traffic or a single private key.
 
-- **A WireGuard mesh with nothing to configure by hand.** Each machine gets
-  a stable address and its peer list is kept up to date. It connects
-  directly to the others, through NAT where it can.
-- **Publish services by name.** `wireserve plex 80:32400` makes `plex.wg`
-  reach port 32400 on this machine. Each service has its own address, and
-  only the ports you publish are open.
-- **Phones and laptops without extra software.** They use the standard
-  WireGuard app with a generated config or a QR code.
-- **Works behind NAT.** When two machines can't reach each other, another
-  machine relays their traffic without being able to read it.
-- **Real names and HTTPS, optional.** Services can get names under your own
-  domain and Let's Encrypt certificates, issued on the machine that runs
-  them.
-- **Access control.** Choose who reaches what with groups, tags and your
-  identity provider's users, and require a sign-in for web services.
-- **Exit node.** A phone can send all its internet traffic through a
-  machine at home.
-- **Devices on your LAN.** Publish a router or printer through the machine
-  next to it.
+```sh
+wireserve plex 80:32400    # plex.wg now reaches Plex from anywhere in your mesh
+```
+
+## Why wireserve
+
+- 🔌 **No hand-written WireGuard.** A machine joins with one command and
+  a token. wireserve handles addresses, keys and peer lists, and machines
+  connect to each other directly, through NAT included.
+- 🏷️ **Services, not IP addresses.** One command publishes a service, and
+  every machine reaches it by name. Each service gets its own address, and
+  only the ports you publish are open. The rest of the machine stays
+  closed.
+- 🔒 **Real HTTPS on your own domain.** Optionally, `plex.example.com` gets
+  a Let's Encrypt certificate, and wireserve manages the DNS records for you
+  (Cloudflare, deSEC, Hetzner, Porkbun or any RFC 2136 server). The
+  certificate's key is created and kept on the machine that serves it.
+  WebSockets work.
+- 🪪 **Sign in with your own identity provider.** Put any web service behind
+  your Pocket ID, Authentik or Keycloak login, and decide who reaches what
+  by group, tag or user: `wireserve-admin grant add oidc:family media`.
+- 📱 **Phones with the stock WireGuard app.** Scan a QR code and you're in,
+  with no extra app. On untrusted Wi-Fi, a phone can send all its internet
+  traffic home through an exit node.
+- 🧱 **Gets through even hard NAT.** When two machines can't reach each
+  other directly, a third one relays their traffic. The connection stays
+  encrypted end to end, so the relay can't read it, and you don't run any
+  relay servers.
+- 🖨️ **Brings your LAN along.** Publish a router, NAS or printer through the
+  machine next to it, without installing anything on the device.
+- 🧯 **Works with the firewall you already have.** ufw, firewalld, Docker
+  hosts and your own nftables rules keep working. wireserve opens exactly
+  the mesh interface and nothing else, and restores that opening when they
+  reload.
+- 🛡️ **You stay in charge.** Nothing is published until you approve it, a
+  node can't carry other nodes' traffic unless you allow it, and a lost
+  laptop is cut off with one command.
 
 ## Requirements
 
