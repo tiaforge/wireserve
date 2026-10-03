@@ -4526,5 +4526,6 @@ what it can before saving.
     `/admin/owners`, and a test that an issuer differing only in its slash
     is found. The coordinator install e2e passes with the setup verbs
     (2026-10-03). The interactive prompts were walked through in a
-    container. The owner e2e (`sudo`) gained an `owner status` step and
-    has not been run.
+    container. The owner e2e (`sudo`) gained an `owner status` step, and
+    passes (2026-10-03) once its mock login marks the e-mail verified,
+    which #275 requires and the e2e had not been updated for (d8e994c).
