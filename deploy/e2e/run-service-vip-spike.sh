@@ -39,7 +39,7 @@ DEBUG_IMG=wireserve-e2e-debug-tools
 log() { echo; echo "=== $* ==="; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-cleanup() { podman rm -f "$CTR" >/dev/null 2>&1 || true; }
+cleanup() { podman rm -fv -t 0 "$CTR" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 cleanup
 

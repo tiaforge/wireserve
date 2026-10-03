@@ -41,9 +41,9 @@ pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 cleanup() {
-    podman rm -f "$COORD" "$BIND" >/dev/null 2>&1 || true
+    podman rm -fv -t 0 "$COORD" "$BIND" >/dev/null 2>&1 || true
     for c in $(podman ps -aq --filter "name=wireserve-dns-helper" 2>/dev/null); do
-        podman rm -f "$c" >/dev/null 2>&1 || true
+        podman rm -fv -t 0 "$c" >/dev/null 2>&1 || true
     done
     podman network rm "$NET" >/dev/null 2>&1 || true
     [ -n "${WORK:-}" ] && rm -rf "$WORK"
@@ -106,8 +106,7 @@ command -v python3 >/dev/null || fail "python3 not found on PATH"
 pass "podman and python3 are present"
 
 log "building images"
-podman build -q -f deploy/docker/coordinator.Dockerfile -t wireserve-coordinator:dns-test . >/dev/null
-podman build -q -f deploy/e2e/debug-tools.Dockerfile -t "$DEBUG_IMG" deploy/e2e >/dev/null
+./deploy/e2e/build.sh
 podman pull -q "$BIND_IMG" >/dev/null
 pass "images built"
 
@@ -161,7 +160,7 @@ start_coordinator() {
         -e WIRESERVE_DNS_TSIG_SECRET="$TSIG_SECRET" \
         -e WIRESERVE_DNS_TTL=60 \
         -e RUST_LOG=info \
-        wireserve-coordinator:dns-test >/dev/null
+        wireserve-coordinator:e2e >/dev/null
     sleep 2
 }
 podman volume rm -f wireserve-dns-coord-data >/dev/null 2>&1 || true
@@ -174,7 +173,9 @@ PX=$(new_node px)
 HOME_B=$(new_node home)
 poll "$PX" "[$(svc web 443 8443)]" >/dev/null
 poll "$HOME_B" "[$(svc prom 80 9090), $(svc plex 443 32400), $(svc docs 80 9091)]" >/dev/null
-sleep 8
+# A poll wakes the coordinator's DNS pass, which runs at most MIN_SPACING
+# (5s, dns/sync.rs) later: one has run by now.
+sleep 6
 [ -z "$(lookup web.$DOMAIN)" ] || fail "a pending service was published"
 admin service approve web --node px >/dev/null
 admin service approve prom --node home >/dev/null
@@ -220,11 +221,12 @@ pass "keep.$DOMAIN still 192.0.2.10 and prom.$DOMAIN still 192.0.2.99"
 
 log "6. a restart with everything already written changes nothing"
 SERIAL=$(in_netns "$COORD" dig +short "@$BIND_IP" "$DOMAIN" SOA | awk '{print $3}')
-podman rm -f "$COORD" >/dev/null
+podman rm -fv -t 0 "$COORD" >/dev/null
 start_coordinator
-sleep 10
+# The restarted coordinator runs a pass as it starts, and the poll wakes
+# another at most MIN_SPACING (5s) after that one: both have run by now.
 poll "$PX" "[$(svc web 443 8443)]" >/dev/null
-sleep 8
+sleep 6
 AFTER=$(in_netns "$COORD" dig +short "@$BIND_IP" "$DOMAIN" SOA | awk '{print $3}')
 [ "$SERIAL" = "$AFTER" ] || fail "the zone changed on restart (serial $SERIAL -> $AFTER)"
 expect_record "web.$DOMAIN" "$WEB_VIP"

@@ -43,3 +43,24 @@ podman build -f deploy/docker/coordinator.Dockerfile -t wireserve-coordinator .
 podman build -f deploy/docker/agent.Dockerfile -t wireserve-agent .   # the image runs /usr/local/bin/wireserve
 podman builder prune --all   # if a build ever looks like it reused something stale
 ```
+
+## Running the end-to-end tests
+
+The suites in `deploy/e2e/` stand up real meshes in Podman containers.
+Most need rootful Podman and the WireGuard kernel module; each says so at
+the top. Run them from anywhere:
+
+```sh
+sudo ./deploy/e2e/run-e2e-test.sh
+sudo E2E_RELEASE=1 ./deploy/e2e/run-e2e-test.sh   # test the release build instead
+```
+
+Each suite starts with `deploy/e2e/build.sh`, which compiles every binary
+once, as a debug build unless `E2E_RELEASE=1` is set. It compiles in a
+`rust:1-slim-bookworm` container, for the glibc reason above, and keeps
+cargo's target directory in the Podman volume `wireserve-e2e-target`, so
+later builds are incremental. The binaries land in `target/e2e/bin`, and
+the shipped Dockerfiles take them from there with
+`--build-arg BINARIES=prebuilt`. That way the suites test the same
+runtime images that ship. When nothing has changed, the build takes a few
+seconds, so running several suites in a row costs almost nothing.

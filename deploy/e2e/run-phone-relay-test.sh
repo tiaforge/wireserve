@@ -47,6 +47,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+. deploy/e2e/lib.sh
 
 INET=wireserve-pr-inet
 SITE_H=wireserve-pr-site-h
@@ -68,9 +69,9 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 note() { echo "NOTE: $*"; }
 
 cleanup() {
-    podman rm -f "$COORD" "$ROUTER_H" "$ROUTER_P" "$CARRIER" "$HOME_AGENT" "$PHONE" >/dev/null 2>&1 || true
+    podman rm -fv -t 0 "$COORD" "$ROUTER_H" "$ROUTER_P" "$CARRIER" "$HOME_AGENT" "$PHONE" >/dev/null 2>&1 || true
     for c in $(podman ps -aq --filter "name=wireserve-pr-helper" 2>/dev/null); do
-        podman rm -f "$c" >/dev/null 2>&1 || true
+        podman rm -fv -t 0 "$c" >/dev/null 2>&1 || true
     done
     podman network rm "$SITE_H" "$SITE_P" "$INET" >/dev/null 2>&1 || true
     rm -rf "$OUT"
@@ -110,9 +111,7 @@ modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available
 pass "podman, python3 and the WireGuard kernel module are present"
 
 log "building images"
-podman build -q -f deploy/docker/coordinator.Dockerfile -t wireserve-coordinator:pr-test . >/dev/null
-podman build -q -f deploy/docker/agent.Dockerfile -t wireserve-agent:pr-test . >/dev/null
-podman build -q -f deploy/e2e/debug-tools.Dockerfile -t "$DEBUG_IMG" deploy/e2e >/dev/null
+./deploy/e2e/build.sh
 pass "images built"
 
 log "creating the network segments"
@@ -124,7 +123,7 @@ pass "an 'internet' on a public-looking range, and two NAT-ed sites"
 log "starting the coordinator"
 podman run -d --name "$COORD" --network "$INET" \
     -e WIRESERVE_ADMIN_TOKEN="$ADMIN_TOKEN" \
-    wireserve-coordinator:pr-test >/dev/null
+    wireserve-coordinator:e2e >/dev/null
 sleep 2
 COORD_IP=$(ip_on "$COORD" "$INET")
 echo "coordinator: $COORD_IP"
@@ -149,7 +148,7 @@ ROUTER_P_LAN=$(ip_on "$ROUTER_P" "$SITE_P")
 log "starting the carrier directly on the inet segment"
 podman run -d --name "$CARRIER" --network "$INET" \
     --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun --sysctl net.ipv4.ip_forward=0 \
-    --entrypoint sleep wireserve-agent:pr-test infinity >/dev/null
+    --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
 sleep 1
 CARRIER_IP=$(ip_on "$CARRIER" "$INET")
 # Internal networks have no default route; a carrier finds the interface
@@ -161,11 +160,21 @@ echo "carrier: $CARRIER_IP ($CARRIER_IF)"
 log "starting the homeserver agent behind NAT"
 podman run -d --name "$HOME_AGENT" --network "$SITE_H" \
     --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
-    --entrypoint sleep wireserve-agent:pr-test infinity >/dev/null
+    --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
 sleep 1
 in_netns "$HOME_AGENT" ip route replace default via "$ROUTER_H_LAN" >/dev/null
 
 create_node() { admin node create "$1" | grep -oE 'jtk_[a-f0-9]+'; }
+sees() { podman exec "$1" wireserve status --json | grep -q "\"name\": \"$2\""; }
+pending() { podman exec "$1" wireserve status --json | grep -q '"pending": true'; }
+dialable_known() {
+    [ "$(admin node list --json | jq '[.dialable["node-carrier"], .dialable["node-home"]] | map(select(. != null)) | length')" = 2 ]
+}
+# The relay port the carrier holds for homeserver, as homeserver sees it.
+relay_port() {
+    podman exec "$HOME_AGENT" wireserve status --json \
+        | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(p['relay']['port'] for p in d['peers'] if p['name']=='node-home'))"
+}
 
 log "joining the two agents"
 JT_CARRIER=$(create_node node-carrier)
@@ -175,9 +184,11 @@ podman exec "$CARRIER" wireserve join "http://$COORD_IP:47820" --allow-plaintext
 podman exec "$HOME_AGENT" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_HOME" \
     --listen-port "$WG_PORT" 2>/dev/null
 for a in "$CARRIER" "$HOME_AGENT"; do
-    podman exec -d "$a" wireserve daemon --poll-interval-secs 5
+    podman exec -d "$a" wireserve daemon --poll-interval-secs "$POLL"
 done
-sleep 15
+wait_for 30 sees "$CARRIER" node-home || fail "node-carrier never got node-home into its peers"
+wait_for 30 sees "$HOME_AGENT" node-carrier || fail "node-home never got node-carrier into its peers"
+wait_for 40 dialable_known || true
 pass "both agents registered and polling"
 
 log "1/9: each agent knows whether it is dialable"
@@ -188,17 +199,16 @@ pass "carrier dialable, homeserver not"
 
 log "declaring a service on homeserver"
 podman exec "$HOME_AGENT" wireserve svc-home 12345
-sleep 8
+wait_for 20 pending "$HOME_AGENT" || fail "node-home never reported svc-home"
 admin service approve svc-home --node node-home || fail "could not approve svc-home"
-sleep 8
+wait_for 20 eval '! pending "$HOME_AGENT"' || fail "node-home never learnt svc-home was approved"
 
 log "opting the carrier in (both halves)"
 podman exec "$CARRIER" wireserve transit on
 admin transit approve node-carrier || fail "could not approve node-carrier"
-sleep 12
+wait_for 30 relay_port || fail "homeserver never got a relay port on the carrier"
 
-RELAY_PORT=$(admin node list >/dev/null; podman exec "$HOME_AGENT" wireserve status --json \
-    | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(p['relay']['port'] for p in d['peers'] if p['name']=='node-home'))")
+RELAY_PORT=$(relay_port)
 echo "homeserver's relay port: $RELAY_PORT"
 
 log "2/9: with the relay port blocked upstream, the export stops and says what to open"
@@ -225,7 +235,9 @@ pass "refused before creating anything, naming UDP $RELAY_PORT on $CARRIER_IP"
 in_netns "$CARRIER" nft delete table ip cloudfw
 
 log "3/9: exporting the phone's config"
-admin device create phone --register-url "http://127.0.0.1:47820" > "$OUT/phone.conf" 2>"$OUT/export.log" \
+# Tried again while the carrier may still be opening its relay port: a
+# refused export creates nothing (step 2).
+wait_for 20 eval 'admin device create phone --register-url "http://127.0.0.1:47820" > "$OUT/phone.conf" 2>"$OUT/export.log"' \
     || { cat "$OUT/export.log"; fail "device create failed with the port open"; }
 note "exported config:"
 sed 's/^PrivateKey = .*/PrivateKey = <redacted>/; s/^/  /' "$OUT/phone.conf"
@@ -236,7 +248,9 @@ grep -qE "AllowedIPs = [0-9.]+/2[0-9]" "$OUT/phone.conf" && fail "a covering mes
 [ "$(grep -c '^\[Peer\]' "$OUT/phone.conf")" = "2" ] || fail "expected exactly two [Peer] blocks"
 pass "carrier direct, homeserver at the relay port, carry MTU, no covering route"
 
-sleep 8
+# The phone is a peer of both agents from their next poll on.
+wait_for 20 sees "$CARRIER" phone || fail "the carrier never got the phone into its peers"
+wait_for 20 sees "$HOME_AGENT" phone || fail "homeserver never got the phone into its peers"
 
 log "bringing the phone up as a plain WireGuard client, no agent"
 podman run -d --name "$PHONE" --network "$SITE_P" \
@@ -264,7 +278,7 @@ svc_addr() { podman exec "$1" getent hosts "$2" | awk 'NR == 1 {print $1}'; }
 SVC_HOME=$(svc_addr "$CARRIER" svc-home.wg)
 [ -n "$SVC_HOME" ] || fail "svc-home.wg does not resolve"
 in_netns_bg "$HOME_AGENT" nc -l -k -p 12345
-sleep 5
+sleep 1
 
 log "4/9: the phone reaches the NAT-ed node's service through the relay"
 podman exec "$PHONE" timeout 30 bash -c "exec 3<>/dev/tcp/$SVC_HOME/12345" \

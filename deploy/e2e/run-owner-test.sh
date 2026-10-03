@@ -30,6 +30,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+. deploy/e2e/lib.sh
 
 NET=wireserve-ow-net
 COORD=wireserve-ow-coord
@@ -60,9 +61,9 @@ fail() {
 }
 
 cleanup() {
-    podman rm -f "$COORD" "$MOCK" "$HOME_AGENT" "$LAPTOP" "$TV" >/dev/null 2>&1 || true
+    podman rm -fv -t 0 "$COORD" "$MOCK" "$HOME_AGENT" "$LAPTOP" "$TV" >/dev/null 2>&1 || true
     for c in $(podman ps -aq --filter "name=wireserve-ow-helper" 2>/dev/null); do
-        podman rm -f "$c" >/dev/null 2>&1 || true
+        podman rm -fv -t 0 "$c" >/dev/null 2>&1 || true
     done
     podman network rm "$NET" >/dev/null 2>&1 || true
     if [ -n "$WORK" ]; then rm -rf "$WORK"; fi
@@ -88,7 +89,7 @@ vip_of() { podman exec "$LAPTOP" getent hosts "$1.wg" | awk '{print $1; exit}'; 
 ask() { in_netns "$1" sh -c "echo hi | timeout 8 socat -t3 - TCP:$(vip_of db):5432" 2>/dev/null || true; }
 reaches() { [ -n "$(ask "$1")" ]; }
 refused() { [ -z "$(ask "$1")" ]; }
-wait_for() {
+wait_until() {
     local what=$1 secs=$2; shift 2
     for _ in $(seq 1 "$secs"); do
         "$@" >/dev/null 2>&1 && return 0
@@ -109,9 +110,7 @@ modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available
 pass "podman and the WireGuard kernel module are present"
 
 log "building images"
-podman build -q -f deploy/docker/coordinator.Dockerfile -t wireserve-coordinator:ow-test . >/dev/null
-podman build -q -f deploy/docker/agent.Dockerfile -t wireserve-agent:ow-test . >/dev/null
-podman build -q -f deploy/e2e/debug-tools.Dockerfile -t "$DEBUG_IMG" deploy/e2e >/dev/null
+./deploy/e2e/build.sh
 podman pull -q "$MOCK_IMG" >/dev/null
 pass "images built"
 
@@ -122,13 +121,13 @@ podman run -d --name "$MOCK" --network "$NET" \
 sleep 2
 ISSUER="http://$(ip_on "$MOCK" "$NET"):8080/default"
 mock_up() { in_netns "$MOCK" curl -sf --max-time 3 "$ISSUER/.well-known/openid-configuration" >/dev/null; }
-wait_for "the provider to answer" 60 mock_up
+wait_until "the provider to answer" 60 mock_up
 podman run -d --name "$COORD" --network "$NET" --network-alias coord \
     -e WIRESERVE_ADMIN_TOKEN="$ADMIN_TOKEN" -e WIRESERVE_REQUIRE_SERVICE_APPROVAL=false \
     -e WIRESERVE_PUBLIC_URL="$PUBLIC" \
     -e WIRESERVE_OIDC_ISSUER="$ISSUER" -e WIRESERVE_OIDC_CLIENT_ID=wireserve \
     -e WIRESERVE_OIDC_CLIENT_SECRET=anything -e WIRESERVE_OIDC_REFRESH_SECS=60 \
-    wireserve-coordinator:ow-test >/dev/null
+    wireserve-coordinator:e2e >/dev/null
 sleep 3
 COORD_IP=$(ip_on "$COORD" "$NET")
 
@@ -137,19 +136,19 @@ for pair in "$HOME_AGENT:node-home" "$LAPTOP:node-laptop" "$TV:node-tv"; do
     c=${pair%%:*}; n=${pair#*:}
     podman run -d --name "$c" --network "$NET" \
         --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
-        --entrypoint sleep wireserve-agent:ow-test infinity >/dev/null
+        --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
     jt=$(admin node create "$n" 2>/dev/null | grep -oE 'jtk_[a-f0-9]+')
     podman exec "$c" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$jt" \
         --listen-port "$WG_PORT" --endpoint "$(ip_on "$c" "$NET"):$WG_PORT" 2>/dev/null
-    podman exec -d "$c" sh -c 'wireserve daemon --poll-interval-secs 3 >/var/log/agent.log 2>&1'
+    podman exec -d "$c" sh -c 'wireserve daemon --poll-interval-secs '"$POLL"' >/var/log/agent.log 2>&1'
 done
 admin group create infra
 admin grant add oidc:family infra
 podman exec "$HOME_AGENT" wireserve db 5432 --group infra
 in_netns_bg "$HOME_AGENT" socat TCP-LISTEN:5432,fork,reuseaddr EXEC:cat
-wait_for "db to resolve on the laptop" 60 sh -c "podman exec $LAPTOP getent hosts db.wg"
-wait_for "db to resolve on the tv" 60 sh -c "podman exec $TV getent hosts db.wg"
-sleep 6
+wait_until "db to resolve on the laptop" 60 sh -c "podman exec $LAPTOP getent hosts db.wg"
+wait_until "db to resolve on the tv" 60 sh -c "podman exec $TV getent hosts db.wg"
+settle
 refused "$LAPTOP" || fail "the laptop reached db before anyone claimed it"
 refused "$TV" || fail "the tv reached db"
 pass "db is in infra; nobody but home reaches it"
@@ -178,7 +177,7 @@ browser --data-urlencode "token=$TOKEN" "$PUBLIC/claim/confirm" | grep -q 'is yo
 admin node access node-laptop | tee "$WORK/laptop.out"
 grep -q 'belongs to alice@example.com' "$WORK/laptop.out" || fail "the laptop has no owner"
 grep -q 'oidc:family' "$WORK/laptop.out" || fail "the laptop does not act as oidc:family"
-wait_for "the laptop to reach db" 30 reaches "$LAPTOP"
+wait_until "the laptop to reach db" 30 reaches "$LAPTOP"
 refused "$TV" || fail "the unclaimed tv reached db"
 pass "node-laptop belongs to alice and reaches db; node-tv does not"
 
@@ -188,7 +187,7 @@ pass "a used link is refused"
 
 log "4/5: the owner's groups are refreshed"
 refreshed() { podman logs "$COORD" 2>&1 | grep -q 'owner_refreshed'; }
-wait_for "a refresh of alice's groups" 150 refreshed
+wait_until "a refresh of alice's groups" 150 refreshed
 podman logs "$COORD" 2>&1 | grep -E 'owner refresh failed|owner_dropped' && fail "refreshing alice's groups failed"
 admin node access node-laptop | grep -q 'belongs to alice@example.com' || fail "alice lost the laptop on refresh"
 reaches "$LAPTOP" || fail "the laptop lost db on refresh"
@@ -201,7 +200,7 @@ pass "owner status: provider answering, oidc:family granted, alice owns node-lap
 
 log "5/5: owner clear takes it away"
 admin owner clear node-laptop
-wait_for "the laptop to be refused db" 30 refused "$LAPTOP"
+wait_until "the laptop to be refused db" 30 refused "$LAPTOP"
 pass "node-laptop belongs to nobody, and is refused"
 
 echo

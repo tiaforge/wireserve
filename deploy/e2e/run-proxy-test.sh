@@ -26,6 +26,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+. deploy/e2e/lib.sh
 
 FRONT=wireserve-proxy-front
 BACK=wireserve-proxy-back
@@ -42,7 +43,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 note() { echo "NOTE: $*"; }
 
 cleanup() {
-    podman rm -f "$COORD" "$PROXY" "$AGENT1" "$AGENT2" >/dev/null 2>&1 || true
+    podman rm -fv -t 0 "$COORD" "$PROXY" "$AGENT1" "$AGENT2" >/dev/null 2>&1 || true
     podman network rm "$FRONT" "$BACK" >/dev/null 2>&1 || true
     # ${WORK:-} because the trap is armed before the directory exists, so
     # an early failure must not expand to `rm -rf ""`.
@@ -64,8 +65,7 @@ modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available
 pass "podman, openssl and the WireGuard kernel module are present"
 
 log "building images"
-podman build -q -f deploy/docker/coordinator.Dockerfile -t wireserve-coordinator:proxy-test . >/dev/null
-podman build -q -f deploy/docker/agent.Dockerfile -t wireserve-agent:proxy-test . >/dev/null
+./deploy/e2e/build.sh
 pass "images built"
 
 log "generating a private CA and a server certificate"
@@ -94,7 +94,7 @@ log "starting the coordinator on the back segment only"
 podman run -d --name "$COORD" --network "$BACK" \
     -e WIRESERVE_ADMIN_TOKEN="$ADMIN_TOKEN" \
     -e WIRESERVE_TRUST_PROXY_HEADERS=true \
-    wireserve-coordinator:proxy-test >/dev/null
+    wireserve-coordinator:e2e >/dev/null
 sleep 2
 COORD_IP=$(podman inspect "$COORD" --format "{{(index .NetworkSettings.Networks \"$BACK\").IPAddress}}")
 echo "coordinator (back segment only): $COORD_IP"
@@ -138,7 +138,7 @@ start_agent() {
         --cap-add=NET_ADMIN --device /dev/net/tun \
         --add-host "$HOSTNAME_FQDN:$PROXY_IP" \
         -v "$WORK/ca.crt:/usr/local/share/ca-certificates/wireserve-test-ca.crt:ro,Z" \
-        --entrypoint sleep wireserve-agent:proxy-test infinity >/dev/null
+        --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
     sleep 1
     # Install the private CA properly rather than turning verification
     # off: the point is to prove the agent's HTTPS client validates a
@@ -207,19 +207,30 @@ log "checking the two agents get separate rate-limit budgets behind one proxy"
 # are keyed separately; agent1 burning its budget must not affect agent2.
 # Burn agent1's budget with bad bearer tokens, then confirm agent2 is
 # unaffected. Keyed on the proxy's address these would share one bucket.
-for _ in $(seq 1 12); do
-    podman exec "$AGENT1" wireserve join "$URL" "jtk_deliberately_wrong" \
-        --listen-port 51820 >/dev/null 2>&1 || true
-done
+#
+# Straight to /register from agent1's network namespace, not with
+# `wireserve join`: that first spends 3s on a reflexive-address probe,
+# which nothing answers behind this proxy, every time.
+BAD_REGISTER="{\"join_token\":\"jtk_deliberately_wrong\",\"pubkey\":\"$(head -c 32 /dev/urandom | base64)\",\"listen_port\":51820}"
+podman run --rm --network "container:$AGENT1" wireserve-e2e-debug-tools sh -c "
+    for _ in \$(seq 1 12); do
+        curl -sk -o /dev/null --max-time 10 --resolve '$HOSTNAME_FQDN:443:$PROXY_IP' \
+            -X POST -H 'Content-Type: application/json' -d '$BAD_REGISTER' '$URL/register' || true
+    done"
+[ "$(podman logs "$COORD" 2>&1 | grep -c auth_failure)" -ge 12 ] \
+    || fail "the bad registrations never reached the coordinator as failed sign-ins"
 JT3=$(create_node node3)
 podman exec "$AGENT2" wireserve join "$URL" "$JT3" --listen-port 51822 \
     || fail "agent2 was rate-limited by agent1's failures — the budget is being shared"
 pass "one agent burning its budget does not block the other behind the same proxy"
 
 log "both agents poll successfully through the proxy"
-podman exec -d "$AGENT1" sh -c "wireserve daemon --poll-interval-secs 5 >/tmp/daemon.log 2>&1"
-podman exec -d "$AGENT2" sh -c "wireserve daemon --poll-interval-secs 5 >/tmp/daemon.log 2>&1"
-sleep 15
+podman exec -d "$AGENT1" sh -c "wireserve daemon --poll-interval-secs $POLL >/tmp/daemon.log 2>&1"
+podman exec -d "$AGENT2" sh -c "wireserve daemon --poll-interval-secs $POLL >/tmp/daemon.log 2>&1"
+sees() { podman exec "$1" wireserve status --json | grep -q "\"name\": \"$2\""; }
+# Each lists node1 once it has polled (agent2 joined again as node3 above).
+wait_for 30 sees "$AGENT1" node1 || fail "agent1 never polled through the proxy"
+wait_for 30 sees "$AGENT2" node1 || fail "agent2 never polled through the proxy"
 for a in node1 node2; do
     podman exec "$COORD" wireserve-admin node list --json | jq -e --arg n "$a" 'any(.peers[]; .name == $n)' >/dev/null \
         || fail "$a vanished from the directory"
@@ -235,7 +246,7 @@ coord_events() { podman logs "$COORD" 2>&1 | grep -c "service_declared" || true;
 POLLED=$(coord_events)
 podman exec "$AGENT1" wireserve proxysvc 9999 \
     || fail "could not declare a service on agent1"
-sleep 8
+wait_for 20 eval '[ "$(coord_events)" -gt "$POLLED" ]' || true
 POLLED_AFTER=$(coord_events)
 [ "$POLLED_AFTER" -gt "$POLLED" ] \
     || fail "no poll reached the coordinator through the proxy after a serve"

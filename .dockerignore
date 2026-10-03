@@ -6,3 +6,5 @@ target/
 *.sqlite
 *.sqlite3
 .env
+# ...except what deploy/e2e/build.sh compiled, for `--build-arg BINARIES=prebuilt`.
+!target/e2e/bin/

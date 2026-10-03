@@ -39,6 +39,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+. deploy/e2e/lib.sh
 
 NET=wireserve-tt-net
 COORD=wireserve-tt-coord
@@ -72,9 +73,9 @@ fail() {
 }
 
 cleanup() {
-    podman rm -f "$COORD" "$BIND" "$PEBBLE" "$HOME_AGENT" "$CLIENT" >/dev/null 2>&1 || true
+    podman rm -fv -t 0 "$COORD" "$BIND" "$PEBBLE" "$HOME_AGENT" "$CLIENT" >/dev/null 2>&1 || true
     for c in $(podman ps -aq --filter "name=wireserve-tt-helper" 2>/dev/null); do
-        podman rm -f "$c" >/dev/null 2>&1 || true
+        podman rm -fv -t 0 "$c" >/dev/null 2>&1 || true
     done
     podman network rm "$NET" >/dev/null 2>&1 || true
     [ -n "${WORK:-}" ] && rm -rf "$WORK"
@@ -123,7 +124,7 @@ signal() {
     podman exec "$1" sh -c 'for p in /proc/[0-9]*; do [ "${p#/proc/}" = "$$" ] && continue; tr "\0" " " 2>/dev/null <$p/cmdline | grep -q -- "'"$3"'" && kill -'"$2"' ${p#/proc/} 2>/dev/null; done; true' \
         || fail "could not signal $3 in $1"
 }
-wait_for() {
+wait_until() {
     local what=$1 secs=$2; shift 2
     for _ in $(seq 1 "$secs"); do
         "$@" >/dev/null 2>&1 && return 0
@@ -141,9 +142,7 @@ modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available
 pass "podman, python3 and the WireGuard kernel module are present"
 
 log "building images"
-podman build -q -f deploy/docker/coordinator.Dockerfile -t wireserve-coordinator:tt-test . >/dev/null
-podman build -q -f deploy/docker/agent.Dockerfile -t wireserve-agent:tt-test . >/dev/null
-podman build -q -f deploy/e2e/debug-tools.Dockerfile -t "$DEBUG_IMG" deploy/e2e >/dev/null
+./deploy/e2e/build.sh
 podman pull -q "$BIND_IMG" >/dev/null
 podman pull -q "$PEBBLE_IMG" >/dev/null
 pass "images built"
@@ -190,14 +189,14 @@ podman run -d --name "$COORD" --network "$NET" \
     -e WIRESERVE_DNS_TSIG_KEY_NAME=wireserve -e WIRESERVE_DNS_TSIG_SECRET="$TSIG_SECRET" \
     -e WIRESERVE_DNS_TTL=60 \
     -e WIRESERVE_ACME_DIRECTORY=https://pebble:14000/dir -e WIRESERVE_ACME_PROPAGATION_SECS=0 \
-    wireserve-coordinator:tt-test >/dev/null
+    wireserve-coordinator:e2e >/dev/null
 sleep 2
 COORD_IP=$(ip_on "$COORD" "$NET")
 
 for c in "$HOME_AGENT" "$CLIENT"; do
     podman run -d --name "$c" --network "$NET" \
         --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
-        --entrypoint sleep wireserve-agent:tt-test infinity >/dev/null
+        --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
 done
 podman cp "$WORK/pebble-minica.pem" "$HOME_AGENT:/etc/pebble-minica.pem"
 
@@ -207,11 +206,11 @@ for pair in "$HOME_AGENT:node-home" "$CLIENT:node-client"; do
     jt=$(admin node create "$n" | grep -oE 'jtk_[a-f0-9]+')
     podman exec "$c" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$jt" \
         --listen-port "$WG_PORT" --endpoint "$(ip_on "$c" "$NET"):$WG_PORT" 2>/dev/null
-    podman exec -d "$c" sh -c 'wireserve daemon --poll-interval-secs 3 >/var/log/agent.log 2>&1'
+    podman exec -d "$c" sh -c 'wireserve daemon --poll-interval-secs '"$POLL"' >/var/log/agent.log 2>&1'
 done
 start_terminator() {
     podman exec -d "$HOME_AGENT" sh -c 'WIRESERVE_ACME_CA_FILE=/etc/pebble-minica.pem \
-        wireserve tls-daemon --state-dir /var/lib/wireserve-tls >>/var/log/tls.log 2>&1'
+        wireserve tls-daemon --state-dir /var/lib/wireserve-tls --check-in-secs '"$POLL"' >>/var/log/tls.log 2>&1'
 }
 # Something else of the host's on every address's 443 (PLAN.md M35),
 # there before the terminator, the way a Caddy started at boot would be.
@@ -221,7 +220,7 @@ podman exec "$HOME_AGENT" wireserve plex 443:32400 81:32401
 for port in 32400 32401; do
     in_netns_bg "$HOME_AGENT" socat "TCP-LISTEN:$port,fork,reuseaddr" EXEC:"/e2e/echo-backend.sh $port"
 done
-sleep 8
+wait_until "plex to get a service address" 30 eval '[ -n "$(entry "$HOME_AGENT" plex vip4)" ]'
 PLEX_VIP=$(entry "$HOME_AGENT" plex vip4)
 HOME_IP=$(podman exec "$HOME_AGENT" wireserve status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["node"]["ip4"])' 2>/dev/null || true)
 [ -n "$PLEX_VIP" ] || fail "plex has no service address: $(podman exec "$HOME_AGENT" wireserve status)"
@@ -229,12 +228,12 @@ pass "plex at $PLEX_VIP"
 
 log "1/10: a certificate from Pebble, and plex terminated"
 terminated_on() { [ "$(entry "$1" plex terminated)" = True ]; }
-wait_for "the terminator to report plex" 90 terminated_on "$HOME_AGENT"
+wait_until "the terminator to report plex" 90 terminated_on "$HOME_AGENT"
 podman exec "$HOME_AGENT" grep -q 'certificate issued' /var/log/tls.log || fail "no issuance in the terminator's log"
 [ "$(podman exec "$HOME_AGENT" grep -c 'certificate issued' /var/log/tls.log)" = 1 ] || fail "more than one issuance"
 in_netns "$CLIENT" curl -sk --max-time 10 https://pebble:15000/roots/0 > "$WORK/pebble-root.pem"
 grep -q 'BEGIN CERTIFICATE' "$WORK/pebble-root.pem" || fail "could not fetch Pebble's issuing root"
-wait_for "the client to see plex terminated" 30 terminated_on "$CLIENT"
+wait_until "the client to see plex terminated" 30 terminated_on "$CLIENT"
 pass "issued once; the directory says terminated"
 
 log "2/10: from the client, verified TLS on the service's own address"
@@ -277,7 +276,7 @@ fi
 pass "81 → 32401 mapped; 32400 closed from the mesh"
 
 log "6/10: no challenge record left behind"
-wait_for "the challenge record to go" 30 sh -c "[ -z \"\$(podman run --rm --network container:$COORD $DEBUG_IMG dig +short @$BIND_IP _acme-challenge.plex.$DOMAIN TXT)\" ]"
+wait_until "the challenge record to go" 30 sh -c "[ -z \"\$(podman run --rm --network container:$COORD $DEBUG_IMG dig +short @$BIND_IP _acme-challenge.plex.$DOMAIN TXT)\" ]"
 pass "_acme-challenge.plex.$DOMAIN is empty"
 
 log "7/10: a restarted terminator serves the stored certificate"
@@ -285,7 +284,9 @@ SERIAL=$(in_netns "$CLIENT" sh -c "echo | openssl s_client -connect $PLEX_VIP:44
 signal "$HOME_AGENT" TERM 'wireserve tls-daemon'
 sleep 1
 start_terminator
-sleep 12
+wait_until "plex served after the restart" 30 eval 'fetch "$CLIENT" | grep -q "^STATUS 200"'
+# Time for a wrong second issuance to show in the log.
+settle
 [ "$(podman exec "$HOME_AGENT" grep -c 'certificate issued' /var/log/tls.log)" = 1 ] || fail "the restart issued a new certificate"
 fetch "$CLIENT" | grep -q '^STATUS 200' || fail "not served after the restart"
 AFTER=$(in_netns "$CLIENT" sh -c "echo | openssl s_client -connect $PLEX_VIP:443 -servername plex.$DOMAIN 2>/dev/null | openssl x509 -noout -serial" 2>/dev/null || true)
@@ -295,37 +296,37 @@ pass "same certificate, no new issuance"
 log "8/10: a stopped terminator hands the address back to the mapping"
 signal "$HOME_AGENT" TERM 'wireserve tls-daemon'
 # The firewall stops relying on it after 30s without a check-in.
-wait_for "plain HTTP on :443 to reach the backend again" 60 \
+wait_until "plain HTTP on :443 to reach the backend again" 60 \
     sh -c "podman run --rm --network container:$CLIENT $DEBUG_IMG curl -s --max-time 3 http://$PLEX_VIP:443/ | grep -q backend:32400"
 pass "vip:443 is the plain mapping again"
 start_terminator
-wait_for "TLS back on :443" 60 sh -c "podman run --rm --network container:$CLIENT -v $WORK:/work:ro,Z $DEBUG_IMG curl -s --max-time 3 --cacert /work/pebble-root.pem --resolve plex.$DOMAIN:443:$PLEX_VIP https://plex.$DOMAIN/ | grep -q backend:32400"
+wait_until "TLS back on :443" 60 sh -c "podman run --rm --network container:$CLIENT -v $WORK:/work:ro,Z $DEBUG_IMG curl -s --max-time 3 --cacert /work/pebble-root.pem --resolve plex.$DOMAIN:443:$PLEX_VIP https://plex.$DOMAIN/ | grep -q backend:32400"
 pass "and TLS again once it is back"
 
 log "9/10: local routes go with the daemon, and a crash's are swept"
 in_netns "$HOME_AGENT" ip -4 route show table local proto 247 | grep -q "$PLEX_VIP" \
     || fail "no local route for $PLEX_VIP while terminated"
 signal "$HOME_AGENT" TERM 'wireserve daemon'
-sleep 4
+wait_until "the daemon to remove its local route" 10 eval '! in_netns "$HOME_AGENT" ip -4 route show table local proto 247 | grep -q .'
 in_netns "$HOME_AGENT" ip -4 route show table local proto 247 | grep -q . \
     && fail "a stopped daemon left its local route"
 pass "a clean stop removes the local route"
-podman exec -d "$HOME_AGENT" sh -c 'wireserve daemon --poll-interval-secs 3 >/var/log/agent.log 2>&1'
-wait_for "the route to come back" 60 sh -c "podman run --rm --network container:$HOME_AGENT --cap-add=NET_ADMIN $DEBUG_IMG ip -4 route show table local proto 247 | grep -q $PLEX_VIP"
+podman exec -d "$HOME_AGENT" sh -c 'wireserve daemon --poll-interval-secs '"$POLL"' >/var/log/agent.log 2>&1'
+wait_until "the route to come back" 60 sh -c "podman run --rm --network container:$HOME_AGENT --cap-add=NET_ADMIN $DEBUG_IMG ip -4 route show table local proto 247 | grep -q $PLEX_VIP"
 signal "$HOME_AGENT" KILL 'wireserve daemon'
 sleep 1
 in_netns "$HOME_AGENT" ip -4 route show table local proto 247 | grep -q "$PLEX_VIP" \
     || fail "the route should have outlived a kill -9 (nothing left to test otherwise)"
-podman exec -d "$HOME_AGENT" sh -c 'wireserve daemon --poll-interval-secs 3 >/var/log/agent2.log 2>&1'
-wait_for "the sweep" 20 podman exec "$HOME_AGENT" grep -q 'left behind' /var/log/agent2.log
+podman exec -d "$HOME_AGENT" sh -c 'wireserve daemon --poll-interval-secs '"$POLL"' >/var/log/agent2.log 2>&1'
+wait_until "the sweep" 20 podman exec "$HOME_AGENT" grep -q 'left behind' /var/log/agent2.log
 pass "the leftover route was swept at start"
 [ -n "$HOME_IP" ] || true
 
 log "10/10: a WebSocket through the terminator"
-wait_for "plex served again after the restarts" 60 sh -c "podman run --rm --network container:$CLIENT -v $WORK:/work:ro,Z $DEBUG_IMG curl -s --max-time 3 --cacert /work/pebble-root.pem --resolve plex.$DOMAIN:443:$PLEX_VIP https://plex.$DOMAIN/ | grep -q backend:32400"
+wait_until "plex served again after the restarts" 60 sh -c "podman run --rm --network container:$CLIENT -v $WORK:/work:ro,Z $DEBUG_IMG curl -s --max-time 3 --cacert /work/pebble-root.pem --resolve plex.$DOMAIN:443:$PLEX_VIP https://plex.$DOMAIN/ | grep -q backend:32400"
 # The plain backend on 32400 makes way for a WebSocket one.
 for c in $(podman ps -q --filter "name=wireserve-tt-helper"); do
-    podman inspect "$c" --format '{{join .Config.Cmd " "}}' | grep -q 'TCP-LISTEN:32400' && podman rm -f "$c" >/dev/null
+    podman inspect "$c" --format '{{join .Config.Cmd " "}}' | grep -q 'TCP-LISTEN:32400' && podman rm -fv -t 0 "$c" >/dev/null
 done
 in_netns_bg "$HOME_AGENT" python3 /e2e/ws-backend.py 32400
 cp deploy/e2e/ws-client.py "$WORK/ws-client.py"
@@ -336,7 +337,7 @@ m = [p['ip4'] for p in json.load(sys.stdin).get('peers', []) if p.get('name') ==
 print(m[0] if m else '')")
 [ -n "$CLIENT_IP" ] || fail "the home node does not list node-client"
 ws_ok() { in_netns "$CLIENT" python3 /work/ws-client.py "wss://plex.$DOMAIN/live?x=1" "$PLEX_VIP" /work/pebble-root.pem; }
-wait_for "the WebSocket backend" 20 ws_ok
+wait_until "the WebSocket backend" 20 ws_ok
 OUT=$(ws_ok) || true
 echo "$OUT" | sed 's/^/  /'
 echo "$OUT" | grep -q '^subprotocol=chat$' || fail "the backend's subprotocol did not reach the client"

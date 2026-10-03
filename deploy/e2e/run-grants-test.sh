@@ -27,6 +27,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+. deploy/e2e/lib.sh
 
 NET=wireserve-gr-net
 COORD=wireserve-gr-coord
@@ -56,9 +57,9 @@ fail() {
 }
 
 cleanup() {
-    podman rm -f "$COORD" "$HOME_AGENT" "$CLIENT_A" "$CLIENT_B" >/dev/null 2>&1 || true
+    podman rm -fv -t 0 "$COORD" "$HOME_AGENT" "$CLIENT_A" "$CLIENT_B" >/dev/null 2>&1 || true
     for c in $(podman ps -aq --filter "name=wireserve-gr-helper" 2>/dev/null); do
-        podman rm -f "$c" >/dev/null 2>&1 || true
+        podman rm -fv -t 0 "$c" >/dev/null 2>&1 || true
     done
     podman network rm "$NET" >/dev/null 2>&1 || true
     if [ -n "$WORK" ]; then rm -rf "$WORK"; fi
@@ -106,7 +107,7 @@ groups_of() {
     admin service list --json | jq -r --arg n "$1" '.services[] | select(.name == $n) | .groups[]'
 }
 
-wait_for() {
+wait_until() {
     local what=$1 secs=$2; shift 2
     for _ in $(seq 1 "$secs"); do
         "$@" >/dev/null 2>&1 && return 0
@@ -124,16 +125,14 @@ modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available
 pass "podman and the WireGuard kernel module are present"
 
 log "building images"
-podman build -q -f deploy/docker/coordinator.Dockerfile -t wireserve-coordinator:gr-test . >/dev/null
-podman build -q -f deploy/docker/agent.Dockerfile -t wireserve-agent:gr-test . >/dev/null
-podman build -q -f deploy/e2e/debug-tools.Dockerfile -t "$DEBUG_IMG" deploy/e2e >/dev/null
+./deploy/e2e/build.sh
 pass "images built"
 
 log "coordinator, approval off"
 podman network create --internal "$NET" >/dev/null
 podman run -d --name "$COORD" --network "$NET" \
     -e WIRESERVE_ADMIN_TOKEN="$ADMIN_TOKEN" -e WIRESERVE_REQUIRE_SERVICE_APPROVAL=false \
-    wireserve-coordinator:gr-test >/dev/null
+    wireserve-coordinator:e2e >/dev/null
 sleep 2
 COORD_IP=$(ip_on "$COORD" "$NET")
 
@@ -142,23 +141,23 @@ for pair in "$HOME_AGENT:node-home" "$CLIENT_A:node-a" "$CLIENT_B:node-b"; do
     c=${pair%%:*}; n=${pair#*:}
     podman run -d --name "$c" --network "$NET" \
         --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
-        --entrypoint sleep wireserve-agent:gr-test infinity >/dev/null
+        --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
     jt=$(admin node create "$n" | grep -oE 'jtk_[a-f0-9]+')
     podman exec "$c" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$jt" \
         --listen-port "$WG_PORT" --endpoint "$(ip_on "$c" "$NET"):$WG_PORT" 2>/dev/null
-    podman exec -d "$c" sh -c 'wireserve daemon --poll-interval-secs 3 >/var/log/agent.log 2>&1'
+    podman exec -d "$c" sh -c 'wireserve daemon --poll-interval-secs '"$POLL"' >/var/log/agent.log 2>&1'
 done
 admin tag add node-a ops
 podman exec "$HOME_AGENT" wireserve web 80:8080
 podman exec "$HOME_AGENT" wireserve db 5432
 in_netns_bg "$HOME_AGENT" socat TCP-LISTEN:8080,fork,reuseaddr SYSTEM:'read x; echo web'
 in_netns_bg "$HOME_AGENT" socat TCP-LISTEN:5432,fork,reuseaddr EXEC:cat
-wait_for "db to resolve on a" 60 sh -c "podman exec $CLIENT_A getent hosts db.wg"
-wait_for "db to resolve on b" 60 sh -c "podman exec $CLIENT_B getent hosts db.wg"
+wait_until "db to resolve on a" 60 sh -c "podman exec $CLIENT_A getent hosts db.wg"
+wait_until "db to resolve on b" 60 sh -c "podman exec $CLIENT_B getent hosts db.wg"
 pass "home serves web and db; node-a is tagged ops"
 
 log "1/6: a fresh mesh reaches everything"
-wait_for "a to reach db" 30 reaches "$CLIENT_A" db 5432
+wait_until "a to reach db" 30 reaches "$CLIENT_A" db 5432
 for c in "$CLIENT_A" "$CLIENT_B"; do
     reaches "$c" web 80 || { explain web 80 8080; fail "$c does not reach web"; }
     reaches "$c" db 5432 || { explain db 5432 5432; fail "$c does not reach db"; }
@@ -168,7 +167,7 @@ pass "a and b reach web and db"
 log "2/6: a group takes db out of default"
 admin group create infra
 admin group add infra db
-wait_for "b to be refused db" 30 refused "$CLIENT_B" db 5432
+wait_until "b to be refused db" 30 refused "$CLIENT_B" db 5432
 refused "$CLIENT_A" db 5432 || fail "a reached db before anything was granted"
 reaches "$CLIENT_B" web 80 || fail "web left default too"
 reaches "$HOME_AGENT" db 5432 || fail "db's own node lost it"
@@ -176,20 +175,22 @@ pass "db reaches nobody but home; web is still open"
 
 log "3/6: a grant to a tag lets exactly that node in"
 admin grant add tag:ops infra
-wait_for "a to reach db" 30 reaches "$CLIENT_A" db 5432
+wait_until "a to reach db" 30 reaches "$CLIENT_A" db 5432
 refused "$CLIENT_B" db 5432 || fail "b reached db without the tag"
 # `status` says the same as the firewall (PLAN.md M45).
 access_says() { podman exec "$1" wireserve status | grep -qE "^$2\.wg .* $3\$"; }
-wait_for "a's status to say it reaches db" 30 access_says "$CLIENT_A" db yes
+wait_until "a's status to say it reaches db" 30 access_says "$CLIENT_A" db yes
 access_says "$CLIENT_B" db no || fail "b's status does not say db is closed to it"
 access_says "$CLIENT_B" web yes || fail "b's status does not say it reaches web"
 pass "node-a (tag ops) reaches db; node-b does not, and both statuses say so"
 
 log "4/6: taking the grant away cuts an open connection"
-in_netns_bg "$CLIENT_A" sh -c "(echo one; sleep 20; echo two) | socat -t25 - TCP:$(vip_of db):5432 > /work/flow.out 2>&1"
-wait_for "the connection to carry its first line" 10 grep -q one "$WORK/flow.out"
+# The second line goes 8s after the first: long enough for home to have
+# polled and dropped the grant in between.
+in_netns_bg "$CLIENT_A" sh -c "(echo one; sleep 8; echo two) | socat -t10 - TCP:$(vip_of db):5432 > /work/flow.out 2>&1"
+wait_until "the connection to carry its first line" 10 grep -q one "$WORK/flow.out"
 admin grant remove tag:ops infra
-sleep 25
+sleep 11
 cat "$WORK/flow.out"
 grep -q two "$WORK/flow.out" && fail "the open connection outlived the grant"
 refused "$CLIENT_A" db 5432 || fail "a still reaches db"
@@ -200,15 +201,15 @@ admin grant add tag:ops infra
 admin group create media
 podman exec "$HOME_AGENT" wireserve vault 8200 --group infra
 in_netns_bg "$HOME_AGENT" socat TCP-LISTEN:8200,fork,reuseaddr SYSTEM:'read x; echo vault'
-wait_for "vault to resolve on b" 60 sh -c "podman exec $CLIENT_B getent hosts vault.wg"
-wait_for "a to reach vault" 30 reaches "$CLIENT_A" vault 8200
+wait_until "vault to resolve on b" 60 sh -c "podman exec $CLIENT_B getent hosts vault.wg"
+wait_until "a to reach vault" 30 reaches "$CLIENT_A" vault 8200
 refused "$CLIENT_B" vault 8200 || fail "vault landed in default"
 groups_of vault | grep -qx infra || fail "vault is not listed in infra"
 podman exec "$HOME_AGENT" wireserve vault 8200 --group media
-wait_for "the notice about vault" 30 sh -c "podman exec $HOME_AGENT wireserve status | grep -q 'vault: stays in infra'"
+wait_until "the notice about vault" 30 sh -c "podman exec $HOME_AGENT wireserve status | grep -q 'vault: stays in infra'"
 [ "$(groups_of vault)" = infra ] || fail "a declaration moved vault"
 podman exec "$HOME_AGENT" wireserve ghost 9000 --group nope
-wait_for "the notice about ghost" 30 sh -c "podman exec $HOME_AGENT wireserve status | grep -q 'ghost: there is no group nope'"
+wait_until "the notice about ghost" 30 sh -c "podman exec $HOME_AGENT wireserve status | grep -q 'ghost: there is no group nope'"
 [ -n "$(groups_of ghost)" ] && fail "a service naming an unknown group was published"
 pass "vault joined infra and stayed there; ghost was not published"
 

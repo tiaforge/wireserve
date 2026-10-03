@@ -30,6 +30,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."   # repo root
+. deploy/e2e/lib.sh
 
 NET=wireserve-e2e-test
 ADMIN_TOKEN=e2e-test-admin-token
@@ -45,7 +46,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 cleanup() {
     log "cleaning up containers and network"
-    podman rm -f "$COORD" "$AGENT1" "$AGENT2" "$DEBUG_CONTAINER" \
+    podman rm -fv -t 0 "$COORD" "$AGENT1" "$AGENT2" "$DEBUG_CONTAINER" \
         wireserve-guard-e2e-test >/dev/null 2>&1 || true
     podman network rm "$NET" >/dev/null 2>&1 || true
 }
@@ -66,15 +67,13 @@ modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available
 pass "podman and the WireGuard kernel module are present"
 
 log "building images"
-podman build -f deploy/docker/coordinator.Dockerfile -t wireserve-coordinator:e2e-test .
-podman build -f deploy/docker/agent.Dockerfile -t wireserve-agent:e2e-test .
-podman build -f deploy/e2e/debug-tools.Dockerfile -t "$DEBUG_IMG" deploy/e2e
+./deploy/e2e/build.sh
 
 log "starting coordinator"
 podman network create "$NET" >/dev/null 2>&1 || true
 podman run -d --name "$COORD" --network "$NET" \
     -e WIRESERVE_ADMIN_TOKEN="$ADMIN_TOKEN" \
-    wireserve-coordinator:e2e-test >/dev/null
+    wireserve-coordinator:e2e >/dev/null
 sleep 1
 COORD_IP=$(podman inspect "$COORD" --format "{{(index .NetworkSettings.Networks \"$NET\").IPAddress}}")
 echo "coordinator reachable at $COORD_IP"
@@ -91,15 +90,17 @@ start_agent() {
     local name=$1 token=$2
     podman run -d --name "$name" --network "$NET" \
         --cap-add=NET_ADMIN --device /dev/net/tun \
-        --entrypoint sleep wireserve-agent:e2e-test infinity >/dev/null
+        --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
     podman exec "$name" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$token" --listen-port 51820
-    podman exec -d "$name" wireserve daemon --poll-interval-secs 5
+    podman exec -d "$name" wireserve daemon --poll-interval-secs "$POLL"
 }
 start_agent "$AGENT1" "$JT1"
 start_agent "$AGENT2" "$JT2"
 
-log "waiting for the first few poll cycles"
-sleep 8
+log "waiting for both agents to see each other"
+sees() { podman exec "$1" wireserve status --json | grep -q "\"name\": \"$2\""; }
+wait_for 30 sees "$AGENT1" node2 || fail "agent1 never got node2 into its peers"
+wait_for 30 sees "$AGENT2" node1 || fail "agent2 never got node1 into its peers"
 
 log "checking both agents have a real wireserve0 interface"
 for agent in "$AGENT1" "$AGENT2"; do
@@ -160,7 +161,11 @@ log "declaring services on agent1 — they must NOT propagate before approval"
 podman exec "$AGENT1" wireserve testsvc 80:12345
 podman exec "$AGENT1" wireserve web2 80:12347
 podman exec "$AGENT1" wireserve udpsvc 53:5353/udp
-sleep 8
+# Once agent1 shows them pending the coordinator has them; then give
+# agent2 a few polls in which they could (wrongly) arrive.
+pending() { podman exec "$AGENT1" wireserve status --json | grep -q '"pending": true'; }
+wait_for 20 pending || true
+settle
 # Service approval is on by default: a declaration is stored but withheld
 # from every other node's directory until an admin approves it, so that
 # one compromised node cannot claim an unclaimed name and have every
@@ -181,9 +186,13 @@ for svc in testsvc web2 udpsvc; do
     podman exec "$COORD" wireserve-admin service approve "$svc" --node node1 \
         || fail "could not approve $svc for node1"
 done
-sleep 8
-podman exec "$AGENT2" grep -q "testsvc.wg" /etc/hosts \
-    || fail "agent2's /etc/hosts never picked up testsvc.wg after approval"
+for svc in testsvc web2 udpsvc; do
+    wait_for 20 podman exec "$AGENT2" grep -q "$svc.wg" /etc/hosts \
+        || fail "agent2's /etc/hosts never picked up $svc.wg after approval"
+done
+# ...and agent1 has learnt they are approved, and opened them.
+wait_for 20 eval '! pending' \
+    || fail "agent1 still shows its services pending after approval"
 pass "agent2's /etc/hosts synced testsvc.wg once approved"
 
 AGENT1_MESH_IP=$(mesh_ip_of "$AGENT1" node1)
@@ -265,10 +274,8 @@ pass "the human-readable list shows the service, its address and mapping"
 
 log "testing revoke propagation"
 podman exec "$COORD" wireserve-admin node revoke node1
-sleep 8
-if podman exec "$AGENT2" wireserve status --json | grep -q '"name": "node1"'; then
-    fail "node1 is still listed as a peer on agent2 after revoke"
-fi
+wait_for 20 eval '! sees "$AGENT2" node1' \
+    || fail "node1 is still listed as a peer on agent2 after revoke"
 pass "node1 dropped out of agent2's peer list after revoke"
 
 log "the agent must never take over an interface it did not create"
@@ -280,10 +287,10 @@ log "the agent must never take over an interface it did not create"
 # used to quietly destroy it. Everything below is set up to look exactly
 # like that situation: somebody else's wireserve0.
 GUARD=wireserve-guard-e2e-test
-podman rm -f "$GUARD" >/dev/null 2>&1 || true
+podman rm -fv -t 0 "$GUARD" >/dev/null 2>&1 || true
 podman run -d --name "$GUARD" --network "$NET" \
     --cap-add=NET_ADMIN --device /dev/net/tun \
-    --entrypoint sleep wireserve-agent:e2e-test infinity >/dev/null
+    --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
 JT_GUARD=$(create_node node3)
 podman exec "$GUARD" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_GUARD" --listen-port 51820
 
@@ -303,7 +310,7 @@ foreign_intact() {
 }
 
 # Told to use exactly that name, it refuses.
-if podman exec "$GUARD" wireserve daemon --poll-interval-secs 5 --ifname wireserve0 2>&1 | tee /tmp/guard-out.txt; then
+if podman exec "$GUARD" wireserve daemon --poll-interval-secs "$POLL" --ifname wireserve0 2>&1 | tee /tmp/guard-out.txt; then
     fail "the agent started on an interface it did not create — it should have refused"
 fi
 grep -qi "cannot use the interface name 'wireserve0'" /tmp/guard-out.txt \
@@ -312,13 +319,12 @@ foreign_intact
 pass "pinned to a foreign interface's name, the agent refused and left it alone"
 
 # Left to choose, it goes around it.
-podman exec -d "$GUARD" wireserve daemon --poll-interval-secs 5
-sleep 8
-podman exec "$GUARD" test -d /sys/class/net/wireserve1 \
+podman exec -d "$GUARD" wireserve daemon --poll-interval-secs "$POLL"
+wait_for 20 podman exec "$GUARD" test -d /sys/class/net/wireserve1 \
     || fail "the agent did not come up on the next free name, wireserve1"
 foreign_intact
 pass "without --ifname the agent picked wireserve1 and left the foreign wireserve0 alone"
-podman rm -f "$GUARD" >/dev/null 2>&1 || true
+podman rm -fv -t 0 "$GUARD" >/dev/null 2>&1 || true
 
 log "testing leave removes the managed hosts-file block (regression: F2)"
 podman exec "$AGENT2" wireserve leave

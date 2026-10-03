@@ -16,6 +16,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."   # repo root
+. deploy/e2e/lib.sh
 
 NET=wireserve-hostfw-test
 ADMIN_TOKEN=hostfw-test-admin-token
@@ -33,7 +34,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 cleanup() {
     log "cleaning up containers and network"
-    podman rm -f "$COORD" "$AGENT1" "$AGENT2" "$GUARD" "$DBG1" "$DBG_GUARD" \
+    podman rm -fv -t 0 "$COORD" "$AGENT1" "$AGENT2" "$GUARD" "$DBG1" "$DBG_GUARD" \
         wireserve-legacy-hostfw-test wireserve-debugl-hostfw-test >/dev/null 2>&1 || true
     podman network rm "$NET" >/dev/null 2>&1 || true
 }
@@ -49,14 +50,12 @@ modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available
 pass "prerequisites present"
 
 log "building images"
-podman build -f deploy/docker/coordinator.Dockerfile -t wireserve-coordinator:e2e-test .
-podman build -f deploy/docker/agent.Dockerfile -t wireserve-agent:e2e-test .
-podman build -f deploy/e2e/debug-tools.Dockerfile -t "$DEBUG_IMG" deploy/e2e
+./deploy/e2e/build.sh
 
 log "starting coordinator"
 podman network create "$NET" >/dev/null 2>&1 || true
 podman run -d --name "$COORD" --network "$NET" \
-    -e WIRESERVE_ADMIN_TOKEN="$ADMIN_TOKEN" wireserve-coordinator:e2e-test >/dev/null
+    -e WIRESERVE_ADMIN_TOKEN="$ADMIN_TOKEN" wireserve-coordinator:e2e >/dev/null
 sleep 1
 COORD_IP=$(podman inspect "$COORD" --format "{{(index .NetworkSettings.Networks \"$NET\").IPAddress}}")
 
@@ -67,7 +66,7 @@ create_node() {
 node_container() {
     podman run -d --name "$1" --network "$NET" \
         --cap-add=NET_ADMIN --device /dev/net/tun \
-        --entrypoint sleep wireserve-agent:e2e-test infinity >/dev/null
+        --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
 }
 
 # Debug container sharing a node's network namespace: its nft/iptables
@@ -128,9 +127,9 @@ BEFORE_NFT=$(in_dbg "nft list table inet filter")
 
 podman exec "$AGENT1" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT1" --listen-port 51820
 podman exec "$AGENT2" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT2" --listen-port 51820
-podman exec -d "$AGENT1" wireserve daemon --poll-interval-secs 5
-podman exec -d "$AGENT2" wireserve daemon --poll-interval-secs 5
-sleep 8
+podman exec -d "$AGENT1" wireserve daemon --poll-interval-secs "$POLL"
+podman exec -d "$AGENT2" wireserve daemon --poll-interval-secs "$POLL"
+wait_for 30 eval '[ "$(in_dbg "iptables -S INPUT; nft list table inet filter" | grep -c wireserve:wireserve0)" -ge 2 ]' || true
 
 log "checking the host firewalls now let wireserve0 through (and only wireserve0)"
 IPT=$(in_dbg "iptables -S INPUT")
@@ -151,9 +150,11 @@ log "declaring and approving a service on agent1"
 # rewritten packet still arrives on wireserve0, so it is the same
 # interface-scoped accept in the host firewalls that has to let it in.
 podman exec "$AGENT1" wireserve testsvc 80:12345
-sleep 6
+pending() { podman exec "$AGENT1" wireserve status --json | grep -q '"pending": true'; }
+wait_for 20 pending || fail "agent1 never reported testsvc to the coordinator"
 podman exec "$COORD" wireserve-admin service approve testsvc --node node1
-sleep 6
+wait_for 20 podman exec "$AGENT2" getent hosts testsvc.wg || true
+wait_for 20 eval '! pending' || fail "agent1 never learnt testsvc was approved"
 AGENT1_MESH_IP=$(mesh_ip_of "$AGENT2" node1)
 [ -n "$AGENT1_MESH_IP" ] || fail "could not determine agent1's mesh address"
 VIP=$(podman exec "$AGENT2" getent hosts testsvc.wg | awk '{print $1}')
@@ -197,8 +198,8 @@ pass "native table reload repaired within 3s; service reachable again"
 
 log "E3: an iptables rule removed by hand comes back within one poll"
 in_dbg "iptables -D INPUT -i wireserve0 -m comment --comment wireserve:wireserve0 -j ACCEPT"
-sleep 6
-[ "$(in_dbg "iptables -S INPUT" | grep -c 'wireserve:wireserve0')" = 1 ] || fail "iptables rule not restored"
+wait_for 10 eval '[ "$(in_dbg "iptables -S INPUT" | grep -c wireserve:wireserve0)" = 1 ]' \
+    || fail "iptables rule not restored"
 [ "$(native_tags)" = 1 ] || fail "native rule duplicated during repair"
 pass "iptables rule restored, no duplicates anywhere"
 
@@ -228,7 +229,7 @@ podman exec "$GUARD" wireserve join "http://$COORD_IP:47820" --allow-plaintext-h
 # Pinned to that name (without --ifname it would simply pick another), so
 # the agent has to refuse — and must do so before any firewall change,
 # since every rule it would install is keyed on the name.
-if podman exec "$GUARD" wireserve daemon --poll-interval-secs 5 --ifname wg0 >/tmp/hostfw-guard.txt 2>&1; then
+if podman exec "$GUARD" wireserve daemon --poll-interval-secs "$POLL" --ifname wg0 >/tmp/hostfw-guard.txt 2>&1; then
     fail "the agent started on a foreign wg0"
 fi
 grep -qi "cannot use the interface name 'wg0'" /tmp/hostfw-guard.txt || fail "unexpected failure: $(cat /tmp/hostfw-guard.txt)"
@@ -242,15 +243,15 @@ pass "refused start on a foreign wg0 left every firewall untouched"
 log "E6: legacy iptables (skipped if legacy iptables can't be used here)"
 LEGACY=wireserve-legacy-hostfw-test
 DBG_LEGACY=wireserve-debugl-hostfw-test
-podman rm -f "$LEGACY" "$DBG_LEGACY" >/dev/null 2>&1 || true
+podman rm -fv -t 0 "$LEGACY" "$DBG_LEGACY" >/dev/null 2>&1 || true
 node_container "$LEGACY"
 debug_for "$DBG_LEGACY" "$LEGACY"
 if podman exec "$DBG_LEGACY" sh -c "iptables-legacy -A INPUT -i lo -j ACCEPT && iptables-legacy -P INPUT DROP" 2>/dev/null \
    && podman exec "$DBG_LEGACY" grep -qx filter /proc/net/ip_tables_names; then
     JT4=$(create_node node4)
     podman exec "$LEGACY" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT4" --listen-port 51820
-    podman exec -d "$LEGACY" wireserve daemon --poll-interval-secs 5
-    sleep 6
+    podman exec -d "$LEGACY" wireserve daemon --poll-interval-secs "$POLL"
+    wait_for 20 eval 'podman exec "$DBG_LEGACY" iptables-legacy -S INPUT | grep -q wireserve:wireserve0' || true
     podman exec "$DBG_LEGACY" iptables-legacy -S INPUT | sed -n 2p \
         | grep -qx -- '-A INPUT -i wireserve0 -m comment --comment "wireserve:wireserve0" -j ACCEPT' \
         || fail "legacy iptables INPUT does not start with our wireserve0 accept"
@@ -263,7 +264,7 @@ if podman exec "$DBG_LEGACY" sh -c "iptables-legacy -A INPUT -i lo -j ACCEPT && 
 else
     echo "SKIPPED: legacy iptables (ip_tables) not usable in this environment"
 fi
-podman rm -f "$LEGACY" "$DBG_LEGACY" >/dev/null 2>&1 || true
+podman rm -fv -t 0 "$LEGACY" "$DBG_LEGACY" >/dev/null 2>&1 || true
 
 echo
 echo "=== ALL HOST-FIREWALL CHECKS PASSED ==="

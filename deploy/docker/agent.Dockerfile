@@ -51,6 +51,11 @@
 # `docker exec wireserve-agent wireserve status`, not from the host,
 # unless /run/wireserve is separately bind-mounted out.
 
+# The e2e suites build with `--build-arg BINARIES=prebuilt`: the runtime
+# stage below then takes binaries deploy/e2e/build.sh has already compiled
+# into target/e2e/bin, and the build stage is skipped entirely.
+ARG BINARIES=builder
+
 # ---- build stage ----
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /build
@@ -68,18 +73,30 @@ COPY . .
 #
 # Clear them with `podman builder prune --all` if a build ever looks like
 # it is reusing something it should not.
+#
+# RUSTUP_TOOLCHAIN: the image names its toolchain by version (1.xx.y), so
+# rust-toolchain.toml's `stable`, copied in with the rest of the repo,
+# would otherwise make rustup download a whole second toolchain on every
+# build. Pinning to the one the image ships is the same stable release.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
+    RUSTUP_TOOLCHAIN="$(rustup default | cut -d' ' -f1)" \
     cargo build --release -p wireserve-agent \
     && mkdir -p /out \
     && cp target/release/wireserve /out/
+
+# ---- or: binaries built beforehand (e2e) ----
+FROM scratch AS prebuilt
+COPY target/e2e/bin/wireserve /out/
+
+FROM ${BINARIES} AS binaries
 
 # ---- runtime stage ----
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates nftables iptables \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /out/wireserve /usr/local/bin/wireserve
+COPY --from=binaries /out/wireserve /usr/local/bin/wireserve
 
 # Runs as the image's default root user, deliberately — same reasoning as
 # deploy/systemd/wireserve-agent.service: writing the bind-mounted host

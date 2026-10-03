@@ -50,6 +50,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+. deploy/e2e/lib.sh
 
 NET=wireserve-sa-net
 COORD=wireserve-sa-coord
@@ -81,9 +82,9 @@ fail() {
 }
 
 cleanup() {
-    podman rm -f "$COORD" "$BIND" "$PEBBLE" "$GATE" "$HOME_AGENT" "$CLIENT" >/dev/null 2>&1 || true
+    podman rm -fv -t 0 "$COORD" "$BIND" "$PEBBLE" "$GATE" "$HOME_AGENT" "$CLIENT" >/dev/null 2>&1 || true
     for c in $(podman ps -aq --filter "name=wireserve-sa-helper" 2>/dev/null); do
-        podman rm -f "$c" >/dev/null 2>&1 || true
+        podman rm -fv -t 0 "$c" >/dev/null 2>&1 || true
     done
     podman network rm "$NET" >/dev/null 2>&1 || true
     [ -n "${WORK:-}" ] && rm -rf "$WORK"
@@ -116,7 +117,7 @@ d=json.load(sys.stdin).get('last_directory') or {}
 s=next((s for s in d.get('services',[]) if s['name']=='$1'), {})
 print(s.get('$2', ''))"
 }
-wait_for() {
+wait_until() {
     local what=$1 secs=$2; shift 2
     for _ in $(seq 1 "$secs"); do
         "$@" >/dev/null 2>&1 && return 0
@@ -154,9 +155,7 @@ modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available
 pass "podman, python3 and the WireGuard kernel module are present"
 
 log "building images"
-podman build -q -f deploy/docker/coordinator.Dockerfile -t wireserve-coordinator:sa-test . >/dev/null
-podman build -q -f deploy/docker/agent.Dockerfile -t wireserve-agent:sa-test . >/dev/null
-podman build -q -f deploy/e2e/debug-tools.Dockerfile -t "$DEBUG_IMG" deploy/e2e >/dev/null
+./deploy/e2e/build.sh
 podman pull -q "$BIND_IMG" >/dev/null
 podman pull -q "$PEBBLE_IMG" >/dev/null
 pass "images built"
@@ -204,14 +203,14 @@ podman run -d --name "$COORD" --network "$NET" \
     -e WIRESERVE_DNS_TTL=60 \
     -e WIRESERVE_ACME_DIRECTORY=https://pebble:14000/dir -e WIRESERVE_ACME_PROPAGATION_SECS=0 \
     -e WIRESERVE_AUTH_SERVICE=auth -e WIRESERVE_AUTH_NODE=node-gate \
-    wireserve-coordinator:sa-test >/dev/null
+    wireserve-coordinator:e2e >/dev/null
 sleep 2
 COORD_IP=$(ip_on "$COORD" "$NET")
 
 for c in "$GATE" "$HOME_AGENT" "$CLIENT"; do
     podman run -d --name "$c" --network "$NET" \
         --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
-        --entrypoint sleep wireserve-agent:sa-test infinity >/dev/null
+        --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
 done
 # Pebble issues from a root made at start: every terminator trusts it for the
 # sign-in check, as a public CA's root is trusted without asking.
@@ -228,11 +227,11 @@ for pair in "$GATE:node-gate" "$HOME_AGENT:node-home" "$CLIENT:node-client"; do
     jt=$(admin node create "$n" | grep -oE 'jtk_[a-f0-9]+')
     podman exec "$c" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$jt" \
         --listen-port "$WG_PORT" --endpoint "$(ip_on "$c" "$NET"):$WG_PORT" 2>/dev/null
-    podman exec -d "$c" sh -c 'wireserve daemon --poll-interval-secs 3 >/var/log/agent.log 2>&1'
+    podman exec -d "$c" sh -c 'wireserve daemon --poll-interval-secs '"$POLL"' >/var/log/agent.log 2>&1'
 done
 for c in "$GATE" "$HOME_AGENT"; do
     podman exec -d "$c" sh -c 'WIRESERVE_ACME_CA_FILE=/etc/pebble-minica.pem WIRESERVE_TLS_TRUST_FILE=/etc/pebble-root.pem \
-        wireserve tls-daemon --state-dir /var/lib/wireserve-tls >>/var/log/tls.log 2>&1'
+        wireserve tls-daemon --state-dir /var/lib/wireserve-tls --check-in-secs '"$POLL"' >>/var/log/tls.log 2>&1'
 done
 podman exec "$GATE" wireserve auth 443:8080
 in_netns_bg "$GATE" socat "TCP-LISTEN:8080,fork,reuseaddr" EXEC:/e2e/auth-stub.sh
@@ -244,7 +243,7 @@ done
 
 log "1/10: all three terminated; jellyfin in media, for tag:tv and oidc:family"
 for s in auth jellyfin grafana; do
-    wait_for "$s to be terminated" 120 terminated "$s"
+    wait_until "$s to be terminated" 120 terminated "$s"
 done
 admin group create media
 admin group add media jellyfin
@@ -256,9 +255,9 @@ if admin group add media auth 2>/dev/null; then
 fi
 admin service list --json | jq -e '.services[] | select(.name == "jellyfin") | .groups | index("media")' >/dev/null \
     || fail "service list does not show jellyfin in media"
-wait_for "home to fall back to the sign-in for jellyfin" 30 signs_in jellyfin
+wait_until "home to fall back to the sign-in for jellyfin" 30 signs_in jellyfin
 # The terminator picks it up on its next check-in.
-sleep 8
+wait_until "the terminator to ask for a sign-in" 30 eval 'fetch jellyfin | grep -q "^STATUS 302"'
 pass "auth, jellyfin and grafana served by their own nodes; jellyfin restricted"
 
 log "2/10: no session, sent to sign in"
@@ -335,12 +334,12 @@ pass "Host: grafana on jellyfin's address: 421, no backend"
 log "9/10: a provider on another node is not the provider"
 podman exec "$GATE" wireserve auth off
 auth_gone() { [ -z "$(entry auth name)" ]; }
-wait_for "auth to leave the directory" 30 auth_gone
+wait_until "auth to leave the directory" 30 auth_gone
 podman exec "$HOME_AGENT" wireserve auth 443:8081
 in_netns_bg "$HOME_AGENT" socat "TCP-LISTEN:8081,fork,reuseaddr" EXEC:/e2e/impostor-stub.sh
 held_by_home() { [ "$(entry auth node)" = node-home ] && terminated auth; }
-wait_for "home's auth to be terminated" 120 held_by_home
-sleep 8
+wait_until "home's auth to be terminated" 120 held_by_home
+wait_until "jellyfin to refuse with no provider" 30 eval 'fetch jellyfin -H "Cookie: authward_session=ok" | grep -q "^STATUS 503"'
 OUT=$(fetch jellyfin -H 'Cookie: authward_session=ok') || true
 echo "$OUT" | tail -1
 echo "$OUT" | grep -qi 'impostor' && { echo "$OUT"; fail "the impostor's answer let the request in"; }
@@ -350,8 +349,8 @@ pass "auth declared by node-home is ignored; jellyfin refuses with 503"
 
 log "10/10: out of its group, jellyfin is back in default"
 admin group remove media jellyfin | grep -q 'back in default' || fail "the admin was not told jellyfin is in default again"
-wait_for "jellyfin without a sign-in" 60 sh -c "podman run --rm --network container:$CLIENT -v $WORK:/work:ro,Z $DEBUG_IMG curl -s --max-time 5 --cacert /work/pebble-root.pem --resolve jellyfin.$DOMAIN:443:$JF_VIP https://jellyfin.$DOMAIN/ | grep -q backend:8096"
-wait_for "jellyfin's other port back" 30 sh -c "podman run --rm --network container:$CLIENT $DEBUG_IMG curl -s --max-time 3 http://$JF_VIP:8920/ | grep -q backend:8920"
+wait_until "jellyfin without a sign-in" 60 sh -c "podman run --rm --network container:$CLIENT -v $WORK:/work:ro,Z $DEBUG_IMG curl -s --max-time 5 --cacert /work/pebble-root.pem --resolve jellyfin.$DOMAIN:443:$JF_VIP https://jellyfin.$DOMAIN/ | grep -q backend:8096"
+wait_until "jellyfin's other port back" 30 sh -c "podman run --rm --network container:$CLIENT $DEBUG_IMG curl -s --max-time 3 http://$JF_VIP:8920/ | grep -q backend:8920"
 pass "in default again: no sign-in, and 8920 reachable"
 
 echo

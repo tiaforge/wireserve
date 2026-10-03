@@ -33,6 +33,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+. deploy/e2e/lib.sh
 
 INET=wireserve-nat-inet
 SITE_A=wireserve-nat-site-a
@@ -53,10 +54,10 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 note() { echo "NOTE: $*"; }
 
 cleanup() {
-    podman rm -f "$COORD" "$ROUTER_A" "$ROUTER_B" "$AGENT1" "$AGENT2" "$AGENT3" \
+    podman rm -fv -t 0 "$COORD" "$ROUTER_A" "$ROUTER_B" "$AGENT1" "$AGENT2" "$AGENT3" \
         >/dev/null 2>&1 || true
     for c in $(podman ps -aq --filter "name=wireserve-nat-helper" 2>/dev/null); do
-        podman rm -f "$c" >/dev/null 2>&1 || true
+        podman rm -fv -t 0 "$c" >/dev/null 2>&1 || true
     done
     podman network rm "$SITE_A" "$SITE_B" "$INET" >/dev/null 2>&1 || true
 }
@@ -92,9 +93,7 @@ modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available
 pass "podman, python3 and the WireGuard kernel module are present"
 
 log "building images"
-podman build -q -f deploy/docker/coordinator.Dockerfile -t wireserve-coordinator:nat-test . >/dev/null
-podman build -q -f deploy/docker/agent.Dockerfile -t wireserve-agent:nat-test . >/dev/null
-podman build -q -f deploy/e2e/debug-tools.Dockerfile -t "$DEBUG_IMG" deploy/e2e >/dev/null
+./deploy/e2e/build.sh
 pass "images built"
 
 log "creating the three network segments"
@@ -120,7 +119,7 @@ pass "three internal segments, so the only NAT is the one our routers do"
 log "starting the coordinator on the inet segment"
 podman run -d --name "$COORD" --network "$INET" \
     -e WIRESERVE_ADMIN_TOKEN="$ADMIN_TOKEN" \
-    wireserve-coordinator:nat-test >/dev/null
+    wireserve-coordinator:e2e >/dev/null
 sleep 2
 COORD_IP=$(ip_on "$COORD" "$INET")
 echo "coordinator: $COORD_IP"
@@ -162,7 +161,7 @@ start_agent() {
     local name=$1 site=$2 gateway=$3
     podman run -d --name "$name" --network "$site" \
         --cap-add=NET_ADMIN --device /dev/net/tun \
-        --entrypoint sleep wireserve-agent:nat-test infinity >/dev/null
+        --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
     sleep 1
     # An --internal network has no default route; point it at our router.
     in_netns "$name" ip route replace default via "$gateway" >/dev/null
@@ -226,10 +225,8 @@ log "what endpoint did the coordinator record for each node?"
 podman exec "$COORD" wireserve-admin node list | sed 's/^/  /'
 
 for a in "$AGENT1" "$AGENT2" "$AGENT3"; do
-    podman exec -d "$a" wireserve daemon --poll-interval-secs 5
+    podman exec -d "$a" wireserve daemon --poll-interval-secs "$POLL"
 done
-log "waiting for poll cycles and WireGuard handshakes"
-sleep 20
 
 mesh_ip_of() {
     podman exec "$1" wireserve status --json | python3 -c "
@@ -239,6 +236,17 @@ m = [p['ip4'] for p in peers if p.get('name') == '$2']
 print(m[0] if m else '')
 "
 }
+# Whether every node's startup probe has been decided, either way.
+dialable_known() {
+    [ "$(podman exec "$COORD" wireserve-admin node list --json \
+        | jq '[.dialable.node1, .dialable.node2, .dialable.node3] | map(select(. != null)) | length')" = 3 ]
+}
+pending() { podman exec "$1" wireserve status --json | grep -q '"pending": true'; }
+
+log "waiting for the nodes to see each other and their probes to finish"
+wait_for 30 eval '[ -n "$(mesh_ip_of "$AGENT2" node1)" ]' || true
+wait_for 30 eval '[ -n "$(mesh_ip_of "$AGENT1" node2)" ]' || true
+wait_for 40 dialable_known || true
 
 AGENT1_MESH=$(mesh_ip_of "$AGENT2" node1)
 AGENT2_MESH=$(mesh_ip_of "$AGENT1" node2)
@@ -263,7 +271,9 @@ log "declaring a service on each of agent1 and agent2"
 podman exec "$AGENT1" wireserve svc-one 12345
 podman exec "$AGENT2" wireserve svc-two 12345
 podman exec "$AGENT3" wireserve svc-three 12345
-sleep 8
+for a in "$AGENT1" "$AGENT2" "$AGENT3"; do
+    wait_for 20 pending "$a" || fail "$a never reported its service"
+done
 # Service approval is on by default. This harness is about NAT traversal,
 # not about the approval gate (run-e2e-test.sh covers that), so approve
 # both and get on with the actual question.
@@ -273,7 +283,12 @@ podman exec "$COORD" wireserve-admin service approve svc-two --node node2 \
     || fail "could not approve svc-two"
 podman exec "$COORD" wireserve-admin service approve svc-three --node node3 \
     || fail "could not approve svc-three"
-sleep 12
+for a in "$AGENT1" "$AGENT2" "$AGENT3"; do
+    wait_for 20 eval '! pending "$a"' || fail "$a never learnt its service was approved"
+done
+wait_for 20 podman exec "$AGENT2" getent hosts svc-one.wg || true
+wait_for 20 podman exec "$AGENT1" getent hosts svc-two.wg || true
+wait_for 20 podman exec "$AGENT1" getent hosts svc-three.wg || true
 # Each service answers on its own address (PLAN.md M20), not on its
 # node's: resolve them the way any client would.
 svc_addr() { podman exec "$1" getent hosts "$2" | awk '{print $1}'; }

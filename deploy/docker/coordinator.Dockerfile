@@ -22,6 +22,11 @@
 # and can be published normally, e.g. `-p 127.0.0.1:47820:47820` with a
 # reverse proxy terminating TLS in front of that, per spec §7.
 
+# The e2e suites build with `--build-arg BINARIES=prebuilt`: the runtime
+# stage below then takes binaries deploy/e2e/build.sh has already compiled
+# into target/e2e/bin, and the build stage is skipped entirely.
+ARG BINARIES=builder
+
 # ---- build stage ----
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /build
@@ -42,11 +47,24 @@ COPY . .
 #
 # Clear them with `podman builder prune --all` if a build ever looks like
 # it is reusing something it should not.
+#
+# RUSTUP_TOOLCHAIN: the image names its toolchain by version (1.xx.y), so
+# rust-toolchain.toml's `stable`, copied in with the rest of the repo,
+# would otherwise make rustup download a whole second toolchain on every
+# build. Pinning to the one the image ships is the same stable release.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
+    RUSTUP_TOOLCHAIN="$(rustup default | cut -d' ' -f1)" \
     cargo build --release -p wireserve-coordinator -p wireserve-admin \
     && mkdir -p /out \
     && cp target/release/wireserve-coordinator target/release/wireserve-admin /out/
+
+# ---- or: binaries built beforehand (e2e) ----
+FROM scratch AS prebuilt
+COPY target/e2e/bin/wireserve-coordinator /out/
+COPY target/e2e/bin/wireserve-admin /out/
+
+FROM ${BINARIES} AS binaries
 
 # ---- runtime stage ----
 FROM debian:bookworm-slim
@@ -61,8 +79,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && useradd --system --no-create-home --shell /usr/sbin/nologin wireserve \
     && mkdir -p /var/lib/wireserve \
     && chown wireserve:wireserve /var/lib/wireserve
-COPY --from=builder /out/wireserve-coordinator /usr/local/bin/wireserve-coordinator
-COPY --from=builder /out/wireserve-admin /usr/local/bin/wireserve-admin
+COPY --from=binaries /out/wireserve-coordinator /usr/local/bin/wireserve-coordinator
+COPY --from=binaries /out/wireserve-admin /usr/local/bin/wireserve-admin
 
 USER wireserve
 ENV WIRESERVE_DB_PATH=/var/lib/wireserve/coordinator.db

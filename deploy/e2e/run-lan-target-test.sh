@@ -34,6 +34,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+. deploy/e2e/lib.sh
 
 INET=wireserve-lan-inet
 LAN=wireserve-lan-lan
@@ -51,9 +52,9 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 note() { echo "NOTE: $*"; }
 
 cleanup() {
-    podman rm -f "$COORD" "$OWNER" "$CLIENT" "$DEVICE" >/dev/null 2>&1 || true
+    podman rm -fv -t 0 "$COORD" "$OWNER" "$CLIENT" "$DEVICE" >/dev/null 2>&1 || true
     for c in $(podman ps -aq --filter "name=wireserve-lan-helper" 2>/dev/null); do
-        podman rm -f "$c" >/dev/null 2>&1 || true
+        podman rm -fv -t 0 "$c" >/dev/null 2>&1 || true
     done
     podman network rm "$LAN" "$INET" >/dev/null 2>&1 || true
 }
@@ -71,7 +72,9 @@ ip_on() {
 admin() { podman exec "$COORD" wireserve-admin "$@"; }
 fwd_flag() { in_netns "$OWNER" cat "/proc/sys/net/ipv4/conf/$1/forwarding" 2>/dev/null || echo "?"; }
 # One TCP exchange: prints whatever the far end answered, empty on failure.
-ask() { local from=$1 addr=$2 port=$3; in_netns "$from" timeout 8 socat -t3 - "TCP:$addr:$port" </dev/null 2>/dev/null || true; }
+# A check that something is refused sets ASK_TIMEOUT short: by then the path
+# is known to work, and what answers at all answers in well under a second.
+ask() { local from=$1 addr=$2 port=$3; in_netns "$from" timeout "${ASK_TIMEOUT:-8}" socat -t3 - "TCP:$addr:$port" </dev/null 2>/dev/null || true; }
 
 log "checking prerequisites"
 command -v podman >/dev/null || fail "podman not found on PATH"
@@ -82,9 +85,7 @@ modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available
 pass "podman, python3 and the WireGuard kernel module are present"
 
 log "building images"
-podman build -q -f deploy/docker/coordinator.Dockerfile -t wireserve-coordinator:lan-test . >/dev/null
-podman build -q -f deploy/docker/agent.Dockerfile -t wireserve-agent:lan-test . >/dev/null
-podman build -q -f deploy/e2e/debug-tools.Dockerfile -t "$DEBUG_IMG" deploy/e2e >/dev/null
+./deploy/e2e/build.sh
 pass "images built"
 
 log "creating the two segments"
@@ -95,7 +96,7 @@ pass "inet and lan, both internal"
 log "starting the coordinator"
 podman run -d --name "$COORD" --network "$INET" \
     -e WIRESERVE_ADMIN_TOKEN="$ADMIN_TOKEN" \
-    wireserve-coordinator:lan-test >/dev/null
+    wireserve-coordinator:e2e >/dev/null
 sleep 2
 COORD_IP=$(ip_on "$COORD" "$INET")
 echo "coordinator: $COORD_IP"
@@ -117,10 +118,10 @@ log "starting the owner (inet + lan) with forwarding off everywhere, and the cli
 podman run -d --name "$OWNER" --network "$INET" --network "$LAN" \
     --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
     --sysctl net.ipv4.conf.all.forwarding=0 --sysctl net.ipv4.conf.default.forwarding=0 \
-    --entrypoint sleep wireserve-agent:lan-test infinity >/dev/null
+    --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
 podman run -d --name "$CLIENT" --network "$INET" \
     --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
-    --entrypoint sleep wireserve-agent:lan-test infinity >/dev/null
+    --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
 sleep 1
 OWNER_INET=$(ip_on "$OWNER" "$INET")
 OWNER_LAN=$(ip_on "$OWNER" "$LAN")
@@ -136,6 +137,8 @@ podman exec "$OWNER" sh -c "echo 0 > /proc/sys/net/ipv4/conf/$LAN_IF/forwarding"
 pass "the owner forwards nothing to begin with"
 
 create_node() { admin node create "$1" | grep -oE 'jtk_[a-f0-9]+'; }
+sees() { podman exec "$1" wireserve status --json | grep -q "\"name\": \"$2\""; }
+pending() { podman exec "$1" wireserve status --json | grep -q '"pending": true'; }
 
 log "joining both agents"
 JT_OWNER=$(create_node node-owner)
@@ -145,9 +148,10 @@ podman exec "$OWNER" wireserve join "http://$COORD_IP:47820" --allow-plaintext-h
 podman exec "$CLIENT" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_CLIENT" \
     --listen-port "$WG_PORT" --endpoint "$(ip_on "$CLIENT" "$INET"):$WG_PORT" 2>/dev/null
 for a in "$OWNER" "$CLIENT"; do
-    podman exec -d "$a" wireserve daemon --poll-interval-secs 5
+    podman exec -d "$a" wireserve daemon --poll-interval-secs "$POLL"
 done
-sleep 15
+wait_for 30 sees "$OWNER" node-client || fail "node-owner never got node-client into its peers"
+wait_for 30 sees "$CLIENT" node-owner || fail "node-client never got node-owner into its peers"
 pass "both agents registered and polling"
 
 log "refusals at serve time"
@@ -161,16 +165,18 @@ pass "loopback and IPv6 targets are refused"
 
 log "serving the device's port 80 on 443"
 podman exec "$OWNER" wireserve myrouter "443:$DEVICE_IP:80"
-sleep 8
+wait_for 20 pending "$OWNER" || fail "node-owner never reported myrouter"
 admin service approve myrouter --node node-owner || fail "could not approve myrouter"
 admin service list | grep '^myrouter ' | grep -q "443:$DEVICE_IP:80/tcp" \
     || fail "the approver does not see the target address"
 pass "the approver sees 443:$DEVICE_IP:80/tcp"
-sleep 12
+wait_for 20 eval '! pending "$OWNER"' || fail "node-owner never learnt myrouter was approved"
+wait_for 20 podman exec "$CLIENT" getent hosts myrouter.wg || true
 
 VIP=$(podman exec "$CLIENT" getent hosts myrouter.wg | awk '{print $1}')
 [ -n "$VIP" ] || fail "myrouter.wg does not resolve on the client"
 echo "myrouter.wg=$VIP"
+wait_for 20 eval '[ -n "$(ask "$CLIENT" "$VIP" 443)" ]' || true
 
 log "1-2/7: the client reaches the device, which sees the owner's lan address"
 GOT=$(ask "$CLIENT" "$VIP" 443)
@@ -186,9 +192,9 @@ GOT=$(ask "$OWNER" "$VIP" 443)
 pass "the owner reaches its own service through the output path"
 
 log "4/7: only the published port answers"
-[ -z "$(ask "$CLIENT" "$VIP" 22)" ] || fail "the device's unpublished port 22 was reachable"
-[ -z "$(ask "$CLIENT" "$VIP" 80)" ] || fail "the target port 80 was reachable on the service address"
-[ -z "$(ask "$CLIENT" "$DEVICE_IP" 80)" ] || fail "the device was reachable at its own address from the mesh"
+[ -z "$(ASK_TIMEOUT=4 ask "$CLIENT" "$VIP" 22)" ] || fail "the device's unpublished port 22 was reachable"
+[ -z "$(ASK_TIMEOUT=4 ask "$CLIENT" "$VIP" 80)" ] || fail "the target port 80 was reachable on the service address"
+[ -z "$(ASK_TIMEOUT=4 ask "$CLIENT" "$DEVICE_IP" 80)" ] || fail "the device was reachable at its own address from the mesh"
 pass "22, 80 on the service address, and the device's own address are all refused"
 
 log "5/7: forwarding on the lan interface alone, and guarded"
@@ -216,7 +222,7 @@ done
 if podman logs "$PROBE" 2>/dev/null | grep -q routed-through-owner; then
     fail "the device's packet reached the coordinator through the owner — the lan is being routed"
 fi
-podman rm -f "$PROBE" >/dev/null
+podman rm -fv -t 0 "$PROBE" >/dev/null
 pass "nothing but the service's own flows is forwarded from $LAN_IF"
 
 log "6/7: the rest of the mesh never learns the device's address"

@@ -51,6 +51,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+. deploy/e2e/lib.sh
 
 INET=wireserve-exit-inet
 GW_LAN=wireserve-exit-gw-lan
@@ -74,9 +75,9 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 note() { echo "NOTE: $*"; }
 
 cleanup() {
-    podman rm -f "$COORD" "$ROUTER_P" "$GW" "$HOME_AGENT" "$WEB" "$LAN_HOST" "$PHONE" "$TABLET" >/dev/null 2>&1 || true
+    podman rm -fv -t 0 "$COORD" "$ROUTER_P" "$GW" "$HOME_AGENT" "$WEB" "$LAN_HOST" "$PHONE" "$TABLET" >/dev/null 2>&1 || true
     for c in $(podman ps -aq --filter "name=wireserve-exit-helper" 2>/dev/null); do
-        podman rm -f "$c" >/dev/null 2>&1 || true
+        podman rm -fv -t 0 "$c" >/dev/null 2>&1 || true
     done
     podman network rm "$SITE_P" "$GW_LAN" "$INET" >/dev/null 2>&1 || true
     rm -rf "$OUT"
@@ -102,7 +103,13 @@ ip_on() {
 admin() { podman exec "$COORD" wireserve-admin "$@"; }
 # Reads one line from a TCP service, which is what the internet host answers
 # with: the address it saw the connection come from.
-tcp_line() { podman exec "$1" timeout 15 bash -c "exec 3<>/dev/tcp/$2/$3; head -1 <&3"; }
+# TCP_TIMEOUT: a check that something is refused sets it short — what gets
+# through at all gets through in well under a second.
+tcp_line() { podman exec "$1" timeout "${TCP_TIMEOUT:-15}" bash -c "exec 3<>/dev/tcp/$2/$3; head -1 <&3"; }
+# Whether agent $1's status lists the peer $2.
+sees() { podman exec "$1" wireserve status --json | grep -q "\"name\": \"$2\""; }
+# Whether agent $1 shows any of its own services still pending approval.
+pending() { podman exec "$1" wireserve status --json | grep -q '"pending": true'; }
 
 log "checking prerequisites"
 command -v podman >/dev/null || fail "podman not found on PATH"
@@ -114,9 +121,7 @@ modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available
 pass "podman, python3 and the WireGuard kernel module are present"
 
 log "building images"
-podman build -q -f deploy/docker/coordinator.Dockerfile -t wireserve-coordinator:exit-test . >/dev/null
-podman build -q -f deploy/docker/agent.Dockerfile -t wireserve-agent:exit-test . >/dev/null
-podman build -q -f deploy/e2e/debug-tools.Dockerfile -t "$DEBUG_IMG" deploy/e2e >/dev/null
+./deploy/e2e/build.sh
 pass "images built"
 
 log "creating the network segments"
@@ -128,7 +133,7 @@ pass "an 'internet' on a public-looking range, the gateway's LAN, and the phone'
 log "starting the coordinator and the internet host"
 podman run -d --name "$COORD" --network "$INET" \
     -e WIRESERVE_ADMIN_TOKEN="$ADMIN_TOKEN" \
-    wireserve-coordinator:exit-test >/dev/null
+    wireserve-coordinator:e2e >/dev/null
 podman run -d --name "$WEB" --network "$INET" "$DEBUG_IMG" \
     socat TCP-LISTEN:8080,fork,reuseaddr SYSTEM:'echo $SOCAT_PEERADDR' >/dev/null
 sleep 2
@@ -151,7 +156,7 @@ log "starting the gateway (inet + its own LAN) and a node behind it"
 # egress switch itself, which is what makes check 6 mean something.
 podman run -d --name "$GW" --network "$INET" --network "$GW_LAN" \
     --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun --sysctl net.ipv4.ip_forward=0 \
-    --entrypoint sleep wireserve-agent:exit-test infinity >/dev/null
+    --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
 sleep 1
 GW_IP=$(ip_on "$GW" "$INET")
 GW_LAN_IP=$(ip_on "$GW" "$GW_LAN")
@@ -167,7 +172,7 @@ echo "gw: $GW_IP (egress $GW_INET_IF), lan $GW_LAN_IP"
 
 podman run -d --name "$HOME_AGENT" --network "$INET" \
     --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
-    --entrypoint sleep wireserve-agent:exit-test infinity >/dev/null
+    --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
 sleep 1
 
 podman run -d --name "$LAN_HOST" --network "$GW_LAN" --cap-add=NET_ADMIN "$DEBUG_IMG" \
@@ -185,9 +190,10 @@ podman exec "$GW" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http
 podman exec "$HOME_AGENT" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_HOME" \
     --listen-port "$WG_PORT" 2>/dev/null
 for a in "$GW" "$HOME_AGENT"; do
-    podman exec -d "$a" wireserve daemon --poll-interval-secs 5
+    podman exec -d "$a" wireserve daemon --poll-interval-secs "$POLL"
 done
-sleep 15
+wait_for 30 sees "$GW" node-home || fail "node-gw never got node-home into its peers"
+wait_for 30 sees "$HOME_AGENT" node-gw || fail "node-home never got node-gw into its peers"
 pass "both agents registered and polling"
 
 # The LAN host routes the mesh back through the gateway, so only the exit's
@@ -200,10 +206,15 @@ in_netns "$LAN_HOST" ip route replace "$MESH_NET" via "$GW_LAN_IP" >/dev/null
 log "a service on the home node, and a resolver on the gateway"
 podman exec "$HOME_AGENT" wireserve svc-home 12345
 podman exec "$GW" wireserve dns 53:53/udp 53:53/tcp
-sleep 8
+wait_for 20 pending "$HOME_AGENT" || fail "node-home never reported svc-home"
+wait_for 20 pending "$GW" || fail "node-gw never reported dns"
 admin service approve svc-home --node node-home || fail "could not approve svc-home"
 admin service approve dns --node node-gw || fail "could not approve dns"
-sleep 12
+for a in "$GW" "$HOME_AGENT"; do
+    wait_for 20 eval '! pending "$a"' || fail "$a never learnt its service was approved"
+done
+wait_for 20 podman exec "$GW" getent hosts svc-home.wg || true
+wait_for 20 podman exec "$GW" getent hosts dns.wg || true
 svc_addr() { podman exec "$1" getent hosts "$2" | awk '{print $1}'; }
 SVC_HOME=$(svc_addr "$GW" svc-home.wg)
 DNS_VIP=$(svc_addr "$GW" dns.wg)
@@ -220,7 +231,6 @@ echo "svc-home.wg=$SVC_HOME  dns.wg=$DNS_VIP"
 log "making node-gw a gateway"
 podman exec "$GW" wireserve transit on
 admin transit approve node-gw || fail "could not approve node-gw for transit"
-sleep 10
 
 log "1/9: --exit is refused while the gateway has not opted in"
 if admin device create phone --exit node-gw --dns dns --out /tmp/phone.conf \
@@ -234,8 +244,9 @@ pass "refused, naming \`exit on\`"
 
 log "2/9: two profiles, one key"
 podman exec "$GW" wireserve exit on
-sleep 10
-admin device create phone --exit node-gw --dns dns --out /tmp/phone.conf \
+# Refused until node-gw's next poll tells the coordinator; a refusal creates
+# nothing (step 1), so trying again is safe.
+wait_for 20 admin device create phone --exit node-gw --dns dns --out /tmp/phone.conf \
     --register-url "http://127.0.0.1:47820" \
     || fail "device create --exit failed (a conflict here means step 1 created the node before refusing)"
 podman cp "$COORD:/tmp/phone.conf" "$OUT/phone.conf"
@@ -270,7 +281,8 @@ podman exec "$PHONE" mkdir -p /etc/wireguard
 # seem to work for as long as the exit does.
 grep -v '^DNS' "$OUT/phone-exit.conf" | podman exec -i "$PHONE" tee /etc/wireguard/wg0.conf >/dev/null
 podman exec "$PHONE" wg-quick up wg0 || fail "the full-tunnel profile would not come up"
-sleep 10
+# Nothing passes until the gateway's next poll brings it the phone.
+wait_for 30 tcp_line "$PHONE" "$WEB_IP" 8080 || true
 PHONE_IP4=$(grep '^Address' "$OUT/phone.conf" | sed 's/Address = //; s#/32.*##')
 
 # What the gateway looks like when an exit check fails, and where one retry's
@@ -318,7 +330,7 @@ fi
 pass "svc-home reachable, over the phone's own direct peer entry"
 
 log "5/9: the gateway's LAN is not the internet"
-if tcp_line "$PHONE" "$LAN_IP" 8080 >/dev/null 2>&1; then
+if TCP_TIMEOUT=5 tcp_line "$PHONE" "$LAN_IP" 8080 >/dev/null 2>&1; then
     fail "the exit forwarded to a private address on the gateway's LAN"
 fi
 pass "the LAN host stays unreachable, though it routes to the mesh"
@@ -347,8 +359,8 @@ pass "FORWARD DROP opened for exit-marked flows"
 
 log "9/9: exit off"
 podman exec "$GW" wireserve exit off
-sleep 12
-if tcp_line "$PHONE" "$WEB_IP" 8080 >/dev/null 2>&1; then
+wait_for 20 eval '! TCP_TIMEOUT=5 tcp_line "$PHONE" "$WEB_IP" 8080' || true
+if TCP_TIMEOUT=5 tcp_line "$PHONE" "$WEB_IP" 8080 >/dev/null 2>&1; then
     fail "the phone still reaches the internet after \`exit off\`"
 fi
 podman exec "$PHONE" timeout 15 bash -c "exec 3<>/dev/tcp/$SVC_HOME/12345" \
@@ -374,7 +386,7 @@ podman exec "$TABLET" ip route replace default via "$ROUTER_P_LAN"
 podman exec "$TABLET" mkdir -p /etc/wireguard
 grep -v '^DNS' "$OUT/tablet.conf" | podman exec -i "$TABLET" tee /etc/wireguard/wg0.conf >/dev/null
 podman exec "$TABLET" wg-quick up wg0 || fail "the mesh profile would not come up"
-sleep 5
+wait_for 30 eval '[ "$(podman exec "$TABLET" dig +short +time=2 +tries=1 "@$DNS_VIP" svc-home.wg)" = "$SVC_HOME" ]' || true
 ANSWER=$(podman exec "$TABLET" dig +short +time=3 +tries=2 "@$DNS_VIP" svc-home.wg) || true
 [ "$ANSWER" = "$SVC_HOME" ] || fail "through the mesh profile the resolver answered '$ANSWER' for svc-home.wg, expected $SVC_HOME"
 pass "svc-home.wg -> $ANSWER over the plain mesh profile; a public resolver is refused for it"

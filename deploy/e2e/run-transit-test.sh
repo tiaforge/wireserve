@@ -42,6 +42,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+. deploy/e2e/lib.sh
 
 INET=wireserve-transit-inet
 SITE_A=wireserve-transit-site-a
@@ -64,10 +65,10 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 note() { echo "NOTE: $*"; }
 
 cleanup() {
-    podman rm -f "$COORD" "$ROUTER_A" "$ROUTER_B" "$ROUTER_C" "$AGENT1" "$AGENT2" "$AGENT4" \
+    podman rm -fv -t 0 "$COORD" "$ROUTER_A" "$ROUTER_B" "$ROUTER_C" "$AGENT1" "$AGENT2" "$AGENT4" \
         >/dev/null 2>&1 || true
     for c in $(podman ps -aq --filter "name=wireserve-transit-helper" 2>/dev/null); do
-        podman rm -f "$c" >/dev/null 2>&1 || true
+        podman rm -fv -t 0 "$c" >/dev/null 2>&1 || true
     done
     podman network rm "$SITE_A" "$SITE_B" "$SITE_C" "$INET" >/dev/null 2>&1 || true
 }
@@ -104,9 +105,7 @@ modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available
 pass "podman, python3 and the WireGuard kernel module are present"
 
 log "building images"
-podman build -q -f deploy/docker/coordinator.Dockerfile -t wireserve-coordinator:transit-test . >/dev/null
-podman build -q -f deploy/docker/agent.Dockerfile -t wireserve-agent:transit-test . >/dev/null
-podman build -q -f deploy/e2e/debug-tools.Dockerfile -t "$DEBUG_IMG" deploy/e2e >/dev/null
+./deploy/e2e/build.sh
 pass "images built"
 
 log "creating the four network segments"
@@ -122,7 +121,7 @@ pass "four internal segments, so the only NAT is the one our routers do"
 log "starting the coordinator on the inet segment"
 podman run -d --name "$COORD" --network "$INET" \
     -e WIRESERVE_ADMIN_TOKEN="$ADMIN_TOKEN" \
-    wireserve-coordinator:transit-test >/dev/null
+    wireserve-coordinator:e2e >/dev/null
 sleep 2
 COORD_IP=$(ip_on "$COORD" "$INET")
 echo "coordinator: $COORD_IP"
@@ -166,7 +165,7 @@ start_agent() {
     local name=$1 site=$2 gateway=$3
     podman run -d --name "$name" --network "$site" \
         --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
-        --entrypoint sleep wireserve-agent:transit-test infinity >/dev/null
+        --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
     sleep 1
     in_netns "$name" ip route replace default via "$gateway" >/dev/null
 }
@@ -189,6 +188,13 @@ podman exec "$ROUTER_A" nft \
 create_node() {
     podman exec "$COORD" wireserve-admin node create "$1" | grep -oE 'jtk_[a-f0-9]+'
 }
+sees() { podman exec "$1" wireserve status --json | grep -q "\"name\": \"$2\""; }
+pending() { podman exec "$1" wireserve status --json | grep -q '"pending": true'; }
+# The carrier agent $1 was told to reach peer $2 through; empty for none.
+relay_via() {
+    podman exec "$1" wireserve status --json \
+        | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(((p.get('relay') or {}).get('via') or '' for p in d['peers'] if p.get('name')=='$2'), ''))"
+}
 
 log "joining the three nodes"
 JT1=$(create_node node1)
@@ -201,10 +207,12 @@ podman exec "$AGENT4" wireserve join "http://$COORD_IP:47820" --allow-plaintext-
 pass "all three nodes registered"
 
 for a in "$AGENT1" "$AGENT2" "$AGENT4"; do
-    podman exec -d "$a" wireserve daemon --poll-interval-secs 5
+    podman exec -d "$a" wireserve daemon --poll-interval-secs "$POLL"
 done
-log "waiting for poll cycles and WireGuard handshakes (transit still off everywhere)"
-sleep 20
+log "waiting for the nodes to see each other (transit still off everywhere)"
+for pair in "$AGENT1:node2" "$AGENT1:node4" "$AGENT2:node4" "$AGENT4:node2"; do
+    wait_for 30 sees "${pair%%:*}" "${pair#*:}" || fail "${pair%%:*} never got ${pair#*:} into its peers"
+done
 
 # Baselines for the interface-scoped-forwarding check further down. NOT
 # assumed to be "0": a fresh network namespace inherits its own starting
@@ -222,10 +230,15 @@ AGENT4_WG_BASELINE=$(in_netns "$AGENT4" cat /proc/sys/net/ipv4/conf/wireserve0/f
 log "declaring a service on agent2 and agent4"
 podman exec "$AGENT2" wireserve svc-two 12345
 podman exec "$AGENT4" wireserve svc-four 12345
-sleep 8
+wait_for 20 pending "$AGENT2" || fail "agent2 never reported svc-two"
+wait_for 20 pending "$AGENT4" || fail "agent4 never reported svc-four"
 podman exec "$COORD" wireserve-admin service approve svc-two --node node2 || fail "could not approve svc-two"
 podman exec "$COORD" wireserve-admin service approve svc-four --node node4 || fail "could not approve svc-four"
-sleep 12
+for a in "$AGENT2" "$AGENT4"; do
+    wait_for 20 eval '! pending "$a"' || fail "$a never learnt its service was approved"
+done
+wait_for 20 podman exec "$AGENT4" getent hosts svc-two.wg || true
+wait_for 20 podman exec "$AGENT2" getent hosts svc-four.wg || true
 
 svc_addr() { podman exec "$1" getent hosts "$2" | awk 'NR == 1 {print $1}'; }
 SVC2=$(svc_addr "$AGENT4" svc-two.wg)
@@ -254,12 +267,12 @@ log "opting agent1 in as transit"
 podman exec "$AGENT1" wireserve transit on
 log "approving node1 as a carrier (the node's own opt-in is not enough on its own)"
 podman exec "$COORD" wireserve-admin transit approve node1 || fail "could not approve node1 for transit"
-log "waiting for transit selection to propagate (up to one poll interval each side)"
-sleep 20
+log "waiting for transit selection to reach both sides"
+wait_for 60 eval '[ -n "$(relay_via "$AGENT4" node2)" ]' || true
+wait_for 30 eval '[ -n "$(relay_via "$AGENT2" node4)" ]' || true
 
 log "confirming the coordinator names agent1 as the relay for this pair"
-NODE2_RELAY_VIA=$(podman exec "$AGENT4" wireserve status --json \
-    | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(((p.get('relay') or {}).get('via') or '' for p in d['peers'] if p.get('name')=='node2'), ''))")
+NODE2_RELAY_VIA=$(relay_via "$AGENT4" node2)
 [ -n "$NODE2_RELAY_VIA" ] || fail "agent4's poll response never named a relay for node2"
 podman exec "$AGENT4" wireserve status | grep -q "relayed by node1" || fail "wireserve status does not say node2 is relayed by node1"
 pass "agent4 was told to reach node2 through a relay, and says so"
@@ -346,7 +359,10 @@ pass "the two nodes that never opted in have their forwarding posture completely
 
 log "toggling transit off on agent1 mid-run"
 podman exec "$AGENT1" wireserve transit off
-sleep 20
+wait_for 30 eval '[ -z "$(relay_via "$AGENT4" node2)" ]' || true
+wait_for 30 eval '[ -z "$(relay_via "$AGENT2" node4)" ]' || true
+# ...and agent1 has had a few polls to take its side down.
+settle
 in_netns_bg "$AGENT2" nc -l -k -p 12345
 in_netns_bg "$AGENT4" nc -l -k -p 12345
 sleep 2
