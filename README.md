@@ -360,7 +360,7 @@ Each `PORT` is `[PUBLIC:][ADDRESS:]TARGET[/tcp|/udp]` (TCP unless given;
 without an address, the target is on this node). Names are unique across the
 whole mesh, first come first served.
 
-`list` reads the daemon's cache of the last poll, no network call:
+`status` reads the daemon's cache of the last poll, no network call:
 
 ```
 lego2, instance default on wireserve0
@@ -392,7 +392,7 @@ firewall rewrites `address:PUBLIC` to `node:TARGET` in the kernel:
 
 - **Only the published ports answer.** The target port is closed to the
   mesh, on the node's own address and on the service's: after
-  `serve openobserve 80:5080`, `openobserve.wg:80` works and
+  `wireserve openobserve 80:5080`, `openobserve.wg:80` works and
   `openobserve.wg:5080` does not.
 - **The service sees the real client.** Nothing is proxied; any TCP or UDP
   protocol works, and logs, rate limits and allowlists see the peer's own
@@ -1028,7 +1028,7 @@ way, and a resolver answering the mesh's names itself is not affected by
   requests" may refuse them, but "permit all origins" on a node with a public
   interface is an open resolver: bind to the mesh address instead.
 - A resolver on a LAN appliance works through a
-  [LAN mapping](#devices-on-the-nodes-network) (`serve dns
+  [LAN mapping](#devices-on-the-nodes-network) (`wireserve dns
   53:192.168.1.2:53/udp`), but it has no names of the mesh's own.
 
 #### The same names without the full tunnel
