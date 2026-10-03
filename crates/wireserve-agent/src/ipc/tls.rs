@@ -1,7 +1,7 @@
 //! The TLS terminator's socket (PLAN.md M33): a second, narrower one than
 //! the agent's own. The terminator runs as its own unprivileged user, and a
 //! compromise of it — it parses TLS and HTTP from the whole mesh — must not
-//! be able to `serve`, `unserve` or `leave`. So this socket decodes only
+//! be able to declare or withdraw services, or `leave`. So this socket decodes only
 //! [`TlsRequest`], whose two operations are a check-in and a challenge
 //! record for one of this node's own names.
 //!

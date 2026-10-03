@@ -157,7 +157,7 @@ pub struct InstallArgs {
     /// coordinator listens on.
     #[arg(long, value_name = "IP", requires = "web_server_at")]
     pub listen_on: Option<IpAddr>,
-    /// New services wait for `wireserve-admin approve-service` (the default).
+    /// New services wait for `wireserve-admin service approve` (the default).
     #[arg(long, conflicts_with = "no_approval")]
     pub approval: bool,
     /// New services are shared with every machine at once.
@@ -722,7 +722,7 @@ fn print_next_steps(answers: &Answers, service_user: &str, state_dir: &Path) {
             if let Some(si) = &n.sign_in {
                 let (svc, node) = (&si.service, si.node.as_deref().unwrap_or("<its node>"));
                 println!("   Publish your sign-in provider as `{svc}` on 443 from {node}, e.g.:");
-                println!("     wireserve serve {svc} 443:8080");
+                println!("     wireserve {svc} 443:8080");
             }
         } else {
             println!("3. Service names: <name>.{} works on machines running WireServe only.", n.domain);
@@ -732,10 +732,10 @@ fn print_next_steps(answers: &Answers, service_user: &str, state_dir: &Path) {
     }
     println!();
     match &answers.admin_user {
-        Some(user) => println!("Then, as {user}, add your first machine:  wireserve-admin create-node <name>"),
+        Some(user) => println!("Then, as {user}, add your first machine:  wireserve-admin node create <name>"),
         None => {
             println!("The admin key is in {}/coordinator-secrets.env", state_dir.display());
-            println!("(`sudo grep WIRESERVE_ADMIN_TOKEN` it). Then: wireserve-admin create-node <name>");
+            println!("(`sudo grep WIRESERVE_ADMIN_TOKEN` it). Then: wireserve-admin node create <name>");
         }
     }
     println!(

@@ -124,7 +124,7 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
     let url = format!("{}/register", params.coordinator_url.trim_end_matches('/'));
     // Best-effort: a probe failure must not fail `join` — the mesh
     // already tolerates a node with no reachable endpoint at all, and
-    // `--endpoint-addr` remains available as a manual override for a
+    // `--endpoint` remains available as a manual override for a
     // coordinator this node genuinely can't reach outbound over a
     // required family at join time.
     let dual = crate::probe::probe_both(

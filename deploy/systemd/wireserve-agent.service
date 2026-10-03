@@ -32,7 +32,7 @@ RuntimeDirectory=wireserve wireserve-tls
 RuntimeDirectoryMode=0700
 # The directory starts out root-only. When a `wireserve` group exists the
 # daemon hands it, and its IPC socket, to that group (0750/0660) so its
-# members can run `wireserve serve`/`list`/... without sudo. Changing a
+# members can run `wireserve <service>`/`status`/... without sudo. Changing a
 # file's group to one root is not itself a member of needs CAP_CHOWN,
 # hence it in the bounding set below.
 # The second directory holds the TLS terminator's socket (PLAN.md M33),

@@ -1,4 +1,4 @@
-//! Terminal QR rendering for `export-config --qr` (PLAN.md M24).
+//! Terminal QR rendering for `device create --qr` (PLAN.md M24).
 //!
 //! The point of this is that refreshing a phone becomes a scan instead of a
 //! file transfer. It renders to stdout and never to a file: a `.conf` holds a

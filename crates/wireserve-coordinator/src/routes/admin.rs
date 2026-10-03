@@ -268,7 +268,7 @@ pub async fn rejoin_node(
     // `/register` where every other `kind` mismatch surfaces. A rejoin nulls
     // the pubkey, and `list_all_peers` filters on `pubkey IS NOT NULL`, so by
     // the time a mismatch reached registration this node would already be off
-    // every other node's directory. `export-config --refresh` pointed at an
+    // every other node's directory. `device refresh` pointed at an
     // agent node by mistake would kick a live node off the mesh and only then
     // report the error.
     if let Some(expected) = expected_kind {
@@ -796,7 +796,7 @@ pub async fn record_export(
             let exit = agent(&conn, "exit", exit_name)?;
             if !exit.transit_approved {
                 return Err(AppError::Conflict(format!(
-                    "'{exit_name}' is not approved to send others' traffic on — run                      `wireserve-admin approve-transit {exit_name}` first"
+                    "'{exit_name}' is not approved to send others' traffic on — run                      `wireserve-admin transit approve {exit_name}` first"
                 )));
             }
             if !exit.pubkey.as_deref().is_some_and(|pk| state.transit.is_offering_exit(pk, fresh)) {
@@ -813,7 +813,7 @@ pub async fn record_export(
         let carrier = agent(&conn, "carrier", &r.carrier)?;
         if !carrier.transit_approved {
             return Err(AppError::Conflict(format!(
-                "'{}' is not approved to carry traffic — run `wireserve-admin approve-transit {}` first",
+                "'{}' is not approved to carry traffic — run `wireserve-admin transit approve {}` first",
                 r.carrier, r.carrier
             )));
         }

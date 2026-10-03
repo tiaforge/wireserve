@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# The per-node TLS terminator (PLAN.md M33), run as `wireserve tls-serve`
+# The per-node TLS terminator (PLAN.md M33), run as `wireserve tls-daemon`
 # under its own unprivileged unit. A library so the one `wireserve` binary
 # carries it; nothing here needs any privilege: it listens on an
 # unprivileged port systemd holds for it (PLAN.md M35).

@@ -187,7 +187,7 @@ podman exec "$ROUTER_A" nft \
     "add rule ip nat prerouting iifname \"eth0\" udp dport $WG_PORT dnat to $AGENT1_LAN:$WG_PORT"
 
 create_node() {
-    podman exec "$COORD" wireserve-admin create-node "$1" | grep -oE 'jtk_[a-f0-9]+'
+    podman exec "$COORD" wireserve-admin node create "$1" | grep -oE 'jtk_[a-f0-9]+'
 }
 
 log "joining the three nodes"
@@ -195,7 +195,7 @@ JT1=$(create_node node1)
 JT2=$(create_node node2)
 JT4=$(create_node node4)
 podman exec "$AGENT1" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT1" \
-    --listen-port "$WG_PORT" --endpoint-addr "$ROUTER_A_WAN:$WG_PORT" 2>/dev/null
+    --listen-port "$WG_PORT" --endpoint "$ROUTER_A_WAN:$WG_PORT" 2>/dev/null
 podman exec "$AGENT2" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT2" --listen-port "$WG_PORT" 2>/dev/null
 podman exec "$AGENT4" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT4" --listen-port "$WG_PORT" 2>/dev/null
 pass "all three nodes registered"
@@ -220,11 +220,11 @@ AGENT2_WG_BASELINE=$(in_netns "$AGENT2" cat /proc/sys/net/ipv4/conf/wireserve0/f
 AGENT4_WG_BASELINE=$(in_netns "$AGENT4" cat /proc/sys/net/ipv4/conf/wireserve0/forwarding 2>/dev/null || echo "?")
 
 log "declaring a service on agent2 and agent4"
-podman exec "$AGENT2" wireserve serve svc-two 12345
-podman exec "$AGENT4" wireserve serve svc-four 12345
+podman exec "$AGENT2" wireserve svc-two 12345
+podman exec "$AGENT4" wireserve svc-four 12345
 sleep 8
-podman exec "$COORD" wireserve-admin approve-service node2 svc-two || fail "could not approve svc-two"
-podman exec "$COORD" wireserve-admin approve-service node4 svc-four || fail "could not approve svc-four"
+podman exec "$COORD" wireserve-admin service approve svc-two --node node2 || fail "could not approve svc-two"
+podman exec "$COORD" wireserve-admin service approve svc-four --node node4 || fail "could not approve svc-four"
 sleep 12
 
 svc_addr() { podman exec "$1" getent hosts "$2" | awk 'NR == 1 {print $1}'; }
@@ -253,15 +253,15 @@ pass "agent2 and agent4 cannot reach each other directly — this is the case tr
 log "opting agent1 in as transit"
 podman exec "$AGENT1" wireserve transit on
 log "approving node1 as a carrier (the node's own opt-in is not enough on its own)"
-podman exec "$COORD" wireserve-admin approve-transit node1 || fail "could not approve node1 for transit"
+podman exec "$COORD" wireserve-admin transit approve node1 || fail "could not approve node1 for transit"
 log "waiting for transit selection to propagate (up to one poll interval each side)"
 sleep 20
 
 log "confirming the coordinator names agent1 as the relay for this pair"
-NODE2_RELAY_VIA=$(podman exec "$AGENT4" wireserve list --json \
+NODE2_RELAY_VIA=$(podman exec "$AGENT4" wireserve status --json \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(((p.get('relay') or {}).get('via') or '' for p in d['peers'] if p.get('name')=='node2'), ''))")
 [ -n "$NODE2_RELAY_VIA" ] || fail "agent4's poll response never named a relay for node2"
-podman exec "$AGENT4" wireserve list | grep -q "relayed by node1" || fail "wireserve list does not say node2 is relayed by node1"
+podman exec "$AGENT4" wireserve status | grep -q "relayed by node1" || fail "wireserve status does not say node2 is relayed by node1"
 pass "agent4 was told to reach node2 through a relay, and says so"
 
 log "counting what agent1 forwards, by protocol"
@@ -301,9 +301,9 @@ pass "agent1 forwarded $UDP_SEEN UDP packets and 0 TCP: it relayed ciphertext on
 in_netns "$AGENT1" nft delete table inet relayprobe
 
 log "confirming agent4's addresses sit on agent2's carry interface, not its mesh interface"
-AGENT4_PUBKEY=$(podman exec "$AGENT4" wireserve list --json \
+AGENT4_PUBKEY=$(podman exec "$AGENT4" wireserve status --json \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(next((p.get('pubkey') for p in d['peers'] if p.get('name')=='node4'), ''))")
-AGENT2_PUBKEY=$(podman exec "$AGENT2" wireserve list --json \
+AGENT2_PUBKEY=$(podman exec "$AGENT2" wireserve status --json \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(next((p.get('pubkey') for p in d['peers'] if p.get('name')=='node2'), ''))")
 in_netns "$AGENT2" wg show wireserve0 allowed-ips | grep "$AGENT4_PUBKEY" | grep -q "(none)" \
     || fail "agent2's mesh-interface entry for agent4 still routes something — it should only probe"

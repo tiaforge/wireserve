@@ -154,7 +154,7 @@ pub trait FirewallBackend {
 
 /// Where an exit never forwards to (PLAN.md M27): every IPv4 range that is
 /// not the public internet. The gateway's own table refuses these as
-/// destinations, and `export-config` refuses them as the full-tunnel
+/// destinations, and `device create` refuses them as the full-tunnel
 /// profile's resolver, so the two can never disagree about what an exit
 /// reaches. Private ranges are here on purpose: an exit client reaching the
 /// gateway's LAN would bypass the per-service approval a LAN target needs

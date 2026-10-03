@@ -1,5 +1,5 @@
 # The TLS terminator for a named agent instance: `wireserve-tls@work` runs
-# `wireserve --instance work tls-serve` beside `wireserve-agent@work`. See
+# `wireserve --instance work tls-daemon` beside `wireserve-agent@work`. See
 # wireserve-tls.service for what it is and why it is sandboxed this way;
 # keep the two in step.
 
@@ -16,7 +16,7 @@ User=wireserve-tls
 Group=wireserve-tls
 EnvironmentFile=-/etc/wireserve/tls.env
 EnvironmentFile=-/etc/wireserve/tls-%i.env
-ExecStart=/usr/local/bin/wireserve --instance %i tls-serve
+ExecStart=/usr/local/bin/wireserve --instance %i tls-daemon
 Restart=on-failure
 RestartSec=5s
 

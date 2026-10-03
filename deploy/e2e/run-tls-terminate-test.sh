@@ -204,27 +204,27 @@ podman cp "$WORK/pebble-minica.pem" "$HOME_AGENT:/etc/pebble-minica.pem"
 log "joining both agents; the home node runs its terminator"
 for pair in "$HOME_AGENT:node-home" "$CLIENT:node-client"; do
     c=${pair%%:*}; n=${pair#*:}
-    jt=$(admin create-node "$n" | grep -oE 'jtk_[a-f0-9]+')
+    jt=$(admin node create "$n" | grep -oE 'jtk_[a-f0-9]+')
     podman exec "$c" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$jt" \
-        --listen-port "$WG_PORT" --endpoint-addr "$(ip_on "$c" "$NET"):$WG_PORT" 2>/dev/null
+        --listen-port "$WG_PORT" --endpoint "$(ip_on "$c" "$NET"):$WG_PORT" 2>/dev/null
     podman exec -d "$c" sh -c 'wireserve daemon --poll-interval-secs 3 >/var/log/agent.log 2>&1'
 done
 start_terminator() {
     podman exec -d "$HOME_AGENT" sh -c 'WIRESERVE_ACME_CA_FILE=/etc/pebble-minica.pem \
-        wireserve tls-serve --state-dir /var/lib/wireserve-tls >>/var/log/tls.log 2>&1'
+        wireserve tls-daemon --state-dir /var/lib/wireserve-tls >>/var/log/tls.log 2>&1'
 }
 # Something else of the host's on every address's 443 (PLAN.md M35),
 # there before the terminator, the way a Caddy started at boot would be.
 in_netns_bg "$HOME_AGENT" socat "TCP-LISTEN:443,fork,reuseaddr" SYSTEM:"echo stranger"
 start_terminator
-podman exec "$HOME_AGENT" wireserve serve plex 443:32400 81:32401
+podman exec "$HOME_AGENT" wireserve plex 443:32400 81:32401
 for port in 32400 32401; do
     in_netns_bg "$HOME_AGENT" socat "TCP-LISTEN:$port,fork,reuseaddr" EXEC:"/e2e/echo-backend.sh $port"
 done
 sleep 8
 PLEX_VIP=$(entry "$HOME_AGENT" plex vip4)
-HOME_IP=$(podman exec "$HOME_AGENT" wireserve list --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["node"]["ip4"])' 2>/dev/null || true)
-[ -n "$PLEX_VIP" ] || fail "plex has no service address: $(podman exec "$HOME_AGENT" wireserve list)"
+HOME_IP=$(podman exec "$HOME_AGENT" wireserve status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["node"]["ip4"])' 2>/dev/null || true)
+[ -n "$PLEX_VIP" ] || fail "plex has no service address: $(podman exec "$HOME_AGENT" wireserve status)"
 pass "plex at $PLEX_VIP"
 
 log "1/10: a certificate from Pebble, and plex terminated"
@@ -282,7 +282,7 @@ pass "_acme-challenge.plex.$DOMAIN is empty"
 
 log "7/10: a restarted terminator serves the stored certificate"
 SERIAL=$(in_netns "$CLIENT" sh -c "echo | openssl s_client -connect $PLEX_VIP:443 -servername plex.$DOMAIN 2>/dev/null | openssl x509 -noout -serial" 2>/dev/null || true)
-signal "$HOME_AGENT" TERM 'wireserve tls-serve'
+signal "$HOME_AGENT" TERM 'wireserve tls-daemon'
 sleep 1
 start_terminator
 sleep 12
@@ -293,7 +293,7 @@ AFTER=$(in_netns "$CLIENT" sh -c "echo | openssl s_client -connect $PLEX_VIP:443
 pass "same certificate, no new issuance"
 
 log "8/10: a stopped terminator hands the address back to the mapping"
-signal "$HOME_AGENT" TERM 'wireserve tls-serve'
+signal "$HOME_AGENT" TERM 'wireserve tls-daemon'
 # The firewall stops relying on it after 30s without a check-in.
 wait_for "plain HTTP on :443 to reach the backend again" 60 \
     sh -c "podman run --rm --network container:$CLIENT $DEBUG_IMG curl -s --max-time 3 http://$PLEX_VIP:443/ | grep -q backend:32400"
@@ -330,7 +330,7 @@ done
 in_netns_bg "$HOME_AGENT" python3 /e2e/ws-backend.py 32400
 cp deploy/e2e/ws-client.py "$WORK/ws-client.py"
 # The client's mesh address, as the home node knows it.
-CLIENT_IP=$(podman exec "$HOME_AGENT" wireserve list --json | python3 -c "
+CLIENT_IP=$(podman exec "$HOME_AGENT" wireserve status --json | python3 -c "
 import json, sys
 m = [p['ip4'] for p in json.load(sys.stdin).get('peers', []) if p.get('name') == 'node-client']
 print(m[0] if m else '')")

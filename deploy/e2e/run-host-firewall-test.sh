@@ -61,7 +61,7 @@ sleep 1
 COORD_IP=$(podman inspect "$COORD" --format "{{(index .NetworkSettings.Networks \"$NET\").IPAddress}}")
 
 create_node() {
-    podman exec "$COORD" wireserve-admin create-node "$1" | grep -oE 'jtk_[a-f0-9]+'
+    podman exec "$COORD" wireserve-admin node create "$1" | grep -oE 'jtk_[a-f0-9]+'
 }
 
 node_container() {
@@ -110,7 +110,7 @@ print(sum(1 for o in d if 'rule' in o and str(o['rule'].get('comment', '')).star
 }
 
 mesh_ip_of() {
-    podman exec "$1" wireserve list --json | python3 -c "
+    podman exec "$1" wireserve status --json | python3 -c "
 import json, sys
 m = [p['ip4'] for p in json.load(sys.stdin).get('peers', []) if p.get('name') == '$2']
 print(m[0] if m else '')"
@@ -150,9 +150,9 @@ log "declaring and approving a service on agent1"
 # Published on :80 of its own address (PLAN.md M20), onto 12345: the
 # rewritten packet still arrives on wireserve0, so it is the same
 # interface-scoped accept in the host firewalls that has to let it in.
-podman exec "$AGENT1" wireserve serve testsvc 80:12345
+podman exec "$AGENT1" wireserve testsvc 80:12345
 sleep 6
-podman exec "$COORD" wireserve-admin approve-service node1 testsvc
+podman exec "$COORD" wireserve-admin service approve testsvc --node node1
 sleep 6
 AGENT1_MESH_IP=$(mesh_ip_of "$AGENT2" node1)
 [ -n "$AGENT1_MESH_IP" ] || fail "could not determine agent1's mesh address"

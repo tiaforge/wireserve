@@ -224,19 +224,19 @@ done
 log "joining the three agents; gate and home run their terminators"
 for pair in "$GATE:node-gate" "$HOME_AGENT:node-home" "$CLIENT:node-client"; do
     c=${pair%%:*}; n=${pair#*:}
-    jt=$(admin create-node "$n" | grep -oE 'jtk_[a-f0-9]+')
+    jt=$(admin node create "$n" | grep -oE 'jtk_[a-f0-9]+')
     podman exec "$c" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$jt" \
-        --listen-port "$WG_PORT" --endpoint-addr "$(ip_on "$c" "$NET"):$WG_PORT" 2>/dev/null
+        --listen-port "$WG_PORT" --endpoint "$(ip_on "$c" "$NET"):$WG_PORT" 2>/dev/null
     podman exec -d "$c" sh -c 'wireserve daemon --poll-interval-secs 3 >/var/log/agent.log 2>&1'
 done
 for c in "$GATE" "$HOME_AGENT"; do
     podman exec -d "$c" sh -c 'WIRESERVE_ACME_CA_FILE=/etc/pebble-minica.pem WIRESERVE_TLS_TRUST_FILE=/etc/pebble-root.pem \
-        wireserve tls-serve --state-dir /var/lib/wireserve-tls >>/var/log/tls.log 2>&1'
+        wireserve tls-daemon --state-dir /var/lib/wireserve-tls >>/var/log/tls.log 2>&1'
 done
-podman exec "$GATE" wireserve serve auth 443:8080
+podman exec "$GATE" wireserve auth 443:8080
 in_netns_bg "$GATE" socat "TCP-LISTEN:8080,fork,reuseaddr" EXEC:/e2e/auth-stub.sh
-podman exec "$HOME_AGENT" wireserve serve jellyfin 443:8096 8920:8920
-podman exec "$HOME_AGENT" wireserve serve grafana 443:3000 3001:3001
+podman exec "$HOME_AGENT" wireserve jellyfin 443:8096 8920:8920
+podman exec "$HOME_AGENT" wireserve grafana 443:3000 3001:3001
 for port in 8096 8920 3000 3001; do
     in_netns_bg "$HOME_AGENT" socat "TCP-LISTEN:$port,fork,reuseaddr" EXEC:"/e2e/echo-backend.sh $port"
 done
@@ -253,7 +253,7 @@ admin tag add node-gate tv
 if admin group add media auth 2>/dev/null; then
     fail "the sign-in service was put in a group"
 fi
-admin list-services | grep '^jellyfin' | grep -q 'groups=media' || fail "list-services does not show jellyfin in media"
+admin service list | grep '^jellyfin' | grep -q 'groups=media' || fail "service list does not show jellyfin in media"
 wait_for "home to fall back to the sign-in for jellyfin" 30 signs_in jellyfin
 # The terminator picks it up on its next check-in.
 sleep 8
@@ -331,10 +331,10 @@ echo "$OUT" | grep -q 'backend:' && { echo "$OUT"; fail "a foreign Host reached 
 pass "Host: grafana on jellyfin's address: 421, no backend"
 
 log "9/10: a provider on another node is not the provider"
-podman exec "$GATE" wireserve unserve auth
+podman exec "$GATE" wireserve auth off
 auth_gone() { [ -z "$(entry auth name)" ]; }
 wait_for "auth to leave the directory" 30 auth_gone
-podman exec "$HOME_AGENT" wireserve serve auth 443:8081
+podman exec "$HOME_AGENT" wireserve auth 443:8081
 in_netns_bg "$HOME_AGENT" socat "TCP-LISTEN:8081,fork,reuseaddr" EXEC:/e2e/impostor-stub.sh
 held_by_home() { [ "$(entry auth node)" = node-home ] && terminated auth; }
 wait_for "home's auth to be terminated" 120 held_by_home

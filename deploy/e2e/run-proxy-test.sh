@@ -163,7 +163,7 @@ fi
 pass "the admin port is not exposed"
 
 create_node() {
-    podman exec "$COORD" wireserve-admin create-node "$1" | grep -oE 'jtk_[a-f0-9]+'
+    podman exec "$COORD" wireserve-admin node create "$1" | grep -oE 'jtk_[a-f0-9]+'
 }
 
 log "joining both nodes over HTTPS through the proxy"
@@ -187,9 +187,9 @@ log "checking the coordinator resolved each agent's real address, not the proxy'
 # With trust_proxy_headers on, /register's endpoint fallback should record
 # each agent's own front-segment address. If the header were being ignored
 # the two would be identical and equal to the proxy's.
-podman exec "$COORD" wireserve-admin list-peers | awk '{ for (i = 1; i <= NF; i++) if (index($i, "endpoint=") == 1) printf "  %-7s %s\n", $1, $i }'
-EP1=$(podman exec "$COORD" wireserve-admin list-peers | awk '$1=="node1" { for (i = 1; i <= NF; i++) if (index($i, "endpoint=") == 1) print $i }')
-EP2=$(podman exec "$COORD" wireserve-admin list-peers | awk '$1=="node2" { for (i = 1; i <= NF; i++) if (index($i, "endpoint=") == 1) print $i }')
+podman exec "$COORD" wireserve-admin node list | awk '{ for (i = 1; i <= NF; i++) if (index($i, "endpoint=") == 1) printf "  %-7s %s\n", $1, $i }'
+EP1=$(podman exec "$COORD" wireserve-admin node list | awk '$1=="node1" { for (i = 1; i <= NF; i++) if (index($i, "endpoint=") == 1) print $i }')
+EP2=$(podman exec "$COORD" wireserve-admin node list | awk '$1=="node2" { for (i = 1; i <= NF; i++) if (index($i, "endpoint=") == 1) print $i }')
 [ "$EP1" != "$EP2" ] \
     || fail "both nodes were recorded at the same endpoint ($EP1) — X-Forwarded-For is not being honoured"
 echo "$EP1" | grep -q "$PROXY_IP" \
@@ -216,7 +216,7 @@ podman exec -d "$AGENT1" sh -c "wireserve daemon --poll-interval-secs 5 >/tmp/da
 podman exec -d "$AGENT2" sh -c "wireserve daemon --poll-interval-secs 5 >/tmp/daemon.log 2>&1"
 sleep 15
 for a in node1 node2; do
-    podman exec "$COORD" wireserve-admin list-peers | grep -q "^$a" \
+    podman exec "$COORD" wireserve-admin node list | grep -q "^$a" \
         || fail "$a vanished from the directory"
 done
 # Declaring a service only reaches the coordinator via a poll, so a new
@@ -228,7 +228,7 @@ done
 # that was not stripped first.
 coord_events() { podman logs "$COORD" 2>&1 | grep -c "service_declared" || true; }
 POLLED=$(coord_events)
-podman exec "$AGENT1" wireserve serve proxysvc 9999 \
+podman exec "$AGENT1" wireserve proxysvc 9999 \
     || fail "could not declare a service on agent1"
 sleep 8
 POLLED_AFTER=$(coord_events)

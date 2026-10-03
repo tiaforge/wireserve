@@ -1,4 +1,4 @@
-//! `wireserve-admin export-config <name>` (spec §9): generates a WireGuard
+//! `wireserve-admin device create <name>` (spec §9): generates a WireGuard
 //! keypair locally, creates and immediately redeems a `kind: "static"` node
 //! in one CLI call, and renders a `.conf` for import into an official
 //! WireGuard client.
@@ -18,14 +18,14 @@ use crate::client::{self, AdminClient, ClientError};
 pub enum ExportConfigError {
     #[error(transparent)]
     Client(#[from] ClientError),
-    /// `--refresh` aimed at a name the coordinator does not know. Deliberately
+    /// `device refresh` aimed at a name the coordinator does not know. Deliberately
     /// not an auto-create: a typo would otherwise silently mint a new node.
-    #[error("no such node '{name}' — run export-config without --refresh to create it ({message})")]
+    #[error("no such node '{name}' — run `device create` to create it ({message})")]
     NoSuchNode { name: String, message: String },
     #[error("no such node '{name}' to use as the exit")]
     NoSuchExit { name: String },
     #[error(
-        "'{name}' is not approved to send others' traffic on — run `wireserve-admin approve-transit {name}` \
+        "'{name}' is not approved to send others' traffic on — run `wireserve-admin transit approve {name}` \
          (and `wireserve transit on` and `wireserve exit on` on that node) first"
     )]
     ExitNotApproved { name: String },
@@ -191,7 +191,7 @@ pub fn render_conf(
     RenderedConf { text, exit_text, relays }
 }
 
-/// What `export-config` produced: the mesh profile, and the full-tunnel one
+/// What `device create` produced: the mesh profile, and the full-tunnel one
 /// when `--exit` asked for it.
 pub struct Exported {
     pub conf: String,
@@ -229,7 +229,7 @@ fn resolve_dns(
         return Err(ExportConfigError::BadDns(format!(
             "{ip} is neither a mesh address nor a public one, and the exit forwards to neither \
              private ranges nor anything else off the internet — serve the resolver instead \
-             (e.g. `wireserve serve dns 53:{ip}:53/udp 53:{ip}:53/tcp` on a node that \
+             (e.g. `wireserve dns 53:{ip}:53/udp 53:{ip}:53/tcp` on a node that \
              reaches it) and pass --dns dns"
         )));
     }
@@ -515,7 +515,7 @@ fn plan_routes(admin_client: &AdminClient, opts: &ExportOptions<'_>, exit: Optio
     needed.sort();
     needed.dedup();
     if !needed.is_empty() {
-        eprintln!("this config relies on these ports being open from the internet (see `wireserve-admin relay-ports`):");
+        eprintln!("this config relies on these ports being open from the internet (see `wireserve-admin transit ports`):");
         for line in &needed {
             eprintln!("{line}");
         }
@@ -523,7 +523,7 @@ fn plan_routes(admin_client: &AdminClient, opts: &ExportOptions<'_>, exit: Optio
     Ok(plan)
 }
 
-/// Runs the full `export-config` flow end to end against a live
+/// Runs the full `device create` flow end to end against a live
 /// coordinator: keygen (local only), create+redeem a `kind: "static"` node,
 /// fetch the peer directory and relay plan, render the `.conf`, record it.
 ///

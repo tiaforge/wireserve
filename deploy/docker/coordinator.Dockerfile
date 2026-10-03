@@ -15,7 +15,7 @@
 # for this one port specifically. `wireserve-admin` is therefore bundled
 # into this same image so admin operations run via:
 #
-#   docker exec -it <container> wireserve-admin create-node homeserver
+#   docker exec -it <container> wireserve-admin node create homeserver
 #
 # which reaches the loopback-bound admin port from inside the same
 # network namespace. The node-facing port (47820) has no such restriction
@@ -78,7 +78,7 @@ ENV WIRESERVE_ADMIN_LISTEN_ADDR=127.0.0.1:47821
 # Convenience defaults so a bare `wireserve-admin <subcommand>` works from
 # a `docker exec` shell without extra flags. Two different URLs, matching
 # the two separately-bound listeners: WIRESERVE_COORDINATOR_URL for
-# /admin/*, WIRESERVE_REGISTER_URL for export-config's /register call.
+# /admin/*, WIRESERVE_REGISTER_URL for device create's /register call.
 ENV WIRESERVE_COORDINATOR_URL=http://127.0.0.1:47821
 ENV WIRESERVE_REGISTER_URL=http://127.0.0.1:47820
 VOLUME ["/var/lib/wireserve"]

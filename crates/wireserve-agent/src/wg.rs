@@ -884,7 +884,7 @@ pub fn transit_reachable_peers(
 /// A WireGuard peer's own `/32` + `/128` `AllowedIPs` — never a shared
 /// subnet block, so every peer only ever routes to itself on this
 /// interface (same non-overlapping-`AllowedIPs` reasoning as spec §9's
-/// `export-config`). Kept as a free function so it's testable without a
+/// `device create`). Kept as a free function so it's testable without a
 /// live interface.
 pub fn peer_allowed_ips(ip4: &str, ip6: &str) -> Vec<IpAddrMask> {
     let mut out = Vec::new();
@@ -1092,7 +1092,7 @@ pub fn desired_peers(
             peer.endpoint = resolve(&endpoint);
         }
         // This node likely roams networks (dynamic DNS, NAT rebinding) —
-        // same reasoning as spec §9's export-config PersistentKeepalive.
+        // same reasoning as spec §9's device create PersistentKeepalive.
         // Towards another agent also what tells a dead path from a quiet
         // one (`PEER_SILENT_MAX`).
         peer.persistent_keepalive_interval = Some(keepalive_for(p));

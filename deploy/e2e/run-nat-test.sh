@@ -203,7 +203,7 @@ done
 pass "all three agents reach the coordinator through their NAT"
 
 create_node() {
-    podman exec "$COORD" wireserve-admin create-node "$1" | grep -oE 'jtk_[a-f0-9]+'
+    podman exec "$COORD" wireserve-admin node create "$1" | grep -oE 'jtk_[a-f0-9]+'
 }
 
 log "joining the three nodes"
@@ -213,7 +213,7 @@ JT3=$(create_node node3)
 # agent1 knows its public endpoint, because somebody configured the
 # port-forward and told it so. This is the normal home-server case.
 podman exec "$AGENT1" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT1" \
-    --listen-port "$WG_PORT" --endpoint-addr "$ROUTER_A_WAN:$WG_PORT" 2>/dev/null
+    --listen-port "$WG_PORT" --endpoint "$ROUTER_A_WAN:$WG_PORT" 2>/dev/null
 # agent2 and agent3 do not: they are behind NAT with nothing forwarded, so
 # they leave it unset and the coordinator falls back to the source address
 # it observes (spec §4.2).
@@ -222,7 +222,7 @@ podman exec "$AGENT3" wireserve join "http://$COORD_IP:47820" --allow-plaintext-
 pass "all three nodes registered from behind NAT"
 
 log "what endpoint did the coordinator record for each node?"
-podman exec "$COORD" wireserve-admin list-peers | while read -r line; do echo "  $line"; done
+podman exec "$COORD" wireserve-admin node list | while read -r line; do echo "  $line"; done
 
 for a in "$AGENT1" "$AGENT2" "$AGENT3"; do
     podman exec -d "$a" wireserve daemon --poll-interval-secs 5
@@ -231,7 +231,7 @@ log "waiting for poll cycles and WireGuard handshakes"
 sleep 20
 
 mesh_ip_of() {
-    podman exec "$1" wireserve list --json | python3 -c "
+    podman exec "$1" wireserve status --json | python3 -c "
 import json, sys
 peers = json.load(sys.stdin).get('peers', [])
 m = [p['ip4'] for p in peers if p.get('name') == '$2']
@@ -251,7 +251,7 @@ log "each node tested whether it is dialable from outside (PLAN.md M40)"
 # node never sent to: only a NAT or firewall that lets unsolicited traffic
 # in delivers it. agent1 has a port-forward and agent2 an endpoint-
 # independent mapping; agent3's symmetric NAT drops it.
-PEERS=$(podman exec "$COORD" wireserve-admin list-peers)
+PEERS=$(podman exec "$COORD" wireserve-admin node list)
 for want in "node1:yes" "node2:yes" "node3:no"; do
     echo "$PEERS" | grep "^${want%%:*}	" | grep -q "dialable=${want#*:}" \
         || { echo "$PEERS"; fail "${want%%:*} should report dialable=${want#*:}"; }
@@ -259,18 +259,18 @@ done
 pass "the port-forwarded and endpoint-independent nodes are dialable, the symmetric one is not"
 
 log "declaring a service on each of agent1 and agent2"
-podman exec "$AGENT1" wireserve serve svc-one 12345
-podman exec "$AGENT2" wireserve serve svc-two 12345
-podman exec "$AGENT3" wireserve serve svc-three 12345
+podman exec "$AGENT1" wireserve svc-one 12345
+podman exec "$AGENT2" wireserve svc-two 12345
+podman exec "$AGENT3" wireserve svc-three 12345
 sleep 8
 # Service approval is on by default. This harness is about NAT traversal,
 # not about the approval gate (run-e2e-test.sh covers that), so approve
 # both and get on with the actual question.
-podman exec "$COORD" wireserve-admin approve-service node1 svc-one \
+podman exec "$COORD" wireserve-admin service approve svc-one --node node1 \
     || fail "could not approve svc-one"
-podman exec "$COORD" wireserve-admin approve-service node2 svc-two \
+podman exec "$COORD" wireserve-admin service approve svc-two --node node2 \
     || fail "could not approve svc-two"
-podman exec "$COORD" wireserve-admin approve-service node3 svc-three \
+podman exec "$COORD" wireserve-admin service approve svc-three --node node3 \
     || fail "could not approve svc-three"
 sleep 12
 # Each service answers on its own address (PLAN.md M20), not on its
@@ -319,11 +319,11 @@ log "comparing the endpoint the coordinator recorded against the real one"
 # WireGuard's UDP is unrelated to it. So for any node behind NAT this
 # value is a guess, and this check prints how good a guess it was.
 echo "  recorded by the coordinator:"
-podman exec "$COORD" wireserve-admin list-peers | awk '{ for (i = 1; i <= NF; i++) if (index($i, "endpoint=") == 1) printf "    %-8s %s\n", $1, $i }'
+podman exec "$COORD" wireserve-admin node list | awk '{ for (i = 1; i <= NF; i++) if (index($i, "endpoint=") == 1) printf "    %-8s %s\n", $1, $i }'
 echo "  actually observed by agent1, learned from received packets:"
 in_netns "$AGENT1" wg show wireserve0 endpoints | awk '{printf "    %s\n", $0}'
 
-DUPES=$(podman exec "$COORD" wireserve-admin list-peers | awk '{ for (i = 1; i <= NF; i++) if (index($i, "endpoint=") == 1) print $i }' \
+DUPES=$(podman exec "$COORD" wireserve-admin node list | awk '{ for (i = 1; i <= NF; i++) if (index($i, "endpoint=") == 1) print $i }' \
     | grep -v 'endpoint=-$' | sort | uniq -d)
 if [ -n "$DUPES" ]; then
     note "two nodes were recorded at the SAME endpoint: ${DUPES#endpoint=}"
@@ -404,7 +404,7 @@ fi
 # NAT, like agent3's, the reflexive port is useless to anyone but the
 # coordinator; that case is M23's transit, run-transit-test.sh.)
 list_peers_field() {
-    podman exec "$COORD" wireserve-admin list-peers \
+    podman exec "$COORD" wireserve-admin node list \
         | awk -v name="$1" -v prefix="$2" '$1 == name { for (i = 1; i <= NF; i++) if (index($i, prefix) == 1) print substr($i, length(prefix) + 1) }'
 }
 

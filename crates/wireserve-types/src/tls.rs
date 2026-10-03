@@ -1,6 +1,6 @@
 //! What the agent and its TLS terminator say to each other (PLAN.md M33),
 //! over a socket of their own — never the agent's main one, which can also
-//! `serve`, `unserve` and `leave`.
+//! declare or withdraw services, and `leave`.
 //!
 //! Newline-delimited JSON, one request and one response per connection,
 //! like the main socket. Two requests only: the terminator checks in and

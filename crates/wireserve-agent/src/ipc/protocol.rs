@@ -29,9 +29,9 @@ pub enum IpcRequest {
     Leave,
 }
 
-/// A service as shown by `wireserve list`, with `local` distinguishing
+/// A service as shown by `wireserve status`, with `local` distinguishing
 /// "declared by this node" from "seen in the directory but owned by
-/// someone else" — spec's `wireserve list` needs to show both, but the
+/// someone else" — spec's `wireserve status` needs to show both, but the
 /// wire-level `ServiceInfo` (used for `/poll`'s directory) has no such
 /// flag, since a coordinator response has no concept of "local".
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,7 +113,7 @@ pub struct ListView {
     pub services: Vec<LocalServiceView>,
     /// Declarations the coordinator rejected (name collision, spec §4.3)
     /// — surfaced here rather than silently vanishing (security review
-    /// F3) so `wireserve list` tells the operator *why* a `serve` call
+    /// F3) so `wireserve status` tells the operator *why* a `serve` call
     /// didn't take effect.
     #[serde(default)]
     pub rejected_services: Vec<crate::state::RejectedService>,

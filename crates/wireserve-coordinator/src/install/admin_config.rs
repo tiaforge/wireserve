@@ -1,5 +1,5 @@
 //! Saves `wireserve-admin`'s settings in the admin user's home, so they can
-//! run it with no flags: the admin key, the public address `create-node`
+//! run it with no flags: the admin key, the public address `node create`
 //! prints for new machines, and the admin listener's address.
 //!
 //! This runs as that user, not as root: `install` starts

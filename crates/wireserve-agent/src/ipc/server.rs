@@ -1,4 +1,4 @@
-//! Unix-socket IPC server backing `serve`/`unserve`/`list`/`leave` (§4.6).
+//! Unix-socket IPC server backing `wireserve <service>`/`status`/`leave` (§4.6).
 //! One request/response per connection, newline-delimited JSON. Who may
 //! connect is decided by the socket's file permissions alone (see `serve`):
 //! root, plus the members of the `wireserve` group when there is one.
@@ -170,7 +170,7 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
             // the ones it would sit beside (not its own old version), and
             // only for this one: a hand-edited state file can hold two names
             // aliasing one port, and refusing every later `serve` over that
-            // would leave no way to fix it but `unserve`.
+            // would leave no way to fix it but withdrawing one.
             if let Err(e) = wireserve_types::validate_node_targets(ports.iter().map(|m| (name.as_str(), m))) {
                 return (IpcResponse::error(e), false);
             }
@@ -200,12 +200,23 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
             // Refusing the 65th `serve` locally costs the operator one
             // clear error message instead.
             let would_be_new = !state.declared_services.iter().any(|d| d.name == name);
+            // `wireserve <name>` would run the command, so it could never be
+            // shown or withdrawn again. One declared before PLAN.md M44 is
+            // left alone; it can still change its ports.
+            if would_be_new && crate::RESERVED_SERVICE_NAMES.contains(&name.as_str()) {
+                return (
+                    IpcResponse::error(format!(
+                        "a service can't be named `{name}`: `wireserve {name}` is a command; pick another name"
+                    )),
+                    false,
+                );
+            }
             if would_be_new && state.declared_services.len() >= wireserve_types::MAX_SERVICES_PER_NODE
             {
                 return (
                     IpcResponse::error(format!(
                         "this node already declares {} services, which is the limit \
-                         ({}); withdraw one with `wireserve unserve <name>` first",
+                         ({}); withdraw one with `wireserve <name> off` first",
                         state.declared_services.len(),
                         wireserve_types::MAX_SERVICES_PER_NODE
                     )),
@@ -229,6 +240,10 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
         }
         IpcRequest::Unserve { name } => {
             let mut state = ctx.state.lock().await;
+            // A mistyped name must not read as done.
+            if !state.declared_services.iter().any(|d| d.name == name) {
+                return (IpcResponse::error(format!("this node declares no service named {name}")), false);
+            }
             state.declared_services.retain(|d| d.name != name);
             match state.save(&ctx.state_path) {
                 Ok(()) => (IpcResponse::Ok, false),
@@ -360,7 +375,7 @@ pub(crate) fn lookup_group(_name: &str) -> Option<u32> {
 ///
 /// With no `group` the socket and its parent directory are root-only
 /// (0600/0700). With one, the same two are handed to that group (0660/0750),
-/// so its members can use `wireserve serve`/`list`/... without sudo. Modes are
+/// so its members can use `wireserve <service>`/`status`/... without sudo. Modes are
 /// set explicitly rather than left to umask, and the directory is only
 /// opened to the group after the socket is final, so there is no moment
 /// when the group can reach a socket with default permissions.
@@ -686,6 +701,31 @@ mod tests {
 
         let state = ctx.state.lock().await;
         assert!(state.declared_services.is_empty());
+    }
+
+    #[tokio::test]
+    async fn withdrawing_a_name_this_node_never_declared_is_an_error() {
+        let (ctx, _dir, _rx) = test_ctx();
+        let (resp, _) = dispatch(&ctx, IpcRequest::Unserve { name: "tranzit".into() }).await;
+        assert!(matches!(resp, IpcResponse::Error { .. }), "{resp:?}");
+    }
+
+    #[tokio::test]
+    async fn a_command_name_cannot_be_declared_as_a_service() {
+        let (ctx, _dir, _rx) = test_ctx();
+        for name in ["status", "exit", "off"] {
+            let (resp, _) = dispatch(&ctx, serve_req(name, &["80"])).await;
+            assert!(matches!(resp, IpcResponse::Error { .. }), "{name}: {resp:?}");
+        }
+        assert!(ctx.state.lock().await.declared_services.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_command_name_declared_before_it_was_reserved_can_still_change() {
+        let (ctx, _dir, _rx) = test_ctx();
+        ctx.state.lock().await.declared_services.push(ServiceDecl { name: "status".into(), ports: vec![], group: None });
+        let (resp, _) = dispatch(&ctx, serve_req("status", &["80"])).await;
+        assert!(matches!(resp, IpcResponse::Ok), "{resp:?}");
     }
 
     #[tokio::test]

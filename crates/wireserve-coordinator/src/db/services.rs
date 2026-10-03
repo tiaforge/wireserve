@@ -454,7 +454,7 @@ fn assign_vip(tx: &Connection, node_id: i64, name: &str, vip_range: &str) -> Res
                 held = holds.len(),
                 devices = %devices.join(","),
                 "no address left for a service but ones held back for devices not exported since they were released; \
-                 `export-config --refresh` or delete those devices to free them. It stays reachable at its node's address only"
+                 `device refresh` or delete those devices to free them. It stays reachable at its node's address only"
             );
         }
         Err(e) => tracing::warn!(
@@ -541,7 +541,7 @@ pub fn approve(conn: &Connection, node_id: i64, name: &str, vip_range: &str) -> 
 }
 
 /// Denies `name` for `node_id`, optionally recording a reason the
-/// declaring node will see in `wireserve list`.
+/// declaring node will see in `wireserve status`.
 ///
 /// Denying an already-**approved** service withdraws that approval and
 /// removes it from the directory immediately. That is the only way an

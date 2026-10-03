@@ -22,9 +22,9 @@ pub async fn register(
 ) -> Result<Json<RegisterResponse>, AppError> {
     // S2 (security review): a pubkey/endpoint_addr that isn't validated
     // here gets stored and later redistributed verbatim — to every other
-    // node's /poll response, to wireserve-admin's list-peers output, and
+    // node's /poll response, to wireserve-admin's node list output, and
     // (for endpoint_addr especially) into a rendered .conf file via
-    // export-config. An attacker holding any valid bearer token could
+    // device create. An attacker holding any valid bearer token could
     // otherwise smuggle extra config-file syntax (e.g. an embedded
     // newline + "AllowedIPs = 0.0.0.0/0") into every downstream consumer
     // of the peer directory. Reject anything malformed at the door.
@@ -187,7 +187,7 @@ pub async fn register(
         // topology itself: a proxy on an internal network forwards the
         // node's real address, that address is private because the whole
         // network is, and suppressing the fallback there left every node
-        // that omitted --endpoint-addr with no endpoint at all. Since a
+        // that omitted --endpoint with no endpoint at all. Since a
         // peer with no endpoint cannot be dialled, and a node only learns
         // a peer's real address from traffic that peer sent first, a mesh
         // where nobody has an endpoint never forms at all.

@@ -14,7 +14,7 @@
 #
 # What this proves:
 #
-#   1. a claim link from `claim-url` leads to the provider's sign-in, and
+#   1. a claim link from `owner link` leads to the provider's sign-in, and
 #      back to a confirmation page naming the node;
 #   2. confirming makes alice the laptop's owner, and `oidc:family -> infra`
 #      lets the laptop reach db — while the unclaimed tv is refused;
@@ -138,14 +138,14 @@ for pair in "$HOME_AGENT:node-home" "$LAPTOP:node-laptop" "$TV:node-tv"; do
     podman run -d --name "$c" --network "$NET" \
         --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
         --entrypoint sleep wireserve-agent:ow-test infinity >/dev/null
-    jt=$(admin create-node "$n" 2>/dev/null | grep -oE 'jtk_[a-f0-9]+')
+    jt=$(admin node create "$n" 2>/dev/null | grep -oE 'jtk_[a-f0-9]+')
     podman exec "$c" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$jt" \
-        --listen-port "$WG_PORT" --endpoint-addr "$(ip_on "$c" "$NET"):$WG_PORT" 2>/dev/null
+        --listen-port "$WG_PORT" --endpoint "$(ip_on "$c" "$NET"):$WG_PORT" 2>/dev/null
     podman exec -d "$c" sh -c 'wireserve daemon --poll-interval-secs 3 >/var/log/agent.log 2>&1'
 done
 admin group create infra
 admin grant add oidc:family infra
-podman exec "$HOME_AGENT" wireserve serve db 5432 --group infra
+podman exec "$HOME_AGENT" wireserve db 5432 --group infra
 in_netns_bg "$HOME_AGENT" socat TCP-LISTEN:5432,fork,reuseaddr EXEC:cat
 wait_for "db to resolve on the laptop" 60 sh -c "podman exec $LAPTOP getent hosts db.wg"
 wait_for "db to resolve on the tv" 60 sh -c "podman exec $TV getent hosts db.wg"
@@ -155,9 +155,9 @@ refused "$TV" || fail "the tv reached db"
 pass "db is in infra; nobody but home reaches it"
 
 log "1/5: the claim link leads through the provider to a confirmation"
-CLAIM_OUT=$(admin claim-url node-laptop 2>&1) || fail "claim-url failed: $CLAIM_OUT"
+CLAIM_OUT=$(admin owner link node-laptop 2>&1) || fail "owner link failed: $CLAIM_OUT"
 URL=$(printf '%s\n' "$CLAIM_OUT" | grep -oE "$PUBLIC/claim/clm_[0-9a-f]+" || true)
-[ -n "$URL" ] || fail "claim-url printed no link: $CLAIM_OUT"
+[ -n "$URL" ] || fail "owner link printed no link: $CLAIM_OUT"
 AUTH=$(browser -o "/work/start.html" -w '%{redirect_url}' "$URL") || fail "the browser could not open the link"
 case "$AUTH" in "$ISSUER/authorize?"*) ;; *) cat "$WORK/start.html" >&2; fail "the link did not lead to the provider: '$AUTH'" ;; esac
 CALLBACK=$(browser -o "/work/login.html" -w '%{redirect_url}' --data-urlencode username=alice \
@@ -173,7 +173,7 @@ pass "signed in as alice; asked to confirm node-laptop"
 
 log "2/5: confirmed, the laptop reaches what family is granted"
 browser --data-urlencode "token=$TOKEN" "$PUBLIC/claim/confirm" | grep -q 'is yours now' || fail "the confirmation failed"
-admin access --node node-laptop | tee "$WORK/laptop.out"
+admin node access node-laptop | tee "$WORK/laptop.out"
 grep -q 'belongs to alice@example.com' "$WORK/laptop.out" || fail "the laptop has no owner"
 grep -q 'oidc:family' "$WORK/laptop.out" || fail "the laptop does not act as oidc:family"
 wait_for "the laptop to reach db" 30 reaches "$LAPTOP"
@@ -188,7 +188,7 @@ log "4/5: the owner's groups are refreshed"
 refreshed() { podman logs "$COORD" 2>&1 | grep -q 'owner_refreshed'; }
 wait_for "a refresh of alice's groups" 150 refreshed
 podman logs "$COORD" 2>&1 | grep -E 'owner refresh failed|owner_dropped' && fail "refreshing alice's groups failed"
-admin access --node node-laptop | grep -q 'belongs to alice@example.com' || fail "alice lost the laptop on refresh"
+admin node access node-laptop | grep -q 'belongs to alice@example.com' || fail "alice lost the laptop on refresh"
 reaches "$LAPTOP" || fail "the laptop lost db on refresh"
 pass "refreshed without losing anything"
 

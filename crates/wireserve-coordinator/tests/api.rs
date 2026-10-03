@@ -149,7 +149,7 @@ async fn admin_create_node(router: &Router, name: &str) -> String {
     assert_eq!(
         resp.status(),
         StatusCode::CREATED,
-        "create-node should succeed"
+        "node create should succeed"
     );
     let body = body_json(resp).await;
     body["join_token"].as_str().unwrap().to_string()
@@ -966,7 +966,7 @@ async fn rejoin_then_reregister_keeps_the_same_address() {
     assert_eq!(r2["ip6"].as_str().unwrap(), original_ip6);
 }
 
-// PLAN.md M24: `--refresh` for static peers, and the guard that keeps it
+// PLAN.md M24: `device refresh` for static peers, and the guard that keeps it
 // from being aimed at an agent node.
 
 #[tokio::test]
@@ -996,7 +996,7 @@ async fn rejoin_of_a_static_node_keeps_its_name_and_address() {
     );
 
     // The refresh: rejoin asserting kind=static, then redeem with a brand
-    // new keypair. This is what `export-config --refresh` does.
+    // new keypair. This is what `device refresh` does.
     let req = json_request(
         "POST",
         "/admin/nodes/phone/rejoin",
@@ -1027,7 +1027,7 @@ async fn rejoin_refuses_a_kind_mismatch_without_touching_the_node() {
     let t = admin_create_node(&app.router, "homeserver").await;
     register_node(&app.router, &t, "homeserver", 51820).await;
 
-    // `export-config --refresh homeserver` by mistake: the node is an agent.
+    // `device refresh homeserver` by mistake: the node is an agent.
     let req = json_request(
         "POST",
         "/admin/nodes/homeserver/rejoin",
@@ -1053,7 +1053,7 @@ async fn rejoin_refuses_a_kind_mismatch_without_touching_the_node() {
 #[tokio::test]
 async fn a_rejoin_without_a_kind_still_works_on_either_kind() {
     // Every caller written before the guard sends no `kind`, including the
-    // plain `wireserve-admin rejoin` command. That must keep working.
+    // plain `wireserve-admin node rejoin` command. That must keep working.
     let app = test_app();
     let t = admin_create_node(&app.router, "homeserver").await;
     register_node(&app.router, &t, "homeserver", 51820).await;
@@ -1063,7 +1063,7 @@ async fn a_rejoin_without_a_kind_still_works_on_either_kind() {
     assert_eq!(resp.status(), StatusCode::CREATED);
 }
 
-// F7: spec §4.1/§4.5 both specify 201 for create-node and rejoin.
+// F7: spec §4.1/§4.5 both specify 201 for node create and rejoin.
 
 #[tokio::test]
 async fn create_node_and_rejoin_return_201() {
@@ -1250,7 +1250,7 @@ async fn register_rate_limit_is_keyed_on_forwarded_client_when_proxy_trusted() {
 async fn delete_node_frees_name_for_unregistered_and_revoked_nodes() {
     let app = test_app();
 
-    // Never registered (the export-config-failed-halfway case).
+    // Never registered (a `device create` that failed halfway).
     admin_create_node(&app.router, "orphan").await;
     let req = json_request("DELETE", "/admin/nodes/orphan", Some(ADMIN), json!({}));
     let resp = app.router.clone().oneshot(req).await.unwrap();
@@ -1486,7 +1486,7 @@ async fn static_node_is_refused_at_poll() {
     let bearer = body_json(resp).await["bearer_token"].as_str().unwrap().to_string();
 
     // Spec §9: a static peer never polls. Nothing legitimately holds this
-    // token (export-config discards it), but the endpoint must not depend
+    // token (device create discards it), but the endpoint must not depend
     // on that for the invariant "a static node's endpoint_addr is NULL".
     let req = json_request(
         "POST",
@@ -1515,7 +1515,7 @@ async fn proxied_node_gets_an_endpoint_from_its_forwarded_address() {
     // With trust_proxy_headers on, a node's real address arrives via
     // X-Forwarded-For and is private, because an internal network is
     // private by definition. Treating "private" alone as unusable meant
-    // every node that omitted --endpoint-addr got no endpoint at all, and
+    // every node that omitted --endpoint got no endpoint at all, and
     // a peer with no endpoint cannot be dialled — so a mesh where nobody
     // supplied one could never form.
     let mut config = test_config("");
@@ -2607,7 +2607,7 @@ async fn a_node_that_still_has_an_endpoint_re_reports_it_after_clearing() {
 #[tokio::test]
 async fn poll_self_heals_the_endpoint_as_the_observed_address_changes() {
     // The point of re-deriving the fallback on every poll rather than
-    // only at registration: a node with no --endpoint-addr, whose real
+    // only at registration: a node with no --endpoint, whose real
     // address changes over time (dynamic WAN IP, no dynamic-DNS name
     // configured), stays reachable without an operator having to notice
     // and force a rejoin.
@@ -3730,7 +3730,7 @@ async fn only_an_admin_makes_claim_links_and_only_with_an_identity_provider() {
     let app = oidc_app();
     let req = json_request("POST", "/admin/nodes", Some(ADMIN), json!({ "name": "laptop" }));
     let created = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
-    let url = created["claim"]["url"].as_str().expect("create-node hands out a claim link");
+    let url = created["claim"]["url"].as_str().expect("node create hands out a claim link");
     assert!(url.starts_with("http://mesh.test/claim/clm_"), "{url}");
 
     let (status, link) = admin_call(&app.router, "POST", "/admin/nodes/laptop/claim", json!(null)).await;

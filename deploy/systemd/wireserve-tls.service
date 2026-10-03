@@ -27,7 +27,7 @@ Type=simple
 User=wireserve-tls
 Group=wireserve-tls
 EnvironmentFile=-/etc/wireserve/tls.env
-ExecStart=/usr/local/bin/wireserve tls-serve
+ExecStart=/usr/local/bin/wireserve tls-daemon
 Restart=on-failure
 RestartSec=5s
 

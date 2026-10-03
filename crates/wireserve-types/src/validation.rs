@@ -179,7 +179,7 @@ pub fn is_valid_hostname(s: &str) -> bool {
 /// *from anywhere* has to ask this question instead (PLAN.md M24).
 ///
 /// A hostname is taken at its word: an operator who configured
-/// `--endpoint-addr home.example.com:51820` meant it to resolve publicly, and
+/// `--endpoint home.example.com:51820` meant it to resolve publicly, and
 /// resolving it here would only produce an answer valid from this machine.
 #[must_use]
 pub fn is_globally_routable_endpoint(s: &str) -> bool {

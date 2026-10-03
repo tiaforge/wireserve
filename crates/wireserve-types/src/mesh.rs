@@ -45,7 +45,7 @@ impl MeshRanges {
     ///
     /// Anything rendered into a WireGuard `.conf` has to come back out of a
     /// parser, never straight from a configured string — the same rule
-    /// `export-config`'s service addresses already follow. A mesh CIDR
+    /// `device create`'s service addresses already follow. A mesh CIDR
     /// reaches the coordinator from `WIRESERVE_NET_V4_CIDR` or the bootstrap
     /// file, neither of which is structurally validated at load (the startup
     /// checks only warn), so it is exactly the kind of value that could

@@ -59,7 +59,7 @@ cleanup
 
 log "checking prerequisites"
 command -v podman >/dev/null || fail "podman not found on PATH"
-command -v python3 >/dev/null || fail "python3 not found on PATH (used to parse \`wireserve list\`)"
+command -v python3 >/dev/null || fail "python3 not found on PATH (used to parse \`wireserve status\`)"
 modinfo wireguard >/dev/null 2>&1 || fail "WireGuard kernel module not available (modinfo wireguard failed)"
 [ "$(podman info --format '{{.Host.Security.Rootless}}')" = false ] \
     || fail "needs rootful podman (the kernel refuses service-address rewrites in user namespaces): sudo $0"
@@ -80,7 +80,7 @@ COORD_IP=$(podman inspect "$COORD" --format "{{(index .NetworkSettings.Networks 
 echo "coordinator reachable at $COORD_IP"
 
 create_node() {
-    podman exec "$COORD" wireserve-admin create-node "$1" | grep -oE 'jtk_[a-f0-9]+'
+    podman exec "$COORD" wireserve-admin node create "$1" | grep -oE 'jtk_[a-f0-9]+'
 }
 
 log "creating and joining two nodes"
@@ -119,17 +119,17 @@ pass "agent1's wireserve0 has $PEER_COUNT configured peer(s)"
 # proves that control-plane state was written somewhere. This proves the
 # mesh actually carries a packet. Its absence is exactly how a missing
 # routing step survived several review rounds — `wg show` listed the peer,
-# /etc/hosts had the name, `wireserve list` looked right, and not one byte
+# /etc/hosts had the name, `wireserve status` looked right, and not one byte
 # could travel between the two nodes, because WireGuard's AllowedIPs is a
 # crypto-routing table and does not put anything in the kernel's.
 
-# Reads a peer's mesh IPv4 out of `wireserve list`. Parsed as JSON
+# Reads a peer's mesh IPv4 out of `wireserve status`. Parsed as JSON
 # rather than grepped: field order is not something a test should depend
 # on, and the mesh range is configurable, so matching on a literal prefix
 # would silently stop finding anything the moment someone changes it.
 mesh_ip_of() {
     local from=$1 peer=$2
-    podman exec "$from" wireserve list --json | python3 -c "
+    podman exec "$from" wireserve status --json | python3 -c "
 import json, sys
 peers = json.load(sys.stdin).get('peers', [])
 match = [p['ip4'] for p in peers if p.get('name') == '$peer']
@@ -157,9 +157,9 @@ log "declaring services on agent1 — they must NOT propagate before approval"
 # Each service gets its own address (PLAN.md M20), so two of them can both
 # answer on :80 of one node: testsvc maps 80 onto the listener on 12345,
 # web2 maps 80 onto 12347, udpsvc maps UDP 53 onto 5353.
-podman exec "$AGENT1" wireserve serve testsvc 80:12345
-podman exec "$AGENT1" wireserve serve web2 80:12347
-podman exec "$AGENT1" wireserve serve udpsvc 53:5353/udp
+podman exec "$AGENT1" wireserve testsvc 80:12345
+podman exec "$AGENT1" wireserve web2 80:12347
+podman exec "$AGENT1" wireserve udpsvc 53:5353/udp
 sleep 8
 # Service approval is on by default: a declaration is stored but withheld
 # from every other node's directory until an admin approves it, so that
@@ -172,13 +172,13 @@ if podman exec "$AGENT2" grep -q "testsvc.wg" /etc/hosts; then
 fi
 pass "an unapproved service is withheld from the mesh directory"
 
-podman exec "$AGENT1" wireserve list --json | grep -q '"pending": true' \
+podman exec "$AGENT1" wireserve status --json | grep -q '"pending": true' \
     || fail "the declaring node does not show its own service as pending"
 pass "the declaring node reports its service as pending approval"
 
 log "approving the services and checking hosts-file sync on agent2"
 for svc in testsvc web2 udpsvc; do
-    podman exec "$COORD" wireserve-admin approve-service node1 "$svc" \
+    podman exec "$COORD" wireserve-admin service approve "$svc" --node node1 \
         || fail "could not approve $svc for node1"
 done
 sleep 8
@@ -255,18 +255,18 @@ expect "$AGENT1" tcp "$VIP" 80 "testsvc peer=$AGENT1_MESH_IP"
 expect "$AGENT1" udp "$UVIP" 53 "udpsvc peer=$AGENT1_MESH_IP"
 pass "the owning node reaches its own services through their addresses"
 
-log "checking wireserve list reflects real data on agent1 (regression: F1)"
-podman exec "$AGENT1" wireserve list --json | grep -q '"local": true' \
-    || fail "wireserve list did not show the locally-declared service — the shared-state bug (F1) may have regressed"
-pass "wireserve list shows real, current data"
-podman exec "$AGENT2" wireserve list | grep -E "^testsvc\.wg +$VIP +80:12345/tcp +node1 +online$" >/dev/null \
-    || fail "the human-readable list does not show testsvc.wg: $(podman exec "$AGENT2" wireserve list)"
+log "checking wireserve status reflects real data on agent1 (regression: F1)"
+podman exec "$AGENT1" wireserve status --json | grep -q '"local": true' \
+    || fail "wireserve status did not show the locally-declared service — the shared-state bug (F1) may have regressed"
+pass "wireserve status shows real, current data"
+podman exec "$AGENT2" wireserve status | grep -E "^testsvc\.wg +$VIP +80:12345/tcp +node1 +online$" >/dev/null \
+    || fail "the human-readable list does not show testsvc.wg: $(podman exec "$AGENT2" wireserve status)"
 pass "the human-readable list shows the service, its address and mapping"
 
 log "testing revoke propagation"
-podman exec "$COORD" wireserve-admin revoke node1
+podman exec "$COORD" wireserve-admin node revoke node1
 sleep 8
-if podman exec "$AGENT2" wireserve list --json | grep -q '"name": "node1"'; then
+if podman exec "$AGENT2" wireserve status --json | grep -q '"name": "node1"'; then
     fail "node1 is still listed as a peer on agent2 after revoke"
 fi
 pass "node1 dropped out of agent2's peer list after revoke"

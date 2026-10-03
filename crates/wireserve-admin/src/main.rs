@@ -17,8 +17,9 @@ struct Cli {
     /// Base URL of the coordinator's NODE-FACING listener (where
     /// /register lives) — a different address/port from
     /// --coordinator-url, which talks to the admin listener. Spec §4.0
-    /// requires the two to be bound separately. Used by `export-config`
-    /// (required) and by `create-node`/`rejoin` (optional — fills in the
+    /// requires the two to be bound separately. Used by `device create` and
+    /// `device refresh` (required) and by `node create`/`node rejoin`
+    /// (optional — fills in the
     /// exact `wireserve join` command they print). Or set
     /// WIRESERVE_REGISTER_URL, or write one to
     /// ~/.config/wireserve-admin/register_url.
@@ -31,67 +32,27 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a node record and issue a one-time join token (spec §4.1).
-    CreateNode {
-        name: String,
-        #[arg(long, default_value = "agent")]
-        kind: String,
-        /// Seconds the join token stays redeemable, overriding the
-        /// coordinator's default (30 minutes). Use 0 for no expiry.
-        #[arg(long)]
-        ttl: Option<u64>,
-        /// Which agent instance this node will run as on its host —
-        /// only needed when it's an additional instance alongside
-        /// another agent already running there. Never sent to the
-        /// coordinator; it only fills in `--instance` on the printed
-        /// `wireserve install` command.
-        #[arg(long)]
-        instance: Option<String>,
+    /// Nodes: create, rejoin, revoke, delete, list.
+    Node {
+        #[command(subcommand)]
+        action: NodeAction,
     },
-    /// Revoke a node — its bearer token stops working on its very next
-    /// poll, and its services are removed (spec §4.4).
-    Revoke { name: String },
-    /// Issue a fresh join token for an existing node record (spec §4.5).
-    Rejoin {
-        name: String,
-        /// Seconds the join token stays redeemable, overriding the
-        /// coordinator's default (30 minutes). Use 0 for no expiry.
-        #[arg(long)]
-        ttl: Option<u64>,
-        /// Same as `create-node --instance` — fills in `--instance` on
-        /// the printed `wireserve install` command.
-        #[arg(long)]
-        instance: Option<String>,
+    /// Declared services and their approval.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
     },
-    /// Permanently delete a node record and free its name. Refused while
-    /// the node is still active — revoke it first.
-    DeleteNode { name: String },
-    /// Clear a node's advertised endpoint address. Use when a node has
-    /// lost the public address other peers were dialing (a dropped port
-    /// forward, a move behind CGNAT) and is still advertising it. The
-    /// node reports a new one on its next poll if it still has one set
-    /// locally.
-    ClearEndpoint {
-        name: String,
-        /// Clear only one actively-probed candidate ("v4" or "v6"),
-        /// leaving the explicit override and the other family untouched.
-        /// Omit to clear everything (the explicit override plus both
-        /// candidates) — today's default behavior.
-        #[arg(long)]
-        family: Option<String>,
+    /// Nodes that carry traffic for others: relays and exits.
+    Transit {
+        #[command(subcommand)]
+        action: TransitAction,
     },
-    /// List the full peer directory (spec §4.5.1).
-    ListPeers,
-    /// List every declared service and its approval state.
-    ListServices {
-        /// Show only declarations waiting on approval.
-        #[arg(long)]
-        pending: bool,
+    /// Agent-less devices, such as phones: a WireGuard .conf for each
+    /// (spec §9).
+    Device {
+        #[command(subcommand)]
+        action: DeviceAction,
     },
-    /// Approve a pending service declaration for a specific node.
-    /// Approval binds to this node — it does not reserve the name for
-    /// anyone else.
-    ApproveService { node: String, service: String },
     /// Service groups (PLAN.md M36). A service is in `default` until put in
     /// a group; a fresh mesh grants `default` to everyone.
     Group {
@@ -111,38 +72,105 @@ enum Command {
         #[command(subcommand)]
         action: TagAction,
     },
-    /// A fresh link for whoever a device belongs to: signing in with it
-    /// makes them its owner, and the node reaches what their groups at the
-    /// identity provider are granted. Works once, for ten minutes.
-    ClaimUrl {
-        node: String,
-        /// Also show it as a QR code, for a phone's camera.
-        #[arg(long)]
-        qr: bool,
-    },
     /// A device's owner.
     Owner {
         #[command(subcommand)]
         action: OwnerAction,
     },
-    /// Who reaches a service and why, or what a node reaches.
-    Access {
-        #[arg(required_unless_present = "node", conflicts_with = "node")]
-        service: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum NodeAction {
+    /// Create a node record and issue a one-time join token (spec §4.1).
+    Create {
+        name: String,
+        #[arg(long, default_value = "agent", value_parser = ["agent", "static"])]
+        kind: String,
+        /// Seconds the join token stays redeemable, overriding the
+        /// coordinator's default (30 minutes). Use 0 for no expiry.
         #[arg(long)]
-        node: Option<String>,
+        ttl: Option<u64>,
+        /// Which agent instance this node will run as on its host —
+        /// only needed when it's an additional instance alongside
+        /// another agent already running there. Never sent to the
+        /// coordinator; it only fills in `--instance` on the printed
+        /// `wireserve install` command.
+        #[arg(long)]
+        instance: Option<String>,
+    },
+    /// Issue a fresh join token for an existing node record (spec §4.5).
+    Rejoin {
+        name: String,
+        /// Seconds the join token stays redeemable, overriding the
+        /// coordinator's default (30 minutes). Use 0 for no expiry.
+        #[arg(long)]
+        ttl: Option<u64>,
+        /// Same as `node create --instance` — fills in `--instance` on
+        /// the printed `wireserve install` command.
+        #[arg(long)]
+        instance: Option<String>,
+    },
+    /// Revoke a node — its bearer token stops working on its very next
+    /// poll, and its services are removed (spec §4.4).
+    Revoke { name: String },
+    /// Permanently delete a node record and free its name. Refused while
+    /// the node is still active — revoke it first.
+    Delete { name: String },
+    /// The full node directory (spec §4.5.1).
+    List,
+    /// What a node reaches, and why.
+    Access { name: String },
+    /// Clear a node's advertised endpoint address. Use when a node has
+    /// lost the public address other peers were dialing (a dropped port
+    /// forward, a move behind CGNAT) and is still advertising it. The
+    /// node reports a new one on its next poll if it still has one set
+    /// locally.
+    ClearEndpoint {
+        name: String,
+        /// Clear only one actively-probed candidate, leaving the explicit
+        /// override and the other family untouched. Omit to clear
+        /// everything (the explicit override plus both candidates).
+        #[arg(long, value_parser = ["v4", "v6"])]
+        family: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Every declared service and its approval state.
+    List {
+        /// Show only declarations waiting on approval.
+        #[arg(long)]
+        pending: bool,
+    },
+    /// Approve a pending service declaration for a specific node.
+    /// Approval binds to this node — it does not reserve the name for
+    /// anyone else.
+    Approve {
+        service: String,
+        /// The node that declared it.
+        #[arg(long, required = true)]
+        node: String,
     },
     /// Deny a declaration, or withdraw an approval already granted.
     ///
-    /// For mistakes. For a node you no longer trust use `revoke`: a
+    /// For mistakes. For a node you no longer trust use `node revoke`: a
     /// denied service still holds its globally-unique name until the
     /// declaring node withdraws it, and a compromised node will not.
-    DenyService {
-        node: String,
+    Deny {
         service: String,
+        /// The node that declared it.
+        #[arg(long, required = true)]
+        node: String,
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Who reaches a service, and why.
+    Access { name: String },
+}
+
+#[derive(Subcommand)]
+enum TransitAction {
     /// Allow a node to carry traffic for others: relay the sessions of peers
     /// that can't reach each other directly, and of phones through its
     /// public relay ports, and — with `wireserve exit on` — be a device's
@@ -150,67 +178,73 @@ enum Command {
     /// relay can't read or forge what it relays, but sees who talks to whom
     /// and can drop it; an exit reads everything it sends on. Revoke and
     /// rejoin both withdraw the approval.
-    ApproveTransit { name: String },
+    Approve { name: String },
     /// Withdraw a node's approval to carry traffic. Takes effect for new
     /// carrier choices at once; the pairs it carried move off it on their
-    /// next poll, and devices relying on it need re-exporting.
-    DenyTransit { name: String },
+    /// next poll, and devices relying on it need refreshing.
+    Deny { name: String },
     /// Every public relay port phones use or used (PLAN.md M40): on which
     /// carrier and address it must be open, which node it leads to, which
     /// devices rely on it, and whether it was last seen open. A port no
     /// device relies on any more may be closed again.
-    RelayPorts,
-    /// Generate a WireGuard .conf for an agent-less consumer-only device
-    /// (spec §9).
-    ExportConfig {
-        name: String,
-        #[arg(long)]
-        out: Option<std::path::PathBuf>,
-        /// Re-issue the config for a device that already exists, keeping its
-        /// name and mesh address instead of creating a new node. Only the
-        /// keypair changes, so the device must reimport.
-        ///
-        /// Destructive from its first request: the old key stops working
-        /// immediately, and the node is briefly absent from the mesh while
-        /// the new one is redeemed. Refuses outright if the name belongs to
-        /// an agent node.
-        #[arg(long)]
-        refresh: bool,
-        /// Also print the config as a QR code to scan with the WireGuard app.
-        /// Refuses rather than print an unscannably wide code; use --out for
-        /// a config too large to fit a terminal.
-        #[arg(long)]
-        qr: bool,
-        /// Also write a full-tunnel profile, with the same key and address:
-        /// switched on in the WireGuard app, it sends all of the device's
-        /// internet traffic out through the named node — which reads it, as
-        /// any exit does — for public Wi-Fi or a home connection abroad. The
-        /// mesh stays end to end in it. IPv4 only; the device's IPv6 is
-        /// dropped rather than leaked around the tunnel. The node must run
-        /// `wireserve exit on`; without a name, the one node that qualifies
-        /// is picked. Needs --dns, and --out or --qr, since there are two
-        /// files.
-        #[arg(long, requires = "dns", value_name = "NODE", num_args = 0..=1, default_missing_value = "")]
-        exit: Option<String>,
-        /// Write the config even if a carrier's relay port could not be seen
-        /// open from outside — for a port you know is open, or a check that
-        /// can't reach it from the coordinator's network.
-        #[arg(long)]
-        allow_unverified: bool,
-        /// The resolver to name: an approved service by name (a Pi-hole you
-        /// `serve` on 53, say, which then also answers the mesh's own names),
-        /// or an IPv4 address such as 9.9.9.9. Goes into the full-tunnel
-        /// profile with --exit, into the mesh profile with --mesh-dns.
-        #[arg(long, value_name = "SERVICE|IPV4")]
-        dns: Option<String>,
-        /// Put the --dns resolver into the mesh profile as well, so every
-        /// service has a name on the device, not only the HTTP ones. The
-        /// resolver must be on the mesh and must answer everything: while
-        /// this tunnel is on, ALL of the device's DNS goes to it, and if it
-        /// is down the device has no DNS until the tunnel is switched off.
-        #[arg(long, requires = "dns")]
-        mesh_dns: bool,
-    },
+    Ports,
+}
+
+#[derive(Subcommand)]
+enum DeviceAction {
+    /// Create an agent-less, consumer-only device, such as a phone, and
+    /// write its WireGuard .conf (spec §9).
+    Create(DeviceArgs),
+    /// Re-issue the config for a device that already exists, keeping its
+    /// name and mesh address. Only the keypair changes, so the device must
+    /// reimport.
+    ///
+    /// Destructive from its first request: the old key stops working
+    /// immediately, and the device is briefly absent from the mesh while
+    /// the new one is redeemed. Refuses outright if the name belongs to an
+    /// agent node.
+    Refresh(DeviceArgs),
+}
+
+#[derive(clap::Args)]
+struct DeviceArgs {
+    name: String,
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
+    /// Also print the config as a QR code to scan with the WireGuard app.
+    /// Refuses rather than print an unscannably wide code; use --out for
+    /// a config too large to fit a terminal.
+    #[arg(long)]
+    qr: bool,
+    /// Also write a full-tunnel profile, with the same key and address:
+    /// switched on in the WireGuard app, it sends all of the device's
+    /// internet traffic out through the named node — which reads it, as
+    /// any exit does — for public Wi-Fi or a home connection abroad. The
+    /// mesh stays end to end in it. IPv4 only; the device's IPv6 is
+    /// dropped rather than leaked around the tunnel. The node must run
+    /// `wireserve exit on`; without a name, the one node that qualifies
+    /// is picked. Needs --dns, and --out or --qr, since there are two
+    /// files.
+    #[arg(long, requires = "dns", value_name = "NODE", num_args = 0..=1, default_missing_value = "")]
+    exit: Option<String>,
+    /// Write the config even if a carrier's relay port could not be seen
+    /// open from outside — for a port you know is open, or a check that
+    /// can't reach it from the coordinator's network.
+    #[arg(long)]
+    allow_unverified: bool,
+    /// The resolver to name: an approved service by name (a Pi-hole you
+    /// publish on 53, say, which then also answers the mesh's own names),
+    /// or an IPv4 address such as 9.9.9.9. Goes into the full-tunnel
+    /// profile with --exit, into the mesh profile with --mesh-dns.
+    #[arg(long, value_name = "SERVICE|IPV4")]
+    dns: Option<String>,
+    /// Put the --dns resolver into the mesh profile as well, so every
+    /// service has a name on the device, not only the HTTP ones. The
+    /// resolver must be on the mesh and must answer everything: while
+    /// this tunnel is on, ALL of the device's DNS goes to it, and if it
+    /// is down the device has no DNS until the tunnel is switched off.
+    #[arg(long, requires = "dns")]
+    mesh_dns: bool,
 }
 
 #[derive(Subcommand)]
@@ -238,6 +272,15 @@ enum GrantAction {
 
 #[derive(Subcommand)]
 enum OwnerAction {
+    /// A fresh link for whoever a device belongs to: signing in with it
+    /// makes them its owner, and the node reaches what their groups at the
+    /// identity provider are granted. Works once, for ten minutes.
+    Link {
+        node: String,
+        /// Also show it as a QR code, for a phone's camera.
+        #[arg(long)]
+        qr: bool,
+    },
     /// The node belongs to nobody again; its outstanding claim links stop
     /// working.
     Clear { node: String },
@@ -302,7 +345,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     } = cli;
 
     match command {
-        Command::CreateNode { name, kind, ttl, instance } => {
+        Command::Node { action: NodeAction::Create { name, kind, ttl, instance } } => {
             check_name(&name)?;
             check_instance(instance.as_deref())?;
             let kind: NodeKind = kind.parse()?;
@@ -320,13 +363,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        Command::Revoke { name } => {
+        Command::Node { action: NodeAction::Revoke { name } } => {
             check_name(&name)?;
             let client = build_client(&coordinator_url, &admin_token)?;
             wireserve_admin::cmd_revoke(&client, &name)?;
             println!("node '{name}' revoked");
         }
-        Command::Rejoin { name, ttl, instance } => {
+        Command::Node { action: NodeAction::Rejoin { name, ttl, instance } } => {
             check_name(&name)?;
             check_instance(instance.as_deref())?;
             let client = build_client(&coordinator_url, &admin_token)?;
@@ -337,8 +380,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             );
             print_expiry(resp.join_token_expires_at);
             // `rejoin`'s response doesn't carry the node's kind (unlike
-            // `create-node`, which has it from the --kind flag), and a
-            // static peer's `export-config` covers its own re-registration
+            // `node create`, which has it from the --kind flag), and a
+            // static peer's `device refresh` covers its own re-registration
             // anyway — an operator rejoining a static node manually is not
             // a case this needs to guess at, so this always assumes agent.
             print_install_instructions(
@@ -346,13 +389,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 instance.as_deref(),
             );
         }
-        Command::DeleteNode { name } => {
+        Command::Node { action: NodeAction::Delete { name } } => {
             check_name(&name)?;
             let client = build_client(&coordinator_url, &admin_token)?;
             wireserve_admin::cmd_delete_node(&client, &name)?;
             println!("node '{name}' deleted");
         }
-        Command::ClearEndpoint { name, family } => {
+        Command::Node { action: NodeAction::ClearEndpoint { name, family } } => {
             check_name(&name)?;
             let client = build_client(&coordinator_url, &admin_token)?;
             wireserve_admin::cmd_clear_endpoint(&client, &name, family.as_deref())?;
@@ -361,7 +404,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 None => println!("node '{name}' endpoint cleared"),
             }
         }
-        Command::ListServices { pending } => {
+        Command::Service { action: ServiceAction::List { pending } } => {
             let client = build_client(&coordinator_url, &admin_token)?;
             let resp = wireserve_admin::cmd_list_services(&client)?;
             for s in resp.services {
@@ -373,10 +416,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     wireserve_types::ServiceApprovalState::Approved => "approved",
                     wireserve_types::ServiceApprovalState::Denied => "denied",
                 };
-                // Same S2 defense in depth as list-peers: every field is
+                // Same S2 defense in depth as `node list`: every field is
                 // sanitized, and denied_reason especially — it is the one
                 // field here an operator typed and a database round-tripped.
-                // `<address>\t<mapping,...>` (in `serve` syntax): where the
+                // `<address>\t<mapping,...>` (in `wireserve <service>` syntax): where the
                 // name resolves and what it serves there; `-` for a service
                 // the range had no address left for.
                 let address = s.vip4.as_deref().unwrap_or("-");
@@ -407,7 +450,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        Command::ApproveService { node, service } => {
+        Command::Service { action: ServiceAction::Approve { service, node } } => {
             let client = build_client(&coordinator_url, &admin_token)?;
             wireserve_admin::cmd_approve_service(&client, &node, &service)?;
             println!("service '{service}' approved for node '{node}'");
@@ -508,7 +551,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Command::ClaimUrl { node, qr } => {
+        Command::Owner { action: OwnerAction::Link { node, qr } } => {
             let client = build_client(&coordinator_url, &admin_token)?;
             let claim = wireserve_admin::cmd_claim_link(&client, &node)?;
             print_claim(&claim, qr);
@@ -518,70 +561,59 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             wireserve_admin::cmd_remove_owner(&client, &node)?;
             println!("node '{node}' belongs to nobody now, from its next poll");
         }
-        Command::Access { service, node } => {
+        Command::Node { action: NodeAction::Access { name: node } } => {
             let client = build_client(&coordinator_url, &admin_token)?;
-            let clean_all = |v: &[wireserve_types::GrantSource]| -> String {
-                if v.is_empty() {
-                    "-".to_string()
-                } else {
-                    v.iter().map(|s| sanitize_for_terminal(&s.to_string())).collect::<Vec<_>>().join(", ")
-                }
-            };
-            if let Some(node) = node {
-                let r = wireserve_admin::cmd_node_access(&client, &node)?;
-                if let Some(o) = &r.owner {
-                    let who = o.email.as_deref().or(o.name.as_deref()).unwrap_or(&o.sub);
-                    println!(
-                        "{} belongs to {}{}",
-                        sanitize_for_terminal(&r.node),
-                        sanitize_for_terminal(who),
-                        if o.stale { " (its groups could not be refreshed for over an hour, and count for nothing)" } else { "" }
-                    );
-                }
-                println!("{} acts as: {}", sanitize_for_terminal(&r.node), clean_all(&r.principals));
-                if r.services.is_empty() {
-                    println!("  reaches no service of another node by who it is");
-                }
-                for s in &r.services {
-                    println!("  {}\tvia {}", sanitize_for_terminal(&s.name), clean_all(&s.via));
-                }
-                if r.default_closed {
-                    println!("note: everyone -> default is not granted; services without a group reach nobody");
-                }
-            } else if let Some(service) = service {
-                let r = wireserve_admin::cmd_service_access(&client, &service)?;
-                let owner = r.node.as_deref().map_or_else(|| "nothing declares it yet".to_string(), sanitize_for_terminal);
-                println!("{} ({owner})", sanitize_for_terminal(&r.service));
-                println!("  groups:     {}", r.groups.iter().map(|g| sanitize_for_terminal(g)).collect::<Vec<_>>().join(", "));
-                println!("  granted to: {}", clean_all(&r.granted_to));
-                if r.open {
-                    println!("  reachable by every node");
-                } else {
-                    println!("  reachable by its own node, and:");
-                    if r.nodes.is_empty() {
-                        println!("    no other node");
-                    }
-                    for n in &r.nodes {
-                        println!("    {}\tvia {}", sanitize_for_terminal(&n.name), clean_all(&n.via));
-                    }
-                    if r.sign_in {
-                        let groups = r.sign_in_groups.iter().map(|g| sanitize_for_terminal(g)).collect::<Vec<_>>();
-                        println!("  anyone else: the sign-in, with one of {}", groups.join(", "));
-                    } else if !r.sign_in_groups.is_empty() {
-                        println!("  (identity-provider groups are granted, but no sign-in applies: no provider, \
-                                  no terminator serving it, or its node's agent is too old)");
-                    }
-                }
-                if r.default_closed {
-                    println!("note: everyone -> default is not granted; services without a group reach nobody");
-                }
+            let r = wireserve_admin::cmd_node_access(&client, &node)?;
+            if let Some(o) = &r.owner {
+                let who = o.email.as_deref().or(o.name.as_deref()).unwrap_or(&o.sub);
+                println!(
+                    "{} belongs to {}{}",
+                    sanitize_for_terminal(&r.node),
+                    sanitize_for_terminal(who),
+                    if o.stale { " (its groups could not be refreshed for over an hour, and count for nothing)" } else { "" }
+                );
+            }
+            println!("{} acts as: {}", sanitize_for_terminal(&r.node), sources(&r.principals));
+            if r.services.is_empty() {
+                println!("  reaches no service of another node by who it is");
+            }
+            for s in &r.services {
+                println!("  {}\tvia {}", sanitize_for_terminal(&s.name), sources(&s.via));
+            }
+            if r.default_closed {
+                println!("note: everyone -> default is not granted; services without a group reach nobody");
             }
         }
-        Command::DenyService {
-            node,
-            service,
-            reason,
-        } => {
+        Command::Service { action: ServiceAction::Access { name: service } } => {
+            let client = build_client(&coordinator_url, &admin_token)?;
+            let r = wireserve_admin::cmd_service_access(&client, &service)?;
+            let owner = r.node.as_deref().map_or_else(|| "nothing declares it yet".to_string(), sanitize_for_terminal);
+            println!("{} ({owner})", sanitize_for_terminal(&r.service));
+            println!("  groups:     {}", r.groups.iter().map(|g| sanitize_for_terminal(g)).collect::<Vec<_>>().join(", "));
+            println!("  granted to: {}", sources(&r.granted_to));
+            if r.open {
+                println!("  reachable by every node");
+            } else {
+                println!("  reachable by its own node, and:");
+                if r.nodes.is_empty() {
+                    println!("    no other node");
+                }
+                for n in &r.nodes {
+                    println!("    {}\tvia {}", sanitize_for_terminal(&n.name), sources(&n.via));
+                }
+                if r.sign_in {
+                    let groups = r.sign_in_groups.iter().map(|g| sanitize_for_terminal(g)).collect::<Vec<_>>();
+                    println!("  anyone else: the sign-in, with one of {}", groups.join(", "));
+                } else if !r.sign_in_groups.is_empty() {
+                    println!("  (identity-provider groups are granted, but no sign-in applies: no provider, \
+                              no terminator serving it, or its node's agent is too old)");
+                }
+            }
+            if r.default_closed {
+                println!("note: everyone -> default is not granted; services without a group reach nobody");
+            }
+        }
+        Command::Service { action: ServiceAction::Deny { service, node, reason } } => {
             let client = build_client(&coordinator_url, &admin_token)?;
             wireserve_admin::cmd_deny_service(&client, &node, &service, reason.as_deref())?;
             println!("service '{service}' denied for node '{node}'");
@@ -590,7 +622,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                  (up to one poll interval from now)"
             );
         }
-        Command::ApproveTransit { name } => {
+        Command::Transit { action: TransitAction::Approve { name } } => {
             check_name(&name)?;
             let client = build_client(&coordinator_url, &admin_token)?;
             wireserve_admin::cmd_approve_transit(&client, &name)?;
@@ -599,13 +631,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 "  it carries nothing until it has also run `wireserve transit on`"
             );
         }
-        Command::DenyTransit { name } => {
+        Command::Transit { action: TransitAction::Deny { name } } => {
             check_name(&name)?;
             let client = build_client(&coordinator_url, &admin_token)?;
             wireserve_admin::cmd_deny_transit(&client, &name)?;
             println!("node '{name}' may no longer carry transit traffic");
         }
-        Command::RelayPorts => {
+        Command::Transit { action: TransitAction::Ports } => {
             let client = build_client(&coordinator_url, &admin_token)?;
             let resp = wireserve_admin::cmd_relay_ports(&client)?;
             if resp.ports.is_empty() {
@@ -634,7 +666,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        Command::ListPeers => {
+        Command::Node { action: NodeAction::List } => {
             let client = build_client(&coordinator_url, &admin_token)?;
             let resp = wireserve_admin::cmd_list_peers(&client)?;
             for p in resp.peers {
@@ -703,7 +735,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        Command::ExportConfig { name, out, refresh, qr, exit, allow_unverified, dns, mesh_dns } => {
+        Command::Device { action } => {
+            let (refresh, DeviceArgs { name, out, qr, exit, allow_unverified, dns, mesh_dns }) = match action {
+                DeviceAction::Create(args) => (false, args),
+                DeviceAction::Refresh(args) => (true, args),
+            };
             check_name(&name)?;
             if let Some(exit) = exit.as_deref().filter(|e| !e.is_empty()) {
                 check_name(exit)?;
@@ -801,6 +837,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Grant sources for a person: `everyone, tag:servers`, or `-`.
+fn sources(v: &[wireserve_types::GrantSource]) -> String {
+    if v.is_empty() {
+        "-".to_string()
+    } else {
+        v.iter().map(|s| sanitize_for_terminal(&s.to_string())).collect::<Vec<_>>().join(", ")
+    }
+}
+
 /// Replaces embedded newlines/carriage returns with a visible escape
 /// rather than letting them fake extra lines of terminal output (S2).
 fn sanitize_for_terminal(s: &str) -> String {
@@ -887,9 +932,9 @@ fn build_client(
     Ok(AdminClient::new(url, token))
 }
 
-/// Resolves the register URL the same way `export-config` does (flag → env
+/// Resolves the register URL the same way `device create` does (flag → env
 /// → saved file), but never prompts and never fails the caller — used by
-/// `create-node`/`rejoin`, where this is a bonus annotation on already
+/// `node create`/`node rejoin`, where this is a bonus annotation on already
 /// successful output, not a requirement for the command itself.
 fn resolve_register_url_best_effort(cli_flag: Option<&str>) -> Option<String> {
     config::resolve_register_url(cli_flag).ok()
@@ -956,6 +1001,42 @@ fn warn_if_plaintext_to_remote_host(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(words: &[&str]) -> Result<Command, clap::Error> {
+        Cli::try_parse_from(std::iter::once("wireserve-admin").chain(words.iter().copied())).map(|c| c.command)
+    }
+
+    #[test]
+    fn the_cli_is_well_formed() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn approving_a_service_names_its_node_by_flag() {
+        let Ok(Command::Service { action: ServiceAction::Approve { service, node } }) =
+            parse(&["service", "approve", "web", "--node", "lego2"])
+        else {
+            panic!("not a service approval")
+        };
+        assert_eq!((service.as_str(), node.as_str()), ("web", "lego2"));
+        // The order before M44, node first: refused, not swapped.
+        assert!(parse(&["service", "approve", "lego2", "web"]).is_err());
+    }
+
+    #[test]
+    fn a_refresh_is_its_own_command() {
+        assert!(matches!(parse(&["device", "refresh", "phone"]), Ok(Command::Device { action: DeviceAction::Refresh(_) })));
+        assert!(parse(&["device", "create", "phone", "--refresh"]).is_err());
+    }
+
+    #[test]
+    fn kind_and_family_take_only_known_values() {
+        assert!(parse(&["node", "create", "pc", "--kind", "static"]).is_ok());
+        assert!(parse(&["node", "create", "pc", "--kind", "statik"]).is_err());
+        assert!(parse(&["node", "clear-endpoint", "pc", "--family", "v6"]).is_ok());
+        assert!(parse(&["node", "clear-endpoint", "pc", "--family", "ipv6"]).is_err());
+    }
 
     #[test]
     fn write_conf_file_creates_file_at_mode_600() {

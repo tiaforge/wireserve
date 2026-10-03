@@ -45,10 +45,10 @@
 # than just inside this container. If nothing outside the container
 # needs that resolution, the bind mount can be omitted.
 #
-# The `serve`/`unserve`/`list`/`leave` subcommands talk to the daemon over
+# `wireserve <service>`, `status` and `leave` talk to the daemon over
 # a Unix socket in /run/wireserve, which only exists inside this
 # container's own namespace — run them via
-# `docker exec wireserve-agent wireserve list`, not from the host,
+# `docker exec wireserve-agent wireserve status`, not from the host,
 # unless /run/wireserve is separately bind-mounted out.
 
 # ---- build stage ----

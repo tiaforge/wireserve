@@ -1,4 +1,4 @@
-//! Thin client used by the `serve`/`unserve`/`list`/`leave` CLI
+//! Thin client used by the `wireserve <service>`/`status`/`leave` CLI
 //! subcommands to talk to a running daemon over the Unix socket. The socket
 //! is root-only, or shared with the `wireserve` group when the host has one
 //! (see `server::serve`), so a refused connection is reported as that, not

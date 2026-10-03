@@ -38,7 +38,7 @@ pub enum ConfigError {
         "no node-facing URL found for the /register call — pass --register-url or set \
          WIRESERVE_REGISTER_URL. This is the coordinator's OTHER listener: spec §4.0 requires \
          the admin and node-facing listeners to be bound separately (e.g. different ports), so \
-         --coordinator-url alone isn't enough for export-config"
+         --coordinator-url alone isn't enough for device create"
     )]
     MissingRegisterUrl,
 }
@@ -175,7 +175,7 @@ pub fn resolve_coordinator_url_interactive(cli_flag: Option<&str>) -> Result<Str
     Ok(url)
 }
 
-/// Resolves the node-facing base URL used only by `export-config`'s
+/// Resolves the node-facing base URL used only by `device create`'s
 /// `/register` call (spec §4.2) — deliberately separate from
 /// `resolve_coordinator_url`, which resolves the *admin* listener's URL.
 /// See `ConfigError::MissingRegisterUrl` for why these can't default to
@@ -203,7 +203,7 @@ pub fn resolve_register_url(cli_flag: Option<&str>) -> Result<String, ConfigErro
 
 /// Same as [`resolve_register_url`], except when it comes up empty and
 /// stdin is a terminal: prompts instead of erroring, and offers to save
-/// the answer — this URL doesn't change between one `create-node` and the
+/// the answer — this URL doesn't change between one `node create` and the
 /// next, so it's worth remembering exactly like the admin token is.
 pub fn resolve_register_url_interactive(cli_flag: Option<&str>) -> Result<String, ConfigError> {
     match resolve_register_url(cli_flag) {

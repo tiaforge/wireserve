@@ -75,7 +75,7 @@ pub fn cmd_rejoin(
 ) -> Result<RejoinResponse, CliError> {
     validate_name(name)?;
     // No kind expectation: a bare `rejoin` names the node explicitly and has
-    // always worked on either kind. Only `export-config --refresh` asserts a
+    // always worked on either kind. Only `device refresh` asserts a
     // kind, because it is the caller that could aim at the wrong one.
     Ok(client.rejoin(name, ttl_secs, None)?)
 }

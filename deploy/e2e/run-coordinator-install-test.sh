@@ -104,13 +104,13 @@ if grep -q '^WIRESERVE_TRUSTED_PROXY=' "$WORK/env1"; then fail "trusted proxy se
 [ "$(in_c "$C" stat -c '%U %a' /etc/wireserve/coordinator.env)" = "root 600" ] || fail "env file not root 600"
 pass "env file holds exactly the answers, root 600"
 
-in_c "$C" runuser -l tester -c 'wireserve-admin list-peers' >/dev/null || fail "wireserve-admin does not work for tester"
+in_c "$C" runuser -l tester -c 'wireserve-admin node list' >/dev/null || fail "wireserve-admin does not work for tester"
 pass "wireserve-admin works for the admin user with no flags"
 [ "$(in_c "$C" stat -c '%U %a' /home/tester/.config/wireserve-admin/admin_token)" = "tester 600" ] \
     || fail "admin_token not tester 600"
-in_c "$C" runuser -l tester -c 'wireserve-admin create-node box1' > "$WORK/create.out" 2>&1 || fail "create-node failed"
-grep -q 'https://mesh.test' "$WORK/create.out" || { cat "$WORK/create.out"; fail "create-node does not print the public address"; }
-pass "create-node prints the public address"
+in_c "$C" runuser -l tester -c 'wireserve-admin node create box1' > "$WORK/create.out" 2>&1 || fail "node create failed"
+grep -q 'https://mesh.test' "$WORK/create.out" || { cat "$WORK/create.out"; fail "node create does not print the public address"; }
+pass "node create prints the public address"
 
 # ---------------------------------------------------------------------
 log "--reconfigure changes only its own keys"
@@ -123,7 +123,7 @@ expect_key "$WORK/env2" WIRESERVE_REQUIRE_SERVICE_APPROVAL=false
 expect_key "$WORK/env2" WIRESERVE_SERVICE_DOMAIN=int.test
 expect_key "$WORK/env2" WIRESERVE_PUBLIC_URL=https://mesh.test
 in_c "$C" systemctl is-active --quiet wireserve-coordinator || fail "service not active after reconfigure"
-in_c "$C" runuser -l tester -c 'wireserve-admin list-peers' >/dev/null || fail "admin key changed on reconfigure"
+in_c "$C" runuser -l tester -c 'wireserve-admin node list' >/dev/null || fail "admin key changed on reconfigure"
 pass "hand-added line kept, approval off, the rest unchanged, same admin key"
 
 in_c "$C" /opt/ws/wireserve-coordinator install --reconfigure --no-domain --yes >/dev/null 2>&1 || fail "--no-domain failed"

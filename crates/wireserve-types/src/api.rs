@@ -522,7 +522,7 @@ pub struct DeniedService {
 /// Cap on an admin-supplied denial reason.
 ///
 /// It rides back to the declaring node on every poll until that node
-/// quarantines the declaration, and then sits in `wireserve list` output.
+/// quarantines the declaration, and then sits in `wireserve status` output.
 /// Lives here, not in the coordinator, so `wireserve-admin` can refuse an
 /// over-long one before spending a round trip — the same reasoning as
 /// [`MAX_SERVICES_PER_NODE`].
@@ -567,7 +567,7 @@ pub struct PollResponse {
     /// offer. A self-reported offer is never enough on its own: a carrier
     /// sees who talks to whom and can drop it, and an exit reads what it
     /// sends on, so only an admin decides who may be one. Reported so
-    /// `wireserve list` can say why the node never carries
+    /// `wireserve status` can say why the node never carries
     /// anything; absent from the JSON when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub transit_awaiting_approval: bool,
@@ -697,11 +697,11 @@ pub struct RejoinRequest {
     /// rejoin mutates anything (PLAN.md M24). `None` skips the check, which
     /// is what every caller written before this field did.
     ///
-    /// Load-bearing for `export-config --refresh`: a rejoin nulls the node's
+    /// Load-bearing for `device refresh`: a rejoin nulls the node's
     /// pubkey, which drops it out of `list_all_peers` and so off every other
     /// node's directory on their next poll. Registration is where a `kind`
     /// mismatch would otherwise be caught, and that is one round trip too
-    /// late — `--refresh` aimed at an agent node by mistake would kick a live
+    /// late — `device refresh` aimed at an agent node by mistake would kick a live
     /// node off the mesh and only *then* fail. An admin CLI cannot pre-check
     /// this itself: `PeerInfo` carries no `kind`, and a separate lookup would
     /// race the rejoin regardless.
@@ -748,7 +748,7 @@ pub struct RelayAssignment {
 /// port — with that port checked from the internet first.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RelayPlanRequest {
-    /// Keep a relay whose port could not be confirmed open (`export-config
+    /// Keep a relay whose port could not be confirmed open (`device create
     /// --allow-unverified`), for an operator who knows better than the
     /// check, which runs from the coordinator's own network.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -851,7 +851,7 @@ pub struct AdminPeersResponse {
     pub dialable: std::collections::BTreeMap<String, bool>,
     /// Static peers whose `.conf` no longer matches the mesh (PLAN.md M40):
     /// a node joined after the export, or a carrier it relies on no longer
-    /// qualifies. `export-config --refresh` brings one up to date.
+    /// qualifies. `device refresh` brings one up to date.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stale_devices: Vec<String>,
     /// Released service addresses each device still holds back (PLAN.md

@@ -195,7 +195,7 @@ async fn serve() {
         listen_addr.port()
     );
     eprintln!();
-    eprintln!("  Next: add a node —  wireserve-admin create-node <name>");
+    eprintln!("  Next: add a node —  wireserve-admin node create <name>");
     eprintln!("========================================================================");
 
     tracing::info!(%listen_addr, %admin_listen_addr, %reflexive_addr, "wireserve-coordinator starting");

@@ -4337,3 +4337,54 @@ as agreed with the user. Nothing deployed; no e2e suite covers these paths.
     marking rule it stays dropped (checked by switching the rule off).
     Planner tests: inserted beside every mesh opening, none on FORWARD,
     settles, comes out when no longer a carrier. Not run in the podman e2e.
+
+## M44 — the CLI says each thing once
+
+`wireserve serve web 80` said its verb twice, and `unserve` was an invented
+word. `wireserve-admin` mixed verb-noun commands (`create-node`,
+`approve-service`, `deny-transit`) with noun-verb groups (`group create`,
+`grant add`). Old names are gone, not aliased; only `tls-serve` stays, hidden,
+because hand-installed Quadlet units call it and `install` doesn't rewrite
+those.
+
+283. **The service is the command** (2026-10-03). `wireserve <name>
+    [PORT]... [--group G]` declares a service, and the ports given replace
+    the ones it had. `wireserve <name> off` withdraws it, and `wireserve
+    <name>` shows it (`render::render_service`). Implemented as a clap
+    `external_subcommand` re-parsed by `ServiceArgs`, which also takes
+    `--instance` after the name. We compared `off`, `unserve`, `stop` and
+    `remove`. `off` won because it reads the same as `transit off` and
+    `exit off`. `stop` was rejected because it suggests the backend is
+    stopped.
+    - **Reserved names** (`RESERVED_SERVICE_NAMES`): every command, its
+      aliases and `off`. A new declaration with one of these names is
+      refused at the IPC. A test checks that the list covers every
+      subcommand. A service already declared under such a name keeps
+      working, but can no longer be reached from the CLI.
+    - **Withdrawing an unknown name is an error.** Before, it answered `ok`,
+      so a typo looked like it worked. IPC errors from the service form now
+      exit non-zero.
+284. **Agent renames.** `list` → `status`, `tls-serve` → `tls-daemon`
+    (hidden, with the old name as an alias), and `join --endpoint-addr` →
+    `--endpoint`, which now has a doc comment. Internally, `TransitAction`
+    → `Toggle`.
+285. **Admin, noun-verb throughout:**
+
+    | before | now |
+    |---|---|
+    | `create-node`, `rejoin`, `revoke`, `delete-node`, `list-peers`, `clear-endpoint` | `node create\|rejoin\|revoke\|delete\|list\|clear-endpoint` |
+    | `access --node N` / `access S` | `node access N` / `service access S` |
+    | `list-services`, `approve-service N S`, `deny-service N S` | `service list`, `service approve S --node N`, `service deny S --node N` |
+    | `approve-transit`, `deny-transit`, `relay-ports` | `transit approve\|deny\|ports` |
+    | `claim-url` | `owner link` |
+    | `export-config`, `export-config --refresh` | `device create`, `device refresh` |
+
+    `service approve` and `service deny` take the node as `--node`. A node
+    and a service can share a name, so swapping the old positional order
+    would have been dangerous. `--kind` and `--family` accept only their
+    known values. `--register-url` is unchanged: renaming it would also
+    rename the setting the coordinator installer saves on real hosts.
+286. **Verification.** Unit tests: both CLIs pass `debug_assert`; parse
+    tests for the service form, `off`, the reserved list and the admin
+    regroup; IPC tests for reserved and unknown names. The e2e scripts,
+    README, units and printed hints are updated. Not yet run in e2e.

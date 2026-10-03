@@ -120,7 +120,7 @@ sleep 1
 
 token() {
     WIRESERVE_ADMIN_TOKEN=$ADMIN_TOKEN WIRESERVE_COORDINATOR_URL="http://127.0.0.1:$(($1 + 1))" \
-        "$BIN/wireserve-admin" create-node "$2" | grep -oE 'jtk_[a-f0-9]+'
+        "$BIN/wireserve-admin" node create "$2" | grep -oE 'jtk_[a-f0-9]+'
 }
 
 # Each side has its own state, sockets and hosts file; each command runs
@@ -144,7 +144,7 @@ daemon() {  # side instance [args…]
     LAST_PID=$!
 }
 state() { python3 -c "import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])" "$1" "$2"; }
-list() { "$1" --instance "$2" list --json; }
+list() { "$1" --instance "$2" status --json; }
 field() { python3 -c "import json,sys; print(json.load(sys.stdin)[sys.argv[1]])" "$1"; }
 peer_ip() { python3 -c "
 import json, sys
@@ -152,10 +152,10 @@ print(next(p['ip4'] for p in json.load(sys.stdin)['peers'] if p['name'] == sys.a
 
 # ---------------------------------------------------------------------
 log "joining: host default + work, peer default + work"
-host --instance default join http://10.99.0.1:47820 --allow-plaintext-http "$(token 47820 host-a)" --endpoint-addr 10.99.0.1:51820 >/dev/null
-host --instance work join http://10.99.0.1:47830 --allow-plaintext-http "$(token 47830 host-b)" --endpoint-addr 10.99.0.1:51821 >/dev/null
-peer --instance default join http://10.99.0.1:47820 --allow-plaintext-http "$(token 47820 peer-a)" --listen-port 51820 --endpoint-addr 10.99.0.2:51820 >/dev/null
-peer --instance work join http://10.99.0.1:47830 --allow-plaintext-http "$(token 47830 peer-b)" --listen-port 51821 --endpoint-addr 10.99.0.2:51821 >/dev/null
+host --instance default join http://10.99.0.1:47820 --allow-plaintext-http "$(token 47820 host-a)" --endpoint 10.99.0.1:51820 >/dev/null
+host --instance work join http://10.99.0.1:47830 --allow-plaintext-http "$(token 47830 host-b)" --endpoint 10.99.0.1:51821 >/dev/null
+peer --instance default join http://10.99.0.1:47820 --allow-plaintext-http "$(token 47820 peer-a)" --listen-port 51820 --endpoint 10.99.0.2:51820 >/dev/null
+peer --instance work join http://10.99.0.1:47830 --allow-plaintext-http "$(token 47830 peer-b)" --listen-port 51821 --endpoint 10.99.0.2:51821 >/dev/null
 
 [ "$(state "$WORK/host/lib/agent-state.json" listen_port)" = 51820 ] || fail "default instance did not get port 51820"
 [ "$(state "$WORK/host/lib/instances/work/agent-state.json" listen_port)" = 51821 ] \
@@ -169,7 +169,7 @@ log "starting all four daemons"
 # out after 25s in a namespace that can't reach the host's bus.
 # (Started together they'd split the names either way round, which is
 # fine, but the checks below want to know.)
-up() { for _ in $(seq 600); do "$1" --instance "$2" list >/dev/null 2>&1 && return; sleep 0.1; done; fail "$1/$2 did not come up"; }
+up() { for _ in $(seq 600); do "$1" --instance "$2" status >/dev/null 2>&1 && return; sleep 0.1; done; fail "$1/$2 did not come up"; }
 daemon host default; HOST_DEFAULT=$LAST_PID; up host default
 daemon host work; HOST_WORK=$LAST_PID; up host work
 daemon peer default
@@ -193,8 +193,8 @@ pass "a second daemon for the same instance is refused"
 
 # ---------------------------------------------------------------------
 log "services: each instance opens only what it declared, only on its own interface"
-host --instance default serve alpha 7001 >/dev/null
-host --instance work serve beta 7002 >/dev/null
+host --instance default alpha 7001 >/dev/null
+host --instance work beta 7002 >/dev/null
 for port in 7001 7002 7003; do
     python3 -c "
 import socket, sys
@@ -277,10 +277,10 @@ as_user() { setpriv --reuid=48211 --regid=48211 "$@"; }
 install -m 755 "$BIN/wireserve" "$WORK/wireserve-client"
 member=(as_user --groups="$GRP_GID" env WIRESERVE_RUN_ROOT="$WORK/host/run" "$WORK/wireserve-client" --instance work)
 outsider=(as_user --clear-groups env WIRESERVE_RUN_ROOT="$WORK/host/run" "$WORK/wireserve-client" --instance work)
-"${member[@]}" list >/dev/null || fail "a member of $GRP could not use the daemon"
-"${member[@]}" serve gtest 7099 >/dev/null || fail "a member of $GRP could not change what the node serves"
-"${member[@]}" unserve gtest >/dev/null || fail "a member of $GRP could not withdraw it"
-out=$("${outsider[@]}" list 2>&1) && fail "a non-member could use the daemon"
+"${member[@]}" status >/dev/null || fail "a member of $GRP could not use the daemon"
+"${member[@]}" gtest 7099 >/dev/null || fail "a member of $GRP could not change what the node serves"
+"${member[@]}" gtest off >/dev/null || fail "a member of $GRP could not withdraw it"
+out=$("${outsider[@]}" status 2>&1) && fail "a non-member could use the daemon"
 echo "$out" | grep -q "not permitted" || fail "a non-member got the wrong message: $out"
 pass "members of $GRP (by supplementary group) can use the daemon; everyone else is told why not"
 sleep $((POLL * 2))

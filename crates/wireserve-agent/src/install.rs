@@ -475,7 +475,7 @@ mod tests {
     fn the_terminator_runs_beside_its_own_agent_as_its_own_user() {
         let (content, dest, name) = tls_unit_for(&Instance::default());
         assert_eq!((dest, name.as_str()), ("/etc/systemd/system/wireserve-tls.service", "wireserve-tls"));
-        assert!(content.contains(&format!("ExecStart={BIN_DEST} tls-serve")));
+        assert!(content.contains(&format!("ExecStart={BIN_DEST} tls-daemon")));
         assert!(content.contains("PartOf=wireserve-agent.service") && content.contains("WantedBy=wireserve-agent.service"));
         assert!(content.contains("User=wireserve-tls") && content.contains("CapabilityBoundingSet=\n"));
         assert!(!content.contains("AmbientCapabilities"), "no privilege at all (PLAN.md M35)");
@@ -483,7 +483,7 @@ mod tests {
 
         let (content, _, name) = tls_unit_for(&Instance::new("work").unwrap());
         assert_eq!(name, "wireserve-tls@work");
-        assert!(content.contains(&format!("ExecStart={BIN_DEST} --instance %i tls-serve")));
+        assert!(content.contains(&format!("ExecStart={BIN_DEST} --instance %i tls-daemon")));
         assert!(content.contains("PartOf=wireserve-agent@%i.service") && content.contains("Requires=wireserve-tls@%i.socket"));
         // The agent makes the directory the terminator's socket lives in.
         assert!(UNIT_DEFAULT.contains("RuntimeDirectory=wireserve wireserve-tls\n"));

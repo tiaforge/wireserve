@@ -11,7 +11,7 @@
 # What this proves, and what no unit or namespace test can:
 #
 #   1. the agents tell whether they are dialable: the carrier on a public
-#      address is, the node behind NAT is not (`list-peers` shows it);
+#      address is, the node behind NAT is not (`node list` shows it);
 #   2. the export checks the carrier's relay port from outside, and with the
 #      port blocked upstream of the carrier stops before creating anything,
 #      naming the exact port and address to open;
@@ -23,7 +23,7 @@
 #      never saw inside;
 #   6. the phone roams (a new source port) and reaches it again;
 #   7. default-deny still holds through the relay;
-#   8. `relay-ports` names the port, its device, and that it is open;
+#   8. `transit ports` names the port, its device, and that it is open;
 #   9. a refresh keeps the phone's address.
 #
 #     ( inet 198.51.100.0/24 )──────────┬──────────────┬─────────────┐
@@ -164,7 +164,7 @@ podman run -d --name "$HOME_AGENT" --network "$SITE_H" \
 sleep 1
 in_netns "$HOME_AGENT" ip route replace default via "$ROUTER_H_LAN" >/dev/null
 
-create_node() { admin create-node "$1" | grep -oE 'jtk_[a-f0-9]+'; }
+create_node() { admin node create "$1" | grep -oE 'jtk_[a-f0-9]+'; }
 
 log "joining the two agents"
 JT_CARRIER=$(create_node node-carrier)
@@ -180,23 +180,23 @@ sleep 15
 pass "both agents registered and polling"
 
 log "1/9: each agent knows whether it is dialable"
-PEERS=$(admin list-peers)
+PEERS=$(admin node list)
 echo "$PEERS" | grep '^node-carrier' | grep -q 'dialable=yes' || { echo "$PEERS"; fail "the carrier on a public address did not find itself dialable"; }
 echo "$PEERS" | grep '^node-home' | grep -q 'dialable=no' || { echo "$PEERS"; fail "the node behind NAT did not find itself undialable"; }
 pass "carrier dialable, homeserver not"
 
 log "declaring a service on homeserver"
-podman exec "$HOME_AGENT" wireserve serve svc-home 12345
+podman exec "$HOME_AGENT" wireserve svc-home 12345
 sleep 8
-admin approve-service node-home svc-home || fail "could not approve svc-home"
+admin service approve svc-home --node node-home || fail "could not approve svc-home"
 sleep 8
 
 log "opting the carrier in (both halves)"
 podman exec "$CARRIER" wireserve transit on
-admin approve-transit node-carrier || fail "could not approve node-carrier"
+admin transit approve node-carrier || fail "could not approve node-carrier"
 sleep 12
 
-RELAY_PORT=$(admin list-peers >/dev/null; podman exec "$HOME_AGENT" wireserve list --json \
+RELAY_PORT=$(admin node list >/dev/null; podman exec "$HOME_AGENT" wireserve status --json \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(p['relay']['port'] for p in d['peers'] if p['name']=='node-home'))")
 echo "homeserver's relay port: $RELAY_PORT"
 
@@ -213,19 +213,19 @@ table ip cloudfw {
 NFT
 in_netns "$CARRIER" nft list table ip cloudfw | grep -q "udp dport $RELAY_PORT drop" \
     || fail "the simulated cloud firewall is not in place — this check would prove nothing"
-if admin export-config phone --register-url "http://127.0.0.1:47820" >"$OUT/closed.conf" 2>"$OUT/closed.log"; then
+if admin device create phone --register-url "http://127.0.0.1:47820" >"$OUT/closed.conf" 2>"$OUT/closed.log"; then
     cat "$OUT/closed.log"
     fail "the export went ahead with the relay port closed"
 fi
 grep -q "open UDP $RELAY_PORT inbound on node-carrier ($CARRIER_IP)" "$OUT/closed.log" \
     || { cat "$OUT/closed.log"; fail "the refusal does not name the port and address to open"; }
-admin list-peers | grep -q '^phone' && fail "the refused export created the node anyway"
+admin node list | grep -q '^phone' && fail "the refused export created the node anyway"
 pass "refused before creating anything, naming UDP $RELAY_PORT on $CARRIER_IP"
 in_netns "$CARRIER" nft delete table ip cloudfw
 
 log "3/9: exporting the phone's config"
-admin export-config phone --register-url "http://127.0.0.1:47820" > "$OUT/phone.conf" 2>"$OUT/export.log" \
-    || { cat "$OUT/export.log"; fail "export-config failed with the port open"; }
+admin device create phone --register-url "http://127.0.0.1:47820" > "$OUT/phone.conf" 2>"$OUT/export.log" \
+    || { cat "$OUT/export.log"; fail "device create failed with the port open"; }
 note "exported config:"
 sed 's/^PrivateKey = .*/PrivateKey = <redacted>/; s/^/  /' "$OUT/phone.conf"
 grep -qx "MTU = 1340" "$OUT/phone.conf" || fail "no carry MTU, though a node is relayed"
@@ -294,7 +294,7 @@ fi
 pass "an undeclared port stays refused"
 
 log "8/9: relay-ports names the port, its device, and that it is open"
-PORTS=$(admin relay-ports)
+PORTS=$(admin transit ports)
 echo "$PORTS"
 echo "$PORTS" | grep "udp/$RELAY_PORT" | grep -q "address=$CARRIER_IP" || fail "relay-ports does not list the port with its address"
 echo "$PORTS" | grep "udp/$RELAY_PORT" | grep -q "open" || fail "relay-ports does not say it is open"
@@ -303,8 +303,8 @@ pass "listed, open, used by the phone"
 
 log "9/9: a refresh keeps the phone's address"
 PHONE_IP4=$(grep '^Address' "$OUT/phone.conf" | sed 's/Address = //; s#/32.*##')
-admin export-config phone --refresh --register-url "http://127.0.0.1:47820" > "$OUT/phone2.conf" 2>/dev/null \
-    || fail "export-config --refresh failed"
+admin device refresh phone --register-url "http://127.0.0.1:47820" > "$OUT/phone2.conf" 2>/dev/null \
+    || fail "device refresh failed"
 NEW_IP4=$(grep '^Address' "$OUT/phone2.conf" | sed 's/Address = //; s#/32.*##')
 [ "$NEW_IP4" = "$PHONE_IP4" ] || fail "a refresh renumbered the device ($PHONE_IP4 -> $NEW_IP4)"
 grep -qx "Endpoint = $CARRIER_IP:$RELAY_PORT" "$OUT/phone2.conf" || fail "the refreshed config lost its relay"

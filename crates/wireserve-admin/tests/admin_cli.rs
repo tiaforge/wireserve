@@ -41,9 +41,9 @@ fn export_config_end_to_end_and_private_key_never_leaves_process() {
     assert!(conf.contains("AllowedIPs = 100.90.0.3/32, fd00:90::3/128"));
     assert!(conf.contains("Endpoint = duckdns.example.com:51820"));
 
-    // list-peers, relay-plan, create-node, register, list-services (for the
+    // node list, relay-plan, node create, register, service list (for the
     // service addresses each peer owns), record-export — exactly six
-    // requests, no more. list-peers and the relay plan come *first*, so the
+    // requests, no more. node list and the relay plan come *first*, so the
     // exit and every relay port are checked before anything is created;
     // record-export tells the exit and carriers what the config relies on.
     assert_eq!(mock.request_count(), 6);
@@ -81,7 +81,7 @@ fn export_config_refresh_rejoins_instead_of_creating_and_keeps_the_same_call_cou
     assert!(conf.contains("[Interface]"));
 
     // The same six as the create path, with rejoin standing in for
-    // create-node — and the directory read first, which matters more here:
+    // node create — and the directory read first, which matters more here:
     // rejoin is destructive, so an exit or relay port that cannot be
     // satisfied must fail before the device's pubkey is nulled.
     assert_eq!(mock.request_count(), 6);
@@ -313,7 +313,7 @@ fn export_config_succeeds_against_two_genuinely_separate_listeners() {
     let client = AdminClient::new(admin_mock.base_url.as_str(), TOKEN);
 
     let conf = wireserve_admin::export_config::run(&client, register_mock.base_url.as_str(), "phone", &Default::default())
-        .expect("export-config must work when admin and register URLs point at different listeners")
+        .expect("device create must work when admin and register URLs point at different listeners")
         .conf;
     assert!(conf.contains("[Interface]"));
 }
@@ -371,7 +371,7 @@ fn tags_by_tag_is_empty_without_tags() {
     assert!(wireserve_admin::tags_by_tag(&resp).is_empty());
 }
 
-// ---- F8: delete-node ----
+// ---- F8: node delete ----
 
 #[test]
 fn delete_node_sends_delete_with_admin_token_and_validates_name_first() {

@@ -474,7 +474,7 @@ pub fn quarantine_rejected_service(state: &mut AgentState, error_body: &str) -> 
 }
 
 /// Drops a declaration and records why, so it stops being resent every
-/// cycle but does not silently vanish from `wireserve list` (security
+/// cycle but does not silently vanish from `wireserve status` (security
 /// review F3).
 ///
 /// Shared by the name-collision path and the admin-denial path so the two
@@ -497,7 +497,7 @@ fn quarantine(state: &mut AgentState, name: String, reason: String) {
 ///   it so an admin can still approve it, keeps its own firewall hole
 ///   open (spec §5 — a node only ever firewalls itself, and nothing
 ///   resolves `<name>.wg` for it yet anyway), and is simply absent from
-///   every other node's directory. It is recorded so `wireserve list` can
+///   every other node's directory. It is recorded so `wireserve status` can
 ///   say "waiting on approval" instead of looking identical to "not
 ///   polled yet".
 ///
@@ -609,7 +609,7 @@ fn sync_local_routes(old: &BTreeSet<Ipv4Addr>, _new: &BTreeSet<Ipv4Addr>, _node:
 /// F1 (security review, round 2): `state` is the same `Mutex` the IPC
 /// server mutates, and the lock is held only for the moments this
 /// function reads or writes it — never across the network round trip —
-/// so a `serve`/`unserve`/`list` issued while a poll is in flight is
+/// so a declaration, withdrawal or `status` issued while a poll is in flight is
 /// neither blocked nor lost. Only the fields this cycle actually
 /// produces (`last_directory`, a quarantined declaration) are written
 /// back; `declared_services` is never overwritten wholesale.

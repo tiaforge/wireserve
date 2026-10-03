@@ -14,7 +14,7 @@
 #   3. `grant add tag:ops infra` lets the tagged node in, and only it;
 #   4. taking the grant away cuts a connection already open;
 #   5. a declaration naming a group lands in it — once: naming another
-#      later changes nothing and says so in `wireserve list`, and naming a
+#      later changes nothing and says so in `wireserve status`, and naming a
 #      group that does not exist publishes nothing;
 #   6. a group in use cannot be deleted, and `access` explains who reaches
 #      a service and why.
@@ -136,14 +136,14 @@ for pair in "$HOME_AGENT:node-home" "$CLIENT_A:node-a" "$CLIENT_B:node-b"; do
     podman run -d --name "$c" --network "$NET" \
         --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
         --entrypoint sleep wireserve-agent:gr-test infinity >/dev/null
-    jt=$(admin create-node "$n" | grep -oE 'jtk_[a-f0-9]+')
+    jt=$(admin node create "$n" | grep -oE 'jtk_[a-f0-9]+')
     podman exec "$c" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$jt" \
-        --listen-port "$WG_PORT" --endpoint-addr "$(ip_on "$c" "$NET"):$WG_PORT" 2>/dev/null
+        --listen-port "$WG_PORT" --endpoint "$(ip_on "$c" "$NET"):$WG_PORT" 2>/dev/null
     podman exec -d "$c" sh -c 'wireserve daemon --poll-interval-secs 3 >/var/log/agent.log 2>&1'
 done
 admin tag add node-a ops
-podman exec "$HOME_AGENT" wireserve serve web 80:8080
-podman exec "$HOME_AGENT" wireserve serve db 5432
+podman exec "$HOME_AGENT" wireserve web 80:8080
+podman exec "$HOME_AGENT" wireserve db 5432
 in_netns_bg "$HOME_AGENT" socat TCP-LISTEN:8080,fork,reuseaddr SYSTEM:'read x; echo web'
 in_netns_bg "$HOME_AGENT" socat TCP-LISTEN:5432,fork,reuseaddr EXEC:cat
 wait_for "db to resolve on a" 60 sh -c "podman exec $CLIENT_A getent hosts db.wg"
@@ -186,29 +186,29 @@ pass "the open connection was cut at the next packet"
 log "5/6: a declaration names a group once, and never an unknown one"
 admin grant add tag:ops infra
 admin group create media
-podman exec "$HOME_AGENT" wireserve serve vault 8200 --group infra
+podman exec "$HOME_AGENT" wireserve vault 8200 --group infra
 in_netns_bg "$HOME_AGENT" socat TCP-LISTEN:8200,fork,reuseaddr SYSTEM:'read x; echo vault'
 wait_for "vault to resolve on b" 60 sh -c "podman exec $CLIENT_B getent hosts vault.wg"
 wait_for "a to reach vault" 30 reaches "$CLIENT_A" vault 8200
 refused "$CLIENT_B" vault 8200 || fail "vault landed in default"
-admin list-services | grep '^vault' | grep -q 'groups=infra' || fail "vault is not listed in infra"
-podman exec "$HOME_AGENT" wireserve serve vault 8200 --group media
-wait_for "the notice about vault" 30 sh -c "podman exec $HOME_AGENT wireserve list | grep -q 'vault: stays in infra'"
-admin list-services | grep '^vault' | grep -q 'groups=infra' || fail "a declaration moved vault"
-podman exec "$HOME_AGENT" wireserve serve ghost 9000 --group nope
-wait_for "the notice about ghost" 30 sh -c "podman exec $HOME_AGENT wireserve list | grep -q 'ghost: there is no group nope'"
-admin list-services | grep -q '^ghost' && fail "a service naming an unknown group was published"
+admin service list | grep '^vault' | grep -q 'groups=infra' || fail "vault is not listed in infra"
+podman exec "$HOME_AGENT" wireserve vault 8200 --group media
+wait_for "the notice about vault" 30 sh -c "podman exec $HOME_AGENT wireserve status | grep -q 'vault: stays in infra'"
+admin service list | grep '^vault' | grep -q 'groups=infra' || fail "a declaration moved vault"
+podman exec "$HOME_AGENT" wireserve ghost 9000 --group nope
+wait_for "the notice about ghost" 30 sh -c "podman exec $HOME_AGENT wireserve status | grep -q 'ghost: there is no group nope'"
+admin service list | grep -q '^ghost' && fail "a service naming an unknown group was published"
 pass "vault joined infra and stayed there; ghost was not published"
 
 log "6/6: groups in use stay, and access explains"
 if admin group delete infra 2>/dev/null; then
     fail "a group holding services was deleted"
 fi
-admin access db | tee "$WORK/access.out"
+admin service access db | tee "$WORK/access.out"
 grep -q 'groups:     infra' "$WORK/access.out" || fail "access does not name db's group"
 grep -qE 'node-a[[:space:]]+via tag:ops' "$WORK/access.out" || fail "access does not say node-a reaches db through tag:ops"
 grep -q 'node-b' "$WORK/access.out" && fail "access claims node-b reaches db"
-admin access --node node-b | tee "$WORK/node-b.out"
+admin node access node-b | tee "$WORK/node-b.out"
 grep -qE '^  web' "$WORK/node-b.out" || fail "node-b should reach web, through everyone"
 grep -qE '^  (db|vault)' "$WORK/node-b.out" && fail "node-b should reach nothing in infra"
 pass "infra could not be deleted; access names node-a via tag:ops, and node-b reaches web alone"

@@ -1,5 +1,6 @@
-//! `wireserve list` for a person: the daemon's cached view as
-//! aligned tables. `list --json` prints the view itself, for scripts.
+//! `wireserve status` for a person: the daemon's cached view as
+//! aligned tables. `status --json` prints the view itself, for scripts.
+//! `wireserve <service>` shows one service's part of the same view.
 //!
 //! Nearly every string here came from the coordinator, which renders it
 //! into the operator's terminal; like `wireserve-admin`'s listings, every
@@ -108,7 +109,7 @@ fn peer_name(view: &ListView, pubkey: &str) -> String {
 /// "direct" or "relayed by <name>" (PLAN.md M39) — this node's own routing
 /// decision for `p`, from the coordinator's `relay.via` hint on its
 /// most recent poll response. Never reflects the kernel's actual live
-/// `AllowedIPs` state (`list` reads `tunnel` for endpoint/handshake, but
+/// `AllowedIPs` state (`status` reads `tunnel` for endpoint/handshake, but
 /// `wg show allowed-ips` isn't parsed here) — the coordinator's hint and
 /// what `wg::desired_peers` actually configured agree by construction
 /// once a poll cycle has completed, so this is accurate as of the same
@@ -157,6 +158,33 @@ fn reason(raw: &str) -> String {
     clean(&text)
 }
 
+/// `wireserve <name>`: the service's row, and anything the coordinator
+/// said about it. `None` when the view knows no service, rejection or
+/// notice by that name.
+#[must_use]
+pub fn render_service(view: &ListView, name: &str) -> Option<String> {
+    let service = view.services.iter().find(|s| s.name == name);
+    let rejected: Vec<_> = view.rejected_services.iter().filter(|r| r.name == name).collect();
+    let notices: Vec<_> = view.service_notices.iter().filter(|n| n.name == name).collect();
+    if service.is_none() && rejected.is_empty() && notices.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    if let Some(s) = service {
+        out.push_str(&table(
+            &["SERVICE", "ADDRESS", "PORTS", "NODE", "STATE"],
+            &[service_row(s, view.service_domain.as_deref())],
+        ));
+    }
+    for r in rejected {
+        out.push_str(&format!("Not published: {}\n", reason(&r.reason)));
+    }
+    for n in notices {
+        out.push_str(&format!("From the coordinator: {}\n", reason(&n.reason)));
+    }
+    Some(out)
+}
+
 #[must_use]
 pub fn render(view: &ListView, now: DateTime<Utc>) -> String {
     let mut out = String::new();
@@ -170,7 +198,7 @@ pub fn render(view: &ListView, now: DateTime<Utc>) -> String {
 
     out.push('\n');
     if view.services.is_empty() {
-        out.push_str("No services yet. Publish one with `wireserve serve <name> <port>`.\n");
+        out.push_str("No services yet. Publish one with `wireserve <name> <port>`.\n");
     } else {
         let mut services: Vec<&LocalServiceView> = view.services.iter().collect();
         services.sort_by(|a, b| a.name.cmp(&b.name));
@@ -238,7 +266,7 @@ pub fn render(view: &ListView, now: DateTime<Utc>) -> String {
             if !view.relay_public.is_empty() {
                 let names: Vec<String> = view.relay_public.iter().map(|n| clean(n)).collect();
                 out.push_str(&format!(
-                    "  relaying devices to (end to end, on public ports — see `wireserve-admin relay-ports`): {}\n",
+                    "  relaying devices to (end to end, on public ports — see `wireserve-admin transit ports`): {}\n",
                     names.join(", ")
                 ));
             }
@@ -464,6 +492,19 @@ Not published:
         assert!(out.contains("relaying (end to end, unreadable here): c <-> x"), "{out}");
         assert!(out.contains("relaying devices to (end to end, on public ports"), "{out}");
         assert!(out.contains("minipc"), "{out}");
+    }
+
+    #[test]
+    fn one_service_shows_its_row_and_what_was_said_about_it() {
+        let view = ListView {
+            services: vec![svc("web", "lego2", Some("10.1.0.4"), &["80:5080"]), svc("db", "strato", None, &["5432"])],
+            rejected_services: vec![RejectedService { name: "git".into(), reason: "taken".into() }],
+            ..Default::default()
+        };
+        let web = render_service(&view, "web").unwrap();
+        assert!(web.contains("web.wg") && web.contains("80:5080/tcp") && !web.contains("db.wg"), "{web}");
+        assert_eq!(render_service(&view, "git").unwrap(), "Not published: taken\n");
+        assert_eq!(render_service(&view, "nope"), None);
     }
 
     #[test]

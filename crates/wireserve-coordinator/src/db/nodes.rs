@@ -423,7 +423,7 @@ pub fn revoke(conn: &Connection, node_id: i64) -> Result<(), DbError> {
 /// `gateway_node_id` and the node's `static_conf_peers` rows deliberately
 /// stay (PLAN.md M24). They describe how the device is *addressed*, in the
 /// same category as `ip4`/`ip6` just above, not what it is allowed to do
-/// under a key that is being rotated — and `export-config --refresh` depends
+/// under a key that is being rotated — and `device refresh` depends
 /// on that, since a refresh should not silently re-home a phone onto a
 /// different gateway.
 pub fn reissue_join_token(
@@ -555,7 +555,7 @@ pub fn static_nodes_depending_on(conn: &Connection, node_id: i64) -> Result<Vec<
 /// unset one: a `/poll` that omits `endpoint_addr` means "no opinion,
 /// keep what you have", not "clear it". That COALESCE is load-bearing and
 /// is deliberately left alone — a node that registered without
-/// `--endpoint-addr` had one inferred from its observed source address
+/// `--endpoint` had one inferred from its observed source address
 /// (spec §4.2) and never learned the value, so it sends no
 /// `endpoint_addr` on its very first poll. Dropping the COALESCE would
 /// wipe that inferred endpoint immediately and break exactly the NAT-ed
@@ -624,7 +624,7 @@ pub fn clear_endpoint(
 }
 
 /// Hard-deletes a node record (security review F8: there was no way to
-/// free a name burned by e.g. a failed `export-config` between create and
+/// free a name burned by e.g. a failed `device create` between create and
 /// register). `services` rows go with it via the schema's
 /// `ON DELETE CASCADE` — this is the one path where that cascade
 /// actually fires, unlike `revoke` (see its doc comment). The caller is

@@ -174,13 +174,13 @@ podman run -d --name "$LAN_HOST" --network "$GW_LAN" --cap-add=NET_ADMIN "$DEBUG
 sleep 1
 LAN_IP=$(ip_on "$LAN_HOST" "$GW_LAN")
 
-create_node() { admin create-node "$1" | grep -oE 'jtk_[a-f0-9]+'; }
+create_node() { admin node create "$1" | grep -oE 'jtk_[a-f0-9]+'; }
 
 log "joining the agents"
 JT_GW=$(create_node node-gw)
 JT_HOME=$(create_node node-home)
 podman exec "$GW" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_GW" \
-    --listen-port "$WG_PORT" --endpoint-addr "$GW_IP:$WG_PORT" 2>/dev/null
+    --listen-port "$WG_PORT" --endpoint "$GW_IP:$WG_PORT" 2>/dev/null
 podman exec "$HOME_AGENT" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_HOME" \
     --listen-port "$WG_PORT" 2>/dev/null
 for a in "$GW" "$HOME_AGENT"; do
@@ -191,17 +191,17 @@ pass "both agents registered and polling"
 
 # The LAN host routes the mesh back through the gateway, so only the exit's
 # own refusal can stop the phone reaching it.
-MESH_V4=$(podman exec "$GW" wireserve list --json \
+MESH_V4=$(podman exec "$GW" wireserve status --json \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(p['ip4'] for p in d['peers'] if p['name']=='node-gw'))")
 MESH_NET="${MESH_V4%.*}.0/24"
 in_netns "$LAN_HOST" ip route replace "$MESH_NET" via "$GW_LAN_IP" >/dev/null
 
 log "a service on the home node, and a resolver on the gateway"
-podman exec "$HOME_AGENT" wireserve serve svc-home 12345
-podman exec "$GW" wireserve serve dns 53:53/udp 53:53/tcp
+podman exec "$HOME_AGENT" wireserve svc-home 12345
+podman exec "$GW" wireserve dns 53:53/udp 53:53/tcp
 sleep 8
-admin approve-service node-home svc-home || fail "could not approve svc-home"
-admin approve-service node-gw dns || fail "could not approve dns"
+admin service approve svc-home --node node-home || fail "could not approve svc-home"
+admin service approve dns --node node-gw || fail "could not approve dns"
 sleep 12
 svc_addr() { podman exec "$1" getent hosts "$2" | awk '{print $1}'; }
 SVC_HOME=$(svc_addr "$GW" svc-home.wg)
@@ -218,25 +218,25 @@ echo "svc-home.wg=$SVC_HOME  dns.wg=$DNS_VIP"
 
 log "making node-gw a gateway"
 podman exec "$GW" wireserve transit on
-admin approve-transit node-gw || fail "could not approve node-gw for transit"
+admin transit approve node-gw || fail "could not approve node-gw for transit"
 sleep 10
 
 log "1/9: --exit is refused while the gateway has not opted in"
-if admin export-config phone --exit node-gw --dns dns --out /tmp/phone.conf \
+if admin device create phone --exit node-gw --dns dns --out /tmp/phone.conf \
     --register-url "http://127.0.0.1:47820" >"$OUT/refused.log" 2>&1; then
     fail "an exit profile was written for a gateway that never ran \`exit on\`"
 fi
 grep -q "exit on" "$OUT/refused.log" || { cat "$OUT/refused.log"; fail "the refusal does not say what to run"; }
-# Nothing was created: step 2 exports the same name without --refresh,
+# Nothing was created: step 2 exports the same name with `device create` again,
 # which a leftover node would make fail with a conflict.
 pass "refused, naming \`exit on\`"
 
 log "2/9: two profiles, one key"
 podman exec "$GW" wireserve exit on
 sleep 10
-admin export-config phone --exit node-gw --dns dns --out /tmp/phone.conf \
+admin device create phone --exit node-gw --dns dns --out /tmp/phone.conf \
     --register-url "http://127.0.0.1:47820" \
-    || fail "export-config --exit failed (a conflict here means step 1 created the node before refusing)"
+    || fail "device create --exit failed (a conflict here means step 1 created the node before refusing)"
 podman cp "$COORD:/tmp/phone.conf" "$OUT/phone.conf"
 podman cp "$COORD:/tmp/phone-exit.conf" "$OUT/phone-exit.conf"
 note "full-tunnel profile:"
@@ -249,7 +249,7 @@ grep -qx "AllowedIPs = 0.0.0.0/0, ::/0" "$OUT/phone-exit.conf" || fail "the exit
 grep -qE "AllowedIPs = [0-9.]+/2[0-9]" "$OUT/phone.conf" && fail "the mesh profile still sends a mesh range to one peer"
 grep -qx "DNS = $DNS_VIP" "$OUT/phone-exit.conf" || fail "the resolver is not the dns service's address"
 grep -q "^DNS" "$OUT/phone.conf" && fail "the mesh profile must not name a resolver (PLAN.md #104)"
-admin list-peers | grep '^phone' | grep -q 'exit=yes' || fail "list-peers does not show the phone's exit"
+admin node list | grep '^phone' | grep -q 'exit=yes' || fail "node list does not show the phone's exit"
 pass "same key; everything on the gateway and a resolver in the second profile only"
 
 log "bringing the phone up on the full-tunnel profile"
@@ -276,7 +276,7 @@ PHONE_IP4=$(grep '^Address' "$OUT/phone.conf" | sed 's/Address = //; s#/32.*##')
 # packets go: in on the mesh, out on the egress, back, or nowhere.
 exit_diagnostics() {
     note "gateway agent's view:"
-    podman exec "$GW" wireserve list --json \
+    podman exec "$GW" wireserve status --json \
         | python3 -c "import json,sys; d=json.load(sys.stdin); print({k: d.get(k) for k in ('transit_capable','exit_capable','exit_clients')})" || true
     note "gateway sysctls:"
     in_netns "$GW" sh -c 'for f in all wireserve0 '"$GW_INET_IF"'; do echo "$f ipv4 forwarding=$(cat /proc/sys/net/ipv4/conf/$f/forwarding) rp_filter=$(cat /proc/sys/net/ipv4/conf/$f/rp_filter)"; done' || true
@@ -355,13 +355,13 @@ podman exec "$PHONE" timeout 15 bash -c "exec 3<>/dev/tcp/$SVC_HOME/12345" \
 pass "the internet is gone, the mesh stays"
 
 log "10/10: names without the full tunnel (--mesh-dns)"
-if admin export-config tablet --dns 9.9.9.9 --mesh-dns --out /tmp/tablet.conf \
+if admin device create tablet --dns 9.9.9.9 --mesh-dns --out /tmp/tablet.conf \
     --register-url "http://127.0.0.1:47820" >"$OUT/mesh-refused.log" 2>&1; then
     fail "a public resolver was accepted for the mesh profile, which would ask it outside the tunnel"
 fi
 grep -q "not on the mesh" "$OUT/mesh-refused.log" || { cat "$OUT/mesh-refused.log"; fail "the refusal does not say why"; }
-admin export-config tablet --dns dns --mesh-dns --out /tmp/tablet.conf \
-    --register-url "http://127.0.0.1:47820" || fail "export-config --mesh-dns failed"
+admin device create tablet --dns dns --mesh-dns --out /tmp/tablet.conf \
+    --register-url "http://127.0.0.1:47820" || fail "device create --mesh-dns failed"
 podman cp "$COORD:/tmp/tablet.conf" "$OUT/tablet.conf"
 grep -qx "DNS = $DNS_VIP" "$OUT/tablet.conf" || fail "the mesh profile does not name the resolver"
 grep -q "0.0.0.0/0" "$OUT/tablet.conf" && fail "--mesh-dns must not widen the mesh profile"

@@ -30,7 +30,7 @@ pub async fn poll(
     // "stays NULL forever" — it is a consumer-only device running an
     // official WireGuard client, with no agent to do the polling. Nothing
     // legitimately reaches this line with a static node's bearer token:
-    // `export-config` generates that token during registration and drops
+    // `device create` generates that token during registration and drops
     // it on the floor without ever printing or storing it. Enforce the
     // invariant anyway rather than leave it resting on that accident,
     // since `update_poll_state` below would otherwise happily write an
@@ -159,7 +159,7 @@ pub async fn poll(
     // Same observed-source-address fallback as `/register` (spec §4.2),
     // re-applied on every poll rather than frozen at join time — see
     // `client_ip::endpoint_fallback`'s doc comment for why (an operator's
-    // own explicit --endpoint-addr, sent every poll, still always wins).
+    // own explicit --endpoint, sent every poll, still always wins).
     //
     // But never when an admin has explicitly cleared this node's endpoint
     // (`node.endpoint_cleared`) — self-healing would otherwise undo that

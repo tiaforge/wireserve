@@ -7,11 +7,11 @@
 #
 #   1. a pending service gets no record; approving it publishes one at its
 #      own address, a 443 service included;
-#   2. `list-services` reports the record as published;
+#   2. `service list` reports the record as published;
 #   3. withdrawing a service removes its record;
 #   4. revoking a node removes the records of every service it had;
 #   5. a record the operator made by hand in the same zone is never touched
-#      — not even one at a service's name: it is left alone, `list-services`
+#      — not even one at a service's name: it is left alone, `service list`
 #      says why, and withdrawing the service does not delete it;
 #   6. a coordinator restart with the records already written changes
 #      nothing.
@@ -63,10 +63,10 @@ ip_on() {
 admin() { podman exec "$COORD" wireserve-admin "$@"; }
 # What BIND answers for a name: the addresses, one per line, or nothing.
 lookup() { in_netns "$COORD" dig +short "@$BIND_IP" "$1" A | sort; }
-# `create-node`, then `/register` with a fresh key: prints the bearer token.
+# `node create`, then `/register` with a fresh key: prints the bearer token.
 new_node() {
     local token pubkey
-    token=$(admin create-node "$1" | sed -n 's/.*join token: //p')
+    token=$(admin node create "$1" | sed -n 's/.*join token: //p')
     pubkey=$(head -c 32 /dev/urandom | base64)
     in_netns "$COORD" curl -sf -X POST http://127.0.0.1:47820/register \
         -H 'Content-Type: application/json' \
@@ -81,7 +81,7 @@ poll() {
 }
 svc() { echo "{\"name\":\"$1\",\"port\":$3,\"proto\":\"tcp\",\"ports\":[{\"public\":$2,\"target\":$3,\"proto\":\"tcp\"}]}"; }
 vip_of() {
-    admin list-services | awk -v n="$1" '$1 == n { print $4 }'
+    admin service list | awk -v n="$1" '$1 == n { print $4 }'
 }
 # Waits until `lookup NAME` prints exactly WANT (empty for "no record").
 expect_record() {
@@ -170,28 +170,28 @@ poll "$PX" "[$(svc web 443 8443)]" >/dev/null
 poll "$HOME_B" "[$(svc prom 80 9090), $(svc plex 443 32400), $(svc docs 80 9091)]" >/dev/null
 sleep 8
 [ -z "$(lookup web.$DOMAIN)" ] || fail "a pending service was published"
-admin approve-service px web >/dev/null
-admin approve-service home prom >/dev/null
-admin approve-service home plex >/dev/null
-admin approve-service home docs >/dev/null
+admin service approve web --node px >/dev/null
+admin service approve prom --node home >/dev/null
+admin service approve plex --node home >/dev/null
+admin service approve docs --node home >/dev/null
 WEB_VIP=$(vip_of web); PLEX_VIP=$(vip_of plex); DOCS_VIP=$(vip_of docs)
-[ -n "$WEB_VIP" ] && [ -n "$PLEX_VIP" ] && [ -n "$DOCS_VIP" ] || fail "no service addresses: $(admin list-services)"
+[ -n "$WEB_VIP" ] && [ -n "$PLEX_VIP" ] && [ -n "$DOCS_VIP" ] || fail "no service addresses: $(admin service list)"
 expect_record "web.$DOMAIN" "$WEB_VIP"
 expect_record "plex.$DOMAIN" "$PLEX_VIP"
 expect_record "docs.$DOMAIN" "$DOCS_VIP"
 pass "web, plex and docs each at their own address"
 # prom was approved too, and its name already held a hand-made record.
 for _ in $(seq 1 30); do
-    admin list-services | grep -q "^prom.*dns=error: .*not overwriting" && break
+    admin service list | grep -q "^prom.*dns=error: .*not overwriting" && break
     sleep 1
 done
-admin list-services | grep -q "^prom.*dns=error: .*not overwriting" \
-    || fail "prom should be reported as not overwriting the zone's record: $(admin list-services)"
+admin service list | grep -q "^prom.*dns=error: .*not overwriting" \
+    || fail "prom should be reported as not overwriting the zone's record: $(admin service list)"
 [ "$(lookup prom.$DOMAIN)" = 192.0.2.99 ] || fail "prom's hand-made record was overwritten"
 pass "prom.$DOMAIN left at the operator's 192.0.2.99, and said so"
 
-log "2. list-services reports the records"
-admin list-services | grep -q "^docs.*dns=published" || fail "no dns=published: $(admin list-services)"
+log "2. service list reports the records"
+admin service list | grep -q "^docs.*dns=published" || fail "no dns=published: $(admin service list)"
 pass "dns=published"
 
 log "3. a withdrawn service leaves DNS — and a record that was never ours stays"
@@ -202,7 +202,7 @@ expect_record "plex.$DOMAIN" "$PLEX_VIP"
 pass "docs removed, plex kept, the hand-made prom record kept"
 
 log "4. a revoked node's services leave DNS"
-admin revoke home >/dev/null
+admin node revoke home >/dev/null
 expect_record "plex.$DOMAIN" ""
 expect_record "web.$DOMAIN" "$WEB_VIP"
 pass "plex removed with its node, web kept"

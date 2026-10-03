@@ -108,7 +108,7 @@ chmod 600 ~/.config/wireserve-admin/admin_token
 ```
 
 ```sh
-wireserve-admin list-peers   # just works — no --coordinator-url, no --admin-token
+wireserve-admin node list   # just works — no --coordinator-url, no --admin-token
 ```
 
 If you'd rather manage the admin token or mesh ranges yourself, copy
@@ -145,7 +145,7 @@ The admin port never leaves the host by design, so admin commands run
 inside the container:
 
 ```sh
-podman exec wireserve-coordinator wireserve-admin list-peers
+podman exec wireserve-coordinator wireserve-admin node list
 ```
 
 ### 2. Add a node
@@ -157,7 +157,7 @@ a private address, or SSH-tunnel it, to reach it from elsewhere). Give it
 the coordinator's public URL once and it remembers it:
 
 ```sh
-wireserve-admin create-node homeserver
+wireserve-admin node create homeserver
 ```
 
 If you haven't set `--coordinator-url`/`WIRESERVE_COORDINATOR_URL` or
@@ -167,7 +167,7 @@ masked for the token — and offers to save both to
 `~/.config/wireserve-admin/` so you're never asked again. Same for
 `--register-url`/`WIRESERVE_REGISTER_URL` (the coordinator's *other*
 listener, the one nodes actually register against): set it once and every
-`create-node`/`rejoin` prints the exact command to run on the new node:
+`node create`/`node rejoin` prints the exact command to run on the new node:
 
 ```
 node 'homeserver' created — join token: jtk_...
@@ -182,7 +182,7 @@ To add this node to the mesh:
 **The token is redeemable for 30 minutes** — long enough to walk over
 to the machine, short enough that a token left in a chat log or a password
 manager is not a live way into the mesh months later. If the window lapses,
-`wireserve-admin rejoin <name>` mints a fresh one for the same node, name
+`wireserve-admin node rejoin <name>` mints a fresh one for the same node, name
 and address. Override with `--ttl <secs>` per token, or coordinator-wide
 with `WIRESERVE_JOIN_TOKEN_TTL_SECS`; `0` disables expiry.
 
@@ -200,7 +200,7 @@ and enables the right systemd unit, then joins — prompting for the join token
 ever lands in shell history. It also creates a `wireserve` group (see
 "Using it without sudo" below); it does not add anyone to it. Running an *additional* agent on a host that
 already runs one? Add `--instance work` (see "Several agents on one host"
-below); `wireserve-admin create-node --instance work` fills that flag into
+below); `wireserve-admin node create --instance work` fills that flag into
 the printed command for you. `install` needs Linux/systemd — Quadlet/podman
 deployments install by hand, per `deploy/quadlet/`.
 
@@ -234,13 +234,13 @@ the same as before (`wireserve join <url> <token>`, or
 `--join-token-file <path>`/`-` for scripted joins) if you'd rather not be
 prompted. `join` generates the keypair locally, redeems the token, and
 stores everything mode-600. The daemon brings the mesh up on `wireserve0`,
-or the next free name if that one is taken; `wireserve list` shows
+or the next free name if that one is taken; `wireserve status` shows
 which.
 
 #### Using it without sudo
 
-`install`, `join` and `daemon` need root. Everything else (`serve`,
-`unserve`, `list`, `transit`, `exit`, `leave`) only talks to the running
+`install`, `join` and `daemon` need root. Everything else (`wireserve
+<service>`, `status`, `transit`, `exit`, `leave`) only talks to the running
 daemon over a Unix socket, and needs no root of its own: whoever can open
 the socket can run them. By default that is root alone. If a group named
 `wireserve` exists when the daemon starts, the daemon shares the socket with
@@ -248,7 +248,7 @@ it, and its members can run those commands as themselves:
 
 ```sh
 sudo usermod -aG wireserve $USER   # then log out and back in
-wireserve list
+wireserve status
 ```
 
 `install` creates the group for you and prints that line; without
@@ -308,7 +308,7 @@ single-operator mesh where every node is already trusted and the round trip
 is pure ceremony.
 
 A node may have at most 16 services waiting for approval or denied at a time;
-a declaration past that is not taken and `wireserve list` says why, until an
+a declaration past that is not taken and `wireserve status` says why, until an
 admin has decided some of the others. A denied service holds its name but not
 an address of the mesh's range. (A poll rate limit and the address range's
 size are the coordinator's other bounds on one node; see
@@ -318,20 +318,20 @@ So the flow is two steps:
 
 ```sh
 # on the node: plex.wg:80 reaches this node's port 32400
-wireserve serve plex 80:32400
+wireserve plex 80:32400
 
 # on the coordinator — see what is waiting, then approve it
-wireserve-admin list-services --pending
-wireserve-admin approve-service homeserver plex
+wireserve-admin service list --pending
+wireserve-admin service approve plex --node homeserver
 ```
 
-Until it is approved, `wireserve list` shows the service as
+Until it is approved, `wireserve status` shows the service as
 `pending approval`, which is how you tell "waiting on an admin" from "this
 node has not polled yet". The node's own firewall is ready immediately
 either way — it is only firewalling itself, and nothing routes to the
 service's address or resolves `<name>.wg` for it yet.
 
-`wireserve-admin deny-service <node> <service> --reason '...'` refuses one,
+`wireserve-admin service deny <service> --node <node> --reason '...'` refuses one,
 and the declaring node withdraws it and closes the hole on its next poll.
 Denying an already-approved service pulls it back out of the directory,
 which is the way to re-review a name on a mesh where approval was switched
@@ -348,12 +348,12 @@ address is routed to its node and its name appears in every other node's
 hosts file.
 
 ```sh
-wireserve serve openobserve 80:5080          # openobserve.wg:80 -> :5080
-wireserve serve mydns 53/udp 53/tcp 8080:8000 # several ports, TCP and UDP
-wireserve serve plex 32400                    # a bare port maps to itself
-wireserve serve myrouter 443:192.168.178.1:80 # a device on this node's LAN, see below
-wireserve list                    # what this node sees right now (--json for scripts)
-wireserve unserve plex
+wireserve openobserve 80:5080          # openobserve.wg:80 -> :5080
+wireserve mydns 53/udp 53/tcp 8080:8000 # several ports, TCP and UDP
+wireserve plex 32400                    # a bare port maps to itself
+wireserve myrouter 443:192.168.178.1:80 # a device on this node's LAN, see below
+wireserve status                    # what this node sees right now (--json for scripts)
+wireserve plex off
 ```
 
 Each `PORT` is `[PUBLIC:][ADDRESS:]TARGET[/tcp|/udp]` (TCP unless given;
@@ -421,7 +421,7 @@ A mapping can name an IPv4 address the node reaches, such as a router,
 NAS or printer that can't run an agent itself:
 
 ```sh
-wireserve serve myrouter 443:192.168.178.1:80   # myrouter.wg:443 -> the router's :80
+wireserve myrouter 443:192.168.178.1:80   # myrouter.wg:443 -> the router's :80
 ```
 
 The node forwards `myrouter.wg:443` to `192.168.178.1:80`, and the device
@@ -430,7 +430,7 @@ back into the mesh, so unlike a service on the node, **the client's address
 is not preserved**. Everything else works the same: approval, the name, only
 the published port answering, and (on 443) HTTPS from the node's
 terminator. What an admin approves includes the address:
-`wireserve-admin list-services` shows `443:192.168.178.1:80/tcp`. The rest
+`wireserve-admin service list` shows `443:192.168.178.1:80/tcp`. The rest
 of the mesh only ever sees `443:80/tcp`.
 
 - **IPv4 only**, and a literal address, not a hostname. A service's own
@@ -458,7 +458,7 @@ A device that only consumes services does not run the agent. This creates
 the node and prints a ready-to-import WireGuard config:
 
 ```sh
-podman exec wireserve-coordinator wireserve-admin export-config myphone \
+podman exec wireserve-coordinator wireserve-admin device create myphone \
     --out myphone.conf
 ```
 
@@ -467,7 +467,7 @@ prints a code to scan straight from the terminal. The file contains a
 private key, so it is written mode 600; move it, do not copy it. (So does
 the QR code — it will sit in your scrollback.) Such a peer gets a mesh
 address and reaches every service by its address (in `wireserve-admin
-list-services`) and port, but has no `.wg` name resolution.
+service list`) and port, but has no `.wg` name resolution.
 
 **Every node, end to end.** The config holds one `[Peer]` per node, and the
 phone talks to each one directly — WireGuard between the two, as between
@@ -478,7 +478,7 @@ agents. How depends on the node:
   when it starts: the coordinator answers its startup probe a second time,
   from a port the node never sent anything to, and that answer only gets in
   where the node's router or firewall lets unsolicited traffic in.
-  `list-peers` shows the result (`dialable=yes|no`).
+  `node list` shows the result (`dialable=yes|no`).
 - **Every other node** — behind a NAT nothing gets through (a home server
   without a port forward, CGNAT), or one that hasn't said, because it is
   offline or runs an older agent — is reached through a **carrier**: an
@@ -490,8 +490,8 @@ agents. How depends on the node:
   It still sees that the two talk, when and how much.
 
 ```sh
-wireserve-admin approve-transit vps1      # and `wireserve transit on` on vps1
-wireserve-admin export-config myphone --qr
+wireserve-admin transit approve vps1      # and `wireserve transit on` on vps1
+wireserve-admin device create myphone --qr
 ```
 
 Before writing anything the export checks, from outside, that every relay
@@ -519,18 +519,18 @@ device uses any more and may be closed again.
 
 **The config is a snapshot.** A node that joins later isn't in it, nor is
 one no carrier reaches at the time of the export (the export says so).
-`list-peers` marks such devices `stale=yes`; `--refresh` (below) brings one
+`node list` marks such devices `stale=yes`; `device refresh` (below) brings one
 up to date. A withdrawn (or revoked, or deleted) service's address is held
 back meanwhile: an older config still sends it to the node that had it, so no
 other node's service gets it until every device exported before is exported
-again or deleted. `list-peers` shows those addresses as `holds=`; a node
+again or deleted. `node list` shows those addresses as `holds=`; a node
 that declares a service again takes its own back. Two phones don't reach each other: neither has anything the
 other could dial.
 
 **Re-issuing a config** keeps the device's name and mesh address:
 
 ```sh
-wireserve-admin export-config myphone --refresh --qr
+wireserve-admin device refresh myphone --qr
 ```
 
 Only the keypair changes. Delete the old tunnel on the device before
@@ -564,8 +564,8 @@ alike, so one base URL is right everywhere.
 **Publishing on TCP 443 is what asks for HTTPS:**
 
 ```sh
-wireserve serve plex 443:32400   # https://plex.int.example.com, served by its own node
-wireserve serve prom 80:9090     # http://prom.int.example.com:80, direct
+wireserve plex 443:32400   # https://plex.int.example.com, served by its own node
+wireserve prom 80:9090     # http://prom.int.example.com:80, direct
 ```
 
 Nothing that is not published on 443 ever gets a certificate.
@@ -578,7 +578,7 @@ changes, removed when it is withdrawn or its node revoked. **It never
 overwrites a record it did not write:** before it first writes a name it asks
 the provider what the zone already holds there, and a name with an A record
 outside the mesh's range, an AAAA or a CNAME is left alone — `wireserve-admin
-list-services` shows it as an error ("not overwriting it") until the record is
+service list` shows it as an error ("not overwriting it") until the record is
 gone. A name whose zone cannot be read waits too. So a node declaring a service
 called `mail` cannot take over, or later delete, a record you already have
 under the domain — nor get a certificate for it: the ACME challenge for such a
@@ -589,7 +589,7 @@ after a node (`hetzner` on the node `hetzner`), but only by that node: nobody
 else may newly declare another node's name, nor the coordinator's own host name
 when it lies under the service domain, nor any name in
 `WIRESERVE_RESERVED_SERVICE_NAMES` (comma-separated). The node is told in
-`wireserve list`; a service it already has is never taken away for it.
+`wireserve status`; a service it already has is never taken away for it.
 `wireserve-coordinator install` asks for the provider, and before saving
 writes and removes a throwaway `_wireserve-check` TXT record, so a wrong
 token shows up there rather than as names that never appear. The wizard says where each provider's token is created:
@@ -627,7 +627,7 @@ What to know first:
   read them.
 - **An address change waits 20 seconds** before it is written, so a name
   that swings and swings back never reaches resolver caches.
-  `wireserve-admin list-services` shows each record as `dns=published`,
+  `wireserve-admin service list` shows each record as `dns=published`,
   `dns=pending` or the provider's error.
 
 #### HTTPS on the service's own node
@@ -704,8 +704,8 @@ wireserve-admin group add infra grafana        # out of default, into infra
 wireserve-admin tag add ci-runner ops
 wireserve-admin tag list                       # each tag in use and its nodes
 wireserve-admin grant add tag:ops infra        # the ci-runner reaches grafana
-wireserve-admin access grafana                 # who reaches it, and why
-wireserve-admin access --node ci-runner        # what a node reaches
+wireserve-admin service access grafana                 # who reaches it, and why
+wireserve-admin node access ci-runner        # what a node reaches
 wireserve-admin group list
 wireserve-admin grant list
 ```
@@ -715,12 +715,12 @@ an existing group once, so a new service never appears in `default` even with
 approval off:
 
 ```sh
-wireserve serve vault 8200 --group infra
+wireserve vault 8200 --group infra
 ```
 
 That applies to a service that has no group yet, and only when it is
 approved; after that its groups are yours, and a declaration naming another
-one changes nothing and says so in `wireserve list`. A declaration naming a
+one changes nothing and says so in `wireserve status`. A declaration naming a
 group that does not exist is not published at all. Groups belong to the
 service **name**: they survive the service being withdrawn and declared again,
 and a name can be put in a group before anything declares it. `group delete`
@@ -753,14 +753,14 @@ WIRESERVE_OIDC_GROUPS_CLAIM=groups
 WIRESERVE_OIDC_REFRESH_SECS=900
 ```
 
-`create-node` and `export-config` then also print a **claim link** (with
-`--qr`, as a code for the phone's camera), and `claim-url <node>` makes a
+`node create` and `device create` then also print a **claim link** (with
+`--qr`, as a code for the phone's camera), and `owner link <node>` makes a
 fresh one:
 
 ```sh
-wireserve-admin claim-url laptop --qr
+wireserve-admin owner link laptop --qr
 wireserve-admin grant add oidc:family media
-wireserve-admin access --node laptop      # whose it is, and what that gives it
+wireserve-admin node access laptop      # whose it is, and what that gives it
 wireserve-admin owner clear laptop
 ```
 
@@ -800,7 +800,7 @@ Run the provider as a mesh service on 443 — its login pages are then
 the coordinator:
 
 ```sh
-wireserve serve auth 443:8080             # on the node running authward
+wireserve auth 443:8080             # on the node running authward
 # on the coordinator
 WIRESERVE_AUTH_SERVICE=auth
 WIRESERVE_AUTH_NODE=gate                  # the node that runs it
@@ -964,7 +964,7 @@ to dial it directly:
 
 ```sh
 wireserve exit on                           # on the exit, besides `transit on`
-wireserve-admin export-config myphone --exit vps1 --dns 9.9.9.9 --qr
+wireserve-admin device create myphone --exit vps1 --dns 9.9.9.9 --qr
 ```
 
 With exactly one node qualifying, `--exit` needs no name.
@@ -972,7 +972,7 @@ With exactly one node qualifying, `--exit` needs no name.
 That prints two codes; import both. The WireGuard app runs one tunnel at a
 time, so switching on `myphone-exit` is the exit switch. With `--out
 myphone.conf` the second one is written beside it as `myphone-exit.conf`.
-`--refresh` without `--exit` withdraws it.
+`device refresh` without `--exit` withdraws it.
 
 - **IPv4 only.** The full tunnel captures the device's IPv6 as well, so none
   of it leaks around the tunnel on someone else's network, and the exit
@@ -992,9 +992,9 @@ not just HTTP ones**. A resolver that runs on a node reads that node's
 `/etc/hosts`, where the agent writes every service's name:
 
 ```sh
-wireserve serve dns 53:53/udp 53:53/tcp     # on the node running the resolver
-wireserve-admin approve-service homeserver dns
-wireserve-admin export-config myphone --exit vps1 --dns dns --refresh --qr
+wireserve dns 53:53/udp 53:53/tcp     # on the node running the resolver
+wireserve-admin service approve dns --node homeserver
+wireserve-admin device refresh myphone --exit vps1 --dns dns --qr
 ```
 
 `ssh backup.wg` and `jellyfin.wg:8096` then work from the phone while the
@@ -1037,7 +1037,7 @@ The mesh profile can name the resolver too, so every service has a name on
 the phone whether or not the full tunnel is on:
 
 ```sh
-wireserve-admin export-config myphone --dns dns --mesh-dns --refresh --qr
+wireserve-admin device refresh myphone --dns dns --mesh-dns --qr
 # with the exit as well:  ... --exit --dns dns --mesh-dns ...
 ```
 
@@ -1065,8 +1065,8 @@ that lets a node do, and what it does not:
 Two more things to know about a machine that runs an agent:
 
 - **The `wireserve` group is not a convenience group.** Its members can
-  `serve` (a service pointed at any address the node reaches, which an admin's
-  approval then publishes to the mesh), `unserve`, `leave`, and switch transit
+  publish a service pointed at any address the node reaches (which an admin's
+  approval then publishes to the mesh), withdraw one, `leave`, and switch transit
   and exit on. Treat membership as administering the node's network; give it to
   the people who could `sudo` anyway.
 - **Identity is the device's.** Whoever can send packets from a node — another
@@ -1086,7 +1086,7 @@ as long as the backend allows.
 ### 5. When a machine is lost or compromised
 
 ```sh
-podman exec wireserve-coordinator wireserve-admin revoke homeserver
+podman exec wireserve-coordinator wireserve-admin node revoke homeserver
 ```
 
 The node's token stops working immediately, and every other node drops it
@@ -1095,7 +1095,7 @@ the poll interval rather than instant. `rejoin` issues a fresh join token
 for the same name and address when the machine itself is still trusted
 but its key may not be: the old key and token stop working at once, and
 the node drops out of every other node's peer list until it registers
-again under a new key. `delete-node` frees the name entirely, and refuses
+again under a new key. `node delete` frees the name entirely, and refuses
 until the node is revoked.
 
 ### 6. Route through another node when NAT blocks a direct path
@@ -1134,8 +1134,8 @@ never used; and the mesh admin approves it as a carrier:
 wireserve transit on   # on the node: willing to carry traffic for others
 wireserve transit off  # stop — takes effect on the next poll, no rejoin
 
-wireserve-admin approve-transit homeserver   # on the admin side: trusted to
-wireserve-admin deny-transit homeserver      # withdraw it again
+wireserve-admin transit approve homeserver   # on the admin side: trusted to
+wireserve-admin transit deny homeserver      # withdraw it again
 ```
 
 A carrier cannot read or forge a relayed session, but it still sees who
@@ -1143,12 +1143,12 @@ talks to whom, when and how much, and it can drop the traffic. What a node
 says about itself (that it is willing, which peers it reaches) cannot be
 verified, so without approval a single compromised node could offer to
 carry every pair in the mesh and learn all of that. Until it is approved,
-`wireserve list` on that node says `Transit: on, waiting for an admin to
+`wireserve status` on that node says `Transit: on, waiting for an admin to
 approve this node as a carrier`. Revoking or rejoining a node withdraws
-its approval, and `list-peers` shows who currently has one
+its approval, and `node list` shows who currently has one
 (`transit=approved`).
 
-`wireserve list` shows the outcome, both for a peer this node can't
+`wireserve status` shows the outcome, both for a peer this node can't
 reach directly and for what this node is relaying on others' behalf:
 
 ```
@@ -1183,11 +1183,11 @@ members of the `wireserve` group have (see "Using it without sudo"):
 | --- | --- |
 | `wireserve install [url] [--instance name]` | installs the binary + systemd unit, then joins — one command, needs root. On a node that already joined, with no URL or token: upgrades and restarts the agents instead |
 | `wireserve join [url] [token]` | one-time bootstrap, generates the keypair — prompts for either if omitted |
-| `wireserve serve <name> <[public:][address:]target[/tcp\|/udp]>... [--group <g>]` | publish a service on its own address — on this node, or on an address it reaches; a new one in group `g` |
-| `wireserve unserve <name>` | withdraw one |
-| `wireserve transit on\|off` | opt in/out of relaying for two other nodes that can't reach each other directly (also needs `approve-transit`) |
+| `wireserve <name> <[public:][address:]target[/tcp\|/udp]>... [--group <g>]` | publish a service on its own address — on this node, or on an address it reaches; a new one in group `g` |
+| `wireserve <name> off` | withdraw one |
+| `wireserve transit on\|off` | opt in/out of relaying for two other nodes that can't reach each other directly (also needs `transit approve`) |
 | `wireserve exit on\|off` | opt in/out of sending the internet traffic of devices exported with `--exit` through this node (also needs `transit on` and approval) |
-| `wireserve list [--json]` | services (name, address, ports, owner, state), peers (with each one's route — direct or via a carrier) and anything not published, from the last poll |
+| `wireserve status [--json]` | services (name, address, ports, owner, state), peers (with each one's route — direct or via a carrier) and anything not published, from the last poll |
 | `wireserve leave` | tear down interface, firewall, hosts block |
 
 On the coordinator host, as root:
@@ -1203,27 +1203,28 @@ anywhere that can reach it):
 
 | Command | What it does |
 | --- | --- |
-| `wireserve-admin create-node <name>` | create a node, print a join token |
-| `wireserve-admin export-config <name> [--exit [node]] [--dns <svc\|ip>] [--mesh-dns] [--allow-unverified] [--refresh] [--qr]` | create (or re-issue) a static peer's `.conf`: every node end to end, directly or through a carrier's relay port; `--exit` adds a full-tunnel profile, `--mesh-dns` names the resolver in the mesh profile too |
-| `wireserve-admin list-peers` | the full directory, with each agent's `dialable=` and each device's `stale=` and `holds=` |
-| `wireserve-admin relay-ports` | every public relay port phones use: where it must be open, which node and devices, whether it was open, which may be closed |
-| `wireserve-admin revoke <name>` | cut a node off, keep its name reserved |
-| `wireserve-admin rejoin <name>` | fresh join token, same name and address; the old key stops working at once |
-| `wireserve-admin delete-node <name>` | remove the record, free the name |
-| `wireserve-admin clear-endpoint <name>` | drop a stale advertised endpoint |
-| `wireserve-admin list-services [--pending]` | declared services and their approval state |
-| `wireserve-admin approve-service <node> <svc>` | let a declaration reach the mesh |
+| `wireserve-admin node create <name>` | create a node, print a join token |
+| `wireserve-admin device create <name> [--exit [node]] [--dns <svc\|ip>] [--mesh-dns] [--allow-unverified] [--out <file>] [--qr]` | create a device (an agent-less static peer, such as a phone) and write its `.conf`: every node end to end, directly or through a carrier's relay port; `--exit` adds a full-tunnel profile, `--mesh-dns` names the resolver in the mesh profile too |
+| `wireserve-admin device refresh <name> [same flags]` | re-issue a device's `.conf` under a new key, same name and address; the old key stops working at once |
+| `wireserve-admin node list` | the full directory, with each agent's `dialable=` and each device's `stale=` and `holds=` |
+| `wireserve-admin transit ports` | every public relay port phones use: where it must be open, which node and devices, whether it was open, which may be closed |
+| `wireserve-admin node revoke <name>` | cut a node off, keep its name reserved |
+| `wireserve-admin node rejoin <name>` | fresh join token, same name and address; the old key stops working at once |
+| `wireserve-admin node delete <name>` | remove the record, free the name |
+| `wireserve-admin node clear-endpoint <name>` | drop a stale advertised endpoint |
+| `wireserve-admin service list [--pending]` | declared services and their approval state |
+| `wireserve-admin service approve <svc> --node <node>` | let a declaration reach the mesh |
 | `wireserve-admin group create\|delete\|list` | service groups; a service in none is in `default` |
 | `wireserve-admin group add\|remove <group> <svc>` | put a service in a group, or take it out |
 | `wireserve-admin grant add\|remove <source> <group>`, `grant list` | let `everyone`, `tag:<tag>` or `oidc:<group>` reach a group |
 | `wireserve-admin tag add\|remove <node> <tag>` | tag a node, for grants to name |
-| `wireserve-admin tag list [<tag>]` | every tag in use and the nodes carrying it (`list-peers` shows `tags=` per node too) |
-| `wireserve-admin access <svc>` / `access --node <node>` | who reaches a service and why, or what a node reaches |
-| `wireserve-admin claim-url <node> [--qr]` | a single-use link for whoever the device belongs to |
+| `wireserve-admin tag list [<tag>]` | every tag in use and the nodes carrying it (`node list` shows `tags=` per node too) |
+| `wireserve-admin service access <svc>` / `node access <node>` | who reaches a service and why, or what a node reaches |
+| `wireserve-admin owner link <node> [--qr]` | a single-use link for whoever the device belongs to |
 | `wireserve-admin owner clear <node>` | the device belongs to nobody again |
-| `wireserve-admin deny-service <node> <svc>` | refuse one, or withdraw an approval |
-| `wireserve-admin approve-transit <name>` | let a node that opted in relay for others, and be an exit |
-| `wireserve-admin deny-transit <name>` | withdraw that |
+| `wireserve-admin service deny <svc> --node <node>` | refuse one, or withdraw an approval |
+| `wireserve-admin transit approve <name>` | let a node that opted in relay for others, and be an exit |
+| `wireserve-admin transit deny <name>` | withdraw that |
 
 ## Workspace layout
 
@@ -1268,13 +1269,13 @@ the admin port is deliberately unreachable from anywhere else.
 | Port | Direction | Who connects | Notes |
 | --- | --- | --- | --- |
 | 51820/udp | inbound | other agent nodes, phones | the WireGuard listen port, on the node's real interface |
-| relay ports/udp | inbound | phones | **carriers only, and only the ports `wireserve-admin relay-ports` lists** — see below |
+| relay ports/udp | inbound | phones | **carriers only, and only the ports `wireserve-admin transit ports` lists** — see below |
 | 443/tcp | outbound | the coordinator | the poll loop |
 | 443/tcp | outbound | your ACME CA | the TLS terminator, for certificates (Let's Encrypt by default) |
 
 Inbound UDP 51820 has to reach the node for other peers to open a tunnel to
 it, which usually means a port-forward on the router plus an
-`--endpoint-addr` the other nodes can resolve. A node behind NAT with no
+`--endpoint` the other nodes can resolve. A node behind NAT with no
 port-forward can still reach nodes that do have one, and they can reach
 back into it, because `PersistentKeepalive` holds its side of the mapping
 open. Two nodes that both lack a forward cannot reach each other at all.
@@ -1290,9 +1291,9 @@ through it — that node's relay port, `41000` plus its number — on its public
 IPv4 address. Its own firewall (ufw, firewalld, nftables) is WireServe's to
 handle; a firewall **outside** the machine is yours: a cloud provider's
 security group, or the router's port forward for a carrier at home.
-`export-config` checks each port from outside before writing a config that
+`device create` checks each port from outside before writing a config that
 needs it, and stops with the exact port and address if it is closed;
-`wireserve-admin relay-ports` lists them all afterwards, including those no
+`wireserve-admin transit ports` lists them all afterwards, including those no
 device uses any more. A port stays the same for the node's life, so it is
 opened once. The whole relay range (`41000`–`42999` by default, moved with
 `WIRESERVE_RELAY_PORT_BASE`) is closed to anything not relayed on a
@@ -1306,7 +1307,7 @@ fails those two nodes cannot reach each other even though both reach
 everything else on the mesh normally. Giving at least one of them a
 port-forward avoids it.
 
-A related wrinkle if you skip `--endpoint-addr`: the coordinator falls back
+A related wrinkle if you skip `--endpoint`: the coordinator falls back
 to the source address it observed plus the port the node reported for
 itself, and behind NAT the port a router maps for WireGuard's UDP is not
 that one. The recorded endpoint is then wrong, and two nodes behind one
@@ -1314,7 +1315,7 @@ router get recorded identically. It self-corrects, because WireGuard
 replaces a peer's endpoint with the real source of the first packet it
 receives, so any node that speaks within its keepalive (10 seconds between
 agents, 25 for a phone) is found.
-Set `--endpoint-addr` on nodes that have a stable reachable address rather
+Set `--endpoint` on nodes that have a stable reachable address rather
 than relying on the guess.
 
 The agent needs `CAP_NET_ADMIN` and `/dev/net/tun`, and in a container it
@@ -1422,7 +1423,7 @@ A carrier (`transit on`) also gets one input accept that is not tied to
 the mesh interface: `ct mark & 0x8000000 == 0x8000000` (iptables:
 `-m connmark --mark 0x8000000/0x8000000`). Only the agent's own table sets
 that bit, and only on the public relay port a `wireserve-admin
-export-config` is checking at that moment, so the coordinator's probe gets
+device create` is checking at that moment, so the coordinator's probe gets
 through the host's own firewall and the check measures the firewalls
 outside the host — the cloud firewall or router — which are the only ones
 to open by hand. firewalld is not covered: on a firewalld host, open the
@@ -1441,8 +1442,8 @@ default instance; name the others:
 
 ```sh
 sudo wireserve install https://wireserve.example.com --instance work
-wireserve --instance work serve git 3000     # no sudo needed once you are in the group
-wireserve --instance work list
+wireserve --instance work git 3000     # no sudo needed once you are in the group
+wireserve --instance work status
 ```
 
 Or, by hand:

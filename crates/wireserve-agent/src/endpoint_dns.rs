@@ -1,7 +1,7 @@
 //! Resolving peer endpoints that are hostnames, without letting a slow
 //! resolver hold up the poll cycle (security review).
 //!
-//! A peer's endpoint can be a DNS name — an operator's `--endpoint-addr`
+//! A peer's endpoint can be a DNS name — an operator's `--endpoint`
 //! for a dynamic-DNS host is the legitimate case — and it used to be
 //! resolved synchronously for every peer on every cycle (defguard's
 //! `Peer::set_endpoint`), ahead of the firewall and hosts-file steps. Any

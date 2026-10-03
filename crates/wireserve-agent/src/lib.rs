@@ -21,3 +21,8 @@ pub mod tls_link;
 mod test_alloc;
 pub mod vip;
 pub mod wg;
+
+/// Words that can't name a service declared here: `wireserve <word>` runs
+/// that command instead (PLAN.md M44). `off` is what withdraws one.
+pub const RESERVED_SERVICE_NAMES: &[&str] =
+    &["join", "install", "daemon", "tls-daemon", "tls-serve", "transit", "exit", "status", "leave", "help", "off"];

@@ -21,7 +21,7 @@ no relay, nothing fighting your existing DNS. One coordinator per net. CLI only.
                  │  - defguard_wireguard_rs → kernel WG interface
                  │  - FirewallBackend → host firewall (nftables on Linux)
                  │  - /etc/hosts managed block
-                 │  - local unix-socket state for `wireserve list`
+                 │  - local unix-socket state for `wireserve status`
                  └────────────────────┘
 ```
 
@@ -66,7 +66,7 @@ hand-duplicated structs on either side.
 ```sql
 CREATE TABLE nodes (
     id              INTEGER PRIMARY KEY,
-    name            TEXT NOT NULL UNIQUE,       -- set at `wireserve-admin create-node`
+    name            TEXT NOT NULL UNIQUE,       -- set at `wireserve-admin node create`
     kind            TEXT NOT NULL DEFAULT 'agent'
                     CHECK (kind IN ('agent', 'static')),
                     -- 'static' = consumer-only peer (e.g. a phone via the
@@ -270,7 +270,7 @@ The agent poll loop is the single place that:
 2. reconciles the returned `peers` against the local WireGuard interface (via `defguard_wireguard_rs`),
 3. reconciles the returned `services` for *this node only* against the local `FirewallBackend`,
 4. rewrites the `/etc/hosts` managed block,
-5. writes the merged result to local state for `wireserve list` to read.
+5. writes the merged result to local state for `wireserve status` to read.
 
 ### 4.4 Admin: revoke node
 
@@ -331,14 +331,15 @@ used by `export-config` (§9), and generally useful for any future
 ### 4.6 Agent-local (not coordinator-facing)
 
 ```
-wireserve serve <name> <port> [tcp|udp]   # queues a local declare, applied on next poll
-wireserve unserve <name>                  # queues a local withdrawal
-wireserve list                            # reads local cached state, no network call
+wireserve <name> <port>...               # queues a local declare, applied on next poll
+wireserve <name> off                      # queues a local withdrawal
+wireserve status                          # reads local cached state, no network call
 wireserve leave                           # tears down interface, firewall, hosts block
 ```
 
-`serve`/`unserve` talk to the running agent over a local Unix socket
-(`/run/wireserve/agent.sock`), which is also what `list` reads from.
+Declaring and withdrawing talk to the running agent over a local Unix
+socket (`/run/wireserve/agent.sock`), which is also what `status` reads
+from. (Before PLAN.md M44 these were `serve`, `unserve` and `list`.)
 
 The socket is root-only (0600, in a 0700 directory) unless a `wireserve`
 group exists when the daemon starts; then it is 0660 and 0750, owned by
@@ -620,7 +621,7 @@ app, no new protocol, and it's the same `kind: 'static'` node type from §3
 regardless of which device it ends up on.
 
 ```
-wireserve-admin export-config <name> [--out <path>]
+wireserve-admin device create <name> [--out <path>]
 ```
 
 What it does, end to end:

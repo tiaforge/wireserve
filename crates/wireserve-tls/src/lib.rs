@@ -1,4 +1,4 @@
-//! The per-node TLS terminator (PLAN.md M33): `wireserve tls-serve`.
+//! The per-node TLS terminator (PLAN.md M33): `wireserve tls-daemon`.
 //!
 //! Serves each of this node's services published on TCP 443 with TLS, on
 //! the service's own address, with a certificate it obtains itself — the

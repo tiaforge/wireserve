@@ -11,7 +11,14 @@ use wireserve_agent::{firewall, ifname, lock, poll_loop, register, wg::WgInterfa
 use wireserve_types::{FirewallBackend, PortMap};
 
 #[derive(Parser)]
-#[command(name = "wireserve")]
+#[command(
+    name = "wireserve",
+    allow_external_subcommands = true,
+    override_usage = "wireserve [OPTIONS] <SERVICE> [PORT]... [--group GROUP]\n       \
+                      wireserve [OPTIONS] <SERVICE> off\n       \
+                      wireserve [OPTIONS] <COMMAND>",
+    after_help = SERVICE_HELP
+)]
 struct Cli {
     /// Which agent instance to act on. Each instance is a separate node
     /// with its own state, interface, firewall rules and hosts-file block,
@@ -23,6 +30,30 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 }
+
+const SERVICE_HELP: &str = "\
+Services:
+  wireserve <SERVICE> [PORT]...   Publish SERVICE from this node, or change its ports: the
+                                  ports given replace the ones it had. Applied on the next poll.
+  wireserve <SERVICE> off         Stop publishing SERVICE and free its name. Whatever answers
+                                  behind it keeps running.
+  wireserve <SERVICE>             Show SERVICE as of the last poll.
+
+  Each PORT is [PUBLIC:][ADDRESS:]TARGET[/tcp|/udp]: <service>.wg:PUBLIC reaches TARGET on
+  this node, or on ADDRESS when given — an IPv4 address this node reaches, such as a router
+  on its LAN, which then sees the connection come from this node (TCP unless given; a bare
+  port maps to itself).
+
+  --group GROUP puts a new service in this group, which an admin created, rather than in
+  `default`, which everyone reaches. Only the first time: after that an admin decides its
+  groups.
+
+  wireserve web 80:5080
+  wireserve dns 53/udp 53/tcp 8080:8000
+  wireserve myrouter 443:192.168.178.1:80
+  wireserve web off
+
+  A service can't be named after a command, or `off`.";
 
 /// Shared by `join` and `install` — the latter does everything the former
 /// does, plus installs the binary and systemd unit around it, so both
@@ -46,7 +77,12 @@ struct JoinArgs {
     /// 51820 up that no other instance on this host has.
     #[arg(long)]
     listen_port: Option<u16>,
-    #[arg(long)]
+    /// The `host:port` other peers dial this node on — a public address,
+    /// a DNS name or a port forward's outside end. Without it the
+    /// coordinator learns one from the address this node polls from and
+    /// from its startup probe, which a node with a fixed public address or
+    /// a forwarded port can do better than.
+    #[arg(long = "endpoint", value_name = "HOST:PORT")]
     endpoint_addr: Option<String>,
     /// Allow a plain http:// coordinator URL to a non-loopback host.
     /// Refused otherwise: the join token, this node's bearer token and
@@ -72,12 +108,12 @@ struct InstallArgs {
 #[derive(Subcommand)]
 enum Command {
     /// One-time bootstrap: redeem a join token issued by `wireserve-admin
-    /// create-node`, generating this node's keypair locally.
+    /// node create`, generating this node's keypair locally.
     Join(JoinArgs),
     /// Installs the binary to /usr/local/bin, installs and enables the
     /// right systemd unit for this instance (plain, or the `@.service`
     /// template for a named instance), then joins — everything
-    /// `wireserve-admin create-node`'s printed command needs, in one
+    /// `wireserve-admin node create`'s printed command needs, in one
     /// step. Also creates the `wireserve` group whose members can run the
     /// other commands without sudo. Needs root, and Linux/systemd
     /// (Quadlet/podman deployments install by hand, per `deploy/quadlet/`).
@@ -94,51 +130,31 @@ enum Command {
         #[arg(long, value_parser = parse_ifname_flag)]
         ifname: Option<ifname::Flag>,
     },
-    /// Queues a local service declaration, applied on the next poll.
-    ///
-    /// Each PORT is `[PUBLIC:][ADDRESS:]TARGET[/tcp|/udp]`:
-    /// `<name>.wg:PUBLIC` reaches TARGET on this node, or on ADDRESS when
-    /// given — an IPv4 address this node reaches, such as a router on its
-    /// LAN, which then sees the connection come from this node (TCP unless
-    /// given; a bare port maps to itself). `serve web 80:5080`,
-    /// `serve dns 53/udp 53/tcp 8080:8000`, `serve myrouter 443:192.168.178.1:80`.
-    Serve {
-        name: String,
-        #[arg(required = true, value_name = "PORT")]
-        ports: Vec<String>,
-        /// Put a new service in this group, which an admin created, rather
-        /// than in `default`, which everyone reaches. Only the first time:
-        /// after that an admin decides its groups.
-        #[arg(long, value_name = "GROUP")]
-        group: Option<String>,
-    },
-    /// Queues a local service withdrawal, applied on the next poll.
-    Unserve { name: String },
     /// Opts this node in or out of carrying transit traffic for other mesh
     /// peers that can't reach each other directly (PLAN.md M23) — a live
-    /// operational toggle, same shape as `serve`/`unserve`: takes effect
-    /// next poll, no rejoin. Off by default; a node with metered/capped
+    /// operational toggle, same shape as `wireserve <service> off`: takes
+    /// effect next poll, no rejoin. Off by default; a node with metered/capped
     /// traffic should simply never turn it on. Opting in is only half:
     /// the coordinator ignores the offer until an admin also approves
-    /// this node with `wireserve-admin approve-transit`.
+    /// this node with `wireserve-admin transit approve`.
     Transit {
         #[command(subcommand)]
-        action: TransitAction,
+        action: Toggle,
     },
     /// Opts this node in or out of being the exit for the devices that use
     /// it as their gateway (PLAN.md M27): their full-tunnel profile sends
     /// all of their internet traffic here, and it leaves under this host's
     /// own public address. Off by default. Only half the consent: a device
     /// uses it only once an admin exports it with
-    /// `wireserve-admin export-config --exit`, and the node must already be
+    /// `wireserve-admin device create --exit`, and the node must already be
     /// a gateway (`transit on`, approved).
     Exit {
         #[command(subcommand)]
-        action: TransitAction,
+        action: Toggle,
     },
     /// Shows this node's services, peers and anything not published, from
     /// the daemon's cache of the last poll — no network call.
-    List {
+    Status {
         /// Print the cached view as JSON instead, for scripts.
         #[arg(long)]
         json: bool,
@@ -149,8 +165,10 @@ enum Command {
     /// services published on TCP 443 with TLS on the service's own address,
     /// with a certificate it obtains itself. Run by the `wireserve-tls`
     /// unit, as its own unprivileged user, beside the daemon, on the socket
-    /// `wireserve-tls.socket` holds for it (PLAN.md M35).
-    TlsServe {
+    /// `wireserve-tls.socket` holds for it (PLAN.md M35). `tls-serve` is
+    /// its name from before M44, still in hand-installed units.
+    #[command(hide = true, alias = "tls-serve")]
+    TlsDaemon {
         /// Where certificates and the ACME account are kept. Defaults to
         /// the unit's state directory.
         #[arg(long, value_name = "DIR", env = "STATE_DIRECTORY")]
@@ -171,10 +189,56 @@ enum Command {
         #[arg(long, env = "WIRESERVE_TLS_PORT", default_value_t = wireserve_types::TLS_LISTEN_PORT, hide = true)]
         port: u16,
     },
+    /// `wireserve <service> ...`: everything that isn't one of the commands
+    /// above. See [`ServiceArgs`].
+    #[command(external_subcommand)]
+    Service(Vec<String>),
+}
+
+/// `wireserve <service> [PORT]...` (PLAN.md M44): the service is the
+/// command. Parsed separately from [`Cli`], from the words clap hands
+/// [`Command::Service`].
+#[derive(Parser, Debug, PartialEq)]
+#[command(name = "wireserve <service>", no_binary_name = true)]
+struct ServiceArgs {
+    name: String,
+    /// Each a port mapping, or the single word `off`.
+    #[arg(value_name = "PORT")]
+    ports: Vec<String>,
+    #[arg(long, value_name = "GROUP")]
+    group: Option<String>,
+    /// Also accepted after the service name.
+    #[arg(long, value_parser = parse_instance)]
+    instance: Option<Instance>,
+}
+
+/// What `wireserve <service> ...` asks for.
+#[derive(Debug, PartialEq)]
+enum ServiceAction {
+    Show,
+    Declare { ports: Vec<String>, group: Option<String> },
+    Withdraw,
+}
+
+impl ServiceArgs {
+    fn action(&self) -> Result<ServiceAction, String> {
+        match self.ports.as_slice() {
+            [] if self.group.is_some() => Err("--group needs the service's ports".into()),
+            [] => Ok(ServiceAction::Show),
+            [off] if off == "off" => match self.group {
+                Some(_) => Err("--group has nothing to do with withdrawing a service".into()),
+                None => Ok(ServiceAction::Withdraw),
+            },
+            ports if ports.iter().any(|p| p == "off") => {
+                Err("`off` withdraws a service and goes alone, without ports".into())
+            }
+            ports => Ok(ServiceAction::Declare { ports: ports.to_vec(), group: self.group.clone() }),
+        }
+    }
 }
 
 #[derive(Subcommand)]
-enum TransitAction {
+enum Toggle {
     On,
     Off,
 }
@@ -224,7 +288,7 @@ async fn main() {
         } => {
             cmd_daemon(&instance, poll_interval_secs, ifname).await
         }
-        Command::TlsServe { state_dir, acme_ca_file, trust_file, check_in_secs, port } => {
+        Command::TlsDaemon { state_dir, acme_ca_file, trust_file, check_in_secs, port } => {
             // systemd may list several colon-separated state directories;
             // the unit names exactly one.
             let state_dir = state_dir
@@ -241,11 +305,10 @@ async fn main() {
             .await
             .map_err(Into::into)
         }
-        Command::Serve { name, ports, group } => cmd_serve(&instance, name, &ports, group).await,
-        Command::Unserve { name } => cmd_unserve(&instance, name).await,
+        Command::Service(words) => cmd_service(&instance, &words).await,
         Command::Transit { action } => cmd_transit(&instance, action).await,
         Command::Exit { action } => cmd_exit(&instance, action).await,
-        Command::List { json } => cmd_list(&instance, json).await,
+        Command::Status { json } => cmd_status(&instance, json).await,
         Command::Leave => cmd_leave(&instance).await,
     };
 
@@ -357,7 +420,7 @@ async fn cmd_install(instance: &Instance, args: InstallArgs) -> Result<(), Box<d
     wireserve_agent::install::start_tls(&tls)?;
     let instance_flag = if instance.is_default() { String::new() } else { format!(" --instance {}", instance.name()) };
     println!();
-    println!("{unit} is running — `wireserve{instance_flag} list` shows its services and peers");
+    println!("{unit} is running — `wireserve{instance_flag} status` shows its services and peers");
     if let Some(note) = &tls.note {
         println!("{note}");
     }
@@ -428,7 +491,7 @@ fn resolve_join_token(
         None => {
             if is_interactive() {
                 let token = rpassword::prompt_password(
-                    "Join token (from 'wireserve-admin create-node'): ",
+                    "Join token (from 'wireserve-admin node create'): ",
                 )?;
                 let token = token.trim().to_string();
                 if !token.is_empty() {
@@ -642,7 +705,7 @@ async fn cmd_daemon(
     // F1 (security review, round 2): exactly ONE in-memory copy of the
     // agent state, shared by the poll loop and the IPC server. The
     // previous design kept two copies and re-synced them at cycle
-    // boundaries, which still silently dropped any `serve`/`unserve`
+    // boundaries, which still silently dropped any declaration or withdrawal
     // issued while a poll request was in flight (the copy-back after the
     // poll overwrote it).
     // A crashed run leaves its terminator's local routes behind (PLAN.md
@@ -787,7 +850,7 @@ async fn cmd_daemon(
                 // Safety net for host-firewall changes the interop's own
                 // change monitor can't see (legacy iptables, firewalld) —
                 // and the place the transit opt-in and target-address
-                // services are re-read, since `transit on` and `serve`
+                // services are re-read, since `transit on` and a declaration
                 // mutate a running daemon and the host firewall's FORWARD
                 // hook has to follow them.
                 interop.tick(firewall::ForwardWanted::of(&*shared_state.lock().await));
@@ -838,11 +901,11 @@ async fn cmd_daemon(
                         // operator can inspect what the node last saw and
                         // nothing irreversible happens from the daemon's
                         // side; `join` with a fresh token from
-                        // `wireserve-admin rejoin` overwrites it anyway.
+                        // `wireserve-admin node rejoin` overwrites it anyway.
                         tracing::error!(
                             "poll rejected with 401 {} times in a row — this node has been \
                              revoked; tearing down and stopping (run `wireserve join` \
-                             again with a fresh token from `wireserve-admin rejoin` to rejoin)",
+                             again with a fresh token from `wireserve-admin node rejoin` to rejoin)",
                             UNAUTHORIZED_STREAK_TO_TEARDOWN
                         );
                         teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, instance.hosts_label(), &socket_path, &shared_state, &state_path, false).await;
@@ -1029,51 +1092,89 @@ async fn teardown_everything<F: FirewallBackend>(
     }
 }
 
-/// `serve`'s port arguments, each a [`PortMap`].
-fn parse_serve_ports(args: &[String]) -> Result<Vec<PortMap>, String> {
+/// A service's port arguments, each a [`PortMap`].
+fn parse_service_ports(args: &[String]) -> Result<Vec<PortMap>, String> {
     args.iter().map(|a| a.parse::<PortMap>()).collect()
 }
 
-async fn cmd_serve(
+/// `wireserve <service> ...` — the words after the binary's own options.
+async fn cmd_service(instance: &Instance, words: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let args = match ServiceArgs::try_parse_from(words) {
+        Ok(args) => args,
+        Err(e) => e.exit(),
+    };
+    let instance = args.instance.as_ref().unwrap_or(instance);
+    match args.action()? {
+        ServiceAction::Show => cmd_show(instance, &args.name).await,
+        ServiceAction::Declare { ports, group } => cmd_declare(instance, args.name, &ports, group).await,
+        ServiceAction::Withdraw => cmd_withdraw(instance, args.name).await,
+    }
+}
+
+/// An error answer as an error, so the exit status says it failed.
+fn into_result(resp: wireserve_agent::ipc::IpcResponse) -> Result<wireserve_agent::ipc::IpcResponse, Box<dyn std::error::Error>> {
+    match resp {
+        wireserve_agent::ipc::IpcResponse::Error { message } => Err(message.into()),
+        other => Ok(other),
+    }
+}
+
+async fn cmd_declare(
     instance: &Instance,
     name: String,
     ports: &[String],
     group: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ports = parse_serve_ports(ports)?;
+    let ports = parse_service_ports(ports)?;
     wireserve_types::validate_service_ports(&ports)?;
-    let resp = client::call(&instance.socket_path(), &IpcRequest::Serve { name, ports, group }).await?;
+    into_result(client::call(&instance.socket_path(), &IpcRequest::Serve { name, ports, group }).await?)?;
     // "ok" alone overstates what just happened: the declaration is queued
     // locally and only reaches the coordinator on the next poll, and if
     // that coordinator requires approval it will sit pending until an
     // admin acts. The agent cannot know which until it polls, so say what
     // is actually true and point at where the answer shows up.
-    if matches!(resp, wireserve_agent::ipc::IpcResponse::Ok) {
-        println!("ok — queued; takes effect on the next poll");
-        println!(
-            "  if this coordinator requires admin approval, `wireserve list` will show \
-             it as pending until an admin approves it"
-        );
-        return Ok(());
+    println!("ok — queued; takes effect on the next poll");
+    println!(
+        "  if this coordinator requires admin approval, `wireserve status` will show \
+         it as pending until an admin approves it"
+    );
+    Ok(())
+}
+
+async fn cmd_withdraw(instance: &Instance, name: String) -> Result<(), Box<dyn std::error::Error>> {
+    into_result(client::call(&instance.socket_path(), &IpcRequest::Unserve { name: name.clone() }).await?)?;
+    println!("ok — {name} is withdrawn on the next poll, and its name is free for other nodes");
+    println!("  `wireserve {name} <port>...` publishes it again");
+    Ok(())
+}
+
+async fn cmd_show(instance: &Instance, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    match into_result(client::call(&instance.socket_path(), &IpcRequest::List).await?)? {
+        wireserve_agent::ipc::IpcResponse::List(view) => match wireserve_agent::ipc::render::render_service(&view, name) {
+            Some(out) => {
+                print!("{out}");
+                Ok(())
+            }
+            None => Err(format!(
+                "no service named {name} — `wireserve {name} <port>...` publishes one, `wireserve status` lists them all"
+            )
+            .into()),
+        },
+        other => {
+            print_response(other);
+            Ok(())
+        }
     }
-    print_response(resp);
-    Ok(())
 }
 
-async fn cmd_unserve(instance: &Instance, name: String) -> Result<(), Box<dyn std::error::Error>> {
-    let resp = client::call(&instance.socket_path(), &IpcRequest::Unserve { name }).await?;
-    print_response(resp);
-    Ok(())
-}
-
-async fn cmd_transit(instance: &Instance, action: TransitAction) -> Result<(), Box<dyn std::error::Error>> {
-    let enabled = matches!(action, TransitAction::On);
+async fn cmd_transit(instance: &Instance, action: Toggle) -> Result<(), Box<dyn std::error::Error>> {
+    let enabled = matches!(action, Toggle::On);
     let resp = client::call(&instance.socket_path(), &IpcRequest::TransitCapable { enabled }).await?;
     if matches!(resp, wireserve_agent::ipc::IpcResponse::Ok) {
         if enabled {
             println!(
                 "ok — transit enabled; this node carries traffic only once an admin approves \
-                 it (`wireserve-admin approve-transit <node>`), from the next poll after that"
+                 it (`wireserve-admin transit approve <node>`), from the next poll after that"
             );
             if !firewall::ip_forward::ipv6_per_interface_supported() {
                 println!(
@@ -1090,13 +1191,13 @@ async fn cmd_transit(instance: &Instance, action: TransitAction) -> Result<(), B
     Ok(())
 }
 
-async fn cmd_exit(instance: &Instance, action: TransitAction) -> Result<(), Box<dyn std::error::Error>> {
-    let enabled = matches!(action, TransitAction::On);
+async fn cmd_exit(instance: &Instance, action: Toggle) -> Result<(), Box<dyn std::error::Error>> {
+    let enabled = matches!(action, Toggle::On);
     let resp = client::call(&instance.socket_path(), &IpcRequest::ExitCapable { enabled }).await?;
     if matches!(resp, wireserve_agent::ipc::IpcResponse::Ok) {
         if enabled {
             println!(
-                "ok — exit enabled; devices exported with `wireserve-admin export-config --exit` \
+                "ok — exit enabled; devices exported with `wireserve-admin device create --exit` \
                  through this node will send their internet traffic out from here, under this \
                  host's own address, from the next poll. IPv4 only: their IPv6 is dropped here."
             );
@@ -1109,7 +1210,7 @@ async fn cmd_exit(instance: &Instance, action: TransitAction) -> Result<(), Box<
     Ok(())
 }
 
-async fn cmd_list(instance: &Instance, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn cmd_status(instance: &Instance, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let resp = client::call(&instance.socket_path(), &IpcRequest::List).await?;
     match resp {
         wireserve_agent::ipc::IpcResponse::List(view) if json => {
@@ -1184,22 +1285,87 @@ mod tests {
         a.iter().map(|s| (*s).to_string()).collect()
     }
 
+    fn service(words: &[&str]) -> ServiceArgs {
+        ServiceArgs::try_parse_from(words).unwrap()
+    }
+
+    fn top(words: &[&str]) -> Command {
+        Cli::try_parse_from(std::iter::once("wireserve").chain(words.iter().copied())).unwrap().command
+    }
+
+    #[test]
+    fn the_cli_is_well_formed() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+        ServiceArgs::command().debug_assert();
+    }
+
+    #[test]
+    fn a_word_that_is_no_command_is_a_service() {
+        let Command::Service(words) = top(&["web", "80:5080", "--group", "g"]) else { panic!("not a service") };
+        assert_eq!(words, args(&["web", "80:5080", "--group", "g"]));
+        let s = service(&["web", "80:5080", "--group", "g"]);
+        assert_eq!(
+            s.action().unwrap(),
+            ServiceAction::Declare { ports: args(&["80:5080"]), group: Some("g".into()) }
+        );
+    }
+
+    #[test]
+    fn off_withdraws_and_no_ports_shows() {
+        assert_eq!(service(&["web", "off"]).action().unwrap(), ServiceAction::Withdraw);
+        assert_eq!(service(&["web"]).action().unwrap(), ServiceAction::Show);
+    }
+
+    #[test]
+    fn off_goes_alone() {
+        assert!(service(&["web", "80", "off"]).action().is_err());
+        assert!(service(&["web", "off", "--group", "g"]).action().is_err());
+        assert!(service(&["web", "--group", "g"]).action().is_err());
+    }
+
+    #[test]
+    fn the_instance_can_follow_the_service_name() {
+        let s = service(&["web", "80", "--instance", "work"]);
+        assert_eq!(s.instance.unwrap().name(), "work");
+    }
+
+    #[test]
+    fn commands_still_win_over_services() {
+        assert!(matches!(top(&["exit", "on"]), Command::Exit { action: Toggle::On }));
+        assert!(matches!(top(&["status"]), Command::Status { json: false }));
+        assert!(matches!(top(&["tls-serve"]), Command::TlsDaemon { .. }));
+    }
+
+    #[test]
+    fn every_command_is_a_reserved_service_name() {
+        use clap::CommandFactory;
+        for sub in Cli::command().get_subcommands() {
+            for name in std::iter::once(sub.get_name()).chain(sub.get_all_aliases()) {
+                assert!(
+                    wireserve_agent::RESERVED_SERVICE_NAMES.contains(&name),
+                    "`{name}` can be declared as a service but `wireserve {name}` runs the command"
+                );
+            }
+        }
+    }
+
     #[test]
     fn serve_takes_port_mappings() {
         assert_eq!(
-            parse_serve_ports(&args(&["53/udp", "53/tcp", "8080:8000"])).unwrap(),
+            parse_service_ports(&args(&["53/udp", "53/tcp", "8080:8000"])).unwrap(),
             vec![
                 PortMap { public: 53, target: 53, proto: Proto::Udp, addr: None },
                 PortMap { public: 53, target: 53, proto: Proto::Tcp, addr: None },
                 PortMap { public: 8080, target: 8000, proto: Proto::Tcp, addr: None },
             ]
         );
-        assert_eq!(parse_serve_ports(&args(&["80:5080"])).unwrap(), vec!["80:5080".parse().unwrap()]);
+        assert_eq!(parse_service_ports(&args(&["80:5080"])).unwrap(), vec!["80:5080".parse().unwrap()]);
     }
 
     #[test]
     fn serve_rejects_a_bad_mapping() {
-        assert!(parse_serve_ports(&args(&["80:5080", "nope"])).is_err());
+        assert!(parse_service_ports(&args(&["80:5080", "nope"])).is_err());
     }
 
     // ---- S7: resolve_join_token ----

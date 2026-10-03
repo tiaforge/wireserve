@@ -590,8 +590,8 @@ impl Asker<'_> {
         explain(&[
             "When a machine offers a new service (say, \"plex\"), every other machine",
             "learns its name. With approval on, nothing is shared until you say",
-            "`wireserve-admin approve-service plex`, so one broken or stolen machine",
-            "can't take over a name. Turn it off if every machine is yours and you",
+            "`wireserve-admin service approve plex --node <machine>`, so one broken",
+            "or stolen machine can't take over a name. Turn it off if every machine is yours and you",
             "trust all of them.",
         ]);
         Ok(ask_yes_no("Should new services wait for your approval?", default))

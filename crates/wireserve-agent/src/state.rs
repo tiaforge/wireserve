@@ -1,6 +1,6 @@
 //! Local persisted agent state: bearer token, this node's own WireGuard
 //! private key, the last successful poll's directory, and any
-//! `serve`/`unserve` declarations queued locally but not yet confirmed by a
+//! Service declarations and withdrawals queued locally but not yet confirmed by a
 //! poll (§4.6). Written at mode 600 from the moment of creation (§7) — a
 //! leaked backup of this file is as sensitive as a leaked bearer token or
 //! private key.
@@ -39,12 +39,12 @@ pub struct AgentState {
     /// `services` in each `/poll` request.
     pub declared_services: Vec<ServiceDecl>,
     /// The full mesh + service directory from the last successful poll,
-    /// used to answer `wireserve list` without a network round trip.
+    /// used to answer `wireserve status` without a network round trip.
     pub last_directory: Option<PollResponse>,
     /// Service declarations the coordinator rejected (name collision with
     /// another node, spec §4.3) — removed from `declared_services` so
     /// they're not resent forever (security review F3), but kept here so
-    /// `wireserve list` can show *why* a `serve` call didn't take effect
+    /// `wireserve status` can show *why* a `serve` call didn't take effect
     /// instead of it just silently vanishing.
     #[serde(default)]
     pub rejected_services: Vec<RejectedService>,
@@ -53,7 +53,7 @@ pub struct AgentState {
     ///
     /// Coordinator-derived and replaced wholesale every cycle, never
     /// merged — an approval shows up here as a name *disappearing*, which
-    /// is also how `wireserve list` learns to stop flagging it. Denials
+    /// is also how `wireserve status` learns to stop flagging it. Denials
     /// are not kept here; they go through `rejected_services`, which
     /// already exists for declarations that will not take effect.
     #[serde(default)]
@@ -68,7 +68,7 @@ pub struct AgentState {
     /// This node's own live opt-in to carry transit traffic for other
     /// mesh peers (PLAN.md M23), set by `wireserve transit on|off`
     /// via IPC and read fresh every poll cycle — matches `serve`/
-    /// `unserve`'s shape (a live operational decision on a running
+    /// withdrawing a service's shape (a live operational decision on a running
     /// daemon), not a join-time flag. Defaults to `false`, same as
     /// `RegisterRequest::transit_capable` always does at join time.
     #[serde(default)]
@@ -115,7 +115,7 @@ pub struct AgentState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub own_access: Vec<wireserve_types::ServiceAccess>,
     /// What the coordinator said about the groups this node's declarations
-    /// named, as of the last poll; shown by `wireserve list`.
+    /// named, as of the last poll; shown by `wireserve status`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub service_notices: Vec<wireserve_types::ServiceNotice>,
     /// Who owns the devices that may reach this node's terminated services
