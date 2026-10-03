@@ -217,12 +217,55 @@ async fn serve() {
     ));
     tokio::spawn(reflexive::serve(reflexive_socket, probe_udp, reflexive_limiter));
 
-    let node_server = axum::serve(node_listener, node_app);
-    let admin_server = axum::serve(admin_listener, admin_app);
+    // On SIGTERM or Ctrl-C both listeners stop accepting and the requests
+    // already in hand are answered, for at most SHUTDOWN_GRACE. A handler is
+    // needed at all because in a container the coordinator is PID 1, which
+    // the kernel gives no default action for SIGTERM: without one, every
+    // `podman stop` (and every Quadlet restart, which each `setup` verb
+    // ends with) waited out Podman's 10s and then killed it.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
+    let stopped = |mut rx: tokio::sync::watch::Receiver<()>| async move {
+        let _ = rx.changed().await;
+    };
+    let node_server = axum::serve(node_listener, node_app).with_graceful_shutdown(stopped(stop_rx.clone()));
+    let admin_server = axum::serve(admin_listener, admin_app).with_graceful_shutdown(stopped(stop_rx));
+    let servers = async { tokio::try_join!(node_server, admin_server) };
+    tokio::pin!(servers);
 
-    if let Err(err) = tokio::try_join!(node_server, admin_server) {
+    let result = tokio::select! {
+        result = &mut servers => result,
+        () = termination_signal() => {
+            tracing::info!("termination signal received — finishing open requests, then stopping");
+            let _ = stop_tx.send(());
+            tokio::time::timeout(SHUTDOWN_GRACE, servers).await.unwrap_or_else(|_| {
+                tracing::warn!("requests still open after {}s; stopping anyway", SHUTDOWN_GRACE.as_secs());
+                Ok(((), ()))
+            })
+        }
+    };
+    if let Err(err) = result {
         eprintln!("server error: {err}");
         std::process::exit(1);
+    }
+}
+
+/// How long a stop waits for requests already in hand. Well inside
+/// Podman's 10s stop timeout, so a stop never ends in a kill.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Resolves on the first SIGTERM (systemd, Podman) or SIGINT (Ctrl-C).
+async fn termination_signal() {
+    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!(error = %err, "could not listen for SIGTERM; only Ctrl-C stops the coordinator cleanly");
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = sigterm.recv() => {}
+        _ = tokio::signal::ctrl_c() => {}
     }
 }
 

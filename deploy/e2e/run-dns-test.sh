@@ -221,6 +221,12 @@ pass "keep.$DOMAIN still 192.0.2.10 and prom.$DOMAIN still 192.0.2.99"
 
 log "6. a restart with everything already written changes nothing"
 SERIAL=$(in_netns "$COORD" dig +short "@$BIND_IP" "$DOMAIN" SOA | awk '{print $3}')
+# A plain stop, as Podman and Quadlet do it: as PID 1 the coordinator only
+# stops on SIGTERM because it handles it, and otherwise sat out the 10s.
+STOP_START=$SECONDS
+podman stop -t 10 "$COORD" >/dev/null
+[ $((SECONDS - STOP_START)) -lt 5 ] || fail "the coordinator took $((SECONDS - STOP_START))s to stop on SIGTERM"
+[ "$(podman inspect "$COORD" --format '{{.State.ExitCode}}')" = 0 ] || fail "the coordinator did not exit cleanly on SIGTERM"
 podman rm -fv -t 0 "$COORD" >/dev/null
 start_coordinator
 # The restarted coordinator runs a pass as it starts, and the poll wakes

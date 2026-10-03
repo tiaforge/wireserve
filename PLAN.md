@@ -4529,3 +4529,16 @@ what it can before saving.
     container. The owner e2e (`sudo`) gained an `owner status` step, and
     passes (2026-10-03) once its mock login marks the e-mail verified,
     which #275 requires and the e2e had not been updated for (d8e994c).
+
+## The coordinator stops on SIGTERM
+
+303. **A handler, for PID 1.** In a container the coordinator is PID 1,
+    and the kernel gives PID 1 no default action for SIGTERM. With no
+    handler, every `podman stop`, and every Quadlet restart (each `setup`
+    verb ends with one), waited out Podman's 10s and then killed it. Now
+    SIGTERM or Ctrl-C stops both listeners from accepting, gives requests
+    already in hand up to 5s, and exits 0. Under the plain systemd unit
+    nothing visible changes: there SIGTERM already ended it at once, just
+    without finishing open requests. The DNS e2e now restarts its
+    coordinator with `podman stop`, and fails if that takes 5s or more or
+    the exit is not clean.
