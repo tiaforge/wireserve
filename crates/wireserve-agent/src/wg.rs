@@ -2071,6 +2071,7 @@ mod tests {
     fn service(name: &str, node: &str, vip4: Option<&str>) -> ServiceInfo {
         ServiceInfo {
             terminated: false,
+            reach: None,
             name: name.into(),
             node: node.into(),
             ip4: String::new(),

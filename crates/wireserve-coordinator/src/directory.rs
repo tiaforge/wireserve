@@ -59,6 +59,7 @@ pub fn service_info(
         vip4: service.vip4.clone(),
         ports: service.ports.iter().map(|m| wireserve_types::PortMap { addr: None, ..*m }).collect(),
         terminated,
+        reach: None,
     }
 }
 

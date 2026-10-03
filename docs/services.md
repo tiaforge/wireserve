@@ -70,10 +70,10 @@ whole mesh, first come first served.
 ```
 lego2, instance default on wireserve0
 
-SERVICE         ADDRESS          PORTS                        NODE               STATE
-mydns.wg        10.1.0.4         53/udp 53/tcp 8080:8000/tcp  lego2 (this node)  pending approval
-openobserve.wg  10.1.0.3         80:5080/tcp                  strato             online
-plex.wg         10.1.0.2 (node)  32400/tcp                    strato             offline
+SERVICE         ADDRESS       PORTS                        NODE               STATE             ACCESS
+mydns.wg        10.1.0.4      53/udp 53/tcp 8080:8000/tcp  lego2 (this node)  pending approval  yes
+openobserve.wg  10.1.0.3      80:5080/tcp                  strato             online            yes
+plex.wg         (no address)  32400/tcp                    strato             offline           no
 
 PEER    ADDRESS   ENDPOINT              HANDSHAKE
 lego2   10.1.0.1  -                     this node
@@ -86,7 +86,8 @@ coordinator has on record (an IPv6 candidate this node can't use, say, or
 a peer that roamed).
 
 `(no address)` marks a service the coordinator had no address left for; it
-is reachable nowhere until one frees up.
+is reachable nowhere until one frees up. ACCESS is what this node's grants
+get it there, see [Who can reach what](access-control.md).
 
 ## Service addresses
 

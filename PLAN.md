@@ -4388,3 +4388,34 @@ those.
     tests for the service form, `off`, the reserved list and the admin
     regroup; IPC tests for reserved and unknown names. The e2e scripts,
     README, units and printed hints are updated. Not yet run in e2e.
+
+## M45 — `status` says what this node may reach
+
+Every node's directory lists every published service, so `wireserve status`
+listed them all with nothing to say which ones the node's grants let it use.
+We kept the list whole: the agent's hosts file and VIP routes already hold
+every name, so leaving names out of `status` alone would hide nothing, and a
+service you can see but not reach is something to ask an admin for. Trimming
+the directory per node is a separate decision and was put off: the DNS sync
+writes every name to the zone anyway.
+
+287. **One `reach` per directory entry, per requester** (2026-10-03).
+    `ServiceInfo.reach` is `allowed`, `sign-in` or `denied`, computed on each
+    poll by `access::reach` for the polling node, and `None` where there is
+    no requester (the DNS sync) or from an older coordinator. It is
+    `service_access` for one node: the owner, the provider and an
+    `everyone` grant allow; a principal granted one of the service's groups
+    allows when the node has an address; otherwise `sign-in` when the
+    owner's terminator offers the sign-in, else `denied`. They share the
+    sign-in condition (`SignInFacts::offered`), and a test checks that
+    `reach` agrees with the `ServiceAccess` the owner enforces for every
+    node across a matrix of grants and sign-in facts. Shown, never
+    enforced: the owner's firewall still decides.
+288. **`status` gets an ACCESS column**: `yes`, `sign-in`, `no`, or `-` when
+    the coordinator did not say. A node's own pending declaration shows
+    `yes`. `--json` carries `reach` per service. A `--reachable` filter was
+    left out until someone needs it.
+289. **Verification.** Unit tests for `reach` and the rendered table. The
+    grants e2e (step 3) checks that each client's `status` matches what its
+    firewall lets through, and the base e2e's status line expects `yes`.
+    Not yet run in e2e.

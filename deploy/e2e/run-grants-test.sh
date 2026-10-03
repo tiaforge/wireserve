@@ -11,7 +11,8 @@
 #   1. a fresh mesh reaches every service, as before grants existed;
 #   2. putting db in a group takes it out of `default`: nobody but its own
 #      node reaches it, while web stays open;
-#   3. `grant add tag:ops infra` lets the tagged node in, and only it;
+#   3. `grant add tag:ops infra` lets the tagged node in, and only it,
+#      and each node's `wireserve status` says what it reaches;
 #   4. taking the grant away cuts a connection already open;
 #   5. a declaration naming a group lands in it — once: naming another
 #      later changes nothing and says so in `wireserve status`, and naming a
@@ -171,7 +172,12 @@ log "3/6: a grant to a tag lets exactly that node in"
 admin grant add tag:ops infra
 wait_for "a to reach db" 30 reaches "$CLIENT_A" db 5432
 refused "$CLIENT_B" db 5432 || fail "b reached db without the tag"
-pass "node-a (tag ops) reaches db; node-b does not"
+# `status` says the same as the firewall (PLAN.md M45).
+access_says() { podman exec "$1" wireserve status | grep -qE "^$2\.wg .* $3\$"; }
+wait_for "a's status to say it reaches db" 30 access_says "$CLIENT_A" db yes
+access_says "$CLIENT_B" db no || fail "b's status does not say db is closed to it"
+access_says "$CLIENT_B" web yes || fail "b's status does not say it reaches web"
+pass "node-a (tag ops) reaches db; node-b does not, and both statuses say so"
 
 log "4/6: taking the grant away cuts an open connection"
 in_netns_bg "$CLIENT_A" sh -c "(echo one; sleep 20; echo two) | socat -t25 - TCP:$(vip_of db):5432 > /work/flow.out 2>&1"

@@ -254,6 +254,7 @@ mod tests {
     fn svc(name: &str, ip4: &str) -> ServiceInfo {
         ServiceInfo {
             terminated: false,
+            reach: None,
             name: name.into(),
             node: "somenode".into(),
             ip4: ip4.into(),
@@ -547,6 +548,7 @@ mod naming_tests {
     fn svc(name: &str, vip: &str, public: u16) -> ServiceInfo {
         ServiceInfo {
             terminated: false,
+            reach: None,
             name: name.into(),
             node: "somenode".into(),
             ip4: "100.90.0.3".into(),

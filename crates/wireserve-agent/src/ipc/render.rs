@@ -8,7 +8,7 @@
 //! the cursor, recolour the screen or forge a line of output.
 
 use chrono::{DateTime, Utc};
-use wireserve_types::{ErrorBody, PeerInfo, PortMap};
+use wireserve_types::{ErrorBody, PeerInfo, PortMap, Reach};
 
 use crate::ipc::protocol::{ListView, LocalServiceView};
 
@@ -67,6 +67,16 @@ fn service_state(s: &LocalServiceView) -> &'static str {
     }
 }
 
+/// `-` when the coordinator did not say, as one older than M45 does not.
+fn service_access(s: &LocalServiceView) -> &'static str {
+    match s.reach {
+        Some(Reach::Allowed) => "yes",
+        Some(Reach::SignIn) => "sign-in",
+        Some(Reach::Denied) => "no",
+        None => "-",
+    }
+}
+
 fn service_row(s: &LocalServiceView, domain: Option<&str>) -> Vec<String> {
     let node = if s.local { format!("{} (this node)", clean(&s.node)) } else { clean(&s.node) };
     // A service the coordinator had no address left for is reachable
@@ -80,7 +90,7 @@ fn service_row(s: &LocalServiceView, domain: Option<&str>) -> Vec<String> {
         Some(d) => format!("{}.{}", clean(&s.name), clean(d)),
         None => format!("{}.wg", clean(&s.name)),
     };
-    vec![host, address, ports(&maps), node, service_state(s).into()]
+    vec![host, address, ports(&maps), node, service_state(s).into(), service_access(s).into()]
 }
 
 /// `4s ago`, `3m ago`, `5h ago`, `2d ago`.
@@ -172,7 +182,7 @@ pub fn render_service(view: &ListView, name: &str) -> Option<String> {
     let mut out = String::new();
     if let Some(s) = service {
         out.push_str(&table(
-            &["SERVICE", "ADDRESS", "PORTS", "NODE", "STATE"],
+            &["SERVICE", "ADDRESS", "PORTS", "NODE", "STATE", "ACCESS"],
             &[service_row(s, view.service_domain.as_deref())],
         ));
     }
@@ -205,7 +215,7 @@ pub fn render(view: &ListView, now: DateTime<Utc>) -> String {
         let domain = view.service_domain.as_deref();
         let rows: Vec<Vec<String>> =
             services.into_iter().map(|s| service_row(s, domain)).collect();
-        out.push_str(&table(&["SERVICE", "ADDRESS", "PORTS", "NODE", "STATE"], &rows));
+        out.push_str(&table(&["SERVICE", "ADDRESS", "PORTS", "NODE", "STATE", "ACCESS"], &rows));
     }
 
     out.push('\n');
@@ -308,6 +318,7 @@ mod tests {
             online: true,
             local: false,
             pending: false,
+            reach: Some(Reach::Allowed),
         }
     }
 
@@ -334,6 +345,11 @@ mod tests {
         mine.pending = true;
         let mut unaddressed = svc("plex", "strato", None, &["32400"]);
         unaddressed.online = false;
+        unaddressed.reach = Some(Reach::Denied);
+        let mut photos = svc("photos", "strato", Some("10.1.0.6"), &["443"]);
+        photos.reach = Some(Reach::SignIn);
+        let mut old = svc("wiki", "strato", Some("10.1.0.7"), &["80"]);
+        old.reach = None;
         let view = ListView {
             instance: "default".into(),
             ifname: "wireserve0".into(),
@@ -362,7 +378,7 @@ mod tests {
                 },
                 TunnelPeer { pubkey: "pk-newbie".into(), endpoint: Some("198.51.100.7:51820".into()), last_handshake: None, rx_bytes: 0 },
             ],
-            services: vec![svc("openobserve", "strato", Some("10.1.0.3"), &["80:5080"]), mine, unaddressed],
+            services: vec![svc("openobserve", "strato", Some("10.1.0.3"), &["80:5080"]), mine, unaddressed, photos, old],
             rejected_services: vec![RejectedService {
                 name: "git".into(),
                 reason: r#"{"error":"service name 'git' is already declared by another node","conflicting_service":"git"}"#.into(),
@@ -374,10 +390,12 @@ mod tests {
             "\
 lego2, instance default on wireserve0
 
-SERVICE         ADDRESS       PORTS                        NODE               STATE
-mydns.wg        10.1.0.4      53/udp 53/tcp 8080:8000/tcp  lego2 (this node)  pending approval
-openobserve.wg  10.1.0.3      80:5080/tcp                  strato             online
-plex.wg         (no address)  32400/tcp                    strato             offline
+SERVICE         ADDRESS       PORTS                        NODE               STATE             ACCESS
+mydns.wg        10.1.0.4      53/udp 53/tcp 8080:8000/tcp  lego2 (this node)  pending approval  yes
+openobserve.wg  10.1.0.3      80:5080/tcp                  strato             online            yes
+photos.wg       10.1.0.6      443/tcp                      strato             online            sign-in
+plex.wg         (no address)  32400/tcp                    strato             offline           no
+wiki.wg         10.1.0.7      80/tcp                       strato             online            -
 
 PEER    ADDRESS   ENDPOINT              HANDSHAKE  ROUTE
 lego2   10.1.0.1  -                     this node  -

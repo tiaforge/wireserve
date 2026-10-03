@@ -55,6 +55,10 @@ pub struct LocalServiceView {
     /// operator which of the two they are looking at.
     #[serde(default)]
     pub pending: bool,
+    /// What this node gets at it (PLAN.md M45); `None` when the
+    /// coordinator did not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach: Option<wireserve_types::Reach>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

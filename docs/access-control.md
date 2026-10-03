@@ -43,6 +43,13 @@ taken away at its next packet. Changes reach it within a poll and a
 terminator check-in (seconds). Removing the `everyone → default` grant
 turns the whole mesh deny-by-default; `access` says when it is gone.
 
+Every node still sees every published service, so a name you aren't granted
+is something to ask for, not a mystery. The ACCESS column of `wireserve
+status` says what this node gets at each one: `yes` (every port), `sign-in`
+(only its HTTPS, and only for someone who signs in with a granted group) or
+`no`. It is the answer the service's own node enforces, worked out by the
+coordinator on each poll. `-` means the coordinator is too old to say.
+
 ## Devices that belong to someone
 
 With an identity provider (Pocket ID, Authentik, Keycloak, … — the same one

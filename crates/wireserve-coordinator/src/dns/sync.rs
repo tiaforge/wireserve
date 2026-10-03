@@ -331,6 +331,7 @@ mod tests {
     fn svc(name: &str, vip: &str, public: u16) -> ServiceInfo {
         ServiceInfo {
             terminated: false,
+            reach: None,
             name: name.into(),
             node: "n".into(),
             ip4: "10.77.0.2".into(),

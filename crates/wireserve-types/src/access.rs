@@ -140,6 +140,22 @@ pub struct ServiceAccess {
     pub sign_in_groups: Vec<String>,
 }
 
+/// What one node gets at another node's service (PLAN.md M45): the answer
+/// the owner's firewall and terminator give it, worked out for the node the
+/// directory goes to. Shown, never enforced — the owner enforces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Reach {
+    /// Every port: the service is open, or one of the node's grants
+    /// covers it, or it is the node's own.
+    Allowed,
+    /// Only the terminated 443, and only for a person who signs in with a
+    /// granted group.
+    SignIn,
+    /// Nothing gets through.
+    Denied,
+}
+
 /// The person a calling device belongs to (PLAN.md M38), for a terminator
 /// to name to its backends when the device's own grants let it in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -487,6 +487,11 @@ pub struct ServiceInfo {
     /// false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub terminated: bool,
+    /// What the node this directory went to gets at it (PLAN.md M45),
+    /// computed afresh for each requester. `None` where there is no
+    /// requester (the DNS sync) and from a coordinator older than M45.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach: Option<crate::Reach>,
 }
 
 /// A declaration the coordinator accepted and stored but has NOT put in
@@ -1045,6 +1050,7 @@ mod tests {
             }],
             services: vec![ServiceInfo {
                 terminated: false,
+                reach: None,
                 name: "plex".into(),
                 node: "homeserver".into(),
                 ip4: "100.90.0.3".into(),

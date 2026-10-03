@@ -12,7 +12,7 @@ members of the `wireserve` group have (see [Using it without sudo](nodes.md#usin
 | `wireserve <name> off` | withdraw one |
 | `wireserve transit on\|off` | opt in/out of relaying for two other nodes that can't reach each other directly (also needs `transit approve`) |
 | `wireserve exit on\|off` | opt in/out of sending the internet traffic of devices exported with `--exit` through this node (also needs `transit on` and approval) |
-| `wireserve status [--json]` | services (name, address, ports, owner, state), peers (with each one's route — direct or via a carrier) and anything not published, from the last poll |
+| `wireserve status [--json]` | services (name, address, ports, owner, state, whether this node may reach it), peers (with each one's route — direct or via a carrier) and anything not published, from the last poll |
 | `wireserve leave` | tear down interface, firewall, hosts block |
 
 On the coordinator host, as root:

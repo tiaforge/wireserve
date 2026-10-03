@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 
-use wireserve_types::{GrantSource, ServiceAccess};
+use wireserve_types::{GrantSource, Reach, ServiceAccess};
 
 use crate::db::grants::{effective_groups, Grant};
 use crate::db::nodes::NodeRow;
@@ -115,16 +115,56 @@ pub fn service_access(
     if let Some(own) = owner.ip4.as_deref().and_then(|ip| ip.parse().ok()) {
         sources.insert(own);
     }
-    let sign_in_groups: Vec<String> = granted
+    let sign_in_groups = sign_in_groups(&granted);
+    let sign_in = sign_in.offered(&sign_in_groups);
+    ServiceAccess { name: service.name.clone(), open: false, sources: sources.into_iter().collect(), sign_in, sign_in_groups }
+}
+
+/// The identity provider's groups among `granted`.
+fn sign_in_groups(granted: &BTreeSet<GrantSource>) -> Vec<String> {
+    granted
         .iter()
         .filter_map(|s| match s {
             GrantSource::Oidc(g) => Some(g.clone()),
             _ => None,
         })
-        .collect();
-    let sign_in =
-        sign_in.provider.is_some() && sign_in.owner_capable && sign_in.terminated && !sign_in_groups.is_empty();
-    ServiceAccess { name: service.name.clone(), open: false, sources: sources.into_iter().collect(), sign_in, sign_in_groups }
+        .collect()
+}
+
+impl SignInFacts<'_> {
+    /// Whether the owner's terminator lets anyone try the sign-in.
+    fn offered(&self, sign_in_groups: &[String]) -> bool {
+        self.provider.is_some() && self.owner_capable && self.terminated && !sign_in_groups.is_empty()
+    }
+}
+
+/// What `requester` gets at `service` (PLAN.md M45): [`service_access`]'s
+/// answer for one node, without working it out for every peer.
+#[must_use]
+pub fn reach(
+    service: &ServiceRow,
+    owner: &NodeRow,
+    requester: &NodeRow,
+    rules: &Rules,
+    sign_in: &SignInFacts<'_>,
+) -> Reach {
+    if requester.id == owner.id || sign_in.provider == Some((service.name.as_str(), owner.name.as_str())) {
+        return Reach::Allowed;
+    }
+    let granted = rules.granted(&service.name);
+    if granted.contains(&GrantSource::Everyone) {
+        return Reach::Allowed;
+    }
+    // `service_access` lets a node in by its address: one without any is
+    // let in nowhere.
+    let addressed = requester.ip4.as_deref().is_some_and(|ip| ip.parse::<Ipv4Addr>().is_ok());
+    if addressed && rules.principals(requester.id).iter().any(|p| granted.contains(p)) {
+        return Reach::Allowed;
+    }
+    if sign_in.offered(&sign_in_groups(&granted)) {
+        return Reach::SignIn;
+    }
+    Reach::Denied
 }
 
 #[cfg(test)]
@@ -210,6 +250,68 @@ mod tests {
         assert!(!access("db", &g, &not_capable).sign_in);
         let not_terminated = SignInFacts { terminated: false, ..SIGN_IN };
         assert!(!access("db", &g, &not_terminated).sign_in);
+    }
+
+    /// What the owner's firewall would let `requester` through, from the
+    /// access it is sent: the meaning `reach` must keep.
+    fn enforced(a: &ServiceAccess, requester: &NodeRow) -> Reach {
+        let ip: Option<Ipv4Addr> = requester.ip4.as_deref().and_then(|ip| ip.parse().ok());
+        if a.open || ip.is_some_and(|ip| a.sources.contains(&ip)) {
+            Reach::Allowed
+        } else if a.sign_in {
+            Reach::SignIn
+        } else {
+            Reach::Denied
+        }
+    }
+
+    #[test]
+    fn reach_agrees_with_the_access_the_owner_enforces() {
+        let grant_sets: Vec<Vec<Grant>> = vec![
+            vec![],
+            vec![grant("everyone", "default")],
+            vec![grant("everyone", "infra")],
+            vec![grant("tag:ops", "infra")],
+            vec![grant("oidc:family", "infra")],
+            vec![grant("tag:ops", "infra"), grant("oidc:family", "infra")],
+            vec![grant("oidc:friends", "infra")],
+            vec![grant("tag:ops", "other")],
+        ];
+        let mut peers = peers();
+        peers.push(NodeRow::for_test(5, "no-address"));
+        let facts = [
+            NO_SIGN_IN,
+            SIGN_IN,
+            SignInFacts { owner_capable: false, ..SIGN_IN },
+            SignInFacts { terminated: false, ..SIGN_IN },
+            SignInFacts { provider: Some(("db", "home")), ..SIGN_IN },
+        ];
+        for grants in &grant_sets {
+            let r = rules(grants);
+            for svc in ["web", "db"] {
+                for si in &facts {
+                    let a = service_access(&service(svc), &peers[0], &peers, &r, si);
+                    for requester in &peers {
+                        assert_eq!(
+                            reach(&service(svc), &peers[0], requester, &r, si),
+                            enforced(&a, requester),
+                            "{svc} for {} with {grants:?}",
+                            requester.name,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_node_outside_the_grants_is_told_it_may_sign_in_or_not() {
+        let peers = peers();
+        let g = [grant("oidc:family", "infra")];
+        let tv = &peers[3];
+        assert_eq!(reach(&service("db"), &peers[0], tv, &rules(&g), &SIGN_IN), Reach::SignIn);
+        assert_eq!(reach(&service("db"), &peers[0], tv, &rules(&g), &NO_SIGN_IN), Reach::Denied);
+        assert_eq!(reach(&service("db"), &peers[0], &peers[2], &rules(&g), &SIGN_IN), Reach::Allowed, "its owner is in family");
     }
 
     #[test]

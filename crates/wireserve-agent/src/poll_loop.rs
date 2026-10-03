@@ -1145,6 +1145,7 @@ mod tests {
     fn published(name: &str, owner: Ipv4Addr, vip4: Option<Ipv4Addr>) -> ServiceInfo {
         ServiceInfo {
             terminated: false,
+            reach: None,
             name: name.into(),
             node: "n".into(),
             ip4: owner.to_string(),

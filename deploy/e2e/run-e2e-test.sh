@@ -259,7 +259,7 @@ log "checking wireserve status reflects real data on agent1 (regression: F1)"
 podman exec "$AGENT1" wireserve status --json | grep -q '"local": true' \
     || fail "wireserve status did not show the locally-declared service — the shared-state bug (F1) may have regressed"
 pass "wireserve status shows real, current data"
-podman exec "$AGENT2" wireserve status | grep -E "^testsvc\.wg +$VIP +80:12345/tcp +node1 +online$" >/dev/null \
+podman exec "$AGENT2" wireserve status | grep -E "^testsvc\.wg +$VIP +80:12345/tcp +node1 +online +yes$" >/dev/null \
     || fail "the human-readable list does not show testsvc.wg: $(podman exec "$AGENT2" wireserve status)"
 pass "the human-readable list shows the service, its address and mapping"
 

@@ -381,18 +381,34 @@ pub async fn poll(
 
     let tls_ready = crate::db::tls::ready(&conn)?;
     let ctx = state.directory_context(&tls_ready);
-    let services = directory::services_directory(&all_services, &all_peers, &ctx);
+    let mut services = directory::services_directory(&all_services, &all_peers, &ctx);
+    let rules = crate::access::read_rules(&conn)?;
+    let provider = state.config.sign_in.as_ref().map(|si| (si.service.as_str(), si.node.as_str()));
+    let sign_in_capable = |owner: &nodes::NodeRow| {
+        owner.pubkey.as_deref().is_some_and(|pk| {
+            state.transit.has_capability(pk, wireserve_types::CAP_SIGN_IN, state.config.online_threshold_secs)
+        })
+    };
+
+    // What this requester gets at each service (PLAN.md M45), for its
+    // `status` to show. Names are unique across the mesh.
+    let reach: std::collections::HashMap<&str, wireserve_types::Reach> = all_services
+        .iter()
+        .filter_map(|s| {
+            let owner = all_peers.iter().find(|n| n.id == s.node_id)?;
+            let facts =
+                crate::access::SignInFacts { provider, owner_capable: sign_in_capable(owner), terminated: ctx.terminates(s) };
+            Some((s.name.as_str(), crate::access::reach(s, owner, &node, &rules, &facts)))
+        })
+        .collect();
+    for s in &mut services {
+        s.reach = reach.get(s.name.as_str()).copied();
+    }
 
     // Who may reach each of this node's own services (PLAN.md M36), pending
     // ones included, so its firewall is ready the moment approval publishes
     // them. Sent to this node alone.
-    let rules = crate::access::read_rules(&conn)?;
-    let owner_capable = state.transit.has_capability(
-        &self_pubkey,
-        wireserve_types::CAP_SIGN_IN,
-        state.config.online_threshold_secs,
-    );
-    let provider = state.config.sign_in.as_ref().map(|si| (si.service.as_str(), si.node.as_str()));
+    let owner_capable = sign_in_capable(&node);
     let own_rows = services::list_for_node(&conn, node.id)?;
     let access: Vec<wireserve_types::ServiceAccess> = own_rows
         .iter()
