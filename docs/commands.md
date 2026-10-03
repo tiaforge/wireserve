@@ -21,6 +21,9 @@ On the coordinator host, as root:
 | --- | --- |
 | `wireserve-coordinator install` | asks a few questions, then installs both binaries, the `wireserve-coordinator` user and the unit, and starts it. On a host where it is installed: upgrades and restarts instead |
 | `wireserve-coordinator install --reconfigure` | asks again, with the current settings as defaults |
+| `wireserve-coordinator setup domain [--off]` | names under your own domain instead of `.wg`, and the DNS provider that publishes them; lists the renames first, checks the token |
+| `wireserve-coordinator setup owners [--off]` | devices that belong to people at your login server; checks its discovery document |
+| `wireserve-coordinator setup sign-in [--off]` | the forward_auth sign-in for people sharing a computer: authward, Authentik, Authelia or another |
 
 Against the admin port (loopback-only by default; run from the coordinator
 host, or point `--coordinator-url`/`WIRESERVE_COORDINATOR_URL` at it from
@@ -49,6 +52,7 @@ anywhere that can reach it):
 | `--json` on `node list`, `service list`, `group list`, `grant list`, `tag list` and `transit ports` | the coordinator's answer as JSON, for scripts; the tables are for people and may change |
 | `wireserve-admin owner link <node> [--qr]` | a single-use link for whoever the device belongs to |
 | `wireserve-admin owner clear <node>` | the device belongs to nobody again |
+| `wireserve-admin owner status [--json]` | whether device owners work: the login server (checked now), the `oidc:` groups granted, whose devices are whose, and what's missing |
 | `wireserve-admin service deny <svc> --node <node>` | refuse one, or withdraw an approval |
 | `wireserve-admin transit approve <name>` | let a node that opted in relay for others, and be an exit |
 | `wireserve-admin transit deny <name>` | withdraw that |

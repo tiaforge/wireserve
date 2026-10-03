@@ -13,7 +13,7 @@ cargo build --release --workspace
 sudo ./target/release/wireserve-coordinator install
 ```
 
-It asks six questions in plain language, each with a short explanation and
+It asks five questions in plain language, each with a short explanation and
 a sensible default:
 
 1. the web address your machines reach the coordinator at (`https://…`);
@@ -22,16 +22,15 @@ a sensible default:
 3. the internal port the web server passes requests to (47820): TCP stays
    closed to the internet, UDP may be forwarded for NAT help;
 4. whether new services wait for your approval (yes);
-5. whether services get names under a domain you own, the DNS provider that
-   holds it, and which service runs your sign-in, if any, on which node;
-6. which local user gets the admin key saved, so `wireserve-admin` needs no
+5. which local user gets the admin key saved, so `wireserve-admin` needs no
    flags (whoever ran sudo).
 
 Then it creates the `wireserve-coordinator` user and group, installs both
 binaries to `/usr/local/bin`, writes `/etc/wireserve/coordinator.env`,
 generates the admin key and mesh ranges, starts the service, and prints what
-is left by hand: a ready-to-paste Caddy block, the firewall rules, and (with a
-domain) the DNS record. Every question also has a flag (`install --help`), and
+is left by hand: a ready-to-paste Caddy block, the firewall rules, the
+command for your first device — and the `setup` commands below, so you know
+they exist. Every question also has a flag (`install --help`), and
 without a terminal it never asks — `--public-url` is the only one without a
 default:
 
@@ -46,6 +45,36 @@ wireserve-admin host:/tmp/ && ssh host sudo /tmp/wireserve-coordinator
 install` the whole update. `install --reconfigure` asks the questions again
 with the current settings as defaults, and changes only those keys in
 `coordinator.env` — a key you drop is commented out, never deleted.
+
+## Later: a domain, people, a sign-in
+
+What a working mesh doesn't need, install doesn't ask. Each of these is its
+own command, run whenever its time comes — and again to change it, or with
+`--off` to undo it. Each starts by saying what it is for, checks what it can
+before saving (a DNS token, a login server), changes only its own keys and
+restarts the coordinator:
+
+```sh
+sudo wireserve-coordinator setup domain    # plex.home.example.com instead of plex.wg, on phones too, with HTTPS
+sudo wireserve-coordinator setup owners    # access follows people: devices belong to someone at your login server
+sudo wireserve-coordinator setup sign-in   # people sharing one computer sign in to web services
+```
+
+- **`setup domain`** ([Real names and HTTPS](names-and-https.md)) is worth
+  doing early: a domain *replaces* `.wg`, so it renames every service, and
+  anything set up with an old name needs the new one. It lists the renames
+  before it saves.
+- **`setup owners`** ([Devices that belong to someone](access-control.md#devices-that-belong-to-someone))
+  needs a login server you run — Pocket ID, Authentik, Keycloak:
+  [recipes](identity-providers.md). `wireserve-admin owner status` shows
+  whether it works.
+- **`setup sign-in`** ([Signing in, for shared devices](access-control.md#signing-in-for-shared-devices))
+  needs `setup domain` with DNS records first, and a forward_auth provider:
+  authward, or the one built into Authentik or Authelia.
+
+Without a terminal they take flags (`setup <what> --help`); secrets come
+from the environment (`WIRESERVE_DNS_*`, `WIRESERVE_OIDC_CLIENT_SECRET`),
+never the command line.
 
 The coordinator runs as its own `wireserve-coordinator` user. Earlier
 versions ran it as `wireserve`, which on a host that also runs an agent is the

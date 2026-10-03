@@ -7,8 +7,9 @@
 # wireserve-coordinator user, installs both binaries, writes exactly the
 # asked-for settings, starts the service as that user and leaves
 # wireserve-admin working for the admin user with no flags; that
-# --reconfigure changes only its own keys; and that a plain re-run upgrades
-# without touching the settings.
+# --reconfigure changes only its own keys; that a plain re-run upgrades
+# without touching the settings; and that `setup domain|owners|sign-in`
+# (PLAN.md M47) change only theirs, and restart the service to take them.
 #
 # The image has to be able to run binaries built on this machine (same or
 # newer glibc) and boot systemd; Arch's does both for an Arch-based host.
@@ -72,7 +73,7 @@ C=wireserve-coord-install-$$
 boot "$C"
 in_c "$C" useradd -m tester
 in_c "$C" env SUDO_USER=tester /opt/ws/wireserve-coordinator install \
-    --public-url https://mesh.test --port 48000 --domain int.test --yes >"$WORK/fresh.out" 2>&1 \
+    --public-url https://mesh.test --port 48000 --yes >"$WORK/fresh.out" 2>&1 \
     || { cat "$WORK/fresh.out"; fail "install exited non-zero"; }
 cat "$WORK/fresh.out"
 
@@ -99,10 +100,14 @@ expect_key "$WORK/env1" WIRESERVE_LISTEN_ADDR=127.0.0.1:48000
 expect_key "$WORK/env1" WIRESERVE_ADMIN_LISTEN_ADDR=127.0.0.1:48001
 expect_key "$WORK/env1" WIRESERVE_TRUST_PROXY_HEADERS=true
 expect_key "$WORK/env1" WIRESERVE_REQUIRE_SERVICE_APPROVAL=true
-expect_key "$WORK/env1" WIRESERVE_SERVICE_DOMAIN=int.test
+if grep -q '^WIRESERVE_SERVICE_DOMAIN=' "$WORK/env1"; then fail "install set a domain"; fi
 if grep -q '^WIRESERVE_TRUSTED_PROXY=' "$WORK/env1"; then fail "trusted proxy set for a local web server"; fi
 [ "$(in_c "$C" stat -c '%U %a' /etc/wireserve/coordinator.env)" = "root 600" ] || fail "env file not root 600"
 pass "env file holds exactly the answers, root 600"
+for verb in "setup domain" "setup owners" "setup sign-in"; do
+    grep -q "wireserve-coordinator $verb" "$WORK/fresh.out" || fail "install does not point at $verb"
+done
+pass "install points at the setup commands"
 
 in_c "$C" runuser -l tester -c 'wireserve-admin node list' >/dev/null || fail "wireserve-admin does not work for tester"
 pass "wireserve-admin works for the admin user with no flags"
@@ -111,6 +116,17 @@ pass "wireserve-admin works for the admin user with no flags"
 in_c "$C" runuser -l tester -c 'wireserve-admin node create box1' > "$WORK/create.out" 2>&1 || fail "node create failed"
 grep -q 'https://mesh.test' "$WORK/create.out" || { cat "$WORK/create.out"; fail "node create does not print the public address"; }
 pass "node create prints the public address"
+
+# ---------------------------------------------------------------------
+log "setup domain sets the domain, and restarts the service"
+before=$(main_pid "$C")
+in_c "$C" /opt/ws/wireserve-coordinator setup domain --domain int.test --no-dns --yes >"$WORK/domain.out" 2>&1 \
+    || { cat "$WORK/domain.out"; fail "setup domain exited non-zero"; }
+in_c "$C" cat /etc/wireserve/coordinator.env > "$WORK/env1b"
+expect_key "$WORK/env1b" WIRESERVE_SERVICE_DOMAIN=int.test
+[ "$(main_pid "$C")" != "$before" ] || fail "setup domain did not restart the service"
+in_c "$C" systemctl is-active --quiet wireserve-coordinator || fail "service not active after setup domain"
+pass "domain set, service restarted"
 
 # ---------------------------------------------------------------------
 log "--reconfigure changes only its own keys"
@@ -124,9 +140,37 @@ expect_key "$WORK/env2" WIRESERVE_SERVICE_DOMAIN=int.test
 expect_key "$WORK/env2" WIRESERVE_PUBLIC_URL=https://mesh.test
 in_c "$C" systemctl is-active --quiet wireserve-coordinator || fail "service not active after reconfigure"
 in_c "$C" runuser -l tester -c 'wireserve-admin node list' >/dev/null || fail "admin key changed on reconfigure"
-pass "hand-added line kept, approval off, the rest unchanged, same admin key"
+pass "hand-added line kept, approval off, the domain and the rest unchanged, same admin key"
 
-in_c "$C" /opt/ws/wireserve-coordinator install --reconfigure --no-domain --yes >/dev/null 2>&1 || fail "--no-domain failed"
+# ---------------------------------------------------------------------
+log "setup sign-in needs DNS records; setup owners writes and clears its keys"
+if in_c "$C" /opt/ws/wireserve-coordinator setup sign-in --node gate --yes >"$WORK/signin.out" 2>&1; then
+    fail "a sign-in without DNS records was accepted"
+fi
+grep -q 'setup domain' "$WORK/signin.out" || { cat "$WORK/signin.out"; fail "the refusal does not point at setup domain"; }
+pass "setup sign-in without DNS records points at setup domain"
+
+in_c "$C" env WIRESERVE_OIDC_CLIENT_SECRET=s3cret /opt/ws/wireserve-coordinator setup owners \
+    --issuer https://id.test/application/o/wireserve/ --client-id wireserve --skip-check --yes >"$WORK/owners.out" 2>&1 \
+    || { cat "$WORK/owners.out"; fail "setup owners exited non-zero"; }
+in_c "$C" cat /etc/wireserve/coordinator.env > "$WORK/env2b"
+expect_key "$WORK/env2b" WIRESERVE_OIDC_ISSUER=https://id.test/application/o/wireserve/
+expect_key "$WORK/env2b" WIRESERVE_OIDC_CLIENT_ID=wireserve
+expect_key "$WORK/env2b" WIRESERVE_OIDC_CLIENT_SECRET=s3cret
+if grep -q 's3cret' "$WORK/owners.out"; then fail "the client secret was printed"; fi
+in_c "$C" systemctl is-active --quiet wireserve-coordinator || fail "service not active with owners set up"
+grep -q 'owner link' "$WORK/owners.out" || { cat "$WORK/owners.out"; fail "setup owners does not say what's next"; }
+pass "owners set up (issuer as typed, secret from the environment, never printed)"
+
+in_c "$C" /opt/ws/wireserve-coordinator setup owners --off --yes >"$WORK/owners-off.out" 2>&1 \
+    || { cat "$WORK/owners-off.out"; fail "setup owners --off failed"; }
+in_c "$C" cat /etc/wireserve/coordinator.env > "$WORK/env2c"
+if grep -q '^WIRESERVE_OIDC_' "$WORK/env2c"; then fail "an OIDC key is still active"; fi
+expect_key "$WORK/env2c" "# WIRESERVE_OIDC_CLIENT_SECRET=s3cret"
+pass "--off comments the owner keys out"
+
+in_c "$C" /opt/ws/wireserve-coordinator setup domain --off --yes >"$WORK/domain-off.out" 2>&1 \
+    || { cat "$WORK/domain-off.out"; fail "setup domain --off failed"; }
 in_c "$C" cat /etc/wireserve/coordinator.env > "$WORK/env3"
 if grep -q '^WIRESERVE_SERVICE_DOMAIN=' "$WORK/env3"; then fail "domain still active"; fi
 expect_key "$WORK/env3" "# WIRESERVE_SERVICE_DOMAIN=int.test"
@@ -143,7 +187,7 @@ cmp -s "$WORK/env3" "$WORK/env4" || fail "upgrade changed the env file"
 [ "$(main_pid "$C")" != "$before" ] || fail "service was not restarted"
 pass "upgraded, restarted, env file byte-identical"
 
-if in_c "$C" /opt/ws/wireserve-coordinator install --domain x.test >"$WORK/refuse.out" 2>&1; then
+if in_c "$C" /opt/ws/wireserve-coordinator install --no-approval >"$WORK/refuse.out" 2>&1; then
     fail "a settings flag without --reconfigure was accepted"
 fi
 grep -q -- '--reconfigure' "$WORK/refuse.out" || { cat "$WORK/refuse.out"; fail "refusal does not point at --reconfigure"; }

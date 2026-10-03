@@ -94,6 +94,16 @@ Every machine in the mesh can now reach `http://plex.wg`.
 wireserve-admin device create myphone --qr
 ```
 
+**Later, when you want them**, on the coordinator:
+
+```sh
+sudo wireserve-coordinator setup domain    # plex.home.example.com instead of plex.wg: works on phones, with HTTPS
+sudo wireserve-coordinator setup owners    # access follows people, through your login server
+sudo wireserve-coordinator setup sign-in   # people sharing one computer sign in to web services
+```
+
+Each says what it is for before asking anything, and `--off` undoes it.
+
 ## Everyday use
 
 On a machine:
@@ -128,6 +138,8 @@ Run any command with `--help` for its options.
   providers, certificates
 - [Who can reach what](docs/access-control.md): groups, grants, tags,
   owners, sign-in
+- [Identity providers](docs/identity-providers.md): Pocket ID, Authentik
+  and Keycloak, for device owners and the sign-in
 - [Relaying between nodes](docs/relaying.md): when machines can't reach each
   other directly
 - [Ports, firewalls and host setup](docs/firewall.md): what each machine

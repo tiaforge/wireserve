@@ -37,12 +37,12 @@ const ENV_EXAMPLE: &str = include_str!("../../../../deploy/env/coordinator.env.e
 pub const DEFAULT_SERVICE_USER: &str = "wireserve-coordinator";
 pub const BIN_DEST: &str = "/usr/local/bin/wireserve-coordinator";
 const ADMIN_BIN_DEST: &str = "/usr/local/bin/wireserve-admin";
-const UNIT_NAME: &str = "wireserve-coordinator";
+pub(crate) const UNIT_NAME: &str = "wireserve-coordinator";
 const UNIT_DEST: &str = "/etc/systemd/system/wireserve-coordinator.service";
 const DROPIN_DIR: &str = "/etc/systemd/system/wireserve-coordinator.service.d";
 const DROPIN_DEST: &str = "/etc/systemd/system/wireserve-coordinator.service.d/user.conf";
 const ENV_DIR: &str = "/etc/wireserve";
-const ENV_DEST: &str = "/etc/wireserve/coordinator.env";
+pub(crate) const ENV_DEST: &str = "/etc/wireserve/coordinator.env";
 const STATE_DIR: &str = "/var/lib/wireserve-coordinator";
 
 #[derive(Debug, thiserror::Error)]
@@ -62,73 +62,7 @@ pub enum InstallError {
     Failed(String),
 }
 
-/// Writes and removes one throwaway TXT record through the provider, so a
-/// wrong token is found now, while nothing is installed, and not later as
-/// names that never appear.
-///
-/// It also finds the zone the records go into, which is not asked: few
-/// people know what their provider calls a zone. It tries the zone already
-/// set, then the domain itself, then each domain it sits under
-/// (`home.example.com`, `example.com`), and keeps the first one the
-/// provider takes. Cloudflare and deSEC find the zone themselves, so the
-/// domain itself works there at once.
-fn check_dns_provider(dns: &mut questions::DnsAnswer, domain: &str) -> Result<(), InstallError> {
-    let name = format!("_wireserve-check.{domain}");
-    eprintln!("Checking that wireserve can create DNS records for {domain} …");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| failed("starting the DNS check", e))?;
-    let mut refused = Vec::new();
-    for zone in zone_candidates(dns.zone.as_deref(), domain) {
-        let attempt = questions::DnsAnswer { zone: Some(zone.clone()), ..dns.clone() };
-        let cfg = attempt.check(domain).map_err(InstallError::Failed)?;
-        let provider = crate::dns::provider::Provider::connect(&cfg).map_err(InstallError::Failed)?;
-        let value = crate::tokengen::generate("wireserve-check-");
-        let written = runtime.block_on(async {
-            use crate::dns::provider::DnsWriter as _;
-            provider.add_txt(&name, &value).await?;
-            if let Err(e) = provider.remove_txt(&name, &value).await {
-                eprintln!("note: the test record {name} could not be removed ({e}); delete it by hand");
-            }
-            Ok::<_, String>(())
-        });
-        match written {
-            Ok(()) => {
-                eprintln!("  OK: the records go into {zone}.");
-                dns.zone = (!zone.eq_ignore_ascii_case(domain)).then_some(zone);
-                return Ok(());
-            }
-            Err(e) => refused.push(format!("  as part of {zone}: {e}")),
-        }
-    }
-    Err(InstallError::Failed(format!(
-        "{} did not accept a test record for {domain}:\n{}\nNothing was installed. Check that the token is right and may \
-         change DNS records for {domain}, then run the install again (--skip-dns-check skips this test).",
-        dns.provider,
-        refused.join("\n")
-    )))
-}
-
-/// The zones to try for `domain`, most likely first: one already set, the
-/// domain, then each parent down to two labels (never a bare `com`).
-fn zone_candidates(set: Option<&str>, domain: &str) -> Vec<String> {
-    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-    let mut out: Vec<String> = set.map(|z| z.trim_end_matches('.').to_ascii_lowercase()).into_iter().collect();
-    let mut rest = domain.as_str();
-    loop {
-        if !out.iter().any(|z| z == rest) {
-            out.push(rest.to_string());
-        }
-        match rest.split_once('.') {
-            Some((_, parent)) if parent.contains('.') => rest = parent,
-            _ => break,
-        }
-    }
-    out
-}
-
-fn failed(what: impl std::fmt::Display, e: impl std::fmt::Display) -> InstallError {
+pub(crate) fn failed(what: impl std::fmt::Display, e: impl std::fmt::Display) -> InstallError {
     InstallError::Failed(format!("{what}: {e}"))
 }
 
@@ -163,36 +97,6 @@ pub struct InstallArgs {
     /// New services are shared with every machine at once.
     #[arg(long)]
     pub no_approval: bool,
-    /// Name services <name>.<DOMAIN> instead of <name>.wg.
-    #[arg(long, value_name = "DOMAIN", conflicts_with = "no_domain")]
-    pub domain: Option<String>,
-    /// Keep services named <name>.wg.
-    #[arg(long)]
-    pub no_domain: bool,
-    /// With a DNS provider: the service running your sign-in (forward_auth)
-    /// provider, e.g. authward published as `auth`.
-    #[arg(long, value_name = "NAME", conflicts_with = "no_auth_service")]
-    pub auth_service: Option<String>,
-    /// No sign-in.
-    #[arg(long)]
-    pub no_auth_service: bool,
-    /// The node that runs the sign-in service
-    // Every sign-in goes there, and a service of the same name on any other
-    // node is ignored.
-    #[arg(long, value_name = "NODE", conflicts_with = "no_auth_service")]
-    pub auth_node: Option<String>,
-    /// Publish services' DNS records through this provider: rfc2136, cloudflare, desec, hetzner, porkbun
-    // Its credentials are read from the WIRESERVE_DNS_* environment
-    // variables, or asked for at a terminal.
-    #[arg(long, value_name = "PROVIDER", conflicts_with = "no_dns")]
-    pub dns_provider: Option<String>,
-    /// Leave DNS records to you.
-    #[arg(long)]
-    pub no_dns: bool,
-    /// Don't write and remove a test record through the DNS provider before
-    /// installing.
-    #[arg(long)]
-    pub skip_dns_check: bool,
     /// Save the admin key for this local user (default: whoever ran sudo).
     #[arg(long, value_name = "USER", conflicts_with = "no_admin_user")]
     pub admin_user: Option<String>,
@@ -226,10 +130,6 @@ impl InstallArgs {
             } else {
                 None
             },
-            domain: if self.no_domain { Some(None) } else { self.domain.clone().map(Some) },
-            sign_in: if self.no_auth_service { Some(None) } else { self.auth_service.clone().map(Some) },
-            sign_in_node: self.auth_node.clone(),
-            dns_provider: if self.no_dns { Some(None) } else { self.dns_provider.clone().map(Some) },
             admin_user: if self.no_admin_user { Some(None) } else { self.admin_user.clone().map(Some) },
         }
     }
@@ -243,13 +143,6 @@ impl InstallArgs {
             (self.web_server_at.is_some(), "--web-server-at"),
             (self.approval, "--approval"),
             (self.no_approval, "--no-approval"),
-            (self.domain.is_some(), "--domain"),
-            (self.no_domain, "--no-domain"),
-            (self.auth_service.is_some(), "--auth-service"),
-            (self.no_auth_service, "--no-auth-service"),
-            (self.auth_node.is_some(), "--auth-node"),
-            (self.dns_provider.is_some(), "--dns-provider"),
-            (self.no_dns, "--no-dns"),
             (self.admin_user.is_some(), "--admin-user"),
             (self.no_admin_user, "--no-admin-user"),
         ]
@@ -302,7 +195,6 @@ pub fn run(args: InstallArgs) -> Result<(), InstallError> {
     } else {
         let asker = Asker {
             interactive,
-            env: &|key| std::env::var(key).ok(),
             given: args.given(),
             current: env_before.as_deref().map(Current::from_env_file).unwrap_or_default(),
             sudo_user: std::env::var("SUDO_USER").ok().filter(|u| !u.is_empty() && u != "root"),
@@ -310,16 +202,9 @@ pub fn run(args: InstallArgs) -> Result<(), InstallError> {
             is_local: &is_local_address,
             user_exists: &|name| lookup_user(name).is_some(),
         };
-        let mut answers = asker.ask_all()?;
+        let answers = asker.ask_all()?;
         if interactive && !args.yes {
             questions::confirm(&answers, &service_user)?;
-        }
-        if !args.skip_dns_check {
-            if let Some(n) = &mut answers.naming {
-                if let Some(dns) = &mut n.dns {
-                    check_dns_provider(dns, &n.domain)?;
-                }
-            }
         }
         Some(answers)
     };
@@ -386,7 +271,7 @@ pub fn run(args: InstallArgs) -> Result<(), InstallError> {
 // ---- system pieces ----
 
 #[cfg(target_os = "linux")]
-fn require_root() -> Result<(), InstallError> {
+pub(crate) fn require_root() -> Result<(), InstallError> {
     if unsafe { libc::geteuid() } == 0 {
         Ok(())
     } else {
@@ -395,7 +280,7 @@ fn require_root() -> Result<(), InstallError> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn require_root() -> Result<(), InstallError> {
+pub(crate) fn require_root() -> Result<(), InstallError> {
     Err(InstallError::UnsupportedPlatform)
 }
 
@@ -454,7 +339,7 @@ pub(crate) fn write_file_io(path: &Path, contents: &[u8], mode: u32) -> std::io:
     Ok(())
 }
 
-fn write_env_file(text: &str) -> Result<(), InstallError> {
+pub(crate) fn write_env_file(text: &str) -> Result<(), InstallError> {
     std::fs::create_dir_all(ENV_DIR).map_err(|e| failed(ENV_DIR, e))?;
     // Root-owned and private: systemd reads it as PID 1, before dropping to
     // the service user, and it may hold the admin key.
@@ -463,7 +348,7 @@ fn write_env_file(text: &str) -> Result<(), InstallError> {
 
 /// Where the coordinator keeps its database and generated secrets, as the
 /// service will see it.
-fn state_dir(env_text: &str) -> PathBuf {
+pub(crate) fn state_dir(env_text: &str) -> PathBuf {
     envfile::get(env_text, "WIRESERVE_DB_PATH")
         .filter(|p| !p.is_empty())
         .and_then(|p| Path::new(&p).parent().map(Path::to_path_buf))
@@ -510,7 +395,7 @@ fn pregenerate_secrets(env_text: &str, state_dir: &Path, uid: u32, gid: u32) -> 
 
 /// The admin key as the running coordinator uses it: set in the env file,
 /// or else generated into the state directory.
-fn admin_token(env_text: &str, state_dir: &Path) -> Option<String> {
+pub(crate) fn admin_token(env_text: &str, state_dir: &Path) -> Option<String> {
     envfile::get(env_text, "WIRESERVE_ADMIN_TOKEN").filter(|t| !t.is_empty()).or_else(|| {
         let text = std::fs::read_to_string(state_dir.join("coordinator-secrets.env")).ok()?;
         envfile::get(&text, "WIRESERVE_ADMIN_TOKEN").filter(|t| !t.is_empty())
@@ -607,11 +492,11 @@ fn run_tool(program: &str, args: &[&str]) -> Result<(), InstallError> {
     }
 }
 
-fn systemctl(args: &[&str]) -> Result<(), InstallError> {
+pub(crate) fn systemctl(args: &[&str]) -> Result<(), InstallError> {
     run_tool("systemctl", args)
 }
 
-fn systemctl_ok(args: &[&str]) -> bool {
+pub(crate) fn systemctl_ok(args: &[&str]) -> bool {
     std::process::Command::new("systemctl").args(args).status().is_ok_and(|s| s.success())
 }
 
@@ -675,6 +560,19 @@ fn lookup_group(name: &str) -> Option<u32> {
 
 // ---- what is left for a person to do ----
 
+/// What `setup` can add later (PLAN.md M47), printed after an install so a
+/// newcomer knows it exists without reading anything first.
+pub const SETUP_HINTS: &str = "\
+Worth doing early, if you own a domain:
+  sudo wireserve-coordinator setup domain     names that work on phones too, and HTTPS
+                                              (renames services from .wg, so best before
+                                              you add many)
+
+Later, if more than one person uses this mesh:
+  sudo wireserve-coordinator setup owners     let access follow people, not devices
+  sudo wireserve-coordinator setup sign-in    tell apart people sharing one computer
+";
+
 /// The Caddy site block for these answers.
 #[must_use]
 pub fn caddy_block(answers: &Answers) -> String {
@@ -714,33 +612,21 @@ fn print_next_steps(answers: &Answers, service_user: &str, state_dir: &Path) {
     if let WebServer::Elsewhere { proxy_ip, listen_ip } = answers.web_server {
         println!("   The coordinator listens on {listen_ip}, so allow TCP {port} there from {proxy_ip} only.");
     }
-    if let Some(n) = &answers.naming {
-        println!();
-        if n.dns.is_some() {
-            println!("3. Service names: the coordinator writes <name>.{} for every approved", n.domain);
-            println!("   service, and each node serves its services published on 443 with HTTPS.");
-            if let Some(si) = &n.sign_in {
-                let (svc, node) = (&si.service, si.node.as_deref().unwrap_or("<its node>"));
-                println!("   Publish your sign-in provider as `{svc}` on 443 from {node}, e.g.:");
-                println!("     wireserve {svc} 443:8080");
-            }
-        } else {
-            println!("3. Service names: <name>.{} works on machines running wireserve only.", n.domain);
-            println!("   Give the coordinator a DNS provider (install --reconfigure) for names and");
-            println!("   HTTPS everywhere, phones included.");
+    println!();
+    println!("3. Add your first device:");
+    match &answers.admin_user {
+        Some(user) => println!("     wireserve-admin node create laptop        (as {user})"),
+        None => {
+            println!("     wireserve-admin node create laptop");
+            println!("   It needs the admin key from {}/coordinator-secrets.env", state_dir.display());
+            println!("   (`sudo grep WIRESERVE_ADMIN_TOKEN` it).");
         }
     }
     println!();
-    match &answers.admin_user {
-        Some(user) => println!("Then, as {user}, add your first machine:  wireserve-admin node create <name>"),
-        None => {
-            println!("The admin key is in {}/coordinator-secrets.env", state_dir.display());
-            println!("(`sudo grep WIRESERVE_ADMIN_TOKEN` it). Then: wireserve-admin node create <name>");
-        }
-    }
-    println!(
-        "Settings: /etc/wireserve/coordinator.env. Change them with `sudo wireserve-coordinator install --reconfigure`."
-    );
+    print!("{}", SETUP_HINTS);
+    println!();
+    println!("Settings: /etc/wireserve/coordinator.env. `sudo wireserve-coordinator install --reconfigure`");
+    println!("asks these questions again.");
     println!("The service runs as `{service_user}`; logs: journalctl -u {UNIT_NAME}");
     println!("{rule}");
 }
@@ -748,14 +634,6 @@ fn print_next_steps(answers: &Answers, service_user: &str, state_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_zone_is_looked_for_from_the_domain_down_to_two_labels() {
-        assert_eq!(zone_candidates(None, "Home.Example.com."), ["home.example.com", "example.com"]);
-        assert_eq!(zone_candidates(None, "a.b.example.co.uk"), ["a.b.example.co.uk", "b.example.co.uk", "example.co.uk", "co.uk"]);
-        assert_eq!(zone_candidates(Some("example.com"), "home.example.com"), ["example.com", "home.example.com"]);
-        assert_eq!(zone_candidates(None, "example.com"), ["example.com"]);
-    }
 
     #[test]
     fn an_installed_unit_means_upgrade_unless_reconfiguring() {
@@ -780,7 +658,6 @@ mod tests {
             web_server: WebServer::Here,
             port: 47820,
             approval: true,
-            naming: None,
             admin_user: None,
         };
         let text = envfile::apply(ENV_EXAMPLE, &a.env_changes());
@@ -833,7 +710,6 @@ mod tests {
             web_server: WebServer::Here,
             port: 48000,
             approval: true,
-            naming: None,
             admin_user: None,
         };
         assert_eq!(caddy_block(&a), "mesh.example.com {\n\treverse_proxy 127.0.0.1:48000\n}\n");
@@ -852,8 +728,8 @@ mod tests {
     #[test]
     fn upgrade_rejects_setting_flags() {
         assert_eq!(InstallArgs::default().first_setting_flag(), None);
-        let args = InstallArgs { domain: Some("x.test".into()), ..InstallArgs::default() };
-        assert_eq!(args.first_setting_flag(), Some("--domain"));
+        let args = InstallArgs { no_approval: true, ..InstallArgs::default() };
+        assert_eq!(args.first_setting_flag(), Some("--no-approval"));
         let args = InstallArgs { yes: true, user: Some("u".into()), ..InstallArgs::default() };
         assert_eq!(args.first_setting_flag(), None, "--yes and --user are not settings");
     }

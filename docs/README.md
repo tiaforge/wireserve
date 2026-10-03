@@ -24,6 +24,7 @@ exists.
 - [Phones and laptops](devices.md)
 - [Real names and HTTPS](names-and-https.md)
 - [Who can reach what](access-control.md)
+- [Identity providers](identity-providers.md)
 - [Relaying between nodes](relaying.md)
 - [Ports, firewalls and host setup](firewall.md)
 - [Security](security.md)

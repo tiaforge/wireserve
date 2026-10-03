@@ -52,23 +52,41 @@ coordinator on each poll. `-` means the coordinator is too old to say.
 
 ## Devices that belong to someone
 
-With an identity provider (Pocket ID, Authentik, Keycloak, … — the same one
-your sign-in uses), a device can belong to a person, and then reaches what
-their groups are granted — no browser sign-in on the service, for SSH or a
-database as much as for a web page. Register the coordinator there as an
-OpenID Connect client with the redirect URL `<public url>/claim/callback`,
-and on the coordinator:
+Without anything set up, access goes by the *device*: what its tags allow, or
+what every device gets. With a login server you run (Pocket ID, Authentik,
+Keycloak, … — the same one your sign-in uses), access can follow the
+*person* instead: a device belongs to someone, and reaches what their groups
+are granted — no browser sign-in on the service, for SSH or a database as
+much as for a web page. Anna's laptop and phone both get what Anna is
+allowed, and when she leaves `family` at the login server, both lose it.
+
+On the coordinator:
 
 ```sh
-WIRESERVE_PUBLIC_URL=https://mesh.example.com
+sudo wireserve-coordinator setup owners
+```
+
+It shows the redirect URL to register — `<public url>/claim/callback` —
+asks for the issuer, client ID and secret, and checks the login server's
+discovery document before saving: the issuer is stored exactly as the
+server spells it, and the scopes are narrowed to the ones it lists.
+[Identity providers](identity-providers.md) has step-by-step recipes for
+Pocket ID, Authentik and Keycloak. It writes:
+
+```sh
 WIRESERVE_OIDC_ISSUER=https://id.example.com
 WIRESERVE_OIDC_CLIENT_ID=wireserve
 WIRESERVE_OIDC_CLIENT_SECRET=…
-# optional, shown with their defaults
+# only when not the default
 WIRESERVE_OIDC_SCOPES="openid email profile groups offline_access"
 WIRESERVE_OIDC_GROUPS_CLAIM=groups
+# never asked; 60..86400
 WIRESERVE_OIDC_REFRESH_SECS=900
 ```
+
+`wireserve-admin owner status` then says whether the login server answers,
+which `oidc:` groups grants name, and whose devices are whose — and what to
+do next where something is missing.
 
 `node create` and `device create` then also print a **claim link** (with
 `--qr`, as a code for the phone's camera), and `owner link <node>` makes a
@@ -117,17 +135,35 @@ Run the provider as a mesh service on 443 — its login pages are then
 the coordinator:
 
 ```sh
-wireserve auth 443:8080             # on the node running authward
-# on the coordinator
+wireserve auth 443:8080                       # on the node running authward
+sudo wireserve-coordinator setup sign-in      # on the coordinator
+```
+
+`setup sign-in` needs [a domain with DNS records](names-and-https.md) first.
+It asks which provider you run and fills in its names for things:
+
+| Provider | Verify path | Session cookie | Identity headers | Groups split on |
+| --- | --- | --- | --- | --- |
+| authward (the defaults) | `/verify` | `authward_session` | `X-Auth-User`, `-Email`, `-Groups` | `,` |
+| Authentik, embedded outpost | `/outpost.goauthentik.io/auth/caddy` | `authentik_proxy_` + 8 hex digits of the proxy provider's client ID's SHA-256 — asked for the ID, worked out | `X-Authentik-Username`, `-Email`, `-Groups` | `\|` |
+| Authelia | `/api/authz/forward-auth` | `authelia_session` | `Remote-User`, `-Email`, `-Groups` | `,` |
+
+"other" asks for each. It writes, leaving authward's defaults out:
+
+```sh
 WIRESERVE_AUTH_SERVICE=auth
 WIRESERVE_AUTH_NODE=gate                  # the node that runs it
-# optional, shown with their defaults
 WIRESERVE_AUTH_VERIFY_PATH=/verify
 WIRESERVE_AUTH_SESSION_COOKIE=authward_session
 WIRESERVE_AUTH_USER_HEADER=X-Auth-User
 WIRESERVE_AUTH_EMAIL_HEADER=X-Auth-Email
 WIRESERVE_AUTH_GROUPS_HEADER=X-Auth-Groups
+WIRESERVE_AUTH_GROUPS_SEPARATOR=,         # or |
 ```
+
+Only the configured separator splits: with `,`, a group called `x|admins` is
+one group, never `admins`. A node older than the setting splits on `,`, which
+leaves Authentik's `a|b` one group no grant names — nobody gets in by it.
 
 Then grant a group at your identity provider:
 

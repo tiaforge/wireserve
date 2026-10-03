@@ -40,6 +40,11 @@ enum Command {
     // next to it), creates the wireserve-coordinator user, and starts the
     // service. Where it is already installed, upgrades it instead.
     Install(Box<wireserve_coordinator::install::InstallArgs>),
+    /// Add a domain, device owners or a sign-in to an installed coordinator (needs root)
+    Setup {
+        #[command(subcommand)]
+        what: Box<wireserve_coordinator::setup::SetupCommand>,
+    },
     /// Used by `install`, as the admin user, to save wireserve-admin's
     /// settings in their home.
     #[command(hide = true)]
@@ -51,6 +56,12 @@ fn main() {
         None => serve(),
         Some(Command::Install(args)) => {
             if let Err(err) = wireserve_coordinator::install::run(*args) {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Setup { what }) => {
+            if let Err(err) = wireserve_coordinator::setup::run(*what) {
                 eprintln!("error: {err}");
                 std::process::exit(1);
             }

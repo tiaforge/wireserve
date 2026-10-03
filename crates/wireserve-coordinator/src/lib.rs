@@ -13,6 +13,7 @@ pub mod oidc;
 pub mod rate_limit;
 pub mod reflexive;
 pub mod routes;
+pub mod setup;
 pub mod state;
 pub mod tokengen;
 pub mod transit;

@@ -2,17 +2,24 @@
 
 `<service>.wg` lives in each agent's `/etc/hosts`, which a phone does not
 have. To give services a name that works everywhere, give the coordinator a
-domain and a DNS provider it can write records through:
+domain and a DNS provider it can write records through — on the coordinator,
+any time after the install:
 
 ```sh
-# on the coordinator
+sudo wireserve-coordinator setup domain
+```
+
+It asks for both and writes them to `coordinator.env`:
+
+```sh
 WIRESERVE_SERVICE_DOMAIN=int.example.com
 WIRESERVE_DNS_PROVIDER=cloudflare      # or rfc2136, desec, hetzner, porkbun
 WIRESERVE_DNS_API_TOKEN=...            # a token that may edit the zone
 ```
 
 Every service is then `<name>.int.example.com` instead of `<name>.wg` — the
-suffix is **replaced, not added to**. Two working names would mean two base
+suffix is **replaced, not added to**, so do it early: `setup domain` lists the
+services it renames before it saves. Two working names would mean two base
 URLs, and anything with a single configured one (Gitea's `ROOT_URL`, Grafana's
 `root_url`, an OIDC `redirect_uri`) emits redirects that bounce between them.
 Every name points at the service's own address, from a node and from a phone
@@ -47,7 +54,7 @@ else may newly declare another node's name, nor the coordinator's own host name
 when it lies under the service domain, nor any name in
 `WIRESERVE_RESERVED_SERVICE_NAMES` (comma-separated). The node is told in
 `wireserve status`; a service it already has is never taken away for it.
-`wireserve-coordinator install` asks for the provider, and before saving
+`sudo wireserve-coordinator setup domain` asks for the domain and the provider, and before saving
 writes and removes a throwaway `_wireserve-check` TXT record, so a wrong
 token shows up there rather than as names that never appear. The wizard says where each provider's token is created:
 

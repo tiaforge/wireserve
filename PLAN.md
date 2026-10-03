@@ -4454,3 +4454,77 @@ padded its columns.
 293. **Verification.** Unit tests for `term` and for each listing. The e2e
     suites that read the listings pass (2026-10-03): base, grants, dns,
     exit, service-auth, lan-target, phone-relay, proxy and nat.
+
+## M47 — install asks less; `setup` adds the rest when its time comes
+
+`wireserve-coordinator install` asked about a domain, a DNS provider and the
+sign-in on the first run, and device owners were configured by editing six
+`WIRESERVE_OIDC_*` keys by hand. Someone trying wireserve for the first time
+can't answer those yet: they need a domain and a token, or a login server,
+and only make sense once you know why you'd want them. Device owners in
+particular were an easy "yes" without that context. So install asks only
+what a working mesh needs, and each of the rest is its own verb. Each verb
+starts by explaining, in terms of your own mesh, what it is for, and checks
+what it can before saving.
+
+294. **Install asks five things** (2026-10-03): the web address, the web
+    server, the port, approval and the admin user. Its domain, DNS and
+    sign-in flags are gone, and `install --reconfigure` leaves those keys
+    alone. After an install it prints the first `node create` and names the
+    three `setup` verbs, so a newcomer knows they exist.
+295. **`setup domain`** takes over the M31/M32 naming and DNS questions
+    (token check and zone discovery included). Because a domain *replaces*
+    `.wg`, a new one first lists the services it renames, and what then
+    needs the new name. Turning DNS off also turns the sign-in off, since
+    the coordinator refuses to start with a sign-in and no DNS records.
+296. **`setup owners`** opens with the Anna example: her laptop and phone
+    get what Anna is allowed, and leaving a group takes it from both. If
+    every grant is from `everyone`, it says owners would change nothing
+    until a group is granted. It shows the redirect URL to register, then
+    checks the issuer against the provider's discovery document. The issuer
+    is stored as the server spells it, and the scopes are narrowed to those
+    the server lists (Keycloak refuses unknown scopes; Authentik has no
+    `groups` scope). It notes when `offline_access` or the groups claim is
+    not listed. The secret comes from `WIRESERVE_OIDC_CLIENT_SECRET`, never
+    argv. `--off` comments the keys out.
+297. **`setup sign-in`** offers presets for authward, Authentik's embedded
+    outpost (`/outpost.goauthentik.io/auth/caddy`, `X-Authentik-*`, groups
+    split on `|`, cookie `authentik_proxy_` + the first 4 bytes of
+    sha256(client ID) in hex) and Authelia (`/api/authz/forward-auth`,
+    `Remote-*`, `authelia_session`). These were checked against each
+    project's source, not yet run against wireserve. "other" asks for each
+    value. Without DNS records it explains what the sign-in is for and
+    points to `setup domain`, without asking anything. It warns when the
+    provider does not bind sessions to the device. `--off` keeps the
+    identity header names, since device owners use them too.
+298. **Every verb** has flags and needs no terminal, changes only its own
+    keys, leaves defaults out of the file, and runs `systemctl
+    reset-failed` before its restart. Several setups in a row hit
+    systemd's start limit in the e2e.
+299. **`wireserve-admin owner status`** (`GET /admin/owners`) shows the
+    provider, checked live, the redirect URL, the `oidc:` groups grants
+    name, and every owned device with when it was refreshed and whether
+    refreshing is failing. Where something is missing, it says what to
+    run.
+300. **Fixes found along the way.** The coordinator trimmed the issuer's
+    trailing slash, but openidconnect compares issuers as strings and
+    Authentik's end in one, so owners never worked with Authentik
+    (d88d9f0). Discovery now also tries the slash the other way. The
+    terminator split groups on `,` only, so Authentik's `a|b` matched
+    nothing; `WIRESERVE_AUTH_GROUPS_SEPARATOR` is `,` or `|`, and only the
+    configured one splits (e11f6f9). Older nodes keep `a|b` as one group,
+    which fails closed.
+301. **Docs.** New `docs/identity-providers.md` with recipes for Pocket ID,
+    Authentik and Keycloak (owners and the sign-in). Pocket ID and Keycloak
+    use authward for the sign-in: oauth2-proxy's 401 carries no
+    `X-Login-Url`, so the terminator would show the 401 instead of a login
+    page. Updated `coordinator.md`, `access-control.md`,
+    `names-and-https.md`, `commands.md` and the env example.
+302. **Verification.** Unit tests for each verb's answers and env edits,
+    the discovery judgement, the presets against the coordinator's own
+    config checks, and the separator and status listing. API tests for
+    `/admin/owners`, and a test that an issuer differing only in its slash
+    is found. The coordinator install e2e passes with the setup verbs
+    (2026-10-03). The interactive prompts were walked through in a
+    container. The owner e2e (`sudo`) gained an `owner status` step and
+    has not been run.
