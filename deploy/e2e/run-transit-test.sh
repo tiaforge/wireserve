@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WireServe opt-in transit test (NAT-traversal step 3, PLAN.md M23).
+# wireserve opt-in transit test (NAT-traversal step 3, PLAN.md M23).
 #
 # run-nat-test.sh proves ordinary NAT traversal — a port-forwarded node and
 # a NAT-ed node reaching each other, two nodes behind a shared NAT using

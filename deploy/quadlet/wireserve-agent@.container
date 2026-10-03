@@ -24,7 +24,7 @@
 # exists to avoid.)
 
 [Unit]
-Description=WireServe agent, instance %i (Podman Quadlet)
+Description=wireserve agent, instance %i (Podman Quadlet)
 After=network-online.target
 Wants=network-online.target
 

@@ -260,7 +260,7 @@ impl Answers {
                         "  DNS records:          written by the coordinator through {}; HTTPS on each node\n",
                         d.provider
                     )),
-                    None => s.push_str("  DNS records:          none (names work on WireServe machines only)\n"),
+                    None => s.push_str("  DNS records:          none (names work on wireserve machines only)\n"),
                 }
                 match &n.sign_in {
                     Some(SignInAnswer { service, node: Some(node) }) => {
@@ -612,7 +612,7 @@ impl Asker<'_> {
             None => {
                 explain(&[
                     "Your services get names like plex.wg, which only work on computers",
-                    "running WireServe. If you own a domain, they can have real names",
+                    "running wireserve. If you own a domain, they can have real names",
                     "instead, like plex.home.example.com: those work on phones too, and",
                     "every service on port 443 gets HTTPS with a valid certificate.",
                 ]);
@@ -709,16 +709,16 @@ impl Asker<'_> {
             Some(p) => p,
             None => {
                 explain(&[
-                    "For these names to work everywhere, WireServe creates a DNS record",
+                    "For these names to work everywhere, wireserve creates a DNS record",
                     &format!("for each service (like plex.{domain}) at the company that runs your"),
                     "domain's DNS — usually where you bought the domain, unless you moved",
                     "its DNS elsewhere, e.g. to Cloudflare. It needs an API token from",
                     "that company. It only creates and removes records named after your",
                     &format!("services under {domain}; everything else in your domain is left alone."),
-                    "Without it, the names only work on computers running WireServe, and",
+                    "Without it, the names only work on computers running wireserve, and",
                     "there is no HTTPS.",
                 ]);
-                if !ask_yes_no("Let WireServe manage these DNS records?", current.is_some()) {
+                if !ask_yes_no("Let wireserve manage these DNS records?", current.is_some()) {
                     return Ok(None);
                 }
                 eprintln!();

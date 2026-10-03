@@ -3,7 +3,7 @@
 Two nodes each behind their own hard (symmetric) NAT — no shared LAN,
 nothing port-forwarded to either — can end up with no direct path at all:
 a symmetric NAT maps a different external port per destination, so
-whatever WireServe's own NAT-traversal already learned for one peer is
+whatever wireserve's own NAT-traversal already learned for one peer is
 useless for reaching a different one. When that happens, a third node
 that already reaches both **relays** their connection: the two run their
 own WireGuard session with each other, end to end, and the carrier only
@@ -16,7 +16,7 @@ This runs on a second WireGuard interface on every node, the **carry
 interface** (`wireserve0-t` next to `wireserve0`), with the same key, no
 address of its own and a port the kernel picks once and the node keeps.
 Nothing needs opening for it: relayed sessions arrive through the mesh,
-and WireServe's own firewall and its handling of ufw and firewalld cover
+and wireserve's own firewall and its handling of ufw and firewalld cover
 it the way they cover the mesh interface.
 
 **When the relay takes over.** Agents keep each other alive every 10

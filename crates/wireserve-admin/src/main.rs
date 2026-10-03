@@ -5,7 +5,7 @@ use wireserve_types::term::{clean, columns};
 use wireserve_types::NodeKind;
 
 #[derive(Parser)]
-#[command(name = "wireserve-admin", about = "Manages a WireServe mesh through its coordinator")]
+#[command(name = "wireserve-admin", about = "Manages a wireserve mesh through its coordinator")]
 struct Cli {
     /// The coordinator's admin URL [env: WIRESERVE_COORDINATOR_URL]
     #[arg(long, value_name = "URL", global = true, display_order = 100)]

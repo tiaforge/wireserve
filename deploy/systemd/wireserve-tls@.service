@@ -4,7 +4,7 @@
 # keep the two in step.
 
 [Unit]
-Description=WireServe TLS terminator (instance %i)
+Description=wireserve TLS terminator (instance %i)
 Documentation=file:///usr/share/doc/wireserve/wireserve-design-spec.md
 Requires=wireserve-tls@%i.socket
 After=wireserve-tls@%i.socket wireserve-agent@%i.service

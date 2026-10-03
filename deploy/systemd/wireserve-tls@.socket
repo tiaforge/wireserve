@@ -8,7 +8,7 @@
 # 11443, which the default instance keeps.
 
 [Unit]
-Description=WireServe TLS terminator socket (instance %i)
+Description=wireserve TLS terminator socket (instance %i)
 Documentation=file:///usr/share/doc/wireserve/wireserve-design-spec.md
 
 [Socket]

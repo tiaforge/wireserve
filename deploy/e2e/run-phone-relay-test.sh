@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WireServe phone relay test (PLAN.md M40, M41).
+# wireserve phone relay test (PLAN.md M40, M41).
 #
 # A phone cannot run the agent, so it joins with an exported `.conf` and an
 # official WireGuard client. A node behind a NAT nothing gets through can't

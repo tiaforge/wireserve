@@ -74,7 +74,7 @@ pub enum InstallError {
 /// domain itself works there at once.
 fn check_dns_provider(dns: &mut questions::DnsAnswer, domain: &str) -> Result<(), InstallError> {
     let name = format!("_wireserve-check.{domain}");
-    eprintln!("Checking that WireServe can create DNS records for {domain} …");
+    eprintln!("Checking that wireserve can create DNS records for {domain} …");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -725,7 +725,7 @@ fn print_next_steps(answers: &Answers, service_user: &str, state_dir: &Path) {
                 println!("     wireserve {svc} 443:8080");
             }
         } else {
-            println!("3. Service names: <name>.{} works on machines running WireServe only.", n.domain);
+            println!("3. Service names: <name>.{} works on machines running wireserve only.", n.domain);
             println!("   Give the coordinator a DNS provider (install --reconfigure) for names and");
             println!("   HTTPS everywhere, phones included.");
         }

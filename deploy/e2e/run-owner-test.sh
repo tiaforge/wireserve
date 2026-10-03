@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WireServe device owners test (PLAN.md M38): a person claims a device with
+# wireserve device owners test (PLAN.md M38): a person claims a device with
 # an admin's link, through a real OpenID Connect provider, and the device
 # then reaches what their groups are granted.
 #

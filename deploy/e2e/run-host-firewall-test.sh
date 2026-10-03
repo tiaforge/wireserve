@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WireServe host-firewall interop end-to-end test: a real two-node mesh in
+# wireserve host-firewall interop end-to-end test: a real two-node mesh in
 # Podman where agent1's network namespace ALSO has a host firewall of the
 # kind that used to make declared services unreachable — a ufw-style
 # iptables INPUT policy DROP and a native `inet filter` input chain with

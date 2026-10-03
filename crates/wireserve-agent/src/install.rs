@@ -460,8 +460,8 @@ mod tests {
 
     #[test]
     fn active_units_are_read_from_the_listing_and_only_agent_units_kept() {
-        let listing = "wireserve-agent.service loaded active running WireServe agent\n\
-                       wireserve-agent@work.service loaded active running WireServe agent (work)\n\
+        let listing = "wireserve-agent.service loaded active running wireserve agent\n\
+                       wireserve-agent@work.service loaded active running wireserve agent (work)\n\
                        wireserve-agent-extra.service loaded active running something else\n\
                        \n";
         assert_eq!(

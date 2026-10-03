@@ -26,7 +26,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "wireserve-coordinator",
     version,
-    about = "The WireServe coordinator; with no command, runs the server"
+    about = "The wireserve coordinator; with no command, runs the server"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -155,7 +155,7 @@ async fn serve() {
             "mesh IPv4 range overlaps 100.64.0.0/10, the carrier-grade-NAT block that \
              Tailscale (and some ISPs) allocate from. If any node also runs such an \
              overlay, that overlay's route for 100.64.0.0/10 covers these mesh addresses, \
-             and traffic meant for a WireServe peer can leave over the wrong interface. \
+             and traffic meant for a wireserve peer can leave over the wrong interface. \
              Set WIRESERVE_NET_V4_CIDR to a range you control (e.g. 10.90.0.0/24) before \
              the first node registers — existing nodes keep the address they were already \
              allocated, so changing it later only affects new ones"

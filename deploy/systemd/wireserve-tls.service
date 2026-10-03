@@ -16,7 +16,7 @@
 # listening socket stays with systemd meanwhile.
 
 [Unit]
-Description=WireServe TLS terminator
+Description=wireserve TLS terminator
 Documentation=file:///usr/share/doc/wireserve/wireserve-design-spec.md
 Requires=wireserve-tls.socket
 After=wireserve-tls.socket wireserve-agent.service

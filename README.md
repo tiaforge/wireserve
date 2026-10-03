@@ -1,4 +1,4 @@
-# WireServe
+# wireserve
 
 A self-hosted WireGuard mesh for publishing services between your own
 machines. You run one coordinator, and every machine that joins can reach

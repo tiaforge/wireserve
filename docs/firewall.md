@@ -37,7 +37,7 @@ it.
 **What a carrier needs open, and when.** Nothing, for relaying between
 agents. For phones: one UDP port per node a phone reaches
 through it — that node's relay port, `41000` plus its number — on its public
-IPv4 address. Its own firewall (ufw, firewalld, nftables) is WireServe's to
+IPv4 address. Its own firewall (ufw, firewalld, nftables) is wireserve's to
 handle; a firewall **outside** the machine is yours: a cloud provider's
 security group, or the router's port forward for a carrier at home.
 `device create` checks each port from outside before writing a config that

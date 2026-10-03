@@ -1,4 +1,4 @@
-# WireServe — v1 Design Spec
+# wireserve — v1 Design Spec
 
 Minimal, self-hosted WireGuard mesh with a declared-service directory. No ACLs,
 no relay, nothing fighting your existing DNS. One coordinator per net. CLI only.
@@ -401,7 +401,7 @@ struct ServiceRule {
 
 ## 6. Hostname resolution — managed `/etc/hosts` block, not a resolver
 
-Deliberate rejection of MagicDNS-style resolution: WireServe never becomes
+Deliberate rejection of MagicDNS-style resolution: wireserve never becomes
 the system resolver, never touches `resolv.conf`/systemd-resolved, and never
 listens on port 53. Every other domain on the host resolves exactly as it
 did before the agent existed — this is what avoids the DNSSEC-breaking
@@ -460,7 +460,7 @@ record at a service's name, so the service domain is the coordinator's to
 manage. A changed address is written only after it has held for 20 seconds.
 The credential lives in `coordinator.env`, never in the database.
 
-This does not walk back §6. WireServe still never listens on 53, never
+This does not walk back §6. wireserve still never listens on 53, never
 touches `resolv.conf`, and never enters anyone's query path: a phone's name
 resolution is ordinary public DNS.
 
@@ -549,7 +549,7 @@ which is why the mesh profile of §9 has none. The full-tunnel profile of
 goes through the gateway, so every query going to one resolver is the point,
 not a side effect. That resolver is the operator's own — a Pi-hole or
 AdGuard Home published as an ordinary service, or a public one — and
-WireServe still never listens on 53 or runs one. A resolver that runs on a
+wireserve still never listens on 53 or runs one. A resolver that runs on a
 node reads that node's `/etc/hosts`, so it answers every service's name,
 including the non-HTTP ones §6.1 leaves nameless on a phone.
 

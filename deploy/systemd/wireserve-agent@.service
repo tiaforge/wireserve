@@ -13,7 +13,7 @@
 # in step.
 
 [Unit]
-Description=WireServe agent (instance %i)
+Description=wireserve agent (instance %i)
 Documentation=file:///usr/share/doc/wireserve/wireserve-design-spec.md
 After=network-online.target
 Wants=network-online.target

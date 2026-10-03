@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WireServe reverse-proxy test.
+# wireserve reverse-proxy test.
 #
 # Spec §7 requires that every external path to the coordinator is TLS
 # terminated at the operator's own reverse proxy, and that the
@@ -73,7 +73,7 @@ log "generating a private CA and a server certificate"
 # the only thing this part of the test is here to check.
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
     -keyout "$WORK/ca.key" -out "$WORK/ca.crt" \
-    -subj "/CN=WireServe Test CA" >/dev/null 2>&1
+    -subj "/CN=wireserve Test CA" >/dev/null 2>&1
 openssl req -newkey rsa:2048 -nodes \
     -keyout "$WORK/server.key" -out "$WORK/server.csr" \
     -subj "/CN=$HOSTNAME_FQDN" >/dev/null 2>&1

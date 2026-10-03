@@ -14,7 +14,7 @@
 # first to clear this one. The agent learns the port from the terminator.
 
 [Unit]
-Description=WireServe TLS terminator socket
+Description=wireserve TLS terminator socket
 Documentation=file:///usr/share/doc/wireserve/wireserve-design-spec.md
 
 [Socket]

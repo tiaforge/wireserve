@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WireServe service-on-a-LAN-address test (PLAN.md M26).
+# wireserve service-on-a-LAN-address test (PLAN.md M26).
 #
 # `serve myrouter 443:<device>:80` makes a device on the owning node's LAN —
 # one that cannot run an agent — reachable from the mesh through that node.

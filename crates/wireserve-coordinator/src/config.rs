@@ -706,13 +706,13 @@ const CGNAT_V4: (u32, u32) = (0x6440_0000, 10); // 100.64.0.0/10
 
 /// Whether a configured mesh CIDR overlaps `100.64.0.0/10`.
 ///
-/// This is not a correctness problem for WireServe by itself — the mesh
+/// This is not a correctness problem for wireserve by itself — the mesh
 /// works fine on any range the operator picks — but it collides with
 /// whatever else on the host already claims that space. Tailscale is the
 /// common case: it routes all of `100.64.0.0/10` to its own interface, so
 /// a mesh address inside that block can end up resolving to a route
 /// pointing at `tailscale0` rather than `wg0`, and traffic meant for a
-/// WireServe peer leaves over the tailnet instead (or goes nowhere).
+/// wireserve peer leaves over the tailnet instead (or goes nowhere).
 ///
 /// The project's default (`100.90.0.0/24`, which is what the spec's own
 /// examples use throughout) sits squarely inside it, so this warns rather

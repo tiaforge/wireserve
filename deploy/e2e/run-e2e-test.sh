@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WireServe end-to-end test: builds the real container images and
+# wireserve end-to-end test: builds the real container images and
 # exercises a genuine two-node mesh — real kernel WireGuard interfaces,
 # real nftables rules, real HTTP against a live coordinator — inside
 # Podman containers. This is not a mock: it is the exact test that found

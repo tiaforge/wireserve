@@ -1,5 +1,5 @@
 [Unit]
-Description=WireServe coordinator
+Description=wireserve coordinator
 Documentation=file:///usr/share/doc/wireserve/wireserve-design-spec.md
 After=network-online.target
 Wants=network-online.target

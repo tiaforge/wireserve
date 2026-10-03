@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WireServe sign-in test (PLAN.md M34, M36): who gets into a restricted
+# wireserve sign-in test (PLAN.md M34, M36): who gets into a restricted
 # service, decided by the service's own terminator — by device first, then
 # by the groups a sign-in proves.
 #

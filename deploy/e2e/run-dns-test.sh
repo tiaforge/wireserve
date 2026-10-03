@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WireServe public DNS records test (PLAN.md M32), against a real BIND taking
+# wireserve public DNS records test (PLAN.md M32), against a real BIND taking
 # RFC 2136 updates signed with TSIG — the provider path `dns-update` really
 # speaks, not a fake.
 #

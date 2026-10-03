@@ -10,7 +10,7 @@
 # future change to either must be applied here too.
 
 [Unit]
-Description=WireServe coordinator (Podman Quadlet)
+Description=wireserve coordinator (Podman Quadlet)
 After=network-online.target
 Wants=network-online.target
 

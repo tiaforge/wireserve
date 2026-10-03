@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WireServe access grants test (PLAN.md M36): service groups, grants and
+# wireserve access grants test (PLAN.md M36): service groups, grants and
 # node tags, enforced by each service's own node on real traffic.
 #
 #     [coordinator]──( net )──┬──────────────┬──────────────┐

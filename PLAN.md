@@ -1,4 +1,4 @@
-# WireServe — Implementation Status
+# wireserve — Implementation Status
 
 Living status document. Update the checkboxes and the "Currently working on"
 line as part of the commit that makes progress, so work can pause and
@@ -2734,7 +2734,7 @@ profile) **passes** as of 2026-09-25, with the rest of the suite.
     which has no service address (whose fallback opens the node's port to
     everyone), is not opened at all: fail closed.
 
-159. **The operator's snippets, not an identity provider in WireServe.** A
+159. **The operator's snippets, not an identity provider in wireserve.** A
     marked service's generated `handle` imports `wireserve_auth` ahead of
     `reverse_proxy`; once anything is marked, every service's upstream
     imports `wireserve_upstream`. Both are defined in the operator's

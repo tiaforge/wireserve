@@ -40,7 +40,7 @@
 # exists to avoid.)
 
 [Unit]
-Description=WireServe agent (Podman Quadlet)
+Description=wireserve agent (Podman Quadlet)
 After=network-online.target
 Wants=network-online.target
 

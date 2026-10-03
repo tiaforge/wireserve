@@ -1,4 +1,4 @@
-# WireServe documentation
+# wireserve documentation
 
 ## How it works
 

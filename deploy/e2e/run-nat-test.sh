@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WireServe NAT traversal test.
+# wireserve NAT traversal test.
 #
 # The plain E2E test (run-e2e-test.sh) puts both agents on one bridge
 # network where they can already reach each other directly. That is the

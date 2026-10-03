@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WireServe per-node TLS termination test (PLAN.md M33), against a real
+# wireserve per-node TLS termination test (PLAN.md M33), against a real
 # ACME CA (Pebble), a real authoritative DNS server taking RFC 2136 updates
 # (BIND), real WireGuard and real nftables.
 #

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WireServe exit test (PLAN.md M27, M41): a phone's full-tunnel profile sends
+# wireserve exit test (PLAN.md M27, M41): a phone's full-tunnel profile sends
 # its internet traffic out through its exit — the node named by `--exit` —
 # while the mesh stays end to end, and a home resolver served on the mesh
 # names services for it.
