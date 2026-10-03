@@ -4418,7 +4418,7 @@ writes every name to the zone anyway.
 289. **Verification.** Unit tests for `reach` and the rendered table. The
     grants e2e (step 3) checks that each client's `status` matches what its
     firewall lets through, and the base e2e's status line expects `yes`.
-    Not yet run in e2e.
+    Both pass (2026-10-03).
 
 ## M46 — tables, not tabs
 
@@ -4451,5 +4451,6 @@ padded its columns.
     phone-relay) now read `--json` with `jq`, and check for it at startup.
     lan-target still greps the table on purpose, since what it checks is
     what an approver sees.
-293. **Verification.** Unit tests for `term` and for each listing. Not yet
-    run in e2e.
+293. **Verification.** Unit tests for `term` and for each listing. The e2e
+    suites that read the listings pass (2026-10-03): base, grants, dns,
+    exit, service-auth, lan-target, phone-relay, proxy and nat.
