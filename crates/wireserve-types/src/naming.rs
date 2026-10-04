@@ -34,8 +34,8 @@ pub struct ServiceNaming {
     /// what makes a certificate for a service name obtainable at all.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub acme: Option<AcmeSettings>,
-    /// The sign-in restricted services fall back to (PLAN.md M34, M36),
-    /// built into every node's terminator. Absent while none is configured.
+    /// The sign-in restricted services fall back to (PLAN.md M36, M48),
+    /// checked by every node's terminator. Absent while none is configured.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sign_in: Option<SignIn>,
     /// The headers a backend learns who is calling from (PLAN.md M36).
@@ -61,19 +61,18 @@ pub struct ServiceNaming {
 }
 
 /// The headers a terminator tells a backend who is calling in — filled
-/// from the sign-in's answer, or from the calling device's owner (PLAN.md
-/// M38) — and removes from every request a client sends, on every service,
-/// whether or not anything fills them. Named once, on the coordinator;
-/// authward's names unless set otherwise.
+/// from whoever signed in (PLAN.md M48), or from the calling device's owner
+/// (PLAN.md M38) — and removes from every request a client sends, on every
+/// service, whether or not anything fills them. Named once, on the
+/// coordinator; `X-Auth-*` unless set otherwise.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentityHeaders {
     pub user: String,
     pub email: String,
     /// Group names, separated by `groups_separator`.
     pub groups: String,
-    /// `,` (authward, Authelia) or `|` (Authentik), PLAN.md M47. A node
-    /// too old to know it splits on `,`, which turns `a|b` into one group
-    /// no grant names: it fails closed.
+    /// What a backend expects between group names: `,` or `|` (PLAN.md
+    /// M47).
     #[serde(default = "comma", skip_serializing_if = "is_comma")]
     pub groups_separator: char,
 }
@@ -126,29 +125,17 @@ impl IdentityHeaders {
     }
 }
 
-/// Where the terminators ask whether a request may pass (PLAN.md M34): a
-/// `forward_auth` provider such as authward, itself a mesh service
-/// published on 443.
-///
-/// The terminator sends each request to a marked service to
-/// `https://<service>.<domain><verify_path>` first — on that service's own
-/// address, verified against its certificate, and only while `node` owns
-/// it — with the service's own name as `X-Forwarded-Host`, `X-Forwarded-Method`,
-/// `X-Forwarded-Uri` and cookies. A 2xx lets it
-/// through with the identity headers copied from the answer; a 401 carrying
-/// `X-Login-Url` sends the browser there; anything else is returned as is.
+/// The sign-in (PLAN.md M48): the coordinator signs people in with its own
+/// OpenID Connect client, and every terminator checks the session tokens
+/// it signs. A terminator never talks to the identity provider, and holds
+/// nothing that could make a token.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignIn {
-    /// The service running the provider, e.g. `auth`.
-    pub service: String,
-    /// The node that service must be declared by. A terminator trusts the
-    /// provider only there: whoever declares the name elsewhere is not it.
-    pub node: String,
-    pub verify_path: String,
-    /// The provider's session cookie, removed from every request any
-    /// terminator passes to a backend: it is scoped to the whole domain,
-    /// and no backend needs it.
-    pub session_cookie: String,
+    /// The coordinator's public key for session tokens
+    /// ([`crate::session::public_key`]).
+    pub public_key: String,
+    /// Where a browser goes to sign in: the coordinator's public address.
+    pub login_url: String,
 }
 
 /// The certificate authority every terminator uses, set once on the

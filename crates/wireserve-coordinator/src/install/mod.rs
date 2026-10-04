@@ -569,8 +569,8 @@ Worth doing early, if you own a domain:
                                               you add many)
 
 Later, if more than one person uses this mesh:
-  sudo wireserve-coordinator setup owners     let access follow people, not devices
-  sudo wireserve-coordinator setup sign-in    tell apart people sharing one computer
+  sudo wireserve-coordinator setup login      let access follow people, not devices,
+                                              through a login server you run
 ";
 
 /// The Caddy site block for these answers.

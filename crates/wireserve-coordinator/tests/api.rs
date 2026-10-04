@@ -27,7 +27,6 @@ fn test_config(db_path: &str) -> Config {
         net_v4_cidr: "100.90.0.0/24".to_string(),
         net_v6_prefix: "fd00:90::/64".to_string(),
         service_domain: None,
-        sign_in: None,
         identity_headers: Default::default(),
         public_url: None,
         oidc: None,
@@ -3501,19 +3500,9 @@ async fn a_revoked_device_is_no_longer_an_exit_client_nor_relayed() {
 
 // ---- PLAN.md M36: who can reach what ----
 
-fn sign_in() -> wireserve_types::SignIn {
-    wireserve_types::SignIn {
-        service: "auth".into(),
-        node: "gate".into(),
-        verify_path: "/verify".into(),
-        session_cookie: "authward_session".into(),
-    }
-}
-
 fn named_app() -> TestApp {
     let mut config = test_config("");
     config.service_domain = Some("int.example.com".into());
-    config.sign_in = Some(sign_in());
     app_with_config(config)
 }
 
@@ -3538,8 +3527,8 @@ async fn admin_call(router: &Router, method: &str, path: &str, body: Value) -> (
     (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }
 
-/// The gate running the sign-in as `auth`, a home node publishing
-/// `jellyfin` on 443 and `prom` on 80, and a watcher publishing nothing.
+/// A gate publishing `auth` on 443, a home node publishing `jellyfin` on
+/// 443 and `prom` on 80, and a watcher publishing nothing.
 /// Returns (gate, home, watcher) as (bearer, ip4).
 async fn access_scenario(app: &TestApp) -> [(String, String); 3] {
     let mut out = Vec::new();
@@ -3652,12 +3641,12 @@ async fn a_declaration_names_a_group_once_and_never_an_unknown_one() {
 }
 
 #[tokio::test]
-async fn the_sign_in_and_groups_in_use_stay_where_they_are() {
+async fn groups_in_use_stay_where_they_are() {
     let app = named_app();
     let _ = access_scenario(&app).await;
     admin_call(&app.router, "POST", "/admin/groups", json!({"name": "media"})).await;
     let (status, body) = admin_call(&app.router, "PUT", "/admin/groups/media/services/auth", json!(null)).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "the sign-in stays open: {body}");
+    assert_eq!(status, StatusCode::OK, "a service called auth is nothing special any more (PLAN.md M48): {body}");
     assert_eq!(admin_call(&app.router, "DELETE", "/admin/groups/default", json!(null)).await.0, StatusCode::BAD_REQUEST);
     admin_call(&app.router, "PUT", "/admin/groups/media/services/jellyfin", json!(null)).await;
     let (status, body) = admin_call(&app.router, "DELETE", "/admin/groups/media", json!(null)).await;
@@ -3687,7 +3676,8 @@ fn oidc_app() -> TestApp {
         groups_claim: "groups".into(),
         refresh_interval: std::time::Duration::from_secs(900),
         token_key: [7; 32],
-        redirect_url: "http://mesh.test/claim/callback".into(),
+        sign_in_key: [9; 32],
+        redirect_url: "http://mesh.test/oidc/callback".into(),
     });
     app_with_config(config)
 }
@@ -3725,7 +3715,7 @@ async fn only_an_admin_makes_claim_links_and_only_with_an_identity_provider() {
     admin_create_node(&app.router, "phone").await;
     let (status, body) = admin_call(&app.router, "POST", "/admin/nodes/phone/claim", json!(null)).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body["error"].as_str().unwrap().contains("setup owners"), "{body}");
+    assert!(body["error"].as_str().unwrap().contains("setup login"), "{body}");
 
     let app = oidc_app();
     let req = json_request("POST", "/admin/nodes", Some(ADMIN), json!({ "name": "laptop" }));
@@ -3769,7 +3759,7 @@ async fn a_claim_link_is_checked_before_anything_is_started() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // Without a started sign-in, the callback and the confirmation refuse.
-    let (status, _) = get_page(&app.router, "/claim/callback?code=x&state=y").await;
+    let (status, _) = get_page(&app.router, "/oidc/callback?code=x&state=y").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -4284,7 +4274,7 @@ async fn owner_status_names_the_provider_its_trouble_and_the_people_groups_grant
     assert!(status.is_success());
     let (status, body) = admin_call(&app.router, "GET", "/admin/owners", json!(null)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["provider"]["redirect_url"], "http://mesh.test/claim/callback");
+    assert_eq!(body["provider"]["redirect_url"], "http://mesh.test/oidc/callback");
     assert!(body["provider"]["problem"].as_str().is_some_and(|p| p.contains("discovery")), "nothing listens on :9: {body}");
     assert_eq!(body["granted_groups"], json!(["family"]));
 

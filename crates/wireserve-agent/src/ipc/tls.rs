@@ -2,8 +2,9 @@
 //! the agent's own. The terminator runs as its own unprivileged user, and a
 //! compromise of it — it parses TLS and HTTP from the whole mesh — must not
 //! be able to declare or withdraw services, or `leave`. So this socket decodes only
-//! [`TlsRequest`], whose two operations are a check-in and a challenge
-//! record for one of this node's own names.
+//! [`TlsRequest`]: a check-in, a challenge record, and a sign-in session to
+//! redeem, renew or end (PLAN.md M48) — each for one of this node's own
+//! names.
 //!
 //! Shared with the `wireserve-tls` group (0660, in a 0750 directory) when
 //! that group exists; root-only otherwise.
@@ -15,7 +16,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
-use wireserve_types::tls::{Caller, SignInTarget, TlsConfig, TlsRequest, TlsResponse, TlsService};
+use wireserve_types::tls::{Caller, TlsConfig, TlsRequest, TlsResponse, TlsService};
 use wireserve_types::{Proto, TLS_PUBLIC_PORT};
 
 use crate::state::AgentState;
@@ -100,6 +101,24 @@ async fn dispatch(ctx: &TlsContext, req: TlsRequest) -> TlsResponse {
             TlsResponse::Config(Box::new(config))
         }
         TlsRequest::Challenge { fqdn, value, present } => challenge(ctx, &fqdn, &value, present).await,
+        TlsRequest::Redeem { fqdn, ticket } => {
+            if ticket.is_empty() || ticket.len() > wireserve_types::session::MAX_TICKET_LEN {
+                return TlsResponse::Error { message: "not a ticket".into() };
+            }
+            session(ctx, "redeem", &fqdn, serde_json::json!({ "fqdn": fqdn, "ticket": ticket })).await
+        }
+        TlsRequest::Renew { fqdn, token } => {
+            if token.len() > wireserve_types::session::MAX_TOKEN_LEN {
+                return TlsResponse::Error { message: "not a session token".into() };
+            }
+            session(ctx, "renew", &fqdn, serde_json::json!({ "fqdn": fqdn, "token": token })).await
+        }
+        TlsRequest::End { fqdn, token } => {
+            if token.len() > wireserve_types::session::MAX_TOKEN_LEN {
+                return TlsResponse::Error { message: "not a session token".into() };
+            }
+            session(ctx, "end", &fqdn, serde_json::json!({ "fqdn": fqdn, "token": token })).await
+        }
     }
 }
 
@@ -109,10 +128,8 @@ async fn dispatch(ctx: &TlsContext, req: TlsRequest) -> TlsResponse {
 /// not the directory, because the directory leaves a mapping's target
 /// address out and the terminator needs it.
 ///
-/// Each carries who may reach it (PLAN.md M36), and the sign-in is resolved
-/// to where it answers: the provider's service's own address, on the node
-/// named for it, once that node serves it with TLS — the terminator checks
-/// requests there over verified TLS.
+/// Each carries who may reach it (PLAN.md M36), and the sign-in's public key
+/// and address come as the coordinator sent them (PLAN.md M48).
 #[must_use]
 pub fn build_config(state: &AgentState) -> TlsConfig {
     let Some(directory) = &state.last_directory else {
@@ -155,22 +172,11 @@ pub fn build_config(state: &AgentState) -> TlsConfig {
             })
         })
         .collect();
-    let sign_in = naming.sign_in.as_ref().and_then(|si| {
-        // Only on its own node: a service of the same name declared by any
-        // other would receive every sign-in cookie, and decide who gets in.
-        let provider = directory.services.iter().find(|s| s.name == si.service && s.node == si.node && s.terminated)?;
-        Some(SignInTarget {
-            fqdn: format!("{}.{}", si.service, naming.domain),
-            vip: provider.vip4.as_deref()?.parse().ok()?,
-            verify_path: si.verify_path.clone(),
-            session_cookie: si.session_cookie.clone(),
-        })
-    });
     TlsConfig {
         acme: Some(acme),
         services,
         callers,
-        sign_in,
+        sign_in: naming.sign_in.clone(),
         identity_headers: naming.identity_headers.clone(),
         strip_headers: naming.strip_headers.clone(),
         forwarding_nodes: naming.forwarding_nodes.clone(),
@@ -208,6 +214,44 @@ async fn challenge(ctx: &TlsContext, fqdn: &str, value: &str, present: bool) -> 
     }
 }
 
+/// Redeems, renews or ends a sign-in session through the coordinator
+/// (`POST /sign-in/<op>`), for a name this node's terminator is configured
+/// to serve and no other.
+async fn session(ctx: &TlsContext, op: &str, fqdn: &str, body: serde_json::Value) -> TlsResponse {
+    let (url, bearer, known) = {
+        let s = ctx.state.lock().await;
+        let known = build_config(&s).services.iter().any(|svc| svc.fqdn == fqdn);
+        (s.coordinator_url.clone().unwrap_or_default(), s.bearer_token.clone(), known)
+    };
+    if !known {
+        return TlsResponse::Error { message: format!("{fqdn} is not one of this node's names") };
+    }
+    let Some(bearer) = bearer else {
+        return TlsResponse::Error { message: "not registered".into() };
+    };
+    let url = format!("{}/sign-in/{op}", url.trim_end_matches('/'));
+    #[derive(serde::Deserialize)]
+    struct Answer {
+        token: String,
+        #[serde(default)]
+        to: Option<String>,
+    }
+    match ctx.client.post(&url).bearer_auth(bearer).json(&body).send().await {
+        Ok(r) if r.status() == reqwest::StatusCode::NO_CONTENT => TlsResponse::Ok,
+        Ok(r) if r.status().is_success() => match r.json::<Answer>().await {
+            Ok(a) => TlsResponse::Session { token: a.token, to: a.to },
+            Err(e) => TlsResponse::Error { message: format!("the coordinator's answer was not understood: {e}") },
+        },
+        Ok(r) if r.status() == reqwest::StatusCode::GONE => TlsResponse::SignedOut,
+        Ok(r) => {
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            TlsResponse::Error { message: format!("coordinator refused ({status}): {}", text.escape_debug()) }
+        }
+        Err(e) => TlsResponse::Error { message: format!("coordinator unreachable: {e}") },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,10 +278,8 @@ mod tests {
             domain: "int.test".into(),
             acme: acme.then(|| AcmeSettings { directory: "https://acme.test/dir".into(), email: None, propagation_secs: 0 }),
             sign_in: Some(wireserve_types::SignIn {
-                service: "auth".into(),
-                node: "gate".into(),
-                verify_path: "/verify".into(),
-                session_cookie: "authward_session".into(),
+                public_key: "pk".into(),
+                login_url: "https://mesh.test".into(),
             }),
             identity_headers: wireserve_types::IdentityHeaders::default(),
             strip_headers: Vec::new(),
@@ -302,26 +344,25 @@ mod tests {
     }
 
     #[test]
-    fn a_restricted_service_is_served_with_its_access_and_the_sign_in_resolved() {
+    fn a_restricted_service_is_served_with_its_access_and_the_sign_in() {
         let cfg = build_config(&state(true, true));
         assert!(!cfg.services[0].access.open);
         assert_eq!(cfg.services[0].access.sign_in_groups, ["family"]);
-        let si = cfg.sign_in.expect("the provider is terminated, so it can be reached");
-        assert_eq!((si.fqdn.as_str(), si.vip), ("auth.int.test", "10.9.0.60".parse().unwrap()));
-
-        // A provider its own node does not serve with TLS yet is unreachable
-        // for the check, so there is no target — and marked services refuse.
-        let mut st = state(true, true);
-        let dir = st.last_directory.as_mut().unwrap();
-        dir.services.iter_mut().find(|s| s.name == "auth").unwrap().terminated = false;
-        assert!(build_config(&st).sign_in.is_none());
+        let si = cfg.sign_in.expect("as the coordinator sent it");
+        assert_eq!((si.public_key.as_str(), si.login_url.as_str()), ("pk", "https://mesh.test"));
     }
 
-    #[test]
-    fn a_provider_on_any_other_node_is_not_the_provider() {
-        let mut st = state(true, true);
-        let dir = st.last_directory.as_mut().unwrap();
-        dir.services.iter_mut().find(|s| s.name == "auth").unwrap().node = "impostor".into();
-        assert!(build_config(&st).sign_in.is_none(), "every cookie would go to whoever declared the name");
+    #[tokio::test]
+    async fn sessions_are_asked_about_for_this_nodes_own_names_only() {
+        let ctx = TlsContext {
+            state: Arc::new(Mutex::new(state(true, true))),
+            link: Arc::new(TlsLink::default()),
+            client: reqwest::Client::new(),
+        };
+        let req = TlsRequest::Renew { fqdn: "vault.int.test".into(), token: "wst1.x.y".into() };
+        let TlsResponse::Error { message } = dispatch(&ctx, req).await else { panic!("asked the coordinator") };
+        assert!(message.contains("not one of this node's names"), "{message}");
+        let req = TlsRequest::Redeem { fqdn: "plex.int.test".into(), ticket: "x".repeat(500) };
+        assert!(matches!(dispatch(&ctx, req).await, TlsResponse::Error { .. }), "too long to be a ticket");
     }
 }

@@ -353,8 +353,15 @@ enum OwnerAction {
         /// The device's name
         node: String,
     },
-    /// Whether device owners work: the login server, checked now, the
-    /// grants that use people's groups, and whose devices are whose
+    /// Sign a person out of every web service, in every browser
+    // PLAN.md M48: their sign-in sessions end, and each service asks them
+    // to sign in again at its next renewal. Their devices stay theirs.
+    SignOut {
+        /// Their e-mail address, or their subject at the login server
+        person: String,
+    },
+    /// Whether the login server works: the server, checked now, the grants
+    /// that use people's groups, whose devices are whose, and who is signed in
     // PLAN.md M47. Says what to do next where something is missing.
     Status {
         /// Print the coordinator's response as JSON
@@ -622,6 +629,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             wireserve_admin::cmd_remove_owner(&client, &node)?;
             println!("node '{node}' belongs to nobody now, from its next poll");
         }
+        Command::Owner { action: OwnerAction::SignOut { person } } => {
+            let client = build_client(&coordinator_url, &admin_token)?;
+            let ended = wireserve_admin::cmd_end_sessions(&client, &person)?;
+            println!("signed {person} out of {ended} browser{}", if ended == 1 { "" } else { "s" });
+        }
         Command::Owner { action: OwnerAction::Status { json } } => {
             let client = build_client(&coordinator_url, &admin_token)?;
             let status = wireserve_admin::cmd_owners_status(&client)?;
@@ -675,8 +687,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let groups = r.sign_in_groups.iter().map(|g| clean(g)).collect::<Vec<_>>();
                     println!("  anyone else: the sign-in, with one of {}", groups.join(", "));
                 } else if !r.sign_in_groups.is_empty() {
-                    println!("  (identity-provider groups are granted, but no sign-in applies: no provider, \
-                              no terminator serving it, or its node's agent is too old)");
+                    println!("  (identity-provider groups are granted, but no sign-in applies: no login server or \
+                              DNS records, no terminator serving it, or its node's agent is too old)");
                 }
             }
             if r.default_closed {

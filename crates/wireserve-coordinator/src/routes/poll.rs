@@ -383,7 +383,7 @@ pub async fn poll(
     let ctx = state.directory_context(&tls_ready);
     let mut services = directory::services_directory(&all_services, &all_peers, &ctx);
     let rules = crate::access::read_rules(&conn)?;
-    let provider = state.config.sign_in.as_ref().map(|si| (si.service.as_str(), si.node.as_str()));
+    let available = state.config.sign_in().is_some();
     let sign_in_capable = |owner: &nodes::NodeRow| {
         owner.pubkey.as_deref().is_some_and(|pk| {
             state.transit.has_capability(pk, wireserve_types::CAP_SIGN_IN, state.config.online_threshold_secs)
@@ -397,7 +397,7 @@ pub async fn poll(
         .filter_map(|s| {
             let owner = all_peers.iter().find(|n| n.id == s.node_id)?;
             let facts =
-                crate::access::SignInFacts { provider, owner_capable: sign_in_capable(owner), terminated: ctx.terminates(s) };
+                crate::access::SignInFacts { available, owner_capable: sign_in_capable(owner), terminated: ctx.terminates(s) };
             Some((s.name.as_str(), crate::access::reach(s, owner, &node, &rules, &facts)))
         })
         .collect();
@@ -414,7 +414,7 @@ pub async fn poll(
         .iter()
         .filter(|s| s.denied_at.is_none() || s.approved_at.is_some())
         .map(|s| {
-            let facts = crate::access::SignInFacts { provider, owner_capable, terminated: ctx.terminates(s) };
+            let facts = crate::access::SignInFacts { available, owner_capable, terminated: ctx.terminates(s) };
             crate::access::service_access(s, &node, &all_peers, &rules, &facts)
         })
         .collect();

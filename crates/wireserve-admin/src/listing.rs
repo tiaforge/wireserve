@@ -208,14 +208,15 @@ pub fn nodes(resp: &AdminPeersResponse, now: DateTime<Utc>) -> String {
     table(&header, &rows)
 }
 
-/// `owner status` (PLAN.md M47): the login server, the grants that use
-/// people's groups and the owners, each with what to do when it's missing.
+/// `owner status` (PLAN.md M47, M48): the login server, the grants that
+/// use people's groups, the owners and who is signed in, each with what to
+/// do when it's missing.
 #[must_use]
 pub fn owners(status: &OwnersStatus, now: DateTime<Utc>) -> String {
     let Some(p) = &status.provider else {
-        return "Device owners are off: devices don't belong to anyone, and access goes by the device.\n\
-                To let access follow people, on the coordinator's machine run:\n\
-                \x20 sudo wireserve-coordinator setup owners\n"
+        return "There is no login server: devices don't belong to anyone, nobody signs in, and access\n\
+                goes by the device. To let access follow people, on the coordinator's machine run:\n\
+                \x20 sudo wireserve-coordinator setup login\n"
             .to_string();
     };
     let mut out = String::new();
@@ -233,37 +234,76 @@ pub fn owners(status: &OwnersStatus, now: DateTime<Utc>) -> String {
         ("redirect URL", format!("{}  (registered there)", clean(&p.redirect_url))),
         ("groups", format!("from the `{}` claim, refreshed every {}", clean(&p.groups_claim), every(p.refresh_secs))),
         ("grants", granted),
+        (
+            "sign-in",
+            if status.sign_in {
+                format!("on: web services ask whoever their grants don't let in ({} signed in)", status.sessions.len())
+            } else {
+                "off until the coordinator publishes DNS records (`setup domain`)".to_string()
+            },
+        ),
     ]));
     out.push('\n');
     if status.owners.is_empty() {
         out.push_str("No device belongs to anyone yet. Hand one to its person with:\n");
         out.push_str("  wireserve-admin owner link <device> --qr\n");
-        return out;
+    } else {
+        out.push_str(&owner_table(status, now));
     }
+    if !status.sessions.is_empty() {
+        out.push('\n');
+        out.push_str(&session_table(status, now));
+    }
+    out
+}
+
+fn note(stale: bool, failing_since: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+    match (stale, failing_since) {
+        (true, _) => "refresh failing for over an hour; its groups count for nothing".to_string(),
+        (false, Some(since)) => format!("refresh failing since {}; groups count for an hour", ago(since, now)),
+        (false, None) => String::new(),
+    }
+}
+
+/// Drops the last column when no row has anything in it.
+fn table_with_note(mut header: Vec<&str>, mut rows: Vec<Vec<String>>) -> String {
+    if rows.iter().all(|r| r.last().is_some_and(String::is_empty)) {
+        for r in &mut rows {
+            r.pop();
+        }
+        header.pop();
+    }
+    table(&header, &rows)
+}
+
+fn session_table(status: &OwnersStatus, now: DateTime<Utc>) -> String {
+    let rows: Vec<Vec<String>> = status
+        .sessions
+        .iter()
+        .map(|s| {
+            let who = s.person.email.as_deref().or(s.person.name.as_deref()).unwrap_or(&s.person.sub);
+            vec![
+                clean(who),
+                list(&s.person.groups),
+                ago(s.signed_in_at, now),
+                ago(s.last_used_at, now),
+                note(s.person.stale, s.failing_since, now),
+            ]
+        })
+        .collect();
+    table_with_note(vec!["SIGNED IN", "GROUPS", "SINCE", "USED", "NOTE"], rows)
+}
+
+fn owner_table(status: &OwnersStatus, now: DateTime<Utc>) -> String {
     let rows: Vec<Vec<String>> = status
         .owners
         .iter()
         .map(|o| {
             let who = o.owner.email.as_deref().or(o.owner.name.as_deref()).unwrap_or(&o.owner.sub);
-            let note = match (o.owner.stale, o.failing_since) {
-                (true, _) => "refresh failing for over an hour; its groups count for nothing".to_string(),
-                (false, Some(since)) => format!("refresh failing since {}; groups count for an hour", ago(since, now)),
-                (false, None) => String::new(),
-            };
-            vec![clean(&o.node), clean(who), list(&o.owner.groups), ago(o.refreshed_at, now), note]
+            vec![clean(&o.node), clean(who), list(&o.owner.groups), ago(o.refreshed_at, now), note(o.owner.stale, o.failing_since, now)]
         })
         .collect();
-    let mut rows = rows;
-    let mut header = vec!["DEVICE", "OWNER", "GROUPS", "REFRESHED"];
-    if rows.iter().all(|r| r.last().is_some_and(String::is_empty)) {
-        for r in &mut rows {
-            r.pop();
-        }
-    } else {
-        header.push("NOTE");
-    }
-    out.push_str(&table(&header, &rows));
-    out
+    table_with_note(vec!["DEVICE", "OWNER", "GROUPS", "REFRESHED", "NOTE"], rows)
 }
 
 /// `15 min`, `1 h`, `90 s`.
@@ -452,20 +492,21 @@ phone   10.1.0.3  -                     never   -         yes       -           
     fn owner_status_says_what_is_missing() {
         use wireserve_types::{OwnedNode, OwnerInfo, OwnersProvider};
         let now = Utc::now();
-        let off = OwnersStatus { provider: None, owners: vec![], granted_groups: vec![] };
-        assert!(owners(&off, now).contains("sudo wireserve-coordinator setup owners"));
+        let off = OwnersStatus { provider: None, owners: vec![], sign_in: false, sessions: vec![], granted_groups: vec![] };
+        assert!(owners(&off, now).contains("sudo wireserve-coordinator setup login"));
 
         let provider = OwnersProvider {
             issuer: "https://id.example.com".into(),
-            redirect_url: "https://mesh.example.com/claim/callback".into(),
+            redirect_url: "https://mesh.example.com/oidc/callback".into(),
             groups_claim: "groups".into(),
             scopes: vec!["openid".into()],
             refresh_secs: 900,
             problem: None,
         };
-        let empty = OwnersStatus { provider: Some(provider.clone()), owners: vec![], granted_groups: vec![] };
+        let empty = OwnersStatus { provider: Some(provider.clone()), owners: vec![], sign_in: false, sessions: vec![], granted_groups: vec![] };
         let out = owners(&empty, now);
         assert!(out.contains("(answering)") && out.contains("every 15 min"), "{out}");
+        assert!(out.contains("off until the coordinator publishes DNS records"), "{out}");
         assert!(out.contains("grant add oidc:family media") && out.contains("owner link <device>"), "{out}");
 
         let alice = OwnedNode {
@@ -481,11 +522,26 @@ phone   10.1.0.3  -                     never   -         yes       -           
             failing_since: Some(now - chrono::Duration::minutes(5)),
         };
         let down = OwnersProvider { problem: Some("discovery: connection refused".into()), ..provider };
-        let full = OwnersStatus { provider: Some(down), owners: vec![alice.clone(), bob], granted_groups: vec!["family".into()] };
+        let session = wireserve_types::SignInSession {
+            person: OwnerInfo { sub: "c3".into(), email: Some("carl@example.com".into()), name: None, groups: vec!["family".into()], stale: false },
+            signed_in_at: now - chrono::Duration::hours(2),
+            refreshed_at: now - chrono::Duration::minutes(1),
+            last_used_at: now - chrono::Duration::minutes(1),
+            failing_since: None,
+        };
+        let full = OwnersStatus {
+            provider: Some(down),
+            owners: vec![alice.clone(), bob],
+            sign_in: true,
+            sessions: vec![session],
+            granted_groups: vec!["family".into()],
+        };
         let out = owners(&full, now);
         assert!(out.contains("NOT ANSWERING: discovery: connection refused") && out.contains("oidc:family"), "{out}");
         assert!(out.contains("laptop  alice@example.com  family  3m ago"), "{out}");
         assert!(out.contains("refresh failing since 5m ago"), "{out}");
+        assert!(out.contains("on: web services ask") && out.contains("(1 signed in)"), "{out}");
+        assert!(out.contains("carl@example.com  family  2h ago  1m ago"), "{out}");
         let fine = OwnersStatus { owners: vec![alice], ..full };
         assert!(!owners(&fine, now).contains("NOTE"), "no note, no column");
     }

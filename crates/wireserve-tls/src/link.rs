@@ -22,6 +22,9 @@ pub enum LinkError {
     Decode(serde_json::Error),
     #[error("{0}")]
     Refused(String),
+    /// The sign-in session is over (PLAN.md M48).
+    #[error("signed out")]
+    SignedOut,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +61,31 @@ impl Link {
         }
     }
 
+    /// Redeems a sign-in ticket for the service `fqdn` (PLAN.md M48): its
+    /// session token, and the path the browser goes on to.
+    pub async fn redeem(&self, fqdn: &str, ticket: &str) -> Result<(String, Option<String>), LinkError> {
+        match self.exchange(&TlsRequest::Redeem { fqdn: fqdn.into(), ticket: ticket.into() }).await? {
+            TlsResponse::Session { token, to } => Ok((token, to)),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// A fresh session token for an expired one.
+    pub async fn renew(&self, fqdn: &str, token: &str) -> Result<String, LinkError> {
+        match self.exchange(&TlsRequest::Renew { fqdn: fqdn.into(), token: token.into() }).await? {
+            TlsResponse::Session { token, .. } => Ok(token),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Ends the session `token` is for.
+    pub async fn end(&self, fqdn: &str, token: &str) -> Result<(), LinkError> {
+        match self.exchange(&TlsRequest::End { fqdn: fqdn.into(), token: token.into() }).await? {
+            TlsResponse::Ok | TlsResponse::SignedOut => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
     async fn exchange(&self, req: &TlsRequest) -> Result<TlsResponse, LinkError> {
         let io = |e| LinkError::Io(self.socket.clone(), e);
         let run = async {
@@ -77,6 +105,7 @@ impl Link {
 fn unexpected(resp: TlsResponse) -> LinkError {
     match resp {
         TlsResponse::Error { message } => LinkError::Refused(message),
+        TlsResponse::SignedOut => LinkError::SignedOut,
         other => LinkError::Refused(format!("unexpected answer: {other:?}")),
     }
 }

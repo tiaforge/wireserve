@@ -51,6 +51,10 @@ pub fn build_state_with_dns(
             routes::tls::CHALLENGE_BURST,
             routes::tls::CHALLENGES_PER_MIN,
         )),
+        sign_in_limiter: Arc::new(rate_limit::TokenBuckets::new(
+            oidc::sign_in::SIGN_IN_BURST,
+            oidc::sign_in::SIGN_INS_PER_MIN,
+        )),
         transit: Arc::new(transit::TransitState::default()),
         oidc: config.oidc.clone().map(|c| Arc::new(oidc::Oidc::new(c))),
         released: Arc::default(),

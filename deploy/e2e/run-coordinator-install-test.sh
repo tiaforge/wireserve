@@ -8,7 +8,7 @@
 # asked-for settings, starts the service as that user and leaves
 # wireserve-admin working for the admin user with no flags; that
 # --reconfigure changes only its own keys; that a plain re-run upgrades
-# without touching the settings; and that `setup domain|owners|sign-in`
+# without touching the settings; and that `setup domain|login`
 # (PLAN.md M47) change only theirs, and restart the service to take them.
 #
 # The image has to be able to run binaries built on this machine (same or
@@ -104,7 +104,7 @@ if grep -q '^WIRESERVE_SERVICE_DOMAIN=' "$WORK/env1"; then fail "install set a d
 if grep -q '^WIRESERVE_TRUSTED_PROXY=' "$WORK/env1"; then fail "trusted proxy set for a local web server"; fi
 [ "$(in_c "$C" stat -c '%U %a' /etc/wireserve/coordinator.env)" = "root 600" ] || fail "env file not root 600"
 pass "env file holds exactly the answers, root 600"
-for verb in "setup domain" "setup owners" "setup sign-in"; do
+for verb in "setup domain" "setup login"; do
     grep -q "wireserve-coordinator $verb" "$WORK/fresh.out" || fail "install does not point at $verb"
 done
 pass "install points at the setup commands"
@@ -143,31 +143,30 @@ in_c "$C" runuser -l tester -c 'wireserve-admin node list' >/dev/null || fail "a
 pass "hand-added line kept, approval off, the domain and the rest unchanged, same admin key"
 
 # ---------------------------------------------------------------------
-log "setup sign-in needs DNS records; setup owners writes and clears its keys"
-if in_c "$C" /opt/ws/wireserve-coordinator setup sign-in --node gate --yes >"$WORK/signin.out" 2>&1; then
-    fail "a sign-in without DNS records was accepted"
-fi
-grep -q 'setup domain' "$WORK/signin.out" || { cat "$WORK/signin.out"; fail "the refusal does not point at setup domain"; }
-pass "setup sign-in without DNS records points at setup domain"
-
-in_c "$C" env WIRESERVE_OIDC_CLIENT_SECRET=s3cret /opt/ws/wireserve-coordinator setup owners \
-    --issuer https://id.test/application/o/wireserve/ --client-id wireserve --skip-check --yes >"$WORK/owners.out" 2>&1 \
-    || { cat "$WORK/owners.out"; fail "setup owners exited non-zero"; }
+log "setup login writes and clears its keys, and the old sign-in's"
+# A key the forward_auth sign-in read before M48: nothing reads it now, and
+# setup login takes it out, saying so.
+in_c "$C" sh -c 'echo "WIRESERVE_AUTH_SERVICE=auth" >> /etc/wireserve/coordinator.env'
+in_c "$C" env WIRESERVE_OIDC_CLIENT_SECRET=s3cret /opt/ws/wireserve-coordinator setup login \
+    --issuer https://id.test/application/o/wireserve/ --client-id wireserve --skip-check --yes >"$WORK/login.out" 2>&1 \
+    || { cat "$WORK/login.out"; fail "setup login exited non-zero"; }
 in_c "$C" cat /etc/wireserve/coordinator.env > "$WORK/env2b"
 expect_key "$WORK/env2b" WIRESERVE_OIDC_ISSUER=https://id.test/application/o/wireserve/
 expect_key "$WORK/env2b" WIRESERVE_OIDC_CLIENT_ID=wireserve
 expect_key "$WORK/env2b" WIRESERVE_OIDC_CLIENT_SECRET=s3cret
-if grep -q 's3cret' "$WORK/owners.out"; then fail "the client secret was printed"; fi
-in_c "$C" systemctl is-active --quiet wireserve-coordinator || fail "service not active with owners set up"
-grep -q 'owner link' "$WORK/owners.out" || { cat "$WORK/owners.out"; fail "setup owners does not say what's next"; }
-pass "owners set up (issuer as typed, secret from the environment, never printed)"
+if grep -q '^WIRESERVE_AUTH_SERVICE=' "$WORK/env2b"; then fail "the old sign-in's key is still active"; fi
+if grep -q 's3cret' "$WORK/login.out"; then fail "the client secret was printed"; fi
+in_c "$C" systemctl is-active --quiet wireserve-coordinator || fail "service not active with a login server set up"
+grep -q 'owner link' "$WORK/login.out" || { cat "$WORK/login.out"; fail "setup login does not say what's next"; }
+grep -q 'setup domain' "$WORK/login.out" || { cat "$WORK/login.out"; fail "setup login does not say the sign-in needs DNS records"; }
+pass "login server set up (issuer as typed, secret from the environment, never printed); the old key gone"
 
-in_c "$C" /opt/ws/wireserve-coordinator setup owners --off --yes >"$WORK/owners-off.out" 2>&1 \
-    || { cat "$WORK/owners-off.out"; fail "setup owners --off failed"; }
+in_c "$C" /opt/ws/wireserve-coordinator setup login --off --yes >"$WORK/login-off.out" 2>&1 \
+    || { cat "$WORK/login-off.out"; fail "setup login --off failed"; }
 in_c "$C" cat /etc/wireserve/coordinator.env > "$WORK/env2c"
 if grep -q '^WIRESERVE_OIDC_' "$WORK/env2c"; then fail "an OIDC key is still active"; fi
 expect_key "$WORK/env2c" "# WIRESERVE_OIDC_CLIENT_SECRET=s3cret"
-pass "--off comments the owner keys out"
+pass "--off comments the login server's keys out"
 
 in_c "$C" /opt/ws/wireserve-coordinator setup domain --off --yes >"$WORK/domain-off.out" 2>&1 \
     || { cat "$WORK/domain-off.out"; fail "setup domain --off failed"; }

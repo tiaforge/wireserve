@@ -1,16 +1,20 @@
-//! Device owners through the operator's identity provider (PLAN.md M38).
+//! The coordinator as an OpenID Connect client of the operator's identity
+//! provider: device owners (PLAN.md M38) and the sign-in (PLAN.md M48),
+//! through one client, so a group means the same on both paths.
 //!
-//! The coordinator is an OpenID Connect client of the same provider the
-//! sign-in uses, so a group means the same on both paths. A person claims a
-//! node with a link only an admin can make (`claim`): the code flow with
-//! PKCE, a confirmation page naming the node, and the node is theirs — its
-//! grants then count their groups. Their refresh token, sealed with a key
-//! kept outside the database, lets the coordinator fetch the groups again
-//! (`refresh`), and a provider refusing it ends the ownership.
+//! A person claims a node with a link only an admin can make (`claim`): the
+//! code flow with PKCE, a confirmation page naming the node, and the node is
+//! theirs — its grants then count their groups. A person signs in to a
+//! restricted service (`sign_in`) through the same flow, and the service's
+//! terminator gets a session token the coordinator signs. Either way their
+//! refresh token, sealed with a key kept outside the database, lets the
+//! coordinator fetch the groups again (`refresh`, and a session's renewal),
+//! and a provider refusing it ends the ownership or the session.
 
 pub mod claim;
 pub mod pages;
 pub mod refresh;
+pub mod sign_in;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -77,8 +81,7 @@ pub struct Refreshed {
 /// The ID token's email, if the provider marks it verified (PLAN.md #275).
 /// An unverified one is whatever the person typed into their profile, and
 /// it goes to backends as the owner's email header: one that keys on email
-/// would take them for whoever's address they typed. authward refuses it
-/// the same way.
+/// would take them for whoever's address they typed.
 fn verified_email<AC: openidconnect::AdditionalClaims, GC: openidconnect::GenderClaim>(
     claims: &openidconnect::IdTokenClaims<AC, GC>,
 ) -> Option<String> {
@@ -121,6 +124,13 @@ pub struct Oidc {
     pub config: OidcConfig,
     http: reqwest::Client,
     pub(crate) flows: Mutex<HashMap<String, claim::Flow>>,
+    /// One renewal per session at a time (PLAN.md M48): many providers
+    /// rotate the refresh token on each use and, seeing an old one used
+    /// again, revoke the whole family — a page firing ten requests as its
+    /// token runs out must not cost the person their session.
+    pub(crate) renewing: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    /// Signs session tokens.
+    pub(crate) signing_key: ed25519_dalek::SigningKey,
 }
 
 async fn send(http: reqwest::Client, req: openidconnect::HttpRequest) -> Result<openidconnect::HttpResponse, HttpError> {
@@ -143,7 +153,8 @@ impl Oidc {
             .timeout(HTTP_TIMEOUT)
             .build()
             .expect("a client with a timeout and no redirects builds");
-        Self { config, http, flows: Mutex::default() }
+        let signing_key = config.signing_key();
+        Self { config, http, flows: Mutex::default(), renewing: Mutex::default(), signing_key }
     }
 
     fn caller(&self) -> impl Fn(openidconnect::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<openidconnect::HttpResponse, HttpError>> + Send>> {
@@ -292,21 +303,35 @@ impl Oidc {
     /// to another node's row does not open.
     #[must_use]
     pub fn seal(&self, node_id: i64, token: &str) -> String {
+        self.seal_for(&node_id.to_be_bytes(), token)
+    }
+
+    /// Opens what [`Self::seal`] sealed for `node_id`.
+    #[must_use]
+    pub fn open(&self, node_id: i64, sealed: &str) -> Option<String> {
+        self.open_for(&node_id.to_be_bytes(), sealed)
+    }
+
+    /// [`Self::seal`] for whatever `aad` names: a session's refresh token is
+    /// sealed for the session (`s:` and its id), which no node id's eight
+    /// bytes can be.
+    #[must_use]
+    pub fn seal_for(&self, aad: &[u8], token: &str) -> String {
         use base64::Engine as _;
         use chacha20poly1305::aead::{Aead, KeyInit, Payload};
         let cipher = chacha20poly1305::XChaCha20Poly1305::new((&self.config.token_key).into());
         let nonce: [u8; 24] = rand::random();
         let sealed = cipher
-            .encrypt((&nonce).into(), Payload { msg: token.as_bytes(), aad: &node_id.to_be_bytes() })
+            .encrypt((&nonce).into(), Payload { msg: token.as_bytes(), aad })
             .expect("sealing a short token does not fail");
         let mut out = nonce.to_vec();
         out.extend(sealed);
         base64::engine::general_purpose::STANDARD.encode(out)
     }
 
-    /// Opens what [`Self::seal`] sealed for `node_id`.
+    /// Opens what [`Self::seal_for`] sealed for `aad`.
     #[must_use]
-    pub fn open(&self, node_id: i64, sealed: &str) -> Option<String> {
+    pub fn open_for(&self, aad: &[u8], sealed: &str) -> Option<String> {
         use base64::Engine as _;
         use chacha20poly1305::aead::{Aead, KeyInit, Payload};
         let raw = base64::engine::general_purpose::STANDARD.decode(sealed).ok()?;
@@ -315,7 +340,7 @@ impl Oidc {
         }
         let (nonce, ct) = raw.split_at(24);
         let cipher = chacha20poly1305::XChaCha20Poly1305::new((&self.config.token_key).into());
-        let plain = cipher.decrypt(nonce.into(), Payload { msg: ct, aad: &node_id.to_be_bytes() }).ok()?;
+        let plain = cipher.decrypt(nonce.into(), Payload { msg: ct, aad }).ok()?;
         String::from_utf8(plain).ok()
     }
 }
@@ -368,7 +393,8 @@ pub(crate) fn test_config() -> OidcConfig {
         groups_claim: "groups".into(),
         refresh_interval: Duration::from_secs(900),
         token_key: [7; 32],
-        redirect_url: "https://mesh.example.com/claim/callback".into(),
+        sign_in_key: [9; 32],
+        redirect_url: "https://mesh.example.com/oidc/callback".into(),
     }
 }
 

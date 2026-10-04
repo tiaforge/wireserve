@@ -15,6 +15,9 @@ pub struct AppState {
     /// What one node may ask of `/tls/challenge` — each new value is a call
     /// to the operator's DNS provider — per node.
     pub challenge_limiter: Arc<TokenBuckets>,
+    /// What one node may ask of the sign-in's redeem, renew and end calls,
+    /// per node (PLAN.md M48).
+    pub sign_in_limiter: Arc<TokenBuckets>,
     /// Ephemeral transit-selection state (PLAN.md M23) — see
     /// `transit::TransitState`'s module doc for why this lives in memory
     /// rather than the database.

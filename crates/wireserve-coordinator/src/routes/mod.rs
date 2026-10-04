@@ -32,10 +32,17 @@ pub fn node_router(state: AppState) -> Router {
         .route("/poll", post(poll::poll))
         .route("/probe", get(probe::probe))
         .route("/tls/challenge", post(tls::add).delete(tls::remove))
-        // Device owners (PLAN.md M38): pages a browser opens.
-        .route("/claim/callback", get(crate::oidc::claim::callback))
+        // Device owners (PLAN.md M38) and the sign-in (PLAN.md M48): pages
+        // a browser opens, and where the identity provider sends it back.
+        .route("/oidc/callback", get(crate::oidc::claim::callback))
         .route("/claim/confirm", post(crate::oidc::claim::confirm))
         .route("/claim/{code}", get(crate::oidc::claim::start))
+        .route("/sign-in", get(crate::oidc::sign_in::start))
+        .route("/signed-out", get(crate::oidc::sign_in::signed_out))
+        // The sign-in's node calls (PLAN.md M48), bearer-authenticated.
+        .route("/sign-in/redeem", post(crate::oidc::sign_in::redeem))
+        .route("/sign-in/renew", post(crate::oidc::sign_in::renew))
+        .route("/sign-in/end", post(crate::oidc::sign_in::end))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
@@ -86,6 +93,7 @@ pub fn admin_router(state: AppState) -> Router {
         .route("/admin/access/nodes/{name}", get(admin::node_access_report))
         .route("/admin/nodes/{name}/claim", post(admin::claim_link))
         .route("/admin/owners", get(admin::owners_status))
+        .route("/admin/sessions/{person}", delete(admin::end_sessions))
         .route("/admin/nodes/{name}/owner", delete(admin::remove_owner))
         .route(
             "/admin/nodes/{name}/services/{service}/approve",

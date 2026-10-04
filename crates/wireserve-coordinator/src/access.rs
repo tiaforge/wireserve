@@ -74,9 +74,10 @@ pub fn read_rules(conn: &rusqlite::Connection) -> Result<Rules, crate::db::DbErr
 
 /// What a service's own node needs to know about the sign-in, beyond the
 /// grants.
-pub struct SignInFacts<'a> {
-    /// `(service, node)` of the configured provider, if any.
-    pub provider: Option<(&'a str, &'a str)>,
+pub struct SignInFacts {
+    /// The coordinator has a sign-in (PLAN.md M48): an identity provider,
+    /// and DNS records for the terminators to serve under.
+    pub available: bool,
     /// The owning node's terminator can check devices and fall back to the
     /// sign-in (`CAP_SIGN_IN`), reported on its latest poll.
     pub owner_capable: bool,
@@ -95,14 +96,9 @@ pub fn service_access(
     owner: &NodeRow,
     peers: &[NodeRow],
     rules: &Rules,
-    sign_in: &SignInFacts<'_>,
+    sign_in: &SignInFacts,
 ) -> ServiceAccess {
     let open = ServiceAccess { name: service.name.clone(), open: true, sources: vec![], sign_in: false, sign_in_groups: vec![] };
-    // The provider stays reachable by everyone: every terminator asks it,
-    // and a browser not allowed anywhere yet has to reach its login page.
-    if sign_in.provider == Some((service.name.as_str(), owner.name.as_str())) {
-        return open;
-    }
     let granted = rules.granted(&service.name);
     if granted.contains(&GrantSource::Everyone) {
         return open;
@@ -131,10 +127,10 @@ fn sign_in_groups(granted: &BTreeSet<GrantSource>) -> Vec<String> {
         .collect()
 }
 
-impl SignInFacts<'_> {
+impl SignInFacts {
     /// Whether the owner's terminator lets anyone try the sign-in.
     fn offered(&self, sign_in_groups: &[String]) -> bool {
-        self.provider.is_some() && self.owner_capable && self.terminated && !sign_in_groups.is_empty()
+        self.available && self.owner_capable && self.terminated && !sign_in_groups.is_empty()
     }
 }
 
@@ -146,9 +142,9 @@ pub fn reach(
     owner: &NodeRow,
     requester: &NodeRow,
     rules: &Rules,
-    sign_in: &SignInFacts<'_>,
+    sign_in: &SignInFacts,
 ) -> Reach {
-    if requester.id == owner.id || sign_in.provider == Some((service.name.as_str(), owner.name.as_str())) {
+    if requester.id == owner.id {
         return Reach::Allowed;
     }
     let granted = rules.granted(&service.name);
@@ -208,10 +204,10 @@ mod tests {
         vec![node(1, "home", "10.9.0.1"), node(2, "ci", "10.9.0.2"), node(3, "laptop", "10.9.0.3"), node(4, "tv", "10.9.0.4")]
     }
 
-    const NO_SIGN_IN: SignInFacts<'static> = SignInFacts { provider: None, owner_capable: true, terminated: true };
-    const SIGN_IN: SignInFacts<'static> = SignInFacts { provider: Some(("auth", "gate")), owner_capable: true, terminated: true };
+    const NO_SIGN_IN: SignInFacts = SignInFacts { available: false, owner_capable: true, terminated: true };
+    const SIGN_IN: SignInFacts = SignInFacts { available: true, owner_capable: true, terminated: true };
 
-    fn access(svc: &str, grants: &[Grant], si: &SignInFacts<'_>) -> ServiceAccess {
+    fn access(svc: &str, grants: &[Grant], si: &SignInFacts) -> ServiceAccess {
         let peers = peers();
         service_access(&service(svc), &peers[0], &peers, &rules(grants), si)
     }
@@ -236,13 +232,13 @@ mod tests {
         let a = access("db", &[grant("tag:ops", "infra"), grant("oidc:family", "infra")], &NO_SIGN_IN);
         assert_eq!(a.sources, ips(&["10.9.0.1", "10.9.0.2", "10.9.0.3"]));
         assert_eq!(a.sign_in_groups, ["family"]);
-        assert!(!a.sign_in, "no provider configured");
+        assert!(!a.sign_in, "no sign-in configured");
         let a = access("db", &[grant("tag:ops", "other")], &NO_SIGN_IN);
         assert_eq!(a.sources, ips(&["10.9.0.1"]), "a grant to another group is not this one's");
     }
 
     #[test]
-    fn the_sign_in_needs_a_provider_a_capable_terminator_and_a_group_to_prove() {
+    fn the_sign_in_needs_one_configured_a_capable_terminator_and_a_group_to_prove() {
         let g = [grant("oidc:family", "infra")];
         assert!(access("db", &g, &SIGN_IN).sign_in);
         assert!(!access("db", &[grant("tag:ops", "infra")], &SIGN_IN).sign_in, "nothing to prove by signing in");
@@ -284,7 +280,6 @@ mod tests {
             SIGN_IN,
             SignInFacts { owner_capable: false, ..SIGN_IN },
             SignInFacts { terminated: false, ..SIGN_IN },
-            SignInFacts { provider: Some(("db", "home")), ..SIGN_IN },
         ];
         for grants in &grant_sets {
             let r = rules(grants);
@@ -315,14 +310,15 @@ mod tests {
     }
 
     #[test]
-    fn the_provider_on_its_own_node_is_always_open() {
+    fn no_service_is_open_for_being_named_like_a_sign_in() {
+        // Before M48 the forward_auth provider's own service was always
+        // open; the coordinator is the sign-in now, and an `auth` is
+        // restricted like anything else.
         let peers = vec![node(9, "gate", "10.9.0.9")];
         let mut r = rules(&[grant("tag:ops", "infra")]);
         r.members.insert("auth".into(), BTreeSet::from(["infra".to_string()]));
         let mut svc = service("auth");
         svc.node_id = 9;
-        assert!(service_access(&svc, &peers[0], &peers, &r, &SIGN_IN).open);
-        let elsewhere = node(1, "home", "10.9.0.1");
-        assert!(!service_access(&svc, &elsewhere, &peers, &r, &SIGN_IN).open, "only on the named node");
+        assert!(!service_access(&svc, &peers[0], &peers, &r, &SIGN_IN).open);
     }
 }

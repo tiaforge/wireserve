@@ -4,6 +4,7 @@ pub mod owners;
 pub mod nodes;
 pub mod tls;
 pub mod services;
+pub mod sessions;
 
 use std::path::Path;
 
@@ -120,6 +121,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0020_phone_relays.sql")),
         M::up(include_str!("../../migrations/0021_released_service_addresses.sql")),
         M::up(include_str!("../../migrations/0022_owner_emails_verified.sql")),
+        M::up(include_str!("../../migrations/0023_sign_in_sessions.sql")),
     ])
 }
 
@@ -325,7 +327,7 @@ mod tests {
         let peers = crate::db::nodes::list_all_peers(&conn).unwrap();
         let row = crate::db::services::find_by_name(&conn, "jellyfin").unwrap().unwrap();
         let owner = crate::db::nodes::find_by_id(&conn, 1).unwrap().unwrap();
-        let facts = crate::access::SignInFacts { provider: None, owner_capable: true, terminated: true };
+        let facts = crate::access::SignInFacts { available: false, owner_capable: true, terminated: true };
         assert!(crate::access::service_access(&row, &owner, &peers, &rules, &facts).open, "reachable exactly as before");
     }
 

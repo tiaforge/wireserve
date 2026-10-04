@@ -45,9 +45,6 @@ pub struct Options {
     /// A CA certificate to trust for the ACME server itself, for a test CA
     /// such as Pebble. Never needed for a public CA.
     pub ca_file: Option<PathBuf>,
-    /// Another CA to trust for the sign-in check, besides the public roots —
-    /// a test CA such as Pebble's issuing root. Never needed otherwise.
-    pub trust_file: Option<PathBuf>,
     pub check_in_every: Duration,
     /// The port to listen on when systemd passed no socket (PLAN.md M35).
     pub port: u16,
@@ -103,14 +100,6 @@ pub async fn run(opts: Options) -> Result<(), Error> {
     let shared = serve::Shared::default();
     let listener = serve::listener(opts.port).map_err(|e| Error::Listen(opts.port, e))?;
     let port = listener.local_addr().map_err(|e| Error::Listen(opts.port, e))?.port();
-    let extra_roots: Vec<rustls_pki_types::CertificateDer<'static>> = match &opts.trust_file {
-        None => Vec::new(),
-        Some(path) => {
-            use rustls_pki_types::pem::PemObject;
-            let pem = std::fs::read(path).map_err(Error::State)?;
-            rustls_pki_types::CertificateDer::pem_slice_iter(&pem).filter_map(Result::ok).collect()
-        }
-    };
 
     let mut served: BTreeMap<String, Served> = BTreeMap::new();
     let mut issuance: BTreeMap<String, Issuance> = BTreeMap::new();
@@ -145,7 +134,7 @@ pub async fn run(opts: Options) -> Result<(), Error> {
             }
         };
         update_callers(&shared.callers, &config);
-        update_sign_in(&shared.sign_in, config.sign_in.as_ref(), &extra_roots);
+        update_sign_in(&shared.sign_in, config.sign_in.as_ref(), &link);
         *shared.identity.write().unwrap_or_else(std::sync::PoisonError::into_inner) = config.identity_headers.clone();
         *shared.strip.write().unwrap_or_else(std::sync::PoisonError::into_inner) = config.strip_headers.clone();
         *shared.forwarders.write().unwrap_or_else(std::sync::PoisonError::into_inner) = config.forwarding_nodes.clone();
@@ -323,16 +312,21 @@ fn prune(store: &Store, settings: &wireserve_types::AcmeSettings, config: &TlsCo
     }
 }
 
-/// Replaces the sign-in client when the provider moved — only then, so its
-/// connection pool survives every check-in that changed nothing.
-fn update_sign_in(shared: &SharedSignIn, target: Option<&wireserve_types::tls::SignInTarget>, extra_roots: &[rustls_pki_types::CertificateDer<'static>]) {
+/// Replaces the sign-in when the coordinator's settings changed — only then,
+/// so the sessions renewed lately are still known after every check-in
+/// that changed nothing.
+fn update_sign_in(shared: &SharedSignIn, settings: Option<&wireserve_types::SignIn>, link: &Link) {
     let mut current = shared.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if current.as_ref().map(|s| &s.target) == target {
+    if current.as_ref().map(|s| &s.settings) == settings {
         return;
     }
-    *current = target.map(|t| {
-        tracing::info!(provider = %t.fqdn, addr = %t.vip, "sign-in provider");
-        sign_in::SignIn::new(t.clone(), extra_roots)
+    *current = settings.and_then(|s| {
+        let made = sign_in::SignIn::new(s.clone(), link.clone()).map(Arc::new);
+        match &made {
+            Some(_) => tracing::info!(login_url = %s.login_url, "sign-in"),
+            None => tracing::warn!("the coordinator's sign-in key cannot be read; nobody gets in by signing in"),
+        }
+        made
     });
 }
 

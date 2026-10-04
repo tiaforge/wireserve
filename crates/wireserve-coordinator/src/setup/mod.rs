@@ -1,10 +1,10 @@
 //! `wireserve-coordinator setup …` (PLAN.md M47): what a first install
 //! leaves out, each when its time comes.
 //!
-//! `install` asks only what a working mesh needs. A domain, device owners
-//! and the sign-in each need something the person may not have yet — a
-//! domain and a DNS token, a login server — and each only makes sense once
-//! they know why they would want it. So each is a verb of its own, which
+//! `install` asks only what a working mesh needs. A domain and a login
+//! server each need something the person may not have yet — a domain and a
+//! DNS token, a login server — and each only makes sense once they know why
+//! they would want it. So each is a verb of its own, which
 //! starts by saying what it is for in terms of the person's own mesh, and
 //! can be run, run again, or turned off at any time.
 //!
@@ -14,8 +14,7 @@
 //! coordinator is restarted to take them.
 
 pub mod domain;
-pub mod owners;
-pub mod sign_in;
+pub mod login;
 
 use std::io::IsTerminal;
 use std::path::Path;
@@ -30,11 +29,7 @@ pub enum SetupCommand {
     Domain(domain::DomainArgs),
     /// Let access follow people instead of devices, through a login server
     /// you run (Pocket ID, Authentik, Keycloak, …)
-    Owners(owners::OwnersArgs),
-    /// Ask people to sign in before a web service lets them in, to tell
-    /// apart people who share one computer
-    #[command(name = "sign-in")]
-    SignIn(sign_in::SignInArgs),
+    Login(login::LoginArgs),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -56,8 +51,7 @@ pub fn run(command: SetupCommand) -> Result<(), SetupError> {
     let ctx = Ctx { interactive: std::io::stdin().is_terminal(), env_text };
     match command {
         SetupCommand::Domain(args) => domain::run(&ctx, &args),
-        SetupCommand::Owners(args) => owners::run(&ctx, &args),
-        SetupCommand::SignIn(args) => sign_in::run(&ctx, &args),
+        SetupCommand::Login(args) => login::run(&ctx, &args),
     }
 }
 

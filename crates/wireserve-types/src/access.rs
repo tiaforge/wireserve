@@ -162,8 +162,8 @@ pub enum Reach {
 pub struct CallerIdentity {
     /// The device's mesh address.
     pub addr: Ipv4Addr,
-    /// The owner's subject at the identity provider — what authward sends
-    /// as the user too.
+    /// The owner's subject at the identity provider — the same user a
+    /// sign-in names them as.
     pub user: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,

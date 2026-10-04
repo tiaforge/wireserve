@@ -40,7 +40,7 @@ enum Command {
     // next to it), creates the wireserve-coordinator user, and starts the
     // service. Where it is already installed, upgrades it instead.
     Install(Box<wireserve_coordinator::install::InstallArgs>),
-    /// Add a domain, device owners or a sign-in to an installed coordinator (needs root)
+    /// Add a domain, or a login server, to an installed coordinator (needs root)
     Setup {
         #[command(subcommand)]
         what: Box<wireserve_coordinator::setup::SetupCommand>,
@@ -114,7 +114,7 @@ async fn serve() {
         tokio::spawn(dns::sync::run(state.clone(), dns));
     }
     if let Some(oidc) = state.oidc.clone() {
-        tracing::info!(issuer = %oidc.config.issuer, "device owners sign in through the identity provider");
+        tracing::info!(issuer = %oidc.config.issuer, "people sign in through the identity provider");
         tokio::spawn(wireserve_coordinator::oidc::refresh::run(state.clone(), oidc));
     }
 
@@ -347,7 +347,6 @@ mod tests {
             service_domain: None,
             dns: None,
             acme: config::acme_from_lookup(|_| None).unwrap(),
-            sign_in: None,
             identity_headers: Default::default(),
             public_url: None,
             oidc: None,

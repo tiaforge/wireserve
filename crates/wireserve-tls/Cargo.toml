@@ -30,16 +30,9 @@ rustls-pki-types = "1"
 axum-reverse-proxy = { version = "2.2", default-features = false }
 # `client`: an upgrade goes to the backend on its own connection (PLAN.md M42).
 hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio", "http1", "http2", "client-legacy"] }
-http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio", "http1", "http2"] }
 tower = { workspace = true, features = ["util"] }
 socket2 = { version = "0.6", features = ["all"] }
-# The sign-in check (PLAN.md M34): TLS to the provider's own address,
-# verified against the public roots Mozilla ships.
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "logging", "aws-lc-rs"] }
-webpki-roots = "1"
-# Keys of the /verify cache (PLAN.md M37): never the raw cookie.
-sha2.workspace = true
 # A WebSocket backend's `Sec-WebSocket-Accept`, checked before the
 # connection is handed over (RFC 6455 §4.2.2).
 sha1 = "0.10"

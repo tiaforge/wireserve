@@ -3,15 +3,16 @@
 //! declare or withdraw services, and `leave`.
 //!
 //! Newline-delimited JSON, one request and one response per connection,
-//! like the main socket. Two requests only: the terminator checks in and
-//! gets its configuration, and it asks for an ACME challenge record to be
-//! published or withdrawn. An unknown `op` is refused.
+//! like the main socket. The terminator checks in and gets its
+//! configuration, asks for an ACME challenge record to be published or
+//! withdrawn, and redeems, renews or ends a sign-in session (PLAN.md M48) —
+//! each for one of this node's own names only. An unknown `op` is refused.
 
 use std::net::{Ipv4Addr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
-use crate::naming::{AcmeSettings, IdentityHeaders};
+use crate::naming::{AcmeSettings, IdentityHeaders, SignIn};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -29,6 +30,14 @@ pub enum TlsRequest {
     /// Publish (`present`) or withdraw one `_acme-challenge` TXT value for
     /// one of this node's own service names.
     Challenge { fqdn: String, value: String, present: bool },
+    /// A browser came back from signing in with this ticket, to the service
+    /// `fqdn` (PLAN.md M48): what session does it stand for?
+    Redeem { fqdn: String, ticket: String },
+    /// This session token for `fqdn` is past its time: a fresh one, with the
+    /// person's groups as they are now.
+    Renew { fqdn: String, token: String },
+    /// The person signed out at `fqdn`: end the session this token is for.
+    End { fqdn: String, token: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +45,15 @@ pub enum TlsRequest {
 pub enum TlsResponse {
     Config(Box<TlsConfig>),
     Ok,
+    /// A session token ([`crate::session`]), and — for a redeemed ticket —
+    /// the path on the service the browser goes to next.
+    Session {
+        token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<String>,
+    },
+    /// The session is over: the person has to sign in again.
+    SignedOut,
     Error { message: String },
 }
 
@@ -52,11 +70,10 @@ pub struct TlsConfig {
     /// Who is calling, by mesh address: every peer's, and this node's own.
     #[serde(default)]
     pub callers: Vec<Caller>,
-    /// The sign-in provider (PLAN.md M34), resolved to where it answers.
-    /// `None` while none is configured, or its service is not in the
-    /// directory on its own node — nobody gets in by signing in then.
+    /// The sign-in (PLAN.md M48). `None` while none is configured — nobody
+    /// gets in by signing in then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sign_in: Option<SignInTarget>,
+    pub sign_in: Option<SignIn>,
     /// Removed from every request, and set only by the terminator.
     #[serde(default)]
     pub identity_headers: IdentityHeaders,
@@ -67,16 +84,6 @@ pub struct TlsConfig {
     /// `X-Forwarded-Host` are kept (PLAN.md M43).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forwarding_nodes: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SignInTarget {
-    /// `<service>.<domain>`: the name its certificate is checked against.
-    pub fqdn: String,
-    /// Its own address; the request goes to port 443 there.
-    pub vip: Ipv4Addr,
-    pub verify_path: String,
-    pub session_cookie: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +153,10 @@ mod tests {
         assert_eq!(serde_json::from_str::<TlsRequest>(&text).unwrap(), with);
         assert!(serde_json::from_str::<TlsRequest>(r#"{"op":"leave"}"#).is_err());
         assert!(serde_json::from_str::<TlsRequest>(r#"{"op":"serve","name":"x"}"#).is_err());
+        let redeem = TlsRequest::Redeem { fqdn: "plex.int.test".into(), ticket: "t".into() };
+        let text = serde_json::to_string(&redeem).unwrap();
+        assert_eq!(text, r#"{"op":"redeem","fqdn":"plex.int.test","ticket":"t"}"#);
+        assert_eq!(serde_json::from_str::<TlsRequest>(&text).unwrap(), redeem);
     }
 
     #[test]

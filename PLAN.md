@@ -4542,3 +4542,98 @@ what it can before saving.
     without finishing open requests. The DNS e2e now restarts its
     coordinator with `podman stop`, and fails if that takes 5s or more or
     the exit is not clean.
+
+## M48 — the sign-in is the coordinator's own
+
+Since M36 the forward_auth provider only authenticated: the terminator
+decided who got in, from the grants. Yet it took a second client
+registration at the login server, and for Pocket ID and Keycloak a whole
+extra service (authward) on a pinned node; groups arrived two ways (a header
+split on a configured separator, and a token claim); and the provider's
+cookie covered the whole domain, so whoever ran one service could replay a
+visitor's session at another (#227 limited that, it did not end it). The
+coordinator was already an OpenID Connect client of the same server for
+device owners (M38). Decided with the user (2026-10-04): replace forward_auth
+outright with a sign-in run by that client; one refresh timer for owners and
+sessions alike; one callback URL.
+
+304. **One client, one callback.** `/oidc/callback` serves claims and
+    sign-ins, the flow saying which (`claim::Purpose`); `/claim/callback` is
+    gone, and existing registrations change their redirect URL once. The
+    sign-in is on whenever there is a login server and DNS records
+    (`Config::sign_in`); `SignInFacts.provider` became `available`, and no
+    service is open for being the provider any more.
+
+305. **The coordinator signs people in** (`oidc/sign_in.rs`). A terminator
+    sends a browser without a session to `/sign-in?service=<fqdn>&to=<path>`;
+    the service must be approved and terminated, `to` a path on it. The
+    coordinator's own login cookie (`wireserve-login`, hashed in the
+    database) skips the provider for a second service. Only a person in one
+    of the service's granted groups gets a ticket — anyone else a page
+    saying so, so luring someone to `/sign-in` for a service of one's own
+    learns nothing. The ticket (single use, a minute, bound to the service
+    and the path to go on to) goes to `https://<fqdn>/.wireserve/callback`.
+
+306. **Only the service's own node redeems, renews or ends.**
+    `POST /sign-in/redeem|renew|end`, bearer-authenticated, checked like a
+    challenge record (the node's own approved service under the domain),
+    rate-limited per node (60, then 120 a minute). The agent forwards them
+    from the terminator's socket (`TlsRequest::Redeem|Renew|End`) for its
+    own names only; the terminator still never talks to the coordinator,
+    and never to the provider.
+
+307. **Session tokens.** `wst1.<payload>.<sig>`: the session, the person's
+    subject, verified e-mail and groups, the service's name (`aud`) and an
+    expiry, Ed25519-signed with `WIRESERVE_SIGN_IN_KEY` (generated silently
+    into `coordinator-secrets.env`); the public key reaches the terminators
+    in `ServiceNaming.sign_in`. Kept in `__Host-wireserve-session`, host-only:
+    no sibling service ever receives it, a token for one service is refused
+    at every other, and it is stripped from every request before a backend.
+    Over 3800 bytes, only the groups some grant names go in.
+
+308. **One timer for owners and sessions.** A token lasts until the
+    person's groups are due again (`WIRESERVE_OIDC_REFRESH_SECS`); then the
+    terminator renews it — single-flight per session, the result shared by
+    the requests waiting — and sets the new cookie on that response. The
+    coordinator refreshes at the provider only when due, one refresh per
+    session at a time (providers that rotate refresh tokens revoke the whole
+    family when an old one is used again). `invalid_grant` ends the
+    session; other failures leave its groups counting for an hour, as an
+    owner's. Sessions nobody uses for 30 days are forgotten. The user first
+    wanted the provider's own token lifetime; agreed instead that it is a
+    stand-in, not a statement about groups.
+
+309. **Signing out.** `/.wireserve/sign-out` on any service shows a button;
+    its same-origin POST ends the session at the coordinator and goes on to
+    `/signed-out`, which forgets the browser's login. `wireserve-admin owner
+    sign-out <person>` ends every session of someone
+    (`DELETE /admin/sessions/{person}`); `owner status` lists who is signed
+    in.
+
+310. **`setup login`** replaces `setup owners` and `setup sign-in`, and says
+    the sign-in needs `setup domain` when there are no DNS records. It
+    comments out the forward_auth settings it finds; a coordinator still
+    given them logs once that they are read no more. Removed: the
+    forward_auth check, the M37 cache, the presets, `WIRESERVE_AUTH_SERVICE`,
+    `_NODE`, `_VERIFY_PATH`, `_SESSION_COOKIE`, the terminator's trust file
+    and its TLS client, and the cross-site exception for the provider. The
+    identity header names and the groups separator stay — device owners
+    fill them too. `CAP_SIGN_IN` is now `session-sign-in`: a terminator
+    from before never reports it, so it is never trusted with the new
+    sign-in; all nodes upgrade together, as with M36.
+
+311. **Verification.** Unit tests for the token format, the ticket and
+    session store, expiry, the terminator's check, single-flight renewal,
+    callback and sign-out (against a stand-in agent), and the setup verb.
+    `tests/oidc_flow.rs` signs a person in end to end against the in-test
+    provider: the redirect, the shared callback, a ticket only the owning
+    node redeems, once; the login cookie skipping the provider; renewal,
+    groups following the provider, a refused refresh ending it; a person
+    outside the granted groups getting no ticket; sign-out. The install
+    e2e passes with `setup login` (2026-10-04).
+    `deploy/e2e/run-service-auth-test.sh` is rewritten on
+    mock-oauth2-server (the stubs are gone): curl signs in through the
+    provider, the backend sees who, bob is stopped at the coordinator, a
+    jellyfin session sent to grafana is sent to sign in, the session renews
+    past the interval and sign-out ends it. It passes, and so does the
+    owner e2e with the new callback (2026-10-04, run by the user).

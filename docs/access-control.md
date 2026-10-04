@@ -54,7 +54,7 @@ coordinator on each poll. `-` means the coordinator is too old to say.
 
 Without anything set up, access goes by the *device*: what its tags allow, or
 what every device gets. With a login server you run (Pocket ID, Authentik,
-Keycloak, … — the same one your sign-in uses), access can follow the
+Keycloak, … — the same one the sign-in uses), access can follow the
 *person* instead: a device belongs to someone, and reaches what their groups
 are granted — no browser sign-in on the service, for SSH or a database as
 much as for a web page. Anna's laptop and phone both get what Anna is
@@ -63,10 +63,10 @@ allowed, and when she leaves `family` at the login server, both lose it.
 On the coordinator:
 
 ```sh
-sudo wireserve-coordinator setup owners
+sudo wireserve-coordinator setup login
 ```
 
-It shows the redirect URL to register — `<public url>/claim/callback` —
+It shows the redirect URL to register — `<public url>/oidc/callback` —
 asks for the issuer, client ID and secret, and checks the login server's
 discovery document before saving: the issuer is stored exactly as the
 server spells it, and the scopes are narrowed to the ones it lists.
@@ -84,9 +84,12 @@ WIRESERVE_OIDC_GROUPS_CLAIM=groups
 WIRESERVE_OIDC_REFRESH_SECS=900
 ```
 
+The same login server is [the sign-in](#signing-in-for-shared-devices), once
+there is a domain with DNS records: one client registration for both.
+
 `wireserve-admin owner status` then says whether the login server answers,
-which `oidc:` groups grants name, and whose devices are whose — and what to
-do next where something is missing.
+which `oidc:` groups grants name, whose devices are whose and who is signed
+in — and what to do next where something is missing.
 
 `node create` and `device create` then also print a **claim link** (with
 `--qr`, as a code for the phone's camera), and `owner link <node>` makes a
@@ -126,46 +129,13 @@ in the same `X-Auth-*` headers a sign-in fills (the user is the provider's
 
 A grant to a tag or everyone is about the *device*. A laptop the whole family
 uses is one device, though: for HTTP services the terminator can tell its
-people apart by a sign-in. It is built into every node's terminator and
-speaks `forward_auth`, so any provider for that works; the defaults are
-[authward](https://git.tia.sh/tia/authward)'s.
+people apart by a sign-in, at the same login server
+[device owners](#devices-that-belong-to-someone) use. The coordinator signs
+people in itself — there is nothing else to run — and it is on whenever
+there is a login server (`setup login`) and
+[a domain with DNS records](names-and-https.md) (`setup domain`).
 
-Run the provider as a mesh service on 443 — its login pages are then
-`https://auth.int.example.com` — and name it, and the node running it, on
-the coordinator:
-
-```sh
-wireserve auth 443:8080                       # on the node running authward
-sudo wireserve-coordinator setup sign-in      # on the coordinator
-```
-
-`setup sign-in` needs [a domain with DNS records](names-and-https.md) first.
-It asks which provider you run and fills in its names for things:
-
-| Provider | Verify path | Session cookie | Identity headers | Groups split on |
-| --- | --- | --- | --- | --- |
-| authward (the defaults) | `/verify` | `authward_session` | `X-Auth-User`, `-Email`, `-Groups` | `,` |
-| Authentik, embedded outpost | `/outpost.goauthentik.io/auth/caddy` | `authentik_proxy_` + 8 hex digits of the proxy provider's client ID's SHA-256 — asked for the ID, worked out | `X-Authentik-Username`, `-Email`, `-Groups` | `\|` |
-| Authelia | `/api/authz/forward-auth` | `authelia_session` | `Remote-User`, `-Email`, `-Groups` | `,` |
-
-"other" asks for each. It writes, leaving authward's defaults out:
-
-```sh
-WIRESERVE_AUTH_SERVICE=auth
-WIRESERVE_AUTH_NODE=gate                  # the node that runs it
-WIRESERVE_AUTH_VERIFY_PATH=/verify
-WIRESERVE_AUTH_SESSION_COOKIE=authward_session
-WIRESERVE_AUTH_USER_HEADER=X-Auth-User
-WIRESERVE_AUTH_EMAIL_HEADER=X-Auth-Email
-WIRESERVE_AUTH_GROUPS_HEADER=X-Auth-Groups
-WIRESERVE_AUTH_GROUPS_SEPARATOR=,         # or |
-```
-
-Only the configured separator splits: with `,`, a group called `x|admins` is
-one group, never `admins`. A node older than the setting splits on `,`, which
-leaves Authentik's `a|b` one group no grant names — nobody gets in by it.
-
-Then grant a group at your identity provider:
+Grant a group at your identity provider:
 
 ```sh
 wireserve-admin grant add oidc:family media
@@ -173,26 +143,22 @@ wireserve-admin grant add oidc:family media
 
 A request to a service in `media`, served with TLS by its node, then goes:
 
-1. from a device a grant names — its own node, a tagged one: straight through,
-   the sign-in never asked;
-2. from any other device: headers only, to `https://auth.<domain>/verify`,
-   over verified TLS on the provider's own address, with `X-Forwarded-Method`,
-   `X-Forwarded-Uri`, the service's own name in `X-Forwarded-Host` (a
-   request naming any other host is refused with 421 before it gets that
-   far) and the calling device's mesh address as the one `X-Forwarded-For`
-   value, which a provider can bind a session to: the provider's cookie is
-   scoped to the whole domain, so without that anyone hosting a service could
-   replay a visitor's session elsewhere. Not signed in: a 401 with `X-Login-Url` sends the
-   browser to sign in. Signed in: the provider says who, and the terminator
-   decides — one of the granted groups in `X-Auth-Groups` lets it through with
-   the provider's identity headers, anything else gets 403. The provider only
-   authenticates; which groups get in is the grants' business.
-
-A provider that says its answer holds (`Cache-Control: max-age=…` and a `Vary`
-naming the cookie, as authward does) is not asked again for the same cookie
-until it expires, and with `stale-if-error` a signed-in browser keeps working
-through a short outage of the provider. Nothing is kept for a provider that
-says nothing.
+1. from a device a grant names — its own node, a tagged one, one whose owner
+   is in `family`: straight through, nobody asked to sign in;
+2. from any other device, with a session for this service: the terminator
+   checks it on its own — a token the coordinator signed, made out to this
+   service's name, not past its time — and one of the granted groups in it
+   lets the request through, with who it is in `X-Auth-User`, `-Email` and
+   `-Groups`; any other group gets 403;
+3. from any other device without one: a browser is sent to the coordinator's
+   `/sign-in`, which sends it on to the login server. Back from there, the
+   coordinator lets only someone in one of the service's granted groups go
+   on — anyone else gets a page saying the service is not for them, and the
+   service learns nothing about them — with a ticket for that service alone,
+   which the service's node redeems for the session. A second service asks
+   the login server nothing: the coordinator remembers the browser.
+   Anything but a GET gets 401 instead, which a redirect would lose the body
+   of.
 
 So the sign-in is never a per-service switch: a restricted service offers it
 exactly when a grant names an `oidc:` group, and a service in `default` never
@@ -200,30 +166,29 @@ asks. While it does, the service's terminated 443 is open to every node — the
 terminator decides — and its other ports stay with the grants, so nobody
 walks round the sign-in by dialling another one.
 
-The provider is trusted **only on `WIRESERVE_AUTH_NODE`**: every request
-behind the sign-in goes to it, cookies included, and it says who is signed
-in, so the same service name declared by any other node is ignored, and
-nobody gets in by signing in until the named node serves it again. Without
-`WIRESERVE_AUTH_NODE` the sign-in is off, with a warning at startup. The
-provider's own service stays open to every node and cannot be put in a group:
-every terminator and every browser signing in has to reach it.
+**A session is one service's.** Its cookie (`__Host-wireserve-session`)
+belongs to that service's name alone: the browser never sends it to another
+service under the same domain, a token made out to one service is refused at
+every other, and the coordinator redeems and renews it only for the node that
+serves it. Whoever runs a service sees its visitors' sessions — they see
+everything else those visitors send it too — and can use them there, and
+nowhere else. The cookie never reaches a backend.
 
-**Bind sessions to the device, or approving a service means trusting its owner
-with everyone's sessions.** The provider's cookie is scoped to the whole
-domain, so the browser sends it to every service, and whoever runs a service
-under the domain can read it there and replay it at another. wireserve can only
-tell the provider which device is asking: every terminator sends the calling
-device's mesh address as the one `X-Forwarded-For` value on the check (and the
-provider's own terminator hands it on unchanged), and a provider that binds a
-session to the address it was created from then refuses the replay. authward
-does, with `bind_session_to_client_ip` (on by default). authentik does too
-(the *User Login* stage's session binding, to the network, or the exact IP).
-Authelia and oauth2-proxy use the client address for their own access rules,
-but their documentation describes no session binding: behind them the
-exposure stays, and the answer is to be careful which nodes you approve
-services for. Sessions created before a provider starts binding stay unbound
-until they expire, and a browser on a node that hosts services looks like that
-node, not like a different device.
+**Groups stay current.** A session token is good until the person's groups
+are due again — `WIRESERVE_OIDC_REFRESH_SECS`, as for device owners. Then
+the service's node renews it through the coordinator, which asks the login
+server with the person's refresh token, and the browser gets the new one
+with its next answer; the person notices nothing. Someone removed from a
+group loses what it gave them within that time. If the login server refuses
+the refresh token — the person was disabled, or signed out everywhere there
+— the session is over and the next page asks them to sign in. If it cannot be
+reached, the groups keep counting for an hour.
+
+**Signing out**: `https://<service>/.wireserve/sign-out` ends the session —
+every service it was used at asks again at its next renewal — and the
+coordinator forgets the browser too. `wireserve-admin owner sign-out
+anna@example.com` signs a person out of every browser at once (their devices
+stay theirs). A session nobody uses for 30 days is forgotten.
 
 Worth knowing:
 
@@ -233,7 +198,7 @@ Worth knowing:
   may use.
 - **Native apps can't do a browser sign-in.** The Jellyfin, Immich and Home
   Assistant apps, or anything speaking CalDAV/CardDAV, fail behind it — grant
-  their devices instead, or use authward's API tokens and `bypass_paths`.
+  their devices instead, or let the device belong to its person.
 - **No carrier speaks for anyone.** A relayed session — between two agents,
   or a phone and a node — is end to end; the carrier forwards packets it can
   neither read nor forge, so a grant to a relayed peer trusts that peer and
@@ -243,10 +208,8 @@ Worth knowing:
   backend listening on every interface is still reachable from its own
   network. Bind it to the node's mesh address.
 - **Identity headers and the session cookie never reach a backend from a
-  client.** Every terminator removes the identity headers from every request,
-  on every service, and the provider's session cookie from every request but
-  the provider's own — the cookie is scoped to the whole domain, so the
-  browser sends it to every service. So do the headers a proxy or an
+  client.** Every terminator removes the identity headers and the sign-in's
+  session cookie from every request, on every service. So do the headers a proxy or an
   identity-aware front end sets and a backend may believe: every
   `X-Forwarded-*`, `X-Original-*`, `X-Auth-Request-*` and `X-WebAuth-*`,
   `Remote-User` and its kin, `X-Real-IP`, `True-Client-IP` and the like. A
@@ -266,8 +229,7 @@ Worth knowing:
   another site started is refused with 403; another service under the same
   domain counts as another site, since a node's own 443 service is one of
   them. Following a link, reads (which the browser keeps from the other page)
-  and programs that aren't browsers are unaffected, and so is the sign-in
-  provider's own service. Through a forwarding node, the public name it was
+  and programs that aren't browsers are unaffected. Through a forwarding node, the public name it was
   asked for counts as the service's own. A service that must take such requests — itself a
   sign-in client answered by form POST, say — goes in
   `WIRESERVE_CROSS_SITE_SERVICES` on the coordinator.

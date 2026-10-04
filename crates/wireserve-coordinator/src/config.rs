@@ -11,9 +11,6 @@ pub struct Config {
     /// The domain services are named under (PLAN.md M25), e.g.
     /// `int.example.com`. Unset leaves `<name>.wg` exactly as it was.
     pub service_domain: Option<String>,
-    /// The sign-in restricted services fall back to (PLAN.md M34, M36).
-    /// Only with DNS records, which terminated services need.
-    pub sign_in: Option<wireserve_types::SignIn>,
     /// The headers backends learn who is calling from (PLAN.md M36).
     pub identity_headers: wireserve_types::IdentityHeaders,
     /// Further request headers the terminators remove (`WIRESERVE_STRIP_HEADERS`).
@@ -176,6 +173,7 @@ impl Config {
         let generated = bootstrapped.generated;
         let secrets_path = bootstrapped.path;
         let bootstrapped_token_key = bootstrapped.oidc_token_key;
+        let bootstrapped_sign_in_key = bootstrapped.sign_in_key;
 
         let online_threshold_secs = env_parse_or("WIRESERVE_ONLINE_THRESHOLD_SECS", 180)?;
         let relay_port_base = relay_port_base_from(env_parse_or("WIRESERVE_RELAY_PORT_BASE", wireserve_types::DEFAULT_RELAY_PORT_BASE)?)?;
@@ -221,13 +219,18 @@ impl Config {
         };
         let dns = crate::dns::config::from_lookup(|k| std::env::var(k).ok(), service_domain.as_deref())?;
         let acme = acme_from_lookup(|k| std::env::var(k).ok())?;
-        let sign_in = sign_in_from_lookup(|k| std::env::var(k).ok(), dns.is_some())?;
+        warn_forward_auth_keys(|k| std::env::var(k).ok());
         let identity_headers = identity_headers_from_lookup(|k| std::env::var(k).ok())?;
         let strip_headers = strip_headers_from(std::env::var("WIRESERVE_STRIP_HEADERS").ok().as_deref())?;
         let forwarding_nodes = forwarding_nodes_from(std::env::var("WIRESERVE_FORWARDING_NODES").ok().as_deref())?;
         let cross_site_services = cross_site_services_from(std::env::var("WIRESERVE_CROSS_SITE_SERVICES").ok().as_deref())?;
         let public_url = public_url_from_lookup(|k| std::env::var(k).ok())?;
-        let oidc = oidc_from_lookup(|k| std::env::var(k).ok(), public_url.as_deref(), &bootstrapped_token_key)?;
+        let oidc = oidc_from_lookup(
+            |k| std::env::var(k).ok(),
+            public_url.as_deref(),
+            &bootstrapped_token_key,
+            &bootstrapped_sign_in_key,
+        )?;
 
         Ok(Loaded {
             config: Self {
@@ -238,7 +241,6 @@ impl Config {
                 net_v4_cidr,
                 net_v6_prefix,
                 service_domain,
-                sign_in,
                 identity_headers,
                 strip_headers,
                 forwarding_nodes,
@@ -386,6 +388,19 @@ impl Config {
 }
 
 impl Config {
+    /// The sign-in (PLAN.md M48): there whenever both halves are — the
+    /// identity provider, which signs people in, and the DNS records, which
+    /// give the terminators that check it something to serve.
+    #[must_use]
+    pub fn sign_in(&self) -> Option<wireserve_types::SignIn> {
+        let oidc = self.oidc.as_ref()?;
+        self.dns.as_ref()?;
+        Some(wireserve_types::SignIn {
+            public_key: wireserve_types::session::public_key(&oidc.signing_key()),
+            login_url: self.public_url.clone()?,
+        })
+    }
+
     /// How services are named, as nodes are told it (PLAN.md M25) — at
     /// registration and on every poll, the same shape and for the same reason
     /// as [`Config::mesh_info`]. `None` when no domain is set: services are
@@ -395,7 +410,7 @@ impl Config {
         self.service_domain.as_ref().map(|domain| wireserve_types::ServiceNaming {
             domain: domain.clone(),
             acme: self.dns.is_some().then(|| self.acme.clone()),
-            sign_in: self.sign_in.clone(),
+            sign_in: self.sign_in(),
             identity_headers: self.identity_headers.clone(),
             strip_headers: self.strip_headers.clone(),
             forwarding_nodes: self.forwarding_nodes.clone(),
@@ -434,61 +449,28 @@ pub fn acme_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<wires
     Ok(wireserve_types::AcmeSettings { directory, email, propagation_secs })
 }
 
-/// The sign-in settings (PLAN.md M34). `None` unless `WIRESERVE_AUTH_SERVICE`
-/// names the service running the provider and `WIRESERVE_AUTH_NODE` the node
-/// it must run on; the rest default to authward's.
-///
-/// The node pins the provider: every request to a service behind the
-/// sign-in goes to it, cookies included, and its answer decides who gets
-/// in. Were it known by service name alone, whichever node declared that
-/// name next — after the real provider withdrew it — would take its place.
-/// Without the node the sign-in stays off, with a warning, so a coordinator
-/// configured before the setting existed still starts.
-pub fn sign_in_from_lookup(
-    lookup: impl Fn(&str) -> Option<String>,
-    dns: bool,
-) -> Result<Option<wireserve_types::SignIn>, ConfigError> {
-    let get = |key: &str| lookup(key).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-    let Some(service) = get("WIRESERVE_AUTH_SERVICE") else {
-        return Ok(None);
-    };
-    let service = service.to_ascii_lowercase();
-    if !wireserve_types::is_valid_dns_label(&service) {
-        return Err(ConfigError::Invalid("WIRESERVE_AUTH_SERVICE", format!("{service:?} must be a service name")));
-    }
-    let Some(node) = get("WIRESERVE_AUTH_NODE") else {
+/// The forward_auth sign-in's settings (PLAN.md M34), which nothing reads
+/// since M48 replaced it with the coordinator's own: said once at startup,
+/// so an operator who set them knows, rather than left to look as if they
+/// did something.
+pub const FORWARD_AUTH_KEYS: [&str; 4] =
+    ["WIRESERVE_AUTH_SERVICE", "WIRESERVE_AUTH_NODE", "WIRESERVE_AUTH_VERIFY_PATH", "WIRESERVE_AUTH_SESSION_COOKIE"];
+
+fn warn_forward_auth_keys(lookup: impl Fn(&str) -> Option<String>) {
+    let set: Vec<&str> =
+        FORWARD_AUTH_KEYS.into_iter().filter(|k| lookup(k).is_some_and(|v| !v.trim().is_empty())).collect();
+    if !set.is_empty() {
         tracing::warn!(
-            "WIRESERVE_AUTH_SERVICE is set but WIRESERVE_AUTH_NODE is not; the sign-in stays off until it names \
-             the node that runs `{service}`"
+            "{} no longer read: the sign-in is the coordinator's own now, through WIRESERVE_OIDC_* \
+             (`wireserve-coordinator setup login`), and needs no provider service",
+            set.join(", ")
         );
-        return Ok(None);
-    };
-    let node = node.to_ascii_lowercase();
-    if !wireserve_types::is_valid_dns_label(&node) {
-        return Err(ConfigError::Invalid("WIRESERVE_AUTH_NODE", format!("{node:?} must be a node name")));
     }
-    if !dns {
-        return Err(ConfigError::Invalid(
-            "WIRESERVE_AUTH_SERVICE",
-            "is set but WIRESERVE_DNS_PROVIDER is not; the sign-in is built into each node's TLS \
-             terminator, which needs the DNS records"
-                .into(),
-        ));
-    }
-    let verify_path = get("WIRESERVE_AUTH_VERIFY_PATH").unwrap_or_else(|| "/verify".into());
-    if !verify_path.starts_with('/') || verify_path.contains(char::is_whitespace) || verify_path.contains('#') {
-        return Err(ConfigError::Invalid("WIRESERVE_AUTH_VERIFY_PATH", format!("{verify_path:?} is not a path")));
-    }
-    let session_cookie = get("WIRESERVE_AUTH_SESSION_COOKIE").unwrap_or_else(|| "authward_session".into());
-    if !session_cookie.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
-        return Err(ConfigError::Invalid("WIRESERVE_AUTH_SESSION_COOKIE", format!("{session_cookie:?} is not a cookie name")));
-    }
-    Ok(Some(wireserve_types::SignIn { service, node, verify_path, session_cookie }))
 }
 
-/// Signing in the owner of a device (PLAN.md M38): an OpenID Connect
-/// client of the operator's identity provider — the same one the sign-in
-/// provider uses, so group names mean the same thing on both paths.
+/// The coordinator as an OpenID Connect client of the operator's identity
+/// provider: for device owners (PLAN.md M38) and the sign-in (PLAN.md M48)
+/// alike, so a group means the same thing on both paths.
 #[derive(Clone)]
 pub struct OidcConfig {
     pub issuer: String,
@@ -497,12 +479,22 @@ pub struct OidcConfig {
     pub scopes: Vec<String>,
     /// The claim the provider lists a person's groups in.
     pub groups_claim: String,
-    /// How often each owner's groups are fetched again.
+    /// How often each owner's groups are fetched again, and how long a
+    /// sign-in's session token lasts before its groups are.
     pub refresh_interval: std::time::Duration,
     /// Seals refresh tokens at rest; see `bootstrap::OIDC_TOKEN_KEY`.
     pub token_key: [u8; 32],
-    /// `<public url>/claim/callback`.
+    /// Signs session tokens; see `bootstrap::SIGN_IN_KEY`.
+    pub sign_in_key: [u8; 32],
+    /// `<public url>/oidc/callback`, for claims and sign-ins alike.
     pub redirect_url: String,
+}
+
+impl OidcConfig {
+    #[must_use]
+    pub fn signing_key(&self) -> ed25519_dalek::SigningKey {
+        wireserve_types::session::signing_key(&self.sign_in_key)
+    }
 }
 
 impl std::fmt::Debug for OidcConfig {
@@ -531,13 +523,14 @@ pub fn public_url_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result
     Ok(Some(url.trim_end_matches('/').to_string()))
 }
 
-/// The device owners' identity provider (PLAN.md M38): off unless
+/// The identity provider (PLAN.md M38, M48): off unless
 /// `WIRESERVE_OIDC_ISSUER` is set, and then `_CLIENT_ID`, `_CLIENT_SECRET`
 /// and `WIRESERVE_PUBLIC_URL` are required.
 pub fn oidc_from_lookup(
     lookup: impl Fn(&str) -> Option<String>,
     public_url: Option<&str>,
     token_key_hex: &str,
+    sign_in_key_hex: &str,
 ) -> Result<Option<OidcConfig>, ConfigError> {
     let get = |key: &str| lookup(key).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     let Some(issuer) = get("WIRESERVE_OIDC_ISSUER") else {
@@ -577,6 +570,9 @@ pub fn oidc_from_lookup(
     let token_key = parse_key(token_key_hex).ok_or_else(|| {
         ConfigError::Invalid("WIRESERVE_OIDC_TOKEN_KEY", "must be 64 hexadecimal characters (32 bytes)".into())
     })?;
+    let sign_in_key = parse_key(sign_in_key_hex).ok_or_else(|| {
+        ConfigError::Invalid("WIRESERVE_SIGN_IN_KEY", "must be 64 hexadecimal characters (32 bytes)".into())
+    })?;
     Ok(Some(OidcConfig {
         // As given: the provider's discovery document must name exactly
         // this issuer, and some end theirs in a slash (`Oidc::discover`).
@@ -587,9 +583,13 @@ pub fn oidc_from_lookup(
         groups_claim,
         refresh_interval: std::time::Duration::from_secs(refresh_secs),
         token_key,
-        redirect_url: format!("{public_url}/claim/callback"),
+        sign_in_key,
+        redirect_url: format!("{public_url}{REDIRECT_PATH}"),
     }))
 }
+
+/// Where the identity provider sends browsers back to, on the public URL.
+pub const REDIRECT_PATH: &str = "/oidc/callback";
 
 fn parse_key(hex: &str) -> Option<[u8; 32]> {
     let hex = hex.trim();
@@ -605,7 +605,7 @@ fn parse_key(hex: &str) -> Option<[u8; 32]> {
 
 /// The headers backends learn who is calling from (PLAN.md M36):
 /// `WIRESERVE_AUTH_USER_HEADER`, `_EMAIL_HEADER` and `_GROUPS_HEADER`,
-/// authward's names unless set, and `_GROUPS_SEPARATOR` (PLAN.md M47). Every terminator removes them from every
+/// `X-Auth-*` unless set, and `_GROUPS_SEPARATOR` (PLAN.md M47). Every terminator removes them from every
 /// request a client sends, so none may be a header anything else relies
 /// on.
 pub fn identity_headers_from_lookup(
@@ -817,7 +817,6 @@ mod tests {
             service_domain: None,
             dns: None,
             acme: acme_from_lookup(|_| None).unwrap(),
-            sign_in: None,
             identity_headers: Default::default(),
             public_url: None,
             oidc: None,
@@ -978,36 +977,25 @@ mod tests {
     }
 
     #[test]
-    fn sign_in_defaults_to_authward_and_needs_dns() {
-        let only = |k: &str| match k {
-            "WIRESERVE_AUTH_SERVICE" => Some("Auth".to_string()),
-            "WIRESERVE_AUTH_NODE" => Some("Homeserver".to_string()),
-            _ => None,
-        };
-        assert_eq!(sign_in_from_lookup(|_| None, true).unwrap(), None);
-        let s = sign_in_from_lookup(only, true).unwrap().unwrap();
-        assert_eq!((s.service.as_str(), s.verify_path.as_str(), s.session_cookie.as_str()), ("auth", "/verify", "authward_session"));
-        assert_eq!(s.node, "homeserver");
-        let no_node = |k: &str| (k == "WIRESERVE_AUTH_SERVICE").then(|| "auth".to_string());
-        assert_eq!(sign_in_from_lookup(no_node, true).unwrap(), None, "no node: off, not a startup failure");
-        assert!(sign_in_from_lookup(only, false).is_err(), "without DNS there is nothing to terminate");
-        for (k, v) in [
-            ("WIRESERVE_AUTH_VERIFY_PATH", "verify"),
-            ("WIRESERVE_AUTH_SESSION_COOKIE", "a;b"),
-            ("WIRESERVE_AUTH_NODE", "not a node"),
-        ] {
-            let l = move |key: &str| match key {
-                x if x == k => Some(v.to_string()),
-                "WIRESERVE_AUTH_SERVICE" => Some("auth".to_string()),
-                "WIRESERVE_AUTH_NODE" => Some("homeserver".to_string()),
-                _ => None,
-            };
-            assert!(matches!(sign_in_from_lookup(l, true), Err(ConfigError::Invalid(key, _)) if key == k), "{k}={v}");
-        }
+    fn the_sign_in_is_there_with_the_identity_provider_and_dns_records_both() {
+        let mut c = sample();
+        assert!(c.sign_in().is_none());
+        c.oidc = Some(crate::oidc::test_config());
+        c.public_url = Some("https://mesh.example.com".into());
+        assert!(c.sign_in().is_none(), "no DNS records: nothing is terminated to sign in to");
+        c.dns = Some(crate::dns::DnsConfig {
+            provider: crate::dns::config::DnsProvider::Cloudflare { token: "t".into() },
+            zone: "example.com".into(),
+            ttl: 300,
+        });
+        let si = c.sign_in().expect("both halves");
+        assert_eq!(si.login_url, "https://mesh.example.com");
+        let key = wireserve_types::session::parse_public_key(&si.public_key).expect("a public key");
+        assert_eq!(key, crate::oidc::test_config().signing_key().verifying_key());
     }
 
     #[test]
-    fn identity_headers_default_to_authward_and_refuse_what_others_rely_on() {
+    fn identity_headers_default_to_x_auth_and_refuse_what_others_rely_on() {
         let h = identity_headers_from_lookup(|_| None).unwrap();
         assert_eq!(h, wireserve_types::IdentityHeaders::default());
         let one = |k: &'static str, v: &'static str| move |key: &str| (key == k).then(|| v.to_string());
@@ -1036,20 +1024,22 @@ mod tests {
             "WIRESERVE_OIDC_CLIENT_SECRET" => Some("s3cret".to_string()),
             _ => None,
         };
-        assert!(oidc_from_lookup(|_| None, None, &key).unwrap().is_none(), "off unless an issuer is set");
-        let o = oidc_from_lookup(all, Some("https://mesh.example.com"), &key).unwrap().unwrap();
+        assert!(oidc_from_lookup(|_| None, None, &key, &key).unwrap().is_none(), "off unless an issuer is set");
+        let o = oidc_from_lookup(all, Some("https://mesh.example.com"), &key, &"cd".repeat(32)).unwrap().unwrap();
         assert_eq!(o.issuer, "https://id.example.com/", "kept as given: Authentik's issuers end in a slash");
-        assert_eq!(o.redirect_url, "https://mesh.example.com/claim/callback");
+        assert_eq!(o.redirect_url, "https://mesh.example.com/oidc/callback");
+        assert_eq!(o.sign_in_key, [0xcd; 32]);
         assert!(o.scopes.contains(&"offline_access".to_string()));
         assert_eq!(o.groups_claim, "groups");
         assert_eq!(o.token_key, [0xab; 32]);
         assert!(!format!("{o:?}").contains("s3cret"), "the secret stays out of logs");
-        assert!(oidc_from_lookup(all, None, &key).is_err(), "no public URL");
-        assert!(oidc_from_lookup(all, Some("https://m"), "short").is_err(), "a broken key");
+        assert!(oidc_from_lookup(all, None, &key, &key).is_err(), "no public URL");
+        assert!(oidc_from_lookup(all, Some("https://m"), "short", &key).is_err(), "a broken key");
+        assert!(oidc_from_lookup(all, Some("https://m"), &key, "short").is_err(), "a broken signing key");
         let no_secret = |k: &str| if k == "WIRESERVE_OIDC_CLIENT_SECRET" { None } else { all(k) };
-        assert!(oidc_from_lookup(no_secret, Some("https://m"), &key).is_err());
+        assert!(oidc_from_lookup(no_secret, Some("https://m"), &key, &key).is_err());
         let no_openid = |k: &str| if k == "WIRESERVE_OIDC_SCOPES" { Some("email groups".into()) } else { all(k) };
-        assert!(oidc_from_lookup(no_openid, Some("https://m"), &key).is_err());
+        assert!(oidc_from_lookup(no_openid, Some("https://m"), &key, &key).is_err());
     }
 
     #[test]

@@ -40,7 +40,7 @@ wireserve/
 │   ├── wireserve-coordinator/ # axum + sqlite binary
 │   ├── wireserve-agent/       # daemon + CLI; the binary is `wireserve`
 │   └── wireserve-admin/       # separate CLI binary — distinct trust surface
-│                               # (authward-delegated, not the agent's bearer
+│                               # (the admin token, not the agent's bearer
 │                               # token), kept out of wireserve-agent so the
 │                               # two auth paths can't blur together in code
 ├── deploy/
@@ -485,7 +485,7 @@ nothing but a check-in and a challenge request, and tells the backend who is
 calling (`X-Wireserve-Node`, `X-Forwarded-For`), removing any copies a client
 sent.
 
-**Who can reach what (M36), and the sign-in (M34).** Every service is in
+**Who can reach what (M36), and the sign-in (M48).** Every service is in
 one or more service groups — its explicit ones, stored per *name* outside the
 service rows so a withdraw and re-declare cannot quietly drop one, or else
 the built-in `default`. A grant lets a source reach every service in a group:
@@ -502,33 +502,42 @@ below.
 
 A terminated service's terminator checks every request, not every
 connection: an open service, or a caller whose address the access names,
-goes on. Anyone else, where a grant names an `oidc:` group and a provider is
-configured (`WIRESERVE_AUTH_SERVICE` on `WIRESERVE_AUTH_NODE`, trusted on
-that node only), is asked about — Caddy's `forward_auth`, built in: a
-headers-only copy of the request to `https://<provider>.<domain>/verify` on
-the provider's own address, verified TLS, with `X-Forwarded-Method`,
-`X-Forwarded-Uri`, the service's own name as `X-Forwarded-Host` (`Host` is
-the provider's, whose own terminator answers for that name only) and the
-calling device's mesh address as the single `X-Forwarded-For` value — a request
-whose `Host` names another service gets 421 first. A 2xx says who
-it is; one of the granted groups in its groups header passes the request on
-with the identity headers copied on, anything else is 403. A 401 with
-`X-Login-Url` redirects a GET; anything else is returned as is. The provider
-authenticates; the grants authorize. A 2xx naming a user is reused while the
-provider's `Cache-Control: max-age` allows, keyed by the hashed values of its
-`Vary` headers, which must include the cookie or `Authorization` (M37);
-`stale-if-error` covers a provider that is down. Everyone else gets 403. The identity
-headers (`WIRESERVE_AUTH_{USER,EMAIL,GROUPS}_HEADER`) are removed from every
-request on every service, and the provider's domain-wide session cookie from
-every request but the provider's own. The provider's own service is always
-open and cannot be put in a group.
+goes on — a request whose `Host` names another service gets 421 first.
+Anyone else, where a grant names an `oidc:` group and the coordinator has a
+sign-in (an identity provider, `WIRESERVE_OIDC_*`, and DNS records), needs a
+session for this service: a token the coordinator signed (Ed25519, the key in
+`coordinator-secrets.env`, its public half in `ServiceNaming.sign_in`) naming
+the person, their groups, this service's name (`aud`) and an expiry, kept in
+a host-only `__Host-wireserve-session` cookie. The terminator checks it
+locally; one of the granted groups in it passes the request on with the
+identity headers filled, anything else is 403. Without one, a GET is sent to
+the coordinator's `/sign-in?service=…&to=…`; anything else gets 401.
+
+The coordinator runs the same code flow with PKCE as for device owners,
+returning on the shared `/oidc/callback`, and keeps a login cookie of its
+own so a second service needs no new sign-in. Only a person in one of the
+service's granted groups goes on: the browser goes back to
+`https://<service>/.wireserve/callback` with a ticket (single use, a minute,
+bound to the service), which the service's terminator redeems through its
+agent (`TlsRequest::Redeem` → `POST /sign-in/redeem`, bearer-authenticated,
+honoured only from the node owning that service). A token lasts until the
+person's groups are due again (the refresh interval); then the terminator
+renews it the same way (`Renew` → `/sign-in/renew`), one renewal per session
+at a time on both sides, and the coordinator refreshes the groups with the
+person's refresh token (sealed like an owner's, the session as associated
+data). `invalid_grant` ends the session; other failures leave its groups
+counting for an hour. `/.wireserve/sign-out` ends it (`End` →
+`/sign-in/end`). The terminator never talks to the provider or the
+coordinator, and holds nothing that could make a token. The identity headers
+(`WIRESERVE_AUTH_{USER,EMAIL,GROUPS}_HEADER`) and the session cookie are
+removed from every request on every service.
 
 **Device owners (M38).** With an identity provider configured
 (`WIRESERVE_OIDC_*`), a node may belong to a person, whose groups then count
 among its principals (`oidc:<group>`) for every protocol. Only an admin makes
 a claim link (`POST /admin/nodes/{name}/claim`, also handed out by
 `create-node`): single-use, ten minutes, stored hashed. The coordinator runs
-the code flow with PKCE (`/claim/{code}`, `/claim/callback`), checks the ID
+the code flow with PKCE (`/claim/{code}`, `/oidc/callback`), checks the ID
 token and its nonce, and binds the owner only after the person confirms on a
 page naming the node, its tags and its current owner (`POST /claim/confirm`,
 which uses the link up atomically). Flow state is in memory, bound to the
@@ -747,8 +756,9 @@ What it does, end to end:
 
 - Windows/BSD firewall backends (trait exists now, implementations later)
 - Multi-tenant coordinator, web UI
-- OIDC-backed admin auth with per-admin attribution (e.g. delegating to
-  authward, revisited later) — v1 uses a single shared static admin token
+- OIDC-backed admin auth with per-admin attribution (through the
+  coordinator's own identity provider client, revisited later) — v1 uses a
+  single shared static admin token
   (§4.0), which is enough for a single operator but doesn't distinguish
   between multiple admins
 - STUN, relay/hairpin fallback for symmetric NAT

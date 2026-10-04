@@ -42,17 +42,16 @@ pub struct CallerInfo {
 /// replaced on each check-in.
 pub type Callers = Arc<RwLock<HashMap<Ipv4Addr, CallerInfo>>>;
 
-/// The sign-in (PLAN.md M34), shared by every listener and replaced when
-/// the provider moves. `None`: no provider reachable, and nobody gets in by
-/// signing in.
-pub type SharedSignIn = Arc<RwLock<Option<crate::sign_in::SignIn>>>;
+/// The sign-in (PLAN.md M48), shared by every listener and replaced when the
+/// coordinator's settings change. `None`: there is none, and nobody gets in
+/// by signing in.
+pub type SharedSignIn = Arc<RwLock<Option<Arc<crate::sign_in::SignIn>>>>;
 
 /// How one service treats its requests.
 #[derive(Debug, Clone)]
 pub struct Policy {
-    /// The name this service is served under. When it is the sign-in
-    /// provider's — decided per request, since the provider can appear after
-    /// its own service started — its session cookie is its own, and stays.
+    /// The name this service is served under: the one its requests must
+    /// name, and its sign-in cookies be made out to.
     pub fqdn: String,
     /// Who may in (PLAN.md M36).
     pub access: wireserve_types::ServiceAccess,
@@ -417,10 +416,6 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
 pub struct Route {
     upstream: SocketAddr,
     router: axum::Router,
-    /// For the provider's verify path: the calling terminator's
-    /// `X-Forwarded-For` (the device's address) goes to the provider as it
-    /// is, without this node's own peer appended after it.
-    verify_router: axum::Router,
 }
 
 impl Route {
@@ -432,10 +427,8 @@ impl Route {
             .with_host_behaviour(HostBehaviour::Preserve)
             .with_x_forwarded_for(XForwardedFor::Append)
             .with_public_scheme("https");
-        let verify_policy = proxy_policy.clone().with_x_forwarded_for(XForwardedFor::Preserve);
         let router = ReverseProxy::new("/", format!("http://{upstream}")).with_policy(proxy_policy).into();
-        let verify_router = ReverseProxy::new("/", format!("http://{upstream}")).with_policy(verify_policy).into();
-        Self { upstream, router, verify_router }
+        Self { upstream, router }
     }
 }
 
@@ -579,24 +572,17 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                             "misdirected request: it names another host"
                         );
                     }
-                    // The provider's own verify endpoint is asked by the other
-                    // terminators, which name the service in X-Forwarded-Host;
-                    // everywhere else a client's copy is removed.
-                    let verify = sign_in.as_ref().is_some_and(|si| {
-                        policy.as_ref().is_some_and(|p| p.fqdn.eq_ignore_ascii_case(&si.target.fqdn))
-                            && req.uri().path() == si.target.verify_path
-                    });
-                    let router = if verify { route.verify_router.clone() } else { route.router.clone() };
+                    let router = route.router.clone();
                     let (upstream, recheck) = (route.upstream, limits.recheck);
                     let max_upgrades = limits.max_upgrades_per_forwarded_client;
                     let upgrade_slots = Arc::clone(&upgrade_slots);
-                    let upgrade = !verify && crate::upgrade::wanted(&req);
+                    let upgrade = crate::upgrade::wanted(&req);
                     // Anything else asking to switch goes on as a plain
                     // request (PLAN.md #271).
                     if !upgrade {
                         crate::upgrade::ignore(req.headers_mut());
                     }
-                    prepare(req.headers_mut(), caller.as_ref().map(|c| c.node.as_str()), verify, forwarder, &strip);
+                    prepare(req.headers_mut(), caller.as_ref().map(|c| c.node.as_str()), forwarder, &strip);
                     req.extensions_mut().insert(ConnectInfo(peer));
                     let shared = shared.clone();
                     async move {
@@ -614,11 +600,8 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                             ));
                         }
                         // A page on another site may not act here as the
-                        // device it runs on (PLAN.md #276). The sign-in
-                        // provider's own pages are exempt: its provider
-                        // answers by form POST from elsewhere.
-                        let provider = sign_in.as_ref().is_some_and(|si| si.target.fqdn.eq_ignore_ascii_case(&policy.fqdn));
-                        if !policy.cross_site && !provider && started_elsewhere(&req, &policy.fqdn, upgrade, forwarder) {
+                        // device it runs on (PLAN.md #276).
+                        if !policy.cross_site && started_elsewhere(&req, &policy.fqdn, upgrade, forwarder) {
                             tracing::info!(
                                 service = %policy.fqdn,
                                 peer = %peer.ip(),
@@ -632,15 +615,26 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                                 "a page on another site may not do this here",
                             ));
                         }
+                        // The sign-in's own pages, on every service's name
+                        // (PLAN.md M48).
+                        if let Some(si) = sign_in.as_ref().filter(|_| crate::sign_in::is_own_path(req.uri().path())) {
+                            return Ok(if req.uri().path() == wireserve_types::session::CALLBACK_PATH {
+                                si.callback(req.uri(), &policy.fqdn).await
+                            } else {
+                                si.sign_out(req.method(), req.headers(), &policy.fqdn).await
+                            });
+                        }
                         let mut req = req.map(Body::new);
                         // As the client asked, for asking again while it is open.
                         let asked = upgrade.then(|| Arc::new(as_asked(&req)));
                         // A forwarding node speaks for someone else: its owner
                         // says nothing about who is calling (PLAN.md M43).
                         let owner = if forwarder { None } else { caller.and_then(|c| c.owner) };
-                        match guard(&mut req, sign_in.as_ref(), &policy, caller_addr, owner.as_ref(), &identity).await {
-                            Some(denied) => Ok(denied),
-                            None => match asked {
+                        let set_cookie = match guard(&mut req, sign_in.as_deref(), &policy, caller_addr, owner.as_ref(), &identity).await {
+                            Err(denied) => return Ok(*denied),
+                            Ok(set_cookie) => set_cookie,
+                        };
+                        let answer = match asked {
                                 Some(asked) => {
                                     // A forwarding node's client, by the address it
                                     // vouched for — or, without one, the node's own.
@@ -673,8 +667,15 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                                     Ok(answer)
                                 }
                                 None => router.oneshot(req).await,
-                            },
-                        }
+                        };
+                        // A renewed session goes back to the browser with
+                        // whatever the backend answered.
+                        answer.map(|mut a| {
+                            if let Some(c) = set_cookie {
+                                a.headers_mut().append(axum::http::header::SET_COOKIE, c);
+                            }
+                            a
+                        })
                     }
                 });
                 let mut builder = auto::Builder::new(TokioExecutor::new());
@@ -699,8 +700,8 @@ fn as_asked<B>(req: &Request<B>) -> Request<()> {
 /// Whether the caller of an upgraded connection would still be let in,
 /// asked as its request was (PLAN.md M42): its service still served here
 /// under the name it asked for, and `guard` still letting it through. A
-/// sign-in provider that cannot answer right now closes nothing — its
-/// trouble is not the caller's; a refusal does.
+/// sign-in that cannot be renewed right now closes nothing — its trouble is
+/// not the caller's; a refusal does.
 async fn still_admitted(shared: &Shared, vip: Ipv4Addr, caller_addr: Option<Ipv4Addr>, asked: &Request<()>) -> bool {
     if read(&shared.routes).get(&vip).is_none() {
         return false;
@@ -715,9 +716,9 @@ async fn still_admitted(shared: &Shared, vip: Ipv4Addr, caller_addr: Option<Ipv4
     let sign_in = read(&shared.sign_in).clone();
     let identity = read(&shared.identity).clone();
     let mut req = as_asked(asked).map(|()| Body::empty());
-    match guard(&mut req, sign_in.as_ref(), &policy, caller_addr, owner.as_ref(), &identity).await {
-        None => true,
-        Some(denied) => denied.status().is_server_error(),
+    match guard(&mut req, sign_in.as_deref(), &policy, caller_addr, owner.as_ref(), &identity).await {
+        Ok(_) => true,
+        Err(denied) => denied.status().is_server_error(),
     }
 }
 
@@ -764,19 +765,18 @@ fn without_port(host: &str) -> &str {
     }
 }
 
-/// Who gets in (PLAN.md M34, M36): `Some` is the answer to send instead of
-/// passing the request on.
+/// Who gets in (PLAN.md M36, M48): `Err` is the answer to send instead of
+/// passing the request on; `Ok` may carry a renewed session's cookie for
+/// the browser.
 ///
-/// 1. Identity headers a client sent are removed, always.
+/// 1. Identity headers a client sent are removed, always, and so is the
+///    sign-in's cookie: no backend needs it.
 /// 2. An open service, or a caller whose node the grants name, goes on —
 ///    with its owner named, if it has one (PLAN.md M38).
 /// 3. Anyone else, where the grants name groups a sign-in can prove, is
 ///    asked about: signed in with one of them, on — with who they are;
 ///    signed in without, 403; not signed in, sent to sign in.
 /// 4. Anyone else is refused with 403.
-///
-/// The provider's session cookie leaves every request but the provider's
-/// own.
 async fn guard(
     req: &mut Request<Body>,
     sign_in: Option<&crate::sign_in::SignIn>,
@@ -784,57 +784,51 @@ async fn guard(
     caller: Option<Ipv4Addr>,
     owner: Option<&wireserve_types::CallerIdentity>,
     identity: &wireserve_types::IdentityHeaders,
-) -> Option<axum::response::Response> {
+) -> Result<Option<HeaderValue>, Box<axum::response::Response>> {
     use axum::http::StatusCode;
     crate::sign_in::strip_identity(req.headers_mut(), identity);
     let access = &policy.access;
     let by_device = access.open || caller.is_some_and(|c| access.sources.contains(&c));
+    let mut set_cookie = None;
     if by_device {
         if let Some(owner) = owner {
-            name_owner(req.headers_mut(), owner, identity);
+            name(req.headers_mut(), &owner.user, owner.email.as_deref(), &owner.groups, identity);
         }
     } else {
         if !access.sign_in {
-            return Some(crate::sign_in::plain(StatusCode::FORBIDDEN, "this device may not reach this service"));
+            return Err(Box::new(crate::sign_in::plain(StatusCode::FORBIDDEN, "this device may not reach this service")));
         }
         let Some(si) = sign_in else {
-            return Some(crate::sign_in::plain(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "this service is behind a sign-in that cannot be reached",
-            ));
+            return Err(Box::new(crate::sign_in::plain(StatusCode::SERVICE_UNAVAILABLE, "this service's sign-in is not set up here yet")));
         };
-        let (method, uri, headers) = (req.method().clone(), req.uri().clone(), req.headers().clone());
-        match si.check(&method, &uri, &headers, &policy.fqdn, identity, caller).await {
-            crate::sign_in::Verdict::Allow { headers, groups } => {
-                if !groups.iter().any(|g| access.sign_in_groups.contains(g)) {
-                    return Some(crate::sign_in::plain(StatusCode::FORBIDDEN, "signed in, but not allowed here"));
+        match si.check(req.method(), req.uri(), req.headers(), &policy.fqdn).await {
+            crate::sign_in::Verdict::Allow { session, set_cookie: renewed } => {
+                if !session.groups.iter().any(|g| access.sign_in_groups.contains(g)) {
+                    return Err(Box::new(crate::sign_in::plain(StatusCode::FORBIDDEN, "signed in, but not allowed here")));
                 }
-                req.headers_mut().extend(headers);
+                name(req.headers_mut(), &session.sub, session.email.as_deref(), &session.groups, identity);
+                set_cookie = renewed;
             }
-            crate::sign_in::Verdict::Deny(answer) => return Some(answer),
+            crate::sign_in::Verdict::Deny(answer) => return Err(Box::new(answer)),
         }
     }
-    if let Some(si) = sign_in {
-        if !si.target.fqdn.eq_ignore_ascii_case(&policy.fqdn) {
-            crate::sign_in::strip_cookie(req.headers_mut(), &si.target.session_cookie);
-        }
-    }
-    None
+    crate::sign_in::strip_cookie(req.headers_mut(), wireserve_types::session::COOKIE);
+    Ok(set_cookie)
 }
 
-/// Tells the backend who the calling device belongs to, in the same
-/// headers a sign-in fills.
-fn name_owner(headers: &mut HeaderMap, owner: &wireserve_types::CallerIdentity, identity: &wireserve_types::IdentityHeaders) {
+/// Tells the backend who is calling — the device's owner, or whoever
+/// signed in — in the identity headers.
+fn name(headers: &mut HeaderMap, user: &str, email: Option<&str>, groups: &[String], identity: &wireserve_types::IdentityHeaders) {
     let mut set = |name: &str, value: &str| {
         if let (Ok(n), Ok(v)) = (axum::http::HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) {
             headers.insert(n, v);
         }
     };
-    set(&identity.user, &owner.user);
-    if let Some(email) = &owner.email {
+    set(&identity.user, user);
+    if let Some(email) = email {
         set(&identity.email, email);
     }
-    set(&identity.groups, &identity.join_groups(&owner.groups));
+    set(&identity.groups, &identity.join_groups(groups));
 }
 
 /// Headers a proxy or an identity-aware front end sets and a backend may
@@ -850,19 +844,14 @@ const UNTRUSTED_EXACT: &[&str] = &[
 ];
 /// The same, for families of names.
 const UNTRUSTED_PREFIX: &[&str] = &["x-forwarded-", "x-original-", "x-remote-", "x-auth-request-", "x-webauth-", "x-authentik-", "x-authelia-"];
-/// What only the calling terminator sets, and the provider's own reads.
-const VERIFY_KEEPS: &[&str] = &["x-forwarded-host", "x-forwarded-for", "x-forwarded-uri", "x-forwarded-method"];
 /// What a forwarding node — the operator's own reverse proxy — says about
 /// its client (PLAN.md M43): where the client is, and the name it asked
 /// for. Never who it is.
 const FORWARDER_KEEPS: &[&str] = &["x-forwarded-for", "x-forwarded-host"];
 
-fn is_untrusted(name: &str, verify: bool, forwarder: bool, extra: &[String]) -> bool {
+fn is_untrusted(name: &str, forwarder: bool, extra: &[String]) -> bool {
     if name == NODE_HEADER {
         return true;
-    }
-    if verify && VERIFY_KEEPS.contains(&name) {
-        return false;
     }
     if extra.iter().any(|e| e == name) {
         return true;
@@ -919,26 +908,19 @@ fn started_elsewhere<B>(req: &Request<B>, fqdn: &str, websocket: bool, forwarder
 /// the proxy from the connection itself — never appended to what the client
 /// sent. `extra` is the operator's own list on top of the built-in one.
 ///
-/// `verify`: this is the sign-in provider's own verify endpoint, where the
-/// other terminators name the service they ask about in `X-Forwarded-Host`
-/// (PLAN.md M34) and the device calling it in `X-Forwarded-For`, which a
-/// provider may bind a session to. Both stay there. Anyone may send it, but asking `/verify`
-/// directly only ever answers the asker — it opens no backend — so there is
-/// nothing to borrow.
-///
 /// `forwarder`: the caller is a node named in `WIRESERVE_FORWARDING_NODES`
 /// (PLAN.md M43), whose `X-Forwarded-For` and `X-Forwarded-Host` stay, cut
 /// down to what the node itself can vouch for ([`vouched_for`]): the proxy
 /// appends this connection's peer to the first and keeps the second, so the
 /// backend sees the client the forwarding node saw, and the name it was
 /// asked for. The operator's own `extra` list still removes them.
-pub fn prepare(headers: &mut HeaderMap, caller: Option<&str>, verify: bool, forwarder: bool, extra: &[String]) {
+pub fn prepare(headers: &mut HeaderMap, caller: Option<&str>, forwarder: bool, extra: &[String]) {
     let doomed: Vec<axum::http::HeaderName> =
-        headers.keys().filter(|n| is_untrusted(n.as_str(), verify, forwarder, extra)).cloned().collect();
+        headers.keys().filter(|n| is_untrusted(n.as_str(), forwarder, extra)).cloned().collect();
     for name in doomed {
         headers.remove(name);
     }
-    if forwarder && !verify {
+    if forwarder {
         vouched_for(headers);
     }
     if let Some(node) = caller.and_then(|n| HeaderValue::from_str(n).ok()) {
@@ -1019,17 +1001,10 @@ fn join_cookies(headers: &mut HeaderMap) {
 mod tests {
     use super::*;
 
-    fn sign_in() -> crate::sign_in::SignIn {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        crate::sign_in::SignIn::new(
-            wireserve_types::tls::SignInTarget {
-                fqdn: "auth.int.test".into(),
-                vip: "10.9.0.60".parse().unwrap(),
-                verify_path: "/verify".into(),
-                session_cookie: "authward_session".into(),
-            },
-            &[],
-        )
+    /// The sign-in, with a stand-in agent in `dir`.
+    fn sign_in(dir: &std::path::Path) -> crate::sign_in::SignIn {
+        let (link, _) = crate::sign_in::tests::fake_agent(dir);
+        crate::sign_in::SignIn::new(crate::sign_in::tests::settings(), link).unwrap()
     }
 
     fn open(fqdn: &str) -> Policy {
@@ -1056,7 +1031,7 @@ mod tests {
 
     fn request() -> Request<Body> {
         Request::builder()
-            .header("cookie", "theme=dark; authward_session=s3cret")
+            .header("cookie", "theme=dark; __Host-wireserve-session=s3cret")
             .header("x-auth-user", "mallory")
             .body(Body::empty())
             .unwrap()
@@ -1068,32 +1043,60 @@ mod tests {
         let granted = Some("10.9.0.2".parse().unwrap());
         let other = Some("10.9.0.3".parse().unwrap());
         let mut req = request();
-        assert!(guard(&mut req, None, &restricted("jf.int.test", false), granted, None, &ids()).await.is_none());
+        assert!(guard(&mut req, None, &restricted("jf.int.test", false), granted, None, &ids()).await.is_ok());
         assert!(req.headers().get("x-auth-user").is_none(), "a forged identity is removed for a device too");
 
         let answer = guard(&mut request(), None, &restricted("jf.int.test", false), other, None, &ids()).await;
-        assert_eq!(answer.expect("refused").status(), StatusCode::FORBIDDEN, "no sign-in to try");
+        assert_eq!(answer.expect_err("refused").status(), StatusCode::FORBIDDEN, "no sign-in to try");
         let answer = guard(&mut request(), None, &restricted("jf.int.test", false), None, None, &ids()).await;
-        assert_eq!(answer.expect("refused").status(), StatusCode::FORBIDDEN, "an unknown caller neither");
+        assert_eq!(answer.expect_err("refused").status(), StatusCode::FORBIDDEN, "an unknown caller neither");
 
         let answer = guard(&mut request(), None, &restricted("jf.int.test", true), other, None, &ids()).await;
-        assert_eq!(answer.expect("refused").status(), StatusCode::SERVICE_UNAVAILABLE, "the sign-in is unreachable");
+        assert_eq!(answer.expect_err("refused").status(), StatusCode::SERVICE_UNAVAILABLE, "no sign-in here yet");
     }
 
     #[tokio::test]
-    async fn every_backend_but_the_providers_loses_the_cookie_and_forged_identity() {
-        let si = sign_in();
-        let mut req = request();
-        assert!(guard(&mut req, Some(&si), &open("grafana.int.test"), None, None, &ids()).await.is_none());
-        assert_eq!(req.headers().get("cookie").unwrap(), "theme=dark");
-        assert!(req.headers().get("x-auth-user").is_none());
+    async fn every_backend_loses_the_session_cookie_and_forged_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let si = sign_in(dir.path());
+        for si in [Some(&si), None] {
+            let mut req = request();
+            assert!(guard(&mut req, si, &open("grafana.int.test"), None, None, &ids()).await.is_ok());
+            assert_eq!(req.headers().get("cookie").unwrap(), "theme=dark");
+            assert!(req.headers().get("x-auth-user").is_none());
+        }
+    }
 
-        // The provider's own service keeps its session cookie — decided per
-        // request, whatever the listener was started with.
-        let mut req = request();
-        assert!(guard(&mut req, Some(&si), &open("Auth.int.test"), None, None, &ids()).await.is_none());
-        assert_eq!(req.headers().get("cookie").unwrap(), "theme=dark; authward_session=s3cret");
-        assert!(req.headers().get("x-auth-user").is_none(), "a forged identity is removed there too");
+    #[tokio::test]
+    async fn someone_signed_in_with_a_granted_group_gets_in_as_themselves() {
+        use axum::http::StatusCode;
+        let dir = tempfile::tempdir().unwrap();
+        let si = sign_in(dir.path());
+        let other = Some("10.9.0.3".parse().unwrap());
+        let with = |token: &str| {
+            let mut req = request();
+            req.headers_mut().insert("cookie", HeaderValue::from_str(&format!("theme=dark; __Host-wireserve-session={token}")).unwrap());
+            req
+        };
+        let token = crate::sign_in::tests::token;
+
+        let mut req = with(&token("jf.int.test", 60, &["family", "admins"]));
+        assert_eq!(guard(&mut req, Some(&si), &restricted("jf.int.test", true), other, None, &ids()).await.ok(), Some(None));
+        assert_eq!(req.headers()["x-auth-user"], "anna", "not mallory");
+        assert_eq!(req.headers()["x-auth-email"], "anna@example.com");
+        assert_eq!(req.headers()["x-auth-groups"], "family,admins");
+        assert_eq!(req.headers()["cookie"], "theme=dark", "the session stays with the terminator");
+
+        let answer = guard(&mut with(&token("jf.int.test", 60, &["admins"])), Some(&si), &restricted("jf.int.test", true), other, None, &ids()).await;
+        assert_eq!(answer.expect_err("not granted").status(), StatusCode::FORBIDDEN);
+        let answer = guard(&mut with(&token("vault.int.test", 60, &["family"])), Some(&si), &restricted("jf.int.test", true), other, None, &ids()).await;
+        assert_eq!(answer.expect_err("another service's").status(), StatusCode::FOUND, "off to sign in");
+        let answer = guard(&mut request(), Some(&si), &restricted("jf.int.test", false), other, None, &ids()).await;
+        assert_eq!(answer.expect_err("no group to prove").status(), StatusCode::FORBIDDEN);
+
+        // Past its time: renewed, and the browser told.
+        let renewed = guard(&mut with(&token("jf.int.test", -1, &["family"])), Some(&si), &restricted("jf.int.test", true), other, None, &ids()).await;
+        assert!(renewed.expect("renewed").is_some_and(|c| c.to_str().unwrap().starts_with("__Host-wireserve-session=wst1.")));
     }
 
     #[tokio::test]
@@ -1106,7 +1109,7 @@ mod tests {
         };
         let granted = Some("10.9.0.2".parse().unwrap());
         let mut req = request();
-        assert!(guard(&mut req, None, &restricted("jf.int.test", false), granted, Some(&owner), &ids()).await.is_none());
+        assert!(guard(&mut req, None, &restricted("jf.int.test", false), granted, Some(&owner), &ids()).await.is_ok());
         assert_eq!(req.headers()["x-auth-user"], "sub-alice", "not mallory");
         assert_eq!(req.headers()["x-auth-email"], "alice@example.com");
         assert_eq!(req.headers()["x-auth-groups"], "family,admins");
@@ -1114,15 +1117,7 @@ mod tests {
         // A device the grants do not name gets no one's identity.
         let other = Some("10.9.0.3".parse().unwrap());
         let mut req = request();
-        assert!(guard(&mut req, None, &restricted("jf.int.test", false), other, Some(&owner), &ids()).await.is_some());
-    }
-
-    #[tokio::test]
-    async fn without_a_sign_in_the_cookie_stays_but_a_forged_identity_does_not() {
-        let mut req = request();
-        assert!(guard(&mut req, None, &open("grafana.int.test"), None, None, &ids()).await.is_none());
-        assert_eq!(req.headers().get("cookie").unwrap(), "theme=dark; authward_session=s3cret");
-        assert!(req.headers().get("x-auth-user").is_none());
+        assert!(guard(&mut req, None, &restricted("jf.int.test", false), other, Some(&owner), &ids()).await.is_err());
     }
 
     #[test]
@@ -1201,27 +1196,6 @@ mod tests {
         assert!(connect("127.0.0.2").await.is_err(), "an address nobody is routed to is closed unanswered");
     }
 
-    #[tokio::test]
-    async fn the_verify_path_passes_the_devices_address_on_alone_and_other_paths_get_the_peer() {
-        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream = backend.local_addr().unwrap();
-        tokio::spawn(async move {
-            let app = axum::Router::new().fallback(|h: HeaderMap| async move {
-                h.get_all("x-forwarded-for").iter().map(|v| v.to_str().unwrap().to_string()).collect::<Vec<_>>().join("|")
-            });
-            axum::serve(backend, app).await.unwrap();
-        });
-        let route = Route::new(upstream);
-        let ask = |router: axum::Router| async move {
-            let mut req = Request::builder().uri("/verify").header("host", "auth.int.test").header("x-forwarded-for", "10.9.0.3").body(Body::empty()).unwrap();
-            req.extensions_mut().insert(ConnectInfo("10.9.0.7:5555".parse::<SocketAddr>().unwrap()));
-            let resp = router.oneshot(req).await.unwrap();
-            String::from_utf8(axum::body::to_bytes(resp.into_body(), 4096).await.unwrap().to_vec()).unwrap()
-        };
-        assert_eq!(ask(route.verify_router.clone()).await, "10.9.0.3", "the device's address, not followed by the calling node's");
-        assert_eq!(ask(route.router.clone()).await, "10.9.0.3, 10.9.0.7", "an ordinary request gets its peer appended");
-    }
-
     #[test]
     fn a_request_must_name_the_service_it_was_routed_to() {
         let req = |uri: &str, host: Option<&str>| {
@@ -1263,21 +1237,19 @@ mod tests {
             h.insert(axum::http::HeaderName::from_static(keep), HeaderValue::from_static("kept"));
         }
         // `x-corp-user` is the operator's own addition.
-        prepare(&mut h, None, false, false, &["x-corp-user".to_string()]);
+        prepare(&mut h, None, false, &["x-corp-user".to_string()]);
         let left: Vec<&str> = h.keys().map(|k| k.as_str()).collect();
         assert!(left.iter().all(|k| !spoof.contains(k)), "still there: {left:?}");
         assert_eq!(h.len(), 5, "everything else is untouched: {left:?}");
 
-        // Without the operator's addition, that one passes; and the provider's verify path keeps
-        // exactly what the calling terminator set on it.
+        // Without the operator's addition, that one passes.
         let mut h = HeaderMap::new();
-        for name in ["x-corp-user", "x-forwarded-host", "x-forwarded-for", "x-forwarded-uri", "x-forwarded-method", "x-forwarded-proto", "x-forwarded-user", "remote-user"] {
+        for name in ["x-corp-user", "x-forwarded-host", "x-forwarded-for", "x-forwarded-uri", "x-forwarded-method", "remote-user"] {
             h.insert(axum::http::HeaderName::from_static(name), HeaderValue::from_static("v"));
         }
-        prepare(&mut h, None, true, false, &[]);
-        let mut left: Vec<&str> = h.keys().map(|k| k.as_str()).collect();
-        left.sort_unstable();
-        assert_eq!(left, ["x-corp-user", "x-forwarded-for", "x-forwarded-host", "x-forwarded-method", "x-forwarded-uri"]);
+        prepare(&mut h, None, false, &[]);
+        let left: Vec<&str> = h.keys().map(|k| k.as_str()).collect();
+        assert_eq!(left, ["x-corp-user"]);
     }
 
     #[test]
@@ -1288,20 +1260,15 @@ mod tests {
         h.insert(NODE_HEADER, HeaderValue::from_static("admin-laptop"));
         h.insert("cookie", HeaderValue::from_static("a=b"));
         h.insert("x-forwarded-host", HeaderValue::from_static("jellyfin.int.test"));
-        prepare(&mut h, Some("phone"), false, false, &[]);
+        prepare(&mut h, Some("phone"), false, &[]);
         assert!(h.get("x-forwarded-host").is_none());
         assert!(h.get("x-forwarded-for").is_none() && h.get("forwarded").is_none());
         assert_eq!(h.get(NODE_HEADER).unwrap(), "phone");
         assert_eq!(h.get("cookie").unwrap(), "a=b");
 
-        h.insert("x-forwarded-host", HeaderValue::from_static("jellyfin.int.test"));
-        prepare(&mut h, None, true, false, &[]);
-        assert_eq!(h.get("x-forwarded-host").unwrap(), "jellyfin.int.test", "kept for the provider's verify endpoint");
         h.insert("x-forwarded-for", HeaderValue::from_static("10.9.0.3"));
-        prepare(&mut h, None, true, false, &[]);
-        assert_eq!(h.get("x-forwarded-for").unwrap(), "10.9.0.3", "the calling device, for the provider's verify endpoint");
-        prepare(&mut h, None, false, false, &[]);
-        assert!(h.get("x-forwarded-for").is_none(), "anywhere else a client's is removed");
+        prepare(&mut h, None, false, &[]);
+        assert!(h.get("x-forwarded-for").is_none(), "a client's is removed");
         assert!(h.get(NODE_HEADER).is_none(), "an unknown caller is named by nobody");
     }
 
@@ -1320,7 +1287,7 @@ mod tests {
         };
         let mut h = HeaderMap::new();
         sent(&mut h);
-        prepare(&mut h, Some("edge"), false, true, &[]);
+        prepare(&mut h, Some("edge"), true, &[]);
         let mut left: Vec<&str> = h.keys().map(|k| k.as_str()).collect();
         left.sort_unstable();
         assert_eq!(left, ["x-forwarded-for", "x-forwarded-host", NODE_HEADER]);
@@ -1328,11 +1295,11 @@ mod tests {
         // Anyone else's go, and the operator's own list wins over the forwarding node.
         let mut h = HeaderMap::new();
         sent(&mut h);
-        prepare(&mut h, Some("laptop"), false, false, &[]);
+        prepare(&mut h, Some("laptop"), false, &[]);
         assert!(h.get("x-forwarded-for").is_none() && h.get("x-forwarded-host").is_none());
         let mut h = HeaderMap::new();
         sent(&mut h);
-        prepare(&mut h, Some("edge"), false, true, &["x-forwarded-host".to_string()]);
+        prepare(&mut h, Some("edge"), true, &["x-forwarded-host".to_string()]);
         assert!(h.get("x-forwarded-host").is_none());
         assert_eq!(h["x-forwarded-for"], "203.0.113.9");
     }
@@ -1344,7 +1311,7 @@ mod tests {
             for (k, v) in pairs {
                 h.append(axum::http::HeaderName::from_static(k), HeaderValue::from_static(v));
             }
-            prepare(&mut h, Some("edge"), false, true, &[]);
+            prepare(&mut h, Some("edge"), true, &[]);
             let get = |n: &str| h.get_all(n).iter().map(|v| v.to_str().unwrap().to_string()).collect::<Vec<_>>();
             (get("x-forwarded-for"), get("x-forwarded-host"))
         };
@@ -1364,12 +1331,6 @@ mod tests {
             assert!(forwarded(&[("x-forwarded-host", junk)]).1.is_empty(), "{junk:?}");
         }
         assert!(forwarded(&[("x-forwarded-host", "a.example"), ("x-forwarded-host", "b.example")]).1.is_empty(), "two of them");
-
-        // The provider's verify path keeps what the calling terminator set, as it is.
-        let mut h = HeaderMap::new();
-        h.insert("x-forwarded-for", HeaderValue::from_static("10.9.0.3, 10.9.0.4"));
-        prepare(&mut h, Some("edge"), true, true, &[]);
-        assert_eq!(h["x-forwarded-for"], "10.9.0.3, 10.9.0.4");
     }
 
     #[tokio::test]
@@ -1437,15 +1398,15 @@ mod tests {
     async fn cookies_sent_one_per_header_reach_the_backend_as_one() {
         let mut req = request();
         req.headers_mut().remove("cookie");
-        for crumb in ["theme=dark", "authward_session=s3cret", "auth_tokens=abc"] {
+        for crumb in ["theme=dark", "__Host-wireserve-session=s3cret", "auth_tokens=abc"] {
             req.headers_mut().append("cookie", HeaderValue::from_static(crumb));
         }
-        prepare(req.headers_mut(), None, false, false, &[]);
+        prepare(req.headers_mut(), None, false, &[]);
         let cookies: Vec<_> = req.headers().get_all("cookie").iter().collect();
-        assert_eq!(cookies, ["theme=dark; authward_session=s3cret; auth_tokens=abc"]);
+        assert_eq!(cookies, ["theme=dark; __Host-wireserve-session=s3cret; auth_tokens=abc"]);
 
         // And the sign-in's cookie still comes out of the joined header.
-        assert!(guard(&mut req, Some(&sign_in()), &open("observe.int.test"), None, None, &ids()).await.is_none());
+        assert!(guard(&mut req, None, &open("observe.int.test"), None, None, &ids()).await.is_ok());
         let cookies: Vec<_> = req.headers().get_all("cookie").iter().collect();
         assert_eq!(cookies, ["theme=dark; auth_tokens=abc"]);
     }
@@ -2129,7 +2090,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_service_let_open_to_other_sites_and_the_sign_in_provider_take_them() {
+    async fn a_service_let_open_to_other_sites_takes_them() {
         let (port, client, shared) = limited_shared(quick()).await;
         let cross = [("sec-fetch-site", "cross-site"), ("origin", "https://idp.example")];
         let mut s = tls(port, &client).await;
@@ -2140,13 +2101,24 @@ mod tests {
         opened.cross_site = true;
         shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(opened));
         assert!(send(&mut s, "POST", &cross).await.starts_with("HTTP/1.1 200"));
+    }
 
-        // The sign-in provider's own service: its provider answers by form POST.
-        shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(open("svc.test")));
-        let mut provider = sign_in();
-        provider.target.fqdn = "svc.test".into();
-        *shared.sign_in.write().unwrap() = Some(provider);
-        assert!(send(&mut s, "POST", &cross).await.starts_with("HTTP/1.1 200"));
+    #[tokio::test]
+    async fn the_sign_ins_own_pages_are_the_terminators_once_there_is_a_sign_in() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (port, client, shared) = limited_shared(quick()).await;
+        let ask = || async {
+            let mut c = tls(port, &client).await;
+            c.write_all(b"GET /.wireserve/sign-out HTTP/1.1\r\nhost: svc.test\r\nconnection: close\r\n\r\n").await.unwrap();
+            let mut answer = String::new();
+            c.read_to_string(&mut answer).await.unwrap();
+            answer
+        };
+        assert!(!ask().await.contains("<h1>Sign out</h1>"), "no sign-in: the backend's path like any other");
+        let dir = tempfile::tempdir().unwrap();
+        *shared.sign_in.write().unwrap() = Some(Arc::new(sign_in(dir.path())));
+        let answer = ask().await;
+        assert!(answer.starts_with("HTTP/1.1 200") && answer.contains("<h1>Sign out</h1>"), "{answer}");
     }
 
     #[tokio::test]

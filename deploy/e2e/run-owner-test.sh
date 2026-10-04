@@ -162,7 +162,7 @@ case "$AUTH" in "$ISSUER/authorize?"*) ;; *) cat "$WORK/start.html" >&2; fail "t
 CALLBACK=$(browser -o "/work/login.html" -w '%{redirect_url}' --data-urlencode username=alice \
     --data-urlencode 'claims={"groups":["family"],"email":"alice@example.com","email_verified":true}' "$AUTH") \
     || fail "the browser could not post the provider's login form"
-case "$CALLBACK" in "$PUBLIC/claim/callback?"*) ;; *) cat "$WORK/login.html" >&2; fail "the provider did not send the browser back: '$CALLBACK'" ;; esac
+case "$CALLBACK" in "$PUBLIC/oidc/callback?"*) ;; *) cat "$WORK/login.html" >&2; fail "the provider did not send the browser back: '$CALLBACK'" ;; esac
 browser "$CALLBACK" > "$WORK/confirm.html" || fail "the browser could not come back from the provider"
 grep -q 'node-laptop' "$WORK/confirm.html" || { cat "$WORK/confirm.html"; fail "the confirmation does not name the node"; }
 # Only an e-mail the provider marks verified is kept (PLAN.md #275), so the

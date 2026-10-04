@@ -19,6 +19,12 @@ pub enum AppError {
     NoSuch(String),
     #[error("too many requests")]
     TooManyRequests,
+    /// Something that was there is over: a session, a ticket.
+    #[error("{0}")]
+    Gone(String),
+    /// Something this depends on cannot be reached now.
+    #[error("{0}")]
+    Unavailable(String),
     #[error(transparent)]
     Internal(#[from] DbError),
 }
@@ -44,6 +50,8 @@ impl IntoResponse for AppError {
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             AppError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             AppError::NoSuch(msg) => (StatusCode::NOT_FOUND, msg.clone()),
+            AppError::Gone(msg) => (StatusCode::GONE, msg.clone()),
+            AppError::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
             AppError::TooManyRequests => {
                 (StatusCode::TOO_MANY_REQUESTS, "too many requests".to_string())
             }

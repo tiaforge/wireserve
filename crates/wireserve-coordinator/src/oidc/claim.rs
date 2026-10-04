@@ -3,7 +3,8 @@
 //! 1. `GET /claim/{code}` — an admin's link. Checked, not used up (a link
 //!    previewer opening it must not spend it), and a sign-in started: its
 //!    state lives in memory, tied to this browser by a cookie.
-//! 2. `GET /claim/callback` — back from the identity provider. The state
+//! 2. `GET /oidc/callback` — back from the identity provider (shared with
+//!    the sign-in, PLAN.md M48, which the flow says it is for). The state
 //!    must match the cookie's, the code is exchanged, the ID token checked,
 //!    and the person is asked: "make this node yours?", naming the node,
 //!    its tags and its current owner.
@@ -14,6 +15,7 @@
 //! collect people's groups; the confirmation page is the second line.
 
 use std::time::{Duration, Instant};
+
 
 use axum::extract::{ConnectInfo, Form, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -35,52 +37,100 @@ const MAX_FLOWS: usize = 256;
 /// The prefix of a claim link's code.
 pub const CODE_PREFIX: &str = "clm_";
 
-/// A sign-in in progress, for one claim link.
+/// A sign-in at the identity provider in progress: for a claim link, or for
+/// signing in to a service (PLAN.md M48).
 pub struct Flow {
-    node_id: i64,
-    code_hash: String,
-    started: Instant,
-    pending: Option<Pending>,
+    pub(super) purpose: Purpose,
+    pub(super) started: Instant,
+    pub(super) pending: Option<Pending>,
     /// Signed in, awaiting "yes": who, and the token the answer must carry.
     signed_in: Option<(Identity, String)>,
 }
 
-fn cookie_name(state: &AppState) -> &'static str {
-    // `__Host-`: only ever set by this origin, over https, for the whole
-    // path — which a plain-http coordinator (a test setup) cannot have.
-    if state.config.public_url.as_deref().is_some_and(|u| u.starts_with("https://")) {
-        "__Host-wireserve-claim"
-    } else {
-        "wireserve-claim"
+pub(super) enum Purpose {
+    Claim { node_id: i64, code_hash: String },
+    SignIn { fqdn: String, to: String },
+}
+
+impl Flow {
+    pub(super) fn new(purpose: Purpose, pending: Pending) -> Self {
+        Self { purpose, started: Instant::now(), pending: Some(pending), signed_in: None }
     }
 }
 
-fn set_cookie(state: &AppState, value: &str, max_age: u64) -> String {
-    let secure = if cookie_name(state).starts_with("__Host-") { "; Secure" } else { "" };
-    // Lax: the browser comes back from the identity provider by a top-level
-    // navigation, which Lax sends the cookie on and a cross-site POST not.
-    format!("{}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}", cookie_name(state))
+/// A cookie of this coordinator's: `__Host-` (only ever set by this origin,
+/// over https, for the whole path) unless the coordinator is plain http —
+/// a test setup — which cannot have one.
+pub(super) fn cookie_name(state: &AppState, base: &'static str) -> String {
+    if state.config.public_url.as_deref().is_some_and(|u| u.starts_with("https://")) {
+        format!("__Host-{base}")
+    } else {
+        base.to_string()
+    }
 }
 
-fn flow_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
-    let name = cookie_name(state);
+pub(super) fn set_named_cookie(state: &AppState, base: &'static str, value: &str, max_age: u64) -> String {
+    let name = cookie_name(state, base);
+    let secure = if name.starts_with("__Host-") { "; Secure" } else { "" };
+    // Lax: the browser comes back from the identity provider by a top-level
+    // navigation, which Lax sends the cookie on and a cross-site POST not.
+    format!("{name}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}")
+}
+
+pub(super) fn named_cookie(state: &AppState, base: &'static str, headers: &HeaderMap) -> Option<String> {
+    let name = cookie_name(state, base);
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
-        .find_map(|c| c.trim().strip_prefix(name)?.strip_prefix('=').map(str::to_string))
+        .find_map(|c| c.trim().strip_prefix(name.as_str())?.strip_prefix('=').map(str::to_string))
 }
 
-fn same(a: &str, b: &str) -> bool {
+/// The cookie tying a browser to its flow.
+const FLOW_COOKIE: &str = "wireserve-flow";
+
+pub(super) fn set_cookie(state: &AppState, value: &str, max_age: u64) -> String {
+    set_named_cookie(state, FLOW_COOKIE, value, max_age)
+}
+
+fn flow_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    named_cookie(state, FLOW_COOKIE, headers)
+}
+
+/// Remembers a flow, tied to the browser by the returned cookie value.
+/// `None` when too many are in progress.
+pub(super) fn remember(oidc: &super::Oidc, flow: Flow) -> Option<String> {
+    let id = crate::tokengen::generate("");
+    let mut flows = oidc.flows.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    flows.retain(|_, f| f.started.elapsed() < FLOW_TTL);
+    if flows.len() >= MAX_FLOWS {
+        return None;
+    }
+    flows.insert(id.clone(), flow);
+    Some(id)
+}
+
+/// A 302 to the identity provider, setting the flow's cookie.
+pub(super) fn to_provider(state: &AppState, url: String, flow_id: &str) -> Response {
+    let mut resp = (StatusCode::FOUND, [(header::LOCATION, url)]).into_response();
+    if let Ok(v) = set_cookie(state, flow_id, FLOW_TTL.as_secs()).parse() {
+        resp.headers_mut().insert(header::SET_COOKIE, v);
+    }
+    resp.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+    resp.headers_mut().insert(header::REFERRER_POLICY, header::HeaderValue::from_static("no-referrer"));
+    resp
+}
+
+pub(super) fn same(a: &str, b: &str) -> bool {
     use subtle::ConstantTimeEq as _;
     a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 
-fn expired_flow() -> Response {
+pub(super) fn expired_flow() -> Response {
     pages::problem(
         StatusCode::BAD_REQUEST,
-        "This sign-in was started in another browser, or took too long. Open the link you were given again.",
+        "This sign-in was started in another browser, or took too long. Start again from the link or page you came from.",
     )
 }
 
@@ -120,29 +170,11 @@ pub async fn start(
             return pages::problem(StatusCode::BAD_GATEWAY, "The sign-in cannot be reached right now. Try again shortly.");
         }
     };
-    let id = crate::tokengen::generate("");
-    {
-        let mut flows = oidc.flows.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        flows.retain(|_, f| f.started.elapsed() < FLOW_TTL);
-        if flows.len() >= MAX_FLOWS {
-            return pages::problem(StatusCode::SERVICE_UNAVAILABLE, "Too many sign-ins at once. Try again in a few minutes.");
-        }
-        flows.insert(id.clone(), Flow {
-            node_id: node.id,
-            code_hash,
-            started: Instant::now(),
-            pending: Some(pending),
-            signed_in: None,
-        });
-    }
+    let Some(id) = remember(&oidc, Flow::new(Purpose::Claim { node_id: node.id, code_hash }, pending)) else {
+        return pages::problem(StatusCode::SERVICE_UNAVAILABLE, "Too many sign-ins at once. Try again in a few minutes.");
+    };
     tracing::info!(event = "claim_started", node_name = %node.name, client_ip = %client_ip);
-    let mut resp = (StatusCode::FOUND, [(header::LOCATION, url)]).into_response();
-    if let Ok(v) = set_cookie(&state, &id, FLOW_TTL.as_secs()).parse() {
-        resp.headers_mut().insert(header::SET_COOKIE, v);
-    }
-    resp.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
-    resp.headers_mut().insert(header::REFERRER_POLICY, header::HeaderValue::from_static("no-referrer"));
-    resp
+    to_provider(&state, url, &id)
 }
 
 #[derive(Deserialize)]
@@ -152,7 +184,8 @@ pub struct CallbackQuery {
     error: Option<String>,
 }
 
-/// `GET /claim/callback`.
+/// `GET /oidc/callback`: back from the identity provider, for a claim or a
+/// sign-in to a service — whichever the browser's flow is for.
 pub async fn callback(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<CallbackQuery>) -> Response {
     let Some(oidc) = state.oidc.clone() else {
         return StatusCode::NOT_FOUND.into_response();
@@ -160,19 +193,32 @@ pub async fn callback(State(state): State<AppState>, headers: HeaderMap, Query(q
     let Some(id) = flow_id(&state, &headers) else {
         return expired_flow();
     };
-    // Taken out, whatever happens next: a sign-in answers once.
+    // Taken out, whatever happens next: a sign-in answers once. A sign-in
+    // to a service has nothing left to ask, so its flow goes altogether.
     let taken = {
         let mut flows = oidc.flows.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        flows.get_mut(&id).filter(|f| f.started.elapsed() < FLOW_TTL).and_then(|f| Some((f.pending.take()?, f.node_id, f.code_hash.clone())))
+        let live = flows.get(&id).is_some_and(|f| f.started.elapsed() < FLOW_TTL && f.pending.is_some());
+        match flows.get(&id).map(|f| &f.purpose) {
+            Some(Purpose::SignIn { .. }) if live => flows.remove(&id).and_then(|f| {
+                let Purpose::SignIn { fqdn, to } = f.purpose else { unreachable!() };
+                Some((f.pending?, Err((fqdn, to))))
+            }),
+            Some(Purpose::Claim { .. }) if live => flows.get_mut(&id).and_then(|f| {
+                let Purpose::Claim { node_id, code_hash } = &f.purpose else { unreachable!() };
+                let claim = Ok((*node_id, code_hash.clone()));
+                Some((f.pending.take()?, claim))
+            }),
+            _ => None,
+        }
     };
-    let Some((pending, node_id, code_hash)) = taken else {
+    let Some((pending, purpose)) = taken else {
         return expired_flow();
     };
     if let Some(error) = q.error {
-        return pages::problem(StatusCode::BAD_REQUEST, &format!("The sign-in did not finish ({error}). Open the link again to retry."));
+        return pages::problem(StatusCode::BAD_REQUEST, &format!("The sign-in did not finish ({error}). Start again to retry."));
     }
     if !q.state.as_deref().is_some_and(|s| same(s, pending.csrf.secret())) {
-        tracing::warn!(event = "claim_state_mismatch");
+        tracing::warn!(event = "oidc_state_mismatch");
         return expired_flow();
     }
     let Some(code) = q.code else {
@@ -181,9 +227,13 @@ pub async fn callback(State(state): State<AppState>, headers: HeaderMap, Query(q
     let identity = match oidc.finish(code, pending).await {
         Ok(i) => i,
         Err(e) => {
-            tracing::warn!(error = %e, "claim: sign-in failed");
+            tracing::warn!(error = %e, "sign-in at the identity provider failed");
             return pages::problem(StatusCode::BAD_GATEWAY, &format!("The sign-in failed: {e}"));
         }
+    };
+    let (node_id, code_hash) = match purpose {
+        Ok(claim) => claim,
+        Err((fqdn, to)) => return super::sign_in::signed_in(&state, &oidc, identity, &fqdn, &to).await,
     };
     let conn = state.db.conn.lock().await;
     let still_valid = owners::claim_node(&conn, &code_hash).ok().flatten() == Some(node_id);
@@ -223,7 +273,7 @@ pub async fn confirm(State(state): State<AppState>, headers: HeaderMap, Form(for
         });
         if ok { flows.remove(&id) } else { None }
     };
-    let Some(Flow { node_id, code_hash, signed_in: Some((identity, _)), .. }) = flow else {
+    let Some(Flow { purpose: Purpose::Claim { node_id, code_hash }, signed_in: Some((identity, _)), .. }) = flow else {
         return expired_flow();
     };
     let conn = state.db.conn.lock().await;

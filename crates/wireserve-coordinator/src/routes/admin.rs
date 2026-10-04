@@ -71,8 +71,8 @@ pub async fn claim_link(
     check_label("node", &name)?;
     let (Some(_), Some(public)) = (&state.oidc, state.config.public_url.as_deref()) else {
         return Err(AppError::Conflict(
-            "device owners are off; on the coordinator's machine, `sudo wireserve-coordinator setup owners` \
-             sets them up"
+            "there is no login server; on the coordinator's machine, `sudo wireserve-coordinator setup login` \
+             sets one up"
                 .into(),
         ));
     };
@@ -136,7 +136,43 @@ pub async fn owners_status(
         .collect();
     granted_groups.sort();
     granted_groups.dedup();
-    Ok(Json(wireserve_types::OwnersStatus { provider, owners, granted_groups }))
+    let sessions = crate::db::sessions::all(&conn)?
+        .into_iter()
+        .map(|s| wireserve_types::SignInSession {
+            person: wireserve_types::OwnerInfo {
+                stale: !s.groups_count(now),
+                sub: s.sub,
+                email: s.email,
+                name: s.name,
+                groups: s.groups,
+            },
+            signed_in_at: s.created_at,
+            refreshed_at: s.refreshed_at,
+            last_used_at: s.last_used_at,
+            failing_since: s.stale_since,
+        })
+        .collect();
+    let sign_in = state.config.sign_in().is_some();
+    Ok(Json(wireserve_types::OwnersStatus { provider, owners, sign_in, sessions, granted_groups }))
+}
+
+/// `DELETE /admin/sessions/{person}` (PLAN.md M48): ends every sign-in
+/// session of the person whose subject or e-mail is `person`. Each service
+/// asks them to sign in again at its next renewal.
+pub async fn end_sessions(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path(person): Path<String>,
+) -> Result<Json<wireserve_types::SessionsEnded>, AppError> {
+    if person.is_empty() || person.len() > 256 || person.chars().any(char::is_control) {
+        return Err(AppError::BadRequest("not a subject or an e-mail address".into()));
+    }
+    let ended = crate::db::sessions::remove_person(&*state.db.conn.lock().await, &person)?;
+    if ended == 0 {
+        return Err(AppError::NoSuch(format!("{person} is not signed in anywhere")));
+    }
+    tracing::info!(event = "sessions_ended", person = %person, ended);
+    Ok(Json(wireserve_types::SessionsEnded { ended }))
 }
 
 /// `DELETE /admin/nodes/{name}/owner` (PLAN.md M38): the node belongs to
@@ -492,11 +528,6 @@ pub async fn add_group_member(
 ) -> Result<Json<wireserve_types::MembershipResponse>, AppError> {
     check_label("group", &group)?;
     check_label("service", &service)?;
-    if state.config.sign_in.as_ref().is_some_and(|si| si.service == service) {
-        return Err(AppError::BadRequest(format!(
-            "{service} is the sign-in: every terminator and every browser signing in must reach it, so it stays open"
-        )));
-    }
     let conn = state.db.conn.lock().await;
     match grants::add_member(&conn, &group, &service)? {
         grants::AddMemberOutcome::NoSuchGroup => return Err(AppError::NoSuch(format!("no group {group}"))),
@@ -649,7 +680,7 @@ pub async fn service_access_report(
                 state.transit.has_capability(pk, wireserve_types::CAP_SIGN_IN, state.config.online_threshold_secs)
             });
             let facts = crate::access::SignInFacts {
-                provider: state.config.sign_in.as_ref().map(|si| (si.service.as_str(), si.node.as_str())),
+                available: state.config.sign_in().is_some(),
                 owner_capable,
                 terminated: ctx.terminates(row),
             };

@@ -1,11 +1,12 @@
-//! `setup owners` (PLAN.md M47): devices that belong to someone, through
-//! the operator's login server (M38).
+//! `setup login` (PLAN.md M47, M48): the operator's login server, for
+//! devices that belong to someone (M38) and for signing in to web services
+//! (M48) — one client registration for both.
 //!
 //! The coordinator becomes an OpenID Connect client of that server. What
 //! has to match on both sides — the redirect URL, the issuer, the client —
 //! is shown or checked here, against the server's discovery document,
 //! before anything is saved: a typo would otherwise only show when someone
-//! opened a claim link.
+//! opened a claim link or signed in.
 
 use super::{confirm, people_groups, same_for_every_device, save, set_unless_default, Ctx, SetupError};
 use crate::install::envfile::Change;
@@ -24,7 +25,7 @@ const KEYS: [&str; 5] = [
 ];
 
 #[derive(clap::Args, Debug, Default)]
-pub struct OwnersArgs {
+pub struct LoginArgs {
     /// The login server's issuer URL, e.g. https://id.example.com
     // The client secret comes from WIRESERVE_OIDC_CLIENT_SECRET, never the
     // command line, where any user could read it.
@@ -36,7 +37,7 @@ pub struct OwnersArgs {
     /// The claim that lists a person's groups (default: groups).
     #[arg(long, value_name = "CLAIM", conflicts_with = "off")]
     pub groups_claim: Option<String>,
-    /// Devices belong to nobody any more.
+    /// No login server: devices belong to nobody, and nobody signs in.
     #[arg(long)]
     pub off: bool,
     /// Don't check the login server's discovery document first.
@@ -47,7 +48,7 @@ pub struct OwnersArgs {
     pub yes: bool,
 }
 
-/// The settings `setup owners` writes.
+/// The settings `setup login` writes.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Owners {
     pub issuer: String,
@@ -65,19 +66,25 @@ impl std::fmt::Debug for Owners {
     }
 }
 
+/// The env-file edits for `owners`. The forward_auth sign-in's settings,
+/// which nothing reads since M48, go too (`run` says so when there were
+/// any).
 #[must_use]
 pub fn env_changes(owners: Option<&Owners>) -> Vec<(&'static str, Change)> {
+    let old = crate::config::FORWARD_AUTH_KEYS.iter().map(|k| (*k, Change::Clear));
     let Some(o) = owners else {
-        return KEYS.iter().map(|k| (*k, Change::Clear)).collect();
+        return KEYS.iter().map(|k| (*k, Change::Clear)).chain(old).collect();
     };
     let default_scopes = DEFAULT_SCOPES.join(" ");
-    vec![
+    let mut changes = vec![
         ("WIRESERVE_OIDC_ISSUER", Change::Set(o.issuer.clone())),
         ("WIRESERVE_OIDC_CLIENT_ID", Change::Set(o.client_id.clone())),
         ("WIRESERVE_OIDC_CLIENT_SECRET", Change::Set(o.client_secret.clone())),
         ("WIRESERVE_OIDC_GROUPS_CLAIM", set_unless_default(&o.groups_claim, DEFAULT_GROUPS_CLAIM)),
         ("WIRESERVE_OIDC_SCOPES", set_unless_default(&o.scopes.join(" "), &default_scopes)),
-    ]
+    ];
+    changes.extend(old);
+    changes
 }
 
 /// What the login server's discovery document says, as far as it matters.
@@ -192,28 +199,34 @@ fn current(ctx: &Ctx) -> Option<Owners> {
     })
 }
 
-pub fn run(ctx: &Ctx, args: &OwnersArgs) -> Result<(), SetupError> {
+pub fn run(ctx: &Ctx, args: &LoginArgs) -> Result<(), SetupError> {
     let public = ctx.get("WIRESERVE_PUBLIC_URL").ok_or_else(|| {
         SetupError::Failed("the coordinator has no WIRESERVE_PUBLIC_URL; `sudo wireserve-coordinator install --reconfigure` sets it".into())
     })?;
-    let redirect = format!("{public}/claim/callback");
+    let redirect = format!("{public}{}", crate::config::REDIRECT_PATH);
     let current = current(ctx);
     let grants = ctx.admin().and_then(|a| a.grants());
+    let domain = ctx.get("WIRESERVE_DNS_PROVIDER").is_some();
+    let old: Vec<&str> = crate::config::FORWARD_AUTH_KEYS.into_iter().filter(|k| ctx.get(k).is_some()).collect();
 
     let wanted = if args.off {
         false
     } else if args.issuer.is_some() || args.client_id.is_some() || args.groups_claim.is_some() || !ctx.interactive {
         args.issuer.is_some() || current.is_some()
     } else {
-        explain(&why(grants.as_deref()));
-        ask_yes_no("Let devices belong to people?", current.is_some())
+        explain(&why(grants.as_deref(), domain));
+        ask_yes_no("Use a login server?", current.is_some())
     };
     if !wanted {
-        if current.is_none() {
-            println!("Nothing changed: devices don't belong to anyone, as before.");
+        if current.is_none() && old.is_empty() {
+            println!("Nothing changed: no login server, as before.");
             return Ok(());
         }
-        confirm(ctx, args.yes, &["Device owners:  off — devices lose what their owners' groups gave them".into()])?;
+        let mut summary = vec!["Login server:   off — devices lose what their owners' groups gave them, and nobody signs in".into()];
+        if !old.is_empty() {
+            summary.push(format!("Removed:        {} (the old sign-in's, read no more)", old.join(", ")));
+        }
+        confirm(ctx, args.yes, &summary)?;
         save(ctx, &env_changes(None))?;
         return Ok(());
     }
@@ -226,12 +239,22 @@ pub fn run(ctx: &Ctx, args: &OwnersArgs) -> Result<(), SetupError> {
         format!("Groups claim:   {}", owners.groups_claim),
         format!("Scopes:         {}", owners.scopes.join(" ")),
     ];
+    let mut summary = summary;
+    if !old.is_empty() {
+        summary.push(format!("Removed:        {} (the old sign-in's, read no more)", old.join(", ")));
+    }
     confirm(ctx, args.yes, &summary)?;
     if !save(ctx, &env_changes(Some(&owners)))? {
         return Ok(());
     }
     println!();
-    println!("Devices can now belong to people. Next, from wherever you use wireserve-admin:");
+    if domain {
+        println!("Devices can now belong to people, and people can sign in to web services whose");
+        println!("grants name their group. Next, from wherever you use wireserve-admin:");
+    } else {
+        println!("Devices can now belong to people. (Signing in to web services comes with");
+        println!("`setup domain`: it needs the DNS records.) Next, from wherever you use wireserve-admin:");
+    }
     let groups = grants.as_deref().map(people_groups).unwrap_or_default();
     if groups.is_empty() {
         println!("  wireserve-admin grant add oidc:family media    let the \"family\" group reach the services in \"media\"");
@@ -243,8 +266,9 @@ pub fn run(ctx: &Ctx, args: &OwnersArgs) -> Result<(), SetupError> {
     Ok(())
 }
 
-/// Why anyone would want this, in terms of their own mesh.
-fn why(grants: Option<&[wireserve_types::GrantInfo]>) -> Vec<String> {
+/// Why anyone would want this, in terms of their own mesh. `domain`: DNS
+/// records are published, so the sign-in comes with it.
+fn why(grants: Option<&[wireserve_types::GrantInfo]>, domain: bool) -> Vec<String> {
     let mut lines: Vec<String> = [
         "Right now each device gets access on its own: what its tags allow, or",
         "what every device gets.",
@@ -254,14 +278,29 @@ fn why(grants: Option<&[wireserve_types::GrantInfo]>) -> Vec<String> {
         "leaves the \"family\" group at your login server, both lose it — nobody",
         "has to retag anything. You hand each device to its person with a link",
         "they open once and sign in with.",
-        "",
-        "This needs a login server you already run, like Pocket ID, Authentik or",
-        "Keycloak. If it's just you, or you don't run one, you don't need this;",
-        "skipping it changes nothing, and you can come back any time.",
     ]
     .iter()
     .map(|s| (*s).to_string())
     .collect();
+    lines.push(String::new());
+    if domain {
+        lines.push("A computer the whole family shares belongs to nobody in particular: on it,".into());
+        lines.push("a web service asks whoever opens it to sign in, and lets them in by their".into());
+        lines.push("groups.".into());
+    } else {
+        lines.push("With a domain (`setup domain`), people on a computer they share can also".into());
+        lines.push("sign in to web services, which then let them in by their groups.".into());
+    }
+    lines.extend(
+        [
+            "",
+            "This needs a login server you already run, like Pocket ID, Authentik or",
+            "Keycloak. If it's just you, or you don't run one, you don't need this;",
+            "skipping it changes nothing, and you can come back any time.",
+        ]
+        .iter()
+        .map(|s| (*s).to_string()),
+    );
     if grants.is_some_and(same_for_every_device) {
         lines.push(String::new());
         lines.push("At the moment every device gets the same access (no grant names a tag or".into());
@@ -271,7 +310,7 @@ fn why(grants: Option<&[wireserve_types::GrantInfo]>) -> Vec<String> {
     lines
 }
 
-fn ask(ctx: &Ctx, args: &OwnersArgs, current: Option<&Owners>, redirect: &str) -> Result<Owners, SetupError> {
+fn ask(ctx: &Ctx, args: &LoginArgs, current: Option<&Owners>, redirect: &str) -> Result<Owners, SetupError> {
     let groups_claim = match &args.groups_claim {
         Some(c) => check_plain(c).map_err(|e| AskError::Invalid(format!("--groups-claim: {e}")))?,
         None => current.map_or_else(|| DEFAULT_GROUPS_CLAIM.to_string(), |c| c.groups_claim.clone()),
@@ -404,14 +443,16 @@ mod tests {
         assert_eq!(change(&c, "WIRESERVE_OIDC_SCOPES"), &Change::Set("openid profile".into()));
         assert_eq!(change(&c, "WIRESERVE_OIDC_GROUPS_CLAIM"), &Change::Set("roles".into()));
         assert!(env_changes(None).iter().all(|(_, c)| *c == Change::Clear));
+        assert_eq!(change(&c, "WIRESERVE_AUTH_SERVICE"), &Change::Clear, "the old sign-in's settings go");
         assert!(!format!("{o:?}").contains("s3cret"));
     }
 
     #[test]
     fn the_why_says_when_it_would_change_nothing_yet() {
         let open = [wireserve_types::GrantInfo { source: wireserve_types::GrantSource::Everyone, group: "default".into() }];
-        assert!(why(Some(&open)).iter().any(|l| l.contains("changes nothing until")));
-        assert!(!why(None).iter().any(|l| l.contains("changes nothing until")), "can't say without the coordinator");
+        assert!(why(Some(&open), true).iter().any(|l| l.contains("changes nothing until")));
+        assert!(!why(None, true).iter().any(|l| l.contains("changes nothing until")), "can't say without the coordinator");
+        assert!(why(None, false).iter().any(|l| l.contains("setup domain")), "the sign-in needs a domain");
     }
 
     #[test]
@@ -424,6 +465,7 @@ mod tests {
             },
             Some("https://m"),
             &"ab".repeat(32),
+            &"cd".repeat(32),
         )
         .unwrap()
         .unwrap();

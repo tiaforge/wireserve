@@ -98,8 +98,7 @@ wireserve-admin device create myphone --qr
 
 ```sh
 sudo wireserve-coordinator setup domain    # plex.home.example.com instead of plex.wg: works on phones, with HTTPS
-sudo wireserve-coordinator setup owners    # access follows people, through your login server
-sudo wireserve-coordinator setup sign-in   # people sharing one computer sign in to web services
+sudo wireserve-coordinator setup login     # access follows people, through your login server
 ```
 
 Each says what it is for before asking anything, and `--off` undoes it.
@@ -139,7 +138,7 @@ Run any command with `--help` for its options.
 - [Who can reach what](docs/access-control.md): groups, grants, tags,
   owners, sign-in
 - [Identity providers](docs/identity-providers.md): Pocket ID, Authentik
-  and Keycloak, for device owners and the sign-in
+  and Keycloak, one client for device owners and the sign-in
 - [Relaying between nodes](docs/relaying.md): when machines can't reach each
   other directly
 - [Ports, firewalls and host setup](docs/firewall.md): what each machine

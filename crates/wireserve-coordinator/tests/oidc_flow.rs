@@ -1,6 +1,7 @@
-//! A device claimed end to end (PLAN.md M38), against an identity provider
-//! running in this process: discovery, PKCE, the ID token's signature and
-//! nonce, the confirmation, and refreshing the owner's groups afterwards.
+//! A device claimed end to end (PLAN.md M38), and a person signed in to a
+//! service (PLAN.md M48), against an identity provider running in this
+//! process: discovery, PKCE, the ID token's signature and nonce, the
+//! confirmation or the ticket, and refreshing the groups afterwards.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -147,7 +148,15 @@ struct App {
 
 fn app(issuer: &str) -> App {
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let config = Config {
+    let config = config(issuer, &db_file);
+    let db = Db::open(db_file.path()).unwrap();
+    let state = build_state(config, db);
+    let router = routes::node_router(state.clone()).merge(routes::admin_router(state.clone()));
+    App { router, state, _db: db_file }
+}
+
+fn config(issuer: &str, db_file: &tempfile::NamedTempFile) -> Config {
+    Config {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         admin_listen_addr: "127.0.0.1:0".parse().unwrap(),
         admin_token: "admin".into(),
@@ -155,7 +164,6 @@ fn app(issuer: &str) -> App {
         net_v4_cidr: "100.90.0.0/24".into(),
         net_v6_prefix: "fd00:90::/64".into(),
         service_domain: None,
-        sign_in: None,
         identity_headers: Default::default(),
         public_url: Some("http://mesh.test".into()),
         oidc: Some(wireserve_coordinator::config::OidcConfig {
@@ -166,7 +174,8 @@ fn app(issuer: &str) -> App {
             groups_claim: "groups".into(),
             refresh_interval: std::time::Duration::from_secs(900),
             token_key: [7; 32],
-            redirect_url: "http://mesh.test/claim/callback".into(),
+            sign_in_key: [9; 32],
+            redirect_url: "http://mesh.test/oidc/callback".into(),
         }),
         dns: None,
         acme: wireserve_coordinator::config::acme_from_lookup(|_| None).unwrap(),
@@ -188,11 +197,7 @@ fn app(issuer: &str) -> App {
         strip_headers: Vec::new(),
         forwarding_nodes: Vec::new(),
         cross_site_services: Vec::new(),
-    };
-    let db = Db::open(db_file.path()).unwrap();
-    let state = build_state(config, db);
-    let router = routes::node_router(state.clone()).merge(routes::admin_router(state.clone()));
-    App { router, state, _db: db_file }
+    }
 }
 
 async fn call(router: &Router, method: &str, uri: &str, cookie: Option<&str>, form: Option<&str>) -> axum::response::Response {
@@ -257,7 +262,7 @@ async fn signed_in(app: &App, idp: &Shared, sub: &str, groups: &[&str]) -> (Stri
     let location = resp.headers()[header::LOCATION].to_str().unwrap().to_string();
     let cookie = resp.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_string();
     assert!(location.starts_with(&format!("{}/authorize?", idp.lock().unwrap().issuer)), "{location}");
-    assert_eq!(query(&location, "redirect_uri"), "http://mesh.test/claim/callback");
+    assert_eq!(query(&location, "redirect_uri"), "http://mesh.test/oidc/callback");
     assert_eq!(query(&location, "code_challenge_method"), "S256");
 
     let code = format!("code-{sub}");
@@ -270,7 +275,7 @@ async fn signed_in(app: &App, idp: &Shared, sub: &str, groups: &[&str]) -> (Stri
             groups.iter().map(|g| (*g).to_string()).collect(),
         ),
     );
-    (cookie, format!("/claim/callback?code={code}&state={}", query(&location, "state")))
+    (cookie, format!("/oidc/callback?code={code}&state={}", query(&location, "state")))
 }
 
 #[tokio::test]
@@ -390,4 +395,215 @@ async fn an_issuer_differing_only_in_a_trailing_slash_is_found() {
     let (cookie, callback) = signed_in(&app, &idp, "alice", &["family"]).await;
     let resp = call(&app.router, "GET", &callback, Some(&cookie), None).await;
     assert_eq!(resp.status(), StatusCode::OK, "{}", text(resp).await);
+}
+
+// ---- PLAN.md M48: the sign-in ----
+
+/// A DNS provider that takes everything: the sign-in needs DNS records to
+/// exist, not to be anywhere.
+struct NoDns;
+
+impl wireserve_coordinator::dns::provider::DnsWriter for NoDns {
+    fn existing<'a>(&'a self, _: &'a str) -> wireserve_coordinator::dns::provider::ReadFuture<'a> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn set_a<'a>(&'a self, _: &'a str, _: std::net::Ipv4Addr) -> wireserve_coordinator::dns::provider::WriteFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+    fn delete_a<'a>(&'a self, _: &'a str) -> wireserve_coordinator::dns::provider::WriteFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+    fn add_txt<'a>(&'a self, _: &'a str, _: &'a str) -> wireserve_coordinator::dns::provider::WriteFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+    fn remove_txt<'a>(&'a self, _: &'a str, _: &'a str) -> wireserve_coordinator::dns::provider::WriteFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+fn signing_app(issuer: &str) -> App {
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let mut config = config(issuer, &db_file);
+    config.service_domain = Some("int.test".into());
+    config.dns = Some(wireserve_coordinator::dns::DnsConfig {
+        provider: wireserve_coordinator::dns::config::DnsProvider::Cloudflare { token: "t".into() },
+        zone: "int.test".into(),
+        ttl: 300,
+    });
+    let db = Db::open(db_file.path()).unwrap();
+    let state = wireserve_coordinator::build_state_with_dns(config, db, Some(Arc::new(NoDns)));
+    let router = routes::node_router(state.clone()).merge(routes::admin_router(state.clone()));
+    App { router, state, _db: db_file }
+}
+
+async fn json(router: &Router, method: &str, uri: &str, bearer: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+    let mut req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    req.extensions_mut().insert(ConnectInfo("203.0.113.10:1234".parse::<SocketAddr>().unwrap()));
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, serde_json::from_str(&text(resp).await).unwrap_or(serde_json::Value::Null))
+}
+
+/// A node joined, its bearer token.
+async fn join(app: &App, name: &str) -> String {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let (_, created) = json(&app.router, "POST", "/admin/nodes", "admin", serde_json::json!({ "name": name })).await;
+    let pubkey = base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(name.as_bytes()));
+    let body = serde_json::json!({ "join_token": created["join_token"], "pubkey": pubkey, "listen_port": 51820 });
+    let (status, joined) = json(&app.router, "POST", "/register", "", body).await;
+    assert_eq!(status, StatusCode::OK, "{joined}");
+    joined["bearer_token"].as_str().unwrap().to_string()
+}
+
+/// `home` serving `grafana` on 443 with TLS, in a group only `oidc:family`
+/// is granted. Returns home's and another node's bearer tokens, and the
+/// coordinator's public key as nodes are told it.
+async fn grafana(app: &App) -> (String, String, wireserve_types::session::VerifyingKey) {
+    let home = join(app, "home").await;
+    let other = join(app, "other").await;
+    let poll = serde_json::json!({
+        "services": [{"name": "grafana", "ports": [{"public": 443, "target": 3000, "proto": "tcp"}]}],
+        "tls_ready": ["grafana"],
+        "capabilities": [wireserve_types::CAP_SIGN_IN],
+    });
+    json(&app.router, "POST", "/poll", &home, poll.clone()).await;
+    json(&app.router, "POST", "/admin/groups", "admin", serde_json::json!({"name": "ops"})).await;
+    json(&app.router, "PUT", "/admin/groups/ops/services/grafana", "admin", serde_json::Value::Null).await;
+    json(&app.router, "POST", "/admin/grants", "admin", serde_json::json!({"source": "oidc:family", "group": "ops"})).await;
+    let (_, body) = json(&app.router, "POST", "/poll", &home, poll).await;
+    let access = body["access"].as_array().unwrap().iter().find(|a| a["name"] == "grafana").unwrap().clone();
+    assert_eq!((&access["sign_in"], &access["sign_in_groups"]), (&serde_json::json!(true), &serde_json::json!(["family"])), "{body}");
+    let si = &body["naming"]["sign_in"];
+    assert_eq!(si["login_url"], "http://mesh.test", "{body}");
+    let key = wireserve_types::session::parse_public_key(si["public_key"].as_str().unwrap()).unwrap();
+    (home, other, key)
+}
+
+/// A browser sent to sign in to grafana, signing in at the provider as
+/// `sub`: the coordinator's last answer, and the cookies it set.
+async fn sign_in_as(app: &App, idp: &Shared, sub: &str, groups: &[&str]) -> (axum::response::Response, Vec<String>) {
+    let resp = call(&app.router, "GET", "/sign-in?service=grafana.int.test&to=%2Fd%3Fx%3D1", None, None).await;
+    assert_eq!(resp.status(), StatusCode::FOUND, "{}", text(resp).await);
+    let location = resp.headers()[header::LOCATION].to_str().unwrap().to_string();
+    let flow = resp.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_string();
+    assert_eq!(query(&location, "redirect_uri"), "http://mesh.test/oidc/callback", "the one callback, shared with claims");
+    let code = format!("code-{sub}-{}", groups.join("-"));
+    let entry = (query(&location, "nonce"), query(&location, "code_challenge"), sub.to_string(), groups.iter().map(|g| (*g).to_string()).collect());
+    idp.lock().unwrap().codes.insert(code.clone(), entry);
+    let callback = format!("/oidc/callback?code={code}&state={}", query(&location, "state"));
+    let resp = call(&app.router, "GET", &callback, Some(&flow), None).await;
+    let cookies = resp.headers().get_all(header::SET_COOKIE).iter().map(|v| v.to_str().unwrap().split(';').next().unwrap().to_string()).collect();
+    (resp, cookies)
+}
+
+fn ticket_of(resp: &axum::response::Response) -> String {
+    let location = resp.headers()[header::LOCATION].to_str().unwrap();
+    assert!(location.starts_with("https://grafana.int.test/.wireserve/callback?ticket="), "{location}");
+    query(location, "ticket")
+}
+
+#[tokio::test]
+async fn a_person_signs_in_to_a_service_and_only_its_own_node_learns_who() {
+    let idp = start_idp().await;
+    let issuer = idp.lock().unwrap().issuer.clone();
+    let app = signing_app(&issuer);
+    let (home, other, key) = grafana(&app).await;
+
+    let (resp, cookies) = sign_in_as(&app, &idp, "alice", &["family"]).await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let ticket = ticket_of(&resp);
+    let login = cookies.iter().find(|c| c.starts_with("wireserve-login=")).expect("the coordinator's own login").clone();
+
+    // Another node can't redeem it, and trying does not spend it.
+    let redeem = serde_json::json!({"fqdn": "grafana.int.test", "ticket": ticket});
+    let (status, _) = json(&app.router, "POST", "/sign-in/redeem", &other, redeem.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, answer) = json(&app.router, "POST", "/sign-in/redeem", &home, redeem.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["to"], "/d?x=1");
+    let token = answer["token"].as_str().unwrap().to_string();
+    let s = wireserve_types::session::verify(&key, &token).expect("signed by the coordinator");
+    assert_eq!((s.sub.as_str(), s.aud.as_str(), s.groups.as_slice()), ("alice", "grafana.int.test", &["family".to_string()][..]));
+    assert!(s.exp > chrono::Utc::now().timestamp() + 800, "good until the groups are due again");
+    assert_eq!(json(&app.router, "POST", "/sign-in/redeem", &home, redeem).await.0, StatusCode::GONE, "once only");
+
+    // Signed in already: the next visit goes straight back with a ticket.
+    let resp = call(&app.router, "GET", "/sign-in?service=grafana.int.test&to=%2F", Some(&login), None).await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    ticket_of(&resp);
+
+    // Renewing: only by its own node, only for its own service.
+    let renew = serde_json::json!({"fqdn": "grafana.int.test", "token": token});
+    assert_eq!(json(&app.router, "POST", "/sign-in/renew", &other, renew.clone()).await.0, StatusCode::FORBIDDEN);
+    let elsewhere = serde_json::json!({"fqdn": "vault.int.test", "token": token});
+    assert_eq!(json(&app.router, "POST", "/sign-in/renew", &home, elsewhere).await.0, StatusCode::FORBIDDEN);
+    let (status, answer) = json(&app.router, "POST", "/sign-in/renew", &home, renew.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+
+    // Due: the provider is asked, the groups follow it, the token rotates.
+    let backdate = || async {
+        app.state.db.conn.lock().await
+            .execute("UPDATE sign_in_sessions SET refreshed_at = '2020-01-01T00:00:00+00:00'", [])
+            .unwrap();
+    };
+    backdate().await;
+    idp.lock().unwrap().groups_now = vec!["admins".into(), "family".into()];
+    let (_, answer) = json(&app.router, "POST", "/sign-in/renew", &home, renew.clone()).await;
+    let s = wireserve_types::session::verify(&key, answer["token"].as_str().unwrap()).unwrap();
+    assert_eq!(s.groups, ["admins", "family"]);
+    let status = text(call(&app.router, "GET", "/admin/owners", None, None).await).await;
+    assert!(status.contains("\"sign_in\":true") && status.contains("alice@example.com"), "{status}");
+
+    // The provider refusing the refresh token ends the session.
+    backdate().await;
+    idp.lock().unwrap().refuse_refresh = true;
+    assert_eq!(json(&app.router, "POST", "/sign-in/renew", &home, renew).await.0, StatusCode::GONE);
+}
+
+#[tokio::test]
+async fn someone_the_service_does_not_admit_gets_no_ticket() {
+    let idp = start_idp().await;
+    let issuer = idp.lock().unwrap().issuer.clone();
+    let app = signing_app(&issuer);
+    grafana(&app).await;
+    let (resp, _) = sign_in_as(&app, &idp, "mallory", &["guests"]).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(resp.headers().get(header::LOCATION).is_none());
+    assert!(text(resp).await.contains("not for any of your groups"));
+
+    // Nor is anywhere but a path on the service somewhere to go back to.
+    for bad in ["//evil.example/", "https%3A%2F%2Fevil.example%2F"] {
+        let resp = call(&app.router, "GET", &format!("/sign-in?service=grafana.int.test&to={bad}"), None, None).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+    let resp = call(&app.router, "GET", "/sign-in?service=nothing.int.test", None, None).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn signing_out_at_a_service_ends_the_session_everywhere() {
+    let idp = start_idp().await;
+    let issuer = idp.lock().unwrap().issuer.clone();
+    let app = signing_app(&issuer);
+    let (home, _, _) = grafana(&app).await;
+    let (resp, cookies) = sign_in_as(&app, &idp, "alice", &["family"]).await;
+    let redeem = serde_json::json!({"fqdn": "grafana.int.test", "ticket": ticket_of(&resp)});
+    let (_, answer) = json(&app.router, "POST", "/sign-in/redeem", &home, redeem).await;
+    let body = serde_json::json!({"fqdn": "grafana.int.test", "token": answer["token"]});
+    assert_eq!(json(&app.router, "POST", "/sign-in/end", &home, body.clone()).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(json(&app.router, "POST", "/sign-in/renew", &home, body).await.0, StatusCode::GONE);
+
+    // The coordinator's own login is gone with it: back to the provider.
+    let login = cookies.iter().find(|c| c.starts_with("wireserve-login=")).unwrap();
+    let resp = call(&app.router, "GET", "/sign-in?service=grafana.int.test", Some(login), None).await;
+    assert!(resp.headers()[header::LOCATION].to_str().unwrap().starts_with(&issuer), "asked again");
+    let resp = call(&app.router, "GET", "/signed-out", Some(login), None).await;
+    assert!(resp.headers()[header::SET_COOKIE].to_str().unwrap().contains("Max-Age=0"));
 }

@@ -155,10 +155,6 @@ enum Command {
         // Pebble. Never needed for Let's Encrypt.
         #[arg(long, value_name = "PEM", env = "WIRESERVE_ACME_CA_FILE", hide = true)]
         acme_ca_file: Option<std::path::PathBuf>,
-        // Trust this CA too when checking the sign-in provider's
-        // certificate — a test CA. Never needed with a public CA.
-        #[arg(long, value_name = "PEM", env = "WIRESERVE_TLS_TRUST_FILE", hide = true)]
-        trust_file: Option<std::path::PathBuf>,
         #[arg(long, default_value_t = 5, hide = true)]
         check_in_secs: u64,
         // The port to listen on when not started by `wireserve-tls.socket`,
@@ -277,7 +273,7 @@ async fn main() {
         } => {
             cmd_daemon(&instance, poll_interval_secs, ifname).await
         }
-        Command::TlsDaemon { state_dir, acme_ca_file, trust_file, check_in_secs, port } => {
+        Command::TlsDaemon { state_dir, acme_ca_file, check_in_secs, port } => {
             // systemd may list several colon-separated state directories;
             // the unit names exactly one.
             let state_dir = state_dir
@@ -287,7 +283,6 @@ async fn main() {
                 socket: instance.tls_socket_path(),
                 state_dir,
                 ca_file: acme_ca_file,
-                trust_file,
                 check_in_every: Duration::from_secs(check_in_secs.max(1)),
                 port,
             })

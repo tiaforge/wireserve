@@ -25,8 +25,12 @@ const NET_V6_KEY: &str = "WIRESERVE_NET_V6_PREFIX";
 /// Kept here rather than in the database it protects, so a copy of the
 /// database alone does not carry the tokens in the clear.
 pub const OIDC_TOKEN_KEY: &str = "WIRESERVE_OIDC_TOKEN_KEY";
+/// Signs the sign-in's session tokens (PLAN.md M48): the seed of an
+/// Ed25519 key whose public half every node gets. Whoever holds it can let
+/// anyone into any service, so it never leaves this file.
+pub const SIGN_IN_KEY: &str = "WIRESERVE_SIGN_IN_KEY";
 
-const KEYS: [&str; 4] = [ADMIN_TOKEN_KEY, NET_V4_KEY, NET_V6_KEY, OIDC_TOKEN_KEY];
+const KEYS: [&str; 5] = [ADMIN_TOKEN_KEY, NET_V4_KEY, NET_V6_KEY, OIDC_TOKEN_KEY, SIGN_IN_KEY];
 
 #[derive(Debug, thiserror::Error)]
 pub enum BootstrapError {
@@ -43,6 +47,8 @@ pub struct Bootstrapped {
     /// 32 bytes, hex. Generated silently — it is not something an operator
     /// has to know about — and so never listed in `generated`.
     pub oidc_token_key: String,
+    /// 32 bytes, hex, generated silently the same way.
+    pub sign_in_key: String,
     /// Which of the three keys were freshly generated (not found in an env
     /// var or the persisted file) on this call.
     pub generated: Vec<&'static str>,
@@ -90,7 +96,8 @@ pub fn resolve_with(
     let net_v4_cidr = resolve_one(NET_V4_KEY, generate_v4_cidr);
     let net_v6_prefix = resolve_one(NET_V6_KEY, generate_v6_prefix);
     let oidc_token_key = resolve_one(OIDC_TOKEN_KEY, generate_token_key);
-    generated.retain(|k| *k != OIDC_TOKEN_KEY);
+    let sign_in_key = resolve_one(SIGN_IN_KEY, generate_token_key);
+    generated.retain(|k| *k != OIDC_TOKEN_KEY && *k != SIGN_IN_KEY);
 
     if !to_append.is_empty() {
         append_to_file(&path, &to_append)?;
@@ -101,6 +108,7 @@ pub fn resolve_with(
         net_v4_cidr,
         net_v6_prefix,
         oidc_token_key,
+        sign_in_key,
         generated,
         path,
     })

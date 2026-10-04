@@ -300,6 +300,21 @@ impl AdminClient {
         Ok(Self::check_status(resp)?.json()?)
     }
 
+    /// `DELETE /admin/sessions/{person}` (PLAN.md M48).
+    pub fn end_sessions(&self, person: &str) -> Result<wireserve_types::SessionsEnded, ClientError> {
+        // An e-mail address or a provider's subject: anything but the
+        // characters a path segment may hold as they are goes encoded.
+        let segment: String = person
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'@' | b'+' => (b as char).to_string(),
+                _ => format!("%{b:02X}"),
+            })
+            .collect();
+        let resp = self.http.delete(self.url(&format!("/admin/sessions/{segment}"))).bearer_auth(&self.admin_token).send()?;
+        Ok(Self::check_status(resp)?.json()?)
+    }
+
     /// `DELETE /admin/nodes/{name}/owner`.
     pub fn remove_owner(&self, node: &str) -> Result<(), ClientError> {
         let resp = self.http.delete(self.url(&format!("/admin/nodes/{node}/owner"))).bearer_auth(&self.admin_token).send()?;

@@ -39,6 +39,9 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 defguard_wireguard_rs = "0.12"
 nftables = { version = "0.6", default-features = false }
 base64 = "0.23"
+# The sign-in's session tokens (PLAN.md M48); already in the tree through
+# openidconnect.
+ed25519-dalek = "2"
 rpassword = "7"
 # Pure-Rust, zero transitive dependencies (Nayuki's reference implementation).
 # Its last release predates this project, which here means the QR spec is

@@ -91,14 +91,21 @@ pub struct OwnerInfo {
     pub stale: bool,
 }
 
-/// `GET /admin/owners` (PLAN.md M47): whether device owners work, and
-/// whose devices are whose.
+/// `GET /admin/owners` (PLAN.md M47, M48): whether the login server works,
+/// whose devices are whose, and who is signed in to web services.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OwnersStatus {
     /// The identity provider, or `None` when none is configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<OwnersProvider>,
     pub owners: Vec<OwnedNode>,
+    /// Whether people can sign in to web services: a login server, and DNS
+    /// records for the terminators (PLAN.md M48).
+    #[serde(default)]
+    pub sign_in: bool,
+    /// Who is signed in, one entry per browser.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<SignInSession>,
     /// The `oidc:` groups some grant names: an owner's groups count only
     /// through these.
     pub granted_groups: Vec<String>,
@@ -126,6 +133,23 @@ pub struct OwnedNode {
     /// Refreshing has failed since then; the groups count for an hour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failing_since: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// One browser signed in to web services (PLAN.md M48).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignInSession {
+    pub person: OwnerInfo,
+    pub signed_in_at: chrono::DateTime<chrono::Utc>,
+    pub refreshed_at: chrono::DateTime<chrono::Utc>,
+    pub last_used_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failing_since: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// `DELETE /admin/sessions/{person}`: how many sessions ended.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionsEnded {
+    pub ended: usize,
 }
 
 // ---- Node: address probe (dual-family endpoint self-discovery) ----
@@ -271,12 +295,15 @@ pub const MAX_TRANSIT_WANTED_PER_POLL: usize = 64;
 /// ready yet.
 pub const CAP_TLS_TERMINATE: &str = "tls-terminate";
 
-/// `sign-in` (PLAN.md M34, M36): this agent's terminator lets a caller into
-/// a restricted service by its device's grants, or else by the groups it
-/// proves at the sign-in, and its firewall opens a restricted service's
-/// terminated 443 to everyone only while the terminator decides. Without
-/// it, a service's owner is never told to rely on the sign-in.
-pub const CAP_SIGN_IN: &str = "sign-in";
+/// `session-sign-in` (PLAN.md M36, M48): this agent's terminator lets a
+/// caller into a restricted service by its device's grants, or else by the
+/// groups in a session token the coordinator signed, and its firewall opens
+/// a restricted service's terminated 443 to everyone only while the
+/// terminator decides. Without it, a service's owner is never told to rely
+/// on the sign-in. (M34's `sign-in` meant the forward_auth check, which no
+/// coordinator offers any more: a terminator reporting only that is never
+/// trusted with the new one.)
+pub const CAP_SIGN_IN: &str = "session-sign-in";
 
 /// `relay` (PLAN.md M39): this agent runs a carry interface, so sessions
 /// with it can be relayed end to end, and, when it carries, forwards only

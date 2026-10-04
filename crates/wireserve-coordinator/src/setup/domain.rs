@@ -17,7 +17,7 @@ pub struct DomainArgs {
     /// Name services <name>.<DOMAIN> instead of <name>.wg.
     #[arg(long, value_name = "DOMAIN", conflicts_with = "off")]
     pub domain: Option<String>,
-    /// Go back to <name>.wg (also turns off the sign-in, which needs the
+    /// Go back to <name>.wg (the sign-in is off then too: it needs the
     /// DNS records).
     #[arg(long)]
     pub off: bool,
@@ -103,11 +103,10 @@ pub fn current(get: impl Fn(&str) -> Option<String>) -> Option<Naming> {
     get("WIRESERVE_SERVICE_DOMAIN").map(|domain| Naming { domain, dns })
 }
 
-/// The env-file edits for `naming`. Without DNS records there are no
-/// terminators, so a sign-in set up before (`sign_in_set`) is turned off
-/// too — the coordinator would refuse to start with it.
+/// The env-file edits for `naming`. (Without DNS records there are no
+/// terminators, and so no sign-in; that follows by itself.)
 #[must_use]
-pub fn env_changes(naming: Option<&Naming>, sign_in_set: bool) -> Vec<(&'static str, Change)> {
+pub fn env_changes(naming: Option<&Naming>) -> Vec<(&'static str, Change)> {
     let mut changes = vec![(
         "WIRESERVE_SERVICE_DOMAIN",
         naming.map_or(Change::Clear, |n| Change::Set(n.domain.clone())),
@@ -123,10 +122,6 @@ pub fn env_changes(naming: Option<&Naming>, sign_in_set: bool) -> Vec<(&'static 
     }
     let zone = dns.and_then(|d| d.zone.clone());
     changes.push(("WIRESERVE_DNS_ZONE", zone.map_or(Change::Clear, Change::Set)));
-    if dns.is_none() && sign_in_set {
-        changes.push(("WIRESERVE_AUTH_SERVICE", Change::Clear));
-        changes.push(("WIRESERVE_AUTH_NODE", Change::Clear));
-    }
     changes
 }
 
@@ -344,7 +339,7 @@ pub fn run(ctx: &Ctx, args: &DomainArgs) -> Result<(), SetupError> {
             }
         }
     }
-    let sign_in_set = ctx.get("WIRESERVE_AUTH_SERVICE").is_some();
+    let sign_in_set = ctx.get("WIRESERVE_OIDC_ISSUER").is_some();
     let mut summary = vec![match &naming {
         Some(n) => format!("Service names:  <name>.{}", n.domain),
         None => "Service names:  <name>.wg".to_string(),
@@ -356,10 +351,10 @@ pub fn run(ctx: &Ctx, args: &DomainArgs) -> Result<(), SetupError> {
     }
     let dns_off = naming.as_ref().is_none_or(|n| n.dns.is_none());
     if dns_off && sign_in_set {
-        summary.push("Sign-in:        turned off (it needs the DNS records)".into());
+        summary.push("Sign-in:        off until there are DNS records again (device owners stay)".into());
     }
     confirm(ctx, args.yes, &summary)?;
-    if !save(ctx, &env_changes(naming.as_ref(), sign_in_set))? {
+    if !save(ctx, &env_changes(naming.as_ref()))? {
         return Ok(());
     }
     println!();
@@ -376,7 +371,7 @@ pub fn run(ctx: &Ctx, args: &DomainArgs) -> Result<(), SetupError> {
         None => println!("Services are named <name>.wg again."),
     }
     if dns_off && sign_in_set {
-        println!("The sign-in is off; `sudo wireserve-coordinator setup sign-in` sets it up again.");
+        println!("The sign-in to web services is off: it needs the DNS records, and comes back with them.");
     }
     Ok(())
 }
@@ -484,9 +479,8 @@ mod tests {
         let current = Some(Naming { domain: "int.test".into(), dns: None });
         assert_eq!(asker(Given::default(), current.clone(), &none).ask().unwrap(), current, "kept without a terminal");
         assert_eq!(asker(Given { domain: Some(None), ..Given::default() }, current, &none).ask().unwrap(), None);
-        let c = env_changes(None, false);
+        let c = env_changes(None);
         assert_eq!(change(&c, "WIRESERVE_SERVICE_DOMAIN"), &Change::Clear);
-        assert!(!c.iter().any(|(k, _)| *k == "WIRESERVE_AUTH_SERVICE"), "nothing to turn off");
     }
 
     #[test]
@@ -494,7 +488,7 @@ mod tests {
         let env = |k: &str| (k == "WIRESERVE_DNS_API_TOKEN").then(|| "cf-token".to_string());
         let n = asker(dns_given(), None, &env).ask().unwrap().unwrap();
         assert_eq!(n.dns.as_ref().unwrap().provider, "cloudflare");
-        let c = env_changes(Some(&n), false);
+        let c = env_changes(Some(&n));
         assert_eq!(change(&c, "WIRESERVE_DNS_PROVIDER"), &Change::Set("cloudflare".into()));
         assert_eq!(change(&c, "WIRESERVE_DNS_API_TOKEN"), &Change::Set("cf-token".into()));
         assert_eq!(change(&c, "WIRESERVE_DNS_TSIG_SECRET"), &Change::Clear, "other providers' keys are cleared");
@@ -530,23 +524,9 @@ mod tests {
 
         let off = asker(Given { dns_provider: Some(None), ..Given::default() }, from_file(file), &none).ask().unwrap();
         assert_eq!(off.as_ref().unwrap().dns, None);
-        let c = env_changes(off.as_ref(), false);
+        let c = env_changes(off.as_ref());
         assert_eq!(change(&c, "WIRESERVE_DNS_PROVIDER"), &Change::Clear);
         assert_eq!(change(&c, "WIRESERVE_DNS_API_TOKEN"), &Change::Clear);
-    }
-
-    #[test]
-    fn without_dns_records_the_sign_in_is_turned_off_too() {
-        let n = Naming { domain: "int.test".into(), dns: None };
-        for c in [env_changes(Some(&n), true), env_changes(None, true)] {
-            assert_eq!(change(&c, "WIRESERVE_AUTH_SERVICE"), &Change::Clear);
-            assert_eq!(change(&c, "WIRESERVE_AUTH_NODE"), &Change::Clear);
-        }
-        let with_dns = Naming {
-            dns: Some(DnsAnswer { provider: "cloudflare".into(), fields: vec![("WIRESERVE_DNS_API_TOKEN", "t".into())], zone: None }),
-            ..n
-        };
-        assert!(!env_changes(Some(&with_dns), true).iter().any(|(k, _)| *k == "WIRESERVE_AUTH_SERVICE"));
     }
 
     #[test]
@@ -559,7 +539,7 @@ mod tests {
         };
         let n = asker(given.clone(), None, &env).ask().unwrap();
         assert_eq!(n.as_ref().unwrap().dns.as_ref().unwrap().check("home.example.com").unwrap().zone, "example.com");
-        let text = envfile::apply("", &env_changes(n.as_ref(), false));
+        let text = envfile::apply("", &env_changes(n.as_ref()));
         assert!(text.contains("WIRESERVE_DNS_ZONE=example.com"), "{text}");
 
         // A rerun keeps it, and checks with it.
@@ -582,9 +562,9 @@ mod tests {
             _ => None,
         };
         let n = asker(dns_given(), None, &own).ask().unwrap();
-        assert_eq!(change(&env_changes(n.as_ref(), false), "WIRESERVE_DNS_ZONE"), &Change::Clear);
+        assert_eq!(change(&env_changes(n.as_ref()), "WIRESERVE_DNS_ZONE"), &Change::Clear);
         let off = asker(Given { dns_provider: Some(None), ..Given::default() }, from_file(&text), &|_| None).ask().unwrap();
-        assert_eq!(change(&env_changes(off.as_ref(), false), "WIRESERVE_DNS_ZONE"), &Change::Clear);
+        assert_eq!(change(&env_changes(off.as_ref()), "WIRESERVE_DNS_ZONE"), &Change::Clear);
     }
 
     #[test]

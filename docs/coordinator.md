@@ -46,7 +46,7 @@ install` the whole update. `install --reconfigure` asks the questions again
 with the current settings as defaults, and changes only those keys in
 `coordinator.env` — a key you drop is commented out, never deleted.
 
-## Later: a domain, people, a sign-in
+## Later: a domain, and people
 
 What a working mesh doesn't need, install doesn't ask. Each of these is its
 own command, run whenever its time comes — and again to change it, or with
@@ -56,21 +56,20 @@ restarts the coordinator:
 
 ```sh
 sudo wireserve-coordinator setup domain    # plex.home.example.com instead of plex.wg, on phones too, with HTTPS
-sudo wireserve-coordinator setup owners    # access follows people: devices belong to someone at your login server
-sudo wireserve-coordinator setup sign-in   # people sharing one computer sign in to web services
+sudo wireserve-coordinator setup login     # access follows people, through your login server
 ```
 
 - **`setup domain`** ([Real names and HTTPS](names-and-https.md)) is worth
   doing early: a domain *replaces* `.wg`, so it renames every service, and
   anything set up with an old name needs the new one. It lists the renames
   before it saves.
-- **`setup owners`** ([Devices that belong to someone](access-control.md#devices-that-belong-to-someone))
-  needs a login server you run — Pocket ID, Authentik, Keycloak:
-  [recipes](identity-providers.md). `wireserve-admin owner status` shows
-  whether it works.
-- **`setup sign-in`** ([Signing in, for shared devices](access-control.md#signing-in-for-shared-devices))
-  needs `setup domain` with DNS records first, and a forward_auth provider:
-  authward, or the one built into Authentik or Authelia.
+- **`setup login`** needs a login server you run — Pocket ID, Authentik,
+  Keycloak: [recipes](identity-providers.md). Devices can then
+  [belong to someone](access-control.md#devices-that-belong-to-someone), and
+  with `setup domain`'s DNS records people sharing a computer
+  [sign in](access-control.md#signing-in-for-shared-devices) to web services
+  — one client registration for both, nothing else to run.
+  `wireserve-admin owner status` shows whether it works.
 
 Without a terminal they take flags (`setup <what> --help`); secrets come
 from the environment (`WIRESERVE_DNS_*`, `WIRESERVE_OIDC_CLIENT_SECRET`),

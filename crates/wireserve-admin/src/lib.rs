@@ -206,6 +206,10 @@ pub fn cmd_remove_owner(client: &AdminClient, node: &str) -> Result<(), CliError
     Ok(client.remove_owner(node)?)
 }
 
+pub fn cmd_end_sessions(client: &AdminClient, person: &str) -> Result<usize, CliError> {
+    Ok(client.end_sessions(person)?.ended)
+}
+
 pub fn cmd_owners_status(client: &AdminClient) -> Result<wireserve_types::OwnersStatus, CliError> {
     Ok(client.owners_status()?)
 }

@@ -66,7 +66,6 @@ async fn the_shipped_filter_matches_every_failed_authentication_the_coordinator_
         net_v4_cidr: "100.90.0.0/24".into(),
         net_v6_prefix: "fd00:90::/64".into(),
         service_domain: None,
-        sign_in: None,
         identity_headers: Default::default(),
         strip_headers: Vec::new(),
         forwarding_nodes: Vec::new(),
