@@ -244,7 +244,13 @@ Worth knowing:
   and programs that aren't browsers are unaffected. Through a forwarding node, the public name it was
   asked for counts as the service's own. A service that must take such requests — itself a
   sign-in client answered by form POST, say — goes in
-  `WIRESERVE_CROSS_SITE_SERVICES` on the coordinator.
+  `WIRESERVE_CROSS_SITE_SERVICES` on the coordinator. So does one with a
+  desktop app built on Electron, such as Bitwarden's for Vaultwarden: its
+  pages are loaded from the app itself, and the browser inside it calls
+  every request to the service cross-site, so reads work and logging in
+  fails (Bitwarden says "unexpected error"). The service's node logs
+  `refused a request another site started`. A browser extension is not
+  affected.
 - **A node learns who owns a device only when that device calls it.** The
   identity headers name the owner of a calling device; the coordinator tells
   a node an owner's subject, e-mail and groups only for a device the node

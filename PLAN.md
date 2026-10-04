@@ -4673,7 +4673,8 @@ to fix. The first three, together:
     Tests: the bind on the way out and back, a refused handed-over ticket
     (terminator and `oidc_flow.rs`), the per-caller and per-address limits,
     the cached sign-out, flow eviction never taking a claim's slot. The
-    sign-in e2e gained a step opening mallory's ticket in another browser.
+    sign-in e2e gained a step opening mallory's ticket in another browser;
+    it passes with #312 and #313 (2026-10-04, run by the user).
 
 313. **The rest of the review, together** (2026-10-04).
     - *Sign-out by link.* `GET /signed-out` deleted the browser's session,
