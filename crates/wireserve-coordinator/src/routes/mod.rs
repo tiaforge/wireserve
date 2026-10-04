@@ -38,7 +38,7 @@ pub fn node_router(state: AppState) -> Router {
         .route("/claim/confirm", post(crate::oidc::claim::confirm))
         .route("/claim/{code}", get(crate::oidc::claim::start))
         .route("/sign-in", get(crate::oidc::sign_in::start))
-        .route("/signed-out", get(crate::oidc::sign_in::signed_out))
+        .route("/signed-out", get(crate::oidc::sign_in::signed_out).post(crate::oidc::sign_in::sign_out))
         // The sign-in's node calls (PLAN.md M48), bearer-authenticated.
         .route("/sign-in/redeem", post(crate::oidc::sign_in::redeem))
         .route("/sign-in/renew", post(crate::oidc::sign_in::renew))

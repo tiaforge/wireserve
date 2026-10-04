@@ -182,15 +182,25 @@ the service's node renews it through the coordinator, which asks the login
 server with the person's refresh token, and the browser gets the new one
 with its next answer; the person notices nothing. Someone removed from a
 group loses what it gave them within that time. If the login server refuses
-the refresh token — the person was disabled, or signed out everywhere there
+the refresh token — the person was disabled or deleted, or the token revoked
 — the session is over and the next page asks them to sign in. If it cannot be
 reached, the groups keep counting for an hour.
+
+**Signing out at the login server is not enough.** The coordinator holds an
+`offline_access` refresh token, which by design outlives the person's own
+session at the login server: logging out there, or the login server's session
+ending, does not end a wireserve session. To take someone's access away now,
+remove them from the group or disable them at the login server, or run
+`wireserve-admin owner sign-out <their e-mail>`; owned devices follow
+`owner clear`. The same goes for device owners.
 
 **Signing out**: `https://<service>/.wireserve/sign-out` ends the session —
 every service it was used at asks again at its next renewal — and the
 coordinator forgets the browser too. `wireserve-admin owner sign-out
 anna@example.com` signs a person out of every browser at once (their devices
-stay theirs). A session nobody uses for 30 days is forgotten.
+stay theirs). A session nobody uses for 30 days is forgotten, and a person
+keeps at most ten — signing in in an eleventh browser ends the one used
+least recently. Someone the service does not admit gets no session at all.
 
 Worth knowing:
 

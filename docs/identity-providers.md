@@ -97,7 +97,11 @@ sudo wireserve-coordinator setup login
 
 Keycloak keeps every refresh token it hands out for `offline_access` as an
 *offline session*, one per signed-in browser and one per owned device;
-*Sessions* in the admin console lists them.
+*Sessions* in the admin console lists them. Logging out of Keycloak does not
+end them — that is what `offline_access` is for — so to cut someone off,
+disable them, take them out of the group, or revoke their offline sessions
+there (the admin console, or the person's own Account Console under
+*Applications*), or use `wireserve-admin owner sign-out`.
 
 ## Others
 

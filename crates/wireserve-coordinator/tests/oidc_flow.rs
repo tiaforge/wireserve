@@ -579,7 +579,13 @@ async fn someone_the_service_does_not_admit_gets_no_ticket() {
     let (resp, _) = sign_in_as(&app, &idp, "mallory", &["guests"]).await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert!(resp.headers().get(header::LOCATION).is_none());
+    assert!(
+        !resp.headers().get_all(header::SET_COOKIE).iter().any(|c| c.to_str().unwrap().starts_with("wireserve-login=")),
+        "no login cookie"
+    );
     assert!(text(resp).await.contains("not for any of your groups"));
+    let kept = wireserve_coordinator::db::sessions::all(&*app.state.db.conn.lock().await).unwrap();
+    assert!(kept.is_empty(), "nothing kept for someone not admitted (PLAN.md #313): {kept:?}");
 
     // Nor is anywhere but a path on the service somewhere to go back to.
     for bad in ["//evil.example/", "https%3A%2F%2Fevil.example%2F"] {
@@ -640,4 +646,41 @@ async fn one_address_starts_only_so_many_sign_ins() {
         assert_eq!(call(&app.router, "GET", &uri, None, None).await.status(), StatusCode::FOUND);
     }
     assert_eq!(call(&app.router, "GET", &uri, None, None).await.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn only_the_coordinators_own_page_signs_a_browser_out() {
+    // PLAN.md #313: a link any page can send a browser to must not end its
+    // session.
+    let idp = start_idp().await;
+    let issuer = idp.lock().unwrap().issuer.clone();
+    let app = signing_app(&issuer);
+    grafana(&app).await;
+    let (_, cookies) = sign_in_as(&app, &idp, "alice", &["family"]).await;
+    let login = cookies.iter().find(|c| c.starts_with("wireserve-login=")).unwrap().clone();
+    let live = || async { !wireserve_coordinator::db::sessions::all(&*app.state.db.conn.lock().await).unwrap().is_empty() };
+
+    let resp = call(&app.router, "GET", "/signed-out", Some(&login), None).await;
+    assert!(text(resp).await.contains("<form method=\"post\""), "a button, not a sign-out");
+    assert!(live().await);
+
+    let post = |site: &'static str, origin: &'static str| {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/signed-out")
+            .header(header::COOKIE, login.clone())
+            .header("sec-fetch-site", site)
+            .header(header::ORIGIN, origin)
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo("203.0.113.10:1234".parse::<SocketAddr>().unwrap()));
+        app.router.clone().oneshot(req)
+    };
+    assert_eq!(post("same-site", "https://evil.int.test").await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert_eq!(post("same-origin", "https://evil.int.test").await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert!(live().await, "neither ended it");
+    let resp = post("same-origin", "http://mesh.test").await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers()[header::SET_COOKIE].to_str().unwrap().contains("Max-Age=0"));
+    assert!(!live().await, "the button did");
 }

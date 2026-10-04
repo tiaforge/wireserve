@@ -4674,3 +4674,29 @@ to fix. The first three, together:
     (terminator and `oidc_flow.rs`), the per-caller and per-address limits,
     the cached sign-out, flow eviction never taking a claim's slot. The
     sign-in e2e gained a step opening mallory's ticket in another browser.
+
+313. **The rest of the review, together** (2026-10-04).
+    - *Sign-out by link.* `GET /signed-out` deleted the browser's session,
+      so any page could sign a person out of everything. Now a GET with a
+      live session shows a button; its POST signs out, refused unless the
+      browser says it came from the coordinator's own page
+      (`Sec-Fetch-Site` same-origin or none, `Origin` the public URL) —
+      the login cookie is `SameSite=Lax`, which a service under the same
+      parent domain still gets sent. A GET after a service's sign-out,
+      whose session is already over, only clears the cookie, as before.
+    - *What signing out at the login server does.* The docs said a session
+      ends when the person is "signed out everywhere" at the login server.
+      It doesn't: the coordinator holds `offline_access` refresh tokens,
+      which outlive a logout there by design (checked for Keycloak: its
+      logout leaves offline sessions alone; revoking takes the admin or
+      Account Console). `access-control.md` and `identity-providers.md` now
+      say what does cut someone off: the group, disabling them, revoking
+      the token, or `owner sign-out` — for owners too.
+    - *Unbounded sessions.* A session, with its refresh token, was kept for
+      anyone who signed in, admitted or not, one per sign-in. Now nothing
+      is kept for someone the service does not admit (no session, no login
+      cookie), and a person keeps at most ten sessions, the least recently
+      used going first (`sessions::MAX_PER_PERSON`); `create` now stores the
+      session's own `last_used_at`.
+    Tests: the button and the refused cross-site POSTs, nothing kept for
+    someone not admitted (`oidc_flow.rs`), the per-person cap.

@@ -8,6 +8,12 @@ use super::DbError;
 /// How long a ticket works: the browser follows the redirect at once.
 pub const TICKET_TTL: Duration = Duration::seconds(60);
 
+/// The most sessions one person keeps (PLAN.md #313): one per browser, and
+/// a new one pushes out the one least recently used. Signing in again and
+/// again must not grow the table, nor the provider's own list of refresh
+/// tokens it keeps.
+pub const MAX_PER_PERSON: usize = 10;
+
 /// A session nobody has used for this long is forgotten. This keeps the
 /// table small; it says nothing about how fresh anyone's groups are, which
 /// the refresh interval decides.
@@ -61,13 +67,25 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
 }
 
 /// Stores a new session, whose login cookie hashes to `login_hash`. Idle
-/// sessions and spent tickets are swept on the way.
+/// sessions and spent tickets are swept on the way, and the person's least
+/// recently used session goes when they have [`MAX_PER_PERSON`].
 pub fn create(conn: &Connection, session: &Session, login_hash: &str) -> Result<(), DbError> {
     sweep(conn, Utc::now())?;
+    let keep = i64::try_from(MAX_PER_PERSON - 1).unwrap_or(i64::MAX);
+    conn.execute(
+        "DELETE FROM sign_in_tickets WHERE session_id IN (SELECT id FROM sign_in_sessions WHERE sub = ?1 \
+           AND id NOT IN (SELECT id FROM sign_in_sessions WHERE sub = ?1 ORDER BY last_used_at DESC LIMIT ?2))",
+        rusqlite::params![session.sub, keep],
+    )?;
+    conn.execute(
+        "DELETE FROM sign_in_sessions WHERE sub = ?1 \
+           AND id NOT IN (SELECT id FROM sign_in_sessions WHERE sub = ?1 ORDER BY last_used_at DESC LIMIT ?2)",
+        rusqlite::params![session.sub, keep],
+    )?;
     conn.execute(
         "INSERT INTO sign_in_sessions (id, login_hash, sub, email, name, groups, refresh_token_enc, \
            created_at, refreshed_at, stale_since, last_used_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?8)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10)",
         rusqlite::params![
             session.id,
             login_hash,
@@ -78,6 +96,7 @@ pub fn create(conn: &Connection, session: &Session, login_hash: &str) -> Result<
             session.refresh_token_enc,
             session.created_at.to_rfc3339(),
             session.refreshed_at.to_rfc3339(),
+            session.last_used_at.to_rfc3339(),
         ],
     )?;
     Ok(())
@@ -239,6 +258,24 @@ mod tests {
         assert_eq!(all(&conn).unwrap().len(), 1);
         assert!(remove(&conn, "s3").unwrap());
         assert!(!remove(&conn, "s3").unwrap());
+    }
+
+    #[test]
+    fn a_person_keeps_only_so_many_sessions_the_least_used_going_first() {
+        let db = crate::db::Db::open_in_memory_for_test();
+        let conn = db.conn.blocking_lock();
+        for i in 0..MAX_PER_PERSON {
+            let mut s = session(&format!("s{i}"), "anna");
+            s.last_used_at = Utc::now() - Duration::minutes(i64::try_from(i).unwrap());
+            create(&conn, &s, &format!("l{i}")).unwrap();
+        }
+        create(&conn, &session("ben", "ben"), "lb").unwrap();
+        create(&conn, &session("new", "anna"), "ln").unwrap();
+        let all = all(&conn).unwrap();
+        assert_eq!(all.iter().filter(|s| s.sub == "anna").count(), MAX_PER_PERSON);
+        let last = format!("s{}", MAX_PER_PERSON - 1);
+        assert!(!all.iter().any(|s| s.id == last), "the least recently used went");
+        assert!(all.iter().any(|s| s.id == "new") && all.iter().any(|s| s.id == "ben"));
     }
 
     #[test]

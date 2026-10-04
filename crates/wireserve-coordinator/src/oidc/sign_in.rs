@@ -175,6 +175,27 @@ pub async fn start(
 /// Back from the identity provider, signed in, for a sign-in to `fqdn`:
 /// the session is made, and the browser goes back to the service.
 pub(super) async fn signed_in(state: &AppState, oidc: &Oidc, identity: Identity, fqdn: &str, to: &str, bind: &str) -> Response {
+    let flow_cookie = claim::set_cookie(state, "", 0);
+    let service = match sign_in_service(state, fqdn).await {
+        Ok(Some(service)) => service,
+        Ok(None) => {
+            return with_cookies(
+                pages::problem(StatusCode::NOT_FOUND, "There is no service by that name to sign in to any more."),
+                &[flow_cookie],
+            );
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "sign-in: could not read the service");
+            return pages::problem(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong on our side. Try again.");
+        }
+    };
+    // Nothing is kept for someone the service does not admit (PLAN.md
+    // #313): no session, no refresh token, no login cookie.
+    if !admitted(&identity.groups, &service.1) {
+        let who = identity.email.as_deref().or(identity.name.as_deref()).unwrap_or(&identity.sub);
+        let hint = "To use another account, sign out at your login server first, then open the service again.";
+        return with_cookies(not_admitted(fqdn, &identity.sub, who, &service.0, hint), &[flow_cookie]);
+    }
     let now = Utc::now();
     let id = crate::tokengen::generate("");
     let login = crate::tokengen::generate("");
@@ -196,20 +217,19 @@ pub(super) async fn signed_in(state: &AppState, oidc: &Oidc, identity: Identity,
     }
     tracing::info!(event = "signed_in", sub = %s.sub, groups = %s.groups.join(","), service = %fqdn);
     let login_cookie = claim::set_named_cookie(state, LOGIN_COOKIE, &login, sessions::IDLE_TTL.num_seconds().unsigned_abs());
-    let service = match sign_in_service(state, fqdn).await {
-        Ok(Some(service)) => service,
-        Ok(None) => {
-            return with_cookies(
-                pages::problem(StatusCode::NOT_FOUND, "There is no service by that name to sign in to any more."),
-                &[login_cookie, claim::set_cookie(state, "", 0)],
-            );
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "sign-in: could not read the service");
-            return pages::problem(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong on our side. Try again.");
-        }
-    };
     go_back(state, &s, fqdn, &service, to, bind, Some(login_cookie)).await
+}
+
+/// "Signed in as `who`, but `service` is not for any of your groups."
+fn not_admitted(fqdn: &str, sub: &str, who: &str, service: &str, hint: &str) -> Response {
+    tracing::info!(event = "sign_in_not_admitted", sub = %sub, service = %fqdn);
+    let body = format!(
+        "<p>You are signed in as <strong>{}</strong>, but <strong>{}</strong> is not for any of your groups.</p>\
+         <p class=\"note\">Ask whoever runs it to grant one of your groups. {hint}</p>",
+        escape(who),
+        escape(service),
+    );
+    pages::html(StatusCode::FORBIDDEN, "Not for you", &body, None)
 }
 
 /// To the service with a ticket, if the person is someone it admits;
@@ -226,16 +246,9 @@ async fn go_back(
     let mut cookies: Vec<String> = login_cookie.into_iter().collect();
     cookies.push(claim::set_cookie(state, "", 0));
     if !admitted(&s.groups, &service.1) {
-        tracing::info!(event = "sign_in_not_admitted", sub = %s.sub, service = %fqdn);
         let who = s.email.as_deref().or(s.name.as_deref()).unwrap_or(&s.sub);
-        let body = format!(
-            "<p>You are signed in as <strong>{}</strong>, but <strong>{}</strong> is not for any of your groups.</p>\
-             <p class=\"note\">Ask whoever runs it to grant one of your groups, or sign in as someone else: \
-             <a href=\"signed-out\">sign out</a>.</p>",
-            escape(who),
-            escape(&service.0),
-        );
-        return with_cookies(pages::html(StatusCode::FORBIDDEN, "Not for you", &body, None), &cookies);
+        let hint = "To use another account: <a href=\"signed-out\">sign out here</a>, and at your login server.";
+        return with_cookies(not_admitted(fqdn, &s.sub, who, &service.0, hint), &cookies);
     }
     let ticket = crate::tokengen::generate(session::TICKET_PREFIX);
     let stored = sessions::create_ticket(&*state.db.conn.lock().await, &wireserve_types::hash_token(&ticket), &s.id, fqdn, to, bind);
@@ -259,18 +272,49 @@ fn with_cookies(mut resp: Response, cookies: &[String]) -> Response {
     resp
 }
 
-/// `GET /signed-out`: where a service's sign-out ends up. The session is
-/// already over (the service ended it); this browser forgets its login.
+/// This browser's session, by its login cookie.
+async fn login_session(state: &AppState, headers: &HeaderMap) -> Option<sessions::Session> {
+    let login = claim::named_cookie(state, LOGIN_COOKIE, headers)?;
+    sessions::find_by_login(&*state.db.conn.lock().await, &wireserve_types::hash_token(&login)).ok().flatten()
+}
+
+/// `GET /signed-out`: where a service's sign-out ends up, with the session
+/// already over — this browser forgets its login. A browser whose session
+/// is still on gets a button instead (PLAN.md #313): a link any page can
+/// send a browser to must not sign anyone out.
 pub async fn signed_out(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if state.oidc.is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if let Some(login) = claim::named_cookie(&state, LOGIN_COOKIE, &headers) {
-        let conn = state.db.conn.lock().await;
-        if let Ok(Some(s)) = sessions::find_by_login(&conn, &wireserve_types::hash_token(&login)) {
-            let _ = sessions::remove(&conn, &s.id);
-            tracing::info!(event = "signed_out", sub = %s.sub);
-        }
+    if login_session(&state, &headers).await.is_some() {
+        let body = "<p>Sign out of every service, in this browser?</p>\
+                    <form method=\"post\" action=\"signed-out\"><button type=\"submit\">Sign out</button></form>";
+        return pages::html(StatusCode::OK, "Sign out", body, None);
+    }
+    let body = "<p>You are signed out. Every service you were signed in to asks again within a few minutes.</p>\
+                <p class=\"note\">You can close this page.</p>";
+    let cookie = claim::set_named_cookie(&state, LOGIN_COOKIE, "", 0);
+    pages::html(StatusCode::OK, "Signed out", body, Some(cookie))
+}
+
+/// `POST /signed-out`: the button. Only from the coordinator's own page:
+/// the login cookie is `SameSite=Lax`, which still goes with a POST from a
+/// service under the same parent domain, so the browser's own word on
+/// where the form came from must be this site's too.
+pub async fn sign_out(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if state.oidc.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_ascii_lowercase);
+    let site_ok = header("sec-fetch-site").is_none_or(|s| s == "same-origin" || s == "none");
+    let own = state.config.public_url.as_deref().map(str::to_ascii_lowercase);
+    let origin_ok = header("origin").is_none_or(|o| own.as_deref() == Some(o.as_str()));
+    if !site_ok || !origin_ok {
+        return pages::problem(StatusCode::FORBIDDEN, "Sign out from this site's own page.");
+    }
+    if let Some(s) = login_session(&state, &headers).await {
+        let _ = sessions::remove(&*state.db.conn.lock().await, &s.id);
+        tracing::info!(event = "signed_out", sub = %s.sub);
     }
     let body = "<p>You are signed out. Every service you were signed in to asks again within a few minutes.</p>\
                 <p class=\"note\">You can close this page.</p>";
