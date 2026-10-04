@@ -11,7 +11,7 @@ members = [
 [workspace.package]
 edition = "2021"
 rust-version = "1.91"
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
 
 [workspace.dependencies]
 wireserve-types = { path = "crates/wireserve-types" }
