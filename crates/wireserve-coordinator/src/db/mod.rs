@@ -122,6 +122,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0021_released_service_addresses.sql")),
         M::up(include_str!("../../migrations/0022_owner_emails_verified.sql")),
         M::up(include_str!("../../migrations/0023_sign_in_sessions.sql")),
+        M::up(include_str!("../../migrations/0024_sign_in_ticket_bind.sql")),
     ])
 }
 

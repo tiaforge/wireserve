@@ -13,8 +13,11 @@
 //! 3. A ticket — single use, a minute, for that service only — goes back
 //!    to the service: `https://<fqdn>/.wireserve/callback?ticket=…`.
 //! 4. The service's node redeems it (`POST /sign-in/redeem`), and only the
-//!    node that owns the service can: the answer is a session token for
-//!    that service, which its terminator keeps in a cookie of its own.
+//!    node that owns the service can, and only for the browser that started
+//!    the sign-in: the terminator set that browser a bind cookie before
+//!    sending it here, and the ticket carries its hash. The answer is a
+//!    session token for that service, which its terminator keeps in a
+//!    cookie of its own.
 //!
 //! A token lasts until the person's groups are due to be fetched again
 //! (`WIRESERVE_OIDC_REFRESH_SECS`, as for device owners); then the
@@ -42,10 +45,19 @@ use crate::state::AppState;
 /// This coordinator's own cookie for a signed-in browser.
 const LOGIN_COOKIE: &str = "wireserve-login";
 
-/// What one node may ask of the redeem, renew and end calls: each active
-/// session renews once per refresh interval and service.
+/// What one node may ask of the renew and end calls: each active session
+/// renews once per refresh interval and service.
 pub const SIGN_IN_BURST: u32 = 60;
 pub const SIGN_INS_PER_MIN: u32 = 120;
+
+/// What one node may redeem: a ticket per person signing in.
+pub const REDEEM_BURST: u32 = 30;
+pub const REDEEMS_PER_MIN: u32 = 60;
+
+/// Sign-ins one address may start a minute. A person signing in to a few
+/// services in a row starts one each; a browser that already is signed in
+/// starts none at the provider.
+pub const STARTS_PER_MIN: u32 = 20;
 
 /// The associated data a session's refresh token is sealed with.
 fn aad(id: &str) -> Vec<u8> {
@@ -56,6 +68,9 @@ fn aad(id: &str) -> Vec<u8> {
 pub struct StartQuery {
     service: String,
     to: Option<String>,
+    /// The hash of the browser's bind cookie for that service, which the
+    /// ticket will be redeemed for only.
+    bind: Option<String>,
 }
 
 /// A service a sign-in can be for: `fqdn` names it under the service
@@ -105,11 +120,20 @@ pub async fn start(
     let (Some(oidc), Some(_)) = (state.oidc.clone(), state.config.sign_in()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let client_ip =
+        crate::client_ip::resolve_client(&headers, peer.ip(), state.config.trusts_forwarded_from(peer.ip())).ip;
+    if state.sign_in_start_limiter.is_blocked(client_ip) || !state.sign_in_start_limiter.record(client_ip) {
+        tracing::warn!(event = "sign_in_rate_limited", client_ip = %client_ip, "starting sign-ins faster than the per-address limit");
+        return pages::problem(StatusCode::TOO_MANY_REQUESTS, "Too many sign-ins from here just now. Try again in a minute.");
+    }
     let fqdn = q.service.trim().trim_end_matches('.').to_ascii_lowercase();
     let to = q.to.unwrap_or_else(|| "/".into());
     if !session::is_local_path(&to) {
         return pages::problem(StatusCode::BAD_REQUEST, "That is not a page to come back to.");
     }
+    let Some(bind) = q.bind.filter(|b| session::is_token_of(b, "")) else {
+        return pages::problem(StatusCode::BAD_REQUEST, "Open the service's page to sign in to it.");
+    };
     let service = match sign_in_service(&state, &fqdn).await {
         Ok(Some(s)) => s,
         Ok(None) => return pages::problem(StatusCode::NOT_FOUND, "There is no service by that name to sign in to."),
@@ -126,7 +150,7 @@ pub async fn start(
     };
     if let Some(known) = known {
         match freshen(&state, &oidc, &known.id).await {
-            Ok(Fresh::Live(s)) => return go_back(&state, &s, &fqdn, &service, &to, None).await,
+            Ok(Fresh::Live(s)) => return go_back(&state, &s, &fqdn, &service, &to, &bind, None).await,
             Ok(Fresh::Unavailable) => {
                 return pages::problem(StatusCode::BAD_GATEWAY, "The sign-in cannot be reached right now. Try again shortly.");
             }
@@ -141,18 +165,16 @@ pub async fn start(
             return pages::problem(StatusCode::BAD_GATEWAY, "The sign-in cannot be reached right now. Try again shortly.");
         }
     };
-    let Some(id) = claim::remember(&oidc, Flow::new(Purpose::SignIn { fqdn: fqdn.clone(), to }, pending)) else {
+    let Some(id) = claim::remember(&oidc, Flow::new(Purpose::SignIn { fqdn: fqdn.clone(), to, bind }, pending)) else {
         return pages::problem(StatusCode::SERVICE_UNAVAILABLE, "Too many sign-ins at once. Try again in a few minutes.");
     };
-    let client_ip =
-        crate::client_ip::resolve_client(&headers, peer.ip(), state.config.trusts_forwarded_from(peer.ip())).ip;
     tracing::info!(event = "sign_in_started", service = %fqdn, client_ip = %client_ip);
     claim::to_provider(&state, url, &id)
 }
 
 /// Back from the identity provider, signed in, for a sign-in to `fqdn`:
 /// the session is made, and the browser goes back to the service.
-pub(super) async fn signed_in(state: &AppState, oidc: &Oidc, identity: Identity, fqdn: &str, to: &str) -> Response {
+pub(super) async fn signed_in(state: &AppState, oidc: &Oidc, identity: Identity, fqdn: &str, to: &str, bind: &str) -> Response {
     let now = Utc::now();
     let id = crate::tokengen::generate("");
     let login = crate::tokengen::generate("");
@@ -187,7 +209,7 @@ pub(super) async fn signed_in(state: &AppState, oidc: &Oidc, identity: Identity,
             return pages::problem(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong on our side. Try again.");
         }
     };
-    go_back(state, &s, fqdn, &service, to, Some(login_cookie)).await
+    go_back(state, &s, fqdn, &service, to, bind, Some(login_cookie)).await
 }
 
 /// To the service with a ticket, if the person is someone it admits;
@@ -198,6 +220,7 @@ async fn go_back(
     fqdn: &str,
     service: &(String, Vec<String>),
     to: &str,
+    bind: &str,
     login_cookie: Option<String>,
 ) -> Response {
     let mut cookies: Vec<String> = login_cookie.into_iter().collect();
@@ -214,8 +237,8 @@ async fn go_back(
         );
         return with_cookies(pages::html(StatusCode::FORBIDDEN, "Not for you", &body, None), &cookies);
     }
-    let ticket = crate::tokengen::generate("tkt_");
-    let stored = sessions::create_ticket(&*state.db.conn.lock().await, &wireserve_types::hash_token(&ticket), &s.id, fqdn, to);
+    let ticket = crate::tokengen::generate(session::TICKET_PREFIX);
+    let stored = sessions::create_ticket(&*state.db.conn.lock().await, &wireserve_types::hash_token(&ticket), &s.id, fqdn, to, bind);
     if let Err(e) = stored {
         tracing::error!(error = %e, "sign-in: could not store the ticket");
         return pages::problem(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong on our side. Try again.");
@@ -377,8 +400,8 @@ async fn own_service(state: &AppState, node: &crate::db::nodes::NodeRow, fqdn: &
     }
 }
 
-fn limit(state: &AppState, node: &crate::db::nodes::NodeRow) -> Result<(), AppError> {
-    if let crate::rate_limit::Take::Refused { log } = state.sign_in_limiter.take(node.id) {
+fn limit(limiter: &crate::rate_limit::TokenBuckets, node: &crate::db::nodes::NodeRow) -> Result<(), AppError> {
+    if let crate::rate_limit::Take::Refused { log } = limiter.take(node.id) {
         if log {
             tracing::warn!(event = "sign_in_rate_limited", node_name = %node.name, "asking about sessions faster than the per-node limit");
         }
@@ -399,6 +422,8 @@ fn enabled(state: &AppState) -> Result<std::sync::Arc<Oidc>, AppError> {
 pub struct RedeemBody {
     pub fqdn: String,
     pub ticket: String,
+    /// The hash of the bind cookie the redeeming browser sent.
+    pub bind: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -416,13 +441,20 @@ pub async fn redeem(
     Json(body): Json<RedeemBody>,
 ) -> Result<Json<SessionAnswer>, AppError> {
     let oidc = enabled(&state)?;
-    limit(&state, &node)?;
+    limit(&state.redeem_limiter, &node)?;
     let fqdn = body.fqdn.to_ascii_lowercase();
     own_service(&state, &node, &fqdn).await?;
     let taken = sessions::take_ticket(&*state.db.conn.lock().await, &wireserve_types::hash_token(&body.ticket), &fqdn)?;
-    let Some((id, to)) = taken else {
+    let Some(sessions::Ticket { session_id: id, to, bind }) = taken else {
         return Err(AppError::Gone("this sign-in link was used already, or is too old".into()));
     };
+    // Only in the browser that started the sign-in (PLAN.md #312): a ticket
+    // someone handed over would sign the other person in as them. It is
+    // used up either way.
+    if bind.is_empty() || !claim::same(&bind, &body.bind) {
+        tracing::warn!(event = "sign_in_ticket_elsewhere", node_name = %node.name, service = %fqdn, "a ticket was brought back by another browser than the one that asked for it");
+        return Err(AppError::Forbidden("this sign-in was started in another browser".into()));
+    }
     let s = match freshen(&state, &oidc, &id).await? {
         Fresh::Live(s) => s,
         Fresh::Ended => return Err(AppError::Gone("signed out".into())),
@@ -461,7 +493,7 @@ pub async fn renew(
     Json(body): Json<TokenBody>,
 ) -> Result<Json<SessionAnswer>, AppError> {
     let oidc = enabled(&state)?;
-    limit(&state, &node)?;
+    limit(&state.sign_in_limiter, &node)?;
     let (fqdn, id) = held_session(&state, &oidc, &node, &body).await?;
     let s = match freshen(&state, &oidc, &id).await? {
         Fresh::Live(s) => s,
@@ -479,7 +511,7 @@ pub async fn end(
     Json(body): Json<TokenBody>,
 ) -> Result<StatusCode, AppError> {
     let oidc = enabled(&state)?;
-    limit(&state, &node)?;
+    limit(&state.sign_in_limiter, &node)?;
     let (fqdn, id) = held_session(&state, &oidc, &node, &body).await?;
     let conn = state.db.conn.lock().await;
     if let Some(s) = sessions::find(&conn, &id)? {

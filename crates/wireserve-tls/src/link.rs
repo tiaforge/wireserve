@@ -61,10 +61,11 @@ impl Link {
         }
     }
 
-    /// Redeems a sign-in ticket for the service `fqdn` (PLAN.md M48): its
-    /// session token, and the path the browser goes on to.
-    pub async fn redeem(&self, fqdn: &str, ticket: &str) -> Result<(String, Option<String>), LinkError> {
-        match self.exchange(&TlsRequest::Redeem { fqdn: fqdn.into(), ticket: ticket.into() }).await? {
+    /// Redeems a sign-in ticket for the service `fqdn` (PLAN.md M48), for the
+    /// browser whose bind cookie hashes to `bind`: its session token, and the
+    /// path the browser goes on to.
+    pub async fn redeem(&self, fqdn: &str, ticket: &str, bind: &str) -> Result<(String, Option<String>), LinkError> {
+        match self.exchange(&TlsRequest::Redeem { fqdn: fqdn.into(), ticket: ticket.into(), bind: bind.into() }).await? {
             TlsResponse::Session { token, to } => Ok((token, to)),
             other => Err(unexpected(other)),
         }

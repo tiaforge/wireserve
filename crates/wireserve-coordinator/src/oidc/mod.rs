@@ -37,6 +37,12 @@ const MAX_GROUPS: usize = 256;
 /// How long the provider may take for any one request.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a discovery document is reused. Anyone may start a sign-in
+/// (PLAN.md #312), and each would otherwise have this process fetch the
+/// document from the provider; a provider rotating its keys is still
+/// picked up within this.
+const DISCOVERY_TTL: Duration = Duration::from_secs(60);
+
 type Client = CoreClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointMaybeSet, EndpointMaybeSet>;
 
 #[derive(Debug, thiserror::Error)]
@@ -131,6 +137,8 @@ pub struct Oidc {
     pub(crate) renewing: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     /// Signs session tokens.
     pub(crate) signing_key: ed25519_dalek::SigningKey,
+    /// The provider's discovery document, and when it was fetched.
+    discovered: Mutex<Option<(std::time::Instant, CoreProviderMetadata)>>,
 }
 
 async fn send(http: reqwest::Client, req: openidconnect::HttpRequest) -> Result<openidconnect::HttpResponse, HttpError> {
@@ -154,7 +162,7 @@ impl Oidc {
             .build()
             .expect("a client with a timeout and no redirects builds");
         let signing_key = config.signing_key();
-        Self { config, http, flows: Mutex::default(), renewing: Mutex::default(), signing_key }
+        Self { config, http, flows: Mutex::default(), renewing: Mutex::default(), signing_key, discovered: Mutex::default() }
     }
 
     fn caller(&self) -> impl Fn(openidconnect::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<openidconnect::HttpResponse, HttpError>> + Send>> {
@@ -162,10 +170,25 @@ impl Oidc {
         move |req| Box::pin(send(http.clone(), req))
     }
 
-    /// The client, from the provider's discovery document — fetched every
-    /// time, so a provider rotating its keys is picked up.
+    /// The client, from the provider's discovery document — fetched again
+    /// after [`DISCOVERY_TTL`], so a provider rotating its keys is picked up.
     async fn client(&self) -> Result<Client, OidcError> {
-        let metadata = self.discover().await?;
+        let cached = self
+            .discovered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() < DISCOVERY_TTL)
+            .map(|(_, m)| m.clone());
+        let metadata = match cached {
+            Some(m) => m,
+            None => {
+                let m = self.discover().await?;
+                *self.discovered.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some((std::time::Instant::now(), m.clone()));
+                m
+            }
+        };
         let redirect = RedirectUrl::new(self.config.redirect_url.clone()).map_err(|e| OidcError::Provider(e.to_string()))?;
         Ok(CoreClient::from_provider_metadata(
             metadata,

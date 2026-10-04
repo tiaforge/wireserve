@@ -24,6 +24,32 @@ pub const TOKEN_PREFIX: &str = "wst1.";
 /// sibling under the same domain.
 pub const COOKIE: &str = "__Host-wireserve-session";
 
+/// Ties a sign-in to the browser that started it: the terminator sets it
+/// before sending the browser to sign in, and only a ticket issued for its
+/// value is redeemed there. Without it, someone could sign in, stop at the
+/// redirect, and hand the ticket to someone else — whose browser would
+/// then be signed in as them.
+pub const BIND_COOKIE: &str = "__Host-wireserve-bind";
+
+/// What the coordinator is told of a browser's [`BIND_COOKIE`]: its SHA-256,
+/// in hex — the value itself stays in the browser.
+#[must_use]
+pub fn bind_hash(value: &str) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(value.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Whether `value` has the shape of a token the coordinator or a terminator
+/// makes: `prefix` and 64 lowercase hex digits. Anything else is refused
+/// before it costs anyone a call.
+#[must_use]
+pub fn is_token_of(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(|h| h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+/// The prefix of a ticket.
+pub const TICKET_PREFIX: &str = "tkt_";
+
 /// Where the coordinator sends a browser back to, on the service's own name,
 /// with a ticket to redeem.
 pub const CALLBACK_PATH: &str = "/.wireserve/callback";
@@ -175,6 +201,17 @@ mod tests {
         assert_eq!(verify(&public, signed), Err(TokenError::Malformed), "no signature");
         assert_eq!(verify(&public, "wst2.a.b"), Err(TokenError::Malformed));
         assert_eq!(verify(&public, &"x".repeat(MAX_TOKEN_LEN + 1)), Err(TokenError::Malformed));
+    }
+
+    #[test]
+    fn only_tokens_of_the_right_shape_pass() {
+        let t = format!("tkt_{}", "a1".repeat(32));
+        assert!(is_token_of(&t, TICKET_PREFIX));
+        assert!(!is_token_of(&t.to_uppercase(), TICKET_PREFIX));
+        assert!(!is_token_of(&format!("{t}0"), TICKET_PREFIX));
+        assert!(!is_token_of("tkt_", TICKET_PREFIX));
+        assert_eq!(bind_hash("x").len(), 64);
+        assert!(is_token_of(&bind_hash("x"), ""));
     }
 
     #[test]

@@ -101,11 +101,12 @@ async fn dispatch(ctx: &TlsContext, req: TlsRequest) -> TlsResponse {
             TlsResponse::Config(Box::new(config))
         }
         TlsRequest::Challenge { fqdn, value, present } => challenge(ctx, &fqdn, &value, present).await,
-        TlsRequest::Redeem { fqdn, ticket } => {
-            if ticket.is_empty() || ticket.len() > wireserve_types::session::MAX_TICKET_LEN {
+        TlsRequest::Redeem { fqdn, ticket, bind } => {
+            use wireserve_types::session::{is_token_of, TICKET_PREFIX};
+            if !is_token_of(&ticket, TICKET_PREFIX) || !(bind.is_empty() || is_token_of(&bind, "")) {
                 return TlsResponse::Error { message: "not a ticket".into() };
             }
-            session(ctx, "redeem", &fqdn, serde_json::json!({ "fqdn": fqdn, "ticket": ticket })).await
+            session(ctx, "redeem", &fqdn, serde_json::json!({ "fqdn": fqdn, "ticket": ticket, "bind": bind })).await
         }
         TlsRequest::Renew { fqdn, token } => {
             if token.len() > wireserve_types::session::MAX_TOKEN_LEN {
@@ -362,7 +363,7 @@ mod tests {
         let req = TlsRequest::Renew { fqdn: "vault.int.test".into(), token: "wst1.x.y".into() };
         let TlsResponse::Error { message } = dispatch(&ctx, req).await else { panic!("asked the coordinator") };
         assert!(message.contains("not one of this node's names"), "{message}");
-        let req = TlsRequest::Redeem { fqdn: "plex.int.test".into(), ticket: "x".repeat(500) };
-        assert!(matches!(dispatch(&ctx, req).await, TlsResponse::Error { .. }), "too long to be a ticket");
+        let req = TlsRequest::Redeem { fqdn: "plex.int.test".into(), ticket: "x".repeat(500), bind: String::new() };
+        assert!(matches!(dispatch(&ctx, req).await, TlsResponse::Error { .. }), "not the shape of a ticket");
     }
 }

@@ -31,8 +31,10 @@ pub enum TlsRequest {
     /// one of this node's own service names.
     Challenge { fqdn: String, value: String, present: bool },
     /// A browser came back from signing in with this ticket, to the service
-    /// `fqdn` (PLAN.md M48): what session does it stand for?
-    Redeem { fqdn: String, ticket: String },
+    /// `fqdn` (PLAN.md M48): what session does it stand for? `bind` is the
+    /// hash of the browser's bind cookie ([`crate::session::BIND_COOKIE`]),
+    /// empty when it has none.
+    Redeem { fqdn: String, ticket: String, bind: String },
     /// This session token for `fqdn` is past its time: a fresh one, with the
     /// person's groups as they are now.
     Renew { fqdn: String, token: String },
@@ -153,9 +155,9 @@ mod tests {
         assert_eq!(serde_json::from_str::<TlsRequest>(&text).unwrap(), with);
         assert!(serde_json::from_str::<TlsRequest>(r#"{"op":"leave"}"#).is_err());
         assert!(serde_json::from_str::<TlsRequest>(r#"{"op":"serve","name":"x"}"#).is_err());
-        let redeem = TlsRequest::Redeem { fqdn: "plex.int.test".into(), ticket: "t".into() };
+        let redeem = TlsRequest::Redeem { fqdn: "plex.int.test".into(), ticket: "t".into(), bind: "b".into() };
         let text = serde_json::to_string(&redeem).unwrap();
-        assert_eq!(text, r#"{"op":"redeem","fqdn":"plex.int.test","ticket":"t"}"#);
+        assert_eq!(text, r#"{"op":"redeem","fqdn":"plex.int.test","ticket":"t","bind":"b"}"#);
         assert_eq!(serde_json::from_str::<TlsRequest>(&text).unwrap(), redeem);
     }
 

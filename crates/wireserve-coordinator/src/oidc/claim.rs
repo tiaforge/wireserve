@@ -30,9 +30,16 @@ use crate::state::AppState;
 /// How long a started sign-in waits for the person.
 const FLOW_TTL: Duration = Duration::from_secs(600);
 
-/// At most this many sign-ins in progress. Each one needs a valid link, so
+/// At most this many claims in progress. Each one needs a valid link, so
 /// this only bounds what someone holding one can make the process keep.
-const MAX_FLOWS: usize = 256;
+const MAX_CLAIM_FLOWS: usize = 256;
+
+/// At most this many sign-ins to services in progress. Anyone can start one
+/// (PLAN.md #312), so when they are all taken the oldest goes, rather than
+/// every new one being refused — a flood started from many addresses can
+/// make a sign-in start over, never stop them all, and never touches a
+/// claim's.
+const MAX_SIGN_IN_FLOWS: usize = 1024;
 
 /// The prefix of a claim link's code.
 pub const CODE_PREFIX: &str = "clm_";
@@ -49,7 +56,7 @@ pub struct Flow {
 
 pub(super) enum Purpose {
     Claim { node_id: i64, code_hash: String },
-    SignIn { fqdn: String, to: String },
+    SignIn { fqdn: String, to: String, bind: String },
 }
 
 impl Flow {
@@ -99,13 +106,22 @@ fn flow_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
 }
 
 /// Remembers a flow, tied to the browser by the returned cookie value.
-/// `None` when too many are in progress.
+/// `None` when too many claims are in progress; a sign-in takes the oldest
+/// sign-in's place instead.
 pub(super) fn remember(oidc: &super::Oidc, flow: Flow) -> Option<String> {
     let id = crate::tokengen::generate("");
     let mut flows = oidc.flows.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     flows.retain(|_, f| f.started.elapsed() < FLOW_TTL);
-    if flows.len() >= MAX_FLOWS {
-        return None;
+    let signing_in = matches!(flow.purpose, Purpose::SignIn { .. });
+    let of_kind = |f: &Flow| matches!(f.purpose, Purpose::SignIn { .. }) == signing_in;
+    if flows.values().filter(|f| of_kind(f)).count() >= if signing_in { MAX_SIGN_IN_FLOWS } else { MAX_CLAIM_FLOWS } {
+        if !signing_in {
+            return None;
+        }
+        let oldest = flows.iter().filter(|(_, f)| of_kind(f)).min_by_key(|(_, f)| f.started).map(|(k, _)| k.clone());
+        if let Some(oldest) = oldest {
+            flows.remove(&oldest);
+        }
     }
     flows.insert(id.clone(), flow);
     Some(id)
@@ -200,8 +216,8 @@ pub async fn callback(State(state): State<AppState>, headers: HeaderMap, Query(q
         let live = flows.get(&id).is_some_and(|f| f.started.elapsed() < FLOW_TTL && f.pending.is_some());
         match flows.get(&id).map(|f| &f.purpose) {
             Some(Purpose::SignIn { .. }) if live => flows.remove(&id).and_then(|f| {
-                let Purpose::SignIn { fqdn, to } = f.purpose else { unreachable!() };
-                Some((f.pending?, Err((fqdn, to))))
+                let Purpose::SignIn { fqdn, to, bind } = f.purpose else { unreachable!() };
+                Some((f.pending?, Err((fqdn, to, bind))))
             }),
             Some(Purpose::Claim { .. }) if live => flows.get_mut(&id).and_then(|f| {
                 let Purpose::Claim { node_id, code_hash } = &f.purpose else { unreachable!() };
@@ -233,7 +249,7 @@ pub async fn callback(State(state): State<AppState>, headers: HeaderMap, Query(q
     };
     let (node_id, code_hash) = match purpose {
         Ok(claim) => claim,
-        Err((fqdn, to)) => return super::sign_in::signed_in(&state, &oidc, identity, &fqdn, &to).await,
+        Err((fqdn, to, bind)) => return super::sign_in::signed_in(&state, &oidc, identity, &fqdn, &to, &bind).await,
     };
     let conn = state.db.conn.lock().await;
     let still_valid = owners::claim_node(&conn, &code_hash).ok().flatten() == Some(node_id);
@@ -318,4 +334,35 @@ pub fn new_link(
     let code = crate::tokengen::generate(CODE_PREFIX);
     let expires = owners::create_claim(conn, node_id, &wireserve_types::hash_token(&code))?;
     Ok((format!("{public_url}/claim/{code}"), expires))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending() -> Pending {
+        Pending {
+            csrf: openidconnect::CsrfToken::new("c".into()),
+            nonce: openidconnect::Nonce::new("n".into()),
+            pkce: openidconnect::PkceCodeVerifier::new("v".into()),
+        }
+    }
+
+    fn sign_in() -> Flow {
+        Flow::new(Purpose::SignIn { fqdn: "a.int.test".into(), to: "/".into(), bind: String::new() }, pending())
+    }
+
+    #[test]
+    fn a_flood_of_sign_ins_pushes_out_the_oldest_and_never_a_claim() {
+        let oidc = super::super::Oidc::new(super::super::test_config());
+        let claim = remember(&oidc, Flow::new(Purpose::Claim { node_id: 1, code_hash: "h".into() }, pending())).unwrap();
+        let first = remember(&oidc, sign_in()).unwrap();
+        for _ in 0..MAX_SIGN_IN_FLOWS {
+            assert!(remember(&oidc, sign_in()).is_some(), "a sign-in is never refused");
+        }
+        let flows = oidc.flows.lock().unwrap();
+        assert!(!flows.contains_key(&first), "the oldest went");
+        assert!(flows.contains_key(&claim), "the claim stayed");
+        assert_eq!(flows.len(), MAX_SIGN_IN_FLOWS + 1);
+    }
 }

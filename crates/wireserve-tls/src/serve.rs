@@ -619,7 +619,7 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                         // (PLAN.md M48).
                         if let Some(si) = sign_in.as_ref().filter(|_| crate::sign_in::is_own_path(req.uri().path())) {
                             return Ok(if req.uri().path() == wireserve_types::session::CALLBACK_PATH {
-                                si.callback(req.uri(), &policy.fqdn).await
+                                si.callback(req.uri(), req.headers(), &policy.fqdn, peer.ip()).await
                             } else {
                                 si.sign_out(req.method(), req.headers(), &policy.fqdn).await
                             });

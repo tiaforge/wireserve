@@ -488,8 +488,11 @@ async fn grafana(app: &App) -> (String, String, wireserve_types::session::Verify
 
 /// A browser sent to sign in to grafana, signing in at the provider as
 /// `sub`: the coordinator's last answer, and the cookies it set.
+/// The hash of the browser's bind cookie, as its terminator passes it on.
+const BIND: &str = "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1";
+
 async fn sign_in_as(app: &App, idp: &Shared, sub: &str, groups: &[&str]) -> (axum::response::Response, Vec<String>) {
-    let resp = call(&app.router, "GET", "/sign-in?service=grafana.int.test&to=%2Fd%3Fx%3D1", None, None).await;
+    let resp = call(&app.router, "GET", &format!("/sign-in?service=grafana.int.test&to=%2Fd%3Fx%3D1&bind={BIND}"), None, None).await;
     assert_eq!(resp.status(), StatusCode::FOUND, "{}", text(resp).await);
     let location = resp.headers()[header::LOCATION].to_str().unwrap().to_string();
     let flow = resp.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_string();
@@ -522,7 +525,7 @@ async fn a_person_signs_in_to_a_service_and_only_its_own_node_learns_who() {
     let login = cookies.iter().find(|c| c.starts_with("wireserve-login=")).expect("the coordinator's own login").clone();
 
     // Another node can't redeem it, and trying does not spend it.
-    let redeem = serde_json::json!({"fqdn": "grafana.int.test", "ticket": ticket});
+    let redeem = serde_json::json!({"fqdn": "grafana.int.test", "ticket": ticket, "bind": BIND});
     let (status, _) = json(&app.router, "POST", "/sign-in/redeem", &other, redeem.clone()).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     let (status, answer) = json(&app.router, "POST", "/sign-in/redeem", &home, redeem.clone()).await;
@@ -535,7 +538,7 @@ async fn a_person_signs_in_to_a_service_and_only_its_own_node_learns_who() {
     assert_eq!(json(&app.router, "POST", "/sign-in/redeem", &home, redeem).await.0, StatusCode::GONE, "once only");
 
     // Signed in already: the next visit goes straight back with a ticket.
-    let resp = call(&app.router, "GET", "/sign-in?service=grafana.int.test&to=%2F", Some(&login), None).await;
+    let resp = call(&app.router, "GET", &format!("/sign-in?service=grafana.int.test&to=%2F&bind={BIND}"), Some(&login), None).await;
     assert_eq!(resp.status(), StatusCode::FOUND);
     ticket_of(&resp);
 
@@ -580,11 +583,13 @@ async fn someone_the_service_does_not_admit_gets_no_ticket() {
 
     // Nor is anywhere but a path on the service somewhere to go back to.
     for bad in ["//evil.example/", "https%3A%2F%2Fevil.example%2F"] {
-        let resp = call(&app.router, "GET", &format!("/sign-in?service=grafana.int.test&to={bad}"), None, None).await;
+        let resp = call(&app.router, "GET", &format!("/sign-in?service=grafana.int.test&to={bad}&bind={BIND}"), None, None).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad}");
     }
-    let resp = call(&app.router, "GET", "/sign-in?service=nothing.int.test", None, None).await;
+    let resp = call(&app.router, "GET", &format!("/sign-in?service=nothing.int.test&bind={BIND}"), None, None).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = call(&app.router, "GET", "/sign-in?service=grafana.int.test", None, None).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "not from a service's terminator: no bind");
 }
 
 #[tokio::test]
@@ -594,7 +599,7 @@ async fn signing_out_at_a_service_ends_the_session_everywhere() {
     let app = signing_app(&issuer);
     let (home, _, _) = grafana(&app).await;
     let (resp, cookies) = sign_in_as(&app, &idp, "alice", &["family"]).await;
-    let redeem = serde_json::json!({"fqdn": "grafana.int.test", "ticket": ticket_of(&resp)});
+    let redeem = serde_json::json!({"fqdn": "grafana.int.test", "ticket": ticket_of(&resp), "bind": BIND});
     let (_, answer) = json(&app.router, "POST", "/sign-in/redeem", &home, redeem).await;
     let body = serde_json::json!({"fqdn": "grafana.int.test", "token": answer["token"]});
     assert_eq!(json(&app.router, "POST", "/sign-in/end", &home, body.clone()).await.0, StatusCode::NO_CONTENT);
@@ -602,8 +607,37 @@ async fn signing_out_at_a_service_ends_the_session_everywhere() {
 
     // The coordinator's own login is gone with it: back to the provider.
     let login = cookies.iter().find(|c| c.starts_with("wireserve-login=")).unwrap();
-    let resp = call(&app.router, "GET", "/sign-in?service=grafana.int.test", Some(login), None).await;
+    let resp = call(&app.router, "GET", &format!("/sign-in?service=grafana.int.test&bind={BIND}"), Some(login), None).await;
     assert!(resp.headers()[header::LOCATION].to_str().unwrap().starts_with(&issuer), "asked again");
     let resp = call(&app.router, "GET", "/signed-out", Some(login), None).await;
     assert!(resp.headers()[header::SET_COOKIE].to_str().unwrap().contains("Max-Age=0"));
+}
+
+#[tokio::test]
+async fn a_ticket_works_only_in_the_browser_that_asked_for_it() {
+    // PLAN.md #312: someone who signs in and hands their ticket over must
+    // not get the other person signed in as them.
+    let idp = start_idp().await;
+    let issuer = idp.lock().unwrap().issuer.clone();
+    let app = signing_app(&issuer);
+    let (home, _, _) = grafana(&app).await;
+    let (resp, _) = sign_in_as(&app, &idp, "mallory", &["family"]).await;
+    let ticket = ticket_of(&resp);
+    let elsewhere = "c2".repeat(32);
+    let redeem = |bind: &str| serde_json::json!({"fqdn": "grafana.int.test", "ticket": ticket, "bind": bind});
+    assert_eq!(json(&app.router, "POST", "/sign-in/redeem", &home, redeem(&elsewhere)).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(json(&app.router, "POST", "/sign-in/redeem", &home, redeem("")).await.0, StatusCode::GONE, "and it is used up");
+}
+
+#[tokio::test]
+async fn one_address_starts_only_so_many_sign_ins() {
+    let idp = start_idp().await;
+    let issuer = idp.lock().unwrap().issuer.clone();
+    let app = signing_app(&issuer);
+    grafana(&app).await;
+    let uri = format!("/sign-in?service=grafana.int.test&bind={BIND}");
+    for _ in 0..wireserve_coordinator::oidc::sign_in::STARTS_PER_MIN {
+        assert_eq!(call(&app.router, "GET", &uri, None, None).await.status(), StatusCode::FOUND);
+    }
+    assert_eq!(call(&app.router, "GET", &uri, None, None).await.status(), StatusCode::TOO_MANY_REQUESTS);
 }

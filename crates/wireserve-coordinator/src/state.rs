@@ -15,9 +15,16 @@ pub struct AppState {
     /// What one node may ask of `/tls/challenge` — each new value is a call
     /// to the operator's DNS provider — per node.
     pub challenge_limiter: Arc<TokenBuckets>,
-    /// What one node may ask of the sign-in's redeem, renew and end calls,
-    /// per node (PLAN.md M48).
+    /// What one node may ask of the sign-in's renew and end calls, per node
+    /// (PLAN.md M48).
     pub sign_in_limiter: Arc<TokenBuckets>,
+    /// What one node may redeem, per node, apart from renewals: anyone on
+    /// the mesh can make a terminator try a ticket, and that must not cost
+    /// the people already signed in their renewals (PLAN.md #312).
+    pub redeem_limiter: Arc<TokenBuckets>,
+    /// How often one address may start a sign-in at `/sign-in`, which needs
+    /// no credential (PLAN.md #312).
+    pub sign_in_start_limiter: Arc<crate::rate_limit::SlidingWindowLimiter>,
     /// Ephemeral transit-selection state (PLAN.md M23) — see
     /// `transit::TransitState`'s module doc for why this lives in memory
     /// rather than the database.

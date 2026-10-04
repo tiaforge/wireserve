@@ -152,36 +152,45 @@ pub fn sweep(conn: &Connection, now: DateTime<Utc>) -> Result<(), DbError> {
     Ok(())
 }
 
+/// A ticket, taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ticket {
+    pub session_id: String,
+    /// The path on the service the browser goes on to.
+    pub to: String,
+    /// The hash of the bind cookie of the browser that started the sign-in.
+    pub bind: String,
+}
+
 /// Stores a ticket for session `id` and the service `fqdn`, going on to
-/// the path `to` there.
-pub fn create_ticket(conn: &Connection, ticket_hash: &str, id: &str, fqdn: &str, to: &str) -> Result<(), DbError> {
+/// the path `to` there, for the browser whose bind cookie hashes to `bind`.
+pub fn create_ticket(conn: &Connection, ticket_hash: &str, id: &str, fqdn: &str, to: &str, bind: &str) -> Result<(), DbError> {
     conn.execute(
-        "INSERT INTO sign_in_tickets (ticket_hash, session_id, fqdn, to_path, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![ticket_hash, id, fqdn, to, (Utc::now() + TICKET_TTL).to_rfc3339()],
+        "INSERT INTO sign_in_tickets (ticket_hash, session_id, fqdn, to_path, expires_at, bind) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![ticket_hash, id, fqdn, to, (Utc::now() + TICKET_TTL).to_rfc3339(), bind],
     )?;
     Ok(())
 }
 
-/// Uses a ticket up: the session it stands for and the path to go on to,
-/// if it is unexpired and for `fqdn`. A ticket presented for another
-/// service is used up all the same — whoever has it is not the service it
-/// was for.
-pub fn take_ticket(conn: &Connection, ticket_hash: &str, fqdn: &str) -> Result<Option<(String, String)>, DbError> {
-    let found: Option<(String, String, String, String)> = conn
+/// Uses a ticket up: what it stands for, if it is unexpired and for
+/// `fqdn`. A ticket presented for another service is used up all the
+/// same — whoever has it is not the service it was for.
+pub fn take_ticket(conn: &Connection, ticket_hash: &str, fqdn: &str) -> Result<Option<Ticket>, DbError> {
+    let found: Option<(String, String, String, String, String)> = conn
         .query_row(
-            "SELECT session_id, fqdn, to_path, expires_at FROM sign_in_tickets WHERE ticket_hash = ?1",
+            "SELECT session_id, fqdn, to_path, expires_at, bind FROM sign_in_tickets WHERE ticket_hash = ?1",
             [ticket_hash],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
-    let Some((id, for_fqdn, to, expires_at)) = found else {
+    let Some((session_id, for_fqdn, to, expires_at, bind)) = found else {
         return Ok(None);
     };
     if conn.execute("DELETE FROM sign_in_tickets WHERE ticket_hash = ?1", [ticket_hash])? != 1 {
         return Ok(None);
     }
     let fresh = parse_dt(&expires_at).is_some_and(|e| Utc::now() < e);
-    Ok((fresh && for_fqdn == fqdn).then_some((id, to)))
+    Ok((fresh && for_fqdn == fqdn).then_some(Ticket { session_id, to, bind }))
 }
 
 #[cfg(test)]
@@ -209,9 +218,10 @@ mod tests {
         let db = crate::db::Db::open_in_memory_for_test();
         let conn = db.conn.blocking_lock();
         create(&conn, &session("s1", "anna"), "login1").unwrap();
-        create_ticket(&conn, "t1", "s1", "grafana.int.test", "/d").unwrap();
-        create_ticket(&conn, "t2", "s1", "grafana.int.test", "/").unwrap();
-        assert_eq!(take_ticket(&conn, "t1", "grafana.int.test").unwrap(), Some(("s1".into(), "/d".into())));
+        create_ticket(&conn, "t1", "s1", "grafana.int.test", "/d", "b1").unwrap();
+        create_ticket(&conn, "t2", "s1", "grafana.int.test", "/", "b2").unwrap();
+        let t = take_ticket(&conn, "t1", "grafana.int.test").unwrap().unwrap();
+        assert_eq!((t.session_id.as_str(), t.to.as_str(), t.bind.as_str()), ("s1", "/d", "b1"));
         assert_eq!(take_ticket(&conn, "t1", "grafana.int.test").unwrap(), None, "used up");
         assert_eq!(take_ticket(&conn, "t2", "vault.int.test").unwrap(), None, "another service's");
         assert_eq!(take_ticket(&conn, "t2", "grafana.int.test").unwrap(), None, "spent by the wrong service too");

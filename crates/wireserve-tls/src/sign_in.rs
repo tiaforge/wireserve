@@ -16,7 +16,10 @@
 //!
 //! Two paths on every service's name are the sign-in's own: the coordinator
 //! sends the browser back to [`CALLBACK_PATH`] with a ticket, which the
-//! agent redeems for a token; and [`SIGN_OUT_PATH`] ends the session.
+//! agent redeems for a token; and [`SIGN_OUT_PATH`] ends the session. A
+//! ticket is redeemed only for the browser that set off its sign-in: on the
+//! way out it gets a bind cookie of this service's, whose hash the ticket
+//! carries (PLAN.md #312).
 //!
 //! The cookie is `__Host-`: this service's own, never sent to a sibling
 //! under the same domain, so whoever runs one service never sees the
@@ -24,12 +27,13 @@
 //! sees it.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, Method, Response, StatusCode, Uri};
-use wireserve_types::session::{self, Session, VerifyingKey, CALLBACK_PATH, COOKIE, SIGN_OUT_PATH};
+use wireserve_types::session::{self, Session, VerifyingKey, BIND_COOKIE, CALLBACK_PATH, COOKIE, SIGN_OUT_PATH, TICKET_PREFIX};
 use wireserve_types::IdentityHeaders;
 
 use crate::link::{Link, LinkError};
@@ -38,13 +42,35 @@ use crate::link::{Link, LinkError};
 /// an unused session. The token in it is renewed long before.
 const COOKIE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
 
+/// How long the bind cookie lasts: long enough to sign in, in every tab.
+const BIND_MAX_AGE: Duration = Duration::from_secs(3600);
+
 /// Sessions renewed recently, kept to answer the requests that were already
 /// on their way with the old token.
 const MAX_RENEWED: usize = 10_000;
 
+/// How long a session the coordinator said is over is taken as over without
+/// asking again (PLAN.md #312): a browser — or anyone — still sending its
+/// token must not cost a call each time.
+const ENDED_FOR: Duration = Duration::from_secs(600);
+
+/// Returns from sign-in one calling address may bring a minute. Each costs a
+/// call to the coordinator, and the service's 443 is open to every node
+/// while it offers the sign-in (PLAN.md #312).
+const CALLBACKS_PER_MIN: u32 = 20;
+
+/// Calling addresses counted at once; a mesh has far fewer.
+const MAX_CALLERS: usize = 4096;
+
+/// What became of one session's latest renewal at a service.
+enum Renewal {
+    Renewed(String, Session),
+    Ended(Instant),
+}
+
 /// One session's renewal at a service: held while it runs, and its result
-/// — the token and what it says — kept for the requests that waited.
-type Renewed = Arc<tokio::sync::Mutex<Option<(String, Session)>>>;
+/// kept for the requests that waited.
+type Renewed = Arc<tokio::sync::Mutex<Option<Renewal>>>;
 
 /// The sign-in as one check-in configured it.
 pub struct SignIn {
@@ -53,6 +79,8 @@ pub struct SignIn {
     link: Link,
     /// Per session and service: one renewal at a time, and its result.
     renewed: Mutex<HashMap<(String, String), Renewed>>,
+    /// Per calling address: returns from sign-in in the current minute.
+    callbacks: Mutex<HashMap<IpAddr, (Instant, u32)>>,
 }
 
 /// What a request's session says.
@@ -69,7 +97,7 @@ impl SignIn {
     #[must_use]
     pub fn new(settings: wireserve_types::SignIn, link: Link) -> Option<Self> {
         let key = session::parse_public_key(&settings.public_key)?;
-        Some(Self { settings, key, link, renewed: Mutex::default() })
+        Some(Self { settings, key, link, renewed: Mutex::default(), callbacks: Mutex::default() })
     }
 
     /// Checks the session a request to the service `fqdn` carries.
@@ -87,12 +115,12 @@ impl SignIn {
             expired = Some((token.to_string(), s));
         }
         let Some((token, s)) = expired else {
-            return self.to_sign_in(method, uri, fqdn, false);
+            return self.to_sign_in(method, uri, headers, fqdn, false);
         };
         match self.renew(fqdn, &token, &s).await {
             Ok((fresh, s)) => Verdict::Allow { session: s, set_cookie: Some(set_cookie(&fresh)) },
-            Err(Renewal::SignedOut) => self.to_sign_in(method, uri, fqdn, true),
-            Err(Renewal::Failed(e)) => {
+            Err(Failure::SignedOut) => self.to_sign_in(method, uri, headers, fqdn, true),
+            Err(Failure::Failed(e)) => {
                 tracing::warn!(service = %fqdn, error = %e, "could not renew a sign-in session");
                 Verdict::Deny(plain(StatusCode::SERVICE_UNAVAILABLE, "the sign-in cannot be reached right now; try again shortly"))
             }
@@ -101,12 +129,19 @@ impl SignIn {
 
     /// A fresh token for an expired one: the one another request already
     /// got for the same session, if it is still good, or the coordinator's.
-    async fn renew(&self, fqdn: &str, token: &str, s: &Session) -> Result<(String, Session), Renewal> {
+    async fn renew(&self, fqdn: &str, token: &str, s: &Session) -> Result<(String, Session), Failure> {
         let slot = {
             let mut all = self.renewed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if all.len() >= MAX_RENEWED {
                 let now = unix_now();
-                all.retain(|_, slot| Arc::strong_count(slot) > 1 || slot.try_lock().is_ok_and(|g| g.as_ref().is_some_and(|(_, s)| s.exp > now)));
+                all.retain(|_, slot| {
+                    Arc::strong_count(slot) > 1
+                        || slot.try_lock().is_ok_and(|g| match g.as_ref() {
+                            Some(Renewal::Renewed(_, s)) => s.exp > now,
+                            Some(Renewal::Ended(at)) => at.elapsed() < ENDED_FOR,
+                            None => false,
+                        })
+                });
                 if all.len() >= MAX_RENEWED {
                     all.clear();
                 }
@@ -114,20 +149,42 @@ impl SignIn {
             all.entry((s.sid.clone(), fqdn.to_ascii_lowercase())).or_default().clone()
         };
         let mut held = slot.lock().await;
-        if let Some((fresh, s)) = held.as_ref() {
-            if s.exp > unix_now() {
-                return Ok((fresh.clone(), s.clone()));
-            }
+        match held.as_ref() {
+            Some(Renewal::Renewed(fresh, s)) if s.exp > unix_now() => return Ok((fresh.clone(), s.clone())),
+            Some(Renewal::Ended(at)) if at.elapsed() < ENDED_FOR => return Err(Failure::SignedOut),
+            _ => {}
         }
         match self.link.renew(fqdn, token).await {
             Ok(fresh) => {
-                let s = self.accept(&fresh, fqdn).map_err(Renewal::Failed)?;
-                *held = Some((fresh.clone(), s.clone()));
+                let s = self.accept(&fresh, fqdn).map_err(Failure::Failed)?;
+                *held = Some(Renewal::Renewed(fresh.clone(), s.clone()));
                 Ok((fresh, s))
             }
-            Err(LinkError::SignedOut) => Err(Renewal::SignedOut),
-            Err(e) => Err(Renewal::Failed(e.to_string())),
+            Err(LinkError::SignedOut) => {
+                *held = Some(Renewal::Ended(Instant::now()));
+                Err(Failure::SignedOut)
+            }
+            Err(e) => Err(Failure::Failed(e.to_string())),
         }
+    }
+
+    /// Whether `caller` may bring back one more sign-in this minute.
+    fn callback_allowed(&self, caller: IpAddr) -> bool {
+        let mut all = self.callbacks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        if all.len() >= MAX_CALLERS {
+            all.retain(|_, (since, _)| now.duration_since(*since) < Duration::from_secs(60));
+            if all.len() >= MAX_CALLERS {
+                return false;
+            }
+        }
+        let (since, count) = all.entry(caller).or_insert((now, 0));
+        if now.duration_since(*since) >= Duration::from_secs(60) {
+            *since = now;
+            *count = 0;
+        }
+        *count += 1;
+        *count <= CALLBACKS_PER_MIN
     }
 
     /// A token the coordinator just handed over, checked like any other.
@@ -139,18 +196,21 @@ impl SignIn {
         Ok(s)
     }
 
-    /// Off to sign in, for a GET or HEAD; a 401 for anything else, which a
-    /// redirect would lose the body of. `clear`: the cookie held a session
-    /// that is over.
-    fn to_sign_in(&self, method: &Method, uri: &Uri, fqdn: &str, clear: bool) -> Verdict {
+    /// Off to sign in, for a GET or HEAD — with this browser's bind cookie,
+    /// kept if it has one, so sign-ins in several tabs all come back; a 401
+    /// for anything else, which a redirect would lose the body of. `clear`:
+    /// the cookie held a session that is over.
+    fn to_sign_in(&self, method: &Method, uri: &Uri, headers: &HeaderMap, fqdn: &str, clear: bool) -> Verdict {
         let mut r = if matches!(*method, Method::GET | Method::HEAD) {
             let to = uri.path_and_query().map_or("/", |p| p.as_str());
             let to = if session::is_local_path(to) { to } else { "/" };
+            let bind = bind_of(headers).map_or_else(new_bind, str::to_string);
             let url = format!(
-                "{}/sign-in?service={}&to={}",
+                "{}/sign-in?service={}&to={}&bind={}",
                 self.settings.login_url.trim_end_matches('/'),
                 session::encode_query_value(fqdn),
                 session::encode_query_value(to),
+                session::bind_hash(&bind),
             );
             let mut r = Response::new(Body::empty());
             *r.status_mut() = StatusCode::FOUND;
@@ -158,30 +218,43 @@ impl SignIn {
                 r.headers_mut().insert(header::LOCATION, v);
             }
             r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            if let Ok(v) = HeaderValue::from_str(&format!(
+                "{BIND_COOKIE}={bind}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={}",
+                BIND_MAX_AGE.as_secs()
+            )) {
+                r.headers_mut().append(header::SET_COOKIE, v);
+            }
             r
         } else {
             plain(StatusCode::UNAUTHORIZED, "sign in first: open this service's page in your browser")
         };
         if clear {
-            r.headers_mut().insert(header::SET_COOKIE, clear_cookie());
+            r.headers_mut().append(header::SET_COOKIE, clear_cookie());
         }
         Verdict::Deny(r)
     }
 
     /// `GET /.wireserve/callback?ticket=…`: back from the coordinator. The
-    /// agent redeems the ticket; the browser keeps the token, and goes on
-    /// to where it was.
-    pub async fn callback(&self, uri: &Uri, fqdn: &str) -> Response<Body> {
+    /// agent redeems the ticket, for this browser's bind cookie; the browser
+    /// keeps the token, and goes on to where it was. Only a ticket of the
+    /// coordinator's shape, and only so many a minute from one caller, ever
+    /// reach the coordinator.
+    pub async fn callback(&self, uri: &Uri, headers: &HeaderMap, fqdn: &str, caller: IpAddr) -> Response<Body> {
         let ticket = uri
             .query()
             .unwrap_or_default()
             .split('&')
             .find_map(|kv| kv.strip_prefix("ticket="))
-            .filter(|t| !t.is_empty() && t.len() <= session::MAX_TICKET_LEN && t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+            .filter(|t| session::is_token_of(t, TICKET_PREFIX));
         let Some(ticket) = ticket else {
             return page(StatusCode::BAD_REQUEST, "This is not a sign-in link.", fqdn);
         };
-        match self.link.redeem(fqdn, ticket).await {
+        if !self.callback_allowed(caller) {
+            tracing::warn!(service = %fqdn, %caller, "too many returns from sign-in from one address");
+            return page(StatusCode::TOO_MANY_REQUESTS, "Too many sign-ins from here just now. Try again in a minute.", fqdn);
+        }
+        let bind = bind_of(headers).map(session::bind_hash).unwrap_or_default();
+        match self.link.redeem(fqdn, ticket, &bind).await {
             Ok((token, to)) => match self.accept(&token, fqdn) {
                 Ok(s) => {
                     tracing::info!(service = %fqdn, sub = %s.sub, "signed in");
@@ -205,8 +278,10 @@ impl SignIn {
                 page(StatusCode::GONE, "This sign-in link was used already, or is too old. Open the page again to sign in.", fqdn)
             }
             Err(e) => {
+                // Refused — a ticket from another browser among them — or
+                // the coordinator out of reach: either way, start again.
                 tracing::warn!(service = %fqdn, error = %e, "could not redeem a sign-in ticket");
-                page(StatusCode::BAD_GATEWAY, "The sign-in cannot be reached right now. Open the page again shortly.", fqdn)
+                page(StatusCode::FORBIDDEN, "The sign-in did not work in this browser. Open the page again to sign in.", fqdn)
             }
         }
     }
@@ -242,9 +317,20 @@ impl SignIn {
     }
 }
 
-enum Renewal {
+enum Failure {
     SignedOut,
     Failed(String),
+}
+
+/// This browser's bind cookie, if it holds one of the shape this side makes.
+fn bind_of(headers: &HeaderMap) -> Option<&str> {
+    cookies(headers, BIND_COOKIE).find(|v| session::is_token_of(v, ""))
+}
+
+/// A new bind cookie's value: 32 random bytes, in hex.
+fn new_bind() -> String {
+    let bytes: [u8; 32] = rand::random();
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn unix_now() -> i64 {
@@ -376,9 +462,16 @@ pub(crate) mod tests {
         )
     }
 
+    /// A ticket of the coordinator's shape.
+    pub(crate) fn ticket(c: char) -> String {
+        format!("{TICKET_PREFIX}{}", c.to_string().repeat(64))
+    }
+
     /// A stand-in agent on a socket of its own: renews any token to one
-    /// good for a minute (counting how often it was asked), redeems the
-    /// ticket `good`, and says anything else is signed out.
+    /// good for a minute (counting how often it was asked, renewals and
+    /// redeems alike), says a token whose session is `ended` is signed out,
+    /// redeems ticket `a` for the browser whose bind hashes to that of
+    /// `BIND`, and refuses anything else.
     pub(crate) fn fake_agent(dir: &std::path::Path) -> (Link, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         let path = dir.join("tls.sock");
@@ -393,15 +486,20 @@ pub(crate) mod tests {
                     let (read, mut write) = stream.into_split();
                     let mut line = String::new();
                     tokio::io::BufReader::new(read).read_line(&mut line).await.unwrap();
-                    let answer = match serde_json::from_str::<TlsRequest>(line.trim_end()).unwrap() {
+                    let request = serde_json::from_str::<TlsRequest>(line.trim_end()).unwrap();
+                    if matches!(request, TlsRequest::Renew { .. } | TlsRequest::Redeem { .. }) {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    let answer = match request {
+                        TlsRequest::Renew { token: old, .. } if old == ended_token() => TlsResponse::SignedOut,
                         TlsRequest::Renew { fqdn, token: old } if old.contains("wst1.") => {
-                            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             tokio::time::sleep(Duration::from_millis(50)).await;
                             TlsResponse::Session { token: token(&fqdn, 60, &["family"]), to: None }
                         }
-                        TlsRequest::Redeem { fqdn, ticket } if ticket == "good" => {
+                        TlsRequest::Redeem { fqdn, ticket: t, bind } if t == ticket('a') && bind == session::bind_hash(BIND) => {
                             TlsResponse::Session { token: token(&fqdn, 60, &["family"]), to: Some("/dashboard?x=1".into()) }
                         }
+                        TlsRequest::Redeem { .. } => TlsResponse::Error { message: "coordinator refused (403 Forbidden)".into() },
                         TlsRequest::End { .. } => TlsResponse::Ok,
                         _ => TlsResponse::SignedOut,
                     };
@@ -412,6 +510,17 @@ pub(crate) mod tests {
             }
         });
         (Link::new(path), asked)
+    }
+
+    /// A bind cookie's value.
+    pub(crate) const BIND: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// An expired token for a session the coordinator has ended.
+    fn ended_token() -> String {
+        session::sign(
+            &session::signing_key(&SEED),
+            &Session { sid: "ended".into(), sub: "x".into(), email: None, groups: vec![], aud: "jf.int.test".into(), exp: 1 },
+        )
     }
 
     pub(crate) fn settings() -> wireserve_types::SignIn {
@@ -442,7 +551,10 @@ pub(crate) mod tests {
         let theirs = with_cookie(&token("vault.int.test", 60, &["family"]));
         let Verdict::Deny(r) = si.check(&Method::GET, &uri, &theirs, "jf.int.test").await else { panic!("another service's") };
         assert_eq!(r.status(), StatusCode::FOUND);
-        assert_eq!(r.headers()["location"], "https://mesh.test/sign-in?service=jf.int.test&to=%2Fx%3Fy%3D1");
+        let location = r.headers()["location"].to_str().unwrap();
+        assert!(location.starts_with("https://mesh.test/sign-in?service=jf.int.test&to=%2Fx%3Fy%3D1&bind="), "{location}");
+        let bind = r.headers()["set-cookie"].to_str().unwrap().strip_prefix("__Host-wireserve-bind=").unwrap().split(';').next().unwrap();
+        assert!(location.ends_with(&session::bind_hash(bind)), "the coordinator gets the bind cookie's hash, never the cookie");
         let forged = session::sign(&session::signing_key(&[6; 32]), &session::verify(&si.key, &token("jf.int.test", 60, &[])).unwrap());
         let Verdict::Deny(r) = si.check(&Method::POST, &uri, &with_cookie(&forged), "jf.int.test").await else { panic!("forged") };
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "a POST is not redirected");
@@ -467,21 +579,80 @@ pub(crate) mod tests {
         assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1, "one renewal, shared");
     }
 
+    fn bound() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::COOKIE, HeaderValue::from_str(&format!("{BIND_COOKIE}={BIND}")).unwrap());
+        h
+    }
+
+    fn callback_uri(t: &str) -> Uri {
+        format!("/.wireserve/callback?ticket={t}").parse().unwrap()
+    }
+
     #[tokio::test]
-    async fn a_ticket_is_redeemed_into_a_cookie_and_the_way_back() {
+    async fn a_ticket_is_redeemed_into_a_cookie_and_the_way_back_in_its_own_browser_only() {
         let dir = tempfile::tempdir().unwrap();
-        let (link, _) = fake_agent(dir.path());
+        let (link, asked) = fake_agent(dir.path());
         let si = SignIn::new(settings(), link).unwrap();
-        let r = si.callback(&"/.wireserve/callback?ticket=good".parse().unwrap(), "jf.int.test").await;
+        let caller: IpAddr = "10.9.0.3".parse().unwrap();
+        let r = si.callback(&callback_uri(&ticket('a')), &bound(), "jf.int.test", caller).await;
         assert_eq!(r.status(), StatusCode::FOUND);
         assert_eq!(r.headers()["location"], "/dashboard?x=1");
         let cookie = r.headers()["set-cookie"].to_str().unwrap();
         assert!(cookie.starts_with("__Host-wireserve-session=wst1.") && cookie.contains("HttpOnly") && cookie.contains("Secure"), "{cookie}");
 
-        let r = si.callback(&"/.wireserve/callback?ticket=used".parse().unwrap(), "jf.int.test").await;
-        assert_eq!(r.status(), StatusCode::GONE);
-        let r = si.callback(&"/.wireserve/callback?ticket=<script>".parse().unwrap_or_else(|_| "/.wireserve/callback".parse().unwrap()), "jf.int.test").await;
-        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        // Brought by a browser without the bind cookie: not signed in.
+        let r = si.callback(&callback_uri(&ticket('a')), &HeaderMap::new(), "jf.int.test", caller).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert!(r.headers().get("set-cookie").is_none());
+
+        // Not the coordinator's shape: nobody is asked.
+        let before = asked.load(std::sync::atomic::Ordering::SeqCst);
+        for junk in ["good", "<script>", "tkt_ABC"] {
+            let uri = format!("/.wireserve/callback?ticket={}", session::encode_query_value(junk)).parse().unwrap();
+            assert_eq!(si.callback(&uri, &bound(), "jf.int.test", caller).await.status(), StatusCode::BAD_REQUEST, "{junk}");
+        }
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), before);
+    }
+
+    #[tokio::test]
+    async fn one_caller_brings_back_only_so_many_sign_ins_a_minute() {
+        let dir = tempfile::tempdir().unwrap();
+        let (link, asked) = fake_agent(dir.path());
+        let si = SignIn::new(settings(), link).unwrap();
+        let flood: IpAddr = "10.9.0.66".parse().unwrap();
+        for _ in 0..CALLBACKS_PER_MIN {
+            si.callback(&callback_uri(&ticket('b')), &bound(), "jf.int.test", flood).await;
+        }
+        let r = si.callback(&callback_uri(&ticket('b')), &bound(), "jf.int.test", flood).await;
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), CALLBACKS_PER_MIN as usize, "the rest never reached the coordinator");
+        let r = si.callback(&callback_uri(&ticket('a')), &bound(), "jf.int.test", "10.9.0.3".parse().unwrap()).await;
+        assert_eq!(r.status(), StatusCode::FOUND, "anyone else still signs in");
+    }
+
+    #[tokio::test]
+    async fn a_session_said_to_be_over_is_not_asked_about_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (link, asked) = fake_agent(dir.path());
+        let si = SignIn::new(settings(), link).unwrap();
+        let uri: Uri = "/".parse().unwrap();
+        for _ in 0..5 {
+            let Verdict::Deny(r) = si.check(&Method::GET, &uri, &with_cookie(&ended_token()), "jf.int.test").await else {
+                panic!("over");
+            };
+            assert_eq!(r.status(), StatusCode::FOUND);
+            assert!(r.headers().get_all("set-cookie").iter().any(|c| c.to_str().unwrap().contains("wireserve-session=; ")));
+        }
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_browser_keeps_its_bind_cookie_across_sign_ins() {
+        let si = SignIn::new(settings(), Link::new("/nonexistent")).unwrap();
+        let Verdict::Deny(r) = si.to_sign_in(&Method::GET, &"/".parse().unwrap(), &bound(), "jf.int.test", false) else { panic!() };
+        assert!(r.headers()["location"].to_str().unwrap().ends_with(&session::bind_hash(BIND)));
+        assert!(r.headers()["set-cookie"].to_str().unwrap().starts_with(&format!("{BIND_COOKIE}={BIND};")));
     }
 
     #[tokio::test]

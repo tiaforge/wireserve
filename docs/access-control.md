@@ -155,7 +155,9 @@ A request to a service in `media`, served with TLS by its node, then goes:
    coordinator lets only someone in one of the service's granted groups go
    on — anyone else gets a page saying the service is not for them, and the
    service learns nothing about them — with a ticket for that service alone,
-   which the service's node redeems for the session. A second service asks
+   which the service's node redeems for the session, and only in the browser
+   that set off the sign-in: a ticket opened anywhere else signs nobody in.
+   A second service asks
    the login server nothing: the coordinator remembers the browser.
    Anything but a GET gets 401 instead, which a redirect would lose the body
    of.

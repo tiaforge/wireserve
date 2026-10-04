@@ -18,7 +18,8 @@
 #      jellyfin: the backend sees who she is, not a forged X-Auth-User, not
 #      the session cookie — other cookies kept;
 #   4. bob, signed in with another group, is told so by the coordinator and
-#      never handed a ticket; jellyfin's backend is untouched;
+#      never handed a ticket; jellyfin's backend is untouched; and a ticket
+#      someone opens in another browser than their own signs nobody in;
 #   5. the tagged gate gets in without any session: its device is granted;
 #   6. grafana, still in `default`, needs no sign-in, and a session cookie
 #      or a forged identity sent to it never reaches its backend;
@@ -159,21 +160,34 @@ browser() {
         --resolve "grafana.$DOMAIN:443:$(entry grafana vip4)" \
         -b "/work/jar-$who" -c "/work/jar-$who" "$@"
 }
-# Signs `who` in to jellyfin with `groups`, from the redirect jellyfin
-# answers with to the page the coordinator ends on: its status and URL.
-sign_in() {
+# Signs `who` in at the provider with `groups`, starting from jellyfin's
+# redirect, up to the coordinator's last answer: its status and where it
+# sends the browser (a ticket for jellyfin, when it admits them).
+to_ticket() {
     local who=$1 groups=$2 start auth callback
     : > "$WORK/jar-$who"
     start=$(browser "$who" -o /dev/null -w '%{redirect_url}' "https://jellyfin.$DOMAIN/") \
         || fail "$who: jellyfin did not answer"
-    case "$start" in "$PUBLIC/sign-in?service=jellyfin.$DOMAIN&to=%2F") ;; *) fail "$who: not sent to sign in: '$start'" ;; esac
+    case "$start" in "$PUBLIC/sign-in?service=jellyfin.$DOMAIN&to=%2F&bind="*) ;; *) fail "$who: not sent to sign in: '$start'" ;; esac
+    grep -q '__Host-wireserve-bind' "$WORK/jar-$who" || fail "$who: jellyfin set no bind cookie"
     auth=$(browser "$who" -o "/work/start-$who.html" -w '%{redirect_url}' "$start") || fail "$who: the coordinator did not answer"
     case "$auth" in "$ISSUER/authorize?"*) ;; *) cat "$WORK/start-$who.html" >&2; fail "$who: not sent to the provider: '$auth'" ;; esac
     callback=$(browser "$who" -o "/work/login-$who.html" -w '%{redirect_url}' --data-urlencode "username=$who" \
         --data-urlencode "claims={\"groups\":[$groups],\"email\":\"$who@example.com\",\"email_verified\":true}" "$auth") \
         || fail "$who: the provider's login form failed"
     case "$callback" in "$PUBLIC/oidc/callback?"*) ;; *) cat "$WORK/login-$who.html" >&2; fail "$who: the provider did not send the browser back: '$callback'" ;; esac
-    browser "$who" -L -o "/work/landed-$who.html" -w '%{http_code} %{url_effective}' "$callback"
+    browser "$who" -o "/work/landed-$who.html" -w '%{http_code} %{redirect_url}' "$callback"
+}
+# Signs `who` in to jellyfin with `groups`, to the page the browser ends on:
+# its status and URL.
+sign_in() {
+    local who=$1 answer
+    answer=$(to_ticket "$@")
+    case "$answer" in
+        "302 https://jellyfin.$DOMAIN/.wireserve/callback?ticket="*)
+            browser "$who" -L -o "/work/landed-$who.html" -w '%{http_code} %{url_effective}' "${answer#302 }" ;;
+        *) echo "$answer $(grep -o 'not for any of your groups' "$WORK/landed-$who.html" || true)" ;;
+    esac
 }
 
 log "checking prerequisites"
@@ -318,10 +332,20 @@ pass "X-Auth-User: alice, groups family; mallory and the session cookie gone; th
 log "4/11: bob, signed in without a granted group, gets no ticket"
 LANDED=$(sign_in bob '"guests"') || true
 echo "  $LANDED"
-case "$LANDED" in "403 $PUBLIC/oidc/callback?"*) ;; *) cat "$WORK/landed-bob.html"; fail "bob was not stopped at the coordinator: $LANDED" ;; esac
-grep -q 'not for any of your groups' "$WORK/landed-bob.html" || { cat "$WORK/landed-bob.html"; fail "bob was not told why"; }
+case "$LANDED" in "403 "*"not for any of your groups") ;; *) cat "$WORK/landed-bob.html"; fail "bob was not stopped at the coordinator: $LANDED" ;; esac
 grep -q '__Host-wireserve-session' "$WORK/jar-bob" && fail "bob got a session cookie for jellyfin"
 pass "bob (guests) told jellyfin is not for him; no ticket, no cookie"
+
+log "4b/11: a ticket handed to another browser signs nobody in"
+ANSWER=$(to_ticket mallory '"family"')
+case "$ANSWER" in "302 https://jellyfin.$DOMAIN/.wireserve/callback?ticket="*) ;; *) fail "mallory got no ticket: $ANSWER" ;; esac
+: > "$WORK/jar-victim"
+GOT=$(browser victim -o "/work/victim.html" -w '%{http_code}' "${ANSWER#302 }") || true
+[ "$GOT" = 403 ] || { cat "$WORK/victim.html"; fail "another browser redeemed mallory's ticket: $GOT"; }
+grep -q 'wireserve-session' "$WORK/jar-victim" && fail "the other browser got mallory's session"
+GOT=$(browser mallory -o /dev/null -w '%{http_code}' "${ANSWER#302 }") || true
+[ "$GOT" != 302 ] || fail "the ticket worked again after another browser had tried it"
+pass "mallory's ticket, opened in another browser: 403, no session — and used up"
 
 log "5/11: the tagged device gets in without signing in"
 OUT=$(fetch_from "$GATE" jellyfin -H 'X-Auth-User: mallory') || true

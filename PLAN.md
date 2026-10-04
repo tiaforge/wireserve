@@ -4637,3 +4637,40 @@ sessions alike; one callback URL.
     jellyfin session sent to grafana is sent to sign in, the session renews
     past the interval and sign-out ends it. It passes, and so does the
     owner e2e with the new callback (2026-10-04, run by the user).
+
+## M48 security review, first part
+
+An in-depth review of M48 (2026-10-04) found no way into a service one is
+not granted, and no way to forge or carry a token elsewhere, but six things
+to fix. The first three, together:
+
+312. **Starting a sign-in no longer blocks everyone else's; a ticket works
+    only in its own browser; mesh devices can't spend a node's renewals.**
+    - *Anyone could fill the flow table.* `/sign-in` takes no credential,
+      and claims and sign-ins shared 256 pending flows: ~256 requests
+      naming any public service name blocked every sign-in and claim for
+      ten minutes, and each made the coordinator fetch the provider's
+      discovery document. Now one address starts 20 a minute
+      (`sign_in_start_limiter`); sign-ins have 1024 slots of their own, the
+      oldest giving way to a new one, claims keep theirs; the limit is
+      checked before the provider is contacted, and the discovery document
+      is reused for a minute.
+    - *Login CSRF.* A ticket was not tied to a browser: someone in a
+      granted group could sign in, stop at the redirect, and hand the
+      ticket on, signing the other person in as themselves. Now the
+      terminator sets a `__Host-wireserve-bind` cookie (kept across tabs, an
+      hour) before sending a browser to sign in, passes its SHA-256 as
+      `bind`, the coordinator stores it with the ticket (migration 0024),
+      and a redeem whose bind differs is refused — and the ticket used up.
+    - *Renewal starvation.* While a service offers the sign-in its 443 is
+      open to every node, and every `/.wireserve/callback` cost a call to
+      the coordinator out of one per-node budget shared with renewals. Now
+      the terminator forwards only tickets of the coordinator's shape
+      (`tkt_` + 64 hex), at most 20 a minute per calling address; a session
+      the coordinator said is over is taken as over for ten minutes
+      without asking again; and redeems have a budget of their own
+      (`redeem_limiter`), apart from renew and end.
+    Tests: the bind on the way out and back, a refused handed-over ticket
+    (terminator and `oidc_flow.rs`), the per-caller and per-address limits,
+    the cached sign-out, flow eviction never taking a claim's slot. The
+    sign-in e2e gained a step opening mallory's ticket in another browser.
