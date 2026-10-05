@@ -204,9 +204,26 @@ wait_for 20 pending "$HOME_AGENT" || fail "node-home never reported svc-home"
 admin service approve svc-home --node node-home || fail "could not approve svc-home"
 wait_for 20 eval '! pending "$HOME_AGENT"' || fail "node-home never learnt svc-home was approved"
 
+# What a carrier that doesn't qualify looks like from both sides.
+carrier_diag() {
+    note "the carrier as the coordinator sees it:"
+    admin node show node-carrier || true
+    note "the coordinator on the carrier, transit and rate limits:"
+    podman logs "$COORD" 2>&1 | grep -E 'node-carrier|transit|rate_limited' | tail -20 || true
+    note "the carrier's probe, carry interface, warnings and errors:"
+    podman exec "$CARRIER" grep -E 'reflexive|carry|WARN|ERROR' /tmp/daemon.log || true
+    note "the carrier's links:"
+    in_netns "$CARRIER" ip -d link show || true
+    note "the carrier's own status:"
+    podman exec "$CARRIER" wireserve status || true
+}
+
 log "opting the carrier in (both halves)"
 podman exec "$CARRIER" wireserve transit on
 admin transit approve node-carrier || fail "could not approve node-carrier"
+# Approved and offering, as the coordinator sees it: what step 2 needs.
+wait_for 30 eval 'admin node show node-carrier | has -E "^transit: +on$"' \
+    || { carrier_diag; fail "node-carrier is approved but the coordinator never saw it offer transit"; }
 wait_for 30 relay_port || fail "homeserver never got a relay port on the carrier"
 
 RELAY_PORT=$(relay_port)
@@ -228,16 +245,7 @@ in_netns "$CARRIER" nft list table ip cloudfw | has "udp dport $RELAY_PORT drop"
 if admin device create phone --register-url "http://127.0.0.1:47820" >"$OUT/closed.conf" 2>"$OUT/closed.log"; then
     cat "$OUT/closed.log"
     # The usual reason: the carrier doesn't count as one (see the warning).
-    note "the carrier as the coordinator sees it:"
-    admin node show node-carrier || true
-    # Approved, dialable and public, the carrier can still lack the relay
-    # capability (no carry interface) or not be offering transit.
-    note "the carrier's probe, carry interface, warnings and errors:"
-    podman exec "$CARRIER" grep -E 'reflexive|carry|WARN|ERROR' /tmp/daemon.log || true
-    note "the carrier's links:"
-    in_netns "$CARRIER" ip -d link show || true
-    note "the carrier's own status:"
-    podman exec "$CARRIER" wireserve status || true
+    carrier_diag
     fail "the export went ahead with the relay port closed"
 fi
 grep -q "open UDP $RELAY_PORT inbound on node-carrier ($CARRIER_IP)" "$OUT/closed.log" \
