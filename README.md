@@ -1,5 +1,8 @@
 <h1><img src="docs/assets/wireserve-lockup.svg" alt="wireserve" width="360"></h1>
 
+[![CI](https://github.com/tiaforge/wireserve/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tiaforge/wireserve/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/tiaforge/wireserve?include_prereleases&label=release)](https://github.com/tiaforge/wireserve/releases)
+
 **Every service you self-host, on every device you own: by name, encrypted
 end to end, on infrastructure you control.**
 
