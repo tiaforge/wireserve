@@ -101,11 +101,14 @@ EOF
 # nft-native rules carrying our tag, counted from JSON (text output may or
 # may not render iptables-nft's comment match, depending on nft's version;
 # JSON never does, so this counts only the rules added through nft).
+# Rules anywhere in the ruleset carrying wireserve0's tag. Exactly, not by
+# prefix: the carry interface's own accept (wireserve:wireserve0-t) is
+# expected next to it.
 native_tags() {
     in_dbg "nft -j list ruleset" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)['nftables']
-print(sum(1 for o in d if 'rule' in o and str(o['rule'].get('comment', '')).startswith('wireserve:')))"
+print(sum(1 for o in d if 'rule' in o and o['rule'].get('comment') == 'wireserve:wireserve0'))"
 }
 
 mesh_ip_of() {
