@@ -25,6 +25,12 @@
 #
 #   sudo E2E_RELEASE=1 ./deploy/e2e/run-e2e-test.sh
 #
+# E2E_PREBUILT=1 compiles nothing and builds the images from whatever is
+# already in target/e2e/bin. The release workflow uses it to run the
+# suites against the very binaries it then publishes:
+#
+#   sudo E2E_PREBUILT=1 ./deploy/e2e/run-e2e-test.sh
+#
 # The cargo caches are the volumes wireserve-e2e-target and
 # wireserve-e2e-registry; `podman volume rm` them if a build ever looks
 # like it is reusing something it should not.
@@ -32,13 +38,21 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."   # repo root
 
-if [ "${E2E_RELEASE:-0}" = 1 ]; then
+if [ "${E2E_PREBUILT:-0}" = 1 ]; then
+    profile=prebuilt
+elif [ "${E2E_RELEASE:-0}" = 1 ]; then
     profile=release
 else
     profile=debug
 fi
 out=target/e2e/bin
 
+if [ "${E2E_PREBUILT:-0}" = 1 ]; then
+    for b in wireserve wireserve-coordinator wireserve-admin; do
+        [ -x "$out/$b" ] || { echo "E2E_PREBUILT=1 but $out/$b is missing or not executable" >&2; exit 1; }
+    done
+    echo "=== using the prebuilt binaries in $out ==="
+else
 echo "=== building wireserve ($profile) ==="
 mkdir -p "$out"
 # The source is mounted read-only (--locked keeps cargo from wanting to
@@ -69,6 +83,7 @@ podman run --rm \
 # `cargo clean` can remove them.
 if [ -n "${SUDO_UID:-}" ]; then
     chown -R "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" target/e2e
+fi
 fi
 
 echo "=== building e2e images ==="

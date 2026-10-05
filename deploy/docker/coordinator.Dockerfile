@@ -24,7 +24,9 @@
 
 # The e2e suites build with `--build-arg BINARIES=prebuilt`: the runtime
 # stage below then takes binaries deploy/e2e/build.sh has already compiled
-# into target/e2e/bin, and the build stage is skipped entirely.
+# into target/e2e/bin, and the build stage is skipped entirely. The
+# release workflow builds with `--build-arg BINARIES=release`, taking the
+# tested binaries for each platform from dist/<amd64|arm64>.
 ARG BINARIES=builder
 
 # ---- build stage ----
@@ -63,6 +65,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 FROM scratch AS prebuilt
 COPY target/e2e/bin/wireserve-coordinator /out/
 COPY target/e2e/bin/wireserve-admin /out/
+
+# ---- or: the release workflow's binaries, one set per platform ----
+FROM scratch AS release
+ARG TARGETARCH
+COPY dist/${TARGETARCH}/wireserve-coordinator /out/
+COPY dist/${TARGETARCH}/wireserve-admin /out/
 
 FROM ${BINARIES} AS binaries
 

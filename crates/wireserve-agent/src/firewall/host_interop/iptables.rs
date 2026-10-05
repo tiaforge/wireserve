@@ -467,7 +467,7 @@ mod tests {
     #[test]
     fn kernel_insert_list_delete_round_trip() {
         let Some(t) = locate(IpVersion::V4, IptablesVariant::Nft) else {
-            eprintln!("SKIPPED: no iptables-nft");
+            crate::firewall::netns::skip("no iptables-nft");
             return;
         };
         let bin = t.binary.display();
@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn kernel_service_openings_list_back_as_the_planner_spells_them() {
         let Some(t) = locate(IpVersion::V4, IptablesVariant::Nft) else {
-            eprintln!("SKIPPED: no iptables-nft");
+            crate::firewall::netns::skip("no iptables-nft");
             return;
         };
         let bin = t.binary.display();

@@ -13,6 +13,7 @@ use wireserve_types::{FirewallBackend, PortMap};
 #[derive(Parser)]
 #[command(
     name = "wireserve",
+    version,
     about = "Joins this machine to a wireserve mesh and publishes its services",
     allow_external_subcommands = true,
     override_usage = "wireserve [OPTIONS] <SERVICE> [PORT]... [--group GROUP]\n       \

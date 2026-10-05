@@ -5,3 +5,4 @@
 .env
 wireserve.db-shm
 wireserve.db-wal
+/dist/

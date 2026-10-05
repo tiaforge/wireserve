@@ -64,3 +64,19 @@ the shipped Dockerfiles take them from there with
 `--build-arg BINARIES=prebuilt`. That way the suites test the same
 runtime images that ship. When nothing has changed, the build takes a few
 seconds, so running several suites in a row costs almost nothing.
+
+`E2E_PREBUILT=1` skips the compile and uses whatever is already in
+`target/e2e/bin`. The release workflow uses it to run the suites against
+the exact binaries it publishes.
+
+## Unit tests
+
+```sh
+cargo test --workspace
+```
+
+The firewall tests run real `nft`, `iptables` and `wg` inside throwaway
+unprivileged network namespaces, and skip where those are unavailable.
+`WIRESERVE_TEST_STRICT=1` makes such a skip a failure, as CI does. One
+test, for the service addresses' header rewrites, needs real root and
+skips otherwise; CI runs it with sudo.

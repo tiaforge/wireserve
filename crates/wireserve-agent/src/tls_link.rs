@@ -116,7 +116,7 @@ impl TlsLink {
             .filter(|(_, at)| now.saturating_duration_since(**at) < CALLER_TTL)
             .map(|(a, at)| (*a, *at))
             .collect();
-        all.sort_by(|a, b| b.1.cmp(&a.1));
+        all.sort_by_key(|a| std::cmp::Reverse(a.1));
         all.into_iter().map(|(a, _)| a).take(wireserve_types::MAX_CALLERS_SEEN_PER_POLL).collect()
     }
 

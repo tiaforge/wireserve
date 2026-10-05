@@ -382,6 +382,26 @@ pub mod netns {
         if unsafe { libc::geteuid() } == 0 { "-n" } else { "-rn" }
     }
 
+    /// Says why a kernel test is skipping. Under `WIRESERVE_TEST_STRICT=1`
+    /// (CI sets it) a skip is a failure instead: there the environment is
+    /// meant to have everything, and a test that quietly skipped would
+    /// look the same as one that passed.
+    pub fn skip(why: &str) {
+        assert!(std::env::var_os("WIRESERVE_TEST_STRICT").is_none(), "would skip under WIRESERVE_TEST_STRICT: {why}");
+        eprintln!("SKIPPED: {why}");
+    }
+
+    /// Whether this is root of the whole machine, not just of an
+    /// unprivileged namespace (where `geteuid` says 0 too): only the
+    /// initial user namespace maps every uid onto itself.
+    pub fn real_root() -> bool {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        euid == 0
+            && std::fs::read_to_string("/proc/self/uid_map")
+                .is_ok_and(|m| m.split_whitespace().collect::<Vec<_>>() == ["0", "0", "4294967295"])
+    }
+
     pub fn available() -> bool {
         Command::new("unshare")
             .args([flags(), "true"])
@@ -403,7 +423,7 @@ pub mod netns {
             return true;
         }
         if !available() {
-            eprintln!("SKIPPED: unprivileged network namespaces or nft unavailable");
+            skip("unprivileged network namespaces or nft unavailable");
             return false;
         }
         let status = Command::new("unshare")
@@ -421,7 +441,7 @@ pub mod netns {
     /// panic: stdout and stderr, for a test that inspects what failed.
     pub fn run_capturing(script: &str) -> Option<(String, String)> {
         if !available() {
-            eprintln!("SKIPPED: unprivileged network namespaces or nft unavailable");
+            skip("unprivileged network namespaces or nft unavailable");
             return None;
         }
         let out = Command::new("unshare").args([flags(), "sh", "-euc", script]).output().expect("spawn unshare");
@@ -433,7 +453,7 @@ pub mod netns {
     /// unavailable. Panics with stderr if the script itself fails.
     pub fn run(script: &str) -> Option<String> {
         if !available() {
-            eprintln!("SKIPPED: unprivileged network namespaces or nft unavailable");
+            skip("unprivileged network namespaces or nft unavailable");
             return None;
         }
         let out = Command::new("unshare")

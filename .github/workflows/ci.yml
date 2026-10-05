@@ -1,0 +1,86 @@
+# Unit tests and clippy on every branch push and pull request. Tags are
+# left to release.yml, which builds and runs the e2e suites instead.
+#
+# Actions are pinned to commit hashes: this repository is public, and a
+# moved tag in someone else's repository should not change what runs here.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      # A kernel test that would skip fails instead: everything it needs
+      # is set up below, so a skip here means something is missing.
+      WIRESERVE_TEST_STRICT: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The firewall tests run real nft, iptables and wg inside unprivileged
+      # network namespaces, which Ubuntu's AppArmor forbids by default. The
+      # wireguard module is loaded up front because a namespace's root
+      # cannot load modules.
+      - name: Kernel test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nftables iptables wireguard-tools
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          sudo modprobe wireguard
+
+      - name: Rust toolchain
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install stable --profile minimal
+          rustc --version
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+      # The service addresses' payload rewrites are refused in a user
+      # namespace, so this one test only does its work as real root.
+      - name: cargo test (as root, the address rewrites)
+        run: |
+          bin=$(cargo test -p wireserve-agent --lib --locked --no-run --message-format=json \
+            | jq -r 'select(.profile.test == true and .executable != null) | .executable')
+          sudo WIRESERVE_TEST_STRICT=1 "$bin" --exact \
+            firewall::nftables::tests::kernel_a_mapped_service_is_reached_through_the_carry_interface_too --nocapture
+
+  clippy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings

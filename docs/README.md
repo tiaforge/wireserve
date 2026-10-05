@@ -30,3 +30,4 @@ exists.
 - [Security](security.md)
 - [Command reference](commands.md)
 - [Building from source](building.md)
+- [Releasing](releasing.md)

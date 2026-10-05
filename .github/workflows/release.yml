@@ -1,0 +1,211 @@
+# Builds the release binaries, runs every e2e suite against exactly those
+# binaries on both architectures, and only then publishes them.
+#
+#   - Started by hand (Actions → Release → Run workflow): a dry run. It
+#     builds and tests whatever commit it is started on, and publishes
+#     nothing.
+#   - A pushed tag v<version>: the real release. The tag comes from
+#     deploy/release.sh on the Forgejo side and reaches GitHub through the
+#     push mirror — this workflow never creates tags itself, because the
+#     mirror's `git push --mirror` would delete any it did.
+#
+# See docs/releasing.md. Actions are pinned to commit hashes (public
+# repository; see ci.yml).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      suites: ${{ steps.suites.outputs.suites }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Version
+        id: version
+        run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/ s/^version = "\(.*\)"$/\1/p' Cargo.toml)
+          [ -n "$version" ] || { echo "::error::no version in Cargo.toml's [workspace.package]"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml's version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Every run-*-test.sh, so a new suite is part of the release without
+      # anyone remembering to add it here.
+      - name: e2e suites
+        id: suites
+        run: |
+          suites=$(for f in deploy/e2e/run-*-test.sh; do basename "$f" .sh; done | jq -Rnc '[inputs]')
+          echo "suites=$suites" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    name: build (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    # Debian bookworm, like deploy/e2e/build.sh: binaries linked against
+    # its glibc run there and on every newer distribution.
+    container: docker.io/library/rust:1-slim-bookworm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # RUSTUP_TOOLCHAIN: see the comment on it in deploy/docker/agent.Dockerfile.
+      - name: cargo build --release
+        run: |
+          RUSTUP_TOOLCHAIN="$(rustup default | cut -d' ' -f1)"
+          export RUSTUP_TOOLCHAIN
+          cargo build --release --locked --workspace --bins
+          mkdir -p out
+          cp target/release/wireserve target/release/wireserve-coordinator target/release/wireserve-admin out/
+          out/wireserve --version
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bin-${{ matrix.arch }}
+          path: out/
+          if-no-files-found: error
+
+  e2e:
+    needs: [prepare, build]
+    name: e2e (${{ matrix.arch }}, ${{ matrix.suite }})
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJSON(needs.prepare.outputs.suites) }}
+        arch: [x86_64, aarch64]
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bin-${{ matrix.arch }}
+          path: target/e2e/bin
+
+      # Artifacts lose the executable bit on the way.
+      - name: Prerequisites
+        run: |
+          chmod +x target/e2e/bin/*
+          command -v podman >/dev/null || { sudo apt-get update && sudo apt-get install -y podman; }
+          sudo modprobe wireguard
+          podman --version
+          uname -r
+
+      - name: ${{ matrix.suite }}
+        run: sudo E2E_PREBUILT=1 ./deploy/e2e/${{ matrix.suite }}.sh
+
+  publish:
+    # Only a tag publishes; a dry run ends after e2e.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [prepare, build, e2e]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: bin-*
+          path: bins
+
+      # Release archives (agent alone; coordinator with admin) and the
+      # per-platform directories coordinator.Dockerfile's `release` stage
+      # copies from.
+      - name: Archives
+        run: |
+          mkdir -p upload
+          for arch in x86_64 aarch64; do
+            chmod +x "bins/bin-$arch"/*
+            case $arch in x86_64) platform=amd64 ;; aarch64) platform=arm64 ;; esac
+            mkdir -p "dist/$platform"
+            cp "bins/bin-$arch/wireserve-coordinator" "bins/bin-$arch/wireserve-admin" "dist/$platform/"
+
+            agent=wireserve-$VERSION-$arch-linux
+            mkdir -p "$agent"
+            cp "bins/bin-$arch/wireserve" LICENSE.md README.md "$agent/"
+            tar -czf "upload/$agent.tar.gz" --owner=0 --group=0 "$agent"
+
+            coord=wireserve-coordinator-$VERSION-$arch-linux
+            mkdir -p "$coord"
+            cp "bins/bin-$arch/wireserve-coordinator" "bins/bin-$arch/wireserve-admin" LICENSE.md README.md "$coord/"
+            tar -czf "upload/$coord.tar.gz" --owner=0 --group=0 "$coord"
+          done
+          (cd upload && sha256sum -- *.tar.gz > SHA256SUMS)
+          cat upload/SHA256SUMS
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A pre-release (a version with a hyphen, like 1.0.0-beta.1) gets its
+      # version tag only; `latest` moves with real releases.
+      - name: Image tags
+        id: image
+        run: |
+          image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/wireserve-coordinator
+          tags=$image:$VERSION
+          case $VERSION in *-*) ;; *) tags="$tags,$image:latest" ;; esac
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/docker/coordinator.Dockerfile
+          build-args: BINARIES=release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.image.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0
+            org.opencontainers.image.title=wireserve-coordinator
+
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          flags=
+          case $VERSION in *-*) flags=--prerelease ;; esac
+          gh release create "$GITHUB_REF_NAME" upload/* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "wireserve $VERSION" --generate-notes $flags

@@ -2126,7 +2126,8 @@ mod tests {
         let forwarding = Forwarding { guarded: vec!["lan0".into()], ..Forwarding::default() };
         let script = nft_script(&[apply_batch_with("wg0", Some("wg0-t"), &[rule], &forwarding)]);
         let out = std::process::Command::new("sh").args(["-euc", &script]).output().unwrap();
-        if String::from_utf8_lossy(&out.stderr).contains("Operation not permitted") {
+        // As real root the rewrites are allowed, so a refusal there is a failure.
+        if !crate::firewall::netns::real_root() && String::from_utf8_lossy(&out.stderr).contains("Operation not permitted") {
             eprintln!("SKIPPED: the address rewrites need real root (run the test binary under sudo)");
             stop(hosts);
             return;
@@ -2272,7 +2273,7 @@ mod tests {
             return;
         }
         if std::process::Command::new("wg").arg("--version").output().is_err() {
-            eprintln!("SKIPPED: no wg binary");
+            crate::firewall::netns::skip("no wg binary");
             return;
         }
         let mut hosts = Vec::new();
