@@ -173,6 +173,7 @@ podman run -d --name "$BIND" --network "$NET" --user 0:0 \
     --entrypoint /usr/sbin/named "$BIND_IMG" -g -c /etc/bind/named.conf >/dev/null
 sleep 2
 BIND_IP=$(ip_on "$BIND" "$NET")
+[ -n "$BIND_IP" ] || fail "BIND did not start: $(podman logs "$BIND" 2>&1 | tail -5)"
 podman run -d --name "$PEBBLE" --network "$NET" --network-alias pebble \
     -e PEBBLE_VA_NOSLEEP=1 -e PEBBLE_WFE_NONCEREJECT=0 \
     "$PEBBLE_IMG" -config test/config/pebble-config.json -dnsserver "$BIND_IP:53" >/dev/null
