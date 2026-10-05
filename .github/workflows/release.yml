@@ -124,11 +124,22 @@ jobs:
       # BIN: the suites that run the binaries directly (coordinator-install,
       # multi-instance) take them from here too. IMAGE: coordinator-install
       # boots systemd in it; its default, Arch, has no arm64 image.
+      # coordinator-install is the one suite made for rootless podman (its
+      # systemd containers are), so it runs without sudo; the rest need root.
       - name: ${{ matrix.suite }}
+        env:
+          SUITE: ${{ matrix.suite }}
         run: |
-          sudo E2E_PREBUILT=1 BIN="$PWD/target/e2e/bin" \
+          as_root=sudo
+          if [ "$SUITE" = run-coordinator-install-test ]; then
+            as_root=
+            if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            fi
+          fi
+          $as_root env E2E_PREBUILT=1 BIN="$PWD/target/e2e/bin" \
             IMAGE=registry.access.redhat.com/ubi10/ubi-init:latest \
-            ./deploy/e2e/${{ matrix.suite }}.sh
+            "./deploy/e2e/$SUITE.sh"
 
   publish:
     # Only a tag publishes; a dry run ends after e2e.

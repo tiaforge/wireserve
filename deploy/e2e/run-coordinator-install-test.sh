@@ -62,6 +62,9 @@ boot() {
         case "$state" in running|degraded) return 0 ;; esac
         sleep 0.5
     done
+    # A container that already exited has no journal to read; its own
+    # output is what says why.
+    $PODMAN logs "$name" 2>&1 | tail -30 >&2 || true
     fail "$name: systemd did not come up (state: $state)"
 }
 in_c() { local c=$1; shift; $PODMAN exec "$c" "$@"; }
