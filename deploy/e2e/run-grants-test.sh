@@ -178,7 +178,7 @@ admin grant add tag:ops infra
 wait_until "a to reach db" 30 reaches "$CLIENT_A" db 5432
 refused "$CLIENT_B" db 5432 || fail "b reached db without the tag"
 # `status` says the same as the firewall (PLAN.md M45).
-access_says() { podman exec "$1" wireserve status | grep -qE "^$2\.wg .* $3\$"; }
+access_says() { podman exec "$1" wireserve status | has -E "^$2\.wg .* $3\$"; }
 wait_until "a's status to say it reaches db" 30 access_says "$CLIENT_A" db yes
 access_says "$CLIENT_B" db no || fail "b's status does not say db is closed to it"
 access_says "$CLIENT_B" web yes || fail "b's status does not say it reaches web"
@@ -204,7 +204,7 @@ in_netns_bg "$HOME_AGENT" socat TCP-LISTEN:8200,fork,reuseaddr SYSTEM:'read x; e
 wait_until "vault to resolve on b" 60 sh -c "podman exec $CLIENT_B getent hosts vault.wg"
 wait_until "a to reach vault" 30 reaches "$CLIENT_A" vault 8200
 refused "$CLIENT_B" vault 8200 || fail "vault landed in default"
-groups_of vault | grep -qx infra || fail "vault is not listed in infra"
+groups_of vault | has -x infra || fail "vault is not listed in infra"
 podman exec "$HOME_AGENT" wireserve vault 8200 --group media
 wait_until "the notice about vault" 30 sh -c "podman exec $HOME_AGENT wireserve status | grep -q 'vault: stays in infra'"
 [ "$(groups_of vault)" = infra ] || fail "a declaration moved vault"

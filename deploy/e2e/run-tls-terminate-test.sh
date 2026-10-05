@@ -239,38 +239,38 @@ pass "issued once; the directory says terminated"
 log "2/10: from the client, verified TLS on the service's own address"
 OUT=$(fetch "$CLIENT" -H 'X-Wireserve-Node: evil' -H 'X-Forwarded-For: 6.6.6.6') || true
 echo "$OUT" | sed 's/^/  /'
-echo "$OUT" | grep -q '^STATUS 200' || fail "the request did not succeed over verified TLS"
-echo "$OUT" | grep -q 'backend:32400' || fail "the backend was not reached"
-echo "$OUT" | grep -qi '^x-wireserve-node: node-client' || fail "the backend was not told the caller"
-echo "$OUT" | grep -qi 'evil' && fail "a forged X-Wireserve-Node reached the backend"
-echo "$OUT" | grep -qi '6.6.6.6' && fail "a forged X-Forwarded-For reached the backend"
-echo "$OUT" | grep -qi '^x-forwarded-proto: https' || fail "no X-Forwarded-Proto"
-echo "$OUT" | grep -qi "^host: plex.$DOMAIN" || fail "the backend did not see its own name as Host"
+echo "$OUT" | has '^STATUS 200' || fail "the request did not succeed over verified TLS"
+echo "$OUT" | has 'backend:32400' || fail "the backend was not reached"
+echo "$OUT" | has -i '^x-wireserve-node: node-client' || fail "the backend was not told the caller"
+echo "$OUT" | has -i 'evil' && fail "a forged X-Wireserve-Node reached the backend"
+echo "$OUT" | has -i '6.6.6.6' && fail "a forged X-Forwarded-For reached the backend"
+echo "$OUT" | has -i '^x-forwarded-proto: https' || fail "no X-Forwarded-Proto"
+echo "$OUT" | has -i "^host: plex.$DOMAIN" || fail "the backend did not see its own name as Host"
 pass "200 over a Pebble certificate; X-Wireserve-Node: node-client; forged headers gone"
 
 log "3/10: from the owner node itself"
 OUT=$(fetch "$HOME_AGENT") || true
-echo "$OUT" | grep -q '^STATUS 200' || { echo "$OUT"; fail "the owner node could not reach its own service by name"; }
-echo "$OUT" | grep -qi '^x-wireserve-node: node-home' || { echo "$OUT"; fail "the owner node was not named as itself"; }
+echo "$OUT" | has '^STATUS 200' || { echo "$OUT"; fail "the owner node could not reach its own service by name"; }
+echo "$OUT" | has -i '^x-wireserve-node: node-home' || { echo "$OUT"; fail "the owner node was not named as itself"; }
 pass "the owner node is named node-home"
 
 log "4/10: 443 stays the stranger's, and the terminator's port is closed"
 # It answers with a bare line, no HTTP: curl takes that only as HTTP/0.9.
-in_netns "$HOME_AGENT" curl -s --http0.9 --max-time 4 http://127.0.0.1:443/ | grep -q stranger \
+in_netns "$HOME_AGENT" curl -s --http0.9 --max-time 4 http://127.0.0.1:443/ | has stranger \
     || fail "the stranger lost 0.0.0.0:443"
 HOME_LAN=$(ip_on "$HOME_AGENT" "$NET")
-if in_netns "$CLIENT" curl -sk --max-time 4 --resolve "plex.$DOMAIN:11443:$HOME_LAN" "https://plex.$DOMAIN:11443/" | grep -q backend; then
+if in_netns "$CLIENT" curl -sk --max-time 4 --resolve "plex.$DOMAIN:11443:$HOME_LAN" "https://plex.$DOMAIN:11443/" | has backend; then
     fail "the terminator's port answers the LAN"
 fi
-if in_netns "$CLIENT" curl -sk --max-time 4 --resolve "plex.$DOMAIN:11443:$PLEX_VIP" "https://plex.$DOMAIN:11443/" | grep -q backend; then
+if in_netns "$CLIENT" curl -sk --max-time 4 --resolve "plex.$DOMAIN:11443:$PLEX_VIP" "https://plex.$DOMAIN:11443/" | has backend; then
     fail "the terminator's port answers the mesh without the rewrite"
 fi
 pass "the stranger keeps 0.0.0.0:443; 11443 answers only through the rewrite"
 
 log "5/10: the other port is still an ordinary mapping"
-in_netns "$CLIENT" curl -s --max-time 6 "http://$PLEX_VIP:81/" | grep -q 'backend:32401' \
+in_netns "$CLIENT" curl -s --max-time 6 "http://$PLEX_VIP:81/" | has 'backend:32401' \
     || fail "port 81 no longer reaches its target"
-if in_netns "$CLIENT" curl -s --max-time 4 "http://$PLEX_VIP:32400/" | grep -q backend; then
+if in_netns "$CLIENT" curl -s --max-time 4 "http://$PLEX_VIP:32400/" | has backend; then
     fail "the 443 target is reachable directly"
 fi
 pass "81 → 32401 mapped; 32400 closed from the mesh"
@@ -284,11 +284,11 @@ SERIAL=$(in_netns "$CLIENT" sh -c "echo | openssl s_client -connect $PLEX_VIP:44
 signal "$HOME_AGENT" TERM 'wireserve tls-daemon'
 sleep 1
 start_terminator
-wait_until "plex served after the restart" 30 eval 'fetch "$CLIENT" | grep -q "^STATUS 200"'
+wait_until "plex served after the restart" 30 eval 'fetch "$CLIENT" | has "^STATUS 200"'
 # Time for a wrong second issuance to show in the log.
 settle
 [ "$(podman exec "$HOME_AGENT" grep -c 'certificate issued' /var/log/tls.log)" = 1 ] || fail "the restart issued a new certificate"
-fetch "$CLIENT" | grep -q '^STATUS 200' || fail "not served after the restart"
+fetch "$CLIENT" | has '^STATUS 200' || fail "not served after the restart"
 AFTER=$(in_netns "$CLIENT" sh -c "echo | openssl s_client -connect $PLEX_VIP:443 -servername plex.$DOMAIN 2>/dev/null | openssl x509 -noout -serial" 2>/dev/null || true)
 [ -z "$SERIAL" ] || [ "$SERIAL" = "$AFTER" ] || fail "a different certificate after the restart ($SERIAL → $AFTER)"
 pass "same certificate, no new issuance"
@@ -304,18 +304,18 @@ wait_until "TLS back on :443" 60 sh -c "podman run --rm --network container:$CLI
 pass "and TLS again once it is back"
 
 log "9/10: local routes go with the daemon, and a crash's are swept"
-in_netns "$HOME_AGENT" ip -4 route show table local proto 247 | grep -q "$PLEX_VIP" \
+in_netns "$HOME_AGENT" ip -4 route show table local proto 247 | has "$PLEX_VIP" \
     || fail "no local route for $PLEX_VIP while terminated"
 signal "$HOME_AGENT" TERM 'wireserve daemon'
-wait_until "the daemon to remove its local route" 10 eval '! in_netns "$HOME_AGENT" ip -4 route show table local proto 247 | grep -q .'
-in_netns "$HOME_AGENT" ip -4 route show table local proto 247 | grep -q . \
+wait_until "the daemon to remove its local route" 10 eval '! in_netns "$HOME_AGENT" ip -4 route show table local proto 247 | has .'
+in_netns "$HOME_AGENT" ip -4 route show table local proto 247 | has . \
     && fail "a stopped daemon left its local route"
 pass "a clean stop removes the local route"
 podman exec -d "$HOME_AGENT" sh -c 'wireserve daemon --poll-interval-secs '"$POLL"' >/var/log/agent.log 2>&1'
 wait_until "the route to come back" 60 sh -c "podman run --rm --network container:$HOME_AGENT --cap-add=NET_ADMIN $DEBUG_IMG ip -4 route show table local proto 247 | grep -q $PLEX_VIP"
 signal "$HOME_AGENT" KILL 'wireserve daemon'
 sleep 1
-in_netns "$HOME_AGENT" ip -4 route show table local proto 247 | grep -q "$PLEX_VIP" \
+in_netns "$HOME_AGENT" ip -4 route show table local proto 247 | has "$PLEX_VIP" \
     || fail "the route should have outlived a kill -9 (nothing left to test otherwise)"
 podman exec -d "$HOME_AGENT" sh -c 'wireserve daemon --poll-interval-secs '"$POLL"' >/var/log/agent2.log 2>&1'
 wait_until "the sweep" 20 podman exec "$HOME_AGENT" grep -q 'left behind' /var/log/agent2.log
@@ -326,7 +326,7 @@ log "10/10: a WebSocket through the terminator"
 wait_until "plex served again after the restarts" 60 sh -c "podman run --rm --network container:$CLIENT -v $WORK:/work:ro,Z $DEBUG_IMG curl -s --max-time 3 --cacert /work/pebble-root.pem --resolve plex.$DOMAIN:443:$PLEX_VIP https://plex.$DOMAIN/ | grep -q backend:32400"
 # The plain backend on 32400 makes way for a WebSocket one.
 for c in $(podman ps -q --filter "name=wireserve-tt-helper"); do
-    podman inspect "$c" --format '{{join .Config.Cmd " "}}' | grep -q 'TCP-LISTEN:32400' && podman rm -fv -t 0 "$c" >/dev/null
+    podman inspect "$c" --format '{{join .Config.Cmd " "}}' | has 'TCP-LISTEN:32400' && podman rm -fv -t 0 "$c" >/dev/null
 done
 in_netns_bg "$HOME_AGENT" python3 /e2e/ws-backend.py 32400
 cp deploy/e2e/ws-client.py "$WORK/ws-client.py"
@@ -340,12 +340,12 @@ ws_ok() { in_netns "$CLIENT" python3 /work/ws-client.py "wss://plex.$DOMAIN/live
 wait_until "the WebSocket backend" 20 ws_ok
 OUT=$(ws_ok) || true
 echo "$OUT" | sed 's/^/  /'
-echo "$OUT" | grep -q '^subprotocol=chat$' || fail "the backend's subprotocol did not reach the client"
-echo "$OUT" | grep -q '^x-wireserve-node=node-client$' || fail "the backend was not told the caller"
-echo "$OUT" | grep -q "^x-forwarded-for=$CLIENT_IP$" || fail "X-Forwarded-For is not the client's mesh address ($CLIENT_IP)"
-echo "$OUT" | grep -q '^x-forwarded-proto=https$' || fail "no X-Forwarded-Proto"
-echo "$OUT" | grep -q "^host=plex.$DOMAIN$" || fail "the backend did not see its own name as Host"
-echo "$OUT" | grep -q '^echo=over the mesh$' || fail "no echo"
+echo "$OUT" | has '^subprotocol=chat$' || fail "the backend's subprotocol did not reach the client"
+echo "$OUT" | has '^x-wireserve-node=node-client$' || fail "the backend was not told the caller"
+echo "$OUT" | has "^x-forwarded-for=$CLIENT_IP$" || fail "X-Forwarded-For is not the client's mesh address ($CLIENT_IP)"
+echo "$OUT" | has '^x-forwarded-proto=https$' || fail "no X-Forwarded-Proto"
+echo "$OUT" | has "^host=plex.$DOMAIN$" || fail "the backend did not see its own name as Host"
+echo "$OUT" | has '^echo=over the mesh$' || fail "no echo"
 pass "upgraded over verified TLS; subprotocol chat; node-client at $CLIENT_IP; echoed"
 
 echo

@@ -300,15 +300,15 @@ admin service list --json | jq -e '.services[] | select(.name == "jellyfin") | .
     || fail "service list does not show jellyfin in media"
 wait_until "home to fall back to the sign-in for jellyfin" 30 signs_in jellyfin
 # The terminator picks it up on its next check-in.
-wait_until "the terminator to ask for a sign-in" 30 eval 'fetch jellyfin | grep -q "^STATUS 302"'
+wait_until "the terminator to ask for a sign-in" 30 eval 'fetch jellyfin | has "^STATUS 302"'
 pass "jellyfin and grafana served by their own node; jellyfin restricted"
 
 log "2/11: no session, sent to the coordinator's sign-in"
 OUT=$(fetch jellyfin) || true
 echo "$OUT" | tail -1
-echo "$OUT" | grep -q "^STATUS 302 $PUBLIC/sign-in?service=jellyfin.$DOMAIN&to=%2F" \
+echo "$OUT" | has "^STATUS 302 $PUBLIC/sign-in?service=jellyfin.$DOMAIN&to=%2F" \
     || { echo "$OUT"; fail "expected a redirect to the coordinator's sign-in"; }
-echo "$OUT" | grep -q 'backend:' && fail "the backend was reached without a session"
+echo "$OUT" | has 'backend:' && fail "the backend was reached without a session"
 pass "redirected to the sign-in; the backend never saw the request"
 
 log "3/11: alice signs in with family and lands back on jellyfin, as herself"
@@ -321,12 +321,12 @@ grep -q '__Host-wireserve-session' "$WORK/jar-alice" || fail "the browser keeps 
 printf 'jellyfin.%s\tFALSE\t/\tTRUE\t0\ttheme\tdark\n' "$DOMAIN" >> "$WORK/jar-alice"
 OUT=$(browser alice -D - -H 'X-Auth-User: mallory' "https://jellyfin.$DOMAIN/") || true
 echo "$OUT" | sed 's/^/  /'
-echo "$OUT" | grep -qi '^x-auth-user: alice' || fail "the backend did not get the identity header"
-echo "$OUT" | grep -qi '^x-auth-groups: family' || fail "the backend did not get the groups header"
-echo "$OUT" | grep -qi '^x-auth-email: alice@example.com' || fail "the backend did not get the e-mail header"
-echo "$OUT" | grep -qi 'mallory' && fail "a forged X-Auth-User reached the backend"
-echo "$OUT" | grep -q 'wireserve-session' && fail "the session cookie reached the backend"
-echo "$OUT" | grep -qi '^cookie: .*theme=dark' || fail "other cookies were lost"
+echo "$OUT" | has -i '^x-auth-user: alice' || fail "the backend did not get the identity header"
+echo "$OUT" | has -i '^x-auth-groups: family' || fail "the backend did not get the groups header"
+echo "$OUT" | has -i '^x-auth-email: alice@example.com' || fail "the backend did not get the e-mail header"
+echo "$OUT" | has -i 'mallory' && fail "a forged X-Auth-User reached the backend"
+echo "$OUT" | has 'wireserve-session' && fail "the session cookie reached the backend"
+echo "$OUT" | has -i '^cookie: .*theme=dark' || fail "other cookies were lost"
 pass "X-Auth-User: alice, groups family; mallory and the session cookie gone; theme kept"
 
 log "4/11: bob, signed in without a granted group, gets no ticket"
@@ -350,56 +350,56 @@ pass "mallory's ticket, opened in another browser: 403, no session — and used 
 log "5/11: the tagged device gets in without signing in"
 OUT=$(fetch_from "$GATE" jellyfin -H 'X-Auth-User: mallory') || true
 echo "$OUT" | tail -1
-echo "$OUT" | grep -q '^STATUS 200' || { echo "$OUT"; fail "the tagged gate was asked to sign in"; }
-echo "$OUT" | grep -q 'backend:8096' || fail "the wrong backend answered"
-echo "$OUT" | grep -qi 'mallory' && fail "a forged X-Auth-User reached the backend from a granted device"
+echo "$OUT" | has '^STATUS 200' || { echo "$OUT"; fail "the tagged gate was asked to sign in"; }
+echo "$OUT" | has 'backend:8096' || fail "the wrong backend answered"
+echo "$OUT" | has -i 'mallory' && fail "a forged X-Auth-User reached the backend from a granted device"
 pass "node-gate (tag tv) reached jellyfin with no session"
 
 log "6/11: a service in default needs no sign-in, and never sees a session cookie"
 ALICE_TOKEN=$(awk '$6 == "__Host-wireserve-session" {print $7}' "$WORK/jar-alice" | tail -1)
 [ -n "$ALICE_TOKEN" ] || fail "no session token in alice's jar"
 OUT=$(fetch grafana -H "Cookie: __Host-wireserve-session=$ALICE_TOKEN; theme=dark" -H 'X-Auth-User: mallory') || true
-echo "$OUT" | grep -q '^STATUS 200' || { echo "$OUT"; fail "grafana asked for a sign-in"; }
-echo "$OUT" | grep -q 'wireserve-session' && { echo "$OUT"; fail "the session cookie reached grafana"; }
-echo "$OUT" | grep -qi 'mallory' && { echo "$OUT"; fail "a forged X-Auth-User reached grafana"; }
+echo "$OUT" | has '^STATUS 200' || { echo "$OUT"; fail "grafana asked for a sign-in"; }
+echo "$OUT" | has 'wireserve-session' && { echo "$OUT"; fail "the session cookie reached grafana"; }
+echo "$OUT" | has -i 'mallory' && { echo "$OUT"; fail "a forged X-Auth-User reached grafana"; }
 pass "grafana served without a sign-in, without the cookie or a forged identity"
 
 log "7/11: jellyfin's other port follows the grants"
 JF_VIP=$(entry jellyfin vip4); GF_VIP=$(entry grafana vip4)
-in_netns "$CLIENT" curl -s --max-time 6 "http://$GF_VIP:3001/" | grep -q 'backend:3001' \
+in_netns "$CLIENT" curl -s --max-time 6 "http://$GF_VIP:3001/" | has 'backend:3001' \
     || fail "grafana's other port is unreachable — the next check would prove nothing"
-if in_netns "$CLIENT" curl -s --max-time 6 "http://$JF_VIP:8920/" | grep -q 'backend:'; then
+if in_netns "$CLIENT" curl -s --max-time 6 "http://$JF_VIP:8920/" | has 'backend:'; then
     fail "the client reached jellyfin's other port, around the sign-in"
 fi
-in_netns "$GATE" curl -s --max-time 6 "http://$JF_VIP:8920/" | grep -q 'backend:8920' \
+in_netns "$GATE" curl -s --max-time 6 "http://$JF_VIP:8920/" | has 'backend:8920' \
     || fail "the granted gate could not reach jellyfin's other port"
 pass "8920: the gate gets in, the client does not"
 
 log "8/11: a request naming another host is misdirected"
 OUT=$(browser alice -D - -H "Host: grafana.$DOMAIN" "https://jellyfin.$DOMAIN/" -w '\nSTATUS %{http_code}\n') || true
 echo "$OUT" | tail -1
-echo "$OUT" | grep -q '^STATUS 421' || { echo "$OUT"; fail "a foreign Host was not refused with 421"; }
-echo "$OUT" | grep -q 'backend:' && { echo "$OUT"; fail "a foreign Host reached a backend"; }
+echo "$OUT" | has '^STATUS 421' || { echo "$OUT"; fail "a foreign Host was not refused with 421"; }
+echo "$OUT" | has 'backend:' && { echo "$OUT"; fail "a foreign Host reached a backend"; }
 pass "Host: grafana on jellyfin's address: 421, no backend"
 
 log "9/11: a session is good at its own service only"
 admin group add media grafana
 wait_until "grafana to fall back to the sign-in" 30 signs_in grafana
-wait_until "grafana's terminator to ask for a sign-in" 30 eval 'fetch grafana | grep -q "^STATUS 302"'
+wait_until "grafana's terminator to ask for a sign-in" 30 eval 'fetch grafana | has "^STATUS 302"'
 OUT=$(fetch grafana -H "Cookie: __Host-wireserve-session=$ALICE_TOKEN") || true
 echo "$OUT" | tail -1
-echo "$OUT" | grep -q "^STATUS 302 $PUBLIC/sign-in?service=grafana.$DOMAIN" \
+echo "$OUT" | has "^STATUS 302 $PUBLIC/sign-in?service=grafana.$DOMAIN" \
     || { echo "$OUT"; fail "jellyfin's session got into grafana"; }
-echo "$OUT" | grep -q 'backend:' && fail "grafana's backend was reached with jellyfin's session"
+echo "$OUT" | has 'backend:' && fail "grafana's backend was reached with jellyfin's session"
 admin group remove media grafana >/dev/null
 pass "alice's jellyfin cookie, sent to grafana, sends her to sign in there"
 
 log "10/11: past the refresh interval the session is renewed; signing out ends it"
 sleep $((REFRESH + 5))
 OUT=$(browser alice -D - "https://jellyfin.$DOMAIN/" -w '\nSTATUS %{http_code}\n') || true
-echo "$OUT" | grep -q '^STATUS 200' || { echo "$OUT"; fail "the session was not renewed"; }
-echo "$OUT" | grep -qi '^set-cookie: __Host-wireserve-session=wst1\.' || { echo "$OUT"; fail "no renewed token came back"; }
-echo "$OUT" | grep -qi '^x-auth-user: alice' || fail "the renewed session is not alice's"
+echo "$OUT" | has '^STATUS 200' || { echo "$OUT"; fail "the session was not renewed"; }
+echo "$OUT" | has -i '^set-cookie: __Host-wireserve-session=wst1\.' || { echo "$OUT"; fail "no renewed token came back"; }
+echo "$OUT" | has -i '^x-auth-user: alice' || fail "the renewed session is not alice's"
 podman logs "$COORD" 2>&1 | grep -E 'session_ended|session refresh failed' && fail "renewing alice's session failed"
 admin owner status | tee "$WORK/status.out"
 grep -q 'sign-in.*on: web services ask' "$WORK/status.out" || fail "owner status does not say the sign-in is on"
@@ -407,15 +407,15 @@ grep -qE '^alice@example.com +family' "$WORK/status.out" || fail "owner status d
 OUT=$(browser alice -D - -X POST -H "Origin: https://jellyfin.$DOMAIN" -H 'Sec-Fetch-Site: same-origin' \
     "https://jellyfin.$DOMAIN/.wireserve/sign-out" -w '\nSTATUS %{http_code} %{redirect_url}\n') || true
 echo "$OUT" | tail -1
-echo "$OUT" | grep -q "^STATUS 303 $PUBLIC/signed-out" || { echo "$OUT"; fail "signing out did not go on to the coordinator"; }
+echo "$OUT" | has "^STATUS 303 $PUBLIC/signed-out" || { echo "$OUT"; fail "signing out did not go on to the coordinator"; }
 OUT=$(browser alice -o /dev/null "https://jellyfin.$DOMAIN/" -w 'STATUS %{http_code} %{redirect_url}') || true
 echo "  $OUT"
 case "$OUT" in "STATUS 302 $PUBLIC/sign-in?"*) ;; *) fail "after signing out, jellyfin still let alice in: $OUT" ;; esac
-admin owner status | grep -q 'alice@example.com' && fail "owner status still lists alice as signed in"
+admin owner status | has 'alice@example.com' && fail "owner status still lists alice as signed in"
 pass "renewed after ${REFRESH}s; signed out, she is asked to sign in again"
 
 log "11/11: out of its group, jellyfin is back in default"
-admin group remove media jellyfin | grep -q 'back in default' || fail "the admin was not told jellyfin is in default again"
+admin group remove media jellyfin | has 'back in default' || fail "the admin was not told jellyfin is in default again"
 wait_until "jellyfin without a sign-in" 60 sh -c "podman run --rm --network container:$CLIENT -v $WORK:/work:ro,Z $DEBUG_IMG curl -s --max-time 5 --cacert /work/pebble-root.pem --resolve jellyfin.$DOMAIN:443:$JF_VIP https://jellyfin.$DOMAIN/ | grep -q backend:8096"
 wait_until "jellyfin's other port back" 30 sh -c "podman run --rm --network container:$CLIENT $DEBUG_IMG curl -s --max-time 3 http://$JF_VIP:8920/ | grep -q backend:8920"
 pass "in default again: no sign-in, and 8920 reachable"

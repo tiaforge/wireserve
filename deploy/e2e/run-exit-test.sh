@@ -111,9 +111,9 @@ admin() { podman exec "$COORD" wireserve-admin "$@"; }
 # through at all gets through in well under a second.
 tcp_line() { podman exec "$1" timeout "${TCP_TIMEOUT:-15}" bash -c "exec 3<>/dev/tcp/$2/$3; head -1 <&3"; }
 # Whether agent $1's status lists the peer $2.
-sees() { podman exec "$1" wireserve status --json | grep -q "\"name\": \"$2\""; }
+sees() { podman exec "$1" wireserve status --json | has "\"name\": \"$2\""; }
 # Whether agent $1 shows any of its own services still pending approval.
-pending() { podman exec "$1" wireserve status --json | grep -q '"pending": true'; }
+pending() { podman exec "$1" wireserve status --json | has '"pending": true'; }
 
 log "checking prerequisites"
 command -v podman >/dev/null || fail "podman not found on PATH"
@@ -347,7 +347,7 @@ if in_netns "$WEB" ping -c3 -W1 "$PHONE_IP4" >/dev/null 2>&1; then
 fi
 EGRESS_FWD=$(in_netns "$GW" cat "/proc/sys/net/ipv4/conf/$GW_INET_IF/forwarding")
 [ "$EGRESS_FWD" = "1" ] || fail "the gateway's egress does not forward ($EGRESS_FWD) — check 3 passed some other way"
-in_netns "$GW" nft list table inet wireserve.wireserve0 | grep -q "iifname \"$GW_INET_IF\" meta nfproto ipv4 ct mark" \
+in_netns "$GW" nft list table inet wireserve.wireserve0 | has "iifname \"$GW_INET_IF\" meta nfproto ipv4 ct mark" \
     || fail "the egress forwards without the guard"
 pass "the egress forwards, guarded: unsolicited traffic stays out"
 
@@ -357,8 +357,8 @@ ANSWER=$(podman exec "$PHONE" dig +short +time=3 +tries=2 "@$DNS_VIP" svc-home.w
 pass "svc-home.wg -> $ANSWER, from the phone, over the dns service's address"
 
 log "8/9: host-firewall interop opened the exit's flows only"
-in_netns "$GW" iptables -S FORWARD | grep -q "0x2000000/0x2000000" \
-    || in_netns "$GW" nft list chain ip filter FORWARD | grep -q "0x02000000" \
+in_netns "$GW" iptables -S FORWARD | has "0x2000000/0x2000000" \
+    || in_netns "$GW" nft list chain ip filter FORWARD | has "0x02000000" \
     || fail "nothing opened FORWARD for the exit, yet check 3 passed — was the policy really DROP?"
 pass "FORWARD DROP opened for exit-marked flows"
 

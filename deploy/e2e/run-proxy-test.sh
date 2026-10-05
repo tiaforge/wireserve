@@ -130,7 +130,7 @@ podman run -d --name "$PROXY" --network "$FRONT" --network "$BACK" \
 sleep 3
 PROXY_IP=$(podman inspect "$PROXY" --format "{{(index .NetworkSettings.Networks \"$FRONT\").IPAddress}}")
 echo "proxy (front segment): $PROXY_IP"
-podman logs "$PROXY" 2>&1 | grep -qi "emerg" && fail "nginx failed to start: $(podman logs "$PROXY" 2>&1 | tail -3)"
+podman logs "$PROXY" 2>&1 | has -i "emerg" && fail "nginx failed to start: $(podman logs "$PROXY" 2>&1 | tail -3)"
 pass "nginx is terminating TLS in front of the coordinator"
 
 start_agent() {
@@ -179,7 +179,7 @@ pass "both nodes registered over TLS with a validated certificate"
 
 log "checking no plaintext warning was printed for an https:// URL"
 OUT=$(podman exec "$AGENT1" wireserve join "$URL" "jtk_bogus" --listen-port 51820 2>&1 || true)
-if echo "$OUT" | grep -qi "over plain HTTP"; then
+if echo "$OUT" | has -i "over plain HTTP"; then
     fail "the plaintext-HTTP warning fired for an https:// URL"
 fi
 pass "no spurious plaintext warning on an https:// URL"
@@ -197,7 +197,7 @@ EP1=$(endpoint_of node1)
 EP2=$(endpoint_of node2)
 [ "$EP1" != "$EP2" ] \
     || fail "both nodes were recorded at the same endpoint ($EP1) — X-Forwarded-For is not being honoured"
-echo "$EP1" | grep -q "$PROXY_IP" \
+echo "$EP1" | has "$PROXY_IP" \
     && fail "node1 was recorded at the proxy's own address — X-Forwarded-For is not being honoured"
 pass "each node was recorded at its own address, resolved from X-Forwarded-For"
 
@@ -227,7 +227,7 @@ pass "one agent burning its budget does not block the other behind the same prox
 log "both agents poll successfully through the proxy"
 podman exec -d "$AGENT1" sh -c "wireserve daemon --poll-interval-secs $POLL >/tmp/daemon.log 2>&1"
 podman exec -d "$AGENT2" sh -c "wireserve daemon --poll-interval-secs $POLL >/tmp/daemon.log 2>&1"
-sees() { podman exec "$1" wireserve status --json | grep -q "\"name\": \"$2\""; }
+sees() { podman exec "$1" wireserve status --json | has "\"name\": \"$2\""; }
 # Each lists node1 once it has polled (agent2 joined again as node3 above).
 wait_for 30 sees "$AGENT1" node1 || fail "agent1 never polled through the proxy"
 wait_for 30 sees "$AGENT2" node1 || fail "agent2 never polled through the proxy"

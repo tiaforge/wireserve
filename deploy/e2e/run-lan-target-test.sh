@@ -137,8 +137,8 @@ podman exec "$OWNER" sh -c "echo 0 > /proc/sys/net/ipv4/conf/$LAN_IF/forwarding"
 pass "the owner forwards nothing to begin with"
 
 create_node() { admin node create "$1" | grep -oE 'jtk_[a-f0-9]+'; }
-sees() { podman exec "$1" wireserve status --json | grep -q "\"name\": \"$2\""; }
-pending() { podman exec "$1" wireserve status --json | grep -q '"pending": true'; }
+sees() { podman exec "$1" wireserve status --json | has "\"name\": \"$2\""; }
+pending() { podman exec "$1" wireserve status --json | has '"pending": true'; }
 
 log "joining both agents"
 JT_OWNER=$(create_node node-owner)
@@ -167,7 +167,7 @@ log "serving the device's port 80 on 443"
 podman exec "$OWNER" wireserve myrouter "443:$DEVICE_IP:80"
 wait_for 20 pending "$OWNER" || fail "node-owner never reported myrouter"
 admin service approve myrouter --node node-owner || fail "could not approve myrouter"
-admin service list | grep '^myrouter ' | grep -q "443:$DEVICE_IP:80/tcp" \
+admin service list | grep '^myrouter ' | has "443:$DEVICE_IP:80/tcp" \
     || fail "the approver does not see the target address"
 pass "the approver sees 443:$DEVICE_IP:80/tcp"
 wait_for 20 eval '! pending "$OWNER"' || fail "node-owner never learnt myrouter was approved"
@@ -202,7 +202,7 @@ log "5/7: forwarding on the lan interface alone, and guarded"
 [ "$(fwd_flag all)" = 0 ] || fail "the GLOBAL forwarding switch changed"
 [ "$(fwd_flag wireserve0)" = 1 ] || fail "wireserve0 forwarding is not on"
 pass "$LAN_IF and wireserve0 forward; the global switch is untouched"
-in_netns "$OWNER" nft list table inet wireserve.wireserve0 | grep -q "iifname \"$LAN_IF\" meta nfproto ipv4 ct mark" \
+in_netns "$OWNER" nft list table inet wireserve.wireserve0 | has "iifname \"$LAN_IF\" meta nfproto ipv4 ct mark" \
     || fail "no guard for $LAN_IF in the agent's table"
 # The device tries to use the owner as a router to the inet segment. One-way
 # UDP, recorded where it lands: a TCP connect would fail even without the
@@ -219,17 +219,17 @@ for _ in 1 2 3; do
     podman exec "$DEVICE" bash -c "echo routed-through-owner > /dev/udp/$COORD_IP/47999" || true
     sleep 1
 done
-if podman logs "$PROBE" 2>/dev/null | grep -q routed-through-owner; then
+if podman logs "$PROBE" 2>/dev/null | has routed-through-owner; then
     fail "the device's packet reached the coordinator through the owner — the lan is being routed"
 fi
 podman rm -fv -t 0 "$PROBE" >/dev/null
 pass "nothing but the service's own flows is forwarded from $LAN_IF"
 
 log "6/7: the rest of the mesh never learns the device's address"
-if podman exec "$CLIENT" wireserve status --json | grep -q "$DEVICE_IP"; then
+if podman exec "$CLIENT" wireserve status --json | has "$DEVICE_IP"; then
     fail "the client's directory carries the device's address"
 fi
-podman exec "$OWNER" wireserve status | grep myrouter | grep -q "443:$DEVICE_IP:80/tcp" \
+podman exec "$OWNER" wireserve status | grep myrouter | has "443:$DEVICE_IP:80/tcp" \
     || fail "the owner's own list does not show its declaration"
 pass "the client sees only the public face; the owner sees its declaration"
 

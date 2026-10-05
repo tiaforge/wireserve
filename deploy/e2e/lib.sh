@@ -37,3 +37,17 @@ if_on() {
     ip=$(podman inspect "$1" --format "{{(index .NetworkSettings.Networks \"$2\").IPAddress}}")
     podman exec "$1" ip -o -4 addr show | awk -v ip="$ip" '{ split($4, a, "/") } a[1] == ip { print $2 }'
 }
+
+# has [GREP-OPTIONS] PATTERN: `grep -q` for the end of a pipeline.
+#
+#   podman exec "$AGENT" nft list ruleset | has 'iifname "eth1"'
+#
+# grep -q exits at its first match; whatever is still writing into the
+# pipe then fails (podman: "write /dev/stdout: broken pipe"), and under
+# pipefail the check fails although it matched — now and then, as the
+# timing falls. This reads all of its input before it looks.
+has() {
+    local input
+    input=$(cat)
+    grep -q "$@" <<<"$input"
+}

@@ -137,12 +137,12 @@ wait_for 30 eval '[ "$(in_dbg "iptables -S INPUT; nft list table inet filter" | 
 log "checking the host firewalls now let wireserve0 through (and only wireserve0)"
 IPT=$(in_dbg "iptables -S INPUT")
 echo "$IPT"
-echo "$IPT" | sed -n 2p | grep -qx -- '-A INPUT -i wireserve0 -m comment --comment "wireserve:wireserve0" -j ACCEPT' \
+echo "$IPT" | sed -n 2p | has -x -- '-A INPUT -i wireserve0 -m comment --comment "wireserve:wireserve0" -j ACCEPT' \
     || fail "iptables INPUT does not start with our wireserve0 accept"
 NFT=$(in_dbg "nft list table inet filter")
 echo "$NFT"
 [ "$(echo "$NFT" | grep -c 'wireserve:wireserve0"')" = 1 ] || fail "native input chain lacks exactly one wireserve0 accept"
-echo "$NFT" | grep 'wireserve:wireserve0"' | grep -q 'iifname "wireserve0" counter' \
+echo "$NFT" | grep 'wireserve:wireserve0"' | has 'iifname "wireserve0" counter' \
     || fail "native accept is not scoped to iifname wireserve0"
 [ "$(native_tags)" = 1 ] \
     || fail "wireserve-tagged nft rules exist somewhere other than the one native input chain"
@@ -153,7 +153,7 @@ log "declaring and approving a service on agent1"
 # rewritten packet still arrives on wireserve0, so it is the same
 # interface-scoped accept in the host firewalls that has to let it in.
 podman exec "$AGENT1" wireserve testsvc 80:12345
-pending() { podman exec "$AGENT1" wireserve status --json | grep -q '"pending": true'; }
+pending() { podman exec "$AGENT1" wireserve status --json | has '"pending": true'; }
 wait_for 20 pending || fail "agent1 never reported testsvc to the coordinator"
 podman exec "$COORD" wireserve-admin service approve testsvc --node node1
 wait_for 20 podman exec "$AGENT2" getent hosts testsvc.wg || true
@@ -192,10 +192,10 @@ log "E3: a native config reload is repaired within seconds"
 in_dbg "nft delete table inet filter"
 in_dbg "$(echo "$HOST_FIREWALL" | sed -n '/^nft -f/,/^EOF$/p')"
 for _ in $(seq 1 30); do
-    in_dbg "nft list table inet filter" | grep -q 'wireserve:wireserve0"' && break
+    in_dbg "nft list table inet filter" | has 'wireserve:wireserve0"' && break
     sleep 0.1
 done
-in_dbg "nft list table inet filter" | grep -q 'wireserve:wireserve0"' || fail "rule not restored within 3s after reload"
+in_dbg "nft list table inet filter" | has 'wireserve:wireserve0"' || fail "rule not restored within 3s after reload"
 can_connect "$VIP" 80 || fail "service unreachable after the reload was repaired"
 pass "native table reload repaired within 3s; service reachable again"
 
@@ -209,7 +209,7 @@ pass "iptables rule restored, no duplicates anywhere"
 log "E4: leave removes everything we added and nothing else"
 podman exec "$AGENT1" wireserve leave
 sleep 2
-if in_dbg "nft list ruleset; iptables -S" | grep -q 'wireserve'; then
+if in_dbg "nft list ruleset; iptables -S" | has 'wireserve'; then
     in_dbg "nft list ruleset; iptables -S"
     fail "wireserve rules or tables left behind after leave"
 fi
@@ -254,13 +254,13 @@ if podman exec "$DBG_LEGACY" sh -c "iptables-legacy -A INPUT -i lo -j ACCEPT && 
     JT4=$(create_node node4)
     podman exec "$LEGACY" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT4" --listen-port 51820
     podman exec -d "$LEGACY" wireserve daemon --poll-interval-secs "$POLL"
-    wait_for 20 eval 'podman exec "$DBG_LEGACY" iptables-legacy -S INPUT | grep -q wireserve:wireserve0\"' || true
+    wait_for 20 eval 'podman exec "$DBG_LEGACY" iptables-legacy -S INPUT | has wireserve:wireserve0\"' || true
     podman exec "$DBG_LEGACY" iptables-legacy -S INPUT | sed -n 2p \
-        | grep -qx -- '-A INPUT -i wireserve0 -m comment --comment "wireserve:wireserve0" -j ACCEPT' \
+        | has -x -- '-A INPUT -i wireserve0 -m comment --comment "wireserve:wireserve0" -j ACCEPT' \
         || fail "legacy iptables INPUT does not start with our wireserve0 accept"
     podman exec "$LEGACY" wireserve leave
     sleep 2
-    if podman exec "$DBG_LEGACY" iptables-legacy -S INPUT | grep -q wireserve; then
+    if podman exec "$DBG_LEGACY" iptables-legacy -S INPUT | has wireserve; then
         fail "legacy iptables rule left behind after leave"
     fi
     pass "legacy iptables opened for wireserve0 and cleaned up on leave"

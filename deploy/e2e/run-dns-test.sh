@@ -27,6 +27,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+. deploy/e2e/lib.sh
 
 NET=wireserve-dns-net
 COORD=wireserve-dns-coord
@@ -194,10 +195,10 @@ expect_record "docs.$DOMAIN" "$DOCS_VIP"
 pass "web, plex and docs each at their own address"
 # prom was approved too, and its name already held a hand-made record.
 for _ in $(seq 1 30); do
-    dns_of prom | grep -q '^error: .*not overwriting' && break
+    dns_of prom | has '^error: .*not overwriting' && break
     sleep 1
 done
-dns_of prom | grep -q '^error: .*not overwriting' \
+dns_of prom | has '^error: .*not overwriting' \
     || fail "prom should be reported as not overwriting the zone's record: $(admin service list)"
 [ "$(lookup prom.$DOMAIN)" = 192.0.2.99 ] || fail "prom's hand-made record was overwritten"
 pass "prom.$DOMAIN left at the operator's 192.0.2.99, and said so"

@@ -188,8 +188,8 @@ podman exec "$ROUTER_A" nft \
 create_node() {
     podman exec "$COORD" wireserve-admin node create "$1" | grep -oE 'jtk_[a-f0-9]+'
 }
-sees() { podman exec "$1" wireserve status --json | grep -q "\"name\": \"$2\""; }
-pending() { podman exec "$1" wireserve status --json | grep -q '"pending": true'; }
+sees() { podman exec "$1" wireserve status --json | has "\"name\": \"$2\""; }
+pending() { podman exec "$1" wireserve status --json | has '"pending": true'; }
 # The carrier agent $1 was told to reach peer $2 through; empty for none.
 relay_via() {
     podman exec "$1" wireserve status --json \
@@ -274,7 +274,7 @@ wait_for 30 eval '[ -n "$(relay_via "$AGENT2" node4)" ]' || true
 log "confirming the coordinator names agent1 as the relay for this pair"
 NODE2_RELAY_VIA=$(relay_via "$AGENT4" node2)
 [ -n "$NODE2_RELAY_VIA" ] || fail "agent4's poll response never named a relay for node2"
-podman exec "$AGENT4" wireserve status | grep -q "relayed by node1" || fail "wireserve status does not say node2 is relayed by node1"
+podman exec "$AGENT4" wireserve status | has "relayed by node1" || fail "wireserve status does not say node2 is relayed by node1"
 pass "agent4 was told to reach node2 through a relay, and says so"
 
 log "counting what agent1 forwards, by protocol"
@@ -318,9 +318,9 @@ AGENT4_PUBKEY=$(podman exec "$AGENT4" wireserve status --json \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(next((p.get('pubkey') for p in d['peers'] if p.get('name')=='node4'), ''))")
 AGENT2_PUBKEY=$(podman exec "$AGENT2" wireserve status --json \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(next((p.get('pubkey') for p in d['peers'] if p.get('name')=='node2'), ''))")
-in_netns "$AGENT2" wg show wireserve0 allowed-ips | grep "$AGENT4_PUBKEY" | grep -q "(none)" \
+in_netns "$AGENT2" wg show wireserve0 allowed-ips | grep "$AGENT4_PUBKEY" | has "(none)" \
     || fail "agent2's mesh-interface entry for agent4 still routes something — it should only probe"
-in_netns "$AGENT2" wg show wireserve0-t allowed-ips | grep "$AGENT4_PUBKEY" | grep -qF "$SVC4" \
+in_netns "$AGENT2" wg show wireserve0-t allowed-ips | grep "$AGENT4_PUBKEY" | has -F "$SVC4" \
     || fail "agent2's carry interface does not route agent4's service address"
 pass "agent4 is reached over agent2's carry interface; its mesh-interface entry only probes"
 [ -n "$AGENT2_PUBKEY" ] || fail "no pubkey for node2"

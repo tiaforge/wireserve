@@ -241,7 +241,7 @@ dialable_known() {
     [ "$(podman exec "$COORD" wireserve-admin node list --json \
         | jq '[.dialable.node1, .dialable.node2, .dialable.node3] | map(select(. != null)) | length')" = 3 ]
 }
-pending() { podman exec "$1" wireserve status --json | grep -q '"pending": true'; }
+pending() { podman exec "$1" wireserve status --json | has '"pending": true'; }
 
 log "waiting for the nodes to see each other and their probes to finish"
 wait_for 30 eval '[ -n "$(mesh_ip_of "$AGENT2" node1)" ]' || true
@@ -400,12 +400,12 @@ log "confirming the LAN path was actually used, not a hairpin-capable router"
 # connectivity happened to work because this particular router hairpins.
 AGENT2_ENDPOINTS=$(in_netns "$AGENT2" wg show wireserve0 endpoints)
 AGENT3_ENDPOINTS=$(in_netns "$AGENT3" wg show wireserve0 endpoints)
-if echo "$AGENT2_ENDPOINTS" | grep -q "$AGENT3_LAN:$WG_PORT"; then
+if echo "$AGENT2_ENDPOINTS" | has "$AGENT3_LAN:$WG_PORT"; then
     pass "agent2 reaches agent3 at its LAN address ($AGENT3_LAN:$WG_PORT), not the router's WAN address"
 else
     fail "agent2's configured endpoint for agent3 is not its LAN address — got: $AGENT2_ENDPOINTS"
 fi
-if echo "$AGENT3_ENDPOINTS" | grep -q "$AGENT2_LAN:$WG_PORT"; then
+if echo "$AGENT3_ENDPOINTS" | has "$AGENT2_LAN:$WG_PORT"; then
     pass "agent3 reaches agent2 at its LAN address ($AGENT2_LAN:$WG_PORT), not the router's WAN address"
 else
     fail "agent3's configured endpoint for agent2 is not its LAN address — got: $AGENT3_ENDPOINTS"
@@ -438,7 +438,7 @@ pass "node2's reflexive address ($NODE2_REFLEXIVE) carries a real NAT-mapped por
 
 log "confirming agent1 actually dials node2 at its reflexive address, not the naive endpoint= guess"
 AGENT1_ENDPOINTS=$(in_netns "$AGENT1" wg show wireserve0 endpoints)
-if echo "$AGENT1_ENDPOINTS" | grep -q "$NODE2_REFLEXIVE"; then
+if echo "$AGENT1_ENDPOINTS" | has "$NODE2_REFLEXIVE"; then
     pass "agent1 reaches node2 at its reflexive address ($NODE2_REFLEXIVE)"
 else
     fail "agent1's configured endpoint for node2 is not its reflexive address — got: $AGENT1_ENDPOINTS"

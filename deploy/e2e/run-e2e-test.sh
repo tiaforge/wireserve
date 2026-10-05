@@ -98,7 +98,7 @@ start_agent "$AGENT1" "$JT1"
 start_agent "$AGENT2" "$JT2"
 
 log "waiting for both agents to see each other"
-sees() { podman exec "$1" wireserve status --json | grep -q "\"name\": \"$2\""; }
+sees() { podman exec "$1" wireserve status --json | has "\"name\": \"$2\""; }
 wait_for 30 sees "$AGENT1" node2 || fail "agent1 never got node2 into its peers"
 wait_for 30 sees "$AGENT2" node1 || fail "agent2 never got node1 into its peers"
 
@@ -144,7 +144,7 @@ AGENT2_MESH_IP=$(mesh_ip_of "$AGENT2" node2)
 echo "agent2 mesh address: $AGENT2_MESH_IP"
 podman exec "$DEBUG_CONTAINER" ip route get "$AGENT2_MESH_IP" \
     || fail "no route to agent2's mesh address from agent1 — peer routes were never installed"
-podman exec "$DEBUG_CONTAINER" ip route get "$AGENT2_MESH_IP" | grep -q "dev wireserve0" \
+podman exec "$DEBUG_CONTAINER" ip route get "$AGENT2_MESH_IP" | has "dev wireserve0" \
     || fail "route to agent2's mesh address does not go via wireserve0"
 pass "agent1 has a kernel route to agent2 via wireserve0"
 
@@ -163,7 +163,7 @@ podman exec "$AGENT1" wireserve web2 80:12347
 podman exec "$AGENT1" wireserve udpsvc 53:5353/udp
 # Once agent1 shows them pending the coordinator has them; then give
 # agent2 a few polls in which they could (wrongly) arrive.
-pending() { podman exec "$AGENT1" wireserve status --json | grep -q '"pending": true'; }
+pending() { podman exec "$AGENT1" wireserve status --json | has '"pending": true'; }
 wait_for 20 pending || true
 settle
 # Service approval is on by default: a declaration is stored but withheld
@@ -177,7 +177,7 @@ if podman exec "$AGENT2" grep -q "testsvc.wg" /etc/hosts; then
 fi
 pass "an unapproved service is withheld from the mesh directory"
 
-podman exec "$AGENT1" wireserve status --json | grep -q '"pending": true' \
+podman exec "$AGENT1" wireserve status --json | has '"pending": true' \
     || fail "the declaring node does not show its own service as pending"
 pass "the declaring node reports its service as pending approval"
 
@@ -265,7 +265,7 @@ expect "$AGENT1" udp "$UVIP" 53 "udpsvc peer=$AGENT1_MESH_IP"
 pass "the owning node reaches its own services through their addresses"
 
 log "checking wireserve status reflects real data on agent1 (regression: F1)"
-podman exec "$AGENT1" wireserve status --json | grep -q '"local": true' \
+podman exec "$AGENT1" wireserve status --json | has '"local": true' \
     || fail "wireserve status did not show the locally-declared service — the shared-state bug (F1) may have regressed"
 pass "wireserve status shows real, current data"
 podman exec "$AGENT2" wireserve status | grep -E "^testsvc\.wg +$VIP +80:12345/tcp +node1 +online +yes$" >/dev/null \
@@ -306,7 +306,7 @@ foreign_intact() {
     pub=$(podman run --rm --network "container:$GUARD" --cap-add=NET_ADMIN "$DEBUG_IMG" wg show wireserve0 public-key)
     [ "$pub" = "$FOREIGN_PUB" ] || fail "the pre-existing interface's private key was overwritten ($pub != $FOREIGN_PUB)"
     podman run --rm --network "container:$GUARD" --cap-add=NET_ADMIN "$DEBUG_IMG" ip addr show wireserve0 \
-        | grep -q "192.0.2.77" || fail "the pre-existing interface's address was flushed"
+        | has "192.0.2.77" || fail "the pre-existing interface's address was flushed"
 }
 
 # Told to use exactly that name, it refuses.

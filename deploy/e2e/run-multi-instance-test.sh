@@ -32,6 +32,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."   # repo root
+. deploy/e2e/lib.sh
 BIN=${BIN:-$PWD/target/debug}
 
 if [ -z "${WIRESERVE_IN_TEST_NETNS:-}" ]; then
@@ -179,11 +180,11 @@ sleep $((POLL * 3))
 [ "$(list host default | field ifname)" = wireserve1 ] || fail "default instance is not on wireserve1"
 [ "$(list host work | field ifname)" = wireserve2 ] || fail "work instance is not on wireserve2"
 pass "the instances picked wireserve1 and wireserve2, around the foreign wireserve0"
-[ "$(wg show wireserve0 public-key)" = "$FOREIGN_PUB" ] && ip addr show wireserve0 | grep -q 192.0.2.77 \
+[ "$(wg show wireserve0 public-key)" = "$FOREIGN_PUB" ] && ip addr show wireserve0 | has 192.0.2.77 \
     || fail "the foreign wireserve0 was modified"
 pass "the foreign wireserve0 kept its key and address"
 
-nft list tables | grep -qx 'table inet wireserve.wireserve1' && nft list tables | grep -qx 'table inet wireserve.wireserve2' \
+nft list tables | has -x 'table inet wireserve.wireserve1' && nft list tables | has -x 'table inet wireserve.wireserve2' \
     || fail "missing per-interface tables: $(nft list tables)"
 pass "each instance has its own nftables table"
 
@@ -281,7 +282,7 @@ outsider=(as_user --clear-groups env WIRESERVE_RUN_ROOT="$WORK/host/run" "$WORK/
 "${member[@]}" gtest 7099 >/dev/null || fail "a member of $GRP could not change what the node serves"
 "${member[@]}" gtest off >/dev/null || fail "a member of $GRP could not withdraw it"
 out=$("${outsider[@]}" status 2>&1) && fail "a non-member could use the daemon"
-echo "$out" | grep -q "not permitted" || fail "a non-member got the wrong message: $out"
+echo "$out" | has "not permitted" || fail "a non-member got the wrong message: $out"
 pass "members of $GRP (by supplementary group) can use the daemon; everyone else is told why not"
 sleep $((POLL * 2))
 reach "$BETA" 7002 || fail "mesh B unreachable after the restart with the group"
@@ -293,7 +294,7 @@ wait "$HOST_DEFAULT" 2>/dev/null || true
 ip link show wireserve1 >/dev/null 2>&1 && fail "wireserve1 still exists after stop"
 [ "$(tags wireserve1)" = 0 ] || fail "stopped instance left its accepts"
 [ "$(tags wireserve2)" = 2 ] || fail "the other instance's accepts went too"
-nft list tables | grep -q 'wireserve.wireserve1' && fail "stopped instance left its table"
+nft list tables | has 'wireserve.wireserve1' && fail "stopped instance left its table"
 grep -qx '# BEGIN WIRESERVE' "$WORK/host/hosts" && fail "stopped instance left its hosts block"
 grep -qx '# BEGIN WIRESERVE work' "$WORK/host/hosts" || fail "the other instance's hosts block went too"
 reach "$BETA" 7002 || fail "mesh B stopped working when the other instance stopped"
@@ -316,7 +317,7 @@ ip link show wireserve2 >/dev/null 2>&1 && fail "wireserve2 still exists after l
 pass "leave removed only its own instance"
 [ "$(wg show wireserve0 public-key)" = "$FOREIGN_PUB" ] || fail "the foreign wireserve0 was modified"
 pass "the foreign wireserve0 survived all of it"
-if ip route show table all | grep -q blackhole || in_peer ip route show table all | grep -q blackhole; then
+if ip route show table all | has blackhole || in_peer ip route show table all | has blackhole; then
     fail "a blackhole route appeared"
 fi
 pass "no endpoint or blackhole routes anywhere"

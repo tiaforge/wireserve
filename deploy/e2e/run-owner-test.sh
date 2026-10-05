@@ -173,7 +173,7 @@ TOKEN=$(sed -n 's/.*name="token" value="\([0-9a-f]*\)".*/\1/p' "$WORK/confirm.ht
 pass "signed in as alice; asked to confirm node-laptop"
 
 log "2/5: confirmed, the laptop reaches what family is granted"
-browser --data-urlencode "token=$TOKEN" "$PUBLIC/claim/confirm" | grep -q 'is yours now' || fail "the confirmation failed"
+browser --data-urlencode "token=$TOKEN" "$PUBLIC/claim/confirm" | has 'is yours now' || fail "the confirmation failed"
 admin node access node-laptop | tee "$WORK/laptop.out"
 grep -q 'belongs to alice@example.com' "$WORK/laptop.out" || fail "the laptop has no owner"
 grep -q 'oidc:family' "$WORK/laptop.out" || fail "the laptop does not act as oidc:family"
@@ -182,14 +182,14 @@ refused "$TV" || fail "the unclaimed tv reached db"
 pass "node-laptop belongs to alice and reaches db; node-tv does not"
 
 log "3/5: the link works once"
-browser "$URL" | grep -q 'not valid' || fail "a used link started another sign-in"
+browser "$URL" | has 'not valid' || fail "a used link started another sign-in"
 pass "a used link is refused"
 
 log "4/5: the owner's groups are refreshed"
-refreshed() { podman logs "$COORD" 2>&1 | grep -q 'owner_refreshed'; }
+refreshed() { podman logs "$COORD" 2>&1 | has 'owner_refreshed'; }
 wait_until "a refresh of alice's groups" 150 refreshed
 podman logs "$COORD" 2>&1 | grep -E 'owner refresh failed|owner_dropped' && fail "refreshing alice's groups failed"
-admin node access node-laptop | grep -q 'belongs to alice@example.com' || fail "alice lost the laptop on refresh"
+admin node access node-laptop | has 'belongs to alice@example.com' || fail "alice lost the laptop on refresh"
 reaches "$LAPTOP" || fail "the laptop lost db on refresh"
 pass "refreshed without losing anything"
 admin owner status | tee "$WORK/status.out"

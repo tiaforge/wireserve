@@ -165,8 +165,8 @@ sleep 1
 in_netns "$HOME_AGENT" ip route replace default via "$ROUTER_H_LAN" >/dev/null
 
 create_node() { admin node create "$1" | grep -oE 'jtk_[a-f0-9]+'; }
-sees() { podman exec "$1" wireserve status --json | grep -q "\"name\": \"$2\""; }
-pending() { podman exec "$1" wireserve status --json | grep -q '"pending": true'; }
+sees() { podman exec "$1" wireserve status --json | has "\"name\": \"$2\""; }
+pending() { podman exec "$1" wireserve status --json | has '"pending": true'; }
 dialable_known() {
     [ "$(admin node list --json | jq '[.dialable["node-carrier"], .dialable["node-home"]] | map(select(. != null)) | length')" = 2 ]
 }
@@ -222,7 +222,7 @@ table ip cloudfw {
     }
 }
 NFT
-in_netns "$CARRIER" nft list table ip cloudfw | grep -q "udp dport $RELAY_PORT drop" \
+in_netns "$CARRIER" nft list table ip cloudfw | has "udp dport $RELAY_PORT drop" \
     || fail "the simulated cloud firewall is not in place — this check would prove nothing"
 if admin device create phone --register-url "http://127.0.0.1:47820" >"$OUT/closed.conf" 2>"$OUT/closed.log"; then
     cat "$OUT/closed.log"
