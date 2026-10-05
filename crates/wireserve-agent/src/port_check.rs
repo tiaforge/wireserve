@@ -59,7 +59,10 @@ impl PortChecker {
             let until = tokio::time::Instant::now() + LISTEN_FOR;
             let already = inner.active.insert(check.port, Listening { check: check.clone(), nonce, until }).is_some();
             drop(inner);
-            if !already {
+            if already {
+                tracing::info!(port = check.port, "a newer relay port check takes over the port's listener");
+            } else {
+                tracing::info!(port = check.port, "listening for a relay port check");
                 tokio::spawn(listen(Arc::clone(self), check.port));
             }
         }
@@ -111,6 +114,7 @@ async fn listen(me: Arc<PortChecker>, port: u16) {
                 Some(l) if l.until > tokio::time::Instant::now() => l.until,
                 _ => {
                     inner.active.remove(&port);
+                    tracing::info!(port, "relay port check: nothing arrived in time; it reads as closed");
                     return;
                 }
             }
@@ -119,11 +123,16 @@ async fn listen(me: Arc<PortChecker>, port: u16) {
         let Ok(received) = tokio::time::timeout_at(until, socket.recv_from(&mut buf)).await else {
             continue;
         };
-        let Ok((n, _)) = received else {
-            me.inner.lock().unwrap_or_else(|e| e.into_inner()).active.remove(&port);
-            return;
+        let (n, from) = match received {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(port, error = %e, "relay port check: receiving failed; it reads as closed");
+                me.inner.lock().unwrap_or_else(|e| e.into_inner()).active.remove(&port);
+                return;
+            }
         };
         let Some((got, _)) = wireserve_types::reflexive::parse_response(&buf[..n]) else {
+            tracing::info!(port, %from, "relay port check: ignored a datagram that isn't a check");
             continue;
         };
         let mut inner = me.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -131,9 +140,12 @@ async fn listen(me: Arc<PortChecker>, port: u16) {
             let heard = inner.active.remove(&port).expect("checked just above").check;
             inner.seen.push(heard);
             drop(inner);
+            tracing::info!(port, %from, "relay port check received");
             me.wake.notify_one();
             return;
         }
+        drop(inner);
+        tracing::info!(port, %from, "relay port check: a datagram with another check's nonce");
     }
 }
 

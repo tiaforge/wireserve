@@ -258,7 +258,15 @@ log "3/9: exporting the phone's config"
 # Tried again while the carrier may still be opening its relay port: a
 # refused export creates nothing (step 2).
 wait_for 20 eval 'admin device create phone --register-url "http://127.0.0.1:47820" > "$OUT/phone.conf" 2>"$OUT/export.log"' \
-    || { cat "$OUT/export.log"; fail "device create failed with the port open"; }
+    || {
+        cat "$OUT/export.log"
+        carrier_diag
+        note "the carrier's port checks:"
+        podman exec "$CARRIER" grep -i 'port check' /tmp/daemon.log || true
+        note "the carrier's ruleset:"
+        in_netns "$CARRIER" nft list ruleset || true
+        fail "device create failed with the port open"
+    }
 note "exported config:"
 sed 's/^PrivateKey = .*/PrivateKey = <redacted>/; s/^/  /' "$OUT/phone.conf"
 grep -qx "MTU = 1340" "$OUT/phone.conf" || fail "no carry MTU, though a node is relayed"
