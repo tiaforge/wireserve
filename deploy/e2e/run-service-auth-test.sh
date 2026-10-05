@@ -262,7 +262,7 @@ COORD_IP=$(ip_on "$COORD" "$NET")
 
 for c in "$GATE" "$HOME_AGENT" "$CLIENT"; do
     podman run -d --name "$c" --network "$NET" \
-        --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
+        --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --security-opt apparmor=unconfined --device /dev/net/tun \
         --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
 done
 # Pebble issues from a root made at start: the browser trusts it, as a

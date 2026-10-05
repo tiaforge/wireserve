@@ -45,6 +45,10 @@
 # own namespace's. In a rootful container the unmask very likely makes the
 # host's non-namespaced keys (kernel.*, vm.*) writable to its root as well —
 # fine for a throwaway harness running our own code, not a deployment setting.
+# They also get `--security-opt apparmor=unconfined`: where AppArmor is on
+# (Ubuntu, so the GitHub runners), podman's default profile denies every
+# write under /proc/sys whatever the mount, and the agent's writes fail
+# with EACCES. Where it is off the option does nothing.
 #
 # Usage: sudo ./deploy/e2e/run-exit-test.sh
 # Exit code 0 = every check passed.
@@ -155,7 +159,7 @@ log "starting the gateway (inet + its own LAN) and a node behind it"
 # Global IPv4 forwarding off, as on a VPS: the agent has to own and guard the
 # egress switch itself, which is what makes check 6 mean something.
 podman run -d --name "$GW" --network "$INET" --network "$GW_LAN" \
-    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun --sysctl net.ipv4.ip_forward=0 \
+    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --security-opt apparmor=unconfined --device /dev/net/tun --sysctl net.ipv4.ip_forward=0 \
     --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
 sleep 1
 GW_IP=$(ip_on "$GW" "$INET")
@@ -171,7 +175,7 @@ in_netns "$GW" iptables -P FORWARD DROP
 echo "gw: $GW_IP (egress $GW_INET_IF), lan $GW_LAN_IP"
 
 podman run -d --name "$HOME_AGENT" --network "$INET" \
-    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
+    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --security-opt apparmor=unconfined --device /dev/net/tun \
     --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
 sleep 1
 
@@ -266,7 +270,7 @@ pass "same key; everything on the gateway and a resolver in the second profile o
 
 log "bringing the phone up on the full-tunnel profile"
 podman run -d --name "$PHONE" --network "$SITE_P" \
-    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
+    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --security-opt apparmor=unconfined --device /dev/net/tun \
     --sysctl net.ipv4.conf.all.src_valid_mark=1 --sysctl net.ipv6.conf.all.disable_ipv6=0 \
     "$DEBUG_IMG" sleep infinity >/dev/null
 sleep 1
@@ -379,7 +383,7 @@ podman cp "$COORD:/tmp/tablet.conf" "$OUT/tablet.conf"
 grep -qx "DNS = $DNS_VIP" "$OUT/tablet.conf" || fail "the mesh profile does not name the resolver"
 grep -q "0.0.0.0/0" "$OUT/tablet.conf" && fail "--mesh-dns must not widen the mesh profile"
 podman run -d --name "$TABLET" --network "$SITE_P" \
-    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
+    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --security-opt apparmor=unconfined --device /dev/net/tun \
     "$DEBUG_IMG" sleep infinity >/dev/null
 sleep 1
 podman exec "$TABLET" ip route replace default via "$ROUTER_P_LAN"

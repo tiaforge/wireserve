@@ -195,7 +195,7 @@ COORD_IP=$(ip_on "$COORD" "$NET")
 
 for c in "$HOME_AGENT" "$CLIENT"; do
     podman run -d --name "$c" --network "$NET" \
-        --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
+        --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --security-opt apparmor=unconfined --device /dev/net/tun \
         --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
 done
 podman cp "$WORK/pebble-minica.pem" "$HOME_AGENT:/etc/pebble-minica.pem"

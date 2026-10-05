@@ -129,7 +129,7 @@ podman exec "$AGENT1" wireserve join "http://$COORD_IP:47820" --allow-plaintext-
 podman exec "$AGENT2" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT2" --listen-port 51820
 podman exec -d "$AGENT1" wireserve daemon --poll-interval-secs "$POLL"
 podman exec -d "$AGENT2" wireserve daemon --poll-interval-secs "$POLL"
-wait_for 30 eval '[ "$(in_dbg "iptables -S INPUT; nft list table inet filter" | grep -c wireserve:wireserve0)" -ge 2 ]' || true
+wait_for 30 eval '[ "$(in_dbg "iptables -S INPUT; nft list table inet filter" | grep -c wireserve:wireserve0\")" -ge 2 ]' || true
 
 log "checking the host firewalls now let wireserve0 through (and only wireserve0)"
 IPT=$(in_dbg "iptables -S INPUT")
@@ -138,8 +138,8 @@ echo "$IPT" | sed -n 2p | grep -qx -- '-A INPUT -i wireserve0 -m comment --comme
     || fail "iptables INPUT does not start with our wireserve0 accept"
 NFT=$(in_dbg "nft list table inet filter")
 echo "$NFT"
-[ "$(echo "$NFT" | grep -c 'wireserve:wireserve0')" = 1 ] || fail "native input chain lacks exactly one wireserve0 accept"
-echo "$NFT" | grep 'wireserve:wireserve0' | grep -q 'iifname "wireserve0" counter' \
+[ "$(echo "$NFT" | grep -c 'wireserve:wireserve0"')" = 1 ] || fail "native input chain lacks exactly one wireserve0 accept"
+echo "$NFT" | grep 'wireserve:wireserve0"' | grep -q 'iifname "wireserve0" counter' \
     || fail "native accept is not scoped to iifname wireserve0"
 [ "$(native_tags)" = 1 ] \
     || fail "wireserve-tagged nft rules exist somewhere other than the one native input chain"
@@ -189,16 +189,16 @@ log "E3: a native config reload is repaired within seconds"
 in_dbg "nft delete table inet filter"
 in_dbg "$(echo "$HOST_FIREWALL" | sed -n '/^nft -f/,/^EOF$/p')"
 for _ in $(seq 1 30); do
-    in_dbg "nft list table inet filter" | grep -q 'wireserve:wireserve0' && break
+    in_dbg "nft list table inet filter" | grep -q 'wireserve:wireserve0"' && break
     sleep 0.1
 done
-in_dbg "nft list table inet filter" | grep -q 'wireserve:wireserve0' || fail "rule not restored within 3s after reload"
+in_dbg "nft list table inet filter" | grep -q 'wireserve:wireserve0"' || fail "rule not restored within 3s after reload"
 can_connect "$VIP" 80 || fail "service unreachable after the reload was repaired"
 pass "native table reload repaired within 3s; service reachable again"
 
 log "E3: an iptables rule removed by hand comes back within one poll"
 in_dbg "iptables -D INPUT -i wireserve0 -m comment --comment wireserve:wireserve0 -j ACCEPT"
-wait_for 10 eval '[ "$(in_dbg "iptables -S INPUT" | grep -c wireserve:wireserve0)" = 1 ]' \
+wait_for 10 eval '[ "$(in_dbg "iptables -S INPUT" | grep -c wireserve:wireserve0\")" = 1 ]' \
     || fail "iptables rule not restored"
 [ "$(native_tags)" = 1 ] || fail "native rule duplicated during repair"
 pass "iptables rule restored, no duplicates anywhere"
@@ -251,7 +251,7 @@ if podman exec "$DBG_LEGACY" sh -c "iptables-legacy -A INPUT -i lo -j ACCEPT && 
     JT4=$(create_node node4)
     podman exec "$LEGACY" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT4" --listen-port 51820
     podman exec -d "$LEGACY" wireserve daemon --poll-interval-secs "$POLL"
-    wait_for 20 eval 'podman exec "$DBG_LEGACY" iptables-legacy -S INPUT | grep -q wireserve:wireserve0' || true
+    wait_for 20 eval 'podman exec "$DBG_LEGACY" iptables-legacy -S INPUT | grep -q wireserve:wireserve0\"' || true
     podman exec "$DBG_LEGACY" iptables-legacy -S INPUT | sed -n 2p \
         | grep -qx -- '-A INPUT -i wireserve0 -m comment --comment "wireserve:wireserve0" -j ACCEPT' \
         || fail "legacy iptables INPUT does not start with our wireserve0 accept"

@@ -147,7 +147,7 @@ ROUTER_P_LAN=$(ip_on "$ROUTER_P" "$SITE_P")
 
 log "starting the carrier directly on the inet segment"
 podman run -d --name "$CARRIER" --network "$INET" \
-    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun --sysctl net.ipv4.ip_forward=0 \
+    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --security-opt apparmor=unconfined --device /dev/net/tun --sysctl net.ipv4.ip_forward=0 \
     --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
 sleep 1
 CARRIER_IP=$(ip_on "$CARRIER" "$INET")
@@ -159,7 +159,7 @@ echo "carrier: $CARRIER_IP ($CARRIER_IF)"
 
 log "starting the homeserver agent behind NAT"
 podman run -d --name "$HOME_AGENT" --network "$SITE_H" \
-    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
+    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --security-opt apparmor=unconfined --device /dev/net/tun \
     --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
 sleep 1
 in_netns "$HOME_AGENT" ip route replace default via "$ROUTER_H_LAN" >/dev/null
@@ -254,7 +254,7 @@ wait_for 20 sees "$HOME_AGENT" phone || fail "homeserver never got the phone int
 
 log "bringing the phone up as a plain WireGuard client, no agent"
 podman run -d --name "$PHONE" --network "$SITE_P" \
-    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
+    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --security-opt apparmor=unconfined --device /dev/net/tun \
     "$DEBUG_IMG" sleep infinity >/dev/null
 sleep 1
 podman exec "$PHONE" ip route replace default via "$ROUTER_P_LAN"

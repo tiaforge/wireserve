@@ -164,7 +164,7 @@ pass "router-b and router-c both do genuine per-destination NAT"
 start_agent() {
     local name=$1 site=$2 gateway=$3
     podman run -d --name "$name" --network "$site" \
-        --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
+        --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --security-opt apparmor=unconfined --device /dev/net/tun \
         --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
     sleep 1
     in_netns "$name" ip route replace default via "$gateway" >/dev/null

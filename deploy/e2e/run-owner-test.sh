@@ -135,7 +135,7 @@ log "joining home, laptop and tv"
 for pair in "$HOME_AGENT:node-home" "$LAPTOP:node-laptop" "$TV:node-tv"; do
     c=${pair%%:*}; n=${pair#*:}
     podman run -d --name "$c" --network "$NET" \
-        --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
+        --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --security-opt apparmor=unconfined --device /dev/net/tun \
         --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
     jt=$(admin node create "$n" 2>/dev/null | grep -oE 'jtk_[a-f0-9]+')
     podman exec "$c" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$jt" \

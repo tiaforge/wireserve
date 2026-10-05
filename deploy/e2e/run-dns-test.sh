@@ -32,7 +32,10 @@ NET=wireserve-dns-net
 COORD=wireserve-dns-coord
 BIND=wireserve-dns-bind
 DEBUG_IMG=wireserve-e2e-debug-tools
-BIND_IMG=docker.io/internetsystemsconsortium/bind9:9.20
+# Canonical's image rather than ISC's: ISC publishes amd64 only, and the
+# release workflow runs this suite on arm64 too. It has no shell, which
+# is fine — nothing here runs inside it.
+BIND_IMG=docker.io/ubuntu/bind9:9.20-26.04_stable
 ADMIN_TOKEN=dns-test-admin-token
 DOMAIN=int.test
 
@@ -140,7 +143,9 @@ prom  IN A   192.0.2.99
 EOF
 chmod -R a+rwX "$WORK/bind"
 podman network create "$NET" >/dev/null
-podman run -d --name "$BIND" --network "$NET" \
+# --user 0:0: the image's own user is not root; named runs as root here,
+# as it did in ISC's image.
+podman run -d --name "$BIND" --network "$NET" --user 0:0 \
     -v "$WORK/bind/named.conf:/etc/bind/named.conf:ro,Z" \
     -v "$WORK/bind:/var/cache/bind:Z" \
     --entrypoint /usr/sbin/named "$BIND_IMG" -g -c /etc/bind/named.conf >/dev/null

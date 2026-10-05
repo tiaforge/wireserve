@@ -116,11 +116,11 @@ log "starting the owner (inet + lan) with forwarding off everywhere, and the cli
 # owner looks like an ordinary host, the case where the agent must turn the
 # LAN interface's flag on and guard it.
 podman run -d --name "$OWNER" --network "$INET" --network "$LAN" \
-    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
+    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --security-opt apparmor=unconfined --device /dev/net/tun \
     --sysctl net.ipv4.conf.all.forwarding=0 --sysctl net.ipv4.conf.default.forwarding=0 \
     --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
 podman run -d --name "$CLIENT" --network "$INET" \
-    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --device /dev/net/tun \
+    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --security-opt apparmor=unconfined --device /dev/net/tun \
     --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
 sleep 1
 OWNER_INET=$(ip_on "$OWNER" "$INET")

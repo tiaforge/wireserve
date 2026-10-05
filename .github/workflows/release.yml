@@ -109,17 +109,26 @@ jobs:
           name: bin-${{ matrix.arch }}
           path: target/e2e/bin
 
-      # Artifacts lose the executable bit on the way.
+      # Artifacts lose the executable bit on the way. multi-instance runs
+      # the binaries on the runner itself and needs nft and wg there.
       - name: Prerequisites
         run: |
           chmod +x target/e2e/bin/*
-          command -v podman >/dev/null || { sudo apt-get update && sudo apt-get install -y podman; }
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nftables iptables wireguard-tools
+          command -v podman >/dev/null || sudo apt-get install -y podman
           sudo modprobe wireguard
           podman --version
           uname -r
 
+      # BIN: the suites that run the binaries directly (coordinator-install,
+      # multi-instance) take them from here too. IMAGE: coordinator-install
+      # boots systemd in it; its default, Arch, has no arm64 image.
       - name: ${{ matrix.suite }}
-        run: sudo E2E_PREBUILT=1 ./deploy/e2e/${{ matrix.suite }}.sh
+        run: |
+          sudo E2E_PREBUILT=1 BIN="$PWD/target/e2e/bin" \
+            IMAGE=registry.access.redhat.com/ubi10/ubi-init:latest \
+            ./deploy/e2e/${{ matrix.suite }}.sh
 
   publish:
     # Only a tag publishes; a dry run ends after e2e.
