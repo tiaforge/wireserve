@@ -104,6 +104,17 @@ EOF
 # Rules anywhere in the ruleset carrying wireserve0's tag. Exactly, not by
 # prefix: the carry interface's own accept (wireserve:wireserve0-t) is
 # expected next to it.
+# Reads `iptables -S INPUT`: succeeds if wireserve0's exact accept is there
+# and comes before every rule of the host's own. Not as "line 2": the
+# carry interface's accept (wireserve0-t) is inserted at the top as well,
+# by its own worker, and may land above it.
+accept_leads() {
+    local listing
+    listing=$(cat)
+    echo "$listing" | has -x -- '-A INPUT -i wireserve0 -m comment --comment "wireserve:wireserve0" -j ACCEPT' \
+        && echo "$listing" | awk '/^-P/ { next } /"wireserve:wireserve0"/ { found = 1; exit } /"wireserve:/ { next } { exit } END { exit !found }'
+}
+
 native_tags() {
     in_dbg "nft -j list ruleset" | python3 -c "
 import json, sys
@@ -137,8 +148,7 @@ wait_for 30 eval '[ "$(in_dbg "iptables -S INPUT; nft list table inet filter" | 
 log "checking the host firewalls now let wireserve0 through (and only wireserve0)"
 IPT=$(in_dbg "iptables -S INPUT")
 echo "$IPT"
-echo "$IPT" | sed -n 2p | has -x -- '-A INPUT -i wireserve0 -m comment --comment "wireserve:wireserve0" -j ACCEPT' \
-    || fail "iptables INPUT does not start with our wireserve0 accept"
+echo "$IPT" | accept_leads || fail "iptables INPUT does not start with our wireserve0 accept"
 NFT=$(in_dbg "nft list table inet filter")
 echo "$NFT"
 [ "$(echo "$NFT" | grep -c 'wireserve:wireserve0"')" = 1 ] || fail "native input chain lacks exactly one wireserve0 accept"
@@ -262,9 +272,9 @@ if podman exec "$DBG_LEGACY" sh -c "iptables-legacy -A INPUT -i lo -j ACCEPT \
     podman exec "$LEGACY" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT4" --listen-port 51820
     podman exec -d "$LEGACY" wireserve daemon --poll-interval-secs "$POLL"
     wait_for 20 eval 'podman exec "$DBG_LEGACY" iptables-legacy -S INPUT | has wireserve:wireserve0\"' || true
-    podman exec "$DBG_LEGACY" iptables-legacy -S INPUT | sed -n 2p \
-        | has -x -- '-A INPUT -i wireserve0 -m comment --comment "wireserve:wireserve0" -j ACCEPT' \
-        || fail "legacy iptables INPUT does not start with our wireserve0 accept"
+    LEGACY_IPT=$(podman exec "$DBG_LEGACY" iptables-legacy -S INPUT)
+    echo "$LEGACY_IPT"
+    echo "$LEGACY_IPT" | accept_leads || fail "legacy iptables INPUT does not start with our wireserve0 accept"
     podman exec "$LEGACY" wireserve leave
     sleep 2
     if podman exec "$DBG_LEGACY" iptables-legacy -S INPUT | has wireserve; then
