@@ -47,6 +47,9 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           sudo modprobe wireguard
+          # Loading a 20,000-element set in a namespace needs more socket
+          # buffer than Ubuntu's default wmem_max (nft names this value).
+          sudo sysctl -w net.core.wmem_max=2097152
 
       - name: Rust toolchain
         run: |

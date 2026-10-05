@@ -597,7 +597,16 @@ mod tests {
         .unwrap();
 
         let nft = Nft::locate().unwrap();
-        nft.run(&["-f", config.to_str().unwrap()], None).expect("the host's ruleset loads");
+        // Loading a set this size takes a bigger socket buffer than
+        // net.core.wmem_max allows by default (Ubuntu's is about 200 KB),
+        // and only real root may go past that limit.
+        if let Err(e) = nft.run(&["-f", config.to_str().unwrap()], None) {
+            if e.to_string().contains("Message too long") {
+                crate::firewall::netns::skip("loading the set needs `sysctl -w net.core.wmem_max=2097152` on the host");
+                return;
+            }
+            panic!("the host's ruleset loads: {e:?}");
+        }
         let mut ops = RealOps::without_firewalld(nft.clone());
         let terse = ops.list_ruleset().unwrap();
         let full = nft.run(&["-j", "list", "ruleset"], None).unwrap();
