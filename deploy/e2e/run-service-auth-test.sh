@@ -58,7 +58,8 @@ GATE=wireserve-sa-gate
 HOME_AGENT=wireserve-sa-home
 CLIENT=wireserve-sa-client
 DEBUG_IMG=wireserve-e2e-debug-tools
-BIND_IMG=docker.io/internetsystemsconsortium/bind9:9.20
+# Canonical's image, multi-arch; ISC's is amd64 only (see run-dns-test.sh).
+BIND_IMG=docker.io/ubuntu/bind9:9.20-26.04_stable
 PEBBLE_IMG=ghcr.io/letsencrypt/pebble:latest
 MOCK_IMG=ghcr.io/navikt/mock-oauth2-server:latest
 ADMIN_TOKEN=service-auth-test-admin-token
@@ -226,7 +227,7 @@ cat > "$WORK/bind/$DOMAIN.zone" <<EOF
 ns IN A   192.0.2.53
 EOF
 chmod -R a+rwX "$WORK/bind"
-podman run -d --name "$BIND" --network "$NET" \
+podman run -d --name "$BIND" --network "$NET" --user 0:0 \
     -v "$WORK/bind/named.conf:/etc/bind/named.conf:ro,Z" -v "$WORK/bind:/var/cache/bind:Z" \
     --entrypoint /usr/sbin/named "$BIND_IMG" -g -c /etc/bind/named.conf >/dev/null
 sleep 2
