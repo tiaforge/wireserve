@@ -183,8 +183,9 @@ podman exec "$CARRIER" wireserve join "http://$COORD_IP:47820" --allow-plaintext
     --listen-port "$WG_PORT" 2>/dev/null
 podman exec "$HOME_AGENT" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_HOME" \
     --listen-port "$WG_PORT" 2>/dev/null
+# Each daemon's output is kept in its container, for a failure to show.
 for a in "$CARRIER" "$HOME_AGENT"; do
-    podman exec -d "$a" wireserve daemon --poll-interval-secs "$POLL"
+    podman exec -d "$a" sh -c "exec wireserve daemon --poll-interval-secs $POLL >/tmp/daemon.log 2>&1"
 done
 wait_for 30 sees "$CARRIER" node-home || fail "node-carrier never got node-home into its peers"
 wait_for 30 sees "$HOME_AGENT" node-carrier || fail "node-home never got node-carrier into its peers"
@@ -226,6 +227,11 @@ in_netns "$CARRIER" nft list table ip cloudfw | has "udp dport $RELAY_PORT drop"
     || fail "the simulated cloud firewall is not in place — this check would prove nothing"
 if admin device create phone --register-url "http://127.0.0.1:47820" >"$OUT/closed.conf" 2>"$OUT/closed.log"; then
     cat "$OUT/closed.log"
+    # The usual reason: the carrier doesn't count as one (see the warning).
+    note "the carrier as the coordinator sees it:"
+    admin node show node-carrier || true
+    note "the carrier's reachability probe:"
+    podman exec "$CARRIER" grep -i reflexive /tmp/daemon.log || true
     fail "the export went ahead with the relay port closed"
 fi
 grep -q "open UDP $RELAY_PORT inbound on node-carrier ($CARRIER_IP)" "$OUT/closed.log" \
