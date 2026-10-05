@@ -1787,7 +1787,7 @@ mod tests {
         has(&format!("ct direction reply ct mark & {m} == {m} ip saddr 192.168.178.1 tcp sport 80 ip saddr set 100.90.0.50 tcp sport set 443"));
         has("type nat hook postrouting priority srcnat; policy accept;");
         has(&format!("meta mark & {m} == {m} ip daddr 192.168.178.1 tcp dport 80 oifname != \"wg0\" masquerade"));
-        has(&format!("iifname \"eth0\" meta nfproto ipv4 ct mark & {m} != {m} drop"));
+        has(&format!("iifname \"eth0\" meta nfproto ipv4 ct mark & 0x{:08x} == 0x00000000 drop", SERVICE_MARK | EXIT_MARK | RELAY_MARK));
     }
 
     /// A terminated service's rules (PLAN.md M33, M35). As with the mapped
