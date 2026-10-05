@@ -230,8 +230,14 @@ if admin device create phone --register-url "http://127.0.0.1:47820" >"$OUT/clos
     # The usual reason: the carrier doesn't count as one (see the warning).
     note "the carrier as the coordinator sees it:"
     admin node show node-carrier || true
-    note "the carrier's reachability probe:"
-    podman exec "$CARRIER" grep -i reflexive /tmp/daemon.log || true
+    # Approved, dialable and public, the carrier can still lack the relay
+    # capability (no carry interface) or not be offering transit.
+    note "the carrier's probe, carry interface, warnings and errors:"
+    podman exec "$CARRIER" grep -E 'reflexive|carry|WARN|ERROR' /tmp/daemon.log || true
+    note "the carrier's links:"
+    in_netns "$CARRIER" ip -d link show || true
+    note "the carrier's own status:"
+    podman exec "$CARRIER" wireserve status || true
     fail "the export went ahead with the relay port closed"
 fi
 grep -q "open UDP $RELAY_PORT inbound on node-carrier ($CARRIER_IP)" "$OUT/closed.log" \
