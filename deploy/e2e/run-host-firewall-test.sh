@@ -63,9 +63,11 @@ create_node() {
     podman exec "$COORD" wireserve-admin node create "$1" | grep -oE 'jtk_[a-f0-9]+'
 }
 
+# NET_RAW as the real units grant it: legacy iptables (E6) works through a
+# raw socket, and Podman leaves NET_RAW out unless asked.
 node_container() {
     podman run -d --name "$1" --network "$NET" \
-        --cap-add=NET_ADMIN --device /dev/net/tun \
+        --cap-add=NET_ADMIN --cap-add=NET_RAW --device /dev/net/tun \
         --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
 }
 
@@ -270,11 +272,14 @@ if podman exec "$DBG_LEGACY" sh -c "iptables-legacy -A INPUT -i lo -j ACCEPT \
    && podman exec "$DBG_LEGACY" grep -qx filter /proc/net/ip_tables_names; then
     JT4=$(create_node node4)
     podman exec "$LEGACY" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT4" --listen-port 51820
-    podman exec -d "$LEGACY" wireserve daemon --poll-interval-secs "$POLL"
+    podman exec -d "$LEGACY" sh -c "exec wireserve daemon --poll-interval-secs $POLL >/tmp/daemon.log 2>&1"
     wait_for 20 eval 'podman exec "$DBG_LEGACY" iptables-legacy -S INPUT | has wireserve:wireserve0\"' || true
     LEGACY_IPT=$(podman exec "$DBG_LEGACY" iptables-legacy -S INPUT)
     echo "$LEGACY_IPT"
-    echo "$LEGACY_IPT" | accept_leads || fail "legacy iptables INPUT does not start with our wireserve0 accept"
+    echo "$LEGACY_IPT" | accept_leads || {
+        podman exec "$LEGACY" grep -E 'iptables|WARN|ERROR' /tmp/daemon.log || true
+        fail "legacy iptables INPUT does not start with our wireserve0 accept"
+    }
     podman exec "$LEGACY" wireserve leave
     sleep 2
     if podman exec "$DBG_LEGACY" iptables-legacy -S INPUT | has wireserve; then

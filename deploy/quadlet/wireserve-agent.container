@@ -3,7 +3,8 @@
 # `systemctl daemon-reload && systemctl start wireserve-agent`.
 #
 # Mirrors deploy/docker/agent.Dockerfile's image and capability set
-# exactly (CAP_NET_ADMIN + /dev/net/tun, never --privileged — spec §8)
+# exactly (CAP_NET_ADMIN + CAP_NET_RAW + /dev/net/tun, never --privileged —
+# spec §8)
 # and deploy/systemd/wireserve-agent.service's env/volume shape. Written
 # by hand against both, not generated, so any future change to either
 # must be applied here too.
@@ -50,7 +51,9 @@ Image=localhost/wireserve-agent:latest
 # coordinator-side setting; nothing about addressing belongs here.
 EnvironmentFile=/etc/wireserve/agent.env
 Network=host
-AddCapability=CAP_NET_ADMIN
+# NET_RAW: legacy iptables on the host needs it, and Podman doesn't grant it
+# by default (Docker does).
+AddCapability=CAP_NET_ADMIN CAP_NET_RAW
 AddDevice=/dev/net/tun
 Volume=/etc/hosts:/etc/hosts
 Volume=wireserve-agent-state:/var/lib/wireserve

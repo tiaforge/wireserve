@@ -7,7 +7,7 @@
 #
 #   docker run -d --name wireserve-agent \
 #     --network host \
-#     --cap-add=NET_ADMIN --device /dev/net/tun \
+#     --cap-add=NET_ADMIN --cap-add=NET_RAW --device /dev/net/tun \
 #     -v /etc/hosts:/etc/hosts \
 #     -v wireserve-agent-state:/var/lib/wireserve \
 #     -v wireserve-agent-run:/run/wireserve \
@@ -16,7 +16,9 @@
 #
 # Never --privileged (spec §8) — CAP_NET_ADMIN + /dev/net/tun is the
 # whole capability set this needs for WireGuard and nftables
-# operations.
+# operations, plus CAP_NET_RAW on a host whose firewall is legacy
+# iptables: that reads and writes its tables through a raw socket. Docker
+# grants NET_RAW by default and Podman does not, hence asking for it.
 #
 # --network host is REQUIRED for a real node (security review F5): the
 # agent creates its WireGuard interface (wireserve0, or the next free

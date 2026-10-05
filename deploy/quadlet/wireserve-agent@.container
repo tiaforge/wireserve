@@ -32,7 +32,8 @@ Wants=network-online.target
 Image=localhost/wireserve-agent:latest
 EnvironmentFile=/etc/wireserve/agent.env
 Network=host
-AddCapability=CAP_NET_ADMIN
+# NET_RAW: see wireserve-agent.container.
+AddCapability=CAP_NET_ADMIN CAP_NET_RAW
 AddDevice=/dev/net/tun
 Volume=/etc/hosts:/etc/hosts
 Volume=wireserve-agent-state:/var/lib/wireserve
