@@ -28,3 +28,12 @@ wait_for() {
 # What a check that something does NOT happen waits instead: long enough
 # for every agent to have polled a few times since the change.
 settle() { sleep $((3 * POLL + 1)); }
+
+# if_on CONTAINER NETWORK: the name of CONTAINER's interface on NETWORK.
+# Not eth0/eth1 by the order of the --network flags: podman 5 keeps that
+# order, podman 4 (Ubuntu 24.04, so the GitHub runners) does not.
+if_on() {
+    local ip
+    ip=$(podman inspect "$1" --format "{{(index .NetworkSettings.Networks \"$2\").IPAddress}}")
+    podman exec "$1" ip -o -4 addr show | awk -v ip="$ip" '{ split($4, a, "/") } a[1] == ip { print $2 }'
+}

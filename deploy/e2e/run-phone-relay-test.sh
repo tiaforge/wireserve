@@ -136,7 +136,7 @@ start_router() {
     sleep 1
     podman exec "$name" nft add table ip nat
     podman exec "$name" nft 'add chain ip nat postrouting { type nat hook postrouting priority 100 ; }'
-    podman exec "$name" nft 'add rule ip nat postrouting oifname "eth0" masquerade'
+    podman exec "$name" nft "add rule ip nat postrouting oifname \"$(if_on "$name" "$INET")\" masquerade"
 }
 
 log "starting the two NAT routers"

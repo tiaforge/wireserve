@@ -152,7 +152,8 @@ podman run -d --name "$ROUTER_P" --network "$INET" --network "$SITE_P" \
 sleep 1
 podman exec "$ROUTER_P" nft add table ip nat
 podman exec "$ROUTER_P" nft 'add chain ip nat postrouting { type nat hook postrouting priority 100 ; }'
-podman exec "$ROUTER_P" nft 'add rule ip nat postrouting oifname "eth0" masquerade'
+ROUTER_P_WAN_IF=$(if_on "$ROUTER_P" "$INET")
+podman exec "$ROUTER_P" nft "add rule ip nat postrouting oifname \"$ROUTER_P_WAN_IF\" masquerade"
 ROUTER_P_LAN=$(ip_on "$ROUTER_P" "$SITE_P")
 
 log "starting the gateway (inet + its own LAN) and a node behind it"

@@ -130,12 +130,10 @@ start_router() {
         --cap-add=NET_ADMIN --sysctl net.ipv4.ip_forward=1 \
         "$DEBUG_IMG" sleep infinity >/dev/null
     sleep 1
-    # eth0 is the inet side, eth1 the site side: interface order follows
-    # the order the --network flags were given above.
     podman exec "$name" nft add table ip nat
     podman exec "$name" nft 'add chain ip nat postrouting { type nat hook postrouting priority 100 ; }'
     podman exec "$name" nft 'add chain ip nat prerouting { type nat hook prerouting priority -100 ; }'
-    podman exec "$name" nft 'add rule ip nat postrouting oifname "eth0" masquerade'
+    podman exec "$name" nft "add rule ip nat postrouting oifname \"$(if_on "$name" "$INET")\" masquerade"
 }
 
 log "starting the two NAT routers"
@@ -147,8 +145,10 @@ start_router "$ROUTER_B" "$SITE_B"
 # a symmetric NAT, which is what agent3 sits behind. Node2 gets a mapping
 # of its own below, once its address is known (NAT-traversal step 2,
 # PLAN.md decisions log #94).
+ROUTER_A_WAN_IF=$(if_on "$ROUTER_A" "$INET")
+ROUTER_B_WAN_IF=$(if_on "$ROUTER_B" "$INET")
 podman exec "$ROUTER_B" nft flush chain ip nat postrouting
-podman exec "$ROUTER_B" nft 'add rule ip nat postrouting oifname "eth0" masquerade random'
+podman exec "$ROUTER_B" nft "add rule ip nat postrouting oifname \"$ROUTER_B_WAN_IF\" masquerade random"
 ROUTER_A_WAN=$(ip_on "$ROUTER_A" "$INET")
 ROUTER_A_LAN=$(ip_on "$ROUTER_A" "$SITE_A")
 ROUTER_B_WAN=$(ip_on "$ROUTER_B" "$INET")
@@ -180,7 +180,7 @@ echo "agent3 (site-b, shares agent2's NAT):    $AGENT3_LAN"
 
 log "port-forwarding UDP/$WG_PORT on router-a to agent1"
 podman exec "$ROUTER_A" nft \
-    "add rule ip nat prerouting iifname \"eth0\" udp dport $WG_PORT dnat to $AGENT1_LAN:$WG_PORT"
+    "add rule ip nat prerouting iifname \"$ROUTER_A_WAN_IF\" udp dport $WG_PORT dnat to $AGENT1_LAN:$WG_PORT"
 pass "agent1 is reachable from the inet segment, the other two are not"
 
 # Node2 sits behind what most home routers are: a NAT that gives its
@@ -191,9 +191,9 @@ pass "agent1 is reachable from the inet segment, the other two are not"
 # (observed IP + listen_port) gets wrong. Set before node2 registers.
 NODE2_NAT_PORT=40404
 podman exec "$ROUTER_B" nft \
-    "insert rule ip nat postrouting oifname \"eth0\" ip saddr $AGENT2_LAN udp sport $WG_PORT snat to $ROUTER_B_WAN:$NODE2_NAT_PORT"
+    "insert rule ip nat postrouting oifname \"$ROUTER_B_WAN_IF\" ip saddr $AGENT2_LAN udp sport $WG_PORT snat to $ROUTER_B_WAN:$NODE2_NAT_PORT"
 podman exec "$ROUTER_B" nft \
-    "add rule ip nat prerouting iifname \"eth0\" udp dport $NODE2_NAT_PORT dnat to $AGENT2_LAN:$WG_PORT"
+    "add rule ip nat prerouting iifname \"$ROUTER_B_WAN_IF\" udp dport $NODE2_NAT_PORT dnat to $AGENT2_LAN:$WG_PORT"
 
 log "checking the agents can reach the coordinator through NAT at all"
 for a in "$AGENT1" "$AGENT2" "$AGENT3"; do

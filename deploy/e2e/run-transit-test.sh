@@ -135,7 +135,7 @@ start_router() {
     podman exec "$name" nft add table ip nat
     podman exec "$name" nft 'add chain ip nat postrouting { type nat hook postrouting priority 100 ; }'
     podman exec "$name" nft 'add chain ip nat prerouting { type nat hook prerouting priority -100 ; }'
-    podman exec "$name" nft 'add rule ip nat postrouting oifname "eth0" masquerade'
+    podman exec "$name" nft "add rule ip nat postrouting oifname \"$(if_on "$name" "$INET")\" masquerade"
 }
 
 log "starting the three NAT routers"
@@ -150,7 +150,7 @@ start_router "$ROUTER_C" "$SITE_C"
 # real port-forward and is reachable directly, same as run-nat-test.sh.
 for r in "$ROUTER_B" "$ROUTER_C"; do
     podman exec "$r" nft flush chain ip nat postrouting
-    podman exec "$r" nft 'add rule ip nat postrouting oifname "eth0" masquerade random'
+    podman exec "$r" nft "add rule ip nat postrouting oifname \"$(if_on "$r" "$INET")\" masquerade random"
 done
 ROUTER_A_WAN=$(ip_on "$ROUTER_A" "$INET")
 ROUTER_A_LAN=$(ip_on "$ROUTER_A" "$SITE_A")
@@ -183,7 +183,7 @@ echo "agent4 (site-c, symmetric NAT):                              $AGENT4_LAN"
 
 log "port-forwarding UDP/$WG_PORT on router-a to agent1"
 podman exec "$ROUTER_A" nft \
-    "add rule ip nat prerouting iifname \"eth0\" udp dport $WG_PORT dnat to $AGENT1_LAN:$WG_PORT"
+    "add rule ip nat prerouting iifname \"$(if_on "$ROUTER_A" "$INET")\" udp dport $WG_PORT dnat to $AGENT1_LAN:$WG_PORT"
 
 create_node() {
     podman exec "$COORD" wireserve-admin node create "$1" | grep -oE 'jtk_[a-f0-9]+'
