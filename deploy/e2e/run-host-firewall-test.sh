@@ -249,7 +249,14 @@ DBG_LEGACY=wireserve-debugl-hostfw-test
 podman rm -fv -t 0 "$LEGACY" "$DBG_LEGACY" >/dev/null 2>&1 || true
 node_container "$LEGACY"
 debug_for "$DBG_LEGACY" "$LEGACY"
-if podman exec "$DBG_LEGACY" sh -c "iptables-legacy -A INPUT -i lo -j ACCEPT && iptables-legacy -P INPUT DROP" 2>/dev/null \
+# The same ufw-style firewall as HOST_FIREWALL's iptables half, replies to
+# the node's own connections included, or it could not even join. Where
+# legacy iptables is unusable (most desktops) this step skips, so the
+# GitHub runners were the first to run it.
+if podman exec "$DBG_LEGACY" sh -c "iptables-legacy -A INPUT -i lo -j ACCEPT \
+        && iptables-legacy -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT \
+        && iptables-legacy -A INPUT -i eth0 -p udp --dport 51820 -j ACCEPT \
+        && iptables-legacy -P INPUT DROP" 2>/dev/null \
    && podman exec "$DBG_LEGACY" grep -qx filter /proc/net/ip_tables_names; then
     JT4=$(create_node node4)
     podman exec "$LEGACY" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT4" --listen-port 51820
