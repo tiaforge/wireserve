@@ -698,6 +698,8 @@ where
     });
 
     // 1. send
+    // Answered port checks go out until a poll gets through with them.
+    let checks_seen = ctx.port_checks.map(|c| c.seen()).unwrap_or_default();
     let req = build_poll_request(
         &declared,
         endpoint_addr,
@@ -711,7 +713,7 @@ where
             wanted: transit_wanted,
             carry_port: ctx.wg.carry_port(),
             dialable_v4: ctx.own_dialable_v4,
-            port_checks_seen: ctx.port_checks.map(|c| c.take_seen()).unwrap_or_default(),
+            port_checks_seen: checks_seen.clone(),
         },
         tls_report,
     );
@@ -748,6 +750,10 @@ where
             status,
             message: body_text,
         });
+    }
+    // Accepted: the coordinator recorded them before answering.
+    if let Some(checker) = ctx.port_checks {
+        checker.delivered(&checks_seen);
     }
     let mut directory: PollResponse = resp.json().await?;
     // Before anything acts on an address: peers, firewall, hosts file and

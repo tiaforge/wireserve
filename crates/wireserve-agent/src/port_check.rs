@@ -26,7 +26,7 @@ pub struct PortChecker {
 struct Inner {
     /// Ports being listened on, each with the check it now waits for.
     active: HashMap<u16, Listening>,
-    /// Checks answered since the last poll.
+    /// Checks answered and not yet delivered by a poll.
     seen: Vec<PortCheck>,
 }
 
@@ -78,9 +78,18 @@ impl PortChecker {
         ports
     }
 
-    /// The checks answered since the last call, for the next poll.
-    pub fn take_seen(&self) -> Vec<PortCheck> {
-        std::mem::take(&mut self.inner.lock().unwrap_or_else(|e| e.into_inner()).seen)
+    /// The checks answered and not yet delivered, for the next poll. They
+    /// stay until [`Self::delivered`]: a poll that fails — refused by the
+    /// coordinator's rate limit, most likely, as the one an answered check
+    /// wakes comes early — must not lose them.
+    #[must_use]
+    pub fn seen(&self) -> Vec<PortCheck> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).seen.clone()
+    }
+
+    /// `checks`, sent with a poll the coordinator accepted, are reported.
+    pub fn delivered(&self, checks: &[PortCheck]) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).seen.retain(|c| !checks.contains(c));
     }
 }
 
@@ -138,7 +147,9 @@ async fn listen(me: Arc<PortChecker>, port: u16) {
         let mut inner = me.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.active.get(&port).is_some_and(|l| l.nonce == got) {
             let heard = inner.active.remove(&port).expect("checked just above").check;
-            inner.seen.push(heard);
+            if !inner.seen.contains(&heard) {
+                inner.seen.push(heard);
+            }
             drop(inner);
             tracing::info!(port, %from, "relay port check received");
             me.wake.notify_one();
@@ -174,8 +185,10 @@ mod tests {
         let right = wireserve_types::reflexive::build_response([1, 2, 3, 4, 5, 6, 7, 8], "127.0.0.1:1".parse().unwrap());
         sender.send_to(&right, ("127.0.0.1", port)).unwrap();
         tokio::time::timeout(Duration::from_secs(2), checker.wake.notified()).await.unwrap();
-        assert_eq!(checker.take_seen(), [check]);
-        assert!(checker.take_seen().is_empty());
+        assert_eq!(checker.seen(), std::slice::from_ref(&check));
+        assert_eq!(checker.seen(), std::slice::from_ref(&check), "kept until a poll delivers it");
+        checker.delivered(std::slice::from_ref(&check));
+        assert!(checker.seen().is_empty());
         assert!(checker.active_ports().is_empty());
     }
 
@@ -198,7 +211,7 @@ mod tests {
         let new = wireserve_types::reflexive::build_response([2; 8], "127.0.0.1:1".parse().unwrap());
         sender.send_to(&new, ("127.0.0.1", port)).unwrap();
         tokio::time::timeout(Duration::from_secs(2), checker.wake.notified()).await.unwrap();
-        assert_eq!(checker.take_seen(), [second]);
+        assert_eq!(checker.seen(), [second]);
         assert!(checker.active_ports().is_empty());
     }
 }
