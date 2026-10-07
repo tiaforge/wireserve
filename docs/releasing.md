@@ -14,8 +14,13 @@ GitHub Actions there run the checks and publish releases.
      architectures.
   2. Runs every `deploy/e2e/run-*-test.sh` suite against exactly those
      binaries, on both architectures.
-  3. Started by a tag, it then publishes; started by hand, it stops
-     here.
+  3. Started by a tag, it then publishes; started by hand or by the
+     nightly schedule, it stops here.
+
+  The nightly run (03:17 UTC, on `main`) catches a broken suite the day
+  it breaks instead of on release day. It skips itself when `main` has
+  not moved since the last green nightly. GitHub emails a failed
+  scheduled run to whoever last changed the `cron:` line.
 
   A release publishes:
   - `wireserve-<version>-<arch>-linux.tar.gz`: the agent, for bare metal.

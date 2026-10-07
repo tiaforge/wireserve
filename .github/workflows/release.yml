@@ -4,6 +4,9 @@
 #   - Started by hand (Actions → Release → Run workflow): a dry run. It
 #     builds and tests whatever commit it is started on, and publishes
 #     nothing.
+#   - Nightly, on main: the same dry run, so a broken suite shows up the
+#     day it breaks rather than on release day. A night with no commit
+#     since the last green nightly is skipped.
 #   - A pushed tag v<version>: the real release. The tag comes from
 #     deploy/release.sh on the Forgejo side and reaches GitHub through the
 #     push mirror — this workflow never creates tags itself, because the
@@ -17,6 +20,10 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+  # 03:17 UTC: GitHub delays scheduled runs around the top of the hour.
+  # Schedules run on the default branch only.
+  schedule:
+    - cron: "17 3 * * *"
 
 permissions:
   contents: read
@@ -28,10 +35,30 @@ concurrency:
 jobs:
   prepare:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
     outputs:
       version: ${{ steps.version.outputs.version }}
       suites: ${{ steps.suites.outputs.suites }}
+      skip: ${{ steps.unchanged.outputs.skip }}
     steps:
+      # A nightly on the commit the last green nightly already tested has
+      # nothing new to say; the jobs below are skipped.
+      - name: Unchanged since the last green nightly?
+        id: unchanged
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          last=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow release.yml \
+            --event schedule --status success --limit 1 --json headSha --jq '.[0].headSha // ""')
+          if [ "$last" = "$GITHUB_SHA" ]; then
+            echo "::notice::$GITHUB_SHA already passed a nightly; skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -57,6 +84,7 @@ jobs:
 
   build:
     needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
     name: build (${{ matrix.arch }})
     strategy:
       matrix:
