@@ -218,7 +218,12 @@ Worth knowing:
   of the mesh.
 - **Close the owner's LAN yourself.** The mesh admits only the grants; a
   backend listening on every interface is still reachable from its own
-  network. Bind it to the node's mesh address.
+  network. Bind it to the node's mesh address: the agent drops whatever
+  arrives for that address other than through the mesh or from the host
+  itself, so a machine on the LAN that routes the mesh address to the node
+  does not get in either. Neither does a container on a bridge network of
+  the node's own: it reaches the host at the bridge's address, where a
+  backend bound to the mesh address is not listening.
 - **Identity headers and the session cookie never reach a backend from a
   client.** Every terminator removes the identity headers and the sign-in's
   session cookie from every request, on every service. So do the headers a proxy or an

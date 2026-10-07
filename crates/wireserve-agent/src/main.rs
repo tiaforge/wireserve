@@ -604,7 +604,9 @@ async fn cmd_daemon(
     };
 
     #[cfg(target_os = "linux")]
-    let mut fw = firewall::nftables::NftablesBackend::new(ifname.clone())?.with_carry(carry.clone());
+    let mut fw = firewall::nftables::NftablesBackend::new(ifname.clone())?
+        .with_carry(carry.clone())
+        .with_own(&[ip4.into(), ip6.into()]);
     #[cfg(not(target_os = "linux"))]
     let mut fw = NoopFirewall;
 

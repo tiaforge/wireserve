@@ -4758,3 +4758,23 @@ the earlier ones. Two things to fix:
     back and a fresh approval; a denial; approval off and switched on later;
     the migration; and over the API, the directory, `access` and the admin
     listing.
+
+316. **A node's mesh address is the mesh's alone** (2026-10-07).
+    `access-control.md` told operators to bind a backend to the node's mesh
+    address to keep it off the LAN. But Linux takes a packet for any of its
+    addresses on any interface, and the agent's input chain only filtered
+    the mesh interface. So a machine on the same LAN segment that routed the
+    mesh address to the node, by a static route through the node's LAN
+    address, reached whatever listened there. Now the agent's table drops
+    anything for the node's own mesh IPv4 and IPv6 that arrives other than
+    on the mesh interface, the carry interface or `lo`
+    (`NftablesBackend::with_own`). The addresses are set once at bring-up,
+    so the rule is in place from the first ruleset, before any poll.
+    Published container ports are unaffected: their DNAT forwards the
+    traffic and never delivers it to the input chain. A container on the
+    node's own bridge no longer reaches the node's mesh address; the docs
+    say so.
+    Tests: the rule's shape, for both families, and an unchanged ruleset
+    without addresses. In the kernel: a neighbour routing the mesh address
+    to the node gets in before the rule and not after, over v4 and v6,
+    while the host itself still does, and so does the node's LAN address.

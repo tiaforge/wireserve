@@ -5,7 +5,7 @@
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use nftables::expr::{
     BinaryOperation, CTDir, Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, Prefix, Range, SetItem, CT,
@@ -129,6 +129,9 @@ pub struct NftablesBackend {
     /// The carry interface (PLAN.md M39), which gets a table of its own
     /// with the same default-deny and the same service rules.
     carry: Option<String>,
+    /// This node's own mesh addresses (PLAN.md #316), which only the mesh
+    /// and the host itself may reach.
+    own: Vec<IpAddr>,
     nft: Nft,
     last: SharedRuleset,
 }
@@ -140,6 +143,7 @@ impl NftablesBackend {
         Ok(Self {
             ifname: ifname.into(),
             carry: None,
+            own: Vec::new(),
             nft: Nft::locate()?,
             last: SharedRuleset::default(),
         })
@@ -150,6 +154,16 @@ impl NftablesBackend {
     #[must_use]
     pub fn with_carry(mut self, carry: Option<String>) -> Self {
         self.carry = carry;
+        self
+    }
+
+    /// Closes this node's own mesh addresses to everything but the mesh and
+    /// the host itself (PLAN.md #316). Set before the first apply, like the
+    /// carry interface: the addresses are the interface's from the moment
+    /// it comes up.
+    #[must_use]
+    pub fn with_own(mut self, own: &[IpAddr]) -> Self {
+        self.own = own.to_vec();
         self
     }
 
@@ -675,14 +689,17 @@ fn rule(table: &str, chain: &'static str, expr: Vec<Statement<'static>>) -> NfOb
 /// everything arriving there that is not part of one of our flows.
 #[cfg(test)]
 pub(crate) fn apply_batch(ifname: &str, rules: &[ServiceRule], forwarding: &Forwarding) -> Nftables<'static> {
-    apply_batch_with(ifname, None, rules, forwarding)
+    apply_batch_with(ifname, None, &[], rules, forwarding)
 }
 
 /// [`apply_batch`], plus the carry interface's own table when there is one
-/// (PLAN.md M39) — in the same transaction, so the two never disagree.
+/// (PLAN.md M39) — in the same transaction, so the two never disagree —
+/// and this node's own mesh addresses closed to everything but the mesh and
+/// the host (`own`, PLAN.md #316).
 pub(crate) fn apply_batch_with(
     ifname: &str,
     carry: Option<&str>,
+    own: &[IpAddr],
     rules: &[ServiceRule],
     forwarding: &Forwarding,
 ) -> Nftables<'static> {
@@ -761,6 +778,21 @@ pub(crate) fn apply_batch_with(
     for (vip, ..) in &terminated {
         let mut expr = not_mesh();
         expr.extend([is(payload("ip", "daddr"), addr(*vip)), Statement::Drop(None::<Drop>)]);
+        objects.push(rule(t, CHAIN_NAME, expr));
+    }
+    // This node's own mesh addresses (PLAN.md #316). Linux takes a packet
+    // for any of its addresses on any interface, so a machine on the LAN
+    // that routes the mesh address to this host reached whatever listens
+    // there — a backend bound to the mesh address to keep it off the LAN
+    // among them. A reply to a connection of this node's own comes back the
+    // way it left, through the mesh.
+    for own in own {
+        let family = if own.is_ipv4() { "ip" } else { "ip6" };
+        let mut expr = not_mesh();
+        expr.extend([
+            is(payload(family, "daddr"), Expression::String(Cow::Owned(own.to_string()))),
+            Statement::Drop(None::<Drop>),
+        ]);
         objects.push(rule(t, CHAIN_NAME, expr));
     }
     // The terminator's own port, on every address of the host (PLAN.md
@@ -1076,7 +1108,7 @@ impl FirewallBackend for NftablesBackend {
     /// the same transaction, so a mid-cycle failure can never leave them
     /// disagreeing about which cycle they reflect.
     fn apply(&mut self, rules: &[ServiceRule], forwarding: &Forwarding) -> Result<(), Self::Error> {
-        let batch = apply_batch_with(&self.ifname, self.carry.as_deref(), rules, forwarding);
+        let batch = apply_batch_with(&self.ifname, self.carry.as_deref(), &self.own, rules, forwarding);
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         match self.nft.apply(&batch) {
             Ok(()) => {
@@ -1456,6 +1488,26 @@ mod tests {
         );
         // Nothing forwarded for it.
         assert!(!rules_in(&batch, "wireserve-fwd").iter().any(|r| r.to_string().contains("mark")));
+    }
+
+    #[test]
+    fn this_nodes_own_addresses_are_closed_to_all_but_the_mesh_and_the_host() {
+        let own: [IpAddr; 2] = [NODE.into(), "fd00:90::1".parse().unwrap()];
+        let batch = as_json(&apply_batch_with("wg0", Some("wg0-t"), &own, &[], &fwd(&[])));
+        let input = rules_in(&batch, "wireserve-in");
+        let not_mesh = [
+            json!({"match": {"left": {"meta": {"key": "iifname"}}, "right": "wg0", "op": "!="}}),
+            json!({"match": {"left": {"meta": {"key": "iifname"}}, "right": "lo", "op": "!="}}),
+            json!({"match": {"left": {"meta": {"key": "iifname"}}, "right": "wg0-t", "op": "!="}}),
+        ];
+        for (family, addr) in [("ip", NODE.to_string()), ("ip6", "fd00:90::1".to_string())] {
+            let mut expected: Vec<Value> = not_mesh.to_vec();
+            expected.push(json!({"match": {"left": {"payload": {"protocol": family, "field": "daddr"}}, "right": addr, "op": "=="}}));
+            expected.push(json!({"drop": null}));
+            assert!(input.contains(&Value::Array(expected)), "{family} {addr}: {input:?}");
+        }
+        // Without addresses, the default-deny is as it was.
+        assert_eq!(as_json(&apply_batch_with("wg0", None, &[], &[], &fwd(&[]))), as_json(&apply_batch("wg0", &[], &fwd(&[]))));
     }
 
     #[test]
@@ -2016,6 +2068,64 @@ mod tests {
     }
 
     #[test]
+    fn kernel_a_lan_neighbour_cannot_reach_the_mesh_address_and_the_host_still_can() {
+        if !crate::firewall::netns::reexec(
+            "firewall::nftables::tests::kernel_a_lan_neighbour_cannot_reach_the_mesh_address_and_the_host_still_can",
+        ) {
+            return;
+        }
+        let mut outside = std::process::Command::new("unshare").args(["-n", "sleep", "60"]).spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let pid = outside.id();
+        // The LAN on eth0, the mesh address on a stand-in wg0, and a
+        // neighbour that routes the mesh address to this host.
+        let setup = format!(
+            "ip link set lo up
+             ip link add eth0 type veth peer name o0 && ip link set o0 netns {pid}
+             ip addr add 192.168.50.1/24 dev eth0 && ip addr add 2001:db8::1/64 dev eth0 nodad && ip link set eth0 up
+             ip link add wg0 type dummy && ip addr add 100.90.0.1/24 dev wg0 && ip addr add fd00:90::1/64 dev wg0 nodad
+             ip link set wg0 up
+             nsenter -t {pid} -n sh -euc 'ip link set lo up; ip addr add 192.168.50.2/24 dev o0; ip addr add 2001:db8::2/64 dev o0 nodad
+               ip link set o0 up; ip route add 100.90.0.1/32 via 192.168.50.1; ip -6 route add fd00:90::1/128 via 2001:db8::1'"
+        );
+        let out = std::process::Command::new("sh").args(["-euc", &setup]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        // Whether a datagram to `to` arrives at a listener bound there, from
+        // the neighbour or from this host.
+        let arrives = |to: &str, from_neighbour: bool| -> bool {
+            let listener = std::net::UdpSocket::bind((to, 5000)).unwrap();
+            listener.set_read_timeout(Some(std::time::Duration::from_millis(700))).unwrap();
+            let family = if to.contains(':') { "AF_INET6" } else { "AF_INET" };
+            let send = format!("import socket; socket.socket(socket.{family}, socket.SOCK_DGRAM).sendto(b'x', ('{to}', 5000))");
+            let pid = pid.to_string();
+            let mut cmd = std::process::Command::new(if from_neighbour { "nsenter" } else { "python3" });
+            if from_neighbour {
+                cmd.args(["-t", &pid, "-n", "python3"]);
+            }
+            let _ = cmd.args(["-c", &send]).status();
+            let mut buf = [0u8; 4];
+            listener.recv_from(&mut buf).is_ok()
+        };
+        let open_before = arrives("100.90.0.1", true) && arrives("fd00:90::1", true);
+        let own: [IpAddr; 2] = ["100.90.0.1".parse().unwrap(), "fd00:90::1".parse().unwrap()];
+        let script = nft_script(&[apply_batch_with("wg0", None, &own, &[], &Forwarding::default())]);
+        let out = std::process::Command::new("sh").args(["-euc", &script]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let results = [
+            arrives("100.90.0.1", true),
+            arrives("fd00:90::1", true),
+            arrives("100.90.0.1", false),
+            arrives("fd00:90::1", false),
+            arrives("192.168.50.1", true),
+        ];
+        let _ = outside.kill();
+        let _ = outside.wait();
+        assert!(open_before, "without the rule the neighbour gets in: the test is testing something");
+        assert_eq!(results, [false, false, true, true, true], "neighbour v4, v6; host v4, v6; the LAN address itself");
+    }
+
+    #[test]
     fn kernel_a_reply_to_this_hosts_own_udp_on_a_relay_port_arrives() {
         if !crate::firewall::netns::reexec(
             "firewall::nftables::tests::kernel_a_reply_to_this_hosts_own_udp_on_a_relay_port_arrives",
@@ -2124,7 +2234,7 @@ mod tests {
         // 100.90.0.50:80 is 192.168.1.2:8080 on the LAN.
         let rule = ServiceRule::Mapped { vip: VIP, node: NODE, map: "80:192.168.1.2:8080".parse().unwrap(), sources: None };
         let forwarding = Forwarding { guarded: vec!["lan0".into()], ..Forwarding::default() };
-        let script = nft_script(&[apply_batch_with("wg0", Some("wg0-t"), &[rule], &forwarding)]);
+        let script = nft_script(&[apply_batch_with("wg0", Some("wg0-t"), &[], &[rule], &forwarding)]);
         let out = std::process::Command::new("sh").args(["-euc", &script]).output().unwrap();
         // As real root the rewrites are allowed, so a refusal there is a failure.
         if !crate::firewall::netns::real_root() && String::from_utf8_lossy(&out.stderr).contains("Operation not permitted") {
@@ -2223,7 +2333,7 @@ mod tests {
     #[test]
     fn the_carry_interface_gets_its_own_default_deny_and_the_same_grants() {
         let rules = [only(mapped("5432"), &["100.90.0.7"])];
-        let batch = as_json(&apply_batch_with("wg0", Some("wg0-t"), &rules, &fwd(&[])));
+        let batch = as_json(&apply_batch_with("wg0", Some("wg0-t"), &[], &rules, &fwd(&[])));
         let in_table = |table: &str, chain: &str| -> Vec<Value> {
             batch["nftables"].as_array().unwrap().iter()
                 .filter_map(|o| o.pointer("/add/rule"))
@@ -2243,7 +2353,7 @@ mod tests {
                 json!([iif("wg0-t"), {"drop": null}]),
             ]
         );
-        let none = as_json(&apply_batch_with("wg0", Some("wg0-t"), &[terminated("443:32400")], &fwd(&[])));
+        let none = as_json(&apply_batch_with("wg0", Some("wg0-t"), &[], &[terminated("443:32400")], &fwd(&[])));
         let forwards: Vec<&Value> = none["nftables"].as_array().unwrap().iter()
             .filter_map(|o| o.pointer("/add/rule"))
             .filter(|r| r["table"] == "wireserve.wg0-t" && r["chain"] == "wireserve-fwd")
@@ -2257,7 +2367,7 @@ mod tests {
 
     #[test]
     fn a_terminated_address_is_not_dropped_for_the_carry_interface() {
-        let batch = serde_json::to_string(&apply_batch_with("wg0", Some("wg0-t"), &[terminated("443:32400")], &fwd(&[]))).unwrap();
+        let batch = serde_json::to_string(&apply_batch_with("wg0", Some("wg0-t"), &[], &[terminated("443:32400")], &fwd(&[]))).unwrap();
         assert_eq!(batch.matches(r#""right":"wg0-t","op":"!=""#).count(), 2, "both non-mesh drops exempt it: {batch}");
     }
 
@@ -2333,7 +2443,7 @@ mod tests {
             let _ = other_carry;
             // Its own tables: default-deny on both interfaces, the carry port
             // open to the mesh, and pings let in as a declared service would be.
-            let batch = apply_batch_with("wg0", Some("wg0-t"), &[], &Forwarding { relay_ends: vec![carry], ..Forwarding::default() });
+            let batch = apply_batch_with("wg0", Some("wg0-t"), &[], &[], &Forwarding { relay_ends: vec![carry], ..Forwarding::default() });
             sh(&format!(
                 "nsenter -t {pid} -n sh -euc '{}'",
                 nft_script(&[batch]).replace('\'', "'\\''")
