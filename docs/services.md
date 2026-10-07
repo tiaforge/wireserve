@@ -120,7 +120,11 @@ firewall rewrites `address:PUBLIC` to `node:TARGET` in the kernel:
   `0.0.0.0`, or the node's mesh address. A service bound to `127.0.0.1`
   is not reachable, by design.
 - A target port can back one mapping per node (per protocol); `serve`
-  refuses a second.
+  refuses a second. The exception is 443: `wireserve app 80:8080 443:8080`
+  serves one plain-HTTP app as both `http://app…` (say, for a reverse proxy
+  that does its own TLS) and `https://app…`, since the HTTPS side goes
+  through the terminator (see [names-and-https.md](names-and-https.md)).
+  Until the terminator serves it, 443 stays closed and port 80 works.
 - Addresses come from the mesh range, shared with the nodes (a `/24`
   holds 253 nodes and services together), and stay with a service until
   it is withdrawn.

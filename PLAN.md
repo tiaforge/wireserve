@@ -4778,3 +4778,28 @@ the earlier ones. Two things to fix:
     without addresses. In the kernel: a neighbour routing the mesh address
     to the node gets in before the rule and not after, over v4 and v6,
     while the host itself still does, and so does the node's LAN address.
+
+## HTTP and HTTPS onto one port (2026-10-07)
+
+`wireserve app 80:8080 443:8080` was refused: a target port backs one
+mapping per node, because the reply rewrite can only turn a reply from
+`node:8080` back into one public port. Wanted: an outside reverse proxy
+that terminates TLS itself reaches the app over plain HTTP, and the mesh
+gets HTTPS from the terminator, both on the app's one port.
+
+317. **A TCP 443 mapping does not reserve its target.** When the terminator
+    serves it, the rewrite goes to the terminator's port (M35) and the
+    terminator dials the target over its own socket, so its replies never
+    meet the reply rewrite. `targets_conflict` (types) is what `serve`
+    refuses on, for one declaration and against the others alike: same
+    target, and neither side 443/tcp. `is_tls_map` replaces the inline
+    "443 over TCP" tests in the agent and `publishes_tls`.
+    While the terminator does not serve it, a 443 mapping is a plain
+    rewrite, and `service_rules` then gives the target to any other
+    mapping onto it, whatever the declaration order: raw TLS into a port
+    that speaks plain HTTP would not work anyway. Two 443 mappings onto one
+    target (two services) are allowed too; terminated, the terminator tells
+    them apart by address, and unterminated the first keeps it, as before.
+    Tests: `validate_node_targets` with 443 beside 80 and beside another
+    service, and still refused for 81 or UDP; `serve` over IPC; the rules
+    with the terminator serving (both) and not (port 80 only), either order.

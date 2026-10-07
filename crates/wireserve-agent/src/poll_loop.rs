@@ -261,7 +261,7 @@ async fn pinned_mesh_ranges(
 /// nothing to scope a hole to but the node's own address, and a port open
 /// there to the whole mesh is what service addresses exist to avoid.
 ///
-/// A target can carry only one mapping (see
+/// A target can carry only one rewritten mapping (see
 /// `wireserve_types::validate_node_targets`); `serve` refuses a second,
 /// and a hand-edited state file that aliases one anyway keeps it for the
 /// first name only — a second mapping's replies would come back from the
@@ -277,7 +277,12 @@ async fn pinned_mesh_ranges(
 /// that mapping becomes [`ServiceRule::Terminated`], which rewrites the
 /// request to that port on the service address and opens nothing of its
 /// target. Its other mappings stay
-/// rewrites. The target is still reserved against every other mapping.
+/// rewrites. Its target is not reserved: the terminator reaches it over a
+/// socket of its own, so `80:8080` beside `443:8080` is fine. A 443 mapping
+/// the terminator does not serve is a rewrite like any other, and loses its
+/// target to any other mapping onto it, whatever the declaration order —
+/// raw TLS into the port the other one speaks plain to would not work
+/// anyway.
 ///
 /// Who may reach each service comes from `access` (PLAN.md M36), the
 /// coordinator's grants for this node's own services. It only ever narrows
@@ -302,6 +307,14 @@ pub fn service_rules(
     let Some(node) = node_ip else {
         return rules;
     };
+    let in_mesh = |map: &wireserve_types::PortMap| map.addr.is_some_and(|addr| addr == node || mesh.is_some_and(|m| m.contains4(addr)));
+    // What a 443 mapping falling back to a rewrite gives way to.
+    let plain: Vec<wireserve_types::PortMap> = declared
+        .iter()
+        .flat_map(|d| d.ports.iter())
+        .filter(|m| !wireserve_types::is_tls_map(m) && !in_mesh(m))
+        .copied()
+        .collect();
     for d in declared {
         let Some(vip) = own_vip(&d.name, node, directory) else {
             tracing::warn!(service = %d.name, "service has no address of its own yet; not opening it");
@@ -313,28 +326,29 @@ pub fn service_rules(
         };
         let sources: wireserve_types::Sources = (!grants.open).then(|| grants.sources.as_slice().into());
         for map in d.ports.clone() {
-            if map.addr.is_some_and(|addr| addr == node || mesh.is_some_and(|m| m.contains4(addr))) {
+            if in_mesh(&map) {
                 tracing::warn!(service = %d.name, port = %map, "not forwarding to a target address inside the mesh");
                 continue;
             }
-            if targets.iter().any(|t| wireserve_types::same_target(t, &map)) {
+            let tls = wireserve_types::is_tls_map(&map);
+            if tls && terminating.contains(&d.name) {
+                // The terminator checks the rest.
+                let sources = if grants.sign_in { None } else { sources.clone() };
+                rules.push(ServiceRule::Terminated { vip, map, port: tls_port, sources });
+                continue;
+            }
+            let taken = targets.iter().any(|t| wireserve_types::same_target(t, &map))
+                || (tls && plain.iter().any(|t| wireserve_types::same_target(t, &map)));
+            if taken {
                 tracing::warn!(
                     service = %d.name,
                     port = %map,
-                    "target already mapped by another service — not mapping it again"
+                    "target already mapped by another mapping — not mapping it again"
                 );
                 continue;
             }
             targets.push(map);
-            let tls = map.public == wireserve_types::TLS_PUBLIC_PORT && map.proto == wireserve_types::Proto::Tcp;
-            let rule = if tls && terminating.contains(&d.name) {
-                // The terminator checks the rest.
-                let sources = if grants.sign_in { None } else { sources.clone() };
-                ServiceRule::Terminated { vip, map, port: tls_port, sources }
-            } else {
-                ServiceRule::Mapped { vip, node, map, sources: sources.clone() }
-            };
-            rules.push(rule);
+            rules.push(ServiceRule::Mapped { vip, node, map, sources: sources.clone() });
         }
     }
     rules
@@ -1356,7 +1370,7 @@ mod tests {
     }
 
     #[test]
-    fn a_terminated_service_keeps_its_other_ports_and_its_443_target_reserved() {
+    fn a_terminated_service_keeps_its_other_ports_and_leaves_its_443_target_free() {
         let declared = vec![
             ServiceDecl::new("plex", vec![pm("443:32400"), pm("8443:32401")]),
             ServiceDecl::new("clash", vec![pm("80:32400")]),
@@ -1366,10 +1380,27 @@ mod tests {
             published("clash", NODE, Some(Ipv4Addr::new(10, 9, 0, 30))),
         ]);
         let rules = service_rules(&declared, Some(NODE), &dir, &open_all(&declared), None, &BTreeSet::from(["plex".to_string()]), TLS_PORT);
-        assert_eq!(rules.len(), 2, "{rules:?}");
+        assert_eq!(rules.len(), 3, "{rules:?}");
         assert!(matches!(&rules[0], ServiceRule::Terminated { vip, map, port, .. } if *vip == VIP && map.public == 443 && *port == TLS_PORT));
         assert!(matches!(&rules[1], ServiceRule::Mapped { map, .. } if map.public == 8443));
+        assert!(matches!(&rules[2], ServiceRule::Mapped { map, .. } if map.public == 80 && map.target == 32400));
         assert!(rules.iter().all(|r| r.remote_target().is_none()));
+    }
+
+    #[test]
+    fn plain_http_and_https_may_share_one_port() {
+        let dir = with_services(vec![terminated_entry("app", NODE, VIP)]);
+        for ports in [vec![pm("80:8080"), pm("443:8080")], vec![pm("443:8080"), pm("80:8080")]] {
+            let declared = vec![ServiceDecl::new("app", ports.clone())];
+            // Terminated: the terminator reaches 8080 itself, port 80 is rewritten.
+            let rules = service_rules(&declared, Some(NODE), &dir, &open_all(&declared), None, &BTreeSet::from(["app".to_string()]), TLS_PORT);
+            assert_eq!(rules.len(), 2, "{ports:?}: {rules:?}");
+            assert!(rules.iter().any(|r| matches!(r, ServiceRule::Terminated { map, .. } if map.public == 443)));
+            assert!(rules.iter().any(|r| matches!(r, ServiceRule::Mapped { map, .. } if map.public == 80)));
+            // Not terminated: 443 would be a second rewrite onto 8080, and the plain one keeps it.
+            let rules = service_rules(&declared, Some(NODE), &dir, &open_all(&declared), None, &BTreeSet::new(), TLS_PORT);
+            assert_eq!(rules, vec![ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("80:8080"), sources: None }], "{ports:?}");
+        }
     }
 
     #[test]

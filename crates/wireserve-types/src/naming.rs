@@ -15,7 +15,7 @@ use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Proto, ServiceInfo};
+use crate::ServiceInfo;
 
 /// The suffix services are named under, and what every node's terminator
 /// needs to serve them with TLS.
@@ -179,7 +179,7 @@ pub const TLS_LISTEN_PORT: u16 = 11443;
 /// Whether this service publishes [`TLS_PUBLIC_PORT`] over TCP.
 #[must_use]
 pub fn publishes_tls(s: &ServiceInfo) -> bool {
-    s.ports.iter().any(|m| m.public == TLS_PUBLIC_PORT && m.proto == Proto::Tcp)
+    s.ports.iter().any(crate::is_tls_map)
 }
 
 /// A service's own address: the one the coordinator gave it, else its

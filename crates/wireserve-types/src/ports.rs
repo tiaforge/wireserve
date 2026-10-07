@@ -153,7 +153,8 @@ pub fn validate_service_ports(maps: &[PortMap]) -> Result<(), String> {
 }
 
 /// Checks a node's mappings across ALL its services: no target (address
-/// and port) may be used by two mappings for the same protocol.
+/// and port) may be used by two mappings for the same protocol — except by
+/// a TCP 443 one, see [`targets_conflict`].
 ///
 /// The owner rewrites a reply back to the VIP and public port it came in
 /// on by matching the reply's source, which after the rewrite is only the
@@ -165,7 +166,7 @@ pub fn validate_service_ports(maps: &[PortMap]) -> Result<(), String> {
 pub fn validate_node_targets<'a>(maps: impl IntoIterator<Item = (&'a str, &'a PortMap)>) -> Result<(), String> {
     let mut seen: Vec<(&str, &PortMap)> = Vec::new();
     for (name, m) in maps {
-        if let Some((other, _)) = seen.iter().find(|(_, o)| same_target(o, m)) {
+        if let Some((other, _)) = seen.iter().find(|(_, o)| targets_conflict(o, m)) {
             return Err(format!("target {} of '{name}' is already mapped by '{other}'", target_label(m)));
         }
         seen.push((name, m));
@@ -178,6 +179,26 @@ pub fn validate_node_targets<'a>(maps: impl IntoIterator<Item = (&'a str, &'a Po
 #[must_use]
 pub fn same_target(a: &PortMap, b: &PortMap) -> bool {
     a.addr == b.addr && a.target == b.target && a.proto == b.proto
+}
+
+/// Whether `m` is the mapping that asks for TLS under the service's name
+/// (see [`crate::TLS_PUBLIC_PORT`]).
+#[must_use]
+pub fn is_tls_map(m: &PortMap) -> bool {
+    m.public == crate::TLS_PUBLIC_PORT && m.proto == Proto::Tcp
+}
+
+/// Whether `serve` must refuse `a` and `b` side by side: they land on the
+/// same target and neither is a TCP 443 mapping. The terminator answers 443
+/// and reaches the target over a socket of its own, so its replies never
+/// meet the reply rewrite; that lets `80:8080` and `443:8080` share one
+/// HTTP port — plain for a reverse proxy that does its own TLS, HTTPS for
+/// everyone else. While the terminator does not serve the 443 mapping it
+/// falls back to a plain rewrite, and the agent then gives the target to
+/// the other mapping (`service_rules`).
+#[must_use]
+pub fn targets_conflict(a: &PortMap, b: &PortMap) -> bool {
+    same_target(a, b) && !is_tls_map(a) && !is_tls_map(b)
 }
 
 /// `192.168.1.1:80/tcp`, or `80/tcp` for the node itself — for messages.
@@ -295,9 +316,22 @@ mod tests {
     }
 
     #[test]
+    fn a_443_mapping_may_share_its_target() {
+        let plain = pm(80, 8080, Proto::Tcp);
+        let tls = pm(443, 8080, Proto::Tcp);
+        validate_node_targets([("web", &plain), ("web", &tls)]).unwrap();
+        validate_node_targets([("web", &tls), ("api", &plain)]).unwrap();
+        // Only TCP 443 is answered by the terminator.
+        let other = pm(81, 8080, Proto::Tcp);
+        assert!(validate_node_targets([("web", &plain), ("web", &tls), ("web", &other)]).is_err());
+        let udp = pm(443, 8080, Proto::Udp);
+        assert!(validate_node_targets([("web", &pm(80, 8080, Proto::Udp)), ("web", &udp)]).is_err());
+    }
+
+    #[test]
     fn the_same_port_on_another_address_is_another_target() {
         let local = pm(80, 80, Proto::Tcp);
-        let router = remote(443, "192.168.178.1", 80);
+        let router = remote(8080, "192.168.178.1", 80);
         validate_node_targets([("web", &local), ("myrouter", &router)]).unwrap();
         let again = remote(8443, "192.168.178.1", 80);
         let err = validate_node_targets([("myrouter", &router), ("admin", &again)]).unwrap_err();

@@ -25,7 +25,7 @@ pub use firewall::{
 };
 pub use node::{NodeKind, Proto};
 pub use ports::{
-    is_valid_target_addr, same_target, target_label, validate_node_targets, validate_service_ports, PortMap,
+    is_tls_map, is_valid_target_addr, same_target, target_label, targets_conflict, validate_node_targets, validate_service_ports, PortMap,
     MAX_PORTS_PER_SERVICE,
 };
 pub use token::{hash_token, BEARER_TOKEN_PREFIX, JOIN_TOKEN_PREFIX};

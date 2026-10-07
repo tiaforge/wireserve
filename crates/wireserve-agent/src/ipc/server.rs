@@ -168,7 +168,7 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
                     false,
                 );
             }
-            // A target answers for one mapping per node; see
+            // A target answers for one mapping per node, 443 aside; see
             // `validate_node_targets`. Checked for this declaration against
             // the ones it would sit beside (not its own old version), and
             // only for this one: a hand-edited state file can hold two names
@@ -179,7 +179,7 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
             }
             for d in state.declared_services.iter().filter(|d| d.name != name) {
                 for theirs in d.ports.clone() {
-                    if let Some(m) = ports.iter().find(|m| wireserve_types::same_target(m, &theirs)) {
+                    if let Some(m) = ports.iter().find(|m| wireserve_types::targets_conflict(m, &theirs)) {
                         return (
                             IpcResponse::error(format!(
                                 "target {} is already mapped by '{}'",
@@ -807,9 +807,20 @@ mod tests {
     async fn the_same_port_on_another_address_is_not_a_clash() {
         let (ctx, _dir, _rx) = test_ctx();
         assert!(matches!(dispatch(&ctx, serve_req("web", &["80"])).await.0, IpcResponse::Ok));
-        assert!(matches!(dispatch(&ctx, serve_req("myrouter", &["443:192.168.178.1:80"])).await.0, IpcResponse::Ok));
+        assert!(matches!(dispatch(&ctx, serve_req("myrouter", &["8080:192.168.178.1:80"])).await.0, IpcResponse::Ok));
         let (resp, _) = dispatch(&ctx, serve_req("admin", &["8443:192.168.178.1:80"])).await;
         assert!(matches!(&resp, IpcResponse::Error { message } if message.contains("'myrouter'")), "{resp:?}");
+    }
+
+    #[tokio::test]
+    async fn plain_http_and_https_may_share_one_target() {
+        let (ctx, _dir, _rx) = test_ctx();
+        let (resp, _) = dispatch(&ctx, serve_req("app", &["80:8080", "443:8080"])).await;
+        assert!(matches!(resp, IpcResponse::Ok), "{resp:?}");
+        let (resp, _) = dispatch(&ctx, serve_req("other", &["443:8080"])).await;
+        assert!(matches!(resp, IpcResponse::Ok), "the terminator tells the two apart by address: {resp:?}");
+        let (resp, _) = dispatch(&ctx, serve_req("api", &["81:8080"])).await;
+        assert!(matches!(&resp, IpcResponse::Error { message } if message.contains("'app'")), "{resp:?}");
     }
 
     #[tokio::test]

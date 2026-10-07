@@ -17,7 +17,6 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use wireserve_types::tls::{Caller, TlsConfig, TlsRequest, TlsResponse, TlsService};
-use wireserve_types::{Proto, TLS_PUBLIC_PORT};
 
 use crate::state::AgentState;
 use crate::tls_link::TlsLink;
@@ -162,7 +161,7 @@ pub fn build_config(state: &AgentState) -> TlsConfig {
             let vip = crate::poll_loop::own_vip(&d.name, node, directory)?;
             // No entry: not served at all, as the firewall opens nothing.
             let access = access(&d.name)?;
-            let map = d.ports.clone().into_iter().find(|m| m.public == TLS_PUBLIC_PORT && m.proto == Proto::Tcp)?;
+            let map = d.ports.clone().into_iter().find(wireserve_types::is_tls_map)?;
             Some(TlsService {
                 name: d.name.clone(),
                 fqdn: format!("{}.{}", d.name, naming.domain),
