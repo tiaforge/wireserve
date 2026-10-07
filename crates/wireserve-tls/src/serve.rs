@@ -849,11 +849,16 @@ const UNTRUSTED_PREFIX: &[&str] = &["x-forwarded-", "x-original-", "x-remote-", 
 /// for. Never who it is.
 const FORWARDER_KEEPS: &[&str] = &["x-forwarded-for", "x-forwarded-host"];
 
+/// `name` is lowercase, as hyper hands it over. A name with an underscore is
+/// never passed on, whatever it says: WSGI, Rack and Django's ASGI handler
+/// give `X_Auth_User` and `X-Auth-User` one and the same name, so every
+/// header removed here would otherwise come through in that spelling
+/// (CVE-2026-3902, CVE-2025-64484). nginx drops them by default too.
 fn is_untrusted(name: &str, forwarder: bool, extra: &[String]) -> bool {
-    if name == NODE_HEADER {
+    if name.contains('_') || name == NODE_HEADER {
         return true;
     }
-    if extra.iter().any(|e| e == name) {
+    if extra.iter().any(|e| crate::sign_in::same_header(e, name)) {
         return true;
     }
     if forwarder && FORWARDER_KEEPS.contains(&name) {
@@ -907,6 +912,9 @@ fn started_elsewhere<B>(req: &Request<B>, fqdn: &str, websocket: bool, forwarder
 /// names the calling node. The forwarding headers are then set afresh by
 /// the proxy from the connection itself — never appended to what the client
 /// sent. `extra` is the operator's own list on top of the built-in one.
+/// First of all, what the client's `Connection` names goes
+/// ([`take_connection_options`]), so nothing set from here on can be named
+/// away; and any name with an underscore goes too ([`is_untrusted`]).
 ///
 /// `forwarder`: the caller is a node named in `WIRESERVE_FORWARDING_NODES`
 /// (PLAN.md M43), whose `X-Forwarded-For` and `X-Forwarded-Host` stay, cut
@@ -915,6 +923,7 @@ fn started_elsewhere<B>(req: &Request<B>, fqdn: &str, websocket: bool, forwarder
 /// backend sees the client the forwarding node saw, and the name it was
 /// asked for. The operator's own `extra` list still removes them.
 pub fn prepare(headers: &mut HeaderMap, caller: Option<&str>, forwarder: bool, extra: &[String]) {
+    take_connection_options(headers);
     let doomed: Vec<axum::http::HeaderName> =
         headers.keys().filter(|n| is_untrusted(n.as_str(), forwarder, extra)).cloned().collect();
     for name in doomed {
@@ -927,6 +936,48 @@ pub fn prepare(headers: &mut HeaderMap, caller: Option<&str>, forwarder: bool, e
         headers.insert(NODE_HEADER, node);
     }
     join_cookies(headers);
+}
+
+/// The options of `Connection` that are not header names. Everything else in
+/// it names a header of the client's own hop.
+const CONNECTION_OPTIONS: [&str; 3] = ["close", "keep-alive", "upgrade"];
+
+/// Removes the headers a client's `Connection` names (RFC 9110 §7.6.1),
+/// here and now, and leaves `Connection` holding only
+/// [`CONNECTION_OPTIONS`]. The proxy further on removes whatever
+/// `Connection` names too, and does it after `prepare` has named the calling
+/// node and `guard` the person: left to it, `Connection: x-auth-user` took
+/// the terminator's own identity headers away, and a client's underscore
+/// spelling of them reached the backend as the only one. `Host` is not the
+/// client's to drop: the request is routed and checked by it.
+fn take_connection_options(headers: &mut HeaderMap) {
+    use axum::http::header::{CONNECTION, HOST};
+    if !headers.contains_key(CONNECTION) {
+        return;
+    }
+    let tokens: Vec<String> = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    headers.remove(CONNECTION);
+    let (options, named): (Vec<&str>, Vec<&str>) =
+        tokens.iter().map(String::as_str).partition(|t| CONNECTION_OPTIONS.contains(t));
+    for name in named {
+        if let Ok(name) = axum::http::HeaderName::from_bytes(name.as_bytes()) {
+            if name != HOST {
+                headers.remove(name);
+            }
+        }
+    }
+    if !options.is_empty() {
+        if let Ok(v) = HeaderValue::from_str(&options.join(", ")) {
+            headers.insert(CONNECTION, v);
+        }
+    }
 }
 
 /// What a forwarding node can vouch for, and nothing it merely passed on
@@ -1273,6 +1324,36 @@ mod tests {
     }
 
     #[test]
+    fn an_underscore_spelling_never_arrives_and_connection_names_nothing_added_later() {
+        let mut h = HeaderMap::new();
+        for (k, v) in [
+            ("x_auth_user", "admin"),
+            ("remote_user", "admin"),
+            ("x_forwarded_for", "10.0.0.1"),
+            ("x_wireserve_node", "admin-laptop"),
+            ("x_corp-user", "admin"),
+            ("host", "svc.test"),
+            ("x-nominated", "gone"),
+            ("x-custom", "kept"),
+        ] {
+            h.insert(axum::http::HeaderName::from_static(k), HeaderValue::from_static(v));
+        }
+        h.insert("connection", HeaderValue::from_static("keep-alive, X-Auth-User, x-wireserve-node, host, x-nominated, upgrade"));
+        // The operator's addition, spelled with an underscore.
+        prepare(&mut h, Some("phone"), false, &["x_corp_user".to_string()]);
+        let mut left: Vec<&str> = h.keys().map(|k| k.as_str()).collect();
+        left.sort_unstable();
+        assert_eq!(left, ["connection", "host", "x-custom", NODE_HEADER]);
+        assert_eq!(h["connection"], "keep-alive, upgrade", "only the options stay");
+        assert_eq!(h[NODE_HEADER], "phone", "named after `Connection` was dealt with");
+
+        let mut h = HeaderMap::new();
+        h.insert("connection", HeaderValue::from_static("x-auth-user"));
+        prepare(&mut h, None, false, &[]);
+        assert!(h.get("connection").is_none(), "nothing left to say");
+    }
+
+    #[test]
     fn a_forwarding_node_may_name_its_client_and_nothing_more() {
         let sent = |h: &mut HeaderMap| {
             for (k, v) in [
@@ -1392,6 +1473,51 @@ mod tests {
         shared.forwarders.write().unwrap().push("Edge".into());
         let answer = ask().await;
         assert!(answer.ends_with("xff=203.0.113.9, 127.0.0.1 xfh=files.example.com"), "{answer}");
+    }
+
+    /// A backend that answers with every header it got, sorted, one a line.
+    async fn header_echo() -> SocketAddr {
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            let app = axum::Router::new().fallback(|h: HeaderMap| async move {
+                let mut out: Vec<String> = h.iter().map(|(k, v)| format!("{k}={}", v.to_str().unwrap_or("?"))).collect();
+                out.sort();
+                format!("\n{}\n", out.join("\n"))
+            });
+            axum::serve(backend, app).await.unwrap();
+        });
+        upstream
+    }
+
+    #[tokio::test]
+    async fn a_device_cannot_swap_its_owners_identity_for_one_of_its_own() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (port, client, shared) = in_front_of(header_echo().await, quick());
+        shared.callers.write().unwrap().insert(Ipv4Addr::LOCALHOST, CallerInfo {
+            node: "phone".into(),
+            owner: Some(wireserve_types::CallerIdentity {
+                addr: Ipv4Addr::LOCALHOST,
+                user: "anna".into(),
+                email: None,
+                groups: vec!["family".into()],
+            }),
+        });
+        let mut c = tls(port, &client).await;
+        c.write_all(
+            b"GET / HTTP/1.1\r\nhost: svc.test\r\nconnection: close, x-auth-user, x-auth-groups, x-wireserve-node\r\n\
+              X_Auth_User: admin\r\nX_Auth_Email: boss@example.com\r\nX_Auth_Groups: admins\r\nRemote_User: admin\r\n\
+              X_Forwarded_For: 10.0.0.1\r\nX_Wireserve_Node: admin-laptop\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut answer = String::new();
+        c.read_to_string(&mut answer).await.unwrap();
+        assert!(!answer.contains('_'), "no underscore spelling reaches the backend: {answer}");
+        for line in ["\nx-auth-user=anna\n", "\nx-auth-groups=family\n", "\nx-wireserve-node=phone\n"] {
+            assert!(answer.contains(line), "{line:?} in {answer}");
+        }
+        assert!(!answer.contains("x-auth-email"), "anna has no email to name: {answer}");
     }
 
     #[tokio::test]
@@ -1654,7 +1780,7 @@ mod tests {
                             *no.status_mut() = tungstenite::http::StatusCode::FORBIDDEN;
                             return Err(no);
                         }
-                        for name in ["x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "x-wireserve-node", "cookie", "host"] {
+                        for name in ["x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "x-wireserve-node", "x_wireserve_node", "cookie", "host"] {
                             let values: Vec<&str> = req.headers().get_all(name).iter().map(|v| v.to_str().unwrap()).collect();
                             seen.push_str(&format!("{name}={}\n", values.join("|")));
                         }
@@ -1737,6 +1863,20 @@ mod tests {
         ws.send(Message::binary(vec![0u8, 1, 2, 255])).await.unwrap();
         let back = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
         assert_eq!(back.into_data().as_ref(), &[0u8, 1, 2, 255]);
+    }
+
+    #[tokio::test]
+    async fn a_websocket_cannot_swap_the_callers_name_for_one_of_its_own() {
+        use tungstenite::client::IntoClientRequest;
+        let (port, client, shared) = in_front_of(ws_backend().await, quick());
+        shared.callers.write().unwrap().insert(Ipv4Addr::LOCALHOST, CallerInfo { node: "phone".into(), owner: None });
+        let mut req = "wss://svc.test/socket".into_client_request().unwrap();
+        req.headers_mut().insert("connection", "Upgrade, x-wireserve-node".parse().unwrap());
+        req.headers_mut().insert("x_wireserve_node", "admin-laptop".parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::client_async(req, tls(port, &client).await).await.expect("upgraded");
+        let seen = next_text(&mut ws).await;
+        assert!(seen.contains("x-wireserve-node=phone\n"), "{seen}");
+        assert!(seen.contains("x_wireserve_node=\n"), "{seen}");
     }
 
     #[tokio::test]

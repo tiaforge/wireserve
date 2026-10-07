@@ -4701,3 +4701,33 @@ to fix. The first three, together:
       session's own `last_used_at`.
     Tests: the button and the refused cross-site POSTs, nothing kept for
     someone not admitted (`oidc_flow.rs`), the per-person cap.
+
+## Security review, 2026-10-07
+
+A fresh review of the whole tree after 1.0.0-beta.1, done without leaning on
+the earlier ones. Two things to fix:
+
+314. **No identity in a spelling the terminator didn't strip, and none
+    named away** (2026-10-07).
+    - *Underscores.* The terminator removed the identity headers,
+      `X-Wireserve-Node`, `Remote-User`, `X-Forwarded-*` and the
+      operator's list by their exact names. WSGI servers, Rack and Django's
+      ASGI handler (before CVE-2026-3902) read `X_Auth_User` as
+      `HTTP_X_AUTH_USER`, the same as `X-Auth-User`. So any device let into a
+      service could name itself to such a backend as anyone: it was the
+      same bug as oauth2-proxy's CVE-2025-64484. Now every header whose name
+      has an underscore is removed, as nginx does by default, and the
+      operator's identity and strip names match `_` as `-`, case aside
+      (`sign_in::same_header`).
+    - *`Connection`.* The proxy (axum-reverse-proxy, and `upgrade.rs` for
+      WebSockets) removes whatever a client's `Connection` names, after
+      `guard` has set the identity headers. `Connection: x-auth-user` took
+      the terminator's own away, which left a client's underscore spelling
+      as the only one. That also defeats Puma's fix, which drops the
+      underscore copy only when the dash one is there. Now `prepare`
+      removes what `Connection` names first, as RFC 9110 §7.6.1 has a proxy
+      do, and leaves only `close`, `keep-alive` and `upgrade` in it. `Host`
+      is kept: the request is routed and checked by it.
+    Tests: `prepare` with underscore names and a `Connection` list; a
+    device with an owner sending both tricks through a real terminator
+    (the backend sees anna, not admin); the same over a WebSocket.

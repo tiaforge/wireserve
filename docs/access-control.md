@@ -226,7 +226,11 @@ Worth knowing:
   `X-Forwarded-*`, `X-Original-*`, `X-Auth-Request-*` and `X-WebAuth-*`,
   `Remote-User` and its kin, `X-Real-IP`, `True-Client-IP` and the like. A
   backend that trusts a header of its own naming adds it to
-  `WIRESERVE_STRIP_HEADERS` on the coordinator.
+  `WIRESERVE_STRIP_HEADERS` on the coordinator. Any header whose name has an
+  underscore is removed too, as nginx does by default: Python and Ruby
+  servers read `X_Auth_User` as `X-Auth-User`. And a client cannot list a
+  header in `Connection` to have the terminator's own taken away on the way
+  to the backend.
 - **A reverse proxy of your own can name its client.** A node listed in
   `WIRESERVE_FORWARDING_NODES` on the coordinator — a Caddy on a public host
   proxying into the mesh — keeps the last entry of its `X-Forwarded-For`

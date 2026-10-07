@@ -402,11 +402,23 @@ fn page(status: StatusCode, message: &'static str, fqdn: &str) -> Response<Body>
 }
 
 /// Removes every identity header, so none a client supplied survives —
-/// on every request, whether or not anything fills them in again.
+/// on every request, whether or not anything fills them in again. Matched
+/// as a backend that takes `_` for `-` would read them (see [`same_header`]),
+/// so an operator's `remote_user` also takes a client's `Remote-User` away.
 pub fn strip_identity(headers: &mut HeaderMap, identity: &IdentityHeaders) {
-    for name in identity.names() {
+    let doomed: Vec<axum::http::HeaderName> =
+        headers.keys().filter(|k| identity.names().iter().any(|n| same_header(n, k.as_str()))).cloned().collect();
+    for name in doomed {
         headers.remove(name);
     }
+}
+
+/// Whether two header names are one to a backend: case aside, and `_` taken
+/// for `-`, as WSGI, Rack and Django's ASGI handler take it.
+#[must_use]
+pub fn same_header(a: &str, b: &str) -> bool {
+    let fold = |c: u8| if c == b'_' { b'-' } else { c.to_ascii_lowercase() };
+    a.len() == b.len() && a.bytes().zip(b.bytes()).all(|(x, y)| fold(x) == fold(y))
 }
 
 /// Removes the cookie `cookie` from the `Cookie` headers, leaving every
@@ -445,6 +457,21 @@ pub fn plain(status: StatusCode, text: &'static str) -> Response<Body> {
 pub(crate) mod tests {
     use super::*;
     use wireserve_types::tls::{TlsRequest, TlsResponse};
+
+    #[test]
+    fn an_identity_header_goes_in_every_spelling_a_backend_reads_as_it() {
+        assert!(same_header("x-auth-user", "X_Auth_User"));
+        assert!(!same_header("x-auth-user", "x-auth-users"));
+        assert!(!same_header("x-auth-user", "x-auth-usex"));
+        let identity = IdentityHeaders { user: "remote_user".into(), ..IdentityHeaders::default() };
+        let mut h = HeaderMap::new();
+        for (k, v) in [("remote-user", "admin"), ("x-auth-email", "boss@example.com"), ("x-request-id", "1")] {
+            h.insert(axum::http::HeaderName::from_static(k), HeaderValue::from_static(v));
+        }
+        strip_identity(&mut h, &identity);
+        let left: Vec<&str> = h.keys().map(|k| k.as_str()).collect();
+        assert_eq!(left, ["x-request-id"]);
+    }
 
     pub(crate) const SEED: [u8; 32] = [5; 32];
 
