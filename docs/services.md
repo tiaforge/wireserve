@@ -52,6 +52,15 @@ Once approved, the declaration takes effect on the next poll: the service's
 address is routed to its node and its name appears in every other node's
 hosts file.
 
+**An approval covers where the service leads**: the addresses it forwards
+to (the node itself, or a device on its LAN), and whether it answers on TCP
+443, which gets its node a certificate for the name. Changing a port keeps
+the approval. A declaration that adds a target address, or 443, waits for an
+admin again, out of the directory and closed by its node's firewall until
+then. `wireserve status` says why, and `wireserve-admin service list` shows
+what was approved before. Going back to what was approved brings the approval
+back without an admin.
+
 ```sh
 wireserve openobserve 80:5080          # openobserve.wg:80 -> :5080
 wireserve mydns 53/udp 53/tcp 8080:8000 # several ports, TCP and UDP
@@ -136,8 +145,9 @@ back into the mesh, so unlike a service on the node, **the client's address
 is not preserved**. Everything else works the same: approval, the name, only
 the published port answering, and (on 443) HTTPS from the node's
 terminator. What an admin approves includes the address:
-`wireserve-admin service list` shows `443:192.168.178.1:80/tcp`. The rest
-of the mesh only ever sees `443:80/tcp`.
+`wireserve-admin service list` shows `443:192.168.178.1:80/tcp`, and another
+address later waits for approval again. The rest of the mesh only ever sees
+`443:80/tcp`.
 
 - **IPv4 only**, and a literal address, not a hostname. A service's own
   address is IPv4, and the kernel can't forward an IPv4 connection to an

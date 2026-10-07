@@ -123,6 +123,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0022_owner_emails_verified.sql")),
         M::up(include_str!("../../migrations/0023_sign_in_sessions.sql")),
         M::up(include_str!("../../migrations/0024_sign_in_ticket_bind.sql")),
+        M::up(include_str!("../../migrations/0025_approved_ports.sql")),
     ])
 }
 
@@ -384,6 +385,39 @@ mod tests {
         assert_eq!(approved[0].name, "plex");
         assert!(approved[0].approved_at.is_some());
         assert!(approved[0].denied_at.is_none());
+    }
+
+    #[test]
+    fn migration_records_every_approval_as_given_to_the_declaration_as_it_stands() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        migrations().to_version(&mut conn, 24).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (name, kind, pubkey, ip4, ip6, join_token_used) \
+             VALUES ('n1', 'agent', 'pk1', '100.90.0.1', 'fd00:90::1', 1)",
+            [],
+        )
+        .unwrap();
+        let node_id = conn.last_insert_rowid();
+        for (name, approved, denied) in [("plex", true, false), ("wait", false, false), ("no", false, true)] {
+            conn.execute(
+                "INSERT INTO services (node_id, name, port, proto, ports, approved_at, denied_at) \
+                 VALUES (?1, ?2, 80, 'tcp', '[{\"public\":80,\"target\":80,\"proto\":\"tcp\"}]', ?3, ?4)",
+                rusqlite::params![
+                    node_id,
+                    name,
+                    approved.then_some("2026-10-01T00:00:00Z"),
+                    denied.then_some("2026-10-01T00:00:00Z"),
+                ],
+            )
+            .unwrap();
+        }
+        migrations().to_latest(&mut conn).unwrap();
+        let row = |name: &str| crate::db::services::find_by_name(&conn, name).unwrap().unwrap();
+        assert_eq!(row("plex").approved_ports, Some(row("plex").ports), "an approval covers what it was given to");
+        assert!(row("wait").approved_ports.is_none(), "never approved");
+        assert!(row("no").approved_ports.is_none(), "denied");
+        assert!(!row("plex").is_awaiting_review() && !row("wait").is_awaiting_review());
     }
 
     #[test]

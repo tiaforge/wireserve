@@ -44,6 +44,11 @@ pub fn services(services: &[AdminServiceInfo]) -> String {
             let ports = s.ports.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ");
             let mut row = vec![clean(&s.name), clean(&s.node), state.into(), opt(s.vip4.as_deref()), ports, list(&s.groups)];
             let mut note = s.denied_reason.as_deref().map(clean).unwrap_or_default();
+            // Waiting again (PLAN.md #315): what the approval was given to.
+            if !s.approved_ports.is_empty() {
+                let was = s.approved_ports.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ");
+                note = format!("approved before as {was}");
+            }
             if dns {
                 row.push(
                     match &s.dns {
@@ -365,6 +370,7 @@ mod tests {
             approved_at: None,
             denied_at: None,
             denied_reason: None,
+            approved_ports: vec![],
             groups: vec!["default".into()],
             dns: None,
         }
@@ -397,6 +403,20 @@ mod tests {
 SERVICE              NODE    STATE     ADDRESS   PORTS                        GROUPS
 a-long-service-name  strato  approved  10.1.0.9  80:3000/tcp                  infra,media
 dns                  lego2   pending   10.1.0.9  53/udp 53/tcp 8080:8000/tcp  default
+"
+        );
+    }
+
+    #[test]
+    fn a_service_waiting_again_shows_what_was_approved() {
+        let mut again = svc("router", "lego2", ServiceApprovalState::Pending, &["443:192.168.178.1:80"]);
+        again.approved_ports = vec!["80:8080".parse().unwrap()];
+        let out = services(&[again]);
+        assert_eq!(
+            out,
+            "\
+SERVICE  NODE   STATE    ADDRESS   PORTS                     GROUPS   NOTE
+router   lego2  pending  10.1.0.9  443:192.168.178.1:80/tcp  default  approved before as 80:8080/tcp
 "
         );
     }

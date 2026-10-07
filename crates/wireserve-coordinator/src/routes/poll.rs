@@ -252,6 +252,16 @@ pub async fn poll(
     };
     let mut outcome = services::upsert_for_node(&mut conn, node.id, desired, mode, &state.config.net_v4_cidr)?;
     outcome.notices.extend(refused);
+    for review in &outcome.reviews {
+        match review {
+            services::Review::Again { name, why } => {
+                tracing::info!(event = "service_pending_approval", node_name = %node.name, service = %name, reason = %why);
+            }
+            services::Review::Restored { name } => {
+                tracing::info!(event = "service_approval_restored", node_name = %node.name, service = %name);
+            }
+        }
+    }
     // Which of its services this node serves with TLS right now (PLAN.md
     // M33). Replaced wholesale, so a name left out stops being terminated
     // on this very poll; only names the node owns are kept.
@@ -407,12 +417,14 @@ pub async fn poll(
 
     // Who may reach each of this node's own services (PLAN.md M36), pending
     // ones included, so its firewall is ready the moment approval publishes
-    // them. Sent to this node alone.
+    // them. Sent to this node alone. Not one waiting for an admin again
+    // (PLAN.md #315): its address is in phone configs exported while it was
+    // approved, and the node's firewall is what keeps them from the change.
     let owner_capable = sign_in_capable(&node);
     let own_rows = services::list_for_node(&conn, node.id)?;
     let access: Vec<wireserve_types::ServiceAccess> = own_rows
         .iter()
-        .filter(|s| s.denied_at.is_none() || s.approved_at.is_some())
+        .filter(|s| (s.denied_at.is_none() || s.approved_at.is_some()) && !s.is_awaiting_review())
         .map(|s| {
             let facts = crate::access::SignInFacts { available, owner_capable, terminated: ctx.terminates(s) };
             crate::access::service_access(s, &node, &all_peers, &rules, &facts)

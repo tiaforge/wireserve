@@ -184,6 +184,7 @@ mod tests {
             approved_at: None,
             denied_at: None,
             denied_reason: None,
+            approved_ports: None,
         }
     }
 

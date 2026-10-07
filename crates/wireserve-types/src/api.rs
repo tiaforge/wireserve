@@ -720,6 +720,11 @@ pub struct AdminServiceInfo {
     pub denied_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub denied_reason: Option<String>,
+    /// What an admin last approved, while a declaration that went past it
+    /// waits for approval again (PLAN.md #315): its target addresses, or
+    /// TCP 443. Empty otherwise.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub approved_ports: Vec<PortMap>,
     /// The service groups it is in (PLAN.md M36): its explicit ones, or
     /// `default`. They belong to the name, so they survive a withdraw and
     /// re-declare.

@@ -1757,6 +1757,48 @@ async fn approving_propagates_the_service_and_clears_the_pending_report() {
 }
 
 #[tokio::test]
+async fn a_change_past_the_approval_leaves_the_directory_and_the_owners_firewall_until_approved() {
+    // PLAN.md #315: an approval covers where the service leads. A LAN
+    // target added later waits for an admin, and meanwhile the owner is
+    // sent no access for it: phones exported while it was approved still
+    // route its address to the owner.
+    let app = approval_app();
+    let t1 = admin_create_node(&app.router, "n1").await;
+    let r1 = register_node(&app.router, &t1, "n1", 51820).await;
+    let bearer1 = r1["bearer_token"].as_str().unwrap().to_string();
+    declare(&app.router, &bearer1, "plex").await;
+    assert_eq!(admin_post(&app.router, "/admin/nodes/n1/services/plex/approve").await, StatusCode::OK);
+    let body = declare(&app.router, &bearer1, "plex").await;
+    assert!(body["access"].as_array().unwrap().iter().any(|a| a["name"] == "plex"), "{body}");
+
+    let changed = json!({ "services": [{ "name": "plex", "ports": [
+        {"public": 32400, "target": 32400, "proto": "tcp"},
+        {"public": 443, "target": 80, "proto": "tcp", "addr": "192.168.178.1"},
+    ] }] });
+    let poll = |payload: Value| {
+        let router = app.router.clone();
+        let bearer = bearer1.clone();
+        async move { body_json(router.oneshot(json_request("POST", "/poll", Some(&bearer), payload)).await.unwrap()).await }
+    };
+    let body = poll(changed.clone()).await;
+    assert!(body["services"].as_array().unwrap().is_empty(), "out of the directory: {body}");
+    assert_eq!(body["pending_services"][0]["name"], "plex", "{body}");
+    assert!(body.get("access").and_then(Value::as_array).is_none_or(|a| a.iter().all(|a| a["name"] != "plex")), "{body}");
+    let why = body["service_notices"][0]["reason"].as_str().unwrap();
+    assert!(why.contains("192.168.178.1"), "{why}");
+
+    let req = raw_request("GET", "/admin/services", Some(&format!("Bearer {ADMIN}")));
+    let admin = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
+    assert_eq!(admin["services"][0]["state"], "pending", "{admin}");
+    assert_eq!(admin["services"][0]["approved_ports"][0]["target"], 32400, "what was approved: {admin}");
+
+    assert_eq!(admin_post(&app.router, "/admin/nodes/n1/services/plex/approve").await, StatusCode::OK);
+    let body = poll(changed).await;
+    assert_eq!(body["services"][0]["name"], "plex", "{body}");
+    assert!(body["access"].as_array().unwrap().iter().any(|a| a["name"] == "plex"), "{body}");
+}
+
+#[tokio::test]
 async fn approving_for_the_wrong_node_is_refused_and_changes_nothing() {
     // Approval binds to (name, node). An operator acting on a stale view
     // of who owns what must get a 409 naming the real owner, never a

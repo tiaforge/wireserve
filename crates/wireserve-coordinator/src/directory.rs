@@ -153,6 +153,11 @@ pub fn admin_service_info(service: &ServiceRow, owner: &NodeRow, groups: Vec<Str
         approved_at: service.approved_at,
         denied_at: service.denied_at,
         denied_reason: service.denied_reason.clone(),
+        approved_ports: if service.is_awaiting_review() {
+            service.approved_ports.clone().unwrap_or_default()
+        } else {
+            Vec::new()
+        },
         groups,
         dns: None,
     }
@@ -223,6 +228,7 @@ mod tests {
             approved_at: Some(Utc::now()),
             denied_at: None,
             denied_reason: None,
+            approved_ports: None,
         };
         let info = service_info(&svc, &n, 180, false);
         assert!(info.online);
@@ -240,6 +246,7 @@ mod tests {
             approved_at: Some(Utc::now()),
             denied_at: None,
             denied_reason: None,
+            approved_ports: None,
         };
         let fanned = service_info(&svc, &n, 180, false);
         assert_eq!(fanned.ports[0].addr, None);

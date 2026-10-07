@@ -20,6 +20,10 @@ pub struct ServiceRow {
     pub approved_at: Option<DateTime<Utc>>,
     pub denied_at: Option<DateTime<Utc>>,
     pub denied_reason: Option<String>,
+    /// The mappings as they stood when an admin approved them (PLAN.md
+    /// #315, migration 0025). `None` on a row never approved, and on a
+    /// denied one.
+    pub approved_ports: Option<Vec<PortMap>>,
 }
 
 impl ServiceRow {
@@ -28,6 +32,47 @@ impl ServiceRow {
     pub fn is_approved(&self) -> bool {
         self.approved_at.is_some() && self.denied_at.is_none()
     }
+
+    /// Approved once, waiting for an admin again since its declaration
+    /// went past what was approved ([`needs_review`]).
+    #[must_use]
+    pub fn is_awaiting_review(&self) -> bool {
+        self.approved_at.is_none() && self.denied_at.is_none() && self.approved_ports.is_some()
+    }
+}
+
+/// Why `declared` needs an admin to approve it again, after `approved` was
+/// (PLAN.md #315); `None` while it stays inside what was approved.
+///
+/// An approval covers the name and where it leads: the target addresses
+/// (the node itself, or a device on its LAN) and whether it answers on TCP
+/// 443, where its node can get a certificate for the name and every
+/// sign-in's session there. A port changing on a target already approved
+/// does not count: that node's own listener is its own business, and a
+/// re-approval each time would take a working service out of the
+/// directory until an admin noticed.
+#[must_use]
+pub fn needs_review(approved: &[PortMap], declared: &[PortMap]) -> Option<String> {
+    let tls = |maps: &[PortMap]| {
+        maps.iter().any(|m| m.public == wireserve_types::TLS_PUBLIC_PORT && m.proto == wireserve_types::Proto::Tcp)
+    };
+    let mut why: Vec<String> = Vec::new();
+    let mut new_targets: Vec<Option<std::net::Ipv4Addr>> = Vec::new();
+    for m in declared {
+        if !approved.iter().any(|a| a.addr == m.addr) && !new_targets.contains(&m.addr) {
+            new_targets.push(m.addr);
+        }
+    }
+    for t in new_targets {
+        why.push(match t {
+            Some(addr) => format!("it now forwards to {addr}"),
+            None => "it now forwards to its node's own ports".to_string(),
+        });
+    }
+    if tls(declared) && !tls(approved) {
+        why.push("it now answers on TCP 443, which gets its node a certificate for the name".to_string());
+    }
+    (!why.is_empty()).then(|| why.join("; "))
 }
 
 /// Parses a timestamp written either as RFC3339 (everything this code
@@ -67,6 +112,9 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRow> {
         approved_at: dt("approved_at")?,
         denied_at: dt("denied_at")?,
         denied_reason: row.get("denied_reason")?,
+        approved_ports: row
+            .get::<_, Option<String>>("approved_ports")?
+            .map(|json| serde_json::from_str(&json).unwrap_or_default()),
     })
 }
 
@@ -105,8 +153,20 @@ impl ApprovalMode {
 pub struct UpsertOutcome {
     pub pending: Vec<ServiceRow>,
     pub denied: Vec<ServiceRow>,
-    /// What the node should know about the groups it named (PLAN.md M36).
+    /// What the node should know about the groups it named (PLAN.md M36),
+    /// and about a declaration that went past its approval (PLAN.md #315).
     pub notices: Vec<wireserve_types::ServiceNotice>,
+    /// Approvals this declaration took back or gave back, for the log.
+    pub reviews: Vec<Review>,
+}
+
+/// What [`upsert_for_node`] did to one approved name (PLAN.md #315).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Review {
+    /// Its declaration went past what was approved; it waits again, for this.
+    Again { name: String, why: String },
+    /// Its declaration came back inside what was approved.
+    Restored { name: String },
 }
 
 pub fn list_for_node(conn: &Connection, node_id: i64) -> Result<Vec<ServiceRow>, DbError> {
@@ -175,14 +235,14 @@ fn owner_of(conn: &Connection, name: &str) -> Result<Option<i64>, DbError> {
 ///
 /// Approval behaviour, all of it in the `ON CONFLICT` clause:
 ///
-/// * **An existing approval survives a port or proto change.** What the
-///   admin approved is the *name binding*, and the name is the part that
-///   reaches every other node's `/etc/hosts`. The port is the node's own
-///   business — it already controls its listener and its own firewall
-///   hole (spec §5), and a peer can reach that port by IP with or
-///   without a directory entry. Re-approving on every `serve plex 32401`
-///   would also drop a working service out of the directory for as long
-///   as the admin took to notice.
+/// * **An existing approval survives a port or proto change, and nothing
+///   more** (PLAN.md #315). What the admin approved is the name and where
+///   it leads: its target addresses, and whether it answers on TCP 443. A
+///   declaration going past that waits for an admin again ([`review`],
+///   [`needs_review`]); a changed port on a target already approved does
+///   not, since re-approving on every `serve plex 32401` would drop a
+///   working service out of the directory for as long as the admin took to
+///   notice.
 /// * **A denied row re-declared stays denied.** `excluded.approved_at` is
 ///   NULL under `RequireApproval`, so the `COALESCE` keeps NULL and the
 ///   `CASE` preserves `denied_at`. Denial is sticky across the
@@ -296,6 +356,7 @@ pub fn upsert_for_node(
 
     let now = super::nodes::now_str();
     let stamp = mode.stamp();
+    let mut reviews = Vec::new();
     for ServiceDecl { name, ports, group } in accepted {
         // `port` and `proto` are the first mapping's target, kept only
         // because the columns are NOT NULL from migration 0001; nothing
@@ -320,6 +381,7 @@ pub fn upsert_for_node(
              WHERE node_id = excluded.node_id",
             rusqlite::params![node_id, name, port, proto.as_str(), now, stamp, ports_json, group],
         )?;
+        reviews.extend(review(&tx, node_id, name, mode)?);
         assign_vip(&tx, node_id, name, vip_range)?;
         super::grants::promote_declared_group(&tx, name)?;
     }
@@ -344,11 +406,62 @@ pub fn upsert_for_node(
         let denied: Vec<ServiceRow> = denied
             .query_map([node_id], map_row)?
             .collect::<Result<_, _>>()?;
-        UpsertOutcome { pending, denied, notices }
+        // Said on every poll while it waits: the agent keeps only the
+        // latest poll's notices.
+        for row in pending.iter().filter(|r| r.is_awaiting_review()) {
+            let why = needs_review(row.approved_ports.as_deref().unwrap_or_default(), &row.ports)
+                .unwrap_or_else(|| "what it declares changed since it was approved".to_string());
+            notices.push(notice(&row.name, format!("waiting for an admin to approve it again: {why}")));
+        }
+        UpsertOutcome { pending, denied, notices, reviews }
     };
 
     tx.commit()?;
     Ok(outcome)
+}
+
+/// Keeps `name`'s approval to what an admin approved (PLAN.md #315). With
+/// approval required, an approved declaration that went past it
+/// ([`needs_review`]) waits for an admin again — out of the directory, its
+/// public name and its certificate with it — and one waiting that came back
+/// inside it is approved again. With approval off, what is declared is what
+/// is approved.
+fn review(tx: &Connection, node_id: i64, name: &str, mode: ApprovalMode) -> Result<Option<Review>, DbError> {
+    let Some(row) = row_for_name(tx, name)?.filter(|r| r.node_id == node_id) else {
+        return Ok(None);
+    };
+    let params = rusqlite::params![name, node_id];
+    match mode {
+        ApprovalMode::AutoApprove => {
+            if row.is_approved() {
+                tx.execute("UPDATE services SET approved_ports = ports WHERE name = ?1 AND node_id = ?2", params)?;
+            }
+            Ok(None)
+        }
+        ApprovalMode::RequireApproval => {
+            let approved = row.approved_ports.as_deref().unwrap_or_default();
+            if row.is_approved() {
+                let Some(why) = needs_review(approved, &row.ports) else {
+                    return Ok(None);
+                };
+                // An approval with nothing on record approved nothing.
+                tx.execute(
+                    "UPDATE services SET approved_at = NULL, approved_ports = COALESCE(approved_ports, '[]') \
+                     WHERE name = ?1 AND node_id = ?2",
+                    params,
+                )?;
+                Ok(Some(Review::Again { name: name.to_string(), why }))
+            } else if row.is_awaiting_review() && needs_review(approved, &row.ports).is_none() {
+                tx.execute(
+                    "UPDATE services SET approved_at = ?1 WHERE name = ?2 AND node_id = ?3",
+                    rusqlite::params![super::nodes::now_str(), name, node_id],
+                )?;
+                Ok(Some(Review::Restored { name: name.to_string() }))
+            } else {
+                Ok(None)
+            }
+        }
+    }
 }
 
 fn notice(name: &str, reason: String) -> wireserve_types::ServiceNotice {
@@ -526,7 +639,7 @@ pub fn approve(conn: &Connection, node_id: i64, name: &str, vip_range: &str) -> 
         return Ok(ApproveOutcome::AlreadyApproved);
     }
     tx.execute(
-        "UPDATE services SET approved_at = ?1, denied_at = NULL, denied_reason = NULL \
+        "UPDATE services SET approved_at = ?1, denied_at = NULL, denied_reason = NULL, approved_ports = ports \
          WHERE name = ?2 AND node_id = ?3",
         // The `AND node_id = ?3` is redundant given the check above and
         // stays anyway: it is the last line of defence for the
@@ -573,8 +686,8 @@ pub fn deny(
         return Ok(DenyOutcome::AlreadyDenied);
     }
     tx.execute(
-        "UPDATE services SET denied_at = ?1, denied_reason = ?2, approved_at = NULL, vip4 = NULL \
-         WHERE name = ?3 AND node_id = ?4",
+        "UPDATE services SET denied_at = ?1, denied_reason = ?2, approved_at = NULL, approved_ports = NULL, \
+         vip4 = NULL WHERE name = ?3 AND node_id = ?4",
         rusqlite::params![super::nodes::now_str(), reason, name, node_id],
     )?;
     tx.commit()?;
@@ -945,6 +1058,101 @@ mod tests {
         let rows = list_approved(&conn).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ports, vec![PortMap::identity(32401, Proto::Tcp)]);
+    }
+
+    fn maps(list: &[&str]) -> Vec<PortMap> {
+        list.iter().map(|m| m.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn an_approval_covers_its_targets_and_whether_it_answers_on_443() {
+        let approved = maps(&["80:32400", "443:192.168.178.1:80"]);
+        assert_eq!(needs_review(&approved, &maps(&["8080:32401", "443:192.168.178.1:8443"])), None, "ports alone");
+        assert_eq!(
+            needs_review(&approved, &maps(&["443:192.168.178.2:80"])).as_deref(),
+            Some("it now forwards to 192.168.178.2"),
+        );
+        assert_eq!(
+            needs_review(&maps(&["443:192.168.178.1:80"]), &maps(&["443:192.168.178.1:80", "22"])).as_deref(),
+            Some("it now forwards to its node's own ports"),
+        );
+        let why = needs_review(&maps(&["80:32400"]), &maps(&["80:32400", "443:32400"])).unwrap();
+        assert!(why.starts_with("it now answers on TCP 443"), "{why}");
+        assert_eq!(needs_review(&maps(&["443/udp"]), &maps(&["443"])).as_deref().map(|w| w.contains("443")), Some(true));
+        assert!(needs_review(&[], &maps(&["80"])).is_some(), "nothing on record approved nothing");
+    }
+
+    #[tokio::test]
+    async fn going_past_an_approval_waits_for_an_admin_again_and_coming_back_does_not() {
+        let db = Db::open_in_memory_for_test();
+        let id = node_with_id(&db, "n1", "h1").await;
+        let mut conn = db.conn.lock().await;
+        let declare = |conn: &mut Connection, list: &[&str]| {
+            upsert_for_node(conn, id, &[mapped("plex", list)], ApprovalMode::RequireApproval, RANGE).unwrap()
+        };
+        declare(&mut conn, &["80:32400"]);
+        approve(&conn, id, "plex", RANGE).unwrap();
+        let vip = vip_of(&conn, "plex");
+
+        let out = declare(&mut conn, &["80:32400", "443:192.168.178.1:80"]);
+        assert_eq!(out.pending.len(), 1, "back to waiting");
+        assert!(list_approved(&conn).unwrap().is_empty(), "out of the directory");
+        let why = &out.notices.iter().find(|n| n.name == "plex").expect("told why").reason;
+        assert!(why.contains("192.168.178.1") && why.contains("TCP 443"), "{why}");
+        assert!(matches!(&out.reviews[..], [Review::Again { name, .. }] if name == "plex"));
+        let row = row_for_name(&conn, "plex").unwrap().unwrap();
+        assert!(row.is_awaiting_review());
+        assert_eq!(row.approved_ports, Some(maps(&["80:32400"])), "what was approved stays on record");
+        assert_eq!(row.vip4, vip, "it keeps its address");
+
+        // Told again on the next poll, not only the first: the agent keeps
+        // the latest poll's notices alone.
+        let out = declare(&mut conn, &["80:32400", "443:192.168.178.1:80"]);
+        assert!(out.notices.iter().any(|n| n.name == "plex"), "still told");
+        assert!(out.reviews.is_empty(), "nothing changed this time");
+
+        // Back inside what was approved, a port aside: approved again.
+        let out = declare(&mut conn, &["8080:32400"]);
+        assert!(out.pending.is_empty() && out.notices.is_empty());
+        assert!(matches!(&out.reviews[..], [Review::Restored { name }] if name == "plex"));
+        assert_eq!(list_approved(&conn).unwrap().len(), 1);
+
+        // An admin approving the change makes it what is approved.
+        declare(&mut conn, &["443:192.168.178.1:80"]);
+        assert_eq!(approve(&conn, id, "plex", RANGE).unwrap(), ApproveOutcome::Approved);
+        let out = declare(&mut conn, &["443:192.168.178.1:80"]);
+        assert!(out.pending.is_empty() && out.reviews.is_empty());
+        assert_eq!(row_for_name(&conn, "plex").unwrap().unwrap().approved_ports, Some(maps(&["443:192.168.178.1:80"])));
+    }
+
+    #[tokio::test]
+    async fn a_denial_takes_back_what_was_approved() {
+        let db = Db::open_in_memory_for_test();
+        let id = node_with_id(&db, "n1", "h1").await;
+        let mut conn = db.conn.lock().await;
+        upsert_for_node(&mut conn, id, &[mapped("plex", &["80"])], ApprovalMode::RequireApproval, RANGE).unwrap();
+        approve(&conn, id, "plex", RANGE).unwrap();
+        upsert_for_node(&mut conn, id, &[mapped("plex", &["80", "443"])], ApprovalMode::RequireApproval, RANGE).unwrap();
+        deny(&conn, id, "plex", None).unwrap();
+        // Back inside the old approval, it stays denied.
+        let out = upsert_for_node(&mut conn, id, &[mapped("plex", &["80"])], ApprovalMode::RequireApproval, RANGE).unwrap();
+        assert_eq!(out.denied.len(), 1);
+        let row = row_for_name(&conn, "plex").unwrap().unwrap();
+        assert!(row.approved_ports.is_none() && !row.is_awaiting_review());
+    }
+
+    #[tokio::test]
+    async fn with_approval_off_what_is_declared_is_what_is_approved() {
+        let db = Db::open_in_memory_for_test();
+        let id = node_with_id(&db, "n1", "h1").await;
+        let mut conn = db.conn.lock().await;
+        upsert_for_node(&mut conn, id, &[mapped("plex", &["80"])], ApprovalMode::AutoApprove, RANGE).unwrap();
+        let out = upsert_for_node(&mut conn, id, &[mapped("plex", &["443:192.168.178.1:80"])], ApprovalMode::AutoApprove, RANGE).unwrap();
+        assert!(out.pending.is_empty() && out.reviews.is_empty());
+        assert_eq!(row_for_name(&conn, "plex").unwrap().unwrap().approved_ports, Some(maps(&["443:192.168.178.1:80"])));
+        // Switched on later, the approval covers what was last declared.
+        let out = upsert_for_node(&mut conn, id, &[mapped("plex", &["443:192.168.178.1:80"])], ApprovalMode::RequireApproval, RANGE).unwrap();
+        assert!(out.pending.is_empty());
     }
 
     #[tokio::test]

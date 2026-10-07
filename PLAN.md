@@ -4731,3 +4731,30 @@ the earlier ones. Two things to fix:
     Tests: `prepare` with underscore names and a `Connection` list; a
     device with an owner sending both tricks through a real terminator
     (the backend sees anna, not admin); the same over a WebSocket.
+
+315. **An approval covers where a service leads, not only its name**
+    (2026-10-07). Since M18 an approval stayed with the name whatever the
+    node declared next. Then M26 made a declaration able to forward to a LAN
+    address, and M33 made 443 a certificate and a sign-in target. So an
+    approved `metrics 9100` could become `metrics 443:192.168.1.1:80`
+    without an admin seeing it, although `services.md` said "what an admin
+    approves includes the address". M18's other reason, that a peer reached
+    the port by IP anyway, has not held since the mesh interface went
+    default-deny.
+    - The declaration an admin approved is kept (`approved_ports`,
+      migration 0025, which records every approval already given as given to
+      the declaration as it stands). A declaration reaching a target address
+      the approval did not cover, the node's own ports included, or adding
+      TCP 443, goes back to pending (`services::needs_review`). It is out of
+      the directory, so its public name and certificate go with it, and the
+      owner is sent no access for it: phones exported while it was
+      approved still route its address. A changed port on a target already
+      approved keeps the approval, as before.
+    - The node is told why on every poll while it waits. `service list`
+      shows "approved before as …". Going back inside what was approved
+      restores the approval without an admin. A denial clears the record,
+      and with approval off what is declared is what is approved.
+    Tests: `needs_review`'s cases; going past, being told again, coming
+    back and a fresh approval; a denial; approval off and switched on later;
+    the migration; and over the API, the directory, `access` and the admin
+    listing.
