@@ -5,13 +5,20 @@ TLS. You don't need to invent a secret or pick a mesh IP range up front —
 the coordinator generates and persists both for you on first start if you
 leave them unset.
 
-**Bare metal**: build (or copy over) `wireserve-coordinator` and
-`wireserve-admin`, keep them side by side in one directory, and run:
+**Bare metal**: download the coordinator archive for your architecture
+from the [releases page](https://github.com/tiaforge/wireserve/releases)
+(it holds `wireserve-coordinator` and `wireserve-admin` side by side; check
+it against `SHA256SUMS` there if you like) and run its installer:
 
 ```sh
-cargo build --release --workspace
-sudo ./target/release/wireserve-coordinator install
+VERSION=1.0.0-beta.1
+curl -fL https://github.com/tiaforge/wireserve/releases/download/v$VERSION/wireserve-coordinator-$VERSION-$(uname -m)-linux.tar.gz | tar xz
+sudo ./wireserve-coordinator-$VERSION-$(uname -m)-linux/wireserve-coordinator install
 ```
+
+Built [from source](building.md) instead, it is
+`sudo ./target/release/wireserve-coordinator install`; the two binaries
+just need to sit in one directory.
 
 It asks five questions in plain language, each with a short explanation and
 a sensible default:
@@ -40,9 +47,8 @@ sudo ./wireserve-coordinator install --public-url https://mesh.example.com --yes
 
 Run it again on a machine where it is installed and it **upgrades** instead:
 both binaries and the unit replaced and the service restarted, no questions,
-`coordinator.env` untouched. That makes `scp wireserve-coordinator
-wireserve-admin host:/tmp/ && ssh host sudo /tmp/wireserve-coordinator
-install` the whole update. `install --reconfigure` asks the questions again
+`coordinator.env` untouched. Downloading the new version as above and
+running its `install` is the whole update. `install --reconfigure` asks the questions again
 with the current settings as defaults, and changes only those keys in
 `coordinator.env` — a key you drop is commented out, never deleted.
 
@@ -123,15 +129,18 @@ proxy on a different host needs that set to an address it can reach — and
 `WIRESERVE_TRUSTED_PROXY` set to the proxy's address, so the coordinator
 believes the client addresses it forwards and nobody else's.
 
-**Containers**, if you'd rather not use systemd directly:
+**Containers**, if you'd rather not use systemd directly. The image is
+published for amd64 and arm64:
 
 ```sh
-podman build -f deploy/docker/coordinator.Dockerfile -t wireserve-coordinator .
+VERSION=1.0.0-beta.1
 podman run -d --name wireserve-coordinator \
     -p 127.0.0.1:47820:47820 \
     -v wireserve-coordinator-data:/var/lib/wireserve \
-    wireserve-coordinator
+    ghcr.io/tiaforge/wireserve-coordinator:$VERSION
 ```
+
+To build the image yourself instead, see [Building from source](building.md).
 
 Same zero-config behavior applies: the admin token and mesh ranges are
 generated into the named volume on first start unless you pass

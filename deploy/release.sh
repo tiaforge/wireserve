@@ -39,7 +39,11 @@ if [ "$current" != "$version" ]; then
     sed -i '/^\[workspace.package\]/,/^\[/ s/^version = ".*"$/version = "'"$version"'"/' Cargo.toml
     # Brings Cargo.lock's entries for the workspace's own crates along.
     cargo update --workspace --offline --quiet
-    git commit --quiet -m "Release $version" Cargo.toml Cargo.lock
+fi
+# The download commands in the README and docs name the version.
+sed -i "s/^VERSION=.*/VERSION=$version/" README.md docs/*.md
+if [ -n "$(git status --porcelain)" ]; then
+    git commit --quiet -m "Release $version" Cargo.toml Cargo.lock README.md docs/
     echo "committed: Release $version ($current -> $version)"
 fi
 git tag -a "$tag" -m "wireserve $version"

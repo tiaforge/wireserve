@@ -43,7 +43,8 @@ GitHub Actions there run the checks and publish releases.
    ```
 
    It checks that you are on a clean `main` that matches `origin/main`,
-   sets the version in `Cargo.toml`, commits "Release 1.0.0-beta.1", tags
+   sets the version in `Cargo.toml` and in the download commands of the
+   README and docs, commits "Release 1.0.0-beta.1", tags
    `v1.0.0-beta.1`, and asks before pushing both to Forgejo. The mirror
    carries the tag to GitHub, and the Release workflow builds, tests and
    publishes it. The workflow refuses a tag that doesn't match the

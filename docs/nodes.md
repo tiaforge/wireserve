@@ -36,12 +36,15 @@ manager is not a live way into the mesh months later. If the window lapses,
 and address. Override with `--ttl <secs>` per token, or coordinator-wide
 with `WIRESERVE_JOIN_TOKEN_TTL_SECS`; `0` disables expiry.
 
-On the node itself, with the `wireserve` binary already there (built
-via `cargo build --release --workspace` in a checkout, or copied over from
-wherever you built it):
+On the node itself, download the `wireserve` archive for your
+architecture from the [releases page](https://github.com/tiaforge/wireserve/releases)
+and run its `install` (built [from source](building.md) instead, it is
+`target/release/wireserve`):
 
 ```sh
-sudo wireserve install https://wireserve.example.com
+VERSION=1.0.0-beta.1
+curl -fL https://github.com/tiaforge/wireserve/releases/download/v$VERSION/wireserve-$VERSION-$(uname -m)-linux.tar.gz | tar xz
+sudo ./wireserve-$VERSION-$(uname -m)-linux/wireserve install https://wireserve.example.com
 ```
 
 One command: it installs the binary to `/usr/local/bin/wireserve`, installs
@@ -122,13 +125,17 @@ root-only (`podman exec`/`docker exec` runs as root anyway).
 
 ## Upgrading a node
 
-Build, copy the binary over, and run its `install` on the node:
+Download the new version on the node and run its `install`, without a
+URL:
 
 ```sh
-cargo build --release --workspace
-scp target/release/wireserve you@node:/tmp/
-ssh -t you@node sudo /tmp/wireserve install
+VERSION=1.0.0-beta.1
+curl -fL https://github.com/tiaforge/wireserve/releases/download/v$VERSION/wireserve-$VERSION-$(uname -m)-linux.tar.gz | tar xz
+sudo ./wireserve-$VERSION-$(uname -m)-linux/wireserve install
 ```
+
+A binary built from source upgrades the same way: copy it over and run
+its `install`.
 
 On a node that has already joined, `install` given no URL or token is an
 upgrade, not a join: it installs the binary, rewrites the systemd unit files
@@ -138,7 +145,7 @@ the old binary. The node keeps its identity and its declared services; the
 mesh drops out for the few seconds the daemon takes to restart, and its
 firewall is rebuilt deny-first as on any start. Pass a URL or a token and it
 joins again. Upgrade the coordinator first, the same way:
-`sudo ./wireserve-coordinator install` on its host. It matters: an agent
+its new archive's `sudo ./wireserve-coordinator install` on its host. It matters: an agent
 learns from the coordinator who may reach its services, and opens none of
 them until a coordinator that says so answers.
 

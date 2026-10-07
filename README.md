@@ -54,21 +54,28 @@ wireserve plex 80:32400    # plex.wg now reaches Plex from anywhere in your mesh
 ## Requirements
 
 - Linux with systemd on every machine that joins (phones excepted), with
-  `nftables` installed.
+  `nftables` installed. The prebuilt binaries are for x86_64 and aarch64
+  and need glibc 2.34 or newer: Debian 12, Ubuntu 22.04, RHEL 9 or later.
+  Anything else can [build from source](docs/building.md).
 - A host for the coordinator that every machine can reach over HTTPS, with
   a reverse proxy such as Caddy or nginx in front of it.
-- A Rust toolchain to build the binaries: `cargo build --release --workspace`.
 
 ## Quick start
 
-**1. Install the coordinator** on a host every machine can reach:
+**1. Install the coordinator** on a host every machine can reach.
+Download it from the [releases page](https://github.com/tiaforge/wireserve/releases)
+and run its installer:
 
 ```sh
-sudo ./wireserve-coordinator install
+VERSION=1.0.0-beta.1
+curl -fL https://github.com/tiaforge/wireserve/releases/download/v$VERSION/wireserve-coordinator-$VERSION-$(uname -m)-linux.tar.gz | tar xz
+sudo ./wireserve-coordinator-$VERSION-$(uname -m)-linux/wireserve-coordinator install
 ```
 
-It asks a few questions and starts the service. Then point your reverse
-proxy at `127.0.0.1:47820`; the installer prints a ready-to-use Caddy block.
+It asks a few questions, copies `wireserve-coordinator` and
+`wireserve-admin` to `/usr/local/bin` and starts the service. Then point
+your reverse proxy at `127.0.0.1:47820`; the installer prints a
+ready-to-use Caddy block.
 
 **2. Add a machine.** On the coordinator:
 
@@ -76,11 +83,18 @@ proxy at `127.0.0.1:47820`; the installer prints a ready-to-use Caddy block.
 wireserve-admin node create homeserver
 ```
 
-Then, on the new machine, paste the join token when asked:
+Then, on the new machine, download `wireserve` and paste the join token
+when asked:
 
 ```sh
-sudo wireserve install https://mesh.example.com
+VERSION=1.0.0-beta.1
+curl -fL https://github.com/tiaforge/wireserve/releases/download/v$VERSION/wireserve-$VERSION-$(uname -m)-linux.tar.gz | tar xz
+sudo ./wireserve-$VERSION-$(uname -m)-linux/wireserve install https://mesh.example.com
 ```
+
+`install` copies `wireserve` to `/usr/local/bin`, so the downloaded folder
+can go afterwards. To upgrade later, download the new version the same way
+and run its `install` without the URL.
 
 **3. Publish a service** on that machine, and approve it on the coordinator:
 
