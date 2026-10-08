@@ -784,13 +784,25 @@ pub(crate) fn apply_batch_with(
     // for any of its addresses on any interface, so a machine on the LAN
     // that routes the mesh address to this host reached whatever listens
     // there — a backend bound to the mesh address to keep it off the LAN
-    // among them. A reply to a connection of this node's own comes back the
-    // way it left, through the mesh.
+    // among them. Only what is not part of a flow already: a connection of
+    // this node's own does not always leave through the mesh. The owner's
+    // own request to a service on a LAN device (PLAN.md M26) goes out from
+    // the mesh address, masqueraded onto the LAN, and its reply arrives on
+    // the LAN interface addressed back to the mesh address once conntrack
+    // undoes the masquerade. A neighbour's own packet is never established:
+    // dropped while new, it leaves no flow behind.
     for own in own {
         let family = if own.is_ipv4() { "ip" } else { "ip6" };
         let mut expr = not_mesh();
         expr.extend([
             is(payload(family, "daddr"), Expression::String(Cow::Owned(own.to_string()))),
+            // `in`, a bitmask test: nft's `!=` against `established,related`
+            // compares the whole value, so it took an established packet too.
+            Statement::Match(Match {
+                left: ct("state", None),
+                right: Expression::List(["new", "invalid", "untracked"].map(|s| Expression::String(s.into())).to_vec()),
+                op: Operator::IN,
+            }),
             Statement::Drop(None::<Drop>),
         ]);
         objects.push(rule(t, CHAIN_NAME, expr));
@@ -1503,6 +1515,7 @@ mod tests {
         for (family, addr) in [("ip", NODE.to_string()), ("ip6", "fd00:90::1".to_string())] {
             let mut expected: Vec<Value> = not_mesh.to_vec();
             expected.push(json!({"match": {"left": {"payload": {"protocol": family, "field": "daddr"}}, "right": addr, "op": "=="}}));
+            expected.push(json!({"match": {"left": {"ct": {"key": "state"}}, "right": ["new", "invalid", "untracked"], "op": "in"}}));
             expected.push(json!({"drop": null}));
             assert!(input.contains(&Value::Array(expected)), "{family} {addr}: {input:?}");
         }
@@ -2107,6 +2120,30 @@ mod tests {
             let mut buf = [0u8; 4];
             listener.recv_from(&mut buf).is_ok()
         };
+        // Whether the neighbour's answer to a datagram this host sent from
+        // `from`, its mesh address, over the LAN arrives: a flow of this
+        // host's own that does not go through the mesh, as the owner's own
+        // request to a service on a LAN device does (PLAN.md M26).
+        let answer_arrives = |from: &str, neighbour: &str| -> bool {
+            let family = if from.contains(':') { "AF_INET6" } else { "AF_INET" };
+            let echo = format!(
+                "import socket; s = socket.socket(socket.{family}, socket.SOCK_DGRAM); s.bind(('{neighbour}', 5001)); s.settimeout(3)
+d, a = s.recvfrom(4); s.sendto(d, a)"
+            );
+            let mut echo = std::process::Command::new("nsenter")
+                .args(["-t", &pid.to_string(), "-n", "python3", "-c", &echo])
+                .spawn()
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let socket = std::net::UdpSocket::bind((from, 0)).unwrap();
+            socket.set_read_timeout(Some(std::time::Duration::from_millis(700))).unwrap();
+            socket.send_to(b"x", (neighbour, 5001)).unwrap();
+            let mut buf = [0u8; 4];
+            let got = socket.recv_from(&mut buf).is_ok();
+            let _ = echo.kill();
+            let _ = echo.wait();
+            got
+        };
         let open_before = arrives("100.90.0.1", true) && arrives("fd00:90::1", true);
         let own: [IpAddr; 2] = ["100.90.0.1".parse().unwrap(), "fd00:90::1".parse().unwrap()];
         let script = nft_script(&[apply_batch_with("wg0", None, &own, &[], &Forwarding::default())]);
@@ -2118,11 +2155,17 @@ mod tests {
             arrives("100.90.0.1", false),
             arrives("fd00:90::1", false),
             arrives("192.168.50.1", true),
+            answer_arrives("100.90.0.1", "192.168.50.2"),
+            answer_arrives("fd00:90::1", "2001:db8::2"),
         ];
         let _ = outside.kill();
         let _ = outside.wait();
         assert!(open_before, "without the rule the neighbour gets in: the test is testing something");
-        assert_eq!(results, [false, false, true, true, true], "neighbour v4, v6; host v4, v6; the LAN address itself");
+        assert_eq!(
+            results,
+            [false, false, true, true, true, true, true],
+            "neighbour v4, v6; host v4, v6; the LAN address itself; answers to the host's own v4, v6"
+        );
     }
 
     #[test]

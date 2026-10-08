@@ -4803,3 +4803,20 @@ gets HTTPS from the terminator, both on the app's one port.
     Tests: `validate_node_targets` with 443 beside 80 and beside another
     service, and still refused for 81 or UDP; `serve` over IPC; the rules
     with the terminator serving (both) and not (port 80 only), either order.
+
+318. **The mesh-address drop let the owner's own LAN flows starve**
+    (2026-10-08). #316 dropped everything for the node's mesh address from
+    off the mesh, on the theory that a reply to the node's own connection
+    comes back through the mesh. The owner's own request to a service on a
+    LAN device (M26) does not: it leaves from the mesh address, is
+    masqueraded onto the LAN, and its reply arrives on the LAN interface
+    addressed back to the mesh address once conntrack undoes the
+    masquerade. The lan-target e2e caught it at step 3/7. Now the drop takes
+    only packets that are not part of a flow (`ct state
+    invalid,new,untracked`); a neighbour's own packet is new, and dropped
+    while new it leaves no flow behind. As a bitmask test (`in`), not
+    `!= established,related`, which nft compares as a whole value and so
+    still dropped a plain established packet.
+    Tests: the rule's shape; in the kernel, the neighbour's answer to a
+    datagram the host sent from its mesh address over the LAN arrives, v4
+    and v6, while the neighbour's own still does not.
