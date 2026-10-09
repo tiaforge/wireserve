@@ -35,7 +35,7 @@ tower = { workspace = true, features = ["util"] }
 socket2 = { version = "0.6", features = ["all"] }
 # A WebSocket backend's `Sec-WebSocket-Accept`, checked before the
 # connection is handed over (RFC 6455 §4.2.2).
-sha1 = "0.10"
+sha1 = "0.11"
 base64.workspace = true
 libc.workspace = true
 rand.workspace = true
