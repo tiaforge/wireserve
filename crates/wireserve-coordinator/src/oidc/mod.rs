@@ -362,8 +362,9 @@ impl Oidc {
             return None;
         }
         let (nonce, ct) = raw.split_at(24);
+        let nonce: [u8; 24] = nonce.try_into().ok()?;
         let cipher = chacha20poly1305::XChaCha20Poly1305::new((&self.config.token_key).into());
-        let plain = cipher.decrypt(nonce.into(), Payload { msg: ct, aad }).ok()?;
+        let plain = cipher.decrypt((&nonce).into(),Payload { msg: ct, aad }).ok()?;
         String::from_utf8(plain).ok()
     }
 }
