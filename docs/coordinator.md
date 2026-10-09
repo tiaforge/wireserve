@@ -11,7 +11,7 @@ from the [releases page](https://github.com/tiaforge/wireserve/releases)
 it against `SHA256SUMS` there if you like) and run its installer:
 
 ```sh
-VERSION=1.0.0-beta.1
+VERSION=1.0.0-beta.2
 curl -fL https://github.com/tiaforge/wireserve/releases/download/v$VERSION/wireserve-coordinator-$VERSION-$(uname -m)-linux.tar.gz | tar xz
 sudo ./wireserve-coordinator-$VERSION-$(uname -m)-linux/wireserve-coordinator install
 ```
@@ -133,7 +133,7 @@ believes the client addresses it forwards and nobody else's.
 published for amd64 and arm64:
 
 ```sh
-VERSION=1.0.0-beta.1
+VERSION=1.0.0-beta.2
 podman run -d --name wireserve-coordinator \
     -p 127.0.0.1:47820:47820 \
     -v wireserve-coordinator-data:/var/lib/wireserve \

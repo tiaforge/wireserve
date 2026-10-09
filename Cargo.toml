@@ -10,7 +10,7 @@ members = [
 
 [workspace.package]
 # Every crate takes this one version; deploy/release.sh sets it.
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 edition = "2021"
 rust-version = "1.91"
 license = "PolyForm-Noncommercial-1.0.0"
