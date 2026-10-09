@@ -44,5 +44,5 @@ rand.workspace = true
 tempfile = "3"
 rcgen = "0.14"
 time = "0.3"
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
