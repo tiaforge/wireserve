@@ -37,7 +37,7 @@ rusqlite_migration = "2"
 # Public DNS records for services (PLAN.md M32). Default features: the
 # aws-lc-rs provider, the same one reqwest's rustls already brings in.
 dns-update = "0.5"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "rustls-native-certs", "blocking"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "blocking"] }
 defguard_wireguard_rs = "0.12"
 nftables = { version = "0.6", default-features = false }
 base64 = "0.23"
