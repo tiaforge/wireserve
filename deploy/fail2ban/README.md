@@ -3,8 +3,8 @@
 These files belong on the **reverse proxy host**, not the coordinator host.
 
 That is the whole point. The coordinator runs unprivileged with an empty
-`CapabilityBoundingSet=` and never touches the host firewall, and
-behind the TLS-terminating proxy it must sit behind, the only client
+`CapabilityBoundingSet=` and never touches the host firewall. It sits
+behind a TLS-terminating proxy, so the only client
 address it can see is the proxy's own. A block applied there would drop
 every node at once and stay dropped. The proxy sees the real client and
 already holds the privilege to act.
