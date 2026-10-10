@@ -653,11 +653,9 @@ pub fn all_allocated_ip4(conn: &Connection) -> Result<Vec<Ipv4Addr>, DbError> {
     Ok(out)
 }
 
-/// Every node's name.
-pub fn list_all_names(conn: &Connection) -> Result<Vec<String>, DbError> {
-    let mut stmt = conn.prepare("SELECT name FROM nodes")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    Ok(rows.collect::<Result<_, _>>()?)
+/// Whether a node other than `except` is called `name`.
+pub fn name_taken_by_another(conn: &Connection, name: &str, except: i64) -> Result<bool, DbError> {
+    Ok(conn.query_row("SELECT EXISTS (SELECT 1 FROM nodes WHERE name = ?1 AND id != ?2)", rusqlite::params![name, except], |row| row.get(0))?)
 }
 
 pub fn all_allocated_ip6(conn: &Connection) -> Result<Vec<Ipv6Addr>, DbError> {

@@ -280,6 +280,12 @@ pub struct DirectorySnapshot {
     /// The approved services as nodes see them, in `services`' order less
     /// those whose node is gone.
     pub directory: Vec<ServiceInfo>,
+    /// For each entry of `directory`, its row in `services` and its owner's
+    /// in `nodes`.
+    pub directory_src: Vec<(usize, usize)>,
+    /// Whether each of `nodes` can check devices and fall back to the sign-in
+    /// (`CAP_SIGN_IN`), by its latest poll.
+    pub sign_in_capable: Vec<bool>,
     /// Nodes that can be relayed to: a relay port and a carry port.
     pub relayable: std::collections::HashSet<String>,
 }
@@ -306,10 +312,20 @@ impl DirectorySnapshot {
             .filter(|p| p.relay.port.is_some() && p.relay.carry_port.is_some())
             .map(|p| p.pubkey.clone())
             .collect();
-        let directory = services_directory(&services, &nodes, &state.directory_context(&tls_ready));
-        let by_id = nodes.iter().enumerate().map(|(i, n)| (n.id, i)).collect();
+        let by_id: std::collections::HashMap<i64, usize> = nodes.iter().enumerate().map(|(i, n)| (n.id, i)).collect();
+        let ctx = state.directory_context(&tls_ready);
+        let mut directory = Vec::with_capacity(services.len());
+        let mut directory_src = Vec::with_capacity(services.len());
+        for (si, s) in services.iter().enumerate() {
+            if let Some(&ni) = by_id.get(&s.node_id) {
+                directory.push(service_info(s, &nodes[ni], fresh, ctx.terminates(s)));
+                directory_src.push((si, ni));
+            }
+        }
+        let capable = state.transit.with_capability(wireserve_types::CAP_SIGN_IN, fresh);
+        let sign_in_capable = nodes.iter().map(|n| n.pubkey.as_deref().is_some_and(|pk| capable.contains(pk))).collect();
         let by_pubkey = nodes.iter().enumerate().filter_map(|(i, n)| Some((n.pubkey.clone()?, i))).collect();
-        Ok(Self { nodes, by_id, by_pubkey, services, rules, tls_ready, static_relays, peers, directory, relayable })
+        Ok(Self { nodes, by_id, by_pubkey, services, rules, tls_ready, static_relays, peers, directory, directory_src, sign_in_capable, relayable })
     }
 }
 
@@ -372,6 +388,8 @@ mod cache_tests {
             static_relays: Vec::new(),
             peers: Vec::new(),
             directory: Vec::new(),
+            directory_src: Vec::new(),
+            sign_in_capable: Vec::new(),
             relayable: Default::default(),
         }
     }

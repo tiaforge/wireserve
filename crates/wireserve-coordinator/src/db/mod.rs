@@ -124,6 +124,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0023_sign_in_sessions.sql")),
         M::up(include_str!("../../migrations/0024_sign_in_ticket_bind.sql")),
         M::up(include_str!("../../migrations/0025_approved_ports.sql")),
+        M::up(include_str!("../../migrations/0026_node_id_indexes.sql")),
     ])
 }
 

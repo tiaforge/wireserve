@@ -227,31 +227,26 @@ pub async fn poll(
     // node may have a service called after itself, and nobody else may. One
     // the node already has is left alone; it is not the declaration that is
     // new. Told to the node as a notice, never a failed poll.
-    let node_names: std::collections::HashSet<String> =
-        nodes::list_all_names(&conn)?.into_iter().filter(|n| *n != node.name).collect();
     let mut refused: Vec<wireserve_types::ServiceNotice> = Vec::new();
-    let desired_owned: Vec<wireserve_types::ServiceDecl> = req
-        .services
-        .iter()
-        .filter(|d| {
-            if previous_names.contains(d.name.as_str()) {
-                return true;
-            }
-            let why = state
-                .config
-                .reserved_reason(&d.name)
-                .map(str::to_string)
-                .or_else(|| node_names.contains(&d.name).then(|| "another node's name; only that node may have a service by it".to_string()));
-            match why {
-                Some(why) => {
-                    refused.push(wireserve_types::ServiceNotice { name: d.name.clone(), reason: format!("not published: {why}") });
-                    false
+    let mut desired_owned: Vec<wireserve_types::ServiceDecl> = Vec::with_capacity(req.services.len());
+    for d in &req.services {
+        if !previous_names.contains(d.name.as_str()) {
+            // Asked of the database for the names that are new only: listing
+            // every node's name on every poll grew with the mesh.
+            let why = match state.config.reserved_reason(&d.name) {
+                Some(why) => Some(why.to_string()),
+                None if nodes::name_taken_by_another(&conn, &d.name, node.id)? => {
+                    Some("another node's name; only that node may have a service by it".to_string())
                 }
-                None => true,
+                None => None,
+            };
+            if let Some(why) = why {
+                refused.push(wireserve_types::ServiceNotice { name: d.name.clone(), reason: format!("not published: {why}") });
+                continue;
             }
-        })
-        .cloned()
-        .collect();
+        }
+        desired_owned.push(d.clone());
+    }
     let desired = &desired_owned;
     let desired_names: std::collections::HashSet<&str> =
         desired.iter().map(|d| d.name.as_str()).collect();
@@ -454,19 +449,11 @@ pub async fn poll(
     };
 
     // What this requester gets at each service (PLAN.md M45), for its
-    // `status` to show. Names are unique across the mesh.
-    let reach: std::collections::HashMap<&str, wireserve_types::Reach> = snap
-        .services
-        .iter()
-        .filter_map(|s| {
-            let owner = &snap.nodes[*snap.by_id.get(&s.node_id)?];
-            let facts =
-                crate::access::SignInFacts { available, owner_capable: sign_in_capable(owner), terminated: ctx.terminates(s) };
-            Some((s.name.as_str(), crate::access::reach(s, owner, &node, rules, &facts)))
-        })
-        .collect();
-    for s in &mut services {
-        s.reach = reach.get(s.name.as_str()).copied();
+    // `status` to show. Whether an owner can sign devices in is as of the
+    // snapshot; the requester's own is read live, below.
+    for (info, &(si, ni)) in services.iter_mut().zip(&snap.directory_src) {
+        let facts = crate::access::SignInFacts { available, owner_capable: snap.sign_in_capable[ni], terminated: info.terminated };
+        info.reach = Some(crate::access::reach(&snap.services[si], &snap.nodes[ni], &node, rules, &facts));
     }
 
     // Who may reach each of this node's own services (PLAN.md M36), pending

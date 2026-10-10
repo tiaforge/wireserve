@@ -249,6 +249,19 @@ impl TransitState {
             .map(|(p, _)| *p)
     }
 
+    /// The nodes whose own most recent poll, no older than `fresh_secs`, said
+    /// they can do `capability` — [`Self::has_capability`] for every node
+    /// at once, one hold of the mutex.
+    #[must_use]
+    pub fn with_capability(&self, capability: &str, fresh_secs: i64) -> HashSet<String> {
+        let now = Utc::now();
+        let caps = self.capabilities.lock().expect("transit state mutex poisoned");
+        caps.iter()
+            .filter(|(_, (c, at))| c.contains(capability) && (now - *at).num_seconds() <= fresh_secs)
+            .map(|(pk, _)| pk.clone())
+            .collect()
+    }
+
     /// [`Self::carry_port`] for every node at once: one hold of each mutex
     /// instead of two per node, for the directory snapshot.
     #[must_use]
