@@ -51,6 +51,8 @@ pub struct AppState {
     pub directory: Arc<crate::directory_state::DirectoryCache>,
     /// How many whole directories may be on their way to nodes at once.
     pub full_directory_limit: Arc<tokio::sync::Semaphore>,
+    /// The nodes a whole directory is on its way to: one at a time each.
+    pub full_in_flight: Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
     /// How many responses may be worked out at once, on threads of their own
     /// ([`response_builds`]).
     pub response_builds: Arc<tokio::sync::Semaphore>,

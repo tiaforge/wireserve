@@ -227,6 +227,9 @@ async fn serve() {
     let stopped = |mut rx: tokio::sync::watch::Receiver<()>| async move {
         let _ = rx.changed().await;
     };
+    // A connection whose writes stop moving is closed (`stall`); `tap_io`
+    // only so that `ConnectInfo<SocketAddr>` comes with it.
+    let node_listener = axum::serve::ListenerExt::tap_io(wireserve_coordinator::stall::StallGuarded(node_listener), |_| {});
     let node_server = axum::serve(node_listener, node_app).with_graceful_shutdown(stopped(stop_rx.clone()));
     let admin_server = axum::serve(admin_listener, admin_app).with_graceful_shutdown(stopped(stop_rx));
     let servers = async { tokio::try_join!(node_server, admin_server) };

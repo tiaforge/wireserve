@@ -337,15 +337,13 @@ pub async fn poll(
     // fleet that restarts together, or a coordinator that does, would
     // otherwise ask for every node's directory in the same moment. The rest
     // are told to come back, which an agent does after a backoff.
-    // The permit is kept until the last of the response is sent.
+    // The turn is kept until the last of the response is sent, or the
+    // connection is closed (a stalled one is, see `stall`); and a node has
+    // one at a time, so that no one node can take them all.
     let full_permit = if have.is_some_and(|h| state.directory.read().can_serve(&h)) {
         None
     } else {
-        Some(
-            std::sync::Arc::clone(&state.full_directory_limit)
-                .try_acquire_owned()
-                .map_err(|_| AppError::Unavailable("the coordinator is sending a lot of full directories; try again shortly".into()))?,
-        )
+        Some(FullTurn::take(&state, node.id)?)
     };
     let owners = {
         let env = crate::directory_state::Env::of(&state);
@@ -571,17 +569,53 @@ pub async fn poll(
     .await
     .map_err(|e| AppError::Unavailable(format!("building the directory failed: {e}")))?
     .map_err(|e| AppError::Unavailable(format!("encoding the directory failed: {e}")))?;
+    let length = body.iter().map(Bytes::len).sum::<usize>();
     let body = if body.len() == 1 {
         axum::body::Body::from(body.into_iter().next().unwrap_or_default())
     } else {
-        // Sent a piece at a time, from the shared buffers, with the permit
+        // Sent a piece at a time, from the shared buffers, with the turn
         // held until the stream is done or dropped.
         axum::body::Body::from_stream(futures_util::stream::iter(body.into_iter().map(move |chunk| {
             let _in_flight = &full_permit;
             Ok::<_, std::convert::Infallible>(chunk)
         })))
     };
-    Ok(([(axum::http::header::CONTENT_TYPE, "application/json")], body))
+    let mut response = axum::response::Response::new(body);
+    let headers = response.headers_mut();
+    headers.insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("application/json"));
+    headers.insert(axum::http::header::CONTENT_LENGTH, axum::http::HeaderValue::from(length));
+    Ok(response)
+}
+
+/// A turn to be sent the whole directory: one of the few at once, and the
+/// one this node may have.
+struct FullTurn {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    node: i64,
+    in_flight: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
+}
+
+impl FullTurn {
+    fn take(state: &AppState, node: i64) -> Result<Self, AppError> {
+        let in_flight = std::sync::Arc::clone(&state.full_in_flight);
+        if !in_flight.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(node) {
+            return Err(AppError::Unavailable("a whole directory is already on its way to this node".into()));
+        }
+        match std::sync::Arc::clone(&state.full_directory_limit).try_acquire_owned() {
+            Ok(permit) => Ok(Self { _permit: permit, node, in_flight }),
+            // This node's place is let go of again.
+            Err(_) => {
+                in_flight.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&node);
+                Err(AppError::Unavailable("the coordinator is sending a lot of full directories; try again shortly".into()))
+            }
+        }
+    }
+}
+
+impl Drop for FullTurn {
+    fn drop(&mut self) {
+        self.in_flight.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&self.node);
+    }
 }
 
 /// A turn to build a response on a thread of its own (see

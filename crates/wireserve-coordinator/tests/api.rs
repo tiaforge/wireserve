@@ -225,6 +225,9 @@ async fn cross_node_service_collision_returns_409_and_leaves_first_untouched() {
     );
     let resp = app.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    // Read, so that the next whole directory to this node is not refused
+    // while this one is still on its way.
+    let _ = body_json(resp).await;
 
     let req = json_request(
         "POST",
@@ -4499,6 +4502,33 @@ async fn only_so_many_whole_directories_are_on_their_way_at_once_and_a_delta_is_
     let (status, _) = poll_full(&app.router, bearer, json!({ "services": [] })).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     drop(held);
+}
+
+#[tokio::test]
+async fn a_node_is_sent_one_whole_directory_at_a_time_and_told_how_long_it_is() {
+    let app = test_app();
+    let (ta, tb) = (admin_create_node(&app.router, "a").await, admin_create_node(&app.router, "b").await);
+    let a = register_node(&app.router, &ta, "pk-a", 51820).await["bearer_token"].as_str().unwrap().to_string();
+    let b = register_node(&app.router, &tb, "pk-b", 51821).await["bearer_token"].as_str().unwrap().to_string();
+    let full = |bearer: &str| json_request("POST", "/poll", Some(bearer), json!({ "services": [] }));
+
+    // Not read yet: still on its way.
+    let first = app.router.clone().oneshot(full(&a)).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let again = app.router.clone().oneshot(full(&a)).await.unwrap();
+    assert_eq!(again.status(), StatusCode::SERVICE_UNAVAILABLE, "a second one to the same node waits for the first");
+    let other = app.router.clone().oneshot(full(&b)).await.unwrap();
+    assert_eq!(other.status(), StatusCode::OK, "another node is not held up");
+
+    let length: usize = first.headers()[axum::http::header::CONTENT_LENGTH].to_str().unwrap().parse().unwrap();
+    let body = axum::body::to_bytes(first.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body.len(), length);
+    let stamp = serde_json::from_slice::<Value>(&body).unwrap()["stamp"].clone();
+    assert_eq!(app.router.clone().oneshot(full(&a)).await.unwrap().status(), StatusCode::OK, "sent, so the next may go");
+
+    let delta = app.router.clone().oneshot(json_request("POST", "/poll", Some(&a), json!({ "services": [], "directory": stamp }))).await.unwrap();
+    let length: usize = delta.headers()[axum::http::header::CONTENT_LENGTH].to_str().unwrap().parse().unwrap();
+    assert_eq!(axum::body::to_bytes(delta.into_body(), usize::MAX).await.unwrap().len(), length);
 }
 
 #[tokio::test(flavor = "multi_thread")]
