@@ -125,6 +125,10 @@ pub struct ListView {
     /// named (PLAN.md M36).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub service_notices: Vec<wireserve_types::ServiceNotice>,
+    /// The coordinator did not answer what this node gets at each service,
+    /// so ACCESS is not known (as against a service it did not say about).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reach_unavailable: bool,
 }
 
 /// One peer as the kernel's WireGuard interface reports it.

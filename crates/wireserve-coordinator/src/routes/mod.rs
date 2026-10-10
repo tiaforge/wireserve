@@ -31,6 +31,7 @@ pub fn node_router(state: AppState) -> Router {
         .route("/register", post(register::register))
         .route("/poll", post(poll::poll))
         .route("/probe", get(probe::probe))
+        .route("/reach", get(poll::reach))
         .route("/tls/challenge", post(tls::add).delete(tls::remove))
         // Device owners (PLAN.md M38) and the sign-in (PLAN.md M48): pages
         // a browser opens, and where the identity provider sends it back.
@@ -57,7 +58,7 @@ async fn directory_changed_by_node(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let counted = !matches!(req.uri().path(), "/poll" | "/probe");
+    let counted = !matches!(req.uri().path(), "/poll" | "/probe" | "/reach");
     let response = next.run(req).await;
     if counted {
         state.directory_changed();

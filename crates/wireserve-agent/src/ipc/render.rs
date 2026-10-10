@@ -176,6 +176,10 @@ pub fn render(view: &ListView, now: DateTime<Utc>) -> String {
         out.push_str(&table(&["PEER", "ADDRESS", "ENDPOINT", "HANDSHAKE", "ROUTE"], &rows));
     }
 
+    if view.reach_unavailable {
+        out.push_str("\nACCESS is not known: the coordinator did not answer when asked.\n");
+    }
+
     if view.reflexive_unknown {
         out.push_str(
             "\nThis node's NAT-mapped IPv4 port is unknown: its startup check couldn't reach the \
@@ -301,6 +305,7 @@ mod tests {
             node: Some("lego2".into()),
             service_domain: None,
             reflexive_unknown: false,
+            reach_unavailable: false,
             transit_capable: false,
             relay_carrying: vec![],
             relay_public: vec![],
@@ -505,5 +510,12 @@ Not published:
         assert!(!out.contains('\u{1b}') && !out.contains('\r') && !out.contains('\u{7}'), "{out:?}");
         assert!(!out.contains("\nFAKE LINE") && !out.contains("\nb"), "{out:?}");
         assert!(out.contains(r"evil\n\u{1b}[2Jnode"), "{out}");
+    }
+
+    #[test]
+    fn access_that_could_not_be_asked_for_is_said_so_not_shown_as_unknown_per_service() {
+        let view = ListView { reach_unavailable: true, ..Default::default() };
+        assert!(render(&view, now()).contains("ACCESS is not known"));
+        assert!(!render(&ListView::default(), now()).contains("ACCESS is not known"));
     }
 }

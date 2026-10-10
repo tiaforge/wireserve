@@ -29,6 +29,27 @@ pub struct AgentContext {
     /// the actual teardown — the IPC handler itself only queues the
     /// request and acknowledges it, it doesn't own interface state.
     pub shutdown: mpsc::Sender<()>,
+    /// What `status` asks the coordinator what this node gets at each
+    /// service with (`GET /reach`). `None` where nothing can be asked.
+    pub client: Option<reqwest::Client>,
+}
+
+/// What this node gets at each service, by name. Differs from node to node,
+/// so the coordinator does not send it with every poll; `status` asks.
+async fn fetch_reach(
+    client: &reqwest::Client,
+    coordinator_url: &str,
+    bearer: &str,
+) -> Result<std::collections::BTreeMap<String, wireserve_types::Reach>, reqwest::Error> {
+    let url = format!("{}/reach", coordinator_url.trim_end_matches('/'));
+    let resp = client
+        .get(url)
+        .bearer_auth(bearer)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(resp.json::<wireserve_types::ReachResponse>().await?.reach)
 }
 
 fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
@@ -130,6 +151,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
         services,
         rejected_services: state.rejected_services.clone(),
         service_notices: state.service_notices.clone(),
+        reach_unavailable: false,
     }
 }
 
@@ -270,10 +292,23 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
             }
         }
         IpcRequest::List => {
-            let mut view = {
+            let (mut view, link) = {
                 let state = ctx.state.lock().await;
-                build_list_view(ctx, &state)
+                (build_list_view(ctx, &state), state.coordinator_url.clone().zip(state.bearer_token.clone()))
             };
+            if let (Some(client), Some((url, bearer))) = (&ctx.client, link) {
+                match fetch_reach(client, &url, &bearer).await {
+                    Ok(reach) => {
+                        for s in &mut view.services {
+                            s.reach = reach.get(&s.name).copied();
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "could not ask the coordinator what this node gets at each service");
+                        view.reach_unavailable = true;
+                    }
+                }
+            }
             let ifname = ctx.ifname.clone();
             match tokio::task::spawn_blocking(move || crate::wg::tunnel_peers(&ifname)).await {
                 Ok(Ok(tunnel)) => view.tunnel = tunnel,
@@ -481,6 +516,7 @@ mod tests {
                 ifname: "wireserve0".into(),
                 reflexive_unknown: false,
                 shutdown: tx,
+                client: None,
             },
             dir,
             rx,

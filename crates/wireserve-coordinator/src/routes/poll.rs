@@ -489,24 +489,7 @@ pub async fn poll(
                 for (i, via) in vias {
                     peers[i].relay.via = Some(via);
                 }
-                // What this requester gets at each service (PLAN.md M45), for
-                // its `status` to show.
-                let services = dir
-                    .all_services()
-                    .into_iter()
-                    .map(|e| {
-                        let mut info = e.info.clone();
-                        if let Some(owner) = dir.nodes.get(&e.row.node_id) {
-                            let facts = crate::access::SignInFacts {
-                                available,
-                                owner_capable: owner.pubkey.as_deref().is_some_and(|pk| dir.sign_in_capable(pk)),
-                                terminated: info.terminated,
-                            };
-                            info.reach = Some(crate::access::reach(&e.row, owner, &node, &dir.rules, &facts));
-                        }
-                        info
-                    })
-                    .collect();
+                let services = dir.all_services().into_iter().map(|e| e.info.clone()).collect();
                 (peers, services, None)
             }
         };
@@ -586,4 +569,40 @@ pub async fn poll(
     .map_err(|e| AppError::Unavailable(format!("building the directory failed: {e}")))?
     .map_err(|e| AppError::Unavailable(format!("encoding the directory failed: {e}")))?;
     Ok(([(axum::http::header::CONTENT_TYPE, "application/json")], body))
+}
+
+/// `GET /reach` (PLAN.md M45): what the asking node gets at each service, for
+/// its `status` to show. Asked for when `status` runs, not carried by every
+/// poll: it differs from node to node, so it could not be sent as a change,
+/// and working it out for every service on every poll grew with the mesh.
+pub async fn reach(
+    State(state): State<AppState>,
+    BearerNode { node }: BearerNode,
+) -> Result<Json<wireserve_types::ReachResponse>, AppError> {
+    if let crate::rate_limit::Take::Refused { .. } = state.poll_limiter.take(node.id) {
+        return Err(AppError::TooManyRequests);
+    }
+    {
+        let conn = state.db.conn.lock().await;
+        state.directory.ensure(&conn, &state)?;
+    }
+    let reach = tokio::task::spawn_blocking(move || {
+        let dir = state.directory.read();
+        let available = state.config.sign_in().is_some();
+        dir.all_services()
+            .into_iter()
+            .filter_map(|e| {
+                let owner = dir.nodes.get(&e.row.node_id)?;
+                let facts = crate::access::SignInFacts {
+                    available,
+                    owner_capable: owner.pubkey.as_deref().is_some_and(|pk| dir.sign_in_capable(pk)),
+                    terminated: e.info.terminated,
+                };
+                Some((e.row.name.clone(), crate::access::reach(&e.row, owner, &node, &dir.rules, &facts)))
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| AppError::Unavailable(format!("working out access failed: {e}")))?;
+    Ok(Json(wireserve_types::ReachResponse { reach }))
 }

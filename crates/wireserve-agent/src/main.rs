@@ -733,6 +733,7 @@ async fn cmd_daemon(
         ifname: ifname.clone(),
         reflexive_unknown: own_reflexive_addr.is_none(),
         shutdown: shutdown_tx,
+        client: Some(client.clone()),
     };
     let socket_path = instance.socket_path();
     let ipc_socket_path = socket_path.clone();

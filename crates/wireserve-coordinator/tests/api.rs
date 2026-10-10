@@ -4420,3 +4420,25 @@ async fn only_so_many_whole_directories_are_built_at_once_and_a_delta_is_not_one
     let (status, _) = poll_full(&app.router, bearer, json!({ "services": [] })).await;
     assert_eq!(status, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn reach_answers_what_the_asking_node_gets_at_each_service_and_only_to_a_node() {
+    let app = test_app();
+    let (ta, tb) = (admin_create_node(&app.router, "a").await, admin_create_node(&app.router, "b").await);
+    let a = register_node(&app.router, &ta, "pk-a", 51820).await;
+    let b = register_node(&app.router, &tb, "pk-b", 51821).await;
+    declare(&app.router, a["bearer_token"].as_str().unwrap(), "web").await;
+
+    let b_bearer = b["bearer_token"].as_str().unwrap();
+    let resp = app.router.clone().oneshot(json_request("GET", "/reach", Some(b_bearer), json!({}))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["reach"]["web"], "allowed", "{body}");
+
+    // Not carried by the poll any more.
+    let (_, polled) = poll_full(&app.router, b_bearer, json!({ "services": [] })).await;
+    assert!(polled["services"][0].get("reach").is_none(), "{polled}");
+
+    let resp = app.router.clone().oneshot(json_request("GET", "/reach", None, json!({}))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
