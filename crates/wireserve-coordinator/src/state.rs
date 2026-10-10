@@ -12,6 +12,10 @@ pub struct AppState {
     pub rate_limiter: Arc<RateLimiter>,
     /// What one authenticated node may ask of `/poll`, per node.
     pub poll_limiter: Arc<TokenBuckets>,
+    /// What one node may ask of `/reach`, per node: apart from the poll's
+    /// allowance, so that a `status` is not refused because the polls used it
+    /// up, and a loop of `status` does not use up the polls'.
+    pub reach_limiter: Arc<TokenBuckets>,
     /// What one node may ask of `/tls/challenge` — each new value is a call
     /// to the operator's DNS provider — per node.
     pub challenge_limiter: Arc<TokenBuckets>,

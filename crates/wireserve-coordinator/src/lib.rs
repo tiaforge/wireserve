@@ -48,6 +48,7 @@ pub fn build_state_with_dns(
             config.global_auth_failure_window_secs,
         )),
         poll_limiter: Arc::new(rate_limit::TokenBuckets::new(config.poll_rate_burst, config.poll_rate_per_min)),
+        reach_limiter: Arc::new(rate_limit::TokenBuckets::new(routes::poll::REACH_BURST, routes::poll::REACHES_PER_MIN)),
         challenge_limiter: Arc::new(rate_limit::TokenBuckets::new(
             routes::tls::CHALLENGE_BURST,
             routes::tls::CHALLENGES_PER_MIN,

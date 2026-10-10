@@ -595,6 +595,11 @@ pub async fn poll(
     Ok(([(axum::http::header::CONTENT_TYPE, "application/json")], body))
 }
 
+/// What one node may ask of `/reach`: a `status` asks once, and a script
+/// that runs it in a loop is not far above one a second.
+pub const REACH_BURST: u32 = 60;
+pub const REACHES_PER_MIN: u32 = 120;
+
 /// `GET /reach` (PLAN.md M45): what the asking node gets at each service, for
 /// its `status` to show. Asked for when `status` runs, not carried by every
 /// poll: it differs from node to node, so it could not be sent as a change,
@@ -603,7 +608,7 @@ pub async fn reach(
     State(state): State<AppState>,
     BearerNode { node }: BearerNode,
 ) -> Result<Json<wireserve_types::ReachResponse>, AppError> {
-    if let crate::rate_limit::Take::Refused { .. } = state.poll_limiter.take(node.id) {
+    if let crate::rate_limit::Take::Refused { .. } = state.reach_limiter.take(node.id) {
         return Err(AppError::TooManyRequests);
     }
     {

@@ -2158,6 +2158,28 @@ async fn one_node_cannot_poll_faster_than_its_share_and_the_others_do_not_notice
 }
 
 #[tokio::test]
+async fn a_node_whose_polls_used_up_its_allowance_can_still_ask_for_its_reach_and_the_other_way_round() {
+    let mut config = test_config("");
+    config.poll_rate_burst = 2;
+    config.poll_rate_per_min = 1;
+    let app = app_with_config(config);
+    let t = admin_create_node(&app.router, "n").await;
+    let bearer = register_node(&app.router, &t, "n", 51820).await["bearer_token"].as_str().unwrap().to_string();
+    let reach = || json_request("GET", "/reach", Some(&bearer), json!({}));
+
+    for _ in 0..2 {
+        assert_eq!(poll_with(&app.router, &bearer, json!([])).await.0, StatusCode::OK);
+    }
+    assert_eq!(poll_with(&app.router, &bearer, json!([])).await.0, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(app.router.clone().oneshot(reach()).await.unwrap().status(), StatusCode::OK, "status is not a poll");
+
+    for _ in 0..wireserve_coordinator::routes::poll::REACH_BURST {
+        let _ = app.router.clone().oneshot(reach()).await.unwrap();
+    }
+    assert_eq!(app.router.clone().oneshot(reach()).await.unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
 async fn admin_service_listing_reports_every_state() {
     let app = approval_app();
     let t1 = admin_create_node(&app.router, "n1").await;
