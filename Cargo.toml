@@ -32,6 +32,7 @@ clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "signal", "sync", "fs"] }
 axum = { version = "0.8", features = ["macros"] }
 futures-util = { version = "0.3", default-features = false }
+mimalloc = { version = "0.1.52", default-features = false }
 tower = "0.5"
 rusqlite = { version = "0.40", features = ["bundled"] }
 rusqlite_migration = "2"

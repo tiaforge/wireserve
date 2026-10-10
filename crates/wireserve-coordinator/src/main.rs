@@ -51,6 +51,10 @@ enum Command {
     SaveAdminConfig,
 }
 
+/// See the coordinator's `Cargo.toml` for why.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     match Cli::parse().command {
         None => serve(),

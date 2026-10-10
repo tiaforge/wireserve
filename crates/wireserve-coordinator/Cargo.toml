@@ -19,6 +19,12 @@ subtle.workspace = true
 tokio.workspace = true
 axum.workspace = true
 futures-util.workspace = true
+# The coordinator's allocator. glibc's keeps what a burst of polls freed, an
+# arena per thread: 1.24 GB after 20,000 nodes came back at once, against
+# 0.33 GB with jemalloc and 0.18 GB with this (peaks 1.28 / 0.42 / 0.27 GB),
+# at the same latency. It takes the page size from the kernel when it runs,
+# so one aarch64 build serves 4 KiB and 16 KiB kernels alike.
+mimalloc.workspace = true
 rusqlite.workspace = true
 rusqlite_migration.workspace = true
 clap.workspace = true
