@@ -101,13 +101,13 @@ ip_on() {
     podman inspect "$1" --format "{{(index .NetworkSettings.Networks \"$2\").IPAddress}}"
 }
 admin() { podman exec "$COORD" wireserve-admin "$@"; }
-# A field of this node's own directory entry for `name`, from the agent's
-# cached directory.
+# A field of this node's own directory entry for `name`, as `status` shows
+# it. Not from the state file: the directory is written there only now and
+# then.
 entry() {
-    podman exec "$1" cat /var/lib/wireserve/agent-state.json | python3 -c "
+    podman exec "$1" wireserve status --json | python3 -c "
 import json,sys
-d=json.load(sys.stdin).get('last_directory') or {}
-s=next((s for s in d.get('services',[]) if s['name']=='$2'), {})
+s=next((s for s in json.load(sys.stdin).get('services',[]) if s['name']=='$2'), {})
 print(s.get('$3', ''))"
 }
 # HTTPS to plex by name at its own address, verified against Pebble's root:

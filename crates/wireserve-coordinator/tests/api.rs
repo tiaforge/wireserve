@@ -3750,6 +3750,9 @@ async fn a_declaration_names_a_group_once_and_never_an_unknown_one() {
 
     admin_call(&app.router, "POST", "/admin/groups", json!({"name": "infra"})).await;
     admin_call(&app.router, "POST", "/admin/groups", json!({"name": "media"})).await;
+    // A poll in between reads the rules, so the next one would not without
+    // being told: the declaration has to say its group changed them.
+    poll_caps(&app.router, &home, json!([]), true).await;
     let body = poll_caps(&app.router, &home, json!([svc_in("vault", 443, 8200, "infra")]), true).await;
     assert!(body.get("service_notices").is_none(), "{body}");
     assert_eq!(access_entry(&body, "vault")["open"], Value::Null, "in infra, not default: {body}");

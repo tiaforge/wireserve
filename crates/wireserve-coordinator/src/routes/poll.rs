@@ -338,6 +338,12 @@ async fn answer(
     };
     let mut outcome = services::upsert_for_node(&mut conn, node.id, desired, mode, &state.config.net_v4_cidr)?;
     outcome.notices.extend(refused);
+    // A group a declaration named lives in the rules, which only a full read
+    // brings in: read them before this poll's own directory, or the service
+    // sits in default, open to every device, until the next one.
+    if outcome.grouped {
+        state.directory_changed();
+    }
     for review in &outcome.reviews {
         match review {
             services::Review::Again { name, why } => {

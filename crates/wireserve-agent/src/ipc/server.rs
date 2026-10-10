@@ -98,6 +98,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
             // reach any node — set from the same source as the local
             // branch below so the two cannot drift.
             pending: pending_names.contains(s.name.as_str()),
+            terminated: s.terminated,
             reach: s.reach,
         })
         .collect();
@@ -120,6 +121,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
                 online: false,
                 local: true,
                 pending: pending_names.contains(d.name.as_str()),
+                terminated: false,
                 // Its own: the coordinator says so too, once it is listed.
                 reach: Some(wireserve_types::Reach::Allowed),
             });

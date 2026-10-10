@@ -118,10 +118,9 @@ ip_on() {
 admin() { podman exec "$COORD" wireserve-admin "$@"; }
 # A field of a service's directory entry, as the client last saw it.
 entry() {
-    podman exec "$CLIENT" cat /var/lib/wireserve/agent-state.json | python3 -c "
+    podman exec "$CLIENT" wireserve status --json | python3 -c "
 import json,sys
-d=json.load(sys.stdin).get('last_directory') or {}
-s=next((s for s in d.get('services',[]) if s['name']=='$1'), {})
+s=next((s for s in json.load(sys.stdin).get('services',[]) if s['name']=='$1'), {})
 print(s.get('$2', ''))"
 }
 wait_until() {

@@ -4857,3 +4857,15 @@ polls.
     a version more than 2,000 behind; such a node is sent the whole
     directory, through that limit.
     Test: just within reach is served, one further is not.
+
+322. **A service declared into a group was open to everyone for a moment.**
+    The groups a service is in are part of the rules, which the directory
+    kept in memory reads again only in full: every 5 s, or after an admin's
+    write. A declaration naming a group (`wireserve vault 8200 --group
+    infra`) wrote the membership, but its poll refreshed only its own node,
+    so the service sat in default, open to every device and in every hosts
+    file, until the next full read. The grants e2e caught it on aarch64. Now
+    a declaration whose group was taken marks the directory changed before
+    that poll reads it.
+    Test: with a poll in between to read the rules, the declaring poll's own
+    access already has the service closed.

@@ -158,6 +158,9 @@ pub struct UpsertOutcome {
     pub notices: Vec<wireserve_types::ServiceNotice>,
     /// Approvals this declaration took back or gave back, for the log.
     pub reviews: Vec<Review>,
+    /// A declaration put its service in a group: the rules changed, not
+    /// only this node's rows.
+    pub grouped: bool,
 }
 
 /// What [`upsert_for_node`] did to one approved name (PLAN.md #315).
@@ -357,6 +360,7 @@ pub fn upsert_for_node(
     let now = super::nodes::now_str();
     let stamp = mode.stamp();
     let mut reviews = Vec::new();
+    let mut grouped = false;
     for ServiceDecl { name, ports, group } in accepted {
         // `port` and `proto` are the first mapping's target, kept only
         // because the columns are NOT NULL from migration 0001; nothing
@@ -383,7 +387,7 @@ pub fn upsert_for_node(
         )?;
         reviews.extend(review(&tx, node_id, name, mode)?);
         assign_vip(&tx, node_id, name, vip_range)?;
-        super::grants::promote_declared_group(&tx, name)?;
+        grouped |= super::grants::promote_declared_group(&tx, name)?.is_some();
     }
 
     // Read the verdict back inside the same transaction, so what `/poll`
@@ -413,7 +417,7 @@ pub fn upsert_for_node(
                 .unwrap_or_else(|| "what it declares changed since it was approved".to_string());
             notices.push(notice(&row.name, format!("waiting for an admin to approve it again: {why}")));
         }
-        UpsertOutcome { pending, denied, notices, reviews }
+        UpsertOutcome { pending, denied, notices, reviews, grouped }
     };
 
     tx.commit()?;

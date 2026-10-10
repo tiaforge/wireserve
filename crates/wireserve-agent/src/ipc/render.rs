@@ -267,6 +267,7 @@ mod tests {
             online: true,
             local: false,
             pending: false,
+            terminated: false,
             reach: Some(Reach::Allowed),
         }
     }
