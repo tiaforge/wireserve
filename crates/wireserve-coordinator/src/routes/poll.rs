@@ -367,7 +367,9 @@ pub async fn poll(
     let (body, full_permit) = tokio::task::spawn_blocking(move || {
         let full_permit = full_permit;
         let env = crate::directory_state::Env::of(&state);
-        let dir = state.directory.read();
+        // The directory itself: what changed since the version this node holds
+        // when the log can say, otherwise all of it.
+        let (shared, mut delta, dir) = directory_for(&state.directory, have)?;
         let ctx = dir.context(&env);
 
         // End-to-end relaying (PLAN.md M39). A node takes part only while its
@@ -474,23 +476,8 @@ pub async fn poll(
             })
         };
 
-        // The directory itself: what changed since the version this node holds
-        // when the log can say, otherwise all of it.
         let stamp = dir.stamp();
-        let (shared, delta) = match have.and_then(|h| dir.delta_since(&h)) {
-            Some(mut delta) => {
-                delta.relay_via = relay_via;
-                (None, Some(delta))
-            }
-            None => {
-                // Every node that needs all of it is sent the same buffers,
-                // with what changed since they were built as a delta.
-                let shared = dir.shared_full()?;
-                let mut delta = dir.delta_from(shared.version).unwrap_or_default();
-                delta.relay_via = relay_via;
-                (Some(shared), Some(delta))
-            }
-        };
+        delta.relay_via = relay_via;
 
         // Who may reach each of this node's own services (PLAN.md M36), pending
         // ones included, so its firewall is ready the moment approval publishes
@@ -544,7 +531,7 @@ pub async fn poll(
 
         let response = PollResponse {
             stamp: Some(stamp),
-            delta,
+            delta: Some(delta),
             full: shared.is_some(),
             peers: Vec::new(),
             services: Vec::new(),
@@ -593,6 +580,42 @@ pub async fn poll(
         })))
     };
     Ok(([(axum::http::header::CONTENT_TYPE, "application/json")], body))
+}
+
+/// The directory for a node that holds `have`: what changed since, or, when
+/// the log cannot say, the whole directory as serialised for every node that
+/// needs it with what changed since that was built. The read lock comes back
+/// with it, for the rest of the response to be built against the same version.
+fn directory_for(
+    cache: &crate::directory_state::DirectoryCache,
+    have: Option<wireserve_types::DirectoryStamp>,
+) -> Result<
+    (
+        Option<std::sync::Arc<crate::directory_state::SharedFull>>,
+        wireserve_types::DirectoryDelta,
+        std::sync::RwLockReadGuard<'_, crate::directory_state::DirectoryState>,
+    ),
+    serde_json::Error,
+> {
+    let mut shared = None;
+    if !have.is_some_and(|h| cache.read().can_serve(&h)) {
+        // Built, if it must be, with the directory not locked.
+        shared = Some(cache.shared_full()?);
+    }
+    for _ in 0..3 {
+        let dir = cache.read();
+        let delta = match &shared {
+            None => have.and_then(|h| dir.delta_since(&h)),
+            Some(s) => dir.delta_from(s.version),
+        };
+        if let Some(delta) = delta {
+            return Ok((shared, delta, dir));
+        }
+        // The log was trimmed past it in between: all of it, afresh.
+        drop(dir);
+        shared = Some(cache.shared_full()?);
+    }
+    Err(<serde_json::Error as serde::ser::Error>::custom("the directory kept moving past the version being sent"))
 }
 
 /// What one node may ask of `/reach`: a `status` asks once, and a script

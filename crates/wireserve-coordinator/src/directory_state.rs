@@ -11,6 +11,14 @@
 //!
 //! Nothing here is one requester's: its carriers, access and identities are
 //! built per poll.
+//!
+//! Every poll reads this under a read lock, so nothing that grows with the
+//! mesh is done under the write lock: a full re-read works out what differs
+//! under a read lock and takes the write lock only to put that in, and the
+//! whole directory is serialised from a copy of its entries' pointers. That
+//! the state cannot change between the two halves of a re-read rests on every
+//! writer ([`DirectoryCache::ensure`], [`DirectoryCache::refresh_node`])
+//! being called with the database lock held.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -83,7 +91,7 @@ enum Key {
 #[derive(Debug, Clone)]
 pub struct ServiceEntry {
     pub row: ServiceRow,
-    pub info: ServiceInfo,
+    pub info: Arc<ServiceInfo>,
 }
 
 /// Everything the directory is made of, as read from the database and the
@@ -160,7 +168,7 @@ pub struct DirectoryState {
     /// Registered, unrevoked nodes, in id order.
     pub nodes: BTreeMap<i64, NodeRow>,
     by_pubkey: HashMap<String, i64>,
-    peers: HashMap<String, PeerInfo>,
+    peers: HashMap<String, Arc<PeerInfo>>,
     pub services: HashMap<String, ServiceEntry>,
     node_services: HashMap<i64, Vec<String>>,
     pub rules: Rules,
@@ -173,9 +181,6 @@ pub struct DirectoryState {
     /// which addresses.
     access_generation: u64,
     access_memo: Mutex<HashMap<String, MemoEntry>>,
-    shared: Mutex<Option<Arc<SharedFull>>>,
-    /// How large the last one was, to size the next buffer in one go.
-    shared_len: AtomicUsize,
 }
 
 /// A service's access as last worked out, and what it was worked out from.
@@ -226,8 +231,6 @@ impl DirectoryState {
             sign_in_capable: HashSet::new(),
             access_generation: 0,
             access_memo: Mutex::new(HashMap::new()),
-            shared: Mutex::new(None),
-            shared_len: AtomicUsize::new(0),
         }
     }
 
@@ -301,7 +304,7 @@ impl DirectoryState {
 
     /// Every peer, in id order, without carriers.
     pub fn all_peers(&self) -> impl Iterator<Item = &PeerInfo> {
-        self.nodes.values().filter_map(|n| self.peers.get(n.pubkey.as_deref()?))
+        self.nodes.values().filter_map(|n| self.peers.get(n.pubkey.as_deref()?).map(|p| &**p))
     }
 
     /// Every service entry, in name order.
@@ -312,35 +315,17 @@ impl DirectoryState {
         v
     }
 
-    /// Whether [`Self::shared_full`] has one to hand out without building it.
-    #[must_use]
-    pub fn shared_ready(&self) -> bool {
-        self.shared.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_some_and(|s| self.shared_usable(s))
-    }
-
     fn shared_usable(&self, s: &SharedFull) -> bool {
         s.built.elapsed() < SHARED_MAX_AGE && self.version - s.version <= SHARED_MAX_BEHIND && s.version >= self.floor
     }
 
-    /// The whole directory, serialised: the one already built when it is
-    /// recent enough, otherwise a new one. Whoever builds it holds the lock
-    /// on it, so the others that need one wait for it instead of each making
-    /// their own.
-    pub fn shared_full(&self) -> Result<Arc<SharedFull>, serde_json::Error> {
-        let mut slot = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(s) = slot.as_ref().filter(|s| self.shared_usable(s)) {
-            return Ok(Arc::clone(s));
-        }
-        // Nothing held while the old one is replaced, so that it is freed
-        // before the new one is written when nobody is still sending it.
-        *slot = None;
-        let hint = self.shared_len.load(Ordering::Relaxed);
-        let peers = json_array(self.all_peers(), self.peers.len(), hint / 2)?;
-        let services = json_array(self.all_services().into_iter().map(|e| &e.info), self.services.len(), hint / 2)?;
-        self.shared_len.store(peers.len() + services.len(), Ordering::Relaxed);
-        let s = Arc::new(SharedFull { version: self.version, built: Instant::now(), peers: Bytes::from(peers), services: Bytes::from(services) });
-        *slot = Some(Arc::clone(&s));
-        Ok(s)
+    /// The version, and a pointer to every peer (in id order) and service
+    /// (in no order): what the whole directory is serialised from once the
+    /// lock is let go.
+    fn snapshot(&self) -> (u64, Vec<Arc<PeerInfo>>, Vec<Arc<ServiceInfo>>) {
+        let peers = self.nodes.values().filter_map(|n| self.peers.get(n.pubkey.as_deref()?).cloned()).collect();
+        let services = self.services.values().map(|e| Arc::clone(&e.info)).collect();
+        (self.version, peers, services)
     }
 
     // ---- what changed ----
@@ -370,11 +355,11 @@ impl DirectoryState {
             }
             match key {
                 Key::Peer(pk) => match self.peers.get(pk) {
-                    Some(p) => delta.peers_set.push(p.clone()),
+                    Some(p) => delta.peers_set.push((**p).clone()),
                     None => delta.peers_removed.push(pk.clone()),
                 },
                 Key::Service(name) => match self.services.get(name) {
-                    Some(s) => delta.services_set.push(s.info.clone()),
+                    Some(s) => delta.services_set.push((*s.info).clone()),
                     None => delta.services_removed.push(name.clone()),
                 },
             }
@@ -400,13 +385,13 @@ impl DirectoryState {
 
     fn put_peer(&mut self, p: PeerInfo) {
         match self.peers.get(&p.pubkey) {
-            Some(old) if *old == p => return,
+            Some(old) if **old == p => return,
             Some(old) => self.digest.remove(peer_hash(old)),
             None => {}
         }
         self.digest.add(peer_hash(&p));
         let pk = p.pubkey.clone();
-        self.peers.insert(pk.clone(), p);
+        self.peers.insert(pk.clone(), Arc::new(p));
         self.record(Key::Peer(pk));
     }
 
@@ -445,57 +430,99 @@ impl DirectoryState {
     /// Replaces everything that was read, writing only the entries that
     /// differ.
     pub fn adopt(&mut self, l: Loaded, env: &Env) {
+        let plan = self.plan_adopt(l, env);
+        drop(self.apply_adopt(plan));
+    }
+
+    /// What [`Self::adopt`] would change: worked out under a read lock, so
+    /// that polls go on meanwhile. Each entry is compared with the one held
+    /// as it is made and dropped when it is the same, which nearly all are.
+    #[must_use]
+    pub fn plan_adopt(&self, l: Loaded, env: &Env) -> AdoptPlan {
         let nodes: BTreeMap<i64, NodeRow> = l.nodes.into_iter().map(|n| (n.id, n)).collect();
         let mut by_pubkey = HashMap::with_capacity(nodes.len());
         let mut relayable = HashSet::new();
-        // Each entry is compared with the one held as it is made, and dropped
-        // when it is the same, which nearly all are: nothing the size of the
-        // mesh is built twice over.
+        let mut peers_put = Vec::new();
         for n in nodes.values() {
             let Some(pk) = n.pubkey.clone() else { continue };
             let p = make_peer(env, n, l.carry_ports.get(&pk).copied());
             if p.relay.port.is_some() && p.relay.carry_port.is_some() {
                 relayable.insert(pk.clone());
             }
+            if self.peers.get(&pk).is_none_or(|old| **old != p) {
+                peers_put.push(p);
+            }
             by_pubkey.insert(pk, n.id);
-            self.put_peer(p);
         }
-        let gone: Vec<String> = self.peers.keys().filter(|k| !by_pubkey.contains_key(*k)).cloned().collect();
-        for pk in gone {
-            self.remove_peer(&pk);
-        }
+        let peers_gone: Vec<String> = self.peers.keys().filter(|k| !by_pubkey.contains_key(*k)).cloned().collect();
 
         let mut node_services: HashMap<i64, Vec<String>> = HashMap::new();
+        let mut services_put = Vec::new();
         {
             let ctx = DirectoryContext { tls_ready: &l.tls_ready, dns: env.dns, online_threshold_secs: env.online_threshold_secs };
             for s in l.services {
                 let Some(owner) = nodes.get(&s.node_id) else { continue };
                 let info = service_info(&s, owner, env.online_threshold_secs, ctx.terminates(&s));
                 node_services.entry(s.node_id).or_default().push(s.name.clone());
-                self.put_service(ServiceEntry { row: s, info });
+                // The row may differ in ways the entry does not show, and is kept too.
+                if self.services.get(&s.name).is_none_or(|old| *old.info != info || old.row != s) {
+                    services_put.push(ServiceEntry { row: s, info: Arc::new(info) });
+                }
             }
         }
-        let gone: Vec<String> = {
+        let services_gone: Vec<String> = {
             let kept: HashSet<&str> = node_services.values().flatten().map(String::as_str).collect();
             self.services.keys().filter(|k| !kept.contains(k.as_str())).cloned().collect()
         };
-        for name in gone {
-            self.remove_service(&name);
-        }
 
         let same_addresses = self.nodes.len() == nodes.len()
             && self.nodes.iter().zip(nodes.iter()).all(|((a, x), (b, y))| a == b && x.ip4 == y.ip4);
-        if self.rules != l.rules || !same_addresses {
+        AdoptPlan {
+            access_changed: self.rules != l.rules || !same_addresses,
+            nodes,
+            by_pubkey,
+            node_services,
+            rules: l.rules,
+            tls_ready: l.tls_ready,
+            static_relays: l.static_relays,
+            relayable,
+            sign_in_capable: l.sign_in_capable,
+            peers_put,
+            peers_gone,
+            services_put,
+            services_gone,
+        }
+    }
+
+    /// Puts in what [`Self::plan_adopt`] found, under the write lock: as long
+    /// as what changed, not as long as the mesh. What it replaced is handed
+    /// back, to be freed once the lock is let go.
+    pub fn apply_adopt(&mut self, plan: AdoptPlan) -> Replaced {
+        for pk in &plan.peers_gone {
+            self.remove_peer(pk);
+        }
+        for p in plan.peers_put {
+            self.put_peer(p);
+        }
+        for name in &plan.services_gone {
+            self.remove_service(name);
+        }
+        for e in plan.services_put {
+            self.put_service(e);
+        }
+        if plan.access_changed {
             self.access_generation += 1;
         }
-        self.nodes = nodes;
-        self.by_pubkey = by_pubkey;
-        self.node_services = node_services;
-        self.rules = l.rules;
-        self.tls_ready = l.tls_ready;
-        self.static_relays = l.static_relays;
-        self.relayable = relayable;
-        self.sign_in_capable = l.sign_in_capable;
+        Replaced {
+            _nodes: std::mem::replace(&mut self.nodes, plan.nodes),
+            _by_pubkey: std::mem::replace(&mut self.by_pubkey, plan.by_pubkey),
+            _node_services: std::mem::replace(&mut self.node_services, plan.node_services),
+            _rules: std::mem::replace(&mut self.rules, plan.rules),
+            _tls_ready: std::mem::replace(&mut self.tls_ready, plan.tls_ready),
+            _static_relays: std::mem::replace(&mut self.static_relays, plan.static_relays),
+            _relayable: std::mem::replace(&mut self.relayable, plan.relayable),
+            _sign_in_capable: std::mem::replace(&mut self.sign_in_capable, plan.sign_in_capable),
+        }
     }
 
     /// Replaces what is known of one node.
@@ -558,7 +585,7 @@ impl DirectoryState {
             let ctx = DirectoryContext { tls_ready: &self.tls_ready, dns: env.dns, online_threshold_secs: env.online_threshold_secs };
             l.services
                 .into_iter()
-                .map(|s| ServiceEntry { info: service_info(&s, owner, env.online_threshold_secs, ctx.terminates(&s)), row: s })
+                .map(|s| ServiceEntry { info: Arc::new(service_info(&s, owner, env.online_threshold_secs, ctx.terminates(&s))), row: s })
                 .collect()
         };
         let names: Vec<String> = entries.iter().map(|e| e.row.name.clone()).collect();
@@ -570,6 +597,35 @@ impl DirectoryState {
         }
         self.node_services.insert(id, names);
     }
+}
+
+/// What a full re-read changes; see [`DirectoryState::plan_adopt`].
+pub struct AdoptPlan {
+    access_changed: bool,
+    nodes: BTreeMap<i64, NodeRow>,
+    by_pubkey: HashMap<String, i64>,
+    node_services: HashMap<i64, Vec<String>>,
+    rules: Rules,
+    tls_ready: HashMap<String, i64>,
+    static_relays: Vec<(i64, i64, i64)>,
+    relayable: HashSet<String>,
+    sign_in_capable: HashSet<String>,
+    peers_put: Vec<PeerInfo>,
+    peers_gone: Vec<String>,
+    services_put: Vec<ServiceEntry>,
+    services_gone: Vec<String>,
+}
+
+/// What a re-read replaced, freed by dropping it.
+pub struct Replaced {
+    _nodes: BTreeMap<i64, NodeRow>,
+    _by_pubkey: HashMap<String, i64>,
+    _node_services: HashMap<i64, Vec<String>>,
+    _rules: Rules,
+    _tls_ready: HashMap<String, i64>,
+    _static_relays: Vec<(i64, i64, i64)>,
+    _relayable: HashSet<String>,
+    _sign_in_capable: HashSet<String>,
 }
 
 /// `items` as a JSON array, written straight into one buffer: no copy of an
@@ -603,11 +659,21 @@ pub struct DirectoryCache {
     generation: std::sync::atomic::AtomicU64,
     last: Mutex<Option<(u64, Instant)>>,
     state: RwLock<DirectoryState>,
+    /// The whole directory as last serialised.
+    shared: Mutex<Option<Arc<SharedFull>>>,
+    /// How large it was, to size the next buffer in one go.
+    shared_len: AtomicUsize,
 }
 
 impl Default for DirectoryCache {
     fn default() -> Self {
-        Self { generation: std::sync::atomic::AtomicU64::new(0), last: Mutex::new(None), state: RwLock::new(DirectoryState::new()) }
+        Self {
+            generation: std::sync::atomic::AtomicU64::new(0),
+            last: Mutex::new(None),
+            state: RwLock::new(DirectoryState::new()),
+            shared: Mutex::new(None),
+            shared_len: AtomicUsize::new(0),
+        }
     }
 }
 
@@ -636,7 +702,9 @@ impl DirectoryCache {
             return Ok(());
         }
         let loaded = Loaded::read(conn, app)?;
-        self.state.write().unwrap_or_else(PoisonError::into_inner).adopt(loaded, &Env::of(app));
+        let plan = self.read().plan_adopt(loaded, &Env::of(app));
+        let replaced = self.state.write().unwrap_or_else(PoisonError::into_inner).apply_adopt(plan);
+        drop(replaced);
         *last = Some((generation, Instant::now()));
         Ok(())
     }
@@ -651,6 +719,40 @@ impl DirectoryCache {
 
     pub fn read(&self) -> RwLockReadGuard<'_, DirectoryState> {
         self.state.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether [`Self::shared_full`] has one to hand out without building it.
+    #[must_use]
+    pub fn shared_ready(&self) -> bool {
+        let slot = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        slot.as_ref().is_some_and(|s| self.read().shared_usable(s))
+    }
+
+    /// The whole directory, serialised: the one already built when it is
+    /// recent enough, otherwise a new one. Whoever builds it holds the lock
+    /// on it, so the others that need one wait for it instead of each making
+    /// their own; the directory itself is only read for as long as it takes
+    /// to copy a pointer to each entry.
+    pub fn shared_full(&self) -> Result<Arc<SharedFull>, serde_json::Error> {
+        let mut slot = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        let (version, peers, mut services) = {
+            let st = self.read();
+            if let Some(s) = slot.as_ref().filter(|s| st.shared_usable(s)) {
+                return Ok(Arc::clone(s));
+            }
+            st.snapshot()
+        };
+        // Nothing held while the old one is replaced, so that it is freed
+        // before the new one is written when nobody is still sending it.
+        *slot = None;
+        services.sort_by(|a, b| a.name.cmp(&b.name));
+        let hint = self.shared_len.load(Ordering::Relaxed);
+        let peers = json_array(peers.iter().map(|p| &**p), peers.len(), hint / 2)?;
+        let services = json_array(services.iter().map(|s| &**s), services.len(), hint / 2)?;
+        self.shared_len.store(peers.len() + services.len(), Ordering::Relaxed);
+        let s = Arc::new(SharedFull { version, built: Instant::now(), peers: Bytes::from(peers), services: Bytes::from(services) });
+        *slot = Some(Arc::clone(&s));
+        Ok(s)
     }
 }
 
@@ -700,7 +802,7 @@ mod tests {
     }
 
     fn base_of(s: &DirectoryState) -> DirectoryBase {
-        let services: Vec<ServiceInfo> = s.all_services().into_iter().map(|e| e.info.clone()).collect();
+        let services: Vec<ServiceInfo> = s.all_services().into_iter().map(|e| (*e.info).clone()).collect();
         DirectoryBase::from_full(&s.all_peers().cloned().collect::<Vec<_>>(), &services)
     }
 
@@ -787,32 +889,54 @@ mod tests {
 
     #[test]
     fn the_whole_directory_is_serialised_once_and_replayed_by_a_delta_from_its_version() {
-        let mut s = DirectoryState::new();
-        s.adopt(loaded(vec![node(1, None), node(2, None)], vec![service(1, "web", 80)]), &ENV);
-        let first = s.shared_full().unwrap();
-        assert!(s.shared_ready());
-        assert!(Arc::ptr_eq(&first, &s.shared_full().unwrap()), "the one built is the one handed out");
+        let c = DirectoryCache::default();
+        let w = || c.state.write().unwrap();
+        w().adopt(loaded(vec![node(1, None), node(2, None)], vec![service(1, "web", 80)]), &ENV);
+        let first = c.shared_full().unwrap();
+        assert!(c.shared_ready());
+        assert!(Arc::ptr_eq(&first, &c.shared_full().unwrap()), "the one built is the one handed out");
         let peers: Vec<PeerInfo> = serde_json::from_slice(&first.peers).unwrap();
         let services: Vec<ServiceInfo> = serde_json::from_slice(&first.services).unwrap();
-        assert_eq!(peers, s.all_peers().cloned().collect::<Vec<_>>());
+        assert_eq!(peers, c.read().all_peers().cloned().collect::<Vec<_>>());
         assert_eq!(services.len(), 1);
 
         // Something changes: the same buffers still serve, with what changed since.
-        s.apply_node(3, node_load(Some(node(3, Some("203.0.113.3:51820"))), vec![]), &ENV);
-        let again = s.shared_full().unwrap();
+        w().apply_node(3, node_load(Some(node(3, Some("203.0.113.3:51820"))), vec![]), &ENV);
+        let again = c.shared_full().unwrap();
         assert!(Arc::ptr_eq(&first, &again));
-        let delta = s.delta_from(again.version).unwrap();
+        let delta = c.read().delta_from(again.version).unwrap();
         assert_eq!(delta.peers_set.len(), 1);
         let mut base = DirectoryBase::from_full(&peers, &services);
         base.apply(&delta);
-        assert_eq!(base.digest(), s.stamp().digest);
+        assert_eq!(base.digest(), c.read().stamp().digest);
 
         // Too far behind to be worth it: a new one.
         for i in 0..=SHARED_MAX_BEHIND {
-            s.record(Key::Peer(format!("pk-{i}")));
+            w().record(Key::Peer(format!("pk-{i}")));
         }
-        assert!(!s.shared_ready());
-        assert!(!Arc::ptr_eq(&first, &s.shared_full().unwrap()));
+        assert!(!c.shared_ready());
+        assert!(!Arc::ptr_eq(&first, &c.shared_full().unwrap()));
+    }
+
+    #[test]
+    fn a_re_read_planned_under_a_read_lock_changes_what_adopting_it_whole_would() {
+        let rows = |endpoint: &str| loaded(
+            vec![node(1, None), node(2, Some(endpoint)), node(3, None)],
+            vec![service(1, "web", 80), service(2, "db", 5432)],
+        );
+        let mut whole = DirectoryState::new();
+        let mut planned = DirectoryState::new();
+        whole.adopt(rows("203.0.113.1:1"), &ENV);
+        planned.adopt(rows("203.0.113.1:1"), &ENV);
+
+        let next = || loaded(vec![node(1, None), node(2, Some("203.0.113.2:2"))], vec![service(2, "db", 5432)]);
+        whole.adopt(next(), &ENV);
+        let plan = planned.plan_adopt(next(), &ENV);
+        assert_eq!(plan.peers_put.len(), 1, "only what differs is carried over");
+        drop(planned.apply_adopt(plan));
+        assert_eq!(base_of(&planned).digest(), base_of(&whole).digest());
+        assert_eq!(planned.stamp(), DirectoryStamp { epoch: planned.epoch, ..whole.stamp() });
+        assert!(planned.node_by_pubkey("pk-n3").is_none());
     }
 
     #[test]
