@@ -199,6 +199,25 @@ pub struct BearerNode {
     pub node: crate::db::nodes::NodeRow,
 }
 
+/// A request's place among those in hand at once (`routes::polls_at_once`),
+/// given back early by a request whose credential is wrong.
+#[derive(Clone)]
+pub struct InHand(std::sync::Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>);
+
+impl InHand {
+    #[must_use]
+    pub fn new(place: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Some(place))))
+    }
+
+    /// Gives back the place of the request `parts` belongs to, if it has one.
+    fn give_back(parts: &Parts) {
+        if let Some(in_hand) = parts.extensions.get::<InHand>() {
+            in_hand.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        }
+    }
+}
+
 impl FromRequestParts<AppState> for BearerNode {
     type Rejection = AuthError;
 
@@ -209,6 +228,7 @@ impl FromRequestParts<AppState> for BearerNode {
         let blocked = over_budget(state, parts);
         let Some(candidate) = extract_bearer(parts) else {
             record_failed_auth(state, parts, node_endpoint(parts), "missing_header");
+            InHand::give_back(parts);
             state.rate_limiter.apply_failure_delay().await;
             return Err(if blocked {
                 AuthError::RateLimited
@@ -230,6 +250,7 @@ impl FromRequestParts<AppState> for BearerNode {
                 // point, which is what makes the delay safe to await
                 // here — see `RateLimiter::failure_delay`.
                 record_failed_auth(state, parts, node_endpoint(parts), "unknown_token");
+                InHand::give_back(parts);
                 state.rate_limiter.apply_failure_delay().await;
                 Err(if blocked {
                     AuthError::RateLimited

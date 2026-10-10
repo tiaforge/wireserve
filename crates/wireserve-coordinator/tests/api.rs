@@ -4531,6 +4531,38 @@ async fn a_node_is_sent_one_whole_directory_at_a_time_and_told_how_long_it_is() 
     assert_eq!(axum::body::to_bytes(delta.into_body(), usize::MAX).await.unwrap().len(), length);
 }
 
+#[tokio::test]
+async fn a_poll_past_how_many_may_be_in_hand_is_turned_away_before_anything_else() {
+    let app = test_app();
+    let t = admin_create_node(&app.router, "a").await;
+    let bearer = register_node(&app.router, &t, "pk-a", 51820).await["bearer_token"].as_str().unwrap().to_string();
+    let all = u32::try_from(wireserve_coordinator::state::POLLS_AT_ONCE).unwrap();
+    let held = app.state.polls_at_once.clone().try_acquire_many_owned(all).unwrap();
+    assert_eq!(poll_full(&app.router, &bearer, json!({ "services": [] })).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    // Not even the credential is looked at.
+    assert_eq!(poll_full(&app.router, "brt_bogus", json!({ "services": [] })).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    drop(held);
+    assert_eq!(poll_full(&app.router, &bearer, json!({ "services": [] })).await.0, StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bad_tokens_waiting_out_their_delay_do_not_hold_the_places_of_polls_in_hand() {
+    let mut config = test_config("");
+    config.global_auth_failure_max = 0; // every failure is delayed
+    let app = app_with_config(config);
+    let t = admin_create_node(&app.router, "a").await;
+    let bearer = register_node(&app.router, &t, "pk-a", 51820).await["bearer_token"].as_str().unwrap().to_string();
+    // All places but one taken, and that one used by a bad token in its delay.
+    let all = u32::try_from(wireserve_coordinator::state::POLLS_AT_ONCE).unwrap();
+    let held = app.state.polls_at_once.clone().try_acquire_many_owned(all - 1).unwrap();
+    let router = app.router.clone();
+    let bad = tokio::spawn(async move { poll_full(&router, "brt_bogus", json!({ "services": [] })).await.0 });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(poll_full(&app.router, &bearer, json!({ "services": [] })).await.0, StatusCode::OK);
+    assert_eq!(bad.await.unwrap(), StatusCode::UNAUTHORIZED);
+    drop(held);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn only_so_many_responses_are_built_at_once_and_the_rest_wait_their_turn() {
     let app = test_app();

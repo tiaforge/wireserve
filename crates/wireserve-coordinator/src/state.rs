@@ -53,6 +53,8 @@ pub struct AppState {
     pub full_directory_limit: Arc<tokio::sync::Semaphore>,
     /// The nodes a whole directory is on its way to: one at a time each.
     pub full_in_flight: Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
+    /// How many polls may be in hand at once ([`POLLS_AT_ONCE`]).
+    pub polls_at_once: Arc<tokio::sync::Semaphore>,
     /// How many responses may be worked out at once, on threads of their own
     /// ([`response_builds`]).
     pub response_builds: Arc<tokio::sync::Semaphore>,
@@ -63,6 +65,15 @@ pub struct AppState {
 /// come back. They share their buffers, so what each costs is what the
 /// connection holds, and what the node at the other end must hold to read it.
 pub const FULL_DIRECTORIES_IN_FLIGHT: usize = 32;
+
+/// More polls than this in hand at once (waiting for the database, or for
+/// their turn to be built) and the next is told to come back, which an agent
+/// does after a backoff. Each one in hand holds its request and its
+/// connection's buffers: a fleet polling all at once, as one coming back
+/// after an outage does, held 20,000 of them at 20,000 nodes, close to a
+/// gigabyte. In steady state, 20,000 nodes polling every 20 s have about a
+/// hundred in hand at the worst moment, the 5 s re-read of the database.
+pub const POLLS_AT_ONCE: usize = 1024;
 
 /// How many `/poll` and `/reach` responses may be built at once: twice the
 /// cores, at least four. The rest wait as tasks, which cost next to nothing,

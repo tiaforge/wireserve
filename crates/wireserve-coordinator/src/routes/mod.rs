@@ -29,7 +29,7 @@ use crate::state::AppState;
 pub fn node_router(state: AppState) -> Router {
     Router::new()
         .route("/register", post(register::register))
-        .route("/poll", post(poll::poll))
+        .route("/poll", post(poll::poll).layer(axum::middleware::from_fn_with_state(state.clone(), polls_at_once)))
         .route("/probe", get(probe::probe))
         .route("/reach", get(poll::reach))
         .route("/tls/challenge", post(tls::add).delete(tls::remove))
@@ -63,6 +63,31 @@ async fn directory_changed_by_node(
     if counted {
         state.directory_changed();
     }
+    response
+}
+
+/// Turns a poll away straight away when [`crate::state::POLLS_AT_ONCE`] are in
+/// hand: before its bearer token is looked up, which waits for the database
+/// like the rest of the poll.
+///
+/// The place goes with the request (`auth::InHand`), so that one whose
+/// credential is wrong gives it back before its failure delay: otherwise a
+/// flood of bad tokens, each waiting out its delay, would hold every place
+/// and turn the nodes away.
+async fn polls_at_once(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Ok(place) = std::sync::Arc::clone(&state.polls_at_once).try_acquire_owned() else {
+        return axum::response::IntoResponse::into_response(crate::error::AppError::Unavailable(
+            "the coordinator has a lot of polls in hand; try again shortly".into(),
+        ));
+    };
+    let in_hand = crate::auth::InHand::new(place);
+    req.extensions_mut().insert(in_hand.clone());
+    let response = next.run(req).await;
+    drop(in_hand);
     response
 }
 
