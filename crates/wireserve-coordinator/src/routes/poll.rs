@@ -328,28 +328,48 @@ pub async fn poll(
         state.transit.select_where(a, c, fresh, &can_carry)
     };
 
-    for peer in &mut peers {
-        if peer.pubkey == self_pubkey {
+    // Only a pair somebody asked to have relayed can have a carrier
+    // (`either_wants`), so what follows walks those, never every pair of
+    // nodes in the mesh.
+    let wanted = state.transit.wanted_pairs();
+    let index: std::collections::HashMap<&str, usize> =
+        all_peers.iter().enumerate().filter_map(|(i, n)| Some((n.pubkey.as_deref()?, i))).collect();
+    for (x, y) in &wanted {
+        let other = if *x == self_pubkey {
+            y
+        } else if *y == self_pubkey {
+            x
+        } else {
             continue;
+        };
+        if let Some(&i) = index.get(other.as_str()) {
+            if peers[i].pubkey != self_pubkey {
+                peers[i].relay.via = relay_carrier(&self_pubkey, other).filter(|via| via != &self_pubkey);
+            }
         }
-        peer.relay.via = relay_carrier(&self_pubkey, &peer.pubkey).filter(|via| via != &self_pubkey);
     }
 
     // This requester's own carrier role this cycle (PLAN.md M39): every
     // OTHER pair (x, y) — neither of them this requester — for which
     // `relay_carrier` names this requester. A carrier learns its role from
     // this list alone: its own entries for x and y never carry a `via`,
-    // since it is only ever chosen when it reaches both directly.
-    let all_pubkeys: Vec<&str> = all_peers.iter().filter_map(|n| n.pubkey.as_deref()).collect();
+    // since it is only ever chosen when it reaches both directly. A node
+    // that is not offering to carry cannot be chosen for any pair.
     let mut relay_carrying = Vec::new();
-    for (i, &x) in all_pubkeys.iter().enumerate() {
-        if x == self_pubkey {
-            continue;
-        }
-        for &y in &all_pubkeys[i + 1..] {
-            if y == self_pubkey {
-                continue;
-            }
+    if state.transit.is_offering(&self_pubkey, fresh) && can_carry(&self_pubkey) {
+        // In the directory's order, first end first, each pair once.
+        let mut pairs: Vec<(usize, usize)> = wanted
+            .iter()
+            .filter(|(x, y)| x != y && *x != self_pubkey && *y != self_pubkey)
+            .filter_map(|(x, y)| {
+                let (i, j) = (*index.get(x.as_str())?, *index.get(y.as_str())?);
+                Some((i.min(j), i.max(j)))
+            })
+            .collect();
+        pairs.sort_unstable();
+        pairs.dedup();
+        for (i, j) in pairs {
+            let (x, y) = (all_peers[i].pubkey.as_deref().unwrap_or_default(), all_peers[j].pubkey.as_deref().unwrap_or_default());
             if relay_carrier(x, y).as_deref() == Some(self_pubkey.as_str()) {
                 relay_carrying.push(wireserve_types::TransitPair { a: x.to_string(), c: y.to_string() });
             }

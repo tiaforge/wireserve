@@ -133,6 +133,21 @@ impl TransitState {
         wants(a, c) || wants(c, a)
     }
 
+    /// Every `(x, y)` some node's last report names in its `wanted` set, in
+    /// one pass under one hold. [`Self::either_wants`] is false for any other
+    /// pair, so these are the only pairs a relay can ever be chosen for —
+    /// what `/poll` walks instead of every pair of nodes in the mesh.
+    /// Unordered, may name the same two nodes both ways, and may name nodes
+    /// no longer in the directory.
+    #[must_use]
+    pub fn wanted_pairs(&self) -> Vec<(String, String)> {
+        let by_pubkey = self.by_pubkey.lock().expect("transit state mutex poisoned");
+        by_pubkey
+            .iter()
+            .flat_map(|(x, report)| report.wanted.iter().map(move |y| (x.clone(), y.clone())))
+            .collect()
+    }
+
     /// Stops a node being selected as a carrier from this moment, keeping
     /// the rest of its report (what it wants) — for an admin withdrawing
     /// its transit approval, which should not wait for the node's next
@@ -469,5 +484,24 @@ mod tests {
         s.forget("b");
         assert_eq!(s.select("a", "c", 30), None);
         assert!(!s.either_wants("b", "x"));
+    }
+
+    #[test]
+    fn wanted_pairs_cover_exactly_the_pairs_either_wants_accepts() {
+        let s = TransitState::default();
+        let names = ["a", "b", "c", "d", "e", "f"];
+        // A small mesh where each node wants a few others, some both ways.
+        let wants: [(&str, &[&str]); 4] = [("a", &["b", "c"]), ("b", &["a"]), ("d", &["e"]), ("f", &[])];
+        for (who, list) in wants {
+            let list: Vec<String> = list.iter().map(|n| (*n).to_string()).collect();
+            s.report(who, false, &[], &list);
+        }
+        let pairs = s.wanted_pairs();
+        for x in names {
+            for y in names {
+                let listed = pairs.iter().any(|(p, q)| (p == x && q == y) || (p == y && q == x));
+                assert_eq!(listed, s.either_wants(x, y), "{x} {y}");
+            }
+        }
     }
 }
