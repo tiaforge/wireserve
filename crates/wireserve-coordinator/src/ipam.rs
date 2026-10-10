@@ -2,6 +2,7 @@
 //! first-free-address scan over a configured v4 CIDR / v6 ULA prefix,
 //! skipping the network address.
 
+use std::collections::HashSet;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -28,6 +29,9 @@ pub fn allocate_v4(cidr: &str, used: &[Ipv4Addr]) -> Result<Ipv4Addr, IpamError>
     // Exclusive upper bound: the broadcast host is excluded unless /31.
     let max_hosts = if host_bits >= 2 { max_hosts - 1 } else { max_hosts };
 
+    // A set, not `used.contains`: a linear probe per candidate made one
+    // allocation quadratic in the addresses already handed out.
+    let used: HashSet<Ipv4Addr> = used.iter().copied().collect();
     for host in 1..max_hosts {
         let candidate = Ipv4Addr::from(network_u32 | host);
         if !used.contains(&candidate) {
@@ -53,6 +57,7 @@ pub fn allocate_v6(prefix: &str, used: &[Ipv6Addr]) -> Result<Ipv6Addr, IpamErro
     // spin forever.
     let max_hosts: u128 = 1u128 << host_bits.min(32);
 
+    let used: HashSet<Ipv6Addr> = used.iter().copied().collect();
     for host in 1..max_hosts {
         let candidate = Ipv6Addr::from(network_u128 | host);
         if !used.contains(&candidate) {
@@ -136,6 +141,19 @@ mod tests {
             allocate_v4("10.0.0.0/31", &[]).unwrap(),
             Ipv4Addr::new(10, 0, 0, 1)
         );
+    }
+
+    #[test]
+    fn v4_finds_the_first_free_address_in_a_crowded_range() {
+        // Every address of a /16 but one hole, in no particular order.
+        let mut used: Vec<Ipv4Addr> = (1..=65_534u32)
+            .filter(|h| *h != 40_000)
+            .map(|h| Ipv4Addr::from(0x0a64_0000 | h))
+            .collect();
+        used.reverse();
+        assert_eq!(allocate_v4("10.100.0.0/16", &used).unwrap(), Ipv4Addr::from(0x0a64_0000 | 40_000));
+        used.push(Ipv4Addr::from(0x0a64_0000 | 40_000));
+        assert_eq!(allocate_v4("10.100.0.0/16", &used), Err(IpamError::Exhausted));
     }
 
     #[test]
