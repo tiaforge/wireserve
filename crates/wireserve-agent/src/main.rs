@@ -1102,6 +1102,12 @@ async fn teardown_everything<F: FirewallBackend>(
     // longer considers itself part of the mesh sitting on disk
     // indefinitely. The revoked-node path deliberately keeps it.
     if !reset_state {
+        // The directory goes to disk only now and then while running
+        // (`AgentState::save_directory_if_due`); a stop writes the latest, so
+        // that a restart starts from it.
+        if let Err(e) = state.lock().await.save(state_path) {
+            tracing::warn!(error = %e, "failed to save local state during teardown");
+        }
         return;
     }
     let mut state = state.lock().await;
