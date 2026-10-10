@@ -64,6 +64,19 @@ impl PollError {
         )
     }
 
+    /// The coordinator could not be reached, or could not keep up: a request
+    /// that failed or timed out, a 429, a 5xx. What the poll loop backs off
+    /// from (`backoff::delay`), as against a rejection retrying will not cure
+    /// or a local step that failed.
+    #[must_use]
+    pub fn is_coordinator_trouble(&self) -> bool {
+        match self {
+            PollError::Http(_) => true,
+            PollError::Rejected { status, .. } => *status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error(),
+            _ => false,
+        }
+    }
+
     /// The hosts-file step failed with `EROFS`. Under the shipped systemd
     /// unit that means the agent lost its bind mount of `/etc/hosts`:
     /// `ReadWritePaths=/etc/hosts` mounts the file into the unit's
@@ -1658,6 +1671,16 @@ mod tests {
         quarantine_rejected_service(&mut state, &body);
 
         assert_eq!(state.rejected_services.len(), 1);
+    }
+
+    #[test]
+    fn only_an_unreachable_or_struggling_coordinator_is_trouble_to_back_off_from() {
+        let rejected = |status| PollError::Rejected { status, message: String::new() };
+        assert!(rejected(reqwest::StatusCode::TOO_MANY_REQUESTS).is_coordinator_trouble());
+        assert!(rejected(reqwest::StatusCode::BAD_GATEWAY).is_coordinator_trouble());
+        assert!(!rejected(reqwest::StatusCode::BAD_REQUEST).is_coordinator_trouble());
+        assert!(!rejected(reqwest::StatusCode::UNAUTHORIZED).is_coordinator_trouble());
+        assert!(!PollError::NotRegistered.is_coordinator_trouble());
     }
 
     // ---- F9: PollError::is_unauthorized ----

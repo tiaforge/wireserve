@@ -744,6 +744,13 @@ async fn cmd_daemon(
 
     let hosts_path = paths::hosts_path();
     let mut interval = tokio::time::interval(Duration::from_secs(poll_interval_secs));
+    // A poll that overran (a 30 s timeout) is not made up for by polling again
+    // at once: an overloaded coordinator would never get a moment's relief.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Polls in a row the coordinator could not answer, and the earliest an
+    // early wake-up (below) may poll again while backing off from them.
+    let mut coordinator_failures: u32 = 0;
+    let mut not_before = tokio::time::Instant::now();
     // Between polls, the kernel's receive counters: a peer whose path goes
     // quiet is noticed within seconds, not at the next poll.
     let mut liveness = tokio::time::interval(wireserve_agent::wg::LIVENESS_CHECK_INTERVAL);
@@ -796,12 +803,12 @@ async fn cmd_daemon(
             // first time: its owner is asked after now, not at the next
             // cycle, so its first requests wait a second or two for who it is
             // rather than twenty. A moment's grace lets several arrive as one.
-            _ = async {
+            scheduled = async {
                 tokio::select! {
-                    _ = interval.tick() => {}
-                    () = tls_link.wake.notified() => tokio::time::sleep(Duration::from_secs(1)).await,
+                    _ = interval.tick() => true,
+                    () = tls_link.wake.notified() => { tokio::time::sleep(Duration::from_secs(1)).await; false }
                     // A port check answered: the coordinator is waiting on it.
-                    () = port_checks.wake.notified() => {}
+                    () = port_checks.wake.notified() => false,
                     // A peer's path just went dead: ask for its relay now.
                     () = async {
                         loop {
@@ -816,9 +823,14 @@ async fn cmd_daemon(
                                 wireserve_agent::wg::nudge(socket, &endpoint_tracker.peers_to_nudge(now)).await;
                             }
                         }
-                    } => {}
+                    } => false,
                 }
             } => {
+                // Backing off from a coordinator that could not answer: only
+                // the schedule, which backing off moved, may poll it again.
+                if !scheduled && tokio::time::Instant::now() < not_before {
+                    continue;
+                }
                 let mut ctx = poll_loop::PollContext {
                     client: &client,
                     coordinator_url: &coordinator_url,
@@ -841,6 +853,22 @@ async fn cmd_daemon(
                 // mutate a running daemon and the host firewall's FORWARD
                 // hook has to follow them.
                 interop.tick(firewall::ForwardWanted::of(&*shared_state.lock().await));
+
+                match &result {
+                    Err(e) if e.is_coordinator_trouble() => {
+                        coordinator_failures = coordinator_failures.saturating_add(1);
+                        let wait = wireserve_agent::backoff::delay(
+                            Duration::from_secs(poll_interval_secs),
+                            coordinator_failures,
+                            rand::random::<f64>(),
+                        );
+                        not_before = tokio::time::Instant::now() + wait;
+                        interval.reset_after(wait);
+                        tracing::warn!(failures = coordinator_failures, wait_secs = wait.as_secs(), "coordinator did not answer; backing off");
+                    }
+                    // It answered, even if with a refusal.
+                    _ => coordinator_failures = 0,
+                }
 
                 match &result {
                     Ok(_) => hosts_synced = true,
