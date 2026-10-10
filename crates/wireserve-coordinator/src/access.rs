@@ -18,6 +18,7 @@ use crate::db::nodes::NodeRow;
 use crate::db::services::ServiceRow;
 
 /// The grants and memberships in force, read once per request.
+#[derive(PartialEq)]
 pub struct Rules {
     pub grants: Vec<Grant>,
     pub members: BTreeMap<String, BTreeSet<String>>,
@@ -74,6 +75,7 @@ pub fn read_rules(conn: &rusqlite::Connection) -> Result<Rules, crate::db::DbErr
 
 /// What a service's own node needs to know about the sign-in, beyond the
 /// grants.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SignInFacts {
     /// The coordinator has a sign-in (PLAN.md M48): an identity provider,
     /// and DNS records for the terminators to serve under.
@@ -91,10 +93,10 @@ pub struct SignInFacts {
 /// reach its terminator from it, and would otherwise be refused by their
 /// own node.
 #[must_use]
-pub fn service_access(
+pub fn service_access<'a>(
     service: &ServiceRow,
     owner: &NodeRow,
-    peers: &[NodeRow],
+    peers: impl IntoIterator<Item = &'a NodeRow>,
     rules: &Rules,
     sign_in: &SignInFacts,
 ) -> ServiceAccess {
@@ -104,7 +106,7 @@ pub fn service_access(
         return open;
     }
     let mut sources: BTreeSet<Ipv4Addr> = peers
-        .iter()
+        .into_iter()
         .filter(|n| rules.principals(n.id).iter().any(|p| granted.contains(p)))
         .filter_map(|n| n.ip4.as_deref()?.parse().ok())
         .collect();

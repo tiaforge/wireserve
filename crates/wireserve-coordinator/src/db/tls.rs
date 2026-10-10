@@ -16,6 +16,11 @@ pub fn ready(conn: &Connection) -> Result<HashMap<String, i64>, DbError> {
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+/// The names `node_id` reports ready.
+pub fn ready_for_node(conn: &Connection, node_id: i64) -> Result<Vec<String>, DbError> {
+    ready_names(conn, node_id)
+}
+
 /// Replaces `node_id`'s report with `names`. A name the node does not own
 /// is dropped: a node vouches only for its own services. Whether what is
 /// reported now differs from what was.

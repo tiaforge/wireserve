@@ -5,6 +5,7 @@ pub mod client_ip;
 pub mod config;
 pub mod db;
 pub mod directory;
+pub mod directory_state;
 pub mod dns;
 pub mod error;
 pub mod install;
@@ -67,6 +68,7 @@ pub fn build_state_with_dns(
         oidc: config.oidc.clone().map(|c| Arc::new(oidc::Oidc::new(c))),
         released: Arc::default(),
         directory: Arc::default(),
+        full_directory_limit: Arc::new(tokio::sync::Semaphore::new(state::FULL_DIRECTORY_BUILDS)),
         probe_udp: std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
             .inspect_err(|e| tracing::warn!(error = %e, "no second UDP socket: nodes can't tell whether they are dialable, and relay ports can't be checked"))
             .ok()

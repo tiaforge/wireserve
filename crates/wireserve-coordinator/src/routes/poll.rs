@@ -308,31 +308,47 @@ pub async fn poll(
     // included.
     let own_rows = services::list_for_node(&conn, node.id)?;
     changed |= own_rows != previous;
-    if changed {
-        state.directory_changed();
-    }
 
-    // The mesh as every node sees it, read once for all of them. Everything
-    // below that needs the database is read here, so the lock is let go
-    // before the work that grows with the mesh.
+    // The mesh as every node sees it, kept in memory between polls
+    // (`directory_state`). Everything below that needs the database is read
+    // here, so the lock is let go before the work that grows with the mesh.
+    state.directory.ensure(&conn, &state)?;
     let fresh = state.config.online_threshold_secs;
-    // This node's own relay report was made a moment ago. If the snapshot
-    // does not yet agree with it (the node just came up, or lost its carry
-    // port), the node's peers would be told the wrong thing for a TTL: read
-    // again, as for any other change.
+    // This node's own relay and sign-in reports were made a moment ago. If
+    // the directory does not yet agree with them (the node just came up, or
+    // lost its carry port), its peers would be told the wrong thing until the
+    // next full read: read the node again, as for any other change of its own.
     let own_carry_port = state.transit.carry_port(&self_pubkey, fresh);
     let self_relayable =
         wireserve_types::relay_port(state.config.relay_port_base, node.relay_slot).is_some() && own_carry_port.is_some();
-    let build = || crate::directory::DirectorySnapshot::build(&conn, &state);
-    let mut snap = state.directory.get(build)?;
-    if snap.relayable.contains(self_pubkey.as_str()) != self_relayable {
-        state.directory_changed();
-        snap = state.directory.get(build)?;
+    let self_sign_in = state.transit.has_capability(&self_pubkey, wireserve_types::CAP_SIGN_IN, fresh);
+    {
+        let dir = state.directory.read();
+        changed |= dir.relayable(&self_pubkey) != self_relayable || dir.sign_in_capable(&self_pubkey) != self_sign_in;
+    }
+    if changed {
+        state.directory.refresh_node(&conn, &state, node.id)?;
     }
     let seen: std::collections::HashSet<std::net::Ipv4Addr> =
         req.callers_seen.iter().take(wireserve_types::MAX_CALLERS_SEEN_PER_POLL).copied().collect();
+    let have = req.directory;
+    // A whole directory is the expensive answer. Only so many at once: a
+    // fleet that restarts together, or a coordinator that does, would
+    // otherwise ask for every node's directory in the same moment. The rest
+    // are told to come back, which an agent does after a backoff.
+    let full_permit = if have.is_some_and(|h| state.directory.read().can_serve(&h)) {
+        None
+    } else {
+        Some(
+            std::sync::Arc::clone(&state.full_directory_limit)
+                .try_acquire_owned()
+                .map_err(|_| AppError::Unavailable("the coordinator is sending a lot of full directories; try again shortly".into()))?,
+        )
+    };
     let owners = {
-        let ctx = state.directory_context(&snap.tls_ready);
+        let env = crate::directory_state::Env::of(&state);
+        let dir = state.directory.read();
+        let ctx = dir.context(&env);
         if !seen.is_empty() && own_rows.iter().any(|r| ctx.terminates(r)) {
             crate::db::owners::all(&conn)?
         } else {
@@ -347,17 +363,16 @@ pub async fn poll(
     // lock from running, so the lock was handed on at the pace of the
     // slowest of them, however briefly it was held.
     let body = tokio::task::spawn_blocking(move || {
-        let ctx = state.directory_context(&snap.tls_ready);
-        let mut peers = snap.peers.clone();
+        let _full_permit = full_permit;
+        let env = crate::directory_state::Env::of(&state);
+        let dir = state.directory.read();
+        let ctx = dir.context(&env);
 
         // End-to-end relaying (PLAN.md M39). A node takes part only while its
         // own latest poll says it can: a carry port, and the capability. The
-        // snapshot says so of the others, up to its TTL ago; this node's own
-        // report was made a moment ago, and is read as it stands.
-        if let Some(&i) = snap.by_pubkey.get(self_pubkey.as_str()) {
-            peers[i].relay.carry_port = own_carry_port;
-        }
-        let relayable = |pk: &str| if pk == self_pubkey { self_relayable } else { snap.relayable.contains(pk) };
+        // directory says so of the others, up to its last read ago; this
+        // node's own report was made a moment ago, and is read as it stands.
+        let relayable = |pk: &str| if pk == self_pubkey { self_relayable } else { dir.relayable(pk) };
         let can_carry = |pk: &str| state.transit.has_capability(pk, wireserve_types::CAP_RELAY, fresh);
         // The carrier for a pair that can't reach each other directly: only
         // ever one relaying end to end. There is no fallback to forwarding the
@@ -373,6 +388,7 @@ pub async fn poll(
         // (`either_wants`), so what follows walks those, never every pair of
         // nodes in the mesh.
         let wanted = state.transit.wanted_pairs();
+        let mut relay_via: Vec<wireserve_types::PeerVia> = Vec::new();
         for (x, y) in &wanted {
             let other = if *x == self_pubkey {
                 y
@@ -381,9 +397,11 @@ pub async fn poll(
             } else {
                 continue;
             };
-            if let Some(&i) = snap.by_pubkey.get(other.as_str()) {
-                if peers[i].pubkey != self_pubkey {
-                    peers[i].relay.via = relay_carrier(&self_pubkey, other).filter(|via| via != &self_pubkey);
+            if dir.id_of(other).is_some() && *other != self_pubkey {
+                if let Some(via) = relay_carrier(&self_pubkey, other).filter(|via| via != &self_pubkey) {
+                    if !relay_via.iter().any(|v| v.pubkey == *other) {
+                        relay_via.push(wireserve_types::PeerVia { pubkey: other.clone(), via });
+                    }
                 }
             }
         }
@@ -397,18 +415,17 @@ pub async fn poll(
         let mut relay_carrying = Vec::new();
         if state.transit.is_offering(&self_pubkey, fresh) && can_carry(&self_pubkey) {
             // In the directory's order, first end first, each pair once.
-            let mut pairs: Vec<(usize, usize)> = wanted
+            let mut pairs: Vec<(i64, i64, &str, &str)> = wanted
                 .iter()
                 .filter(|(x, y)| x != y && *x != self_pubkey && *y != self_pubkey)
                 .filter_map(|(x, y)| {
-                    let (i, j) = (*snap.by_pubkey.get(x.as_str())?, *snap.by_pubkey.get(y.as_str())?);
-                    Some((i.min(j), i.max(j)))
+                    let (i, j) = (dir.id_of(x)?, dir.id_of(y)?);
+                    Some(if i < j { (i, j, x.as_str(), y.as_str()) } else { (j, i, y.as_str(), x.as_str()) })
                 })
                 .collect();
             pairs.sort_unstable();
             pairs.dedup();
-            for (i, j) in pairs {
-                let (x, y) = (peers[i].pubkey.as_str(), peers[j].pubkey.as_str());
+            for (_, _, x, y) in pairs {
                 if relay_carrier(x, y).as_deref() == Some(self_pubkey.as_str()) {
                     relay_carrying.push(wireserve_types::TransitPair { a: x.to_string(), c: y.to_string() });
                 }
@@ -421,8 +438,8 @@ pub async fn poll(
         // the directory. Whether the node itself still offers is its own
         // business: the agent acts on this only while `exit on`.
         let exit_clients: Vec<String> = if node.transit_approved {
-            snap.nodes
-                .iter()
+            dir.nodes
+                .values()
                 .filter(|n| n.exit_enabled && n.exit_node_id == Some(node.id))
                 .filter_map(|n| n.pubkey.clone())
                 .collect()
@@ -434,11 +451,11 @@ pub async fn poll(
         // through its public address, from their exports — only while it is
         // approved to carry, and only nodes still in the directory.
         let relay_public: Vec<String> = if node.transit_approved {
-            let mut dests: Vec<String> = snap
+            let mut dests: Vec<String> = dir
                 .static_relays
                 .iter()
-                .filter(|(device, _, carrier)| *carrier == node.id && snap.by_id.contains_key(device))
-                .filter_map(|(_, peer, _)| snap.nodes[*snap.by_id.get(peer)?].pubkey.clone())
+                .filter(|(device, _, carrier)| *carrier == node.id && dir.nodes.contains_key(device))
+                .filter_map(|(_, peer, _)| dir.nodes.get(peer)?.pubkey.clone())
                 .collect();
             dests.sort();
             dests.dedup();
@@ -448,8 +465,6 @@ pub async fn poll(
         };
         let port_checks = state.transit.checks_for(&self_pubkey);
 
-        let mut services = snap.directory.clone();
-        let rules = &snap.rules;
         let available = state.config.sign_in().is_some();
         let sign_in_capable = |owner: &nodes::NodeRow| {
             owner.pubkey.as_deref().is_some_and(|pk| {
@@ -457,13 +472,44 @@ pub async fn poll(
             })
         };
 
-        // What this requester gets at each service (PLAN.md M45), for its
-        // `status` to show. Whether an owner can sign devices in is as of the
-        // snapshot; the requester's own is read live, below.
-        for (info, &(si, ni)) in services.iter_mut().zip(&snap.directory_src) {
-            let facts = crate::access::SignInFacts { available, owner_capable: snap.sign_in_capable[ni], terminated: info.terminated };
-            info.reach = Some(crate::access::reach(&snap.services[si], &snap.nodes[ni], &node, rules, &facts));
-        }
+        // The directory itself: what changed since the version this node holds
+        // when the log can say, otherwise all of it.
+        let stamp = dir.stamp();
+        let (peers, services, delta) = match have.and_then(|h| dir.delta_since(&h)) {
+            Some(mut delta) => {
+                delta.relay_via = relay_via;
+                (Vec::new(), Vec::new(), Some(delta))
+            }
+            None => {
+                let mut peers = dir.all_peers();
+                let at: std::collections::HashMap<&str, usize> =
+                    peers.iter().enumerate().map(|(i, p)| (p.pubkey.as_str(), i)).collect();
+                let vias: Vec<(usize, String)> =
+                    relay_via.iter().filter_map(|v| Some((*at.get(v.pubkey.as_str())?, v.via.clone()))).collect();
+                for (i, via) in vias {
+                    peers[i].relay.via = Some(via);
+                }
+                // What this requester gets at each service (PLAN.md M45), for
+                // its `status` to show.
+                let services = dir
+                    .all_services()
+                    .into_iter()
+                    .map(|e| {
+                        let mut info = e.info.clone();
+                        if let Some(owner) = dir.nodes.get(&e.row.node_id) {
+                            let facts = crate::access::SignInFacts {
+                                available,
+                                owner_capable: owner.pubkey.as_deref().is_some_and(|pk| dir.sign_in_capable(pk)),
+                                terminated: info.terminated,
+                            };
+                            info.reach = Some(crate::access::reach(&e.row, owner, &node, &dir.rules, &facts));
+                        }
+                        info
+                    })
+                    .collect();
+                (peers, services, None)
+            }
+        };
 
         // Who may reach each of this node's own services (PLAN.md M36), pending
         // ones included, so its firewall is ready the moment approval publishes
@@ -476,7 +522,7 @@ pub async fn poll(
             .filter(|s| (s.denied_at.is_none() || s.approved_at.is_some()) && !s.is_awaiting_review())
             .map(|s| {
                 let facts = crate::access::SignInFacts { available, owner_capable, terminated: ctx.terminates(s) };
-                crate::access::service_access(s, &node, &snap.nodes, rules, &facts)
+                dir.access_for(s, &node, &facts)
             })
             .collect();
 
@@ -502,7 +548,7 @@ pub async fn poll(
                 .into_iter()
                 .filter(|o| o.groups_count(now))
                 .filter_map(|o| {
-                    let device = &snap.nodes[*snap.by_id.get(&o.node_id)?];
+                    let device = dir.nodes.get(&o.node_id)?;
                     let addr: std::net::Ipv4Addr = device.ip4.as_deref()?.parse().ok()?;
                     if !seen.contains(&addr) || !(every || allowed.contains(&addr)) {
                         return None;
@@ -516,10 +562,8 @@ pub async fn poll(
         };
 
         let response = PollResponse {
-
-            stamp: None,
-
-            delta: None,
+            stamp: Some(stamp),
+            delta,
             peers,
             services,
             pending_services: outcome.pending.iter().map(directory::pending_service).collect(),

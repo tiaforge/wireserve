@@ -44,8 +44,13 @@ pub struct AppState {
     /// unasked. `None` where it could not be bound.
     pub probe_udp: Option<Arc<std::net::UdpSocket>>,
     /// What `/poll` reads of the mesh, shared between polls.
-    pub directory: Arc<crate::directory::DirectoryCache>,
+    pub directory: Arc<crate::directory_state::DirectoryCache>,
+    /// How many whole directories may be built at once (fix 6).
+    pub full_directory_limit: Arc<tokio::sync::Semaphore>,
 }
+
+/// More than this many full directories at once and the rest wait their turn.
+pub const FULL_DIRECTORY_BUILDS: usize = 8;
 
 impl AppState {
     /// How the directory is shaped from this coordinator's settings.

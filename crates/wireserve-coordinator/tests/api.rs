@@ -534,7 +534,9 @@ async fn online_threshold_reflects_last_seen_staleness() {
     let resp = app.router.clone().oneshot(req).await.unwrap();
     let body = body_json(resp).await;
     assert!(body["services"][0]["online"].as_bool().unwrap());
-    assert!(body["peers"][0]["last_handshake"].is_string());
+    // Moves on every poll of every node and nobody reads it from /poll: only
+    // the admin listing below carries it.
+    assert!(body["peers"][0]["last_handshake"].is_null());
 
     // Push last_seen far into the past directly in the DB to simulate
     // staleness without sleeping in a test.
@@ -4322,4 +4324,99 @@ async fn owner_status_names_the_provider_its_trouble_and_the_people_groups_grant
 
     let req = json_request("GET", "/admin/owners", None, json!(null));
     assert_eq!(app.router.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+}
+
+// ---- Sending only what changed in the directory (fix 6) ----
+
+fn directory_of(body: &Value) -> wireserve_types::DirectoryBase {
+    let resp: wireserve_types::PollResponse = serde_json::from_value(body.clone()).unwrap();
+    wireserve_types::DirectoryBase::from_full(&resp.peers, &resp.services)
+}
+
+#[tokio::test]
+async fn a_poll_that_names_the_directory_it_holds_gets_only_what_changed_since() {
+    let app = test_app();
+    let (ta, tb, tc) = (
+        admin_create_node(&app.router, "a").await,
+        admin_create_node(&app.router, "b").await,
+        admin_create_node(&app.router, "c").await,
+    );
+    let a = register_node(&app.router, &ta, "pk-a", 51820).await;
+    let b = register_node(&app.router, &tb, "pk-b", 51821).await;
+    let (a_bearer, b_bearer) = (a["bearer_token"].as_str().unwrap(), b["bearer_token"].as_str().unwrap());
+
+    // The first poll holds nothing, so it gets everything, and a stamp to hold.
+    let (status, first) = poll_full(&app.router, a_bearer, json!({ "services": [] })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(first.get("delta").is_none() && first["peers"].as_array().unwrap().len() == 2, "{first}");
+    let mut base = directory_of(&first);
+    let stamp = first["stamp"].clone();
+    assert_eq!(stamp["digest"].as_u64().unwrap(), base.digest(), "the stamp's digest is the one a node computes");
+
+    // Nothing changed: an empty delta, and the same stamp.
+    let (_, same) = poll_full(&app.router, a_bearer, json!({ "services": [], "directory": stamp })).await;
+    assert!(same["delta"].is_object() && same["peers"].as_array().unwrap().is_empty(), "{same}");
+    assert_eq!(same["stamp"], stamp);
+
+    // B moves and declares a service, a third node joins: one delta for all of it.
+    let c = register_node(&app.router, &tc, "pk-c", 51822).await;
+    let _ = c;
+    let (_, _) = poll_full(
+        &app.router,
+        b_bearer,
+        json!({
+            "services": [{"name": "web", "ports": [{"public": 80, "target": 8080, "proto": "tcp"}]}],
+            "endpoint_addr": "203.0.113.9:51821",
+        }),
+    )
+    .await;
+    let (_, delta) = poll_full(&app.router, a_bearer, json!({ "services": [], "directory": stamp })).await;
+    let parsed: wireserve_types::PollResponse = serde_json::from_value(delta.clone()).unwrap();
+    assert!(parsed.peers.is_empty() && parsed.services.is_empty(), "{delta}");
+    let d = parsed.delta.expect("a delta");
+    assert!(d.peers_set.iter().any(|p| p.name == "b" && p.endpoint_addr.as_deref() == Some("203.0.113.9:51821")));
+    assert!(d.services_set.iter().any(|s| s.name == "web"));
+    base.apply(&d);
+
+    // What the delta leaves a node holding is what a full poll says.
+    let (_, full) = poll_full(&app.router, a_bearer, json!({ "services": [] })).await;
+    assert_eq!(base.digest(), directory_of(&full).digest());
+    assert_eq!(base.digest(), parsed.stamp.unwrap().digest);
+    assert_eq!(base.peers(&[]).len(), 3);
+}
+
+#[tokio::test]
+async fn a_poll_naming_another_coordinators_directory_gets_the_whole_of_this_one() {
+    let app = test_app();
+    let ta = admin_create_node(&app.router, "a").await;
+    let a = register_node(&app.router, &ta, "pk-a", 51820).await;
+    let bearer = a["bearer_token"].as_str().unwrap();
+    let (_, first) = poll_full(&app.router, bearer, json!({ "services": [] })).await;
+    let mut stamp = first["stamp"].clone();
+    stamp["epoch"] = json!(stamp["epoch"].as_u64().unwrap() ^ 1);
+    let (_, resp) = poll_full(&app.router, bearer, json!({ "services": [], "directory": stamp })).await;
+    assert!(resp.get("delta").is_none(), "{resp}");
+    assert_eq!(resp["peers"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn only_so_many_whole_directories_are_built_at_once_and_a_delta_is_not_one() {
+    let app = test_app();
+    let ta = admin_create_node(&app.router, "a").await;
+    let a = register_node(&app.router, &ta, "pk-a", 51820).await;
+    let bearer = a["bearer_token"].as_str().unwrap();
+    let (_, first) = poll_full(&app.router, bearer, json!({ "services": [] })).await;
+    let stamp = first["stamp"].clone();
+
+    // Every permit taken: a node that holds nothing is told to come back.
+    let held = app.state.full_directory_limit.clone().try_acquire_many_owned(8).unwrap();
+    let (status, _) = poll_full(&app.router, bearer, json!({ "services": [] })).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    // A node that can be sent a delta is not affected.
+    let (status, resp) = poll_full(&app.router, bearer, json!({ "services": [], "directory": stamp })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(resp["delta"].is_object());
+    drop(held);
+    let (status, _) = poll_full(&app.router, bearer, json!({ "services": [] })).await;
+    assert_eq!(status, StatusCode::OK);
 }
