@@ -229,6 +229,8 @@ pub async fn register(
     // A new key vouches for nothing yet (PLAN.md M33): its terminator
     // reports afresh on its first poll.
     crate::db::tls::clear_node(&conn, node.id)?;
+    // Under the database lock still, so the next poll's read sees it.
+    state.directory_changed();
 
     tracing::info!(
         event = "node_registered",

@@ -43,6 +43,10 @@ const LOG_MAX_ENTRIES: usize = 500_000;
 const SHARED_MAX_AGE: Duration = Duration::from_secs(10);
 const SHARED_MAX_BEHIND: u64 = 2_000;
 
+/// A node further behind than this is sent the whole directory, which goes
+/// through the limit on those, instead of what changed since.
+const DELTA_MAX_BEHIND: u64 = SHARED_MAX_BEHIND;
+
 /// The whole directory as JSON arrays, built once and shared: a node that
 /// needs all of it is sent these very buffers, so a crowd of them costs one
 /// copy in memory and not one each.
@@ -254,10 +258,17 @@ impl DirectoryState {
         access
     }
 
-    /// Whether a delta from `have` can be served at all.
+    /// Whether a delta from `have` can be served at all. Not one further
+    /// behind than [`DELTA_MAX_BEHIND`]: a delta is built for the one node
+    /// that asks, outside the few whole directories sent at once, so a node
+    /// naming an old version it held would otherwise be built something the
+    /// size of the mesh as often as it may poll (security review 2026-10-10).
     #[must_use]
     pub fn can_serve(&self, have: &DirectoryStamp) -> bool {
-        have.epoch == self.epoch && have.version <= self.version && have.version >= self.floor
+        have.epoch == self.epoch
+            && have.version <= self.version
+            && have.version >= self.floor
+            && self.version - have.version <= DELTA_MAX_BEHIND
     }
 
     #[must_use]
@@ -758,6 +769,20 @@ mod tests {
         old.version -= 1;
         assert!(s.delta_since(&old).is_none(), "older than the log reaches");
         assert!(s.delta_since(&s.stamp()).is_some());
+    }
+
+    #[test]
+    fn a_node_too_far_behind_is_not_built_a_delta_of_its_own() {
+        let mut s = DirectoryState::new();
+        s.adopt(loaded(vec![node(1, None)], vec![]), &ENV);
+        let held = s.stamp();
+        for i in 0..DELTA_MAX_BEHIND {
+            s.record(Key::Peer(format!("pk-{i}")));
+        }
+        assert!(s.can_serve(&held), "just within reach");
+        s.record(Key::Peer("one-more".into()));
+        assert!(s.version - held.version > DELTA_MAX_BEHIND && held.version >= s.floor, "still in the log");
+        assert!(!s.can_serve(&held) && s.delta_since(&held).is_none(), "sent the whole directory instead");
     }
 
     #[test]

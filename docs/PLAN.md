@@ -4820,3 +4820,40 @@ gets HTTPS from the terminator, both on the app's one port.
     Tests: the rule's shape; in the kernel, the neighbour's answer to a
     datagram the host sent from its mesh address over the LAN arrives, v4
     and v6, while the neighbour's own still does not.
+
+## Security review, 2026-10-10
+
+A review of what changed since 1.0.0-beta.2: the directory kept in memory
+and sent as what changed, the shared whole directory, and the limits on
+polls.
+
+319. **One node could hold every poll's place.** A poll took one of the
+    1,024 places before its body was read, and a good token kept it for as
+    long as the body took; the per-node allowance was only asked once the
+    body was in. A joined node sending 1,024 bodies a byte at a time through
+    a proxy that streams them (Caddy, as `Caddyfile.example` has it) turned
+    every other node away: no revocation, approval or new endpoint reached
+    anyone. Now a node has at most `POLLS_IN_HAND_PER_NODE` (2) polls in hand,
+    its allowance is asked before the body is read, and the body must arrive
+    within `BODY_WITHIN` (10 s) or the poll is answered 408.
+    Tests: a node's two stalled polls hold two places, its third is refused
+    without one, another node is answered; a body that never comes is given
+    up on and its places come back.
+
+320. **Anyone could make every poll read the whole mesh.** Every node-facing
+    request but `/poll`, `/probe` and `/reach` marked the directory changed,
+    whatever it was answered: `/sign-in`, `/claim/…` and `/oidc/callback` are
+    open to anyone, and each mark had the next poll read every node,
+    service and rule under the database lock (the 150–200 ms at 20,000
+    nodes). Ten requests a second kept it reading. Now `/register` and the
+    owner's claim mark it, once their write is made, under the lock.
+    Tests: an unseen write stays unseen after those pages and a failed
+    registration, and shows after a registration.
+
+321. **A delta is never further behind than a shared whole directory.** A
+    node naming an old version still in the log (five minutes) was built
+    what changed since for itself alone, outside the 32 whole directories
+    sent at once, as often as its allowance let it. `can_serve` now refuses
+    a version more than 2,000 behind; such a node is sent the whole
+    directory, through that limit.
+    Test: just within reach is served, one further is not.

@@ -45,26 +45,14 @@ pub fn node_router(state: AppState) -> Router {
         .route("/sign-in/renew", post(crate::oidc::sign_in::renew))
         .route("/sign-in/end", post(crate::oidc::sign_in::end))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
-        .layer(axum::middleware::from_fn_with_state(state.clone(), directory_changed_by_node))
         .with_state(state)
 }
 
-/// What `/poll` shares between polls (`DirectorySnapshot`) may have moved
-/// after any node-facing request but the two that write nothing it holds. A
-/// poll says so itself when what it wrote shows. Erring toward a bump costs
-/// one rebuild; a missed one is only held off by the snapshot's TTL.
-async fn directory_changed_by_node(
-    axum::extract::State(state): axum::extract::State<AppState>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    let counted = !matches!(req.uri().path(), "/poll" | "/probe" | "/reach");
-    let response = next.run(req).await;
-    if counted {
-        state.directory_changed();
-    }
-    response
-}
+// What `/poll` shares between polls (`directory_state`) is told it changed by
+// the node-facing handlers that write what it holds, once they have: a
+// registration and an owner's claim. Not by every request: the sign-in and
+// claim pages are open to anyone, and each mark costs the next poll a read of
+// the whole mesh under the database lock (security review 2026-10-10).
 
 /// Turns a poll away straight away when [`crate::state::POLLS_AT_ONCE`] are in
 /// hand: before its bearer token is looked up, which waits for the database

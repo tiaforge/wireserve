@@ -18,15 +18,100 @@ use crate::state::AppState;
 /// wedge waiting to happen.
 pub use wireserve_types::MAX_SERVICES_PER_NODE;
 
+/// How many polls one node may have in hand at once. An agent polls one at a
+/// time; the second is room for one it gave up on that is still being answered.
+pub const POLLS_IN_HAND_PER_NODE: usize = 2;
+
+/// How long a poll's body may take to arrive once its node is known. An
+/// agent's is a few kilobytes, sent at once.
+pub const BODY_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// `POST /poll` (spec §4.3): the agent's single call that both reports its
 /// own state and pulls the current mesh + service directory.
+///
+/// The body is read only once the node has a place of its own and its
+/// allowance let it in, and only for [`BODY_WITHIN`]: a node whose token is
+/// good could otherwise hold every one of the coordinator's places
+/// (`routes::polls_at_once`) by sending its bodies a byte at a time, and
+/// turn every other node away (security review 2026-10-10).
 pub async fn poll(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
     BearerNode { node }: BearerNode,
-    Json(req): Json<PollRequest>,
-) -> Result<impl axum::response::IntoResponse, AppError> {
+    request: axum::extract::Request,
+) -> axum::response::Response {
+    use axum::extract::FromRequest;
+    use axum::response::IntoResponse;
+    let _own = match OwnPlace::take(&state, node.id) {
+        Ok(place) => place,
+        Err(e) => return e.into_response(),
+    };
+    if let crate::rate_limit::Take::Refused { log } = state.poll_limiter.take(node.id) {
+        if log {
+            tracing::warn!(event = "poll_rate_limited", node_name = %node.name, "polling faster than the per-node limit");
+        }
+        return AppError::TooManyRequests.into_response();
+    }
+    let req = match tokio::time::timeout(BODY_WITHIN, Json::<PollRequest>::from_request(request, &state)).await {
+        Ok(Ok(Json(req))) => req,
+        Ok(Err(rejection)) => return rejection.into_response(),
+        Err(_) => {
+            tracing::warn!(event = "poll_body_timeout", node_name = %node.name, "a poll's body did not arrive in time");
+            return (
+                axum::http::StatusCode::REQUEST_TIMEOUT,
+                Json(wireserve_types::ErrorBody::new("the request body did not arrive in time".to_string())),
+            )
+                .into_response();
+        }
+    };
+    match answer(state, peer_addr, headers, node, req).await {
+        Ok(response) => response,
+        Err(e) => e.into_response(),
+    }
+}
+
+/// One of a node's [`POLLS_IN_HAND_PER_NODE`], given back when dropped.
+struct OwnPlace {
+    node: i64,
+    in_hand: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<i64, usize>>>,
+}
+
+impl OwnPlace {
+    fn take(state: &AppState, node: i64) -> Result<Self, AppError> {
+        let in_hand = std::sync::Arc::clone(&state.polls_in_hand);
+        {
+            let mut map = in_hand.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let n = map.entry(node).or_insert(0);
+            if *n >= POLLS_IN_HAND_PER_NODE {
+                return Err(AppError::TooManyRequests);
+            }
+            *n += 1;
+        }
+        Ok(Self { node, in_hand })
+    }
+}
+
+impl Drop for OwnPlace {
+    fn drop(&mut self) {
+        let mut map = self.in_hand.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(n) = map.get_mut(&self.node) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.node);
+            }
+        }
+    }
+}
+
+/// The poll, once its body is in hand.
+async fn answer(
+    state: AppState,
+    peer_addr: SocketAddr,
+    headers: axum::http::HeaderMap,
+    node: crate::db::nodes::NodeRow,
+    req: PollRequest,
+) -> Result<axum::response::Response, AppError> {
     // Spec §9: a `kind=static` node "never polls" and its `endpoint_addr`
     // "stays NULL forever" — it is a consumer-only device running an
     // official WireGuard client, with no agent to do the polling. Nothing
@@ -38,12 +123,6 @@ pub async fn poll(
     // `endpoint_addr` onto a static node and every exported `.conf`
     // afterwards would carry an `Endpoint =` line for a peer that is
     // never meant to be dialed into.
-    if let crate::rate_limit::Take::Refused { log } = state.poll_limiter.take(node.id) {
-        if log {
-            tracing::warn!(event = "poll_rate_limited", node_name = %node.name, "polling faster than the per-node limit");
-        }
-        return Err(AppError::TooManyRequests);
-    }
     if node.kind == wireserve_types::NodeKind::Static {
         return Err(AppError::Forbidden(
             "this node is registered as kind=static, which never polls".into(),

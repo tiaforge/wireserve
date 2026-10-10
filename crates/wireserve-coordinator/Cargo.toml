@@ -48,3 +48,5 @@ tempfile = "3"
 tower.workspace = true
 # Runs the shipped fail2ban filter against the coordinator's real log lines.
 regex = "1"
+# A paused clock, for the poll body's time limit.
+tokio = { workspace = true, features = ["test-util"] }

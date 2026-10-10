@@ -313,6 +313,9 @@ pub async fn confirm(State(state): State<AppState>, headers: HeaderMap, Form(for
         tracing::error!(error = %e, "claim: could not store the owner");
         return pages::problem(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong on our side. Ask for a new link.");
     }
+    // The owner's groups are part of the grants every poll reads.
+    state.directory_changed();
+    drop(conn);
     tracing::info!(event = "node_claimed", node_name = %node.name, sub = %identity.sub, groups = %identity.groups.join(","));
     let who = identity.email.as_deref().unwrap_or(&identity.sub);
     let body = format!(

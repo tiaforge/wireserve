@@ -55,6 +55,8 @@ pub struct AppState {
     pub full_in_flight: Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
     /// How many polls may be in hand at once ([`POLLS_AT_ONCE`]).
     pub polls_at_once: Arc<tokio::sync::Semaphore>,
+    /// How many each node has in hand (`routes::poll::POLLS_IN_HAND_PER_NODE`).
+    pub polls_in_hand: Arc<std::sync::Mutex<std::collections::HashMap<i64, usize>>>,
     /// How many responses may be worked out at once, on threads of their own
     /// ([`response_builds`]).
     pub response_builds: Arc<tokio::sync::Semaphore>,

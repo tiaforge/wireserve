@@ -4563,6 +4563,97 @@ async fn bad_tokens_waiting_out_their_delay_do_not_hold_the_places_of_polls_in_h
     drop(held);
 }
 
+/// A poll with a good token whose body never comes.
+fn stalled_poll(bearer: &str) -> Request<Body> {
+    let body = Body::from_stream(futures_util::stream::pending::<Result<axum::body::Bytes, std::io::Error>>());
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/poll")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {bearer}"))
+        .body(body)
+        .unwrap();
+    let peer: SocketAddr = format!("{PEER_IP}:12345").parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(peer));
+    req
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_sending_its_bodies_slowly_holds_two_places_and_turns_nobody_else_away() {
+    let app = test_app();
+    let (ta, tb) = (admin_create_node(&app.router, "a").await, admin_create_node(&app.router, "b").await);
+    let a = register_node(&app.router, &ta, "pk-a", 51820).await["bearer_token"].as_str().unwrap().to_string();
+    let b = register_node(&app.router, &tb, "pk-b", 51821).await["bearer_token"].as_str().unwrap().to_string();
+    let stalled: Vec<_> = (0..wireserve_coordinator::routes::poll::POLLS_IN_HAND_PER_NODE)
+        .map(|_| tokio::spawn(app.router.clone().oneshot(stalled_poll(&a))))
+        .collect();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let places = app.state.polls_at_once.available_permits();
+    assert_eq!(places, wireserve_coordinator::state::POLLS_AT_ONCE - wireserve_coordinator::routes::poll::POLLS_IN_HAND_PER_NODE);
+
+    // A's next is refused at once, without holding a place.
+    let resp = app.router.clone().oneshot(stalled_poll(&a)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(app.state.polls_at_once.available_permits(), places);
+    // B is answered.
+    assert_eq!(poll_full(&app.router, &b, json!({ "services": [] })).await.0, StatusCode::OK);
+
+    for s in stalled {
+        s.abort();
+        let _ = s.await;
+    }
+    assert_eq!(poll_full(&app.router, &a, json!({ "services": [] })).await.0, StatusCode::OK, "the places came back");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_poll_whose_body_does_not_arrive_in_time_is_given_up_on() {
+    let app = test_app();
+    let t = admin_create_node(&app.router, "a").await;
+    let a = register_node(&app.router, &t, "pk-a", 51820).await["bearer_token"].as_str().unwrap().to_string();
+    let resp = app.router.clone().oneshot(stalled_poll(&a)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(app.state.polls_at_once.available_permits(), wireserve_coordinator::state::POLLS_AT_ONCE);
+    assert!(app.state.polls_in_hand.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn pages_anyone_can_open_do_not_make_the_next_poll_read_the_whole_mesh() {
+    let app = test_app();
+    let (ta, tb, tc) = (
+        admin_create_node(&app.router, "a").await,
+        admin_create_node(&app.router, "b").await,
+        admin_create_node(&app.router, "c").await,
+    );
+    let a = register_node(&app.router, &ta, "pk-a", 51820).await["bearer_token"].as_str().unwrap().to_string();
+    register_node(&app.router, &tb, "pk-b", 51821).await;
+    let b_endpoint = |body: &Value| {
+        body["peers"].as_array().unwrap().iter().find(|p| p["name"] == "b").unwrap()["endpoint_addr"].clone()
+    };
+    let (_, first) = poll_full(&app.router, &a, json!({ "services": [] })).await;
+    let before = b_endpoint(&first);
+
+    // A write the directory is not told of: only a full read would see it.
+    app.state
+        .db
+        .conn
+        .lock()
+        .await
+        .execute("UPDATE nodes SET endpoint_addr = '198.51.100.7:51821' WHERE name = 'b'", [])
+        .unwrap();
+    for uri in ["/sign-in", "/claim/nothing", "/oidc/callback"] {
+        app.router.clone().oneshot(raw_request("GET", uri, None)).await.unwrap();
+    }
+    let bad = json_request("POST", "/register", None, json!({ "join_token": "bogus", "pubkey": pubkey_for("x"), "listen_port": 1 }));
+    assert_ne!(app.router.clone().oneshot(bad).await.unwrap().status(), StatusCode::OK);
+    let (_, after) = poll_full(&app.router, &a, json!({ "services": [] })).await;
+    assert_eq!(b_endpoint(&after), before, "not read again for any of them");
+
+    // A registration is a change, and is read.
+    register_node(&app.router, &tc, "pk-c", 51822).await;
+    let (_, after) = poll_full(&app.router, &a, json!({ "services": [] })).await;
+    assert_eq!(b_endpoint(&after), json!("198.51.100.7:51821"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn only_so_many_responses_are_built_at_once_and_the_rest_wait_their_turn() {
     let app = test_app();
