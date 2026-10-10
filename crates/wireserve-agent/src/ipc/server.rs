@@ -53,10 +53,8 @@ async fn fetch_reach(
 }
 
 fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
-    let directory = state
-        .last_directory
-        .clone()
-        .unwrap_or_default();
+    let none = wireserve_types::PollResponse::default();
+    let directory = state.last_directory.as_ref().unwrap_or(&none);
 
     let self_name = state.public_key.as_ref().and_then(|pk| {
         directory
@@ -146,7 +144,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
         exit_clients: directory.exit_clients.clone(),
         service_domain: directory.naming.as_ref().map(|n| n.domain.clone()),
         reflexive_unknown: ctx.reflexive_unknown,
-        peers: directory.peers,
+        peers: directory.peers.clone(),
         tunnel: vec![],
         services,
         rejected_services: state.rejected_services.clone(),

@@ -41,6 +41,9 @@ pub struct AgentState {
     /// The full mesh + service directory from the last successful poll,
     /// used to answer `wireserve status` without a network round trip.
     pub last_directory: Option<PollResponse>,
+    /// When a save last wrote `last_directory` to disk; not saved itself.
+    #[serde(skip)]
+    pub directory_saved: DirectorySaved,
     /// Service declarations the coordinator rejected (name collision with
     /// another node, spec §4.3) — removed from `declared_services` so
     /// they're not resent forever (security review F3), but kept here so
@@ -125,6 +128,42 @@ pub struct AgentState {
     pub own_identities: Vec<wireserve_types::CallerIdentity>,
 }
 
+/// How long `last_directory` may go unwritten when nothing else needs a save.
+/// It is the size of the mesh (17 MB of JSON at 20,000 nodes), it is replaced
+/// by the next poll within seconds of a restart, and a restarted agent only
+/// uses it for the moments before that.
+pub const DIRECTORY_SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// When (seconds since the epoch) the directory was last written to disk.
+#[derive(Debug, Default)]
+pub struct DirectorySaved(std::sync::atomic::AtomicU64);
+
+impl Clone for DirectorySaved {
+    fn clone(&self) -> Self {
+        Self(std::sync::atomic::AtomicU64::new(self.0.load(std::sync::atomic::Ordering::Relaxed)))
+    }
+}
+
+impl DirectorySaved {
+    fn now() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    }
+
+    fn mark(&self) {
+        self.0.store(Self::now(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn due(&self) -> bool {
+        let at = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        at == 0 || Self::now().saturating_sub(at) >= DIRECTORY_SAVE_EVERY.as_secs()
+    }
+
+    /// Forgets that it was ever written.
+    pub fn forget(&self) {
+        self.0.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RejectedService {
     pub name: String,
@@ -175,6 +214,20 @@ impl AgentState {
         }
         let json = serde_json::to_vec_pretty(self)?;
         atomic_write(path, &json, 0o600)?;
+        if self.last_directory.is_some() {
+            self.directory_saved.mark();
+        }
+        Ok(())
+    }
+
+    /// Saves when the directory has not been written for
+    /// [`DIRECTORY_SAVE_EVERY`] (or never): what a poll cycle does when the
+    /// directory is all it changed. Every other change saves as it is made,
+    /// and writes the latest directory with it.
+    pub fn save_directory_if_due(&self, path: &Path) -> Result<(), StateError> {
+        if self.directory_saved.due() {
+            self.save(path)?;
+        }
         Ok(())
     }
 }
@@ -210,6 +263,24 @@ mod tests {
         let state = AgentState::load(&path).unwrap();
         assert_eq!(state.declared_services[0].group, None);
         assert!(state.own_access.is_empty() && state.service_notices.is_empty());
+    }
+
+    #[test]
+    fn the_directory_alone_is_written_now_and_then_not_every_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-state.json");
+        let mut state = AgentState { last_directory: Some(PollResponse::default()), ..Default::default() };
+        state.save_directory_if_due(&path).unwrap();
+        assert!(path.exists(), "the first one is written");
+        std::fs::remove_file(&path).unwrap();
+
+        state.last_directory = Some(PollResponse { relay_public: vec!["pk".into()], ..Default::default() });
+        state.save_directory_if_due(&path).unwrap();
+        assert!(!path.exists(), "a cycle after it is not");
+
+        state.directory_saved.forget();
+        state.save_directory_if_due(&path).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"pk\""), "until it has been a while, and then it is the latest");
     }
 
     #[test]

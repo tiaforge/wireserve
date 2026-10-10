@@ -638,8 +638,8 @@ fn sync_local_routes(old: &BTreeSet<Ipv4Addr>, _new: &BTreeSet<Ipv4Addr>, _node:
 }
 
 /// Runs exactly one poll cycle against the daemon's single shared `state`,
-/// performing all five steps in order. Returns the fresh directory on
-/// success.
+/// performing all five steps in order. The fresh directory is left in
+/// `state.last_directory`.
 ///
 /// F1 (security review, round 2): `state` is the same `Mutex` the IPC
 /// server mutates, and the lock is held only for the moments this
@@ -651,7 +651,7 @@ fn sync_local_routes(old: &BTreeSet<Ipv4Addr>, _new: &BTreeSet<Ipv4Addr>, _node:
 pub async fn run_once<F: FirewallBackend>(
     ctx: &mut PollContext<'_, F>,
     state: &Mutex<AgentState>,
-) -> Result<PollResponse, PollError>
+) -> Result<(), PollError>
 where
     F::Error: std::fmt::Display,
 {
@@ -1087,14 +1087,16 @@ where
         return Err(PollError::Incomplete(failures));
     }
 
-    // 5. persist merged state.
+    // 5. keep the directory for `status`, the terminator and the firewall.
+    // Written to disk now and then, not every cycle: it is the size of the
+    // mesh, and every other change to the state saved itself when it was made.
     {
         let mut s = state.lock().await;
-        s.last_directory = Some(directory.clone());
-        s.save(ctx.state_path)?;
+        s.last_directory = Some(directory);
+        s.save_directory_if_due(ctx.state_path)?;
     }
 
-    Ok(directory)
+    Ok(())
 }
 
 #[cfg(test)]

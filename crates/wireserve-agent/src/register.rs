@@ -180,6 +180,7 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
         endpoint_addr: params.endpoint_addr,
         declared_services: Vec::new(),
         last_directory: None,
+        directory_saved: Default::default(),
         rejected_services: Vec::new(),
         ifname: params.ifname,
         ifname_pinned: params.ifname_pinned,
