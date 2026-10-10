@@ -2280,6 +2280,11 @@ async fn a_delayed_failure_never_holds_the_database_lock() {
     let r1 = register_node(&app.router, &t1, "n1", 51820).await;
     let bearer = r1["bearer_token"].as_str().unwrap().to_string();
 
+    // A first poll reads the whole directory and starts the threads it is
+    // built on; it is queueing behind the failures that is timed, not that.
+    let req = json_request("POST", "/poll", Some(&bearer), json!({ "services": [] }));
+    assert_eq!(app.router.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
     // Put a pile of bad registrations into their delay.
     let mut handles = Vec::new();
     for i in 0..8 {
@@ -2342,6 +2347,11 @@ async fn a_valid_credential_is_never_delayed_even_with_the_budget_drained() {
         let resp = app.router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
+
+    // A first poll reads the whole directory and starts the threads it is
+    // built on; it is the delay that is timed, not that.
+    let req = json_request("POST", "/poll", Some(&bearer), json!({ "services": [] }));
+    assert_eq!(app.router.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
     let start = std::time::Instant::now();
     let req = json_request("POST", "/poll", Some(&bearer), json!({ "services": [] }));
