@@ -42,7 +42,7 @@ and run its `install` (built [from source](building.md) instead, it is
 `target/release/wireserve`):
 
 ```sh
-VERSION=1.0.0-beta.2
+VERSION=1.0.0-beta.3
 curl -fL https://github.com/tiaforge/wireserve/releases/download/v$VERSION/wireserve-$VERSION-$(uname -m)-linux.tar.gz | tar xz
 sudo ./wireserve-$VERSION-$(uname -m)-linux/wireserve install https://wireserve.example.com
 ```
@@ -129,7 +129,7 @@ Download the new version on the node and run its `install`, without a
 URL:
 
 ```sh
-VERSION=1.0.0-beta.2
+VERSION=1.0.0-beta.3
 curl -fL https://github.com/tiaforge/wireserve/releases/download/v$VERSION/wireserve-$VERSION-$(uname -m)-linux.tar.gz | tar xz
 sudo ./wireserve-$VERSION-$(uname -m)-linux/wireserve install
 ```
