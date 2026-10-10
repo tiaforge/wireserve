@@ -45,12 +45,15 @@ pub struct AppState {
     pub probe_udp: Option<Arc<std::net::UdpSocket>>,
     /// What `/poll` reads of the mesh, shared between polls.
     pub directory: Arc<crate::directory_state::DirectoryCache>,
-    /// How many whole directories may be built at once (fix 6).
+    /// How many whole directories may be on their way to nodes at once.
     pub full_directory_limit: Arc<tokio::sync::Semaphore>,
 }
 
-/// More than this many full directories at once and the rest wait their turn.
-pub const FULL_DIRECTORY_BUILDS: usize = 8;
+/// More than this many whole directories on their way at once (from the
+/// moment one is asked for to the last of it sent) and the rest are told to
+/// come back. They share their buffers, so what each costs is what the
+/// connection holds, and what the node at the other end must hold to read it.
+pub const FULL_DIRECTORIES_IN_FLIGHT: usize = 32;
 
 impl AppState {
     /// How the directory is shaped from this coordinator's settings.

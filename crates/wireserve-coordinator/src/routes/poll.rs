@@ -337,8 +337,8 @@ pub async fn poll(
     // fleet that restarts together, or a coordinator that does, would
     // otherwise ask for every node's directory in the same moment. The rest
     // are told to come back, which an agent does after a backoff.
-    // Not even that when one is already built: it is sent as it is.
-    let full_permit = if have.is_some_and(|h| state.directory.read().can_serve(&h)) || state.directory.read().shared_ready() {
+    // The permit is kept until the last of the response is sent.
+    let full_permit = if have.is_some_and(|h| state.directory.read().can_serve(&h)) {
         None
     } else {
         Some(
@@ -364,8 +364,8 @@ pub async fn poll(
     // hundred of these at once kept the next poll in line for the database
     // lock from running, so the lock was handed on at the pace of the
     // slowest of them, however briefly it was held.
-    let body = tokio::task::spawn_blocking(move || {
-        let _full_permit = full_permit;
+    let (body, full_permit) = tokio::task::spawn_blocking(move || {
+        let full_permit = full_permit;
         let env = crate::directory_state::Env::of(&state);
         let dir = state.directory.read();
         let ctx = dir.context(&env);
@@ -563,7 +563,7 @@ pub async fn poll(
             identities,
         };
         let rest = serde_json::to_vec(&response)?;
-        Ok::<_, serde_json::Error>(match shared {
+        Ok::<_, serde_json::Error>((match shared {
             None => vec![Bytes::from(rest)],
             // `rest` is an object without `peers` and `services` (empty, so
             // left out), which the shared arrays are put at the front of.
@@ -577,7 +577,7 @@ pub async fn poll(
                     Bytes::from(tail),
                 ]
             }
-        })
+        }, full_permit))
     })
     .await
     .map_err(|e| AppError::Unavailable(format!("building the directory failed: {e}")))?
@@ -585,7 +585,12 @@ pub async fn poll(
     let body = if body.len() == 1 {
         axum::body::Body::from(body.into_iter().next().unwrap_or_default())
     } else {
-        axum::body::Body::from_stream(futures_util::stream::iter(body.into_iter().map(Ok::<_, std::convert::Infallible>)))
+        // Sent a piece at a time, from the shared buffers, with the permit
+        // held until the stream is done or dropped.
+        axum::body::Body::from_stream(futures_util::stream::iter(body.into_iter().map(move |chunk| {
+            let _in_flight = &full_permit;
+            Ok::<_, std::convert::Infallible>(chunk)
+        })))
     };
     Ok(([(axum::http::header::CONTENT_TYPE, "application/json")], body))
 }

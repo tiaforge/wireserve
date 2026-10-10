@@ -4443,15 +4443,14 @@ async fn a_poll_naming_another_coordinators_directory_gets_the_whole_of_this_one
 }
 
 #[tokio::test]
-async fn only_so_many_whole_directories_are_built_at_once_and_a_delta_or_one_already_built_is_not_one() {
+async fn only_so_many_whole_directories_are_on_their_way_at_once_and_a_delta_is_not_one() {
     let app = test_app();
     let ta = admin_create_node(&app.router, "a").await;
     let a = register_node(&app.router, &ta, "pk-a", 51820).await;
     let bearer = a["bearer_token"].as_str().unwrap();
 
-    // Every permit taken, and none built yet: a node that holds nothing is
-    // told to come back.
-    let held = app.state.full_directory_limit.clone().try_acquire_many_owned(8).unwrap();
+    // Every permit taken: a node that holds nothing is told to come back.
+    let held = app.state.full_directory_limit.clone().try_acquire_many_owned(u32::try_from(wireserve_coordinator::state::FULL_DIRECTORIES_IN_FLIGHT).unwrap()).unwrap();
     let (status, _) = poll_full(&app.router, bearer, json!({ "services": [] })).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     drop(held);
@@ -4459,15 +4458,14 @@ async fn only_so_many_whole_directories_are_built_at_once_and_a_delta_or_one_alr
     assert_eq!(status, StatusCode::OK);
     let stamp = first["stamp"].clone();
 
-    let held = app.state.full_directory_limit.clone().try_acquire_many_owned(8).unwrap();
+    let held = app.state.full_directory_limit.clone().try_acquire_many_owned(u32::try_from(wireserve_coordinator::state::FULL_DIRECTORIES_IN_FLIGHT).unwrap()).unwrap();
     // A node that can be sent a delta is not affected.
     let (status, resp) = poll_full(&app.router, bearer, json!({ "services": [], "directory": stamp })).await;
     assert_eq!(status, StatusCode::OK);
     assert!(resp["peers"].as_array().unwrap().is_empty());
-    // Nor is one that needs all of it, now that it is built.
-    let (status, resp) = poll_full(&app.router, bearer, json!({ "services": [] })).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(resp["peers"].as_array().unwrap().len(), 1);
+    // One that needs all of it is told to come back, built already or not.
+    let (status, _) = poll_full(&app.router, bearer, json!({ "services": [] })).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     drop(held);
 }
 
