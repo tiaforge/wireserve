@@ -4501,6 +4501,24 @@ async fn only_so_many_whole_directories_are_on_their_way_at_once_and_a_delta_is_
     drop(held);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn only_so_many_responses_are_built_at_once_and_the_rest_wait_their_turn() {
+    let app = test_app();
+    let t = admin_create_node(&app.router, "a").await;
+    let bearer = register_node(&app.router, &t, "pk-a", 51820).await["bearer_token"].as_str().unwrap().to_string();
+    let all = u32::try_from(wireserve_coordinator::state::response_builds()).unwrap();
+    let held = app.state.response_builds.clone().try_acquire_many_owned(all).unwrap();
+
+    let router = app.router.clone();
+    let mut poll = tokio::spawn(async move { poll_full(&router, &bearer, json!({ "services": [] })).await.0 });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut poll).await.is_err(),
+        "waits, rather than being refused or built anyway"
+    );
+    drop(held);
+    assert_eq!(poll.await.unwrap(), StatusCode::OK);
+}
+
 #[tokio::test]
 async fn nodes_that_need_the_whole_directory_are_sent_the_one_serialisation_and_what_changed_since() {
     let app = test_app();

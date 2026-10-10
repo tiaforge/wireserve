@@ -358,6 +358,7 @@ pub async fn poll(
         }
     };
     drop(conn);
+    let building = build_permit(&state).await?;
 
     // What is left is CPU, and grows with the mesh: the response is built and
     // written out on a thread of its own. On the runtime's workers, a few
@@ -366,6 +367,7 @@ pub async fn poll(
     // slowest of them, however briefly it was held.
     let (body, full_permit) = tokio::task::spawn_blocking(move || {
         let full_permit = full_permit;
+        let _building = building;
         let env = crate::directory_state::Env::of(&state);
         // The directory itself: what changed since the version this node holds
         // when the log can say, otherwise all of it.
@@ -582,6 +584,23 @@ pub async fn poll(
     Ok(([(axum::http::header::CONTENT_TYPE, "application/json")], body))
 }
 
+/// A turn to build a response on a thread of its own (see
+/// [`crate::state::response_builds`]).
+async fn build_permit(state: &AppState) -> Result<tokio::sync::OwnedSemaphorePermit, AppError> {
+    std::sync::Arc::clone(&state.response_builds)
+        .acquire_owned()
+        .await
+        .map_err(|_| AppError::Unavailable("the coordinator is stopping".into()))
+}
+
+/// What [`directory_for`] hands back: the shared whole directory when one is
+/// sent, the delta, and the read lock they were taken under.
+type ForNode<'a> = (
+    Option<std::sync::Arc<crate::directory_state::SharedFull>>,
+    wireserve_types::DirectoryDelta,
+    std::sync::RwLockReadGuard<'a, crate::directory_state::DirectoryState>,
+);
+
 /// The directory for a node that holds `have`: what changed since, or, when
 /// the log cannot say, the whole directory as serialised for every node that
 /// needs it with what changed since that was built. The read lock comes back
@@ -589,14 +608,7 @@ pub async fn poll(
 fn directory_for(
     cache: &crate::directory_state::DirectoryCache,
     have: Option<wireserve_types::DirectoryStamp>,
-) -> Result<
-    (
-        Option<std::sync::Arc<crate::directory_state::SharedFull>>,
-        wireserve_types::DirectoryDelta,
-        std::sync::RwLockReadGuard<'_, crate::directory_state::DirectoryState>,
-    ),
-    serde_json::Error,
-> {
+) -> Result<ForNode<'_>, serde_json::Error> {
     let mut shared = None;
     if !have.is_some_and(|h| cache.read().can_serve(&h)) {
         // Built, if it must be, with the directory not locked.
@@ -638,7 +650,9 @@ pub async fn reach(
         let conn = state.db.conn.lock().await;
         state.directory.ensure(&conn, &state)?;
     }
+    let building = build_permit(&state).await?;
     let reach = tokio::task::spawn_blocking(move || {
+        let _building = building;
         let dir = state.directory.read();
         let available = state.config.sign_in().is_some();
         dir.all_services()

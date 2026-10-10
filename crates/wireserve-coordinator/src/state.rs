@@ -51,6 +51,9 @@ pub struct AppState {
     pub directory: Arc<crate::directory_state::DirectoryCache>,
     /// How many whole directories may be on their way to nodes at once.
     pub full_directory_limit: Arc<tokio::sync::Semaphore>,
+    /// How many responses may be worked out at once, on threads of their own
+    /// ([`response_builds`]).
+    pub response_builds: Arc<tokio::sync::Semaphore>,
 }
 
 /// More than this many whole directories on their way at once (from the
@@ -58,6 +61,16 @@ pub struct AppState {
 /// come back. They share their buffers, so what each costs is what the
 /// connection holds, and what the node at the other end must hold to read it.
 pub const FULL_DIRECTORIES_IN_FLIGHT: usize = 32;
+
+/// How many `/poll` and `/reach` responses may be built at once: twice the
+/// cores, at least four. The rest wait as tasks, which cost next to nothing,
+/// rather than as threads of their own; a moment's stall in the directory
+/// otherwise parked a thread per poll that arrived during it, hundreds of them
+/// at 20,000 nodes, each with memory the allocator keeps.
+#[must_use]
+pub fn response_builds() -> usize {
+    std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get).saturating_mul(2).max(4)
+}
 
 impl AppState {
     /// How the directory is shaped from this coordinator's settings.

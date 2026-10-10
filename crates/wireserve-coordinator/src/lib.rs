@@ -70,6 +70,7 @@ pub fn build_state_with_dns(
         released: Arc::default(),
         directory: Arc::default(),
         full_directory_limit: Arc::new(tokio::sync::Semaphore::new(state::FULL_DIRECTORIES_IN_FLIGHT)),
+        response_builds: Arc::new(tokio::sync::Semaphore::new(state::response_builds())),
         probe_udp: std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
             .inspect_err(|e| tracing::warn!(error = %e, "no second UDP socket: nodes can't tell whether they are dialable, and relay ports can't be checked"))
             .ok()
