@@ -125,8 +125,8 @@ firewall rewrites `address:PUBLIC` to `node:TARGET` in the kernel:
   that does its own TLS) and `https://app…`, since the HTTPS side goes
   through the terminator (see [names-and-https.md](names-and-https.md)).
   Until the terminator serves it, 443 stays closed and port 80 works.
-- Addresses come from the mesh range, shared with the nodes (a `/24`
-  holds 253 nodes and services together), and stay with a service until
+- Addresses come from the mesh range, shared with the nodes (a `/16`
+  holds about 65,000 nodes and services together), and stay with a service until
   it is withdrawn.
 
 Rewriting packets needs the agent to run as root in the host's own

@@ -122,13 +122,13 @@ fn generate_admin_token() -> String {
     crate::tokengen::generate("")
 }
 
-/// A private-use IPv4 /24 that can never overlap `100.64.0.0/10` (the
+/// A private-use IPv4 /16 that can never overlap `100.64.0.0/10` (the
 /// carrier-grade-NAT range Tailscale and some ISPs allocate from), because
 /// it's drawn from `10.0.0.0/8` by construction rather than checked after
 /// the fact.
 fn generate_v4_cidr() -> String {
-    let bytes: [u8; 2] = rand::random();
-    format!("10.{}.{}.0/24", bytes[0], bytes[1])
+    let second: u8 = rand::random();
+    format!("10.{second}.0.0/16")
 }
 
 /// A properly-random RFC 4193 unique local address prefix: `fd` followed

@@ -159,7 +159,7 @@ This is almost always **DNS rebinding protection**, and it is worth knowing
 before it costs you an evening. Resolvers strip private addresses out of
 answers from public DNS by default; the usual list is `127/8`, `10/8`,
 `172.16/12`, `192.168/16`, `169.254/16`, `fd00::/8` and `fe80::/10`. The
-coordinator generates a `10.x.x.0/24` mesh and an `fd..::/64` prefix, so
+coordinator generates a `10.x.0.0/16` mesh and an `fd..::/64` prefix, so
 **both families are on that list** and the records are silently dropped —
 no error, just a name that does not resolve.
 
