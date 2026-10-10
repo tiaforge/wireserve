@@ -265,7 +265,7 @@ fn write_unit(content: &str, dest: &'static str) -> Result<bool, InstallError> {
 /// A socket drop-in listening on `port` instead of the unit's own port.
 fn dropin_content(port: u16) -> String {
     format!(
-        "# Written by `wireserve install` (PLAN.md M35): where this TLS terminator\n\
+        "# Written by `wireserve install`: where this TLS terminator\n\
          # listens. The agent rewrites its service addresses' 443 to it.\n\
          [Socket]\n\
          ListenStream=\n\
@@ -478,7 +478,7 @@ mod tests {
         assert!(content.contains(&format!("ExecStart={BIN_DEST} tls-daemon")));
         assert!(content.contains("PartOf=wireserve-agent.service") && content.contains("WantedBy=wireserve-agent.service"));
         assert!(content.contains("User=wireserve-tls") && content.contains("CapabilityBoundingSet=\n"));
-        assert!(!content.contains("AmbientCapabilities"), "no privilege at all (PLAN.md M35)");
+        assert!(!content.contains("AmbientCapabilities"), "no privilege at all");
         assert!(content.contains("Requires=wireserve-tls.socket"));
 
         let (content, _, name) = tls_unit_for(&Instance::new("work").unwrap());

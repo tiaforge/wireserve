@@ -153,8 +153,8 @@ async fn serve() {
     if !config::is_loopback_or_private(listen_addr.ip()) {
         tracing::warn!(
             %listen_addr,
-            "node-facing listener is bound to a non-loopback, non-private address — spec §7 \
-             requires this to sit behind a TLS-terminating reverse proxy and never be directly \
+            "node-facing listener is bound to a non-loopback, non-private address — it \
+             must sit behind a TLS-terminating reverse proxy and never be directly \
              reachable from an untrusted network; confirm nothing routes to this port except \
              that proxy"
         );
@@ -194,7 +194,7 @@ async fn serve() {
         "  Point your reverse proxy at:  http://{}",
         proxy_target(listen_addr)
     );
-    eprintln!("  (it must terminate TLS — the coordinator itself never speaks TLS, §7)");
+    eprintln!("  (it must terminate TLS — the coordinator itself never speaks TLS)");
     if let Some(url) = std::env::var("WIRESERVE_PUBLIC_URL").ok().filter(|u| !u.is_empty()) {
         eprintln!("  Machines reach it at:         {url}");
     }

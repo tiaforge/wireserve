@@ -36,9 +36,8 @@ pub enum ConfigError {
     MissingAdminToken(String),
     #[error(
         "no node-facing URL found for the /register call — pass --register-url or set \
-         WIRESERVE_REGISTER_URL. This is the coordinator's OTHER listener: spec §4.0 requires \
-         the admin and node-facing listeners to be bound separately (e.g. different ports), so \
-         --coordinator-url alone isn't enough for device create"
+         WIRESERVE_REGISTER_URL. This is the coordinator's OTHER listener: the admin and node-facing listeners are bound \
+         separately (e.g. different ports), so --coordinator-url alone isn't enough for device create"
     )]
     MissingRegisterUrl,
 }

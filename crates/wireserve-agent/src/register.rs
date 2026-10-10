@@ -43,8 +43,8 @@ pub fn check_coordinator_transport(url: &str, allowed: bool) -> Result<(), JoinE
     Err(JoinError::PlaintextHttp(format!(
         "refusing to use {url} over plain HTTP: the join token, this node's bearer token and \
          the peer directory (which decides which WireGuard keys this node trusts) would cross \
-         the network unprotected. Use an https:// URL through a TLS-terminating reverse proxy \
-         (spec §7), or, only if every network between here and the coordinator is trusted, \
+         the network unprotected. Use an https:// URL through a TLS-terminating reverse proxy, \
+         or, only if every network between here and the coordinator is trusted, \
          pass --allow-plaintext-http to `join`/`install`"
     )))
 }

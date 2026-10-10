@@ -45,7 +45,7 @@ pub async fn poll(
     }
     if node.kind == wireserve_types::NodeKind::Static {
         return Err(AppError::Forbidden(
-            "this node is registered as kind=static, which never polls (spec §9)".into(),
+            "this node is registered as kind=static, which never polls".into(),
         ));
     }
 

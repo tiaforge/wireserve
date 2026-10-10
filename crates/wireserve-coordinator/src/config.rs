@@ -118,7 +118,7 @@ pub enum ConfigError {
     Invalid(&'static str, String),
     #[error(
         "WIRESERVE_ADMIN_LISTEN_ADDR ({0}) is not loopback or a private-range address — the \
-         admin surface must never be reachable from an untrusted network (spec §4.0). Note \
+         admin surface must never be reachable from an untrusted network. Note \
          that 100.64.0.0/10 addresses (the carrier-grade-NAT range Tailscale and similar \
          overlays hand out) are deliberately not accepted as private here: that range is \
          also used by ISPs on real WAN links, so it cannot be treated as inherently \

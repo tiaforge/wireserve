@@ -998,7 +998,7 @@ fn warn_if_plaintext_to_remote_host(url: &str) {
     if wireserve_types::is_plaintext_http_to_remote_host(url) {
         eprintln!(
             "warning: sending requests to {url} over plain HTTP — the admin token (and any \
-             join token) will be sent in clear over the network. Spec §7 assumes a \
+             join token) will be sent in clear over the network. The coordinator is meant to sit behind a \
              TLS-terminating reverse proxy in front of the coordinator; use an https:// URL \
              unless this really is a loopback/trusted-local connection."
         );

@@ -3,8 +3,8 @@
 These files belong on the **reverse proxy host**, not the coordinator host.
 
 That is the whole point. The coordinator runs unprivileged with an empty
-`CapabilityBoundingSet=` and never touches the host firewall (spec §8), and
-behind the TLS-terminating proxy that spec §7 mandates the only client
+`CapabilityBoundingSet=` and never touches the host firewall, and
+behind the TLS-terminating proxy it must sit behind, the only client
 address it can see is the proxy's own. A block applied there would drop
 every node at once and stay dropped. The proxy sees the real client and
 already holds the privilege to act.
@@ -43,7 +43,7 @@ fail2ban-client status wireserve
 
 Verify the filter matches real output before trusting it — a filter that
 matches nothing fails silently, and this project has been bitten by exactly
-that (PLAN.md decisions log #51, where tracing's ANSI escapes sat between a
+that (where tracing's ANSI escapes sat between a
 field name and its `=`):
 
 ```sh
