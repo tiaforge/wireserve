@@ -25,7 +25,7 @@ pub async fn poll(
     headers: axum::http::HeaderMap,
     BearerNode { node }: BearerNode,
     Json(req): Json<PollRequest>,
-) -> Result<Json<PollResponse>, AppError> {
+) -> Result<impl axum::response::IntoResponse, AppError> {
     // Spec §9: a `kind=static` node "never polls" and its `endpoint_addr`
     // "stays NULL forever" — it is a consumer-only device running an
     // official WireGuard client, with no agent to do the polling. Nothing
@@ -329,198 +329,213 @@ pub async fn poll(
         state.directory_changed();
         snap = state.directory.get(build)?;
     }
-    let ctx = state.directory_context(&snap.tls_ready);
     let seen: std::collections::HashSet<std::net::Ipv4Addr> =
         req.callers_seen.iter().take(wireserve_types::MAX_CALLERS_SEEN_PER_POLL).copied().collect();
-    let owners = if !seen.is_empty() && own_rows.iter().any(|r| ctx.terminates(r)) {
-        crate::db::owners::all(&conn)?
-    } else {
-        Vec::new()
+    let owners = {
+        let ctx = state.directory_context(&snap.tls_ready);
+        if !seen.is_empty() && own_rows.iter().any(|r| ctx.terminates(r)) {
+            crate::db::owners::all(&conn)?
+        } else {
+            Vec::new()
+        }
     };
     drop(conn);
 
-    let mut peers = snap.peers.clone();
+    // What is left is CPU, and grows with the mesh: the response is built and
+    // written out on a thread of its own. On the runtime's workers, a few
+    // hundred of these at once kept the next poll in line for the database
+    // lock from running, so the lock was handed on at the pace of the
+    // slowest of them, however briefly it was held.
+    let body = tokio::task::spawn_blocking(move || {
+        let ctx = state.directory_context(&snap.tls_ready);
+        let mut peers = snap.peers.clone();
 
-    // End-to-end relaying (PLAN.md M39). A node takes part only while its
-    // own latest poll says it can: a carry port, and the capability. The
-    // snapshot says so of the others, up to its TTL ago; this node's own
-    // report was made a moment ago, and is read as it stands.
-    if let Some(&i) = snap.by_pubkey.get(self_pubkey.as_str()) {
-        peers[i].relay.carry_port = own_carry_port;
-    }
-    let relayable = |pk: &str| if pk == self_pubkey { self_relayable } else { snap.relayable.contains(pk) };
-    let can_carry = |pk: &str| state.transit.has_capability(pk, wireserve_types::CAP_RELAY, fresh);
-    // The carrier for a pair that can't reach each other directly: only
-    // ever one relaying end to end. There is no fallback to forwarding the
-    // pair's traffic in the clear — every node upgrades together.
-    let relay_carrier = |a: &str, c: &str| -> Option<String> {
-        if !relayable(a) || !relayable(c) || !state.transit.either_wants(a, c) {
-            return None;
+        // End-to-end relaying (PLAN.md M39). A node takes part only while its
+        // own latest poll says it can: a carry port, and the capability. The
+        // snapshot says so of the others, up to its TTL ago; this node's own
+        // report was made a moment ago, and is read as it stands.
+        if let Some(&i) = snap.by_pubkey.get(self_pubkey.as_str()) {
+            peers[i].relay.carry_port = own_carry_port;
         }
-        state.transit.select_where(a, c, fresh, &can_carry)
-    };
-
-    // Only a pair somebody asked to have relayed can have a carrier
-    // (`either_wants`), so what follows walks those, never every pair of
-    // nodes in the mesh.
-    let wanted = state.transit.wanted_pairs();
-    for (x, y) in &wanted {
-        let other = if *x == self_pubkey {
-            y
-        } else if *y == self_pubkey {
-            x
-        } else {
-            continue;
+        let relayable = |pk: &str| if pk == self_pubkey { self_relayable } else { snap.relayable.contains(pk) };
+        let can_carry = |pk: &str| state.transit.has_capability(pk, wireserve_types::CAP_RELAY, fresh);
+        // The carrier for a pair that can't reach each other directly: only
+        // ever one relaying end to end. There is no fallback to forwarding the
+        // pair's traffic in the clear — every node upgrades together.
+        let relay_carrier = |a: &str, c: &str| -> Option<String> {
+            if !relayable(a) || !relayable(c) || !state.transit.either_wants(a, c) {
+                return None;
+            }
+            state.transit.select_where(a, c, fresh, &can_carry)
         };
-        if let Some(&i) = snap.by_pubkey.get(other.as_str()) {
-            if peers[i].pubkey != self_pubkey {
-                peers[i].relay.via = relay_carrier(&self_pubkey, other).filter(|via| via != &self_pubkey);
+
+        // Only a pair somebody asked to have relayed can have a carrier
+        // (`either_wants`), so what follows walks those, never every pair of
+        // nodes in the mesh.
+        let wanted = state.transit.wanted_pairs();
+        for (x, y) in &wanted {
+            let other = if *x == self_pubkey {
+                y
+            } else if *y == self_pubkey {
+                x
+            } else {
+                continue;
+            };
+            if let Some(&i) = snap.by_pubkey.get(other.as_str()) {
+                if peers[i].pubkey != self_pubkey {
+                    peers[i].relay.via = relay_carrier(&self_pubkey, other).filter(|via| via != &self_pubkey);
+                }
             }
         }
-    }
 
-    // This requester's own carrier role this cycle (PLAN.md M39): every
-    // OTHER pair (x, y) — neither of them this requester — for which
-    // `relay_carrier` names this requester. A carrier learns its role from
-    // this list alone: its own entries for x and y never carry a `via`,
-    // since it is only ever chosen when it reaches both directly. A node
-    // that is not offering to carry cannot be chosen for any pair.
-    let mut relay_carrying = Vec::new();
-    if state.transit.is_offering(&self_pubkey, fresh) && can_carry(&self_pubkey) {
-        // In the directory's order, first end first, each pair once.
-        let mut pairs: Vec<(usize, usize)> = wanted
-            .iter()
-            .filter(|(x, y)| x != y && *x != self_pubkey && *y != self_pubkey)
-            .filter_map(|(x, y)| {
-                let (i, j) = (*snap.by_pubkey.get(x.as_str())?, *snap.by_pubkey.get(y.as_str())?);
-                Some((i.min(j), i.max(j)))
-            })
-            .collect();
-        pairs.sort_unstable();
-        pairs.dedup();
-        for (i, j) in pairs {
-            let (x, y) = (peers[i].pubkey.as_str(), peers[j].pubkey.as_str());
-            if relay_carrier(x, y).as_deref() == Some(self_pubkey.as_str()) {
-                relay_carrying.push(wireserve_types::TransitPair { a: x.to_string(), c: y.to_string() });
+        // This requester's own carrier role this cycle (PLAN.md M39): every
+        // OTHER pair (x, y) — neither of them this requester — for which
+        // `relay_carrier` names this requester. A carrier learns its role from
+        // this list alone: its own entries for x and y never carry a `via`,
+        // since it is only ever chosen when it reaches both directly. A node
+        // that is not offering to carry cannot be chosen for any pair.
+        let mut relay_carrying = Vec::new();
+        if state.transit.is_offering(&self_pubkey, fresh) && can_carry(&self_pubkey) {
+            // In the directory's order, first end first, each pair once.
+            let mut pairs: Vec<(usize, usize)> = wanted
+                .iter()
+                .filter(|(x, y)| x != y && *x != self_pubkey && *y != self_pubkey)
+                .filter_map(|(x, y)| {
+                    let (i, j) = (*snap.by_pubkey.get(x.as_str())?, *snap.by_pubkey.get(y.as_str())?);
+                    Some((i.min(j), i.max(j)))
+                })
+                .collect();
+            pairs.sort_unstable();
+            pairs.dedup();
+            for (i, j) in pairs {
+                let (x, y) = (peers[i].pubkey.as_str(), peers[j].pubkey.as_str());
+                if relay_carrier(x, y).as_deref() == Some(self_pubkey.as_str()) {
+                    relay_carrying.push(wireserve_types::TransitPair { a: x.to_string(), c: y.to_string() });
+                }
             }
         }
-    }
 
-    // This requester's exit role (PLAN.md M27): the devices whose last export
-    // named it as their exit, while it is still approved — withdrawing the
-    // approval ends the exit on the same poll — and a revoked device leaves
-    // the directory. Whether the node itself still offers is its own
-    // business: the agent acts on this only while `exit on`.
-    let exit_clients: Vec<String> = if node.transit_approved {
-        snap.nodes
-            .iter()
-            .filter(|n| n.exit_enabled && n.exit_node_id == Some(node.id))
-            .filter_map(|n| n.pubkey.clone())
-            .collect()
-    } else {
-        Vec::new()
-    };
+        // This requester's exit role (PLAN.md M27): the devices whose last export
+        // named it as their exit, while it is still approved — withdrawing the
+        // approval ends the exit on the same poll — and a revoked device leaves
+        // the directory. Whether the node itself still offers is its own
+        // business: the agent acts on this only while `exit on`.
+        let exit_clients: Vec<String> = if node.transit_approved {
+            snap.nodes
+                .iter()
+                .filter(|n| n.exit_enabled && n.exit_node_id == Some(node.id))
+                .filter_map(|n| n.pubkey.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-    // This requester's public relays (PLAN.md M40): the nodes devices reach
-    // through its public address, from their exports — only while it is
-    // approved to carry, and only nodes still in the directory.
-    let relay_public: Vec<String> = if node.transit_approved {
-        let mut dests: Vec<String> = snap
-            .static_relays
-            .iter()
-            .filter(|(device, _, carrier)| *carrier == node.id && snap.by_id.contains_key(device))
-            .filter_map(|(_, peer, _)| snap.nodes[*snap.by_id.get(peer)?].pubkey.clone())
-            .collect();
-        dests.sort();
-        dests.dedup();
-        dests
-    } else {
-        Vec::new()
-    };
-    let port_checks = state.transit.checks_for(&self_pubkey);
+        // This requester's public relays (PLAN.md M40): the nodes devices reach
+        // through its public address, from their exports — only while it is
+        // approved to carry, and only nodes still in the directory.
+        let relay_public: Vec<String> = if node.transit_approved {
+            let mut dests: Vec<String> = snap
+                .static_relays
+                .iter()
+                .filter(|(device, _, carrier)| *carrier == node.id && snap.by_id.contains_key(device))
+                .filter_map(|(_, peer, _)| snap.nodes[*snap.by_id.get(peer)?].pubkey.clone())
+                .collect();
+            dests.sort();
+            dests.dedup();
+            dests
+        } else {
+            Vec::new()
+        };
+        let port_checks = state.transit.checks_for(&self_pubkey);
 
-    let mut services = snap.directory.clone();
-    let rules = &snap.rules;
-    let available = state.config.sign_in().is_some();
-    let sign_in_capable = |owner: &nodes::NodeRow| {
-        owner.pubkey.as_deref().is_some_and(|pk| {
-            state.transit.has_capability(pk, wireserve_types::CAP_SIGN_IN, state.config.online_threshold_secs)
-        })
-    };
-
-    // What this requester gets at each service (PLAN.md M45), for its
-    // `status` to show. Whether an owner can sign devices in is as of the
-    // snapshot; the requester's own is read live, below.
-    for (info, &(si, ni)) in services.iter_mut().zip(&snap.directory_src) {
-        let facts = crate::access::SignInFacts { available, owner_capable: snap.sign_in_capable[ni], terminated: info.terminated };
-        info.reach = Some(crate::access::reach(&snap.services[si], &snap.nodes[ni], &node, rules, &facts));
-    }
-
-    // Who may reach each of this node's own services (PLAN.md M36), pending
-    // ones included, so its firewall is ready the moment approval publishes
-    // them. Sent to this node alone. Not one waiting for an admin again
-    // (PLAN.md #315): its address is in phone configs exported while it was
-    // approved, and the node's firewall is what keeps them from the change.
-    let owner_capable = sign_in_capable(&node);
-    let access: Vec<wireserve_types::ServiceAccess> = own_rows
-        .iter()
-        .filter(|s| (s.denied_at.is_none() || s.approved_at.is_some()) && !s.is_awaiting_review())
-        .map(|s| {
-            let facts = crate::access::SignInFacts { available, owner_capable, terminated: ctx.terminates(s) };
-            crate::access::service_access(s, &node, &snap.nodes, rules, &facts)
-        })
-        .collect();
-
-    // Who owns the devices its terminator lets in by their grants (PLAN.md
-    // M38), so it can name them to its backends: those allowed into any of
-    // its terminated services — every device, when one is open — and that
-    // the node says have connected to it. Without the second, a node with
-    // one open service would be told every owner's subject, e-mail address
-    // and groups; a node that lies about who came still gets no more than
-    // it asks for, one device at a time, each logged the first time.
-    let terminated: Vec<&wireserve_types::ServiceAccess> = access
-        .iter()
-        .filter(|a| own_rows.iter().any(|r| r.name == a.name && ctx.terminates(r)))
-        .collect();
-    let identities = if terminated.is_empty() || seen.is_empty() {
-        Vec::new()
-    } else {
-        let every = terminated.iter().any(|a| a.open);
-        let allowed: std::collections::BTreeSet<std::net::Ipv4Addr> =
-            terminated.iter().flat_map(|a| a.sources.iter().copied()).collect();
-        let now = chrono::Utc::now();
-        owners
-            .into_iter()
-            .filter(|o| o.groups_count(now))
-            .filter_map(|o| {
-                let device = &snap.nodes[*snap.by_id.get(&o.node_id)?];
-                let addr: std::net::Ipv4Addr = device.ip4.as_deref()?.parse().ok()?;
-                if !seen.contains(&addr) || !(every || allowed.contains(&addr)) {
-                    return None;
-                }
-                if state.first_release(node.id, device.id) {
-                    tracing::info!(event = "owner_identity_released", node_name = %node.name, device = %device.name, sub = %o.sub);
-                }
-                Some(wireserve_types::CallerIdentity { addr, user: o.sub, email: o.email, groups: o.groups })
+        let mut services = snap.directory.clone();
+        let rules = &snap.rules;
+        let available = state.config.sign_in().is_some();
+        let sign_in_capable = |owner: &nodes::NodeRow| {
+            owner.pubkey.as_deref().is_some_and(|pk| {
+                state.transit.has_capability(pk, wireserve_types::CAP_SIGN_IN, state.config.online_threshold_secs)
             })
-            .collect()
-    };
+        };
 
-    Ok(Json(PollResponse {
-        peers,
-        services,
-        pending_services: outcome.pending.iter().map(directory::pending_service).collect(),
-        denied_services: outcome.denied.iter().map(directory::denied_service).collect(),
-        relay_carrying,
-        relay_public,
-        relay_port_base: Some(state.config.relay_port_base),
-        port_checks,
-        transit_awaiting_approval,
-        exit_clients,
-        mesh: Some(state.config.mesh_info()),
-        naming: state.config.service_naming(),
-        access,
-        service_notices: outcome.notices,
-        identities,
-    }))
+        // What this requester gets at each service (PLAN.md M45), for its
+        // `status` to show. Whether an owner can sign devices in is as of the
+        // snapshot; the requester's own is read live, below.
+        for (info, &(si, ni)) in services.iter_mut().zip(&snap.directory_src) {
+            let facts = crate::access::SignInFacts { available, owner_capable: snap.sign_in_capable[ni], terminated: info.terminated };
+            info.reach = Some(crate::access::reach(&snap.services[si], &snap.nodes[ni], &node, rules, &facts));
+        }
+
+        // Who may reach each of this node's own services (PLAN.md M36), pending
+        // ones included, so its firewall is ready the moment approval publishes
+        // them. Sent to this node alone. Not one waiting for an admin again
+        // (PLAN.md #315): its address is in phone configs exported while it was
+        // approved, and the node's firewall is what keeps them from the change.
+        let owner_capable = sign_in_capable(&node);
+        let access: Vec<wireserve_types::ServiceAccess> = own_rows
+            .iter()
+            .filter(|s| (s.denied_at.is_none() || s.approved_at.is_some()) && !s.is_awaiting_review())
+            .map(|s| {
+                let facts = crate::access::SignInFacts { available, owner_capable, terminated: ctx.terminates(s) };
+                crate::access::service_access(s, &node, &snap.nodes, rules, &facts)
+            })
+            .collect();
+
+        // Who owns the devices its terminator lets in by their grants (PLAN.md
+        // M38), so it can name them to its backends: those allowed into any of
+        // its terminated services — every device, when one is open — and that
+        // the node says have connected to it. Without the second, a node with
+        // one open service would be told every owner's subject, e-mail address
+        // and groups; a node that lies about who came still gets no more than
+        // it asks for, one device at a time, each logged the first time.
+        let terminated: Vec<&wireserve_types::ServiceAccess> = access
+            .iter()
+            .filter(|a| own_rows.iter().any(|r| r.name == a.name && ctx.terminates(r)))
+            .collect();
+        let identities = if terminated.is_empty() || seen.is_empty() {
+            Vec::new()
+        } else {
+            let every = terminated.iter().any(|a| a.open);
+            let allowed: std::collections::BTreeSet<std::net::Ipv4Addr> =
+                terminated.iter().flat_map(|a| a.sources.iter().copied()).collect();
+            let now = chrono::Utc::now();
+            owners
+                .into_iter()
+                .filter(|o| o.groups_count(now))
+                .filter_map(|o| {
+                    let device = &snap.nodes[*snap.by_id.get(&o.node_id)?];
+                    let addr: std::net::Ipv4Addr = device.ip4.as_deref()?.parse().ok()?;
+                    if !seen.contains(&addr) || !(every || allowed.contains(&addr)) {
+                        return None;
+                    }
+                    if state.first_release(node.id, device.id) {
+                        tracing::info!(event = "owner_identity_released", node_name = %node.name, device = %device.name, sub = %o.sub);
+                    }
+                    Some(wireserve_types::CallerIdentity { addr, user: o.sub, email: o.email, groups: o.groups })
+                })
+                .collect()
+        };
+
+        let response = PollResponse {
+            peers,
+            services,
+            pending_services: outcome.pending.iter().map(directory::pending_service).collect(),
+            denied_services: outcome.denied.iter().map(directory::denied_service).collect(),
+            relay_carrying,
+            relay_public,
+            relay_port_base: Some(state.config.relay_port_base),
+            port_checks,
+            transit_awaiting_approval,
+            exit_clients,
+            mesh: Some(state.config.mesh_info()),
+            naming: state.config.service_naming(),
+            access,
+            service_notices: outcome.notices,
+            identities,
+        };
+        serde_json::to_vec(&response)
+    })
+    .await
+    .map_err(|e| AppError::Unavailable(format!("building the directory failed: {e}")))?
+    .map_err(|e| AppError::Unavailable(format!("encoding the directory failed: {e}")))?;
+    Ok(([(axum::http::header::CONTENT_TYPE, "application/json")], body))
 }
