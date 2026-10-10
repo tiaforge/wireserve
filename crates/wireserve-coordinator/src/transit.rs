@@ -249,6 +249,25 @@ impl TransitState {
             .map(|(p, _)| *p)
     }
 
+    /// [`Self::carry_port`] for every node at once: one hold of each mutex
+    /// instead of two per node, for the directory snapshot.
+    #[must_use]
+    pub fn carry_ports(&self, fresh_secs: i64) -> HashMap<String, u16> {
+        let now = Utc::now();
+        let caps = self.capabilities.lock().expect("transit state mutex poisoned");
+        let ports = self.carry_ports.lock().expect("transit state mutex poisoned");
+        ports
+            .iter()
+            .filter(|(pk, (_, at))| {
+                (now - *at).num_seconds() <= fresh_secs
+                    && caps.get(pk.as_str()).is_some_and(|(c, cat)| {
+                        c.contains(wireserve_types::CAP_RELAY) && (now - *cat).num_seconds() <= fresh_secs
+                    })
+            })
+            .map(|(pk, (port, _))| (pk.clone(), *port))
+            .collect()
+    }
+
     /// Records whether this node found itself dialable, if it could tell.
     pub fn report_dialable(&self, pubkey: &str, dialable: Option<bool>) {
         let mut map = self.dialable.lock().expect("transit state mutex poisoned");

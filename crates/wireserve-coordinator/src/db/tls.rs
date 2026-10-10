@@ -17,9 +17,11 @@ pub fn ready(conn: &Connection) -> Result<HashMap<String, i64>, DbError> {
 }
 
 /// Replaces `node_id`'s report with `names`. A name the node does not own
-/// is dropped: a node vouches only for its own services.
-pub fn set_ready(conn: &mut Connection, node_id: i64, names: &[String]) -> Result<(), DbError> {
+/// is dropped: a node vouches only for its own services. Whether what is
+/// reported now differs from what was.
+pub fn set_ready(conn: &mut Connection, node_id: i64, names: &[String]) -> Result<bool, DbError> {
     let tx = conn.transaction()?;
+    let before = ready_names(&tx, node_id)?;
     tx.execute("DELETE FROM tls_ready WHERE node_id = ?1", [node_id])?;
     let now = super::nodes::now_str();
     for name in names {
@@ -30,8 +32,15 @@ pub fn set_ready(conn: &mut Connection, node_id: i64, names: &[String]) -> Resul
             rusqlite::params![name, node_id, now],
         )?;
     }
+    let changed = before != ready_names(&tx, node_id)?;
     tx.commit()?;
-    Ok(())
+    Ok(changed)
+}
+
+fn ready_names(conn: &Connection, node_id: i64) -> Result<Vec<String>, DbError> {
+    let mut stmt = conn.prepare("SELECT name FROM tls_ready WHERE node_id = ?1 ORDER BY name")?;
+    let rows = stmt.query_map([node_id], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
 }
 
 /// Forgets everything `node_id` reported: on revoke and on re-join, when

@@ -254,3 +254,153 @@ mod tests {
         assert_eq!(admin_service_info(&svc, &n, vec![]).ports[0].to_string(), "443:192.168.178.1:80/tcp");
     }
 }
+
+/// What every node's `/poll` reads of the mesh and none of them changes: the
+/// directory rows and the lists built from them, read once and shared, so a
+/// poll neither holds the database for them nor builds them again.
+///
+/// Rebuilt when [`DirectoryCache`] says so: a change through an admin or
+/// node route (`AppState::directory_changed`), or after
+/// [`DirectoryCache::TTL`], which also bounds how stale what moves with the
+/// clock (online, carry ports, owners' groups) can get. Holds nothing that
+/// is one requester's: its access, identities and notices are built per poll.
+pub struct DirectorySnapshot {
+    /// Registered, unrevoked nodes, in id order.
+    pub nodes: Vec<NodeRow>,
+    pub by_id: std::collections::HashMap<i64, usize>,
+    pub by_pubkey: std::collections::HashMap<String, usize>,
+    /// Approved services.
+    pub services: Vec<ServiceRow>,
+    pub rules: crate::access::Rules,
+    pub tls_ready: std::collections::HashMap<String, i64>,
+    /// `(device, peer, carrier)`, from the exports.
+    pub static_relays: Vec<(i64, i64, i64)>,
+    /// One per node, in `nodes`' order, carry ports filled in.
+    pub peers: Vec<PeerInfo>,
+    /// The approved services as nodes see them, in `services`' order less
+    /// those whose node is gone.
+    pub directory: Vec<ServiceInfo>,
+    /// Nodes that can be relayed to: a relay port and a carry port.
+    pub relayable: std::collections::HashSet<String>,
+}
+
+impl DirectorySnapshot {
+    pub fn build(conn: &rusqlite::Connection, state: &crate::state::AppState) -> Result<Self, crate::db::DbError> {
+        let nodes = crate::db::nodes::list_all_peers(conn)?;
+        let services = crate::db::services::list_approved(conn)?;
+        let tls_ready = crate::db::tls::ready(conn)?;
+        let rules = crate::access::read_rules(conn)?;
+        let static_relays = crate::db::nodes::all_static_relays(conn)?;
+        let fresh = state.config.online_threshold_secs;
+        let carry = state.transit.carry_ports(fresh);
+        let peers: Vec<PeerInfo> = nodes
+            .iter()
+            .map(|n| {
+                let mut p = peer_info(n, fresh, state.config.relay_port_base);
+                p.relay.carry_port = carry.get(&p.pubkey).copied();
+                p
+            })
+            .collect();
+        let relayable = peers
+            .iter()
+            .filter(|p| p.relay.port.is_some() && p.relay.carry_port.is_some())
+            .map(|p| p.pubkey.clone())
+            .collect();
+        let directory = services_directory(&services, &nodes, &state.directory_context(&tls_ready));
+        let by_id = nodes.iter().enumerate().map(|(i, n)| (n.id, i)).collect();
+        let by_pubkey = nodes.iter().enumerate().filter_map(|(i, n)| Some((n.pubkey.clone()?, i))).collect();
+        Ok(Self { nodes, by_id, by_pubkey, services, rules, tls_ready, static_relays, peers, directory, relayable })
+    }
+}
+
+/// The current [`DirectorySnapshot`], and when it stops being so.
+#[derive(Default)]
+pub struct DirectoryCache {
+    generation: std::sync::atomic::AtomicU64,
+    slot: std::sync::Mutex<Option<(u64, std::time::Instant, std::sync::Arc<DirectorySnapshot>)>>,
+}
+
+impl DirectoryCache {
+    /// How long a snapshot is used when nothing says it changed. Staleness
+    /// of up to a poll interval is already in every directory a node holds;
+    /// this is the backstop for what changes without a write to hook (time,
+    /// the in-memory transit reports) and for a write that was not hooked.
+    pub const TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Something the snapshot holds may have changed: the next [`Self::get`]
+    /// builds a new one.
+    pub fn changed(&self) {
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// The snapshot, built with `build` if there is none, it is older than
+    /// [`Self::TTL`], or [`Self::changed`] was called since it was. Called
+    /// with the database lock held, which is what keeps one build at a time
+    /// and the generation read ahead of rows a later write would change.
+    pub fn get<E>(&self, build: impl FnOnce() -> Result<DirectorySnapshot, E>) -> Result<std::sync::Arc<DirectorySnapshot>, E> {
+        let generation = self.generation.load(std::sync::atomic::Ordering::Acquire);
+        let mut slot = self.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((g, at, snap)) = slot.as_ref() {
+            if *g == generation && at.elapsed() < Self::TTL {
+                return Ok(snap.clone());
+            }
+        }
+        let snap = std::sync::Arc::new(build()?);
+        *slot = Some((generation, std::time::Instant::now(), snap.clone()));
+        Ok(snap)
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn empty() -> DirectorySnapshot {
+        DirectorySnapshot {
+            nodes: Vec::new(),
+            by_id: Default::default(),
+            by_pubkey: Default::default(),
+            services: Vec::new(),
+            rules: crate::access::Rules {
+                grants: Vec::new(),
+                members: Default::default(),
+                tags: Default::default(),
+                owner_groups: Default::default(),
+            },
+            tls_ready: Default::default(),
+            static_relays: Vec::new(),
+            peers: Vec::new(),
+            directory: Vec::new(),
+            relayable: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_snapshot_is_reused_until_something_changes() {
+        let cache = DirectoryCache::default();
+        let builds = Cell::new(0);
+        let build = || -> Result<_, ()> {
+            builds.set(builds.get() + 1);
+            Ok(empty())
+        };
+        let first = cache.get(build).unwrap();
+        let second = cache.get(build).unwrap();
+        assert_eq!(builds.get(), 1);
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        cache.changed();
+        cache.get(build).unwrap();
+        assert_eq!(builds.get(), 2, "a change is read again at once");
+        cache.get(build).unwrap();
+        assert_eq!(builds.get(), 2);
+    }
+
+    #[test]
+    fn a_failed_build_leaves_the_old_snapshot_and_is_retried() {
+        let cache = DirectoryCache::default();
+        cache.get(|| Ok::<_, ()>(empty())).unwrap();
+        cache.changed();
+        assert!(cache.get(|| Err::<DirectorySnapshot, _>(())).is_err());
+        assert!(cache.get(|| Ok::<_, ()>(empty())).is_ok());
+    }
+}

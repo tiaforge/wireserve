@@ -4,7 +4,7 @@ use wireserve_types::{PortMap, ServiceDecl};
 
 use super::DbError;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ServiceRow {
     pub node_id: i64,
     pub name: String,

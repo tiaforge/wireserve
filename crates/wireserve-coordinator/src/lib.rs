@@ -66,6 +66,7 @@ pub fn build_state_with_dns(
         transit: Arc::new(transit::TransitState::default()),
         oidc: config.oidc.clone().map(|c| Arc::new(oidc::Oidc::new(c))),
         released: Arc::default(),
+        directory: Arc::default(),
         probe_udp: std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
             .inspect_err(|e| tracing::warn!(error = %e, "no second UDP socket: nodes can't tell whether they are dialable, and relay ports can't be checked"))
             .ok()

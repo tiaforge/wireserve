@@ -44,7 +44,39 @@ pub fn node_router(state: AppState) -> Router {
         .route("/sign-in/renew", post(crate::oidc::sign_in::renew))
         .route("/sign-in/end", post(crate::oidc::sign_in::end))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), directory_changed_by_node))
         .with_state(state)
+}
+
+/// What `/poll` shares between polls (`DirectorySnapshot`) may have moved
+/// after any node-facing request but the two that write nothing it holds. A
+/// poll says so itself when what it wrote shows. Erring toward a bump costs
+/// one rebuild; a missed one is only held off by the snapshot's TTL.
+async fn directory_changed_by_node(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let counted = !matches!(req.uri().path(), "/poll" | "/probe");
+    let response = next.run(req).await;
+    if counted {
+        state.directory_changed();
+    }
+    response
+}
+
+/// Every write through the admin surface may move it too.
+async fn directory_changed_by_admin(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let writes = !matches!(*req.method(), axum::http::Method::GET | axum::http::Method::HEAD);
+    let response = next.run(req).await;
+    if writes {
+        state.directory_changed();
+    }
+    response
 }
 
 /// Admin router: every route here requires `AdminAuth`. Bound to a
@@ -104,5 +136,6 @@ pub fn admin_router(state: AppState) -> Router {
             post(admin::deny_service),
         )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), directory_changed_by_admin))
         .with_state(state)
 }

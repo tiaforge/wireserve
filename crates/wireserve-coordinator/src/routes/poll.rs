@@ -196,6 +196,17 @@ pub async fn poll(
 
     let mut conn = state.db.conn.lock().await;
 
+    // Whether anything this poll writes shows in the directory every node
+    // shares (`DirectorySnapshot`); `last_seen` does not, the snapshot's TTL
+    // covers it. Told below, before the snapshot is read, so the node sees
+    // its own change in this very response.
+    let mut changed = explicit.is_some_and(|e| node.endpoint_addr.as_deref() != Some(e) || node.endpoint_cleared)
+        || req.endpoint_addr_v4.as_deref().is_some_and(|v| node.endpoint_addr_v4.as_deref() != Some(v))
+        || req.endpoint_addr_v6.as_deref().is_some_and(|v| node.endpoint_addr_v6.as_deref() != Some(v))
+        || req.lan_addr.as_deref().is_some_and(|v| node.lan_addr.as_deref() != Some(v))
+        || req.reflexive_addr.as_deref().is_some_and(|v| node.reflexive_addr.as_deref() != Some(v))
+        || (endpoint_addr.is_some() && endpoint_addr != node.endpoint_addr);
+
     nodes::update_poll_state(
         &conn,
         node.id,
@@ -272,7 +283,7 @@ pub async fn poll(
         .filter(|n| wireserve_types::is_valid_dns_label(n))
         .cloned()
         .collect();
-    crate::db::tls::set_ready(&mut conn, node.id, &tls_ready)?;
+    changed |= crate::db::tls::set_ready(&mut conn, node.id, &tls_ready)?;
     // A declaration, withdrawal or address change on any poll moves the
     // public names; the loop spaces its passes, so poking every time is
     // cheaper than working out whether anything changed.
@@ -298,31 +309,57 @@ pub async fn poll(
         }
     }
 
-    let all_peers = nodes::list_all_peers(&conn)?;
-    let all_services = services::list_approved(&conn)?;
+    // This node's own services as they stand now, pending and denied ones
+    // included.
+    let own_rows = services::list_for_node(&conn, node.id)?;
+    changed |= own_rows != previous;
+    if changed {
+        state.directory_changed();
+    }
 
-    let mut peers: Vec<wireserve_types::PeerInfo> = all_peers
-        .iter()
-        .map(|n| directory::peer_info(n, state.config.online_threshold_secs, state.config.relay_port_base))
-        .collect();
+    // The mesh as every node sees it, read once for all of them. Everything
+    // below that needs the database is read here, so the lock is let go
+    // before the work that grows with the mesh.
+    let fresh = state.config.online_threshold_secs;
+    // This node's own relay report was made a moment ago. If the snapshot
+    // does not yet agree with it (the node just came up, or lost its carry
+    // port), the node's peers would be told the wrong thing for a TTL: read
+    // again, as for any other change.
+    let own_carry_port = state.transit.carry_port(&self_pubkey, fresh);
+    let self_relayable =
+        wireserve_types::relay_port(state.config.relay_port_base, node.relay_slot).is_some() && own_carry_port.is_some();
+    let build = || crate::directory::DirectorySnapshot::build(&conn, &state);
+    let mut snap = state.directory.get(build)?;
+    if snap.relayable.contains(self_pubkey.as_str()) != self_relayable {
+        state.directory_changed();
+        snap = state.directory.get(build)?;
+    }
+    let ctx = state.directory_context(&snap.tls_ready);
+    let seen: std::collections::HashSet<std::net::Ipv4Addr> =
+        req.callers_seen.iter().take(wireserve_types::MAX_CALLERS_SEEN_PER_POLL).copied().collect();
+    let owners = if !seen.is_empty() && own_rows.iter().any(|r| ctx.terminates(r)) {
+        crate::db::owners::all(&conn)?
+    } else {
+        Vec::new()
+    };
+    drop(conn);
+
+    let mut peers = snap.peers.clone();
 
     // End-to-end relaying (PLAN.md M39). A node takes part only while its
-    // own latest poll says it can: a carry port, and the capability.
-    let fresh = state.config.online_threshold_secs;
-    for peer in &mut peers {
-        peer.relay.carry_port = state.transit.carry_port(&peer.pubkey, fresh);
+    // own latest poll says it can: a carry port, and the capability. The
+    // snapshot says so of the others, up to its TTL ago; this node's own
+    // report was made a moment ago, and is read as it stands.
+    if let Some(&i) = snap.by_pubkey.get(self_pubkey.as_str()) {
+        peers[i].relay.carry_port = own_carry_port;
     }
-    let relayable: std::collections::HashSet<String> = peers
-        .iter()
-        .filter(|p| p.relay.port.is_some() && p.relay.carry_port.is_some())
-        .map(|p| p.pubkey.clone())
-        .collect();
+    let relayable = |pk: &str| if pk == self_pubkey { self_relayable } else { snap.relayable.contains(pk) };
     let can_carry = |pk: &str| state.transit.has_capability(pk, wireserve_types::CAP_RELAY, fresh);
     // The carrier for a pair that can't reach each other directly: only
     // ever one relaying end to end. There is no fallback to forwarding the
     // pair's traffic in the clear — every node upgrades together.
     let relay_carrier = |a: &str, c: &str| -> Option<String> {
-        if !relayable.contains(a) || !relayable.contains(c) || !state.transit.either_wants(a, c) {
+        if !relayable(a) || !relayable(c) || !state.transit.either_wants(a, c) {
             return None;
         }
         state.transit.select_where(a, c, fresh, &can_carry)
@@ -332,8 +369,6 @@ pub async fn poll(
     // (`either_wants`), so what follows walks those, never every pair of
     // nodes in the mesh.
     let wanted = state.transit.wanted_pairs();
-    let index: std::collections::HashMap<&str, usize> =
-        all_peers.iter().enumerate().filter_map(|(i, n)| Some((n.pubkey.as_deref()?, i))).collect();
     for (x, y) in &wanted {
         let other = if *x == self_pubkey {
             y
@@ -342,7 +377,7 @@ pub async fn poll(
         } else {
             continue;
         };
-        if let Some(&i) = index.get(other.as_str()) {
+        if let Some(&i) = snap.by_pubkey.get(other.as_str()) {
             if peers[i].pubkey != self_pubkey {
                 peers[i].relay.via = relay_carrier(&self_pubkey, other).filter(|via| via != &self_pubkey);
             }
@@ -362,14 +397,14 @@ pub async fn poll(
             .iter()
             .filter(|(x, y)| x != y && *x != self_pubkey && *y != self_pubkey)
             .filter_map(|(x, y)| {
-                let (i, j) = (*index.get(x.as_str())?, *index.get(y.as_str())?);
+                let (i, j) = (*snap.by_pubkey.get(x.as_str())?, *snap.by_pubkey.get(y.as_str())?);
                 Some((i.min(j), i.max(j)))
             })
             .collect();
         pairs.sort_unstable();
         pairs.dedup();
         for (i, j) in pairs {
-            let (x, y) = (all_peers[i].pubkey.as_deref().unwrap_or_default(), all_peers[j].pubkey.as_deref().unwrap_or_default());
+            let (x, y) = (peers[i].pubkey.as_str(), peers[j].pubkey.as_str());
             if relay_carrier(x, y).as_deref() == Some(self_pubkey.as_str()) {
                 relay_carrying.push(wireserve_types::TransitPair { a: x.to_string(), c: y.to_string() });
             }
@@ -379,10 +414,10 @@ pub async fn poll(
     // This requester's exit role (PLAN.md M27): the devices whose last export
     // named it as their exit, while it is still approved — withdrawing the
     // approval ends the exit on the same poll — and a revoked device leaves
-    // `all_peers`. Whether the node itself still offers is its own
+    // the directory. Whether the node itself still offers is its own
     // business: the agent acts on this only while `exit on`.
     let exit_clients: Vec<String> = if node.transit_approved {
-        all_peers
+        snap.nodes
             .iter()
             .filter(|n| n.exit_enabled && n.exit_node_id == Some(node.id))
             .filter_map(|n| n.pubkey.clone())
@@ -395,11 +430,11 @@ pub async fn poll(
     // through its public address, from their exports — only while it is
     // approved to carry, and only nodes still in the directory.
     let relay_public: Vec<String> = if node.transit_approved {
-        let live: std::collections::HashMap<i64, &nodes::NodeRow> = all_peers.iter().map(|n| (n.id, n)).collect();
-        let mut dests: Vec<String> = nodes::all_static_relays(&conn)?
-            .into_iter()
-            .filter(|(device, _, carrier)| *carrier == node.id && live.contains_key(device))
-            .filter_map(|(_, peer, _)| live.get(&peer)?.pubkey.clone())
+        let mut dests: Vec<String> = snap
+            .static_relays
+            .iter()
+            .filter(|(device, _, carrier)| *carrier == node.id && snap.by_id.contains_key(device))
+            .filter_map(|(_, peer, _)| snap.nodes[*snap.by_id.get(peer)?].pubkey.clone())
             .collect();
         dests.sort();
         dests.dedup();
@@ -409,10 +444,8 @@ pub async fn poll(
     };
     let port_checks = state.transit.checks_for(&self_pubkey);
 
-    let tls_ready = crate::db::tls::ready(&conn)?;
-    let ctx = state.directory_context(&tls_ready);
-    let mut services = directory::services_directory(&all_services, &all_peers, &ctx);
-    let rules = crate::access::read_rules(&conn)?;
+    let mut services = snap.directory.clone();
+    let rules = &snap.rules;
     let available = state.config.sign_in().is_some();
     let sign_in_capable = |owner: &nodes::NodeRow| {
         owner.pubkey.as_deref().is_some_and(|pk| {
@@ -422,13 +455,14 @@ pub async fn poll(
 
     // What this requester gets at each service (PLAN.md M45), for its
     // `status` to show. Names are unique across the mesh.
-    let reach: std::collections::HashMap<&str, wireserve_types::Reach> = all_services
+    let reach: std::collections::HashMap<&str, wireserve_types::Reach> = snap
+        .services
         .iter()
         .filter_map(|s| {
-            let owner = all_peers.iter().find(|n| n.id == s.node_id)?;
+            let owner = &snap.nodes[*snap.by_id.get(&s.node_id)?];
             let facts =
                 crate::access::SignInFacts { available, owner_capable: sign_in_capable(owner), terminated: ctx.terminates(s) };
-            Some((s.name.as_str(), crate::access::reach(s, owner, &node, &rules, &facts)))
+            Some((s.name.as_str(), crate::access::reach(s, owner, &node, rules, &facts)))
         })
         .collect();
     for s in &mut services {
@@ -441,13 +475,12 @@ pub async fn poll(
     // (PLAN.md #315): its address is in phone configs exported while it was
     // approved, and the node's firewall is what keeps them from the change.
     let owner_capable = sign_in_capable(&node);
-    let own_rows = services::list_for_node(&conn, node.id)?;
     let access: Vec<wireserve_types::ServiceAccess> = own_rows
         .iter()
         .filter(|s| (s.denied_at.is_none() || s.approved_at.is_some()) && !s.is_awaiting_review())
         .map(|s| {
             let facts = crate::access::SignInFacts { available, owner_capable, terminated: ctx.terminates(s) };
-            crate::access::service_access(s, &node, &all_peers, &rules, &facts)
+            crate::access::service_access(s, &node, &snap.nodes, rules, &facts)
         })
         .collect();
 
@@ -462,8 +495,6 @@ pub async fn poll(
         .iter()
         .filter(|a| own_rows.iter().any(|r| r.name == a.name && ctx.terminates(r)))
         .collect();
-    let seen: std::collections::HashSet<std::net::Ipv4Addr> =
-        req.callers_seen.iter().take(wireserve_types::MAX_CALLERS_SEEN_PER_POLL).copied().collect();
     let identities = if terminated.is_empty() || seen.is_empty() {
         Vec::new()
     } else {
@@ -471,11 +502,11 @@ pub async fn poll(
         let allowed: std::collections::BTreeSet<std::net::Ipv4Addr> =
             terminated.iter().flat_map(|a| a.sources.iter().copied()).collect();
         let now = chrono::Utc::now();
-        crate::db::owners::all(&conn)?
+        owners
             .into_iter()
             .filter(|o| o.groups_count(now))
             .filter_map(|o| {
-                let device = all_peers.iter().find(|p| p.id == o.node_id)?;
+                let device = &snap.nodes[*snap.by_id.get(&o.node_id)?];
                 let addr: std::net::Ipv4Addr = device.ip4.as_deref()?.parse().ok()?;
                 if !seen.contains(&addr) || !(every || allowed.contains(&addr)) {
                     return None;

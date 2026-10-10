@@ -43,6 +43,8 @@ pub struct AppState {
     /// port checks are sent from it, so what arrives from it was let in
     /// unasked. `None` where it could not be bound.
     pub probe_udp: Option<Arc<std::net::UdpSocket>>,
+    /// What `/poll` reads of the mesh, shared between polls.
+    pub directory: Arc<crate::directory::DirectoryCache>,
 }
 
 impl AppState {
@@ -63,6 +65,12 @@ impl AppState {
     #[must_use]
     pub fn first_release(&self, to: i64, device: i64) -> bool {
         self.released.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert((to, device))
+    }
+
+    /// Tells `/poll` the nodes, services or rules it shares between polls may
+    /// have changed, so the next one reads them again. Call it after the write.
+    pub fn directory_changed(&self) {
+        self.directory.changed();
     }
 
     /// Tells the DNS sync the directory may have changed. Cheap and safe to
