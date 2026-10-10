@@ -178,6 +178,7 @@ pub fn build_poll_request(
         transit_reachable: transit.reachable,
         transit_wanted: transit.wanted,
         services: declared.to_vec(),
+        directory: None,
         capabilities: {
             let mut caps = Vec::new();
             if tls.capable {
@@ -1198,6 +1199,8 @@ mod tests {
 
     fn with_services(services: Vec<ServiceInfo>) -> PollResponse {
         PollResponse {
+            stamp: None,
+            delta: None,
             naming: None, services, ..directory_with(&[], &[]) }
     }
 
@@ -1489,6 +1492,8 @@ mod tests {
         denied: &[(&str, Option<&str>)],
     ) -> PollResponse {
         PollResponse {
+            stamp: None,
+            delta: None,
             naming: None,
             access: vec![],
             service_notices: vec![],

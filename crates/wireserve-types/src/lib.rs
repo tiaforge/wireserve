@@ -1,5 +1,6 @@
 pub mod access;
 pub mod api;
+pub mod directory;
 pub mod firewall;
 pub mod mesh;
 pub mod naming;
@@ -17,6 +18,10 @@ pub use access::{
     MAX_SOURCES_PER_SERVICE,
 };
 pub use api::*;
+pub use directory::{
+    canonical_peer, canonical_service, peer_hash, service_hash, DirectoryBase, DirectoryDelta, DirectoryDigest, DirectoryStamp,
+    PeerVia, ReachResponse,
+};
 pub use mesh::{MeshInfo, MeshRanges};
 pub use naming::{AcmeSettings, IdentityHeaders, ServiceNames, GROUPS_SEPARATORS, SignIn, ServiceNaming, LETS_ENCRYPT_DIRECTORY, TLS_LISTEN_PORT, TLS_PUBLIC_PORT};
 pub use firewall::{

@@ -516,6 +516,10 @@ pub async fn poll(
         };
 
         let response = PollResponse {
+
+            stamp: None,
+
+            delta: None,
             peers,
             services,
             pending_services: outcome.pending.iter().map(directory::pending_service).collect(),

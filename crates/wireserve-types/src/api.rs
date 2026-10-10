@@ -408,6 +408,10 @@ pub struct PollRequest {
     pub transit_wanted: Vec<String>,
     #[serde(default)]
     pub services: Vec<ServiceDecl>,
+    /// The directory this node holds, when it holds one it can apply a delta
+    /// to (fix 6). Without it the response carries the whole directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory: Option<crate::DirectoryStamp>,
     /// What this agent can do — see [`CAP_TLS_TERMINATE`] and
     /// [`CAP_SIGN_IN`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -455,7 +459,7 @@ pub struct PortCheck {
 /// At most this many port checks are read from one poll.
 pub const MAX_PORT_CHECKS_PER_POLL: usize = 16;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub name: String,
     pub pubkey: String,
@@ -533,7 +537,7 @@ impl PeerRelay {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServiceInfo {
     pub name: String,
     pub node: String,
@@ -610,8 +614,18 @@ pub struct TransitPair {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PollResponse {
+    /// The whole directory, or empty when `delta` is set.
     pub peers: Vec<PeerInfo>,
     pub services: Vec<ServiceInfo>,
+    /// Which version of the shared directory this response leaves the node
+    /// holding, and a digest of it to check by. Absent from a coordinator
+    /// that does not number it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stamp: Option<crate::DirectoryStamp>,
+    /// What changed since the version the poll named, in place of `peers`
+    /// and `services`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta: Option<crate::DirectoryDelta>,
     /// Every pair whose end-to-end session THIS node relays right now
     /// (PLAN.md M39): it forwards their UDP between the two relay ports and
     /// never sees inside. Both are in `peers`, which is where their
@@ -1070,6 +1084,8 @@ mod tests {
         // The wire half of "approval disabled behaves exactly as before":
         // the keys must be absent from the JSON, not merely empty arrays.
         let resp = PollResponse {
+            stamp: None,
+            delta: None,
             peers: vec![],
             services: vec![],
             pending_services: vec![],
@@ -1104,6 +1120,8 @@ mod tests {
     #[test]
     fn poll_response_roundtrips() {
         let resp = PollResponse {
+            stamp: None,
+            delta: None,
             peers: vec![PeerInfo {
                 name: "homeserver".into(),
                 pubkey: "abc".into(),

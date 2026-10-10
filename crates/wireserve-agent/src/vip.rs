@@ -120,6 +120,8 @@ mod tests {
 
     fn directory(services: Vec<ServiceInfo>) -> PollResponse {
         PollResponse {
+            stamp: None,
+            delta: None,
             naming: None,
             access: vec![],
             service_notices: vec![],
