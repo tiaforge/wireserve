@@ -18,6 +18,7 @@ rand.workspace = true
 subtle.workspace = true
 tokio.workspace = true
 axum.workspace = true
+futures-util.workspace = true
 rusqlite.workspace = true
 rusqlite_migration.workspace = true
 clap.workspace = true

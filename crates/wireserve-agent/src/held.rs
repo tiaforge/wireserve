@@ -53,9 +53,10 @@ pub fn absorb(held: &mut Option<Held>, resp: &mut PollResponse) -> Result<(), Ou
         *held = None;
         return Ok(());
     };
-    if let Some(delta) = resp.delta.take() {
+    let delta = resp.delta.take();
+    if let (false, Some(delta)) = (resp.full, &delta) {
         let Some(h) = held.as_mut() else { return Err(OutOfStep::NothingHeld) };
-        h.base.apply(&delta);
+        h.base.apply(delta);
         if h.base.digest() != stamp.digest {
             *held = None;
             return Err(OutOfStep::Digest);
@@ -65,12 +66,18 @@ pub fn absorb(held: &mut Option<Held>, resp: &mut PollResponse) -> Result<(), Ou
         resp.services = h.base.services();
         return Ok(());
     }
-    let via: Vec<PeerVia> = resp
+    // A whole directory, which may be of an earlier version than the stamp's,
+    // with what changed since in `delta`.
+    let mut via: Vec<PeerVia> = resp
         .peers
         .iter()
         .filter_map(|p| Some(PeerVia { pubkey: p.pubkey.clone(), via: p.relay.via.clone()? }))
         .collect();
-    let base = DirectoryBase::from_full(&resp.peers, &resp.services);
+    let mut base = DirectoryBase::from_full(&resp.peers, &resp.services);
+    if let Some(delta) = &delta {
+        base.apply(delta);
+        via.extend(delta.relay_via.iter().cloned());
+    }
     if base.digest() != stamp.digest {
         *held = None;
         return Err(OutOfStep::Digest);
@@ -142,6 +149,34 @@ mod tests {
         assert_eq!(second.peers.len(), 2);
         assert_eq!(second.services.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["db"]);
         assert_eq!(held.as_ref().unwrap().stamp().version, 2);
+    }
+
+    #[test]
+    fn a_whole_directory_of_an_earlier_version_is_brought_up_to_date_by_the_delta_sent_with_it() {
+        let mut held = None;
+        let mut b2 = peer("b");
+        b2.endpoint_addr = Some("203.0.113.1:51820".into());
+        let now = DirectoryBase::from_full(&[peer("a"), b2.clone(), peer("c")], &[svc("db")]);
+        let mut resp = PollResponse {
+            stamp: Some(stamp(5, &now)),
+            peers: vec![peer("a"), peer("b")],
+            services: vec![svc("web")],
+            full: true,
+            delta: Some(DirectoryDelta {
+                peers_set: vec![b2, peer("c")],
+                services_set: vec![svc("db")],
+                services_removed: vec!["web".into()],
+                relay_via: vec![PeerVia { pubkey: "pk-c".into(), via: "pk-a".into() }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        absorb(&mut held, &mut resp).unwrap();
+        assert!(resp.delta.is_none());
+        assert_eq!(resp.peers.len(), 3);
+        assert_eq!(resp.services.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["db"]);
+        assert_eq!(resp.peers.iter().find(|p| p.name == "c").unwrap().relay.via.as_deref(), Some("pk-a"));
+        assert_eq!(held.as_ref().unwrap().stamp().version, 5, "and what is held is of the stamp's version");
     }
 
     #[test]

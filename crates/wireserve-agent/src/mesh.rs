@@ -130,6 +130,7 @@ mod tests {
         PollResponse {
             stamp: None,
             delta: None,
+            full: false,
             naming: None,
             access: vec![],
             service_notices: vec![],

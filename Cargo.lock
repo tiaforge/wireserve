@@ -4297,6 +4297,7 @@ dependencies = [
  "clap",
  "dns-update",
  "ed25519-dalek 3.0.0",
+ "futures-util",
  "libc",
  "openidconnect",
  "rand 0.10.3",

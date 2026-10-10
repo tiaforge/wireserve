@@ -116,6 +116,17 @@ fn raw_request(method: &str, uri: &str, auth_header: Option<&str>) -> Request<Bo
 }
 
 async fn body_json(response: axum::response::Response) -> Value {
+    let body = body_raw(response).await;
+    // A poll's response is read as a node that holds nothing reads it.
+    if body.get("stamp").is_some() {
+        whole(body)
+    } else {
+        body
+    }
+}
+
+/// The body as it is on the wire.
+async fn body_raw(response: axum::response::Response) -> Value {
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2771,6 +2782,30 @@ async fn poll_with(router: &Router, bearer: &str, services: Value) -> (StatusCod
     (status, body_json(resp).await)
 }
 
+/// A poll's response as a node that holds nothing reads it: the whole
+/// directory in `peers` and `services` (the shared one with what changed
+/// since applied, and each peer's carrier), and no `full` or `delta`.
+/// A response that is only a delta is left as it is, with empty arrays.
+fn whole(mut body: Value) -> Value {
+    let Some(obj) = body.as_object_mut() else { return body };
+    if obj.get("full") == Some(&json!(true)) {
+        let resp: wireserve_types::PollResponse = serde_json::from_value(Value::Object(obj.clone())).unwrap();
+        let mut base = wireserve_types::DirectoryBase::from_full(&resp.peers, &resp.services);
+        let via = resp.delta.as_ref().map(|d| d.relay_via.clone()).unwrap_or_default();
+        if let Some(d) = &resp.delta {
+            base.apply(d);
+        }
+        obj.insert("peers".into(), serde_json::to_value(base.peers(&via)).unwrap());
+        obj.insert("services".into(), serde_json::to_value(base.services()).unwrap());
+        obj.remove("delta");
+        obj.remove("full");
+    }
+    for key in ["peers", "services"] {
+        obj.entry(key).or_insert_with(|| json!([]));
+    }
+    body
+}
+
 #[tokio::test]
 async fn a_mapped_service_gets_its_own_address_in_every_directory() {
     let app = test_app();
@@ -2889,6 +2924,14 @@ async fn poll_full(router: &Router, bearer: &str, body: Value) -> (StatusCode, V
     let resp = router.clone().oneshot(req).await.unwrap();
     let status = resp.status();
     (status, body_json(resp).await)
+}
+
+/// The response as it is on the wire.
+async fn poll_raw(router: &Router, bearer: &str, body: Value) -> (StatusCode, Value) {
+    let req = json_request("POST", "/poll", Some(bearer), body);
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, body_raw(resp).await)
 }
 
 /// A poll from a node that can be relayed end to end (PLAN.md M39): a
@@ -4400,25 +4443,67 @@ async fn a_poll_naming_another_coordinators_directory_gets_the_whole_of_this_one
 }
 
 #[tokio::test]
-async fn only_so_many_whole_directories_are_built_at_once_and_a_delta_is_not_one() {
+async fn only_so_many_whole_directories_are_built_at_once_and_a_delta_or_one_already_built_is_not_one() {
     let app = test_app();
     let ta = admin_create_node(&app.router, "a").await;
     let a = register_node(&app.router, &ta, "pk-a", 51820).await;
     let bearer = a["bearer_token"].as_str().unwrap();
-    let (_, first) = poll_full(&app.router, bearer, json!({ "services": [] })).await;
-    let stamp = first["stamp"].clone();
 
-    // Every permit taken: a node that holds nothing is told to come back.
+    // Every permit taken, and none built yet: a node that holds nothing is
+    // told to come back.
     let held = app.state.full_directory_limit.clone().try_acquire_many_owned(8).unwrap();
     let (status, _) = poll_full(&app.router, bearer, json!({ "services": [] })).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    drop(held);
+    let (status, first) = poll_full(&app.router, bearer, json!({ "services": [] })).await;
+    assert_eq!(status, StatusCode::OK);
+    let stamp = first["stamp"].clone();
+
+    let held = app.state.full_directory_limit.clone().try_acquire_many_owned(8).unwrap();
     // A node that can be sent a delta is not affected.
     let (status, resp) = poll_full(&app.router, bearer, json!({ "services": [], "directory": stamp })).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(resp["delta"].is_object());
-    drop(held);
-    let (status, _) = poll_full(&app.router, bearer, json!({ "services": [] })).await;
+    assert!(resp["peers"].as_array().unwrap().is_empty());
+    // Nor is one that needs all of it, now that it is built.
+    let (status, resp) = poll_full(&app.router, bearer, json!({ "services": [] })).await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(resp["peers"].as_array().unwrap().len(), 1);
+    drop(held);
+}
+
+#[tokio::test]
+async fn nodes_that_need_the_whole_directory_are_sent_the_one_serialisation_and_what_changed_since() {
+    let app = test_app();
+    let (ta, tb, tc) = (
+        admin_create_node(&app.router, "a").await,
+        admin_create_node(&app.router, "b").await,
+        admin_create_node(&app.router, "c").await,
+    );
+    let a = register_node(&app.router, &ta, "pk-a", 51820).await;
+    let b = register_node(&app.router, &tb, "pk-b", 51821).await;
+    let (a_bearer, b_bearer) = (a["bearer_token"].as_str().unwrap(), b["bearer_token"].as_str().unwrap());
+
+    let (_, first_a) = poll_raw(&app.router, a_bearer, json!({ "services": [] })).await;
+    assert_eq!(first_a["full"], json!(true), "{first_a}");
+    assert_eq!(first_a["peers"].as_array().unwrap().len(), 2);
+
+    // A third node joins and B moves; B asks for all of it next.
+    let c = register_node(&app.router, &tc, "pk-c", 51822).await;
+    let _ = c;
+    let (status, moved) = poll_raw(&app.router, b_bearer, json!({ "services": [], "endpoint_addr": "203.0.113.9:51821" })).await;
+    assert_eq!(status, StatusCode::OK, "{moved}");
+    // (Without it the observed address would take its place again.)
+    let (_, first_b) = poll_raw(&app.router, b_bearer, json!({ "services": [], "endpoint_addr": "203.0.113.9:51821" })).await;
+
+    // The arrays are the very ones A was sent, and the delta brings them up to date.
+    assert_eq!(first_b["full"], json!(true));
+    assert_eq!(first_b["peers"], first_a["peers"], "one serialisation, however much changed since");
+    let delta: wireserve_types::DirectoryDelta = serde_json::from_value(first_b["delta"].clone()).unwrap();
+    assert!(delta.peers_set.iter().any(|p| p.name == "c"));
+    assert!(delta.peers_set.iter().any(|p| p.name == "b" && p.endpoint_addr.as_deref() == Some("203.0.113.9:51821")), "{delta:?}");
+    let whole = whole(first_b.clone());
+    assert_eq!(whole["peers"].as_array().unwrap().len(), 3);
+    assert_eq!(directory_of(&whole).digest(), first_b["stamp"]["digest"].as_u64().unwrap());
 }
 
 #[tokio::test]

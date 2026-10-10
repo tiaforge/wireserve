@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 
 use axum::extract::{ConnectInfo, State};
+use axum::body::Bytes;
 use axum::Json;
 use wireserve_types::{PollRequest, PollResponse};
 
@@ -336,7 +337,8 @@ pub async fn poll(
     // fleet that restarts together, or a coordinator that does, would
     // otherwise ask for every node's directory in the same moment. The rest
     // are told to come back, which an agent does after a backoff.
-    let full_permit = if have.is_some_and(|h| state.directory.read().can_serve(&h)) {
+    // Not even that when one is already built: it is sent as it is.
+    let full_permit = if have.is_some_and(|h| state.directory.read().can_serve(&h)) || state.directory.read().shared_ready() {
         None
     } else {
         Some(
@@ -475,22 +477,18 @@ pub async fn poll(
         // The directory itself: what changed since the version this node holds
         // when the log can say, otherwise all of it.
         let stamp = dir.stamp();
-        let (peers, services, delta) = match have.and_then(|h| dir.delta_since(&h)) {
+        let (shared, delta) = match have.and_then(|h| dir.delta_since(&h)) {
             Some(mut delta) => {
                 delta.relay_via = relay_via;
-                (Vec::new(), Vec::new(), Some(delta))
+                (None, Some(delta))
             }
             None => {
-                let mut peers = dir.all_peers();
-                let at: std::collections::HashMap<&str, usize> =
-                    peers.iter().enumerate().map(|(i, p)| (p.pubkey.as_str(), i)).collect();
-                let vias: Vec<(usize, String)> =
-                    relay_via.iter().filter_map(|v| Some((*at.get(v.pubkey.as_str())?, v.via.clone()))).collect();
-                for (i, via) in vias {
-                    peers[i].relay.via = Some(via);
-                }
-                let services = dir.all_services().into_iter().map(|e| e.info.clone()).collect();
-                (peers, services, None)
+                // Every node that needs all of it is sent the same buffers,
+                // with what changed since they were built as a delta.
+                let shared = dir.shared_full()?;
+                let mut delta = dir.delta_from(shared.version).unwrap_or_default();
+                delta.relay_via = relay_via;
+                (Some(shared), Some(delta))
             }
         };
 
@@ -547,8 +545,9 @@ pub async fn poll(
         let response = PollResponse {
             stamp: Some(stamp),
             delta,
-            peers,
-            services,
+            full: shared.is_some(),
+            peers: Vec::new(),
+            services: Vec::new(),
             pending_services: outcome.pending.iter().map(directory::pending_service).collect(),
             denied_services: outcome.denied.iter().map(directory::denied_service).collect(),
             relay_carrying,
@@ -563,11 +562,31 @@ pub async fn poll(
             service_notices: outcome.notices,
             identities,
         };
-        serde_json::to_vec(&response)
+        let rest = serde_json::to_vec(&response)?;
+        Ok::<_, serde_json::Error>(match shared {
+            None => vec![Bytes::from(rest)],
+            // `rest` is an object without `peers` and `services` (empty, so
+            // left out), which the shared arrays are put at the front of.
+            Some(shared) => {
+                let tail = if rest.len() > 2 { [&[b','][..], &rest[1..]].concat() } else { b"}".to_vec() };
+                vec![
+                    Bytes::from_static(b"{\"peers\":"),
+                    shared.peers.clone(),
+                    Bytes::from_static(b",\"services\":"),
+                    shared.services.clone(),
+                    Bytes::from(tail),
+                ]
+            }
+        })
     })
     .await
     .map_err(|e| AppError::Unavailable(format!("building the directory failed: {e}")))?
     .map_err(|e| AppError::Unavailable(format!("encoding the directory failed: {e}")))?;
+    let body = if body.len() == 1 {
+        axum::body::Body::from(body.into_iter().next().unwrap_or_default())
+    } else {
+        axum::body::Body::from_stream(futures_util::stream::iter(body.into_iter().map(Ok::<_, std::convert::Infallible>)))
+    };
     Ok(([(axum::http::header::CONTENT_TYPE, "application/json")], body))
 }
 

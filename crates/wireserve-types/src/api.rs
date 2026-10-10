@@ -614,9 +614,18 @@ pub struct TransitPair {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PollResponse {
-    /// The whole directory, or empty when `delta` is set.
+    /// The whole directory, or empty when `delta` is set alone. Left out of
+    /// the JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<PeerInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<ServiceInfo>,
+    /// `peers` and `services` are a whole directory, as of the version the
+    /// `delta` starts from: apply the delta to them. Sent so that one
+    /// serialisation of the whole directory can answer every node that needs
+    /// it, whatever changed since.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub full: bool,
     /// Which version of the shared directory this response leaves the node
     /// holding, and a digest of it to check by. Absent from a coordinator
     /// that does not number it.
@@ -1086,6 +1095,7 @@ mod tests {
         let resp = PollResponse {
             stamp: None,
             delta: None,
+            full: false,
             peers: vec![],
             services: vec![],
             pending_services: vec![],
@@ -1122,6 +1132,7 @@ mod tests {
         let resp = PollResponse {
             stamp: None,
             delta: None,
+            full: false,
             peers: vec![PeerInfo {
                 name: "homeserver".into(),
                 pubkey: "abc".into(),
