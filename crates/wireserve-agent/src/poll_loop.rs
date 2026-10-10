@@ -38,6 +38,10 @@ pub enum PollError {
     State(#[from] crate::state::StateError),
     #[error("agent is not registered yet — run `wireserve join` first")]
     NotRegistered,
+    /// What this node holds of the directory does not match the coordinator's;
+    /// the next poll asks for all of it.
+    #[error("{0}")]
+    OutOfStep(#[from] crate::held::OutOfStep),
     /// One or more of the local steps (peers, firewall, hosts file) failed
     /// while the others were still applied — see `run_once`.
     #[error("reconciliation incomplete: {}", join_failures(.0))]
@@ -607,6 +611,9 @@ pub struct PollContext<'a, F: FirewallBackend> {
     pub own_dialable_v4: Option<bool>,
     /// This node's relay port checks (PLAN.md M40); `None` in tests.
     pub port_checks: Option<&'a std::sync::Arc<crate::port_check::PortChecker>>,
+    /// The shared directory as of the last poll (fix 6), kept between polls so
+    /// that the next can name it and be sent only what changed.
+    pub held: &'a mut Option<crate::held::Held>,
 }
 
 /// Moves the terminator's local routes from `old` to `new` (see
@@ -728,7 +735,7 @@ where
     // 1. send
     // Answered port checks go out until a poll gets through with them.
     let checks_seen = ctx.port_checks.map(|c| c.seen()).unwrap_or_default();
-    let req = build_poll_request(
+    let mut req = build_poll_request(
         &declared,
         endpoint_addr,
         &dual,
@@ -745,6 +752,7 @@ where
         },
         tls_report,
     );
+    req.directory = ctx.held.as_ref().map(|h| h.stamp());
     let url = format!("{}/poll", ctx.coordinator_url.trim_end_matches('/'));
     let resp = ctx
         .client
@@ -784,6 +792,8 @@ where
         checker.delivered(&checks_seen);
     }
     let mut directory: PollResponse = resp.json().await?;
+    // The whole directory, whether it came whole or as what changed.
+    crate::held::absorb(ctx.held, &mut directory)?;
     // Before anything acts on an address: peers, firewall, hosts file and
     // the saved directory all see the same, checked, set.
     let mesh_ranges = pinned_mesh_ranges(state, directory.mesh.as_ref()).await;

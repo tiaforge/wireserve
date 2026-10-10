@@ -2,6 +2,7 @@ pub mod backoff;
 pub mod endpoint_dns;
 pub mod firewall;
 pub mod fsutil;
+pub mod held;
 pub mod hosts;
 pub mod ifname;
 pub mod install;

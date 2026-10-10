@@ -751,6 +751,8 @@ async fn cmd_daemon(
     // Polls in a row the coordinator could not answer, and the earliest an
     // early wake-up (below) may poll again while backing off from them.
     let mut coordinator_failures: u32 = 0;
+    // What the last poll left this node holding of the shared directory.
+    let mut held_directory: Option<wireserve_agent::held::Held> = None;
     let mut not_before = tokio::time::Instant::now();
     // Between polls, the kernel's receive counters: a peer whose path goes
     // quiet is noticed within seconds, not at the next poll.
@@ -845,6 +847,7 @@ async fn cmd_daemon(
                     tls: Some(&tls_link),
                     own_dialable_v4,
                     port_checks: Some(&port_checks),
+                    held: &mut held_directory,
                 };
                 let result = poll_loop::run_once(&mut ctx, &shared_state).await;
                 // Safety net for host-firewall changes the interop's own
