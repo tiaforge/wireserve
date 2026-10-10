@@ -38,7 +38,7 @@ const LOG_MAX_ENTRIES: usize = 500_000;
 /// asks for one, together with what changed since (a delta from its version),
 /// for this long or for this many changes.
 const SHARED_MAX_AGE: Duration = Duration::from_secs(10);
-const SHARED_MAX_BEHIND: u64 = 20_000;
+const SHARED_MAX_BEHIND: u64 = 2_000;
 
 /// The whole directory as JSON arrays, built once and shared: a node that
 /// needs all of it is sent these very buffers, so a crowd of them costs one
