@@ -568,7 +568,7 @@ pub async fn poll(
             // `rest` is an object without `peers` and `services` (empty, so
             // left out), which the shared arrays are put at the front of.
             Some(shared) => {
-                let tail = if rest.len() > 2 { [&[b','][..], &rest[1..]].concat() } else { b"}".to_vec() };
+                let tail = if rest.len() > 2 { [b",", &rest[1..]].concat() } else { b"}".to_vec() };
                 vec![
                     Bytes::from_static(b"{\"peers\":"),
                     shared.peers.clone(),
