@@ -4199,6 +4199,32 @@ mod dns_records {
     }
 
     #[tokio::test]
+    async fn a_service_nobody_approved_names_no_owner_whatever_its_node_says() {
+        // Security audit 2026-10-11: a pending service can have no
+        // certificate, so a node calling one ready is lying — and with it,
+        // and devices it says called, it was told every owner.
+        let fake = Arc::new(FakeDns::default());
+        let mut config = test_config("");
+        config.service_domain = Some("int.example.com".into());
+        config.require_service_approval = true;
+        let app = app_with_dns(config, Some(fake.clone() as Arc<dyn DnsWriter>));
+        let home = node(&app, "home").await;
+        let _laptop = node(&app, "laptop").await;
+        own(&app, "laptop", "alice", &["admins"]).await;
+
+        let body = poll_seen(&app, &home, &[]).await;
+        assert!(body["pending_services"].as_array().unwrap().iter().any(|s| s["name"] == "jellyfin"), "{body}");
+        let laptop = address_of(&body, "laptop");
+        let body = poll_seen(&app, &home, &[&laptop]).await;
+        assert!(body.get("identities").is_none(), "a pending service released an owner: {body}");
+
+        // Approved, the same report is believed.
+        admin_call(&app.router, "POST", "/admin/nodes/home/services/jellyfin/approve", json!(null)).await;
+        let body = poll_seen(&app, &home, &[&laptop]).await;
+        assert_eq!(body["identities"][0]["user"], "alice", "{body}");
+    }
+
+    #[tokio::test]
     async fn a_name_the_zone_already_holds_is_never_overwritten_and_the_rest_carry_on() {
         let fake = Arc::new(FakeDns::default());
         let app = app(&fake);

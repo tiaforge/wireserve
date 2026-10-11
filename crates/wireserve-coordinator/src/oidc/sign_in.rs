@@ -34,9 +34,9 @@ use serde::{Deserialize, Serialize};
 use wireserve_types::session::{self, CALLBACK_PATH};
 use wireserve_types::GrantSource;
 
-use super::claim::{self, Flow, Purpose};
+use super::claim;
 use super::pages::{self, escape};
-use super::{Identity, Oidc, RefreshError};
+use super::{Identity, Oidc, Pending, RefreshError};
 use crate::auth::BearerNode;
 use crate::db::{services, sessions, DbError};
 use crate::error::AppError;
@@ -58,6 +58,84 @@ pub const REDEEMS_PER_MIN: u32 = 60;
 /// services in a row starts one each; a browser that already is signed in
 /// starts none at the provider.
 pub const STARTS_PER_MIN: u32 = 20;
+
+/// The IPv6 prefix sign-in starts are counted by. The limiter turns new
+/// sources away once it tracks 65,536, and a /64 each let anyone with a
+/// routed /48 — free from a tunnel broker — fill it and stop every sign-in
+/// (security audit 2026-10-11).
+pub const STARTS_V6_PREFIX: u8 = 48;
+
+/// The cookie that carries a sign-in through the identity provider and
+/// back: what the return must match and where it goes on to, sealed. It is
+/// kept in the browser, not here, so no number of sign-ins started
+/// elsewhere can push out this one (security audit 2026-10-11).
+const FLOW_COOKIE: &str = "wireserve-sign-in";
+
+/// How long a started sign-in waits for the person.
+const FLOW_TTL_SECS: i64 = 600;
+
+/// What the flow cookie is sealed for, which no node id's eight bytes and
+/// no session's `s:<id>` can be.
+const FLOW_AAD: &[u8] = b"sign-in-flow";
+
+/// Past this, a flow cookie's way back is `/`: a browser keeps a cookie of
+/// at most 4096 bytes, name and attributes included.
+const MAX_FLOW_COOKIE: usize = 3600;
+
+/// A sign-in on its way through the identity provider, as its cookie holds
+/// it.
+#[derive(Serialize, Deserialize)]
+struct SealedFlow {
+    fqdn: String,
+    to: String,
+    bind: String,
+    csrf: String,
+    nonce: String,
+    pkce: String,
+    /// Unix seconds after which it is not taken back.
+    until: i64,
+}
+
+impl SealedFlow {
+    fn seal(&self, oidc: &Oidc) -> String {
+        oidc.seal_for(FLOW_AAD, &serde_json::to_string(self).expect("strings serialize"))
+    }
+}
+
+/// A sign-in coming back from the identity provider.
+pub(super) struct Returning {
+    pub fqdn: String,
+    pub to: String,
+    pub bind: String,
+    pub pending: Pending,
+}
+
+/// The sign-in this browser's flow cookie holds, if it opens, is not too
+/// old, and is the one the provider answered (`returned_state`): a claim
+/// may be under way in the same browser, and the state says which of the
+/// two came back.
+pub(super) fn returning(state: &AppState, oidc: &Oidc, headers: &HeaderMap, returned_state: Option<&str>) -> Option<Returning> {
+    let sealed = claim::named_cookie(state, FLOW_COOKIE, headers)?;
+    let flow: SealedFlow = serde_json::from_str(&oidc.open_for(FLOW_AAD, &sealed)?).ok()?;
+    if flow.until < Utc::now().timestamp() || !returned_state.is_some_and(|s| claim::same(s, &flow.csrf)) {
+        return None;
+    }
+    Some(Returning {
+        fqdn: flow.fqdn,
+        to: flow.to,
+        bind: flow.bind,
+        pending: Pending {
+            csrf: openidconnect::CsrfToken::new(flow.csrf),
+            nonce: openidconnect::Nonce::new(flow.nonce),
+            pkce: openidconnect::PkceCodeVerifier::new(flow.pkce),
+        },
+    })
+}
+
+/// Forgets this browser's sign-in flow.
+pub(super) fn clear_flow(state: &AppState) -> String {
+    claim::set_named_cookie(state, FLOW_COOKIE, "", 0)
+}
 
 /// The associated data a session's refresh token is sealed with.
 fn aad(id: &str) -> Vec<u8> {
@@ -165,17 +243,29 @@ pub async fn start(
             return pages::problem(StatusCode::BAD_GATEWAY, "The sign-in cannot be reached right now. Try again shortly.");
         }
     };
-    let Some(id) = claim::remember(&oidc, Flow::new(Purpose::SignIn { fqdn: fqdn.clone(), to, bind }, pending)) else {
-        return pages::problem(StatusCode::SERVICE_UNAVAILABLE, "Too many sign-ins at once. Try again in a few minutes.");
+    let mut flow = SealedFlow {
+        fqdn: fqdn.clone(),
+        to,
+        bind,
+        csrf: pending.csrf.secret().clone(),
+        nonce: pending.nonce.secret().clone(),
+        pkce: pending.pkce.secret().clone(),
+        until: Utc::now().timestamp() + FLOW_TTL_SECS,
     };
+    let mut sealed = flow.seal(&oidc);
+    if sealed.len() > MAX_FLOW_COOKIE {
+        flow.to = "/".into();
+        sealed = flow.seal(&oidc);
+    }
     tracing::info!(event = "sign_in_started", service = %fqdn, client_ip = %client_ip);
-    claim::to_provider(&state, url, &id)
+    let cookie = claim::set_named_cookie(&state, FLOW_COOKIE, &sealed, FLOW_TTL_SECS.unsigned_abs());
+    claim::to_provider(url, &cookie)
 }
 
 /// Back from the identity provider, signed in, for a sign-in to `fqdn`:
 /// the session is made, and the browser goes back to the service.
 pub(super) async fn signed_in(state: &AppState, oidc: &Oidc, identity: Identity, fqdn: &str, to: &str, bind: &str) -> Response {
-    let flow_cookie = claim::set_cookie(state, "", 0);
+    let flow_cookie = clear_flow(state);
     let service = match sign_in_service(state, fqdn).await {
         Ok(Some(service)) => service,
         Ok(None) => {
@@ -244,7 +334,7 @@ async fn go_back(
     login_cookie: Option<String>,
 ) -> Response {
     let mut cookies: Vec<String> = login_cookie.into_iter().collect();
-    cookies.push(claim::set_cookie(state, "", 0));
+    cookies.push(clear_flow(state));
     if !admitted(&s.groups, &service.1) {
         let who = s.email.as_deref().or(s.name.as_deref()).unwrap_or(&s.sub);
         let hint = "To use another account: <a href=\"signed-out\">sign out here</a>, and at your login server.";
@@ -263,7 +353,7 @@ async fn go_back(
     with_cookies(resp, &cookies)
 }
 
-fn with_cookies(mut resp: Response, cookies: &[String]) -> Response {
+pub(super) fn with_cookies(mut resp: Response, cookies: &[String]) -> Response {
     for c in cookies {
         if let Ok(v) = HeaderValue::from_str(c) {
             resp.headers_mut().append(header::SET_COOKIE, v);

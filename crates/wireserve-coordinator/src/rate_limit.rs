@@ -58,16 +58,21 @@ const MAX_CONCURRENT_DELAYS: usize = 64;
 /// (see [`SlidingWindowLimiter::record`]).
 pub const MAX_TRACKED_SOURCES: usize = 65_536;
 
+/// The prefix an IPv6 source is counted by unless a limiter says otherwise
+/// ([`SlidingWindowLimiter::with_v6_prefix`]).
+pub const DEFAULT_V6_PREFIX: u8 = 64;
+
 /// The key a source is counted under: an IPv4 address as is, an IPv6
-/// address by its /64. A single IPv6 host is routinely handed a whole /64
-/// and can send from any address in it, so per-address keys gave it
-/// 2^64 fresh budgets. An IPv4-mapped IPv6 address counts as the IPv4
-/// address it maps.
-fn source_key(ip: IpAddr) -> IpAddr {
+/// address by its first `v6_prefix` bits (a /64 by default). A single IPv6
+/// host is routinely handed a whole /64 and can send from any address in
+/// it, so per-address keys gave it 2^64 fresh budgets. An IPv4-mapped IPv6
+/// address counts as the IPv4 address it maps.
+fn source_key(ip: IpAddr, v6_prefix: u8) -> IpAddr {
     match ip.to_canonical() {
         IpAddr::V6(v6) => {
-            let bits = u128::from(v6) & !((1u128 << 64) - 1);
-            IpAddr::V6(Ipv6Addr::from(bits))
+            let keep = u32::from(v6_prefix.min(128));
+            let mask = if keep == 0 { 0 } else { u128::MAX << (128 - keep) };
+            IpAddr::V6(Ipv6Addr::from(u128::from(v6) & mask))
         }
         v4 => v4,
     }
@@ -95,6 +100,7 @@ pub struct SlidingWindowLimiter {
     max: u32,
     window: Duration,
     max_sources: usize,
+    v6_prefix: u8,
     inner: Mutex<Inner>,
 }
 
@@ -113,11 +119,22 @@ impl SlidingWindowLimiter {
             max,
             window: Duration::from_secs(window_secs),
             max_sources,
+            v6_prefix: DEFAULT_V6_PREFIX,
             inner: Mutex::new(Inner {
                 hits: HashMap::new(),
                 last_sweep: Instant::now(),
             }),
         }
+    }
+
+    /// Counts IPv6 sources by their first `bits` instead: a limiter whose
+    /// table filling up turns new sources away needs a prefix an attacker
+    /// does not hold 65,536 of (a routed /48 is free from a tunnel broker,
+    /// and holds that many /64s).
+    #[must_use]
+    pub fn with_v6_prefix(mut self, bits: u8) -> Self {
+        self.v6_prefix = bits;
+        self
     }
 
     fn live(&self, entry: &VecDeque<Instant>, now: Instant) -> usize {
@@ -134,7 +151,7 @@ impl SlidingWindowLimiter {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner
             .hits
-            .get(&source_key(ip))
+            .get(&source_key(ip, self.v6_prefix))
             .is_some_and(|entry| self.live(entry, now) as u64 >= u64::from(self.max))
     }
 
@@ -149,7 +166,7 @@ impl SlidingWindowLimiter {
     /// the global budget still counts the failure.
     pub fn record(&self, ip: IpAddr) -> bool {
         let now = Instant::now();
-        let key = source_key(ip);
+        let key = source_key(ip, self.v6_prefix);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if now.duration_since(inner.last_sweep) >= self.window {
             let window = self.window;
@@ -187,7 +204,7 @@ impl SlidingWindowLimiter {
     #[cfg(test)]
     fn timestamps_for(&self, ip: IpAddr) -> usize {
         let inner = self.inner.lock().unwrap();
-        inner.hits.get(&source_key(ip)).map_or(0, VecDeque::len)
+        inner.hits.get(&source_key(ip, self.v6_prefix)).map_or(0, VecDeque::len)
     }
 }
 
@@ -548,6 +565,16 @@ mod tests {
         l.record(ip("2001:db8:1:2::1"));
         assert!(l.is_blocked(ip("2001:db8:1:2:ffff::9")), "same /64, same budget");
         assert!(!l.is_blocked(ip("2001:db8:1:3::1")), "another /64 is another source");
+    }
+
+    #[test]
+    fn a_limiter_may_count_ipv6_by_a_wider_prefix() {
+        let l = SlidingWindowLimiter::new(1, 60).with_v6_prefix(48);
+        l.record(ip("2001:db8:1:2::1"));
+        assert!(l.is_blocked(ip("2001:db8:1:ffff::9")), "same /48, same budget");
+        assert!(!l.is_blocked(ip("2001:db8:2::1")), "another /48 is another source");
+        l.record(ip("10.0.0.1"));
+        assert!(l.is_blocked(ip("10.0.0.1")) && !l.is_blocked(ip("10.0.0.2")), "IPv4 is by address still");
     }
 
     #[test]

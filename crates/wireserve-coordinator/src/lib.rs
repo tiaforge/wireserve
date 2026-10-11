@@ -62,10 +62,10 @@ pub fn build_state_with_dns(
             oidc::sign_in::REDEEM_BURST,
             oidc::sign_in::REDEEMS_PER_MIN,
         )),
-        sign_in_start_limiter: Arc::new(rate_limit::SlidingWindowLimiter::new(
-            oidc::sign_in::STARTS_PER_MIN,
-            60,
-        )),
+        sign_in_start_limiter: Arc::new(
+            rate_limit::SlidingWindowLimiter::new(oidc::sign_in::STARTS_PER_MIN, 60)
+                .with_v6_prefix(oidc::sign_in::STARTS_V6_PREFIX),
+        ),
         transit: Arc::new(transit::TransitState::default()),
         oidc: config.oidc.clone().map(|c| Arc::new(oidc::Oidc::new(c))),
         released: Arc::default(),

@@ -4869,3 +4869,36 @@ polls.
     that poll reads it.
     Test: with a poll in between to read the rules, the declaring poll's own
     access already has the service closed.
+
+323. **A node's unapproved service named the owners of the devices that
+    called it.** `tls_ready` took any service its node owned, pending ones
+    included, and `DirectoryContext::terminates` did not ask whether the
+    service was approved. A node that declared a service on 443, called it
+    ready and listed devices in `callers_seen` was told their owners'
+    subjects, verified e-mail addresses and groups — every owner, with the
+    default `everyone -> default` grant — while approval was still required
+    and no admin had approved anything. An honest agent never reports a
+    pending service ready (`/tls/challenge` refuses it a certificate), so
+    only a node that lies could. `terminates` now requires the service to be
+    approved (security audit 2026-10-11).
+    Test: a pending service called ready with a device seen names nobody;
+    approved, the same poll names the device's owner.
+
+324. **Anyone could stop every sign-in to a service.** The coordinator kept
+    each sign-in under way in memory, 1,024 at most, pushing out the oldest:
+    starting them from enough addresses — a /56 of IPv6 is 256 of them at 20
+    a minute each — made everyone else's sign-in start over before they had
+    finished at the identity provider. And the per-address limit on starts
+    turns new addresses away once it tracks 65,536, which one routed /48
+    (a /64 each) filled. Now a sign-in's flow (what the provider's return
+    must match, and where it goes on to) is sealed into a cookie of its own,
+    `wireserve-sign-in`, with the token key, so the coordinator keeps
+    nothing for it; and starts are counted per IPv6 /48. A claim keeps its
+    flow in memory as before: each needs an admin's link. The callback tells
+    the two apart by the state the provider returned, so a claim and a
+    sign-in now also run side by side in one browser, which the one shared
+    flow cookie did not allow (security audit 2026-10-11).
+    Tests: a sign-in under way survives 1,100 started from 55 other /48s; a
+    flow cookie from another browser, altered, or sealed for something else
+    does not come back; a claim and a sign-in in one browser both finish;
+    the limiter counts by the prefix it is given.

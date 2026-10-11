@@ -494,18 +494,25 @@ async fn grafana(app: &App) -> (String, String, wireserve_types::session::Verify
 const BIND: &str = "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1";
 
 async fn sign_in_as(app: &App, idp: &Shared, sub: &str, groups: &[&str]) -> (axum::response::Response, Vec<String>) {
+    let (flow, callback) = start_sign_in(app, idp, sub, groups).await;
+    let resp = call(&app.router, "GET", &callback, Some(&flow), None).await;
+    let cookies = resp.headers().get_all(header::SET_COOKIE).iter().map(|v| v.to_str().unwrap().split(';').next().unwrap().to_string()).collect();
+    (resp, cookies)
+}
+
+/// A browser sent to sign in to grafana, and the provider ready to sign
+/// `sub` in: the flow cookie, and the callback the provider would send the
+/// browser back to.
+async fn start_sign_in(app: &App, idp: &Shared, sub: &str, groups: &[&str]) -> (String, String) {
     let resp = call(&app.router, "GET", &format!("/sign-in?service=grafana.int.test&to=%2Fd%3Fx%3D1&bind={BIND}"), None, None).await;
     assert_eq!(resp.status(), StatusCode::FOUND, "{}", text(resp).await);
     let location = resp.headers()[header::LOCATION].to_str().unwrap().to_string();
     let flow = resp.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_string();
     assert_eq!(query(&location, "redirect_uri"), "http://mesh.test/oidc/callback", "the one callback, shared with claims");
-    let code = format!("code-{sub}-{}", groups.join("-"));
+    let code = format!("code-{sub}-{}-{}", groups.join("-"), query(&location, "state"));
     let entry = (query(&location, "nonce"), query(&location, "code_challenge"), sub.to_string(), groups.iter().map(|g| (*g).to_string()).collect());
     idp.lock().unwrap().codes.insert(code.clone(), entry);
-    let callback = format!("/oidc/callback?code={code}&state={}", query(&location, "state"));
-    let resp = call(&app.router, "GET", &callback, Some(&flow), None).await;
-    let cookies = resp.headers().get_all(header::SET_COOKIE).iter().map(|v| v.to_str().unwrap().split(';').next().unwrap().to_string()).collect();
-    (resp, cookies)
+    (flow, format!("/oidc/callback?code={code}&state={}", query(&location, "state")))
 }
 
 fn ticket_of(resp: &axum::response::Response) -> String {
@@ -685,4 +692,71 @@ async fn only_the_coordinators_own_page_signs_a_browser_out() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(resp.headers()[header::SET_COOKIE].to_str().unwrap().contains("Max-Age=0"));
     assert!(!live().await, "the button did");
+}
+
+#[tokio::test]
+async fn a_sign_in_under_way_outlasts_any_number_started_elsewhere() {
+    // Security audit 2026-10-11: the coordinator kept 1,024 sign-ins under
+    // way and pushed out the oldest, so starting them from enough addresses
+    // made everyone else's start over. It keeps none now.
+    let idp = start_idp().await;
+    let issuer = idp.lock().unwrap().issuer.clone();
+    let app = signing_app(&issuer);
+    grafana(&app).await;
+    let (flow, callback) = start_sign_in(&app, &idp, "alice", &["family"]).await;
+    for i in 0..1100u32 {
+        let from = format!("2001:db8:{:x}::1", i / 20 + 1);
+        let req = || {
+            let mut r = Request::builder().uri(format!("/sign-in?service=grafana.int.test&bind={BIND}")).body(Body::empty()).unwrap();
+            r.extensions_mut().insert(ConnectInfo(SocketAddr::new(from.parse().unwrap(), 1234)));
+            r
+        };
+        assert_eq!(app.router.clone().oneshot(req()).await.unwrap().status(), StatusCode::FOUND, "start {i}");
+    }
+    let resp = call(&app.router, "GET", &callback, Some(&flow), None).await;
+    ticket_of(&resp);
+    assert!(
+        resp.headers().get_all(header::SET_COOKIE).iter().any(|c| c.to_str().unwrap().starts_with("wireserve-sign-in=; ")),
+        "the flow is forgotten once back"
+    );
+}
+
+#[tokio::test]
+async fn a_sign_in_comes_back_only_with_its_own_untouched_cookie() {
+    let idp = start_idp().await;
+    let issuer = idp.lock().unwrap().issuer.clone();
+    let app = signing_app(&issuer);
+    grafana(&app).await;
+    let (flow, callback) = start_sign_in(&app, &idp, "alice", &["family"]).await;
+    let (other_flow, _) = start_sign_in(&app, &idp, "mallory", &["family"]).await;
+
+    // Another browser's flow, or this one's altered, is no flow at all.
+    assert_eq!(call(&app.router, "GET", &callback, Some(&other_flow), None).await.status(), StatusCode::BAD_REQUEST);
+    let (name, value) = flow.split_once('=').unwrap();
+    let flipped = if value.starts_with('A') { "B" } else { "A" };
+    let altered = format!("{name}={flipped}{}", &value[1..]);
+    assert_eq!(call(&app.router, "GET", &callback, Some(&altered), None).await.status(), StatusCode::BAD_REQUEST);
+    // A sealed owner's token is not a flow either.
+    let foreign = format!("{name}={}", app.state.oidc.as_ref().unwrap().seal(1, "{}"));
+    assert_eq!(call(&app.router, "GET", &callback, Some(&foreign), None).await.status(), StatusCode::BAD_REQUEST);
+
+    assert_eq!(call(&app.router, "GET", &callback, Some(&flow), None).await.status(), StatusCode::FOUND);
+}
+
+#[tokio::test]
+async fn a_claim_and_a_sign_in_run_side_by_side_in_one_browser() {
+    let idp = start_idp().await;
+    let issuer = idp.lock().unwrap().issuer.clone();
+    let app = signing_app(&issuer);
+    grafana(&app).await;
+    call(&app.router, "POST", "/admin/nodes", None, None).await;
+    let (claim_cookie, claim_callback) = signed_in(&app, &idp, "alice", &["family"]).await;
+    let (flow, callback) = start_sign_in(&app, &idp, "alice", &["family"]).await;
+    let both = format!("{claim_cookie}; {flow}");
+
+    let resp = call(&app.router, "GET", &callback, Some(&both), None).await;
+    ticket_of(&resp);
+    let resp = call(&app.router, "GET", &claim_callback, Some(&both), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(text(resp).await.contains("Yes, this is my device"));
 }

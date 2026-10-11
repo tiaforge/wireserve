@@ -4,7 +4,8 @@
 //!    previewer opening it must not spend it), and a sign-in started: its
 //!    state lives in memory, tied to this browser by a cookie.
 //! 2. `GET /oidc/callback` — back from the identity provider (shared with
-//!    the sign-in, PLAN.md M48, which the flow says it is for). The state
+//!    the sign-in, PLAN.md M48, whose flow is in a cookie of its own; the
+//!    state the provider returns says which came back). The state
 //!    must match the cookie's, the code is exchanged, the ID token checked,
 //!    and the person is asked: "make this node yours?", naming the node,
 //!    its tags and its current owner.
@@ -32,36 +33,26 @@ const FLOW_TTL: Duration = Duration::from_secs(600);
 
 /// At most this many claims in progress. Each one needs a valid link, so
 /// this only bounds what someone holding one can make the process keep.
+/// (A sign-in to a service, which anyone can start, keeps nothing here: its
+/// flow is in the browser's cookie, see `sign_in::returning`.)
 const MAX_CLAIM_FLOWS: usize = 256;
-
-/// At most this many sign-ins to services in progress. Anyone can start one
-/// (PLAN.md #312), so when they are all taken the oldest goes, rather than
-/// every new one being refused — a flood started from many addresses can
-/// make a sign-in start over, never stop them all, and never touches a
-/// claim's.
-const MAX_SIGN_IN_FLOWS: usize = 1024;
 
 /// The prefix of a claim link's code.
 pub const CODE_PREFIX: &str = "clm_";
 
-/// A sign-in at the identity provider in progress: for a claim link, or for
-/// signing in to a service (PLAN.md M48).
+/// A claim's sign-in at the identity provider, in progress.
 pub struct Flow {
-    pub(super) purpose: Purpose,
-    pub(super) started: Instant,
-    pub(super) pending: Option<Pending>,
+    node_id: i64,
+    code_hash: String,
+    started: Instant,
+    pending: Option<Pending>,
     /// Signed in, awaiting "yes": who, and the token the answer must carry.
     signed_in: Option<(Identity, String)>,
 }
 
-pub(super) enum Purpose {
-    Claim { node_id: i64, code_hash: String },
-    SignIn { fqdn: String, to: String, bind: String },
-}
-
 impl Flow {
-    pub(super) fn new(purpose: Purpose, pending: Pending) -> Self {
-        Self { purpose, started: Instant::now(), pending: Some(pending), signed_in: None }
+    fn new(node_id: i64, code_hash: String, pending: Pending) -> Self {
+        Self { node_id, code_hash, started: Instant::now(), pending: Some(pending), signed_in: None }
     }
 }
 
@@ -105,32 +96,24 @@ fn flow_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
     named_cookie(state, FLOW_COOKIE, headers)
 }
 
-/// Remembers a flow, tied to the browser by the returned cookie value.
-/// `None` when too many claims are in progress; a sign-in takes the oldest
-/// sign-in's place instead.
-pub(super) fn remember(oidc: &super::Oidc, flow: Flow) -> Option<String> {
+/// Remembers a claim's flow, tied to the browser by the returned cookie
+/// value. `None` when too many claims are in progress.
+fn remember(oidc: &super::Oidc, flow: Flow) -> Option<String> {
     let id = crate::tokengen::generate("");
     let mut flows = oidc.flows.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     flows.retain(|_, f| f.started.elapsed() < FLOW_TTL);
-    let signing_in = matches!(flow.purpose, Purpose::SignIn { .. });
-    let of_kind = |f: &Flow| matches!(f.purpose, Purpose::SignIn { .. }) == signing_in;
-    if flows.values().filter(|f| of_kind(f)).count() >= if signing_in { MAX_SIGN_IN_FLOWS } else { MAX_CLAIM_FLOWS } {
-        if !signing_in {
-            return None;
-        }
-        let oldest = flows.iter().filter(|(_, f)| of_kind(f)).min_by_key(|(_, f)| f.started).map(|(k, _)| k.clone());
-        if let Some(oldest) = oldest {
-            flows.remove(&oldest);
-        }
+    if flows.len() >= MAX_CLAIM_FLOWS {
+        return None;
     }
     flows.insert(id.clone(), flow);
     Some(id)
 }
 
-/// A 302 to the identity provider, setting the flow's cookie.
-pub(super) fn to_provider(state: &AppState, url: String, flow_id: &str) -> Response {
+/// A 302 to the identity provider, setting the flow's cookie (`cookie`, a
+/// whole `Set-Cookie` value).
+pub(super) fn to_provider(url: String, cookie: &str) -> Response {
     let mut resp = (StatusCode::FOUND, [(header::LOCATION, url)]).into_response();
-    if let Ok(v) = set_cookie(state, flow_id, FLOW_TTL.as_secs()).parse() {
+    if let Ok(v) = cookie.parse() {
         resp.headers_mut().insert(header::SET_COOKIE, v);
     }
     resp.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
@@ -186,11 +169,11 @@ pub async fn start(
             return pages::problem(StatusCode::BAD_GATEWAY, "The sign-in cannot be reached right now. Try again shortly.");
         }
     };
-    let Some(id) = remember(&oidc, Flow::new(Purpose::Claim { node_id: node.id, code_hash }, pending)) else {
+    let Some(id) = remember(&oidc, Flow::new(node.id, code_hash, pending)) else {
         return pages::problem(StatusCode::SERVICE_UNAVAILABLE, "Too many sign-ins at once. Try again in a few minutes.");
     };
     tracing::info!(event = "claim_started", node_name = %node.name, client_ip = %client_ip);
-    to_provider(&state, url, &id)
+    to_provider(url, &set_cookie(&state, &id, FLOW_TTL.as_secs()))
 }
 
 #[derive(Deserialize)]
@@ -201,33 +184,44 @@ pub struct CallbackQuery {
 }
 
 /// `GET /oidc/callback`: back from the identity provider, for a claim or a
-/// sign-in to a service — whichever the browser's flow is for.
+/// sign-in to a service — whichever the state it returned belongs to.
 pub async fn callback(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<CallbackQuery>) -> Response {
     let Some(oidc) = state.oidc.clone() else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // A sign-in to a service (PLAN.md M48): its flow is the browser's own
+    // cookie, gone whatever happens next — a sign-in answers once, and the
+    // provider would not take its code twice anyway.
+    if let Some(flow) = super::sign_in::returning(&state, &oidc, &headers, q.state.as_deref()) {
+        let cleared = [super::sign_in::clear_flow(&state)];
+        if let Some(error) = q.error {
+            let page = pages::problem(StatusCode::BAD_REQUEST, &format!("The sign-in did not finish ({error}). Start again to retry."));
+            return super::sign_in::with_cookies(page, &cleared);
+        }
+        let Some(code) = q.code else {
+            return super::sign_in::with_cookies(expired_flow(), &cleared);
+        };
+        return match oidc.finish(code, flow.pending).await {
+            Ok(identity) => super::sign_in::signed_in(&state, &oidc, identity, &flow.fqdn, &flow.to, &flow.bind).await,
+            Err(e) => {
+                tracing::warn!(error = %e, "sign-in at the identity provider failed");
+                let page = pages::problem(StatusCode::BAD_GATEWAY, &format!("The sign-in failed: {e}"));
+                super::sign_in::with_cookies(page, &cleared)
+            }
+        };
+    }
     let Some(id) = flow_id(&state, &headers) else {
         return expired_flow();
     };
-    // Taken out, whatever happens next: a sign-in answers once. A sign-in
-    // to a service has nothing left to ask, so its flow goes altogether.
+    // Taken out, whatever happens next: a sign-in answers once.
     let taken = {
         let mut flows = oidc.flows.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let live = flows.get(&id).is_some_and(|f| f.started.elapsed() < FLOW_TTL && f.pending.is_some());
-        match flows.get(&id).map(|f| &f.purpose) {
-            Some(Purpose::SignIn { .. }) if live => flows.remove(&id).and_then(|f| {
-                let Purpose::SignIn { fqdn, to, bind } = f.purpose else { unreachable!() };
-                Some((f.pending?, Err((fqdn, to, bind))))
-            }),
-            Some(Purpose::Claim { .. }) if live => flows.get_mut(&id).and_then(|f| {
-                let Purpose::Claim { node_id, code_hash } = &f.purpose else { unreachable!() };
-                let claim = Ok((*node_id, code_hash.clone()));
-                Some((f.pending.take()?, claim))
-            }),
-            _ => None,
-        }
+        flows
+            .get_mut(&id)
+            .filter(|f| f.started.elapsed() < FLOW_TTL)
+            .and_then(|f| Some((f.pending.take()?, f.node_id, f.code_hash.clone())))
     };
-    let Some((pending, purpose)) = taken else {
+    let Some((pending, node_id, code_hash)) = taken else {
         return expired_flow();
     };
     if let Some(error) = q.error {
@@ -246,10 +240,6 @@ pub async fn callback(State(state): State<AppState>, headers: HeaderMap, Query(q
             tracing::warn!(error = %e, "sign-in at the identity provider failed");
             return pages::problem(StatusCode::BAD_GATEWAY, &format!("The sign-in failed: {e}"));
         }
-    };
-    let (node_id, code_hash) = match purpose {
-        Ok(claim) => claim,
-        Err((fqdn, to, bind)) => return super::sign_in::signed_in(&state, &oidc, identity, &fqdn, &to, &bind).await,
     };
     let conn = state.db.conn.lock().await;
     let still_valid = owners::claim_node(&conn, &code_hash).ok().flatten() == Some(node_id);
@@ -289,7 +279,7 @@ pub async fn confirm(State(state): State<AppState>, headers: HeaderMap, Form(for
         });
         if ok { flows.remove(&id) } else { None }
     };
-    let Some(Flow { purpose: Purpose::Claim { node_id, code_hash }, signed_in: Some((identity, _)), .. }) = flow else {
+    let Some(Flow { node_id, code_hash, signed_in: Some((identity, _)), .. }) = flow else {
         return expired_flow();
     };
     let conn = state.db.conn.lock().await;
@@ -351,21 +341,12 @@ mod tests {
         }
     }
 
-    fn sign_in() -> Flow {
-        Flow::new(Purpose::SignIn { fqdn: "a.int.test".into(), to: "/".into(), bind: String::new() }, pending())
-    }
-
     #[test]
-    fn a_flood_of_sign_ins_pushes_out_the_oldest_and_never_a_claim() {
+    fn claims_in_progress_are_bounded() {
         let oidc = super::super::Oidc::new(super::super::test_config());
-        let claim = remember(&oidc, Flow::new(Purpose::Claim { node_id: 1, code_hash: "h".into() }, pending())).unwrap();
-        let first = remember(&oidc, sign_in()).unwrap();
-        for _ in 0..MAX_SIGN_IN_FLOWS {
-            assert!(remember(&oidc, sign_in()).is_some(), "a sign-in is never refused");
+        for _ in 0..MAX_CLAIM_FLOWS {
+            assert!(remember(&oidc, Flow::new(1, "h".into(), pending())).is_some());
         }
-        let flows = oidc.flows.lock().unwrap();
-        assert!(!flows.contains_key(&first), "the oldest went");
-        assert!(flows.contains_key(&claim), "the claim stayed");
-        assert_eq!(flows.len(), MAX_SIGN_IN_FLOWS + 1);
+        assert!(remember(&oidc, Flow::new(1, "h".into(), pending())).is_none());
     }
 }

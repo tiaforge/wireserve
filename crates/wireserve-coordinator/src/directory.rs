@@ -81,9 +81,15 @@ impl DirectoryContext<'_> {
     /// records, not on TCP 443, no address of its own, or its own node not
     /// vouching for it right now. A restricted service terminates like any
     /// other (PLAN.md M34, M36): the sign-in is in the terminator.
+    ///
+    /// Only an approved one: a pending service can never have a certificate
+    /// (`/tls/challenge` refuses it), so a node calling one ready is not
+    /// telling the truth — and a terminated service is what releases the
+    /// owners of the devices that call it (security audit 2026-10-11).
     #[must_use]
     pub fn terminates(&self, service: &ServiceRow) -> bool {
         self.dns
+            && service.is_approved()
             && service.vip4.is_some()
             && service.ports.iter()
                 .any(|m| m.public == wireserve_types::TLS_PUBLIC_PORT && m.proto == wireserve_types::Proto::Tcp)
