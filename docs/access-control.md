@@ -260,10 +260,13 @@ Worth knowing:
   fails (Bitwarden says "unexpected error"). The service's node logs
   `refused a request another site started`. A browser extension is not
   affected.
-- **A node learns who owns a device only when that device calls it.** The
-  identity headers name the owner of a calling device; the coordinator tells
-  a node an owner's subject, e-mail and groups only for a device the node
-  reports having seen. The first request from a device not seen in the last
-  day may reach the backend unnamed, for a second or two.
+- **A node learns who owns a device it says called it.** The identity
+  headers name the owner of a calling device; the coordinator tells a node
+  an owner's subject, e-mail and groups only for a device its grants let into
+  one of its approved services on 443, and that the node reports having
+  seen. The report is the node's word: one that lies can ask about each such
+  device, and each first answer is logged as `owner_identity_released`. The
+  first request from a device not seen in the last day may reach the backend
+  unnamed, for a second or two.
 - **A deleted node's address**, once given to a new node, keeps the old one's
   grants until the serving node's next poll.
