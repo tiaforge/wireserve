@@ -134,7 +134,8 @@ Worth knowing:
 - **Port 443 stays free on the node** for nginx, Caddy or Stalwart. The
   terminator really listens on port 11443, which systemd holds for it
   (`wireserve-tls.socket`), and the agent sends the mesh's 443 on service
-  addresses there. If 11443 is taken, pick another with
+  addresses there — and their 80 to 11080, its plain-HTTP port (always
+  363 below the TLS one). If 11443 is taken, pick another with
   `sudo wireserve install --tls-port <port>`; a second instance gets the
   next free port automatically.
 - **Let's Encrypt limits** — 5 failed validations per name per hour, 5

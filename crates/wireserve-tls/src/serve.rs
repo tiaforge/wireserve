@@ -47,11 +47,15 @@ pub type Callers = Arc<RwLock<HashMap<Ipv4Addr, CallerInfo>>>;
 pub type SharedSignIn = Arc<RwLock<Option<Arc<crate::sign_in::SignIn>>>>;
 
 /// How one service treats its requests.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Policy {
     /// The name this service is served under: the one its requests must
     /// name, and its sign-in cookies be made out to.
     pub fqdn: String,
+    /// Other hosts its requests may name: on plain HTTP (PLAN.md #328), the
+    /// service's address, typed as it is. None over TLS, where a request's
+    /// name is its certificate's.
+    pub aliases: Vec<String>,
     /// Who may in (PLAN.md M36).
     pub access: wireserve_types::ServiceAccess,
     /// Takes requests other sites start (PLAN.md #276,
@@ -78,6 +82,10 @@ pub struct Shared {
     /// Calling nodes, by name, whose `X-Forwarded-For` and
     /// `X-Forwarded-Host` are kept (`WIRESERVE_FORWARDING_NODES`, PLAN.md M43).
     pub forwarders: Arc<RwLock<Vec<String>>>,
+    /// The services answered in plain HTTP on their port 80 (PLAN.md #328),
+    /// by address, as `routes` and `policies` are for 443.
+    pub http_routes: Routes,
+    pub http_policies: Policies,
 }
 
 impl Shared {
@@ -92,6 +100,21 @@ impl Shared {
     pub fn unroute(&self, vip: Ipv4Addr) {
         self.routes.write().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&vip);
         self.policies.write().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&vip);
+    }
+
+    /// [`Self::unroute`], for `vip`'s plain HTTP.
+    pub fn unroute_http(&self, vip: Ipv4Addr) {
+        self.http_routes.write().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&vip);
+        self.http_policies.write().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&vip);
+    }
+
+    /// The routes and policies of one listener.
+    fn of(&self, http: bool) -> (&Routes, &Policies) {
+        if http {
+            (&self.http_routes, &self.http_policies)
+        } else {
+            (&self.routes, &self.policies)
+        }
     }
 }
 
@@ -415,14 +438,31 @@ impl Route {
 /// are closed unanswered.
 pub type Routes = Arc<RwLock<HashMap<Ipv4Addr, Arc<Route>>>>;
 
-/// The one listening socket (PLAN.md M35): the one systemd passed us when
-/// `wireserve-tls.socket` started this process — held by systemd across
-/// restarts, so no other local user can take the port in between — or,
-/// run outside systemd, `0.0.0.0:port` bound here.
+/// The TLS listening socket (PLAN.md M35): the first one systemd passed us
+/// when `wireserve-tls.socket` started this process — held by systemd
+/// across restarts, so no other local user can take the port in between —
+/// or, run outside systemd, `0.0.0.0:port` bound here.
 pub fn listener(port: u16) -> std::io::Result<TcpListener> {
+    listener_at(0, port)
+}
+
+/// The plain-HTTP listening socket (PLAN.md #328): the second one systemd
+/// passed, or `0.0.0.0:port` bound here outside systemd. `None` when systemd
+/// passed only one — a socket unit from before there was one — and port 80
+/// is then not answered here.
+pub fn http_listener(port: u16) -> std::io::Result<Option<TcpListener>> {
+    let fds = passed_fds(std::process::id(), std::env::var("LISTEN_PID").ok().as_deref(), std::env::var("LISTEN_FDS").ok().as_deref());
+    if fds == Some(1) {
+        return Ok(None);
+    }
+    listener_at(1, port).map(Some)
+}
+
+/// The `index`th socket systemd passed, or one bound to `port`.
+fn listener_at(index: u32, port: u16) -> std::io::Result<TcpListener> {
     use std::os::fd::FromRawFd;
     let pid = std::process::id();
-    let passed = listen_fd(pid, std::env::var("LISTEN_PID").ok().as_deref(), std::env::var("LISTEN_FDS").ok().as_deref());
+    let passed = listen_fd(pid, std::env::var("LISTEN_PID").ok().as_deref(), std::env::var("LISTEN_FDS").ok().as_deref(), index);
     // Left in the environment: the runtime's other threads may read it, and
     // a child could never mistake them for its own, `LISTEN_PID` being ours.
     let std_listener = match passed {
@@ -442,14 +482,20 @@ pub fn listener(port: u16) -> std::io::Result<TcpListener> {
     TcpListener::from_std(std_listener)
 }
 
-/// The descriptor systemd's socket activation passed this process, if it
-/// passed one: `LISTEN_PID` names us, and `LISTEN_FDS` counts at least
-/// one, starting at 3.
-fn listen_fd(pid: u32, listen_pid: Option<&str>, listen_fds: Option<&str>) -> Option<std::os::fd::RawFd> {
+/// The `index`th descriptor systemd's socket activation passed this
+/// process, if it passed that many: `LISTEN_PID` names us, and they count
+/// up from 3, in the order the socket unit lists them.
+fn listen_fd(pid: u32, listen_pid: Option<&str>, listen_fds: Option<&str>, index: u32) -> Option<std::os::fd::RawFd> {
     const SD_LISTEN_FDS_START: std::os::fd::RawFd = 3;
-    let for_us = listen_pid?.parse::<u32>().ok()? == pid;
-    let count = listen_fds?.parse::<u32>().ok()?;
-    (for_us && count >= 1).then_some(SD_LISTEN_FDS_START)
+    let count = passed_fds(pid, listen_pid, listen_fds)?;
+    (index < count).then(|| SD_LISTEN_FDS_START + std::os::fd::RawFd::try_from(index).unwrap_or(0))
+}
+
+/// How many descriptors systemd passed this process; `None` when it was
+/// not started by its socket.
+fn passed_fds(pid: u32, listen_pid: Option<&str>, listen_fds: Option<&str>) -> Option<u32> {
+    (listen_pid?.parse::<u32>().ok()? == pid).then_some(())?;
+    listen_fds?.parse::<u32>().ok().filter(|n| *n >= 1)
 }
 
 /// Accepts on `listener` until aborted, handing each connection to the
@@ -465,7 +511,24 @@ pub fn spawn(listener: TcpListener, tls: Arc<rustls::ServerConfig>, shared: Shar
 
 /// [`spawn`], with the connection limits given.
 pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, shared: Shared, limits: Limits) -> JoinHandle<()> {
-    let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+    accept(listener, Some(tokio_rustls::TlsAcceptor::from(tls)), shared, limits)
+}
+
+/// The plain-HTTP listener (PLAN.md #328): each service's port 80, answered
+/// by the same rules as its 443 but for the sign-in, which needs TLS to keep
+/// a session in.
+pub fn spawn_http(listener: TcpListener, shared: Shared) -> JoinHandle<()> {
+    spawn_http_with_limits(listener, shared, Limits::default())
+}
+
+/// [`spawn_http`], with the connection limits given.
+pub fn spawn_http_with_limits(listener: TcpListener, shared: Shared, limits: Limits) -> JoinHandle<()> {
+    accept(listener, None, shared, limits)
+}
+
+/// One listener's accept loop: TLS when `tls` is given, plain HTTP without.
+fn accept(listener: TcpListener, tls: Option<tokio_rustls::TlsAcceptor>, shared: Shared, limits: Limits) -> JoinHandle<()> {
+    let http = tls.is_none();
     let conns = Arc::new(Conns::default());
     let upgrade_slots = Arc::new(UpgradeSlots::default());
     tokio::spawn(async move {
@@ -479,13 +542,13 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                     continue;
                 }
             };
-            // The address the agent rewrote 443 to this port on. Anything
-            // else — the host's own addresses, a service no longer served
-            // — is nobody's to answer.
+            // The address the agent rewrote 443 (or 80) to this port on.
+            // Anything else — the host's own addresses, a service no longer
+            // served — is nobody's to answer.
             let Some(vip) = tcp.local_addr().ok().and_then(|a| local_v4(a.ip())) else {
                 continue;
             };
-            let route = shared.routes.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(&vip).cloned();
+            let route = read(shared.of(http).0).get(&vip).cloned();
             let Some(route) = route else {
                 continue;
             };
@@ -517,146 +580,180 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                 .with_interval(Duration::from_secs(15))
                 .with_retries(4);
             let _ = socket2::SockRef::from(&tcp).set_tcp_keepalive(&keepalive);
-            let acceptor = acceptor.clone();
-            let upgrade_slots = Arc::clone(&upgrade_slots);
-            let shared = shared.clone();
-            let limits = limits.clone();
+            let conn = Conn { shared: shared.clone(), limits: limits.clone(), upgrade_slots: Arc::clone(&upgrade_slots), vip, peer, route, http };
+            let tls = tls.clone();
             tokio::spawn(async move {
-                let Ok(Ok(tls)) = tokio::time::timeout(limits.handshake, acceptor.accept(tcp)).await else {
-                    return;
-                };
-                let stats = Arc::new(ConnStats::default());
-                let watched = Watched::new(tls, Arc::clone(&stats), permit, &limits);
-                let caller_addr = local_v4(peer.ip());
-                let service = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
-                    let in_flight = InFlight::begin(&stats);
-                    let stats = Arc::clone(&stats);
-                    let policy = read(&shared.policies).get(&vip).cloned();
-                    let caller = caller_addr.and_then(|a| read(&shared.callers).get(&a).cloned());
-                    let sign_in = read(&shared.sign_in).clone();
-                    let identity = read(&shared.identity).clone();
-                    let strip = read(&shared.strip).clone();
-                    let forwarder = shared.forwarding_node(peer.ip()).is_some();
-                    let misdirected = policy.as_ref().is_some_and(|p| !for_this_service(&req, &p.fqdn));
-                    if misdirected {
-                        tracing::info!(
-                            service = policy.as_ref().map(|p| p.fqdn.as_str()).unwrap_or_default(),
-                            authority = req.uri().authority().map(|a| a.as_str()).unwrap_or_default(),
-                            host = ?req.headers().get(axum::http::header::HOST),
-                            version = ?req.version(),
-                            "misdirected request: it names another host"
-                        );
-                    }
-                    let router = route.router.clone();
-                    let (upstream, recheck) = (route.upstream, limits.recheck);
-                    let max_upgrades = limits.max_upgrades_per_forwarded_client;
-                    let upgrade_slots = Arc::clone(&upgrade_slots);
-                    let upgrade = crate::upgrade::wanted(&req);
-                    // Anything else asking to switch goes on as a plain
-                    // request (PLAN.md #271).
-                    if !upgrade {
-                        crate::upgrade::ignore(req.headers_mut());
-                    }
-                    prepare(req.headers_mut(), caller.as_ref().map(|c| c.node.as_str()), forwarder, &strip);
-                    req.extensions_mut().insert(ConnectInfo(peer));
-                    let shared = shared.clone();
-                    async move {
-                        let _in_flight = in_flight;
-                        let Some(policy) = policy else {
-                            return Ok(crate::sign_in::plain(
-                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                                "this service is no longer served here",
-                            ));
+                match tls {
+                    Some(acceptor) => {
+                        let Ok(Ok(tls)) = tokio::time::timeout(conn.limits.handshake, acceptor.accept(tcp)).await else {
+                            return;
                         };
-                        if misdirected {
-                            return Ok(crate::sign_in::plain(
-                                axum::http::StatusCode::MISDIRECTED_REQUEST,
-                                "this address serves another name",
-                            ));
-                        }
-                        // A page on another site may not act here as the
-                        // device it runs on (PLAN.md #276).
-                        if !policy.cross_site && started_elsewhere(&req, &policy.fqdn, upgrade, forwarder) {
-                            tracing::info!(
-                                service = %policy.fqdn,
-                                peer = %peer.ip(),
-                                method = %req.method(),
-                                origin = ?req.headers().get(axum::http::header::ORIGIN),
-                                site = ?req.headers().get("sec-fetch-site"),
-                                "refused a request another site started"
-                            );
-                            return Ok(crate::sign_in::plain(
-                                axum::http::StatusCode::FORBIDDEN,
-                                "a page on another site may not do this here",
-                            ));
-                        }
-                        // The sign-in's own pages, on every service's name
-                        // (PLAN.md M48).
-                        if let Some(si) = sign_in.as_ref().filter(|_| crate::sign_in::is_own_path(req.uri().path())) {
-                            return Ok(if req.uri().path() == wireserve_types::session::CALLBACK_PATH {
-                                si.callback(req.uri(), req.headers(), &policy.fqdn, peer.ip()).await
-                            } else {
-                                si.sign_out(req.method(), req.headers(), &policy.fqdn).await
-                            });
-                        }
-                        let mut req = req.map(Body::new);
-                        // As the client asked, for asking again while it is open.
-                        let asked = upgrade.then(|| Arc::new(as_asked(&req)));
-                        let set_cookie = match guard(&mut req, sign_in.as_deref(), &policy, caller_addr, &identity).await {
-                            Err(denied) => return Ok(*denied),
-                            Ok(set_cookie) => set_cookie,
-                        };
-                        let answer = match asked {
-                                Some(asked) => {
-                                    // A forwarding node's client, by the address it
-                                    // vouched for — or, without one, the node's own.
-                                    let slot = if forwarder {
-                                        let client = req
-                                            .headers()
-                                            .get("x-forwarded-for")
-                                            .and_then(|v| v.to_str().ok())
-                                            .and_then(|v| v.parse::<IpAddr>().ok())
-                                            .unwrap_or(peer.ip());
-                                        let Some(slot) = upgrade_slots.acquire(client, max_upgrades) else {
-                                            tracing::info!(%client, "too many WebSockets open for one client of a forwarding node");
-                                            return Ok(crate::sign_in::plain(
-                                                axum::http::StatusCode::TOO_MANY_REQUESTS,
-                                                "too many connections open from your address",
-                                            ));
-                                        };
-                                        Some(slot)
-                                    } else {
-                                        None
-                                    };
-                                    let again = move || {
-                                        let (shared, asked) = (shared.clone(), Arc::clone(&asked));
-                                        async move { still_admitted(&shared, vip, caller_addr, &asked).await }
-                                    };
-                                    let answer = crate::upgrade::proxy(req, upstream, peer, recheck, again, slot).await;
-                                    if answer.status() == axum::http::StatusCode::SWITCHING_PROTOCOLS {
-                                        stats.upgraded.store(true, Ordering::Relaxed);
-                                    }
-                                    Ok(answer)
-                                }
-                                None => router.oneshot(req).await,
-                        };
-                        // A renewed session goes back to the browser with
-                        // whatever the backend answered.
-                        answer.map(|mut a| {
-                            if let Some(c) = set_cookie {
-                                a.headers_mut().append(axum::http::header::SET_COOKIE, c);
-                            }
-                            a
-                        })
+                        conn.serve(tls, permit).await;
                     }
-                });
-                let mut builder = auto::Builder::new(TokioExecutor::new());
-                builder.http1().timer(TokioTimer::new()).header_read_timeout(limits.header_read);
-                builder.http2().timer(TokioTimer::new()).keep_alive_interval(Some(Duration::from_secs(30))).keep_alive_timeout(Duration::from_secs(20));
-                let _ = builder.serve_connection_with_upgrades(TokioIo::new(watched), service).await;
+                    None => conn.serve(tcp, permit).await,
+                }
             });
         }
     })
+}
+
+/// One accepted connection, and what serving it needs.
+struct Conn {
+    shared: Shared,
+    limits: Limits,
+    upgrade_slots: Arc<UpgradeSlots>,
+    vip: Ipv4Addr,
+    peer: SocketAddr,
+    route: Arc<Route>,
+    /// The plain-HTTP listener's (PLAN.md #328): no sign-in.
+    http: bool,
+}
+
+impl Conn {
+    async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(self, io: S, permit: Permit) {
+        let Conn { shared, limits, upgrade_slots, vip, peer, route, http } = self;
+        let stats = Arc::new(ConnStats::default());
+        let watched = Watched::new(io, Arc::clone(&stats), permit, &limits);
+        let caller_addr = local_v4(peer.ip());
+        let scheme = if http { "http" } else { "https" };
+        let service = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
+            let in_flight = InFlight::begin(&stats);
+            let stats = Arc::clone(&stats);
+            let policy = read(shared.of(http).1).get(&vip).cloned();
+            let caller = caller_addr.and_then(|a| read(&shared.callers).get(&a).cloned());
+            // No sign-in without TLS: no session can be kept safe there.
+            let sign_in = if http { None } else { read(&shared.sign_in).clone() };
+            let identity = read(&shared.identity).clone();
+            let strip = read(&shared.strip).clone();
+            let forwarder = shared.forwarding_node(peer.ip()).is_some();
+            let misdirected = policy.as_ref().is_some_and(|p| !for_this_service(&req, &p.hosts()));
+            if misdirected {
+                tracing::info!(
+                    service = policy.as_ref().map(|p| p.fqdn.as_str()).unwrap_or_default(),
+                    authority = req.uri().authority().map(|a| a.as_str()).unwrap_or_default(),
+                    host = ?req.headers().get(axum::http::header::HOST),
+                    version = ?req.version(),
+                    "misdirected request: it names another host"
+                );
+            }
+            let router = route.router.clone();
+            let (upstream, recheck) = (route.upstream, limits.recheck);
+            let max_upgrades = limits.max_upgrades_per_forwarded_client;
+            let upgrade_slots = Arc::clone(&upgrade_slots);
+            let upgrade = crate::upgrade::wanted(&req);
+            // Anything else asking to switch goes on as a plain
+            // request (PLAN.md #271).
+            if !upgrade {
+                crate::upgrade::ignore(req.headers_mut());
+            }
+            prepare(req.headers_mut(), caller.as_ref().map(|c| c.node.as_str()), forwarder, &strip);
+            req.extensions_mut().insert(ConnectInfo(peer));
+            let shared = shared.clone();
+            async move {
+                let _in_flight = in_flight;
+                let Some(policy) = policy else {
+                    return Ok(crate::sign_in::plain(
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "this service is no longer served here",
+                    ));
+                };
+                if misdirected {
+                    return Ok(crate::sign_in::plain(
+                        axum::http::StatusCode::MISDIRECTED_REQUEST,
+                        "this address serves another name",
+                    ));
+                }
+                // A page on another site may not act here as the
+                // device it runs on (PLAN.md #276).
+                if !policy.cross_site && started_elsewhere(&req, &policy.hosts(), scheme, upgrade, forwarder) {
+                    tracing::info!(
+                        service = %policy.fqdn,
+                        peer = %peer.ip(),
+                        method = %req.method(),
+                        origin = ?req.headers().get(axum::http::header::ORIGIN),
+                        site = ?req.headers().get("sec-fetch-site"),
+                        "refused a request another site started"
+                    );
+                    return Ok(crate::sign_in::plain(
+                        axum::http::StatusCode::FORBIDDEN,
+                        "a page on another site may not do this here",
+                    ));
+                }
+                // The sign-in's own pages, on every service's name
+                // (PLAN.md M48).
+                if let Some(si) = sign_in.as_ref().filter(|_| crate::sign_in::is_own_path(req.uri().path())) {
+                    return Ok(if req.uri().path() == wireserve_types::session::CALLBACK_PATH {
+                        si.callback(req.uri(), req.headers(), &policy.fqdn, peer.ip()).await
+                    } else {
+                        si.sign_out(req.method(), req.headers(), &policy.fqdn).await
+                    });
+                }
+                let mut req = req.map(Body::new);
+                // As the client asked, for asking again while it is open.
+                let asked = upgrade.then(|| Arc::new(as_asked(&req)));
+                let set_cookie = match guard(&mut req, sign_in.as_deref(), &policy, caller_addr, &identity).await {
+                    Err(denied) => return Ok(*denied),
+                    Ok(set_cookie) => set_cookie,
+                };
+                let answer = match asked {
+                    Some(asked) => {
+                        // A forwarding node's client, by the address it
+                        // vouched for — or, without one, the node's own.
+                        let slot = if forwarder {
+                            let client = req
+                                .headers()
+                                .get("x-forwarded-for")
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|v| v.parse::<IpAddr>().ok())
+                                .unwrap_or(peer.ip());
+                            let Some(slot) = upgrade_slots.acquire(client, max_upgrades) else {
+                                tracing::info!(%client, "too many WebSockets open for one client of a forwarding node");
+                                return Ok(crate::sign_in::plain(
+                                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                                    "too many connections open from your address",
+                                ));
+                            };
+                            Some(slot)
+                        } else {
+                            None
+                        };
+                        let again = move || {
+                            let (shared, asked) = (shared.clone(), Arc::clone(&asked));
+                            async move { still_admitted(&shared, http, vip, caller_addr, &asked).await }
+                        };
+                        let answer = crate::upgrade::proxy(req, upstream, peer, recheck, again, slot).await;
+                        if answer.status() == axum::http::StatusCode::SWITCHING_PROTOCOLS {
+                            stats.upgraded.store(true, Ordering::Relaxed);
+                        }
+                        Ok(answer)
+                    }
+                    None => router.oneshot(req).await,
+                };
+                // A renewed session goes back to the browser with
+                // whatever the backend answered.
+                answer.map(|mut a| {
+                    if let Some(c) = set_cookie {
+                        a.headers_mut().append(axum::http::header::SET_COOKIE, c);
+                    }
+                    a
+                })
+            }
+        });
+        let mut builder = auto::Builder::new(TokioExecutor::new());
+        builder.http1().timer(TokioTimer::new()).header_read_timeout(limits.header_read);
+        builder.http2().timer(TokioTimer::new()).keep_alive_interval(Some(Duration::from_secs(30))).keep_alive_timeout(Duration::from_secs(20));
+        // Plain HTTP is HTTP/1 — browsers speak HTTP/2 only over TLS — and
+        // what tries cleartext HTTP/2 here is not one.
+        let builder = if http { builder.http1_only() } else { builder };
+        let _ = builder.serve_connection_with_upgrades(TokioIo::new(watched), service).await;
+    }
+}
+
+impl Policy {
+    /// Every host a request may name.
+    fn hosts(&self) -> Vec<&str> {
+        std::iter::once(self.fqdn.as_str()).chain(self.aliases.iter().map(String::as_str)).collect()
+    }
 }
 
 /// A request's method, target, version and headers, without its body.
@@ -674,17 +771,18 @@ fn as_asked<B>(req: &Request<B>) -> Request<()> {
 /// under the name it asked for, and `guard` still letting it through. A
 /// sign-in that cannot be renewed right now closes nothing — its trouble is
 /// not the caller's; a refusal does.
-async fn still_admitted(shared: &Shared, vip: Ipv4Addr, caller_addr: Option<Ipv4Addr>, asked: &Request<()>) -> bool {
-    if read(&shared.routes).get(&vip).is_none() {
+async fn still_admitted(shared: &Shared, http: bool, vip: Ipv4Addr, caller_addr: Option<Ipv4Addr>, asked: &Request<()>) -> bool {
+    let (routes, policies) = shared.of(http);
+    if read(routes).get(&vip).is_none() {
         return false;
     }
-    let Some(policy) = read(&shared.policies).get(&vip).cloned() else {
+    let Some(policy) = read(policies).get(&vip).cloned() else {
         return false;
     };
-    if !for_this_service(asked, &policy.fqdn) {
+    if !for_this_service(asked, &policy.hosts()) {
         return false;
     }
-    let sign_in = read(&shared.sign_in).clone();
+    let sign_in = if http { None } else { read(&shared.sign_in).clone() };
     let identity = read(&shared.identity).clone();
     let mut req = as_asked(asked).map(|()| Body::empty());
     match guard(&mut req, sign_in.as_deref(), &policy, caller_addr, &identity).await {
@@ -709,10 +807,10 @@ fn local_v4(ip: std::net::IpAddr) -> Option<Ipv4Addr> {
 /// its `Host` and, over HTTP/2 or in absolute form, its authority. The
 /// routing is by address; a request naming another host would otherwise
 /// reach this backend — and the sign-in — under a name it does not have.
-fn for_this_service<B>(req: &Request<B>, fqdn: &str) -> bool {
+fn for_this_service<B>(req: &Request<B>, hosts: &[&str]) -> bool {
     let same = |host: &str| {
         let host = host.strip_suffix('.').unwrap_or(host);
-        host.eq_ignore_ascii_case(fqdn)
+        hosts.iter().any(|h| host.eq_ignore_ascii_case(h))
     };
     let authority = req.uri().host();
     let header = match req.headers().get(axum::http::header::HOST) {
@@ -864,15 +962,17 @@ fn is_untrusted(name: &str, forwarder: bool, extra: &[String]) -> bool {
 /// browsers are on the public name it was asked for — the
 /// `X-Forwarded-Host` it vouched for, which `prepare` kept only then — so
 /// that name's pages are the service's own too.
-fn started_elsewhere<B>(req: &Request<B>, fqdn: &str, websocket: bool, forwarder: bool) -> bool {
+fn started_elsewhere<B>(req: &Request<B>, hosts: &[&str], scheme: &str, websocket: bool, forwarder: bool) -> bool {
     use axum::http::Method;
     let headers = req.headers();
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(|v| v.trim().to_ascii_lowercase());
     let public = header("x-forwarded-host").filter(|_| forwarder);
     let own_origin = |origin: &str| {
-        origin
-            .strip_prefix("https://")
-            .is_some_and(|host| host.eq_ignore_ascii_case(fqdn) || public.as_deref().is_some_and(|p| host.eq_ignore_ascii_case(p)))
+        let ours = origin
+            .strip_prefix(scheme)
+            .and_then(|rest| rest.strip_prefix("://"))
+            .is_some_and(|host| hosts.iter().any(|h| host.eq_ignore_ascii_case(h)));
+        ours || origin.strip_prefix("https://").is_some_and(|host| public.as_deref().is_some_and(|p| host.eq_ignore_ascii_case(p)))
     };
     let origin = header("origin");
     let elsewhere = match header("sec-fetch-site").as_deref() {
@@ -1038,7 +1138,7 @@ mod tests {
     }
 
     fn open(fqdn: &str) -> Policy {
-        Policy { fqdn: fqdn.into(), access: wireserve_types::ServiceAccess { open: true, ..Default::default() }, cross_site: false }
+        Policy { fqdn: fqdn.into(), access: wireserve_types::ServiceAccess { open: true, ..Default::default() }, cross_site: false, aliases: vec![] }
     }
 
     /// Reached by 10.9.0.2 alone; anyone else may sign in with `family`.
@@ -1052,6 +1152,7 @@ mod tests {
                 ..Default::default()
             },
             cross_site: false,
+            aliases: vec![],
         }
     }
 
@@ -1167,12 +1268,15 @@ mod tests {
 
     #[test]
     fn only_a_socket_passed_to_this_very_process_is_taken() {
-        assert_eq!(listen_fd(42, Some("42"), Some("1")), Some(3));
-        assert_eq!(listen_fd(42, Some("41"), Some("1")), None, "meant for another process");
-        assert_eq!(listen_fd(42, Some("42"), Some("0")), None);
-        assert_eq!(listen_fd(42, None, Some("1")), None);
-        assert_eq!(listen_fd(42, Some("42"), None), None);
-        assert_eq!(listen_fd(42, Some("x"), Some("1")), None);
+        assert_eq!(listen_fd(42, Some("42"), Some("1"), 0), Some(3));
+        assert_eq!(listen_fd(42, Some("41"), Some("1"), 0), None, "meant for another process");
+        assert_eq!(listen_fd(42, Some("42"), Some("0"), 0), None);
+        assert_eq!(listen_fd(42, None, Some("1"), 0), None);
+        assert_eq!(listen_fd(42, Some("42"), None, 0), None);
+        assert_eq!(listen_fd(42, Some("x"), Some("1"), 0), None);
+        // The plain-HTTP socket is the second (PLAN.md #328).
+        assert_eq!(listen_fd(42, Some("42"), Some("2"), 1), Some(4));
+        assert_eq!(listen_fd(42, Some("42"), Some("1"), 1), None, "a socket unit from before it");
     }
 
     #[tokio::test]
@@ -1232,7 +1336,7 @@ mod tests {
         let mut buf = vec![0u8; 4096];
         let n = tls.read(&mut buf).await.unwrap();
         assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
-        let closed = Policy { fqdn: "svc.test".into(), access: wireserve_types::ServiceAccess::default(), cross_site: false };
+        let closed = Policy { fqdn: "svc.test".into(), access: wireserve_types::ServiceAccess::default(), cross_site: false, aliases: vec![] };
         shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(closed));
         tls.write_all(get).await.unwrap();
         let n = tls.read(&mut buf).await.unwrap();
@@ -1251,18 +1355,18 @@ mod tests {
             b.body(()).unwrap()
         };
         let fqdn = "jellyfin.int.test";
-        assert!(for_this_service(&req("/", Some("jellyfin.int.test")), fqdn));
-        assert!(for_this_service(&req("/", Some("Jellyfin.INT.test:443")), fqdn));
-        assert!(for_this_service(&req("/", Some("jellyfin.int.test.")), fqdn));
-        assert!(for_this_service(&req("https://jellyfin.int.test/x", None), fqdn), "HTTP/2's authority");
-        assert!(!for_this_service(&req("/", Some("grafana.int.test")), fqdn));
-        assert!(!for_this_service(&req("/", Some("jellyfin.int.test.evil")), fqdn));
-        assert!(!for_this_service(&req("/", None), fqdn), "no name at all");
+        assert!(for_this_service(&req("/", Some("jellyfin.int.test")), &[fqdn]));
+        assert!(for_this_service(&req("/", Some("Jellyfin.INT.test:443")), &[fqdn]));
+        assert!(for_this_service(&req("/", Some("jellyfin.int.test.")), &[fqdn]));
+        assert!(for_this_service(&req("https://jellyfin.int.test/x", None), &[fqdn]), "HTTP/2's authority");
+        assert!(!for_this_service(&req("/", Some("grafana.int.test")), &[fqdn]));
+        assert!(!for_this_service(&req("/", Some("jellyfin.int.test.evil")), &[fqdn]));
+        assert!(!for_this_service(&req("/", None), &[fqdn]), "no name at all");
         assert!(
-            !for_this_service(&req("https://jellyfin.int.test/", Some("grafana.int.test")), fqdn),
+            !for_this_service(&req("https://jellyfin.int.test/", Some("grafana.int.test")), &[fqdn]),
             "authority and Host disagreeing"
         );
-        assert!(!for_this_service(&req("https://grafana.int.test/", Some("jellyfin.int.test")), fqdn));
+        assert!(!for_this_service(&req("https://grafana.int.test/", Some("jellyfin.int.test")), &[fqdn]));
     }
 
     #[test]
@@ -1565,6 +1669,78 @@ mod tests {
         (port, client, shared)
     }
 
+    /// The plain-HTTP listener (PLAN.md #328) for `svc.wg` on 127.0.0.1, in
+    /// front of `upstream`: its port, and what it reads.
+    fn http_in_front_of(upstream: SocketAddr, policy: Policy) -> (u16, Shared) {
+        let listener = listener(0).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shared = Shared::default();
+        shared.http_routes.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(Route::new(upstream)));
+        shared.http_policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(policy));
+        spawn_http_with_limits(listener, shared.clone(), quick());
+        (port, shared)
+    }
+
+    /// One plain-HTTP request, written as given; the whole answer.
+    async fn plain_http(port: u16, request: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        c.write_all(request.as_bytes()).await.unwrap();
+        let mut answer = String::new();
+        let _ = c.read_to_string(&mut answer).await;
+        answer
+    }
+
+    #[tokio::test]
+    async fn port_80_answers_only_its_own_names_and_pages_and_never_signs_anyone_in() {
+        let own = Policy {
+            fqdn: "svc.wg".into(),
+            aliases: vec!["127.0.0.1".into()],
+            access: wireserve_types::ServiceAccess { open: true, ..Default::default() },
+            cross_site: false,
+        };
+        let (port, shared) = http_in_front_of(header_echo().await, own);
+        let get = |host: &str, extra: &str| format!("GET / HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\n{extra}\r\n");
+
+        let answer = plain_http(port, &get("svc.wg", "x-auth-user: mallory\r\nx-forwarded-for: 10.0.0.1\r\n")).await;
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(answer.contains("\nx-forwarded-for=127.0.0.1\n"), "the caller, not what it claimed: {answer}");
+        assert!(!answer.contains("mallory") && !answer.contains("10.0.0.1"), "{answer}");
+        assert!(plain_http(port, &get("127.0.0.1", "")).await.starts_with("HTTP/1.1 200"), "its address, typed as it is");
+
+        // DNS rebinding: someone's name pointed at the address.
+        let answer = plain_http(port, &get("evil.example", "")).await;
+        assert!(answer.starts_with("HTTP/1.1 421"), "{answer}");
+        assert!(!answer.contains("host=evil.example"), "no backend saw it: {answer}");
+
+        // A page on another site may not act here; the service's own may.
+        let post = |origin: &str, site: &str| {
+            format!("POST / HTTP/1.1\r\nhost: svc.wg\r\norigin: {origin}\r\nsec-fetch-site: {site}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+        };
+        assert!(plain_http(port, &post("https://evil.example", "cross-site")).await.starts_with("HTTP/1.1 403"));
+        assert!(plain_http(port, &post("http://svc.wg", "same-origin")).await.starts_with("HTTP/1.1 200"));
+        let older = "POST / HTTP/1.1\r\nhost: svc.wg\r\norigin: https://svc.wg\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+        assert!(plain_http(port, older).await.starts_with("HTTP/1.1 403"), "its https origin is another site's to its http");
+
+        // Restricted: the grants decide, and there is no sign-in to try.
+        let restricted = Policy {
+            fqdn: "svc.wg".into(),
+            access: wireserve_types::ServiceAccess {
+                sources: vec!["10.9.0.2".parse().unwrap()],
+                sign_in_groups: vec!["family".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        shared.http_policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(restricted));
+        let answer = plain_http(port, &get("svc.wg", "")).await;
+        assert!(answer.starts_with("HTTP/1.1 403"), "not sent to sign in: {answer}");
+
+        // Not answered on port 80, closed unanswered.
+        shared.unroute_http(Ipv4Addr::LOCALHOST);
+        assert!(plain_http(port, &get("svc.wg", "")).await.is_empty());
+    }
+
     fn quick() -> Limits {
         Limits {
             handshake: Duration::from_millis(300),
@@ -1850,7 +2026,7 @@ mod tests {
     #[tokio::test]
     async fn a_device_not_let_in_never_reaches_a_websocket_backend() {
         let (port, client, shared) = in_front_of(ws_backend().await, quick());
-        let closed = Policy { fqdn: "svc.test".into(), access: wireserve_types::ServiceAccess::default(), cross_site: false };
+        let closed = Policy { fqdn: "svc.test".into(), access: wireserve_types::ServiceAccess::default(), cross_site: false, aliases: vec![] };
         shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(closed));
         match ws(port, &client, "/").await {
             Err(tungstenite::Error::Http(resp)) => assert_eq!(resp.status(), 403),
@@ -1864,6 +2040,7 @@ mod tests {
             fqdn: "svc.test".into(),
             access: wireserve_types::ServiceAccess { sources: vec![Ipv4Addr::LOCALHOST], ..Default::default() },
             cross_site: false,
+            aliases: vec![],
         };
         let (port, client, shared) = in_front_of(ws_backend().await, quick());
         shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(granted.clone()));
@@ -1872,7 +2049,7 @@ mod tests {
         assert!(!ws_closed_within(&mut ws1, Duration::from_millis(800)).await, "still granted: stays open");
 
         // The grant taken away.
-        let closed = Policy { fqdn: "svc.test".into(), access: wireserve_types::ServiceAccess::default(), cross_site: false };
+        let closed = Policy { fqdn: "svc.test".into(), access: wireserve_types::ServiceAccess::default(), cross_site: false, aliases: vec![] };
         shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(closed));
         assert!(ws_closed_within(&mut ws1, Duration::from_secs(3)).await, "the grant is gone");
 
@@ -2102,7 +2279,7 @@ mod tests {
             b.body(()).unwrap()
         };
         let own = "svc.test";
-        let refused = |method: &str, headers: &[(&str, &str)], ws: bool| started_elsewhere(&req(method, headers), own, ws, false);
+        let refused = |method: &str, headers: &[(&str, &str)], ws: bool| started_elsewhere(&req(method, headers), &[own], "https", ws, false);
         // A form another site submits, or its fetch.
         assert!(refused("POST", &[("sec-fetch-site", "cross-site")], false));
         assert!(refused("DELETE", &[("sec-fetch-site", "same-site")], false), "another service on the domain is another site");
@@ -2126,12 +2303,12 @@ mod tests {
         // Through a forwarding node (PLAN.md M43): the public name it
         // vouched for is the service's own origin, and nobody else's is.
         let public = [("x-forwarded-host", "files.example.com"), ("origin", "https://files.example.com")];
-        assert!(!started_elsewhere(&req("GET", &public), own, true, true), "the public page's WebSocket");
-        assert!(!started_elsewhere(&req("POST", &public), own, false, true), "an older browser's POST from it");
-        assert!(started_elsewhere(&req("GET", &public), own, true, false), "only a forwarding node's word counts");
+        assert!(!started_elsewhere(&req("GET", &public), &[own], "https", true, true), "the public page's WebSocket");
+        assert!(!started_elsewhere(&req("POST", &public), &[own], "https", false, true), "an older browser's POST from it");
+        assert!(started_elsewhere(&req("GET", &public), &[own], "https", true, false), "only a forwarding node's word counts");
         let elsewhere = [("x-forwarded-host", "files.example.com"), ("origin", "https://evil.example")];
-        assert!(started_elsewhere(&req("GET", &elsewhere), own, true, true));
-        assert!(started_elsewhere(&req("POST", &[("sec-fetch-site", "cross-site"), public[0], public[1]]), own, false, true));
+        assert!(started_elsewhere(&req("GET", &elsewhere), &[own], "https", true, true));
+        assert!(started_elsewhere(&req("POST", &[("sec-fetch-site", "cross-site"), public[0], public[1]]), &[own], "https", false, true));
     }
 
     /// Sends `method` to `/` with `headers` and a small body; the status line.

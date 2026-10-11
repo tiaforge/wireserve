@@ -101,6 +101,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
             terminated: s.terminated,
             reach: s.reach,
             always_sign_in: state.declared_services.iter().any(|d| d.name == s.name && d.always_sign_in),
+            http_unguarded: unguarded(state, &s.name),
         })
         .collect();
 
@@ -126,6 +127,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
                 // Its own: the coordinator says so too, once it is listed.
                 reach: Some(if d.always_sign_in { wireserve_types::Reach::SignIn } else { wireserve_types::Reach::Allowed }),
                 always_sign_in: d.always_sign_in,
+                http_unguarded: unguarded(state, &d.name),
             });
         }
     }
@@ -155,6 +157,13 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
         service_notices: state.service_notices.clone(),
         reach_unavailable: false,
     }
+}
+
+/// Whether this node publishes `name` on TCP 80 and its terminator did not
+/// answer that on the last cycle (PLAN.md #328).
+fn unguarded(state: &AgentState, name: &str) -> bool {
+    state.declared_services.iter().any(|d| d.name == name && d.ports.iter().any(wireserve_types::is_http_map))
+        && !state.http_answered.contains(name)
 }
 
 /// Handles one already-parsed request. Returns the response and whether a

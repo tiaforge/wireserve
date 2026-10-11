@@ -69,6 +69,10 @@ pub struct LocalServiceView {
     /// This node declared it for people only (PLAN.md #326).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub always_sign_in: bool,
+    /// This node's own, published on TCP 80, which no terminator here
+    /// answers (PLAN.md #328): any page a mesh user opens may act on it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub http_unguarded: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

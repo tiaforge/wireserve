@@ -185,6 +185,13 @@ pub fn same_target(a: &PortMap, b: &PortMap) -> bool {
     a.addr == b.addr && a.target == b.target && a.proto == b.proto
 }
 
+/// Whether `m` is a service's plain HTTP (see [`crate::HTTP_PUBLIC_PORT`]):
+/// answered by the terminator, like TCP 443.
+#[must_use]
+pub fn is_http_map(m: &PortMap) -> bool {
+    m.public == crate::HTTP_PUBLIC_PORT && m.proto == Proto::Tcp
+}
+
 /// Whether `m` is the mapping that asks for TLS under the service's name
 /// (see [`crate::TLS_PUBLIC_PORT`]).
 #[must_use]

@@ -230,6 +230,10 @@ pub fn install_tls_units(instance: &Instance, tls_port: Option<u16>) -> Result<T
             if !ours && !port_free(port) {
                 return Err(InstallError::TlsPortInUse(port));
             }
+            let http = wireserve_types::http_listen_port(port);
+            if !ours && !port_free(http) {
+                return Err(InstallError::TlsPortInUse(http));
+            }
             (port, (!ours).then(|| format!("the TLS terminator now listens on port {port}")))
         }
         (None, Some(port)) => (port, None),
@@ -266,28 +270,36 @@ fn write_unit(content: &str, dest: &'static str) -> Result<bool, InstallError> {
 fn dropin_content(port: u16) -> String {
     format!(
         "# Written by `wireserve install`: where this TLS terminator\n\
-         # listens. The agent rewrites its service addresses' 443 to it.\n\
+         # listens. The agent rewrites its service addresses' 443 to the\n\
+         # first port, and their 80 to the second.\n\
          [Socket]\n\
          ListenStream=\n\
-         ListenStream=0.0.0.0:{port}\n"
+         ListenStream=0.0.0.0:{port}\n\
+         ListenStream=0.0.0.0:{http}\n",
+        http = wireserve_types::http_listen_port(port),
     )
 }
 
-/// The port the last `ListenStream=` of a socket unit or drop-in names.
+/// The TLS port of a socket unit or drop-in: the first `ListenStream=` after
+/// the last empty one, which clears those before it. The plain-HTTP port
+/// (PLAN.md #328) follows it, and is the TLS port's.
 fn parse_listen_port(text: &str) -> Option<u16> {
-    // An empty one clears those before it; so, last, it clears them all.
-    text.lines()
-        .filter_map(|l| l.trim().strip_prefix("ListenStream="))
-        .next_back()
-        .filter(|v| !v.is_empty())
-        .and_then(|v| v.rsplit(':').next())
-        .and_then(|p| p.parse().ok())
+    let mut first = None;
+    for value in text.lines().filter_map(|l| l.trim().strip_prefix("ListenStream=")) {
+        if value.is_empty() {
+            first = None;
+        } else if first.is_none() {
+            first = value.rsplit(':').next().and_then(|p| p.parse().ok());
+        }
+    }
+    first
 }
 
-/// The first port after `from` that is neither `taken` nor in use.
+/// The first port after `from` that is neither `taken` nor in use, and
+/// whose plain-HTTP port (PLAN.md #328) is not in use either.
 fn pick_tls_port(from: u16, taken: &std::collections::BTreeSet<u16>, free: impl Fn(u16) -> bool) -> Option<u16> {
     // Below the Kubernetes NodePort range, like `from` itself.
-    (from.saturating_add(1)..30000).find(|p| !taken.contains(p) && free(*p))
+    (from.saturating_add(1)..30000).find(|p| !taken.contains(p) && free(*p) && free(wireserve_types::http_listen_port(*p)))
 }
 
 /// Every other instance's terminator port on this host: the default
@@ -504,8 +516,8 @@ mod tests {
     #[test]
     fn a_port_drop_in_replaces_the_units_port_and_reads_back() {
         let text = dropin_content(12443);
-        assert!(text.contains("ListenStream=\nListenStream=0.0.0.0:12443\n"), "{text}");
-        assert_eq!(parse_listen_port(&text), Some(12443));
+        assert!(text.contains("ListenStream=\nListenStream=0.0.0.0:12443\nListenStream=0.0.0.0:12080\n"), "{text}");
+        assert_eq!(parse_listen_port(&text), Some(12443), "the TLS port, not the plain-HTTP one after it");
         assert_eq!(parse_listen_port("[Socket]\nListenStream=\n"), None, "cleared and not set again");
         assert_eq!(parse_listen_port("ListenStream=11500\n"), Some(11500), "a bare port too");
         assert_eq!(parse_listen_port("ListenStream=0.0.0.0:12443\nListenStream=\n"), None, "cleared last");
@@ -517,6 +529,7 @@ mod tests {
         assert_eq!(pick_tls_port(11443, &taken, |_| true), Some(11445));
         assert_eq!(pick_tls_port(11443, &taken, |p| p != 11445), Some(11446), "something else listens there");
         assert_eq!(pick_tls_port(11443, &taken, |_| false), None);
+        assert_eq!(pick_tls_port(11443, &taken, |p| p != 11082), Some(11446), "11445's plain-HTTP port is taken");
     }
 
     #[test]

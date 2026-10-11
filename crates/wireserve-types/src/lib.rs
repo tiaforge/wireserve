@@ -23,14 +23,17 @@ pub use directory::{
     PeerVia, ReachResponse,
 };
 pub use mesh::{MeshInfo, MeshRanges};
-pub use naming::{AcmeSettings, IdentityHeaders, ServiceNames, GROUPS_SEPARATORS, SignIn, ServiceNaming, LETS_ENCRYPT_DIRECTORY, TLS_LISTEN_PORT, TLS_PUBLIC_PORT};
+pub use naming::{
+    http_listen_port, AcmeSettings, IdentityHeaders, ServiceNames, GROUPS_SEPARATORS, SignIn, ServiceNaming, HTTP_PORT_BELOW_TLS,
+    HTTP_PUBLIC_PORT, LETS_ENCRYPT_DIRECTORY, TLS_LISTEN_PORT, TLS_PUBLIC_PORT,
+};
 pub use firewall::{
     is_internet_v4, FirewallBackend, Forwarding, PublicRelay, RelayEnd, RelayForward, ServiceRule, Sources,
     NOT_THE_INTERNET_V4,
 };
 pub use node::{NodeKind, Proto};
 pub use ports::{
-    is_tls_map, is_valid_target_addr, same_target, target_label, targets_conflict, validate_node_targets, validate_service_ports, PortMap,
+    is_http_map, is_tls_map, is_valid_target_addr, same_target, target_label, targets_conflict, validate_node_targets, validate_service_ports, PortMap,
     MAX_PORTS_PER_SERVICE,
 };
 pub use token::{hash_token, BEARER_TOKEN_PREFIX, JOIN_TOKEN_PREFIX};

@@ -100,6 +100,22 @@ pub async fn run(opts: Options) -> Result<(), Error> {
     let shared = serve::Shared::default();
     let listener = serve::listener(opts.port).map_err(|e| Error::Listen(opts.port, e))?;
     let port = listener.local_addr().map_err(|e| Error::Listen(opts.port, e))?.port();
+    // Plain HTTP on services' port 80 (PLAN.md #328). Without its socket the
+    // agent leaves port 80 to the services themselves, as before.
+    let http_wanted = wireserve_types::http_listen_port(port);
+    let http_listener = match serve::http_listener(http_wanted) {
+        Ok(Some(l)) => Some(l),
+        Ok(None) => {
+            tracing::warn!("systemd passed no plain-HTTP socket; port 80 is not guarded — `wireserve install` again to add it");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(port = http_wanted, error = %e, "cannot listen for plain HTTP; port 80 is not guarded");
+            None
+        }
+    };
+    let http_port = http_listener.as_ref().and_then(|l| l.local_addr().ok()).map_or(0, |a| a.port());
+    let mut http_served: BTreeMap<String, wireserve_types::tls::HttpService> = BTreeMap::new();
 
     let mut served: BTreeMap<String, Served> = BTreeMap::new();
     let mut issuance: BTreeMap<String, Issuance> = BTreeMap::new();
@@ -108,8 +124,9 @@ pub async fn run(opts: Options) -> Result<(), Error> {
     let mut in_flight: Option<InFlight> = None;
     let mut last_prune: Option<Instant> = None;
 
-    tracing::info!(socket = %link.socket().display(), port, "TLS terminator starting");
+    tracing::info!(socket = %link.socket().display(), port, http_port, "TLS terminator starting");
     let accepting = serve::spawn(listener, tls, shared.clone());
+    let accepting_http = http_listener.map(|l| serve::spawn_http(l, shared.clone()));
     let mut tick = tokio::time::interval(opts.check_in_every);
     loop {
         tick.tick().await;
@@ -123,7 +140,9 @@ pub async fn run(opts: Options) -> Result<(), Error> {
             .filter(|s| issuance.get(&s.service.fqdn).and_then(|i| i.cert.as_ref()).is_some_and(|c| c.valid_at(SystemTime::now())))
             .map(|s| s.service.name.clone())
             .collect();
-        let config = match link.check_in(serving, port).await {
+        let http_up = accepting_http.as_ref().is_some_and(|h| !h.is_finished());
+        let http: Vec<String> = if http_up { http_served.keys().cloned().collect() } else { Vec::new() };
+        let config = match link.check_in(serving, port, http, if http_up { http_port } else { 0 }).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(error = %e, "could not check in with the agent; keeping what is served");
@@ -137,6 +156,9 @@ pub async fn run(opts: Options) -> Result<(), Error> {
         *shared.forwarders.write().unwrap_or_else(std::sync::PoisonError::into_inner) = config.forwarding_nodes.clone();
 
         forget_gone(&mut served, &mut issuance, &certs, &shared, &config);
+        if http_up {
+            route_http(&shared, &mut http_served, &config.http);
+        }
 
         let Some(settings) = config.acme.clone() else {
             continue;
@@ -206,6 +228,7 @@ pub async fn run(opts: Options) -> Result<(), Error> {
             if entry.cert.is_some() {
                 let policy = Arc::new(serve::Policy {
                     fqdn: service.fqdn.clone(),
+                    aliases: Vec::new(),
                     access: service.access.clone(),
                     cross_site: service.cross_site,
                 });
@@ -290,6 +313,42 @@ fn forget_gone(
         }
         keep
     });
+}
+
+/// Answers exactly the services in `wanted` in plain HTTP (PLAN.md #328):
+/// each one's policy replaced in place, its route only when its address or
+/// backend changed, and the ones no longer wanted let go.
+fn route_http(shared: &serve::Shared, served: &mut BTreeMap<String, wireserve_types::tls::HttpService>, wanted: &[wireserve_types::tls::HttpService]) {
+    let names: BTreeSet<&str> = wanted.iter().map(|s| s.name.as_str()).collect();
+    served.retain(|name, s| {
+        let keep = names.contains(name.as_str());
+        if !keep {
+            tracing::info!(service = %name, "no longer answering its port 80");
+            shared.unroute_http(s.vip);
+        }
+        keep
+    });
+    for service in wanted {
+        let Some((fqdn, aliases)) = service.names.split_first() else { continue };
+        if let Some(old) = served.get(&service.name) {
+            if (old.vip, old.upstream) != (service.vip, service.upstream) {
+                shared.unroute_http(old.vip);
+                served.remove(&service.name);
+            }
+        }
+        // No sign-in without TLS: whoever the grants do not let in, it is
+        // not offered to here.
+        let mut access = service.access.clone();
+        access.sign_in = false;
+        let policy = Arc::new(serve::Policy { fqdn: fqdn.clone(), aliases: aliases.to_vec(), access, cross_site: service.cross_site });
+        shared.http_policies.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(service.vip, policy);
+        if !served.contains_key(&service.name) {
+            tracing::info!(service = %service.name, addr = %service.vip, upstream = %service.upstream, "answering its port 80");
+            let route = Arc::new(serve::Route::new(service.upstream));
+            shared.http_routes.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(service.vip, route);
+            served.insert(service.name.clone(), service.clone());
+        }
+    }
 }
 
 /// Deletes stored certificates that have expired and are not the current

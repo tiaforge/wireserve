@@ -19,8 +19,17 @@ use crate::naming::{AcmeSettings, IdentityHeaders, SignIn};
 pub enum TlsRequest {
     /// "I serve exactly these services right now, on this port; what should
     /// I serve?" The port is the one the terminator's socket really has
-    /// (PLAN.md M35): the agent rewrites a service's 443 to it.
-    CheckIn { serving: Vec<String>, port: u16 },
+    /// (PLAN.md M35): the agent rewrites a service's 443 to it. `http` are
+    /// the services it answers in plain HTTP on `http_port` (PLAN.md #328),
+    /// where the agent rewrites their 80; none without that port.
+    CheckIn {
+        serving: Vec<String>,
+        port: u16,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        http: Vec<String>,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        http_port: u16,
+    },
     /// Publish (`present`) or withdraw one `_acme-challenge` TXT value for
     /// one of this node's own service names.
     Challenge { fqdn: String, value: String, present: bool },
@@ -80,6 +89,32 @@ pub struct TlsConfig {
     /// `X-Forwarded-Host` are kept (PLAN.md M43).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forwarding_nodes: Vec<String>,
+    /// The services to answer in plain HTTP (PLAN.md #328): every one this
+    /// node publishes on TCP 80, domain or not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub http: Vec<HttpService>,
+}
+
+/// A service's plain HTTP, as the terminator answers it on its port 80
+/// (PLAN.md #328): only for its own names, never for a request another
+/// site's page started, and only for the devices its grants let in — no
+/// sign-in without TLS to keep a session in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpService {
+    pub name: String,
+    /// The hosts a request may name: the service's name (`<name>.wg`, or
+    /// `<name>.<domain>`) and its address. Anything else is someone's DNS
+    /// pointed at it.
+    pub names: Vec<String>,
+    /// The service's own address, whose 80 the agent rewrites to the
+    /// terminator's HTTP port.
+    pub vip: Ipv4Addr,
+    /// Where to send the requests: the target of its port 80.
+    pub upstream: SocketAddr,
+    #[serde(default)]
+    pub access: crate::ServiceAccess,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cross_site: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +144,11 @@ pub struct Caller {
     pub node: String,
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(p: &u16) -> bool {
+    *p == 0
+}
+
 /// The header naming the calling node (PLAN.md M33). Always set by the
 /// terminator, from the connection's own source address; a copy arriving
 /// with the request is removed first, so a backend can trust it as far as it
@@ -135,7 +175,7 @@ mod tests {
 
     #[test]
     fn requests_round_trip_and_unknown_ones_are_refused() {
-        let req = TlsRequest::CheckIn { serving: vec!["plex".into()], port: 11443 };
+        let req = TlsRequest::CheckIn { serving: vec!["plex".into()], port: 11443, http: vec![], http_port: 0 };
         let text = serde_json::to_string(&req).unwrap();
         assert_eq!(text, r#"{"op":"check_in","serving":["plex"],"port":11443}"#);
         assert_eq!(serde_json::from_str::<TlsRequest>(&text).unwrap(), req);

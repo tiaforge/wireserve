@@ -181,6 +181,7 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
         declared_services: Vec::new(),
         last_directory: None,
         directory_saved: Default::default(),
+        http_answered: std::collections::BTreeSet::new(),
         rejected_services: Vec::new(),
         ifname: params.ifname,
         ifname_pinned: params.ifname_pinned,

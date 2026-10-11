@@ -109,7 +109,20 @@ firewall rewrites `address:PUBLIC` to `node:TARGET` in the kernel:
   mesh, on the node's own address and on the service's: after
   `wireserve openobserve 80:5080`, `openobserve.wg:80` works and
   `openobserve.wg:5080` does not.
-- **The service sees the real client.** Nothing is proxied; any TCP or UDP
+- **Port 80 is HTTP, like 443 is HTTPS.** Where the node runs its
+  terminator (every `wireserve install`), a service's TCP 80 goes through
+  it: a request must name the service (`<name>.wg` or `<name>.<domain>`)
+  or its address, so DNS rebinding gets 421, and a POST, PUT, DELETE or
+  WebSocket that a page on another site started gets 403. The backend sees
+  the request come from the node, with the caller's mesh address in
+  `X-Forwarded-For`; trust that header from the node's own address. No
+  sign-in on 80: anything for people goes on 443. On a node without a
+  terminator (the container images), or while it is stopped, port 80 goes
+  straight to the service, and `wireserve status` marks it `(80 unguarded)`.
+  **A web app on any other port is not guarded**: any page a mesh user
+  opens can act on it as their device. Publish it as `80:<port>`;
+  `wireserve <name>` says so when a port looks like a web app's.
+- **Other ports see the real client.** Nothing is proxied; any TCP or UDP
   protocol works, and logs, rate limits and allowlists see the peer's own
   mesh address. (A connection from the owning node itself shows up as that
   node, as local connections do.)

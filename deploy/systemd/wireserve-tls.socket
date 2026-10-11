@@ -19,6 +19,8 @@ Documentation=file:///usr/share/doc/wireserve/wireserve-design-spec.md
 
 [Socket]
 ListenStream=0.0.0.0:11443
+# Plain HTTP on services' port 80 (PLAN.md #328): always the second.
+ListenStream=0.0.0.0:11080
 Backlog=1024
 NoDelay=yes
 

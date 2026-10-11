@@ -176,6 +176,25 @@ pub const TLS_PUBLIC_PORT: u16 = 443;
 /// 6443, 7443, 8443, 9443).
 pub const TLS_LISTEN_PORT: u16 = 11443;
 
+/// The port a service's plain HTTP is published on (PLAN.md #328): like
+/// [`TLS_PUBLIC_PORT`], always answered by the terminator where one runs —
+/// which refuses requests that name another host (DNS rebinding) and those a
+/// page on another site starts, before a backend sees them.
+pub const HTTP_PUBLIC_PORT: u16 = 80;
+
+/// How far below the terminator's TLS port its plain-HTTP port lies:
+/// [`TLS_LISTEN_PORT`] gives 11080, and every instance's TLS port is its
+/// own, so its HTTP port is too. The agent rewrites a service address's
+/// [`HTTP_PUBLIC_PORT`] to it; a second port, since the replies of the two
+/// are told apart by the port they come from.
+pub const HTTP_PORT_BELOW_TLS: u16 = 363;
+
+/// The terminator's plain-HTTP port for its TLS port `tls_port`.
+#[must_use]
+pub fn http_listen_port(tls_port: u16) -> u16 {
+    tls_port.saturating_sub(HTTP_PORT_BELOW_TLS)
+}
+
 /// Whether this service publishes [`TLS_PUBLIC_PORT`] over TCP.
 #[must_use]
 pub fn publishes_tls(s: &ServiceInfo) -> bool {
@@ -214,9 +233,15 @@ impl<'a> ServiceNames<'a> {
     /// between the two.
     #[must_use]
     pub fn host_name(&self, s: &ServiceInfo) -> String {
+        self.name_of(&s.name)
+    }
+
+    /// [`Self::host_name`], for the service called `name`.
+    #[must_use]
+    pub fn name_of(&self, name: &str) -> String {
         match self.domain {
-            Some(domain) => format!("{}.{domain}", s.name),
-            None => format!("{}.wg", s.name),
+            Some(domain) => format!("{name}.{domain}"),
+            None => format!("{name}.wg"),
         }
     }
 

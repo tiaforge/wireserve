@@ -4966,3 +4966,25 @@ polls.
     Tests: link-local targets refused; each per-declaration 400 names it;
     the bind cookie never reaches a backend, and the sign-in e2e checks both
     cookies.
+
+328. **A web service off 443 could be driven by any website a mesh user
+    opened.** Grants admit a device, and a browser sends what any open page
+    asks through it: a cross-site POST to a plain-HTTP service, or with DNS
+    rebinding a read. Only the terminator (443) checked Host and where a
+    request came from. Now TCP 80 is HTTP the way 443 is HTTPS: where the
+    terminator runs, the agent rewrites a service address's 80 to its
+    plain-HTTP port (`http_listen_port`, the TLS port minus 363: 11080, a
+    second `ListenStream` of `wireserve-tls.socket`, rewritten by `install`),
+    as `ServiceRule::Terminated`, for the granted sources. There a request
+    must name the service (`<name>.wg`/`<name>.<domain>`) or its address
+    (421 otherwise), a POST/PUT/DELETE/WebSocket another site started is
+    403, forged headers are stripped and the caller goes in X-Forwarded-For;
+    no sign-in (no TLS for a session), and a service for people only is
+    refused there. No terminator, or a stopped one: 80 goes straight to the
+    service, `status` says `(80 unguarded)`. Other ports stay raw — the
+    agent cannot know their protocol, and proxying would hide callers'
+    addresses — and `wireserve <svc>` hints `80:<port>` for a usual web
+    port (security audit 2026-10-11).
+    Tests: terminator port-80 listener (own names, rebinding 421, cross-site
+    403, no sign-in, unrouted closed); agent rules, config, link, install
+    ports and socket fds; TLS e2e step 11 (unrun).

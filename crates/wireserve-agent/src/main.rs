@@ -1148,6 +1148,18 @@ async fn cmd_service(instance: &Instance, words: &[String]) -> Result<(), Box<dy
     }
 }
 
+/// Ports web apps usually listen on.
+const USUAL_WEB_PORTS: [u16; 15] = [3000, 5000, 5001, 8000, 8008, 8080, 8081, 8088, 8096, 8123, 8888, 8920, 9000, 9090, 32400];
+
+/// A mapping that publishes a usual web port as itself while the service
+/// has no port 80 (PLAN.md #328): one the terminator does not guard.
+fn web_port_published_raw(ports: &[wireserve_types::PortMap]) -> Option<wireserve_types::PortMap> {
+    if ports.iter().any(wireserve_types::is_http_map) {
+        return None;
+    }
+    ports.iter().copied().find(|m| m.proto == wireserve_types::Proto::Tcp && USUAL_WEB_PORTS.contains(&m.public))
+}
+
 /// An error answer as an error, so the exit status says it failed.
 fn into_result(resp: wireserve_agent::ipc::IpcResponse) -> Result<wireserve_agent::ipc::IpcResponse, Box<dyn std::error::Error>> {
     match resp {
@@ -1165,6 +1177,7 @@ async fn cmd_declare(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ports = parse_service_ports(ports)?;
     wireserve_types::validate_service_ports(&ports)?;
+    let unguarded = web_port_published_raw(&ports);
     into_result(client::call(&instance.socket_path(), &IpcRequest::Serve { name, ports, group, always_sign_in }).await?)?;
     // "ok" alone overstates what just happened: the declaration is queued
     // locally and only reaches the coordinator on the next poll, and if
@@ -1172,6 +1185,14 @@ async fn cmd_declare(
     // admin acts. The agent cannot know which until it polls, so say what
     // is actually true and point at where the answer shows up.
     println!("ok — queued; takes effect on the next poll");
+    if let Some(m) = unguarded {
+        println!(
+            "  {} is a usual web app's port: publish it as 80:{} instead (`wireserve <name> 80:{} ...`). On 80 the \
+             terminator refuses requests a page on another site starts, and DNS rebinding; on {} any page a mesh user \
+             opens can act on it as their device",
+            m.public, m.target, m.target, m.public
+        );
+    }
     println!(
         "  if this coordinator requires admin approval, `wireserve status` will show \
          it as pending until an admin approves it"
@@ -1359,6 +1380,10 @@ mod tests {
     fn off_goes_alone() {
         assert!(service(&["web", "80", "off"]).action().is_err());
         assert!(service(&["web", "off", "--group", "g"]).action().is_err());
+        let ports = |p: &[&str]| p.iter().map(|m| m.parse().unwrap()).collect::<Vec<wireserve_types::PortMap>>();
+        assert_eq!(web_port_published_raw(&ports(&["8096"])).map(|m| m.public), Some(8096));
+        assert_eq!(web_port_published_raw(&ports(&["80:8096", "8096"])), None, "it has a port 80");
+        assert_eq!(web_port_published_raw(&ports(&["22", "443:3000"])), None);
         assert!(service(&["web", "--group", "g"]).action().is_err());
     }
 

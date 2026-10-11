@@ -32,13 +32,18 @@ struct Inner {
     port: u16,
     /// Name → when the terminator last said it serves it.
     seen: BTreeMap<String, Instant>,
+    /// The services it answers in plain HTTP (PLAN.md #328), and where.
+    http: BTreeSet<String>,
+    http_port: u16,
 }
 
 impl TlsLink {
     /// Records a check-in: the terminator serves exactly `serving` now, on
-    /// `port`.
-    pub fn check_in(&self, serving: BTreeSet<String>, port: u16, now: Instant) {
+    /// `port`, and `http` in plain HTTP on `http_port` (0: none, PLAN.md #328).
+    pub fn check_in(&self, serving: BTreeSet<String>, port: u16, http: BTreeSet<String>, http_port: u16, now: Instant) {
         let mut inner = self.lock();
+        inner.http = if http_port == 0 { BTreeSet::new() } else { http };
+        inner.http_port = http_port;
         for name in &serving {
             inner.seen.insert(name.clone(), now);
         }
@@ -76,6 +81,19 @@ impl TlsLink {
         }
     }
 
+    /// The services the terminator answers on their port 80 this cycle, and
+    /// its port for them (PLAN.md #328), under the same condition as
+    /// [`Self::serving`]: none while it is quiet, so port 80 goes back to the
+    /// services themselves.
+    #[must_use]
+    pub fn http(&self, now: Instant) -> (BTreeSet<String>, u16) {
+        let inner = self.lock();
+        match inner.last_checkin {
+            Some(t) if now.saturating_duration_since(t) < ALIVE && inner.http_port != 0 => (inner.http.clone(), inner.http_port),
+            _ => (BTreeSet::new(), 0),
+        }
+    }
+
     /// What the coordinator is told, latched (see the module doc).
     #[must_use]
     pub fn reported(&self, now: Instant) -> Vec<String> {
@@ -101,6 +119,18 @@ mod tests {
     }
 
     #[test]
+    fn port_80_follows_the_terminator_while_it_has_a_port_for_it() {
+        let link = TlsLink::default();
+        let t0 = Instant::now();
+        link.check_in(set(&[]), 11443, set(&["web"]), 11080, t0);
+        assert_eq!(link.http(t0), (set(&["web"]), 11080));
+        link.check_in(set(&[]), 11443, set(&["web"]), 0, t0);
+        assert_eq!(link.http(t0), (set(&[]), 0), "no port, nothing answered");
+        link.check_in(set(&[]), 11443, set(&["web"]), 11080, t0);
+        assert_eq!(link.http(t0 + ALIVE), (set(&[]), 0), "a quiet terminator answers nothing");
+    }
+
+    #[test]
     fn nothing_before_the_first_check_in() {
         let link = TlsLink::default();
         let now = Instant::now();
@@ -114,13 +144,13 @@ mod tests {
     fn the_firewall_follows_the_terminator_and_the_report_is_latched() {
         let link = TlsLink::default();
         let t0 = Instant::now();
-        link.check_in(set(&["plex", "git"]), 11443, t0);
+        link.check_in(set(&["plex", "git"]), 11443, BTreeSet::new(), 0, t0);
         assert_eq!(link.serving(t0), set(&["plex", "git"]));
 
         // The terminator drops git: the firewall stops at once, the report
         // keeps it until the latch runs out.
         let t1 = t0 + Duration::from_secs(5);
-        link.check_in(set(&["plex"]), 12443, t1);
+        link.check_in(set(&["plex"]), 12443, BTreeSet::new(), 0, t1);
         assert_eq!(link.serving(t1), set(&["plex"]));
         assert_eq!(link.port(t1), Some(12443), "the latest port, as it is now");
         assert_eq!(link.reported(t1), vec!["git".to_string(), "plex".to_string()]);

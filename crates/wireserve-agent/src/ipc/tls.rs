@@ -79,7 +79,7 @@ async fn handle(ctx: &TlsContext, stream: tokio::net::UnixStream) {
 
 async fn dispatch(ctx: &TlsContext, req: TlsRequest) -> TlsResponse {
     match req {
-        TlsRequest::CheckIn { serving, port } => {
+        TlsRequest::CheckIn { serving, port, http, http_port } => {
             // No port, nowhere to send anything: it serves nothing.
             let serving: BTreeSet<String> = serving
                 .into_iter()
@@ -91,9 +91,12 @@ async fn dispatch(ctx: &TlsContext, req: TlsRequest) -> TlsResponse {
             // Only names it was asked to serve count: a terminator claiming
             // anything else is not believed.
             let asked: BTreeSet<&str> = config.services.iter().map(|s| s.name.as_str()).collect();
+            let asked_http: BTreeSet<&str> = config.http.iter().map(|s| s.name.as_str()).collect();
             ctx.link.check_in(
                 serving.into_iter().filter(|n| asked.contains(n.as_str())).collect(),
                 port,
+                http.into_iter().filter(|n| asked_http.contains(n.as_str())).take(MAX_SERVING).collect(),
+                http_port,
                 std::time::Instant::now(),
             );
             TlsResponse::Config(Box::new(config))
@@ -143,11 +146,15 @@ pub fn build_config(state: &AgentState) -> TlsConfig {
             Some(Caller { addr, node: p.name.clone() })
         })
         .collect();
-    let (Some(naming), Some(node)) = (&directory.naming, node) else {
+    let Some(node) = node else {
         return TlsConfig { callers, ..TlsConfig::default() };
     };
+    let http = http_services(state, node, directory);
+    let Some(naming) = &directory.naming else {
+        return TlsConfig { callers, http, ..TlsConfig::default() };
+    };
     let Some(acme) = naming.acme.clone() else {
-        return TlsConfig { callers, ..TlsConfig::default() };
+        return TlsConfig { callers, http, ..TlsConfig::default() };
     };
     // Who may reach each one (PLAN.md M36), from the list saved before the
     // rest of the poll cycle ran — never older than the firewall's.
@@ -178,7 +185,33 @@ pub fn build_config(state: &AgentState) -> TlsConfig {
         identity_headers: naming.identity_headers.clone(),
         strip_headers: naming.strip_headers.clone(),
         forwarding_nodes: naming.forwarding_nodes.clone(),
+        http,
     }
+}
+
+/// This node's services on TCP 80 (PLAN.md #328), for the terminator to
+/// answer in plain HTTP: under the one name every hosts file and DNS record
+/// gives them, or their address — domain or not, certificate or not.
+fn http_services(state: &AgentState, node: Ipv4Addr, directory: &wireserve_types::PollResponse) -> Vec<wireserve_types::tls::HttpService> {
+    let names = wireserve_types::ServiceNames::new(directory.naming.as_ref());
+    state
+        .declared_services
+        .iter()
+        .filter_map(|d| {
+            let vip = crate::poll_loop::own_vip(&d.name, node, directory)?;
+            // No entry: not served at all, as the firewall opens nothing.
+            let access = state.own_access.iter().find(|a| a.name == d.name).cloned()?;
+            let map = d.ports.iter().copied().find(wireserve_types::is_http_map)?;
+            Some(wireserve_types::tls::HttpService {
+                name: d.name.clone(),
+                names: vec![names.name_of(&d.name), vip.to_string()],
+                vip,
+                upstream: SocketAddr::new(map.addr.unwrap_or(node).into(), map.target),
+                access,
+                cross_site: directory.naming.as_ref().is_some_and(|n| n.cross_site_services.contains(&d.name)),
+            })
+        })
+        .collect()
 }
 
 /// Publishes or withdraws a challenge value through the coordinator, for a
@@ -326,6 +359,23 @@ mod tests {
         let mut st = state(true, false);
         st.last_directory.as_mut().unwrap().naming.as_mut().unwrap().cross_site_services = vec!["plex".into()];
         assert!(build_config(&st).services[0].cross_site, "WIRESERVE_CROSS_SITE_SERVICES names it (PLAN.md #276)");
+    }
+
+    #[test]
+    fn port_80_is_answered_under_its_one_name_and_address_records_or_not() {
+        // PLAN.md #328: plain HTTP needs no certificate.
+        for acme in [true, false] {
+            let cfg = build_config(&state(acme, false));
+            assert_eq!(cfg.http.len(), 1, "{cfg:?}");
+            let prom = &cfg.http[0];
+            assert_eq!(prom.names, ["prom.int.test", "10.9.0.51"]);
+            assert_eq!(prom.upstream, "10.9.0.1:9090".parse::<SocketAddr>().unwrap());
+        }
+        let mut st = state(false, false);
+        st.last_directory.as_mut().unwrap().naming = None;
+        assert_eq!(build_config(&st).http[0].names, ["prom.wg", "10.9.0.51"], "no domain: its .wg name");
+        st.own_access.retain(|a| a.name != "prom");
+        assert!(build_config(&st).http.is_empty(), "granted to nobody, answered for nobody");
     }
 
     #[test]

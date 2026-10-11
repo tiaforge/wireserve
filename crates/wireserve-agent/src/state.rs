@@ -44,6 +44,11 @@ pub struct AgentState {
     /// When a save last wrote `last_directory` to disk; not saved itself.
     #[serde(skip)]
     pub directory_saved: DirectorySaved,
+    /// This node's services whose port 80 its terminator answered on the
+    /// last cycle (PLAN.md #328), for `wireserve status` to say which are
+    /// not; not saved.
+    #[serde(skip)]
+    pub http_answered: std::collections::BTreeSet<String>,
     /// Service declarations the coordinator rejected (name collision with
     /// another node, spec §4.3) — removed from `declared_services` so
     /// they're not resent forever (security review F3), but kept here so

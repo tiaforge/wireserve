@@ -25,12 +25,17 @@
 #      has its leftover route swept on the next start;
 #  10. a WebSocket (PLAN.md M42) reaches its backend through the
 #      terminator, with the backend's subprotocol, the caller named and its
-#      mesh address in X-Forwarded-For, and echoes both ways.
+#      mesh address in X-Forwarded-For, and echoes both ways;
+#  11. port 80 goes through the terminator too (PLAN.md #328): the caller's
+#      mesh address in X-Forwarded-For, another Host (DNS rebinding) 421, a
+#      POST another site started 403, its port closed to the LAN; stopped,
+#      it hands port 80 back to the service.
 #
 #     ( net )──┬──────────┬───────┬────────┬──────────────┬────────────┐
 #          [coordinator] [bind] [pebble] [home agent       [client agent]
 #                                         + terminator
-#                                         plex 443:32400 81:32401]
+#                                         plex 443:32400 81:32401
+#                                         web 80:32402]
 #
 # Rootful Podman, like the other harnesses that run WireGuard.
 #
@@ -219,7 +224,8 @@ start_terminator() {
 in_netns_bg "$HOME_AGENT" socat "TCP-LISTEN:443,fork,reuseaddr" SYSTEM:"echo stranger"
 start_terminator
 podman exec "$HOME_AGENT" wireserve plex 443:32400 81:32401
-for port in 32400 32401; do
+podman exec "$HOME_AGENT" wireserve web 80:32402
+for port in 32400 32401 32402; do
     in_netns_bg "$HOME_AGENT" socat "TCP-LISTEN:$port,fork,reuseaddr" EXEC:"/e2e/echo-backend.sh $port"
 done
 wait_until "plex to get a service address" 30 eval '[ -n "$(entry "$HOME_AGENT" plex vip4)" ]'
@@ -228,7 +234,7 @@ HOME_IP=$(podman exec "$HOME_AGENT" wireserve status --json | python3 -c 'import
 [ -n "$PLEX_VIP" ] || fail "plex has no service address: $(podman exec "$HOME_AGENT" wireserve status)"
 pass "plex at $PLEX_VIP"
 
-log "1/10: a certificate from Pebble, and plex terminated"
+log "1/11: a certificate from Pebble, and plex terminated"
 terminated_on() { [ "$(entry "$1" plex terminated)" = True ]; }
 wait_until "the terminator to report plex" 90 terminated_on "$HOME_AGENT"
 podman exec "$HOME_AGENT" grep -q 'certificate issued' /var/log/tls.log || fail "no issuance in the terminator's log"
@@ -238,7 +244,7 @@ grep -q 'BEGIN CERTIFICATE' "$WORK/pebble-root.pem" || fail "could not fetch Peb
 wait_until "the client to see plex terminated" 30 terminated_on "$CLIENT"
 pass "issued once; the directory says terminated"
 
-log "2/10: from the client, verified TLS on the service's own address"
+log "2/11: from the client, verified TLS on the service's own address"
 OUT=$(fetch "$CLIENT" -H 'X-Wireserve-Node: evil' -H 'X-Forwarded-For: 6.6.6.6') || true
 echo "$OUT" | sed 's/^/  /'
 echo "$OUT" | has '^STATUS 200' || fail "the request did not succeed over verified TLS"
@@ -250,13 +256,13 @@ echo "$OUT" | has -i '^x-forwarded-proto: https' || fail "no X-Forwarded-Proto"
 echo "$OUT" | has -i "^host: plex.$DOMAIN" || fail "the backend did not see its own name as Host"
 pass "200 over a Pebble certificate; X-Wireserve-Node: node-client; forged headers gone"
 
-log "3/10: from the owner node itself"
+log "3/11: from the owner node itself"
 OUT=$(fetch "$HOME_AGENT") || true
 echo "$OUT" | has '^STATUS 200' || { echo "$OUT"; fail "the owner node could not reach its own service by name"; }
 echo "$OUT" | has -i '^x-wireserve-node: node-home' || { echo "$OUT"; fail "the owner node was not named as itself"; }
 pass "the owner node is named node-home"
 
-log "4/10: 443 stays the stranger's, and the terminator's port is closed"
+log "4/11: 443 stays the stranger's, and the terminator's port is closed"
 # It answers with a bare line, no HTTP: curl takes that only as HTTP/0.9.
 in_netns "$HOME_AGENT" curl -s --http0.9 --max-time 4 http://127.0.0.1:443/ | has stranger \
     || fail "the stranger lost 0.0.0.0:443"
@@ -269,7 +275,7 @@ if in_netns "$CLIENT" curl -sk --max-time 4 --resolve "plex.$DOMAIN:11443:$PLEX_
 fi
 pass "the stranger keeps 0.0.0.0:443; 11443 answers only through the rewrite"
 
-log "5/10: the other port is still an ordinary mapping"
+log "5/11: the other port is still an ordinary mapping"
 in_netns "$CLIENT" curl -s --max-time 6 "http://$PLEX_VIP:81/" | has 'backend:32401' \
     || fail "port 81 no longer reaches its target"
 if in_netns "$CLIENT" curl -s --max-time 4 "http://$PLEX_VIP:32400/" | has backend; then
@@ -277,11 +283,11 @@ if in_netns "$CLIENT" curl -s --max-time 4 "http://$PLEX_VIP:32400/" | has backe
 fi
 pass "81 → 32401 mapped; 32400 closed from the mesh"
 
-log "6/10: no challenge record left behind"
+log "6/11: no challenge record left behind"
 wait_until "the challenge record to go" 30 sh -c "[ -z \"\$(podman run --rm --network container:$COORD $DEBUG_IMG dig +short @$BIND_IP _acme-challenge.plex.$DOMAIN TXT)\" ]"
 pass "_acme-challenge.plex.$DOMAIN is empty"
 
-log "7/10: a restarted terminator serves the stored certificate"
+log "7/11: a restarted terminator serves the stored certificate"
 SERIAL=$(in_netns "$CLIENT" sh -c "echo | openssl s_client -connect $PLEX_VIP:443 -servername plex.$DOMAIN 2>/dev/null | openssl x509 -noout -serial" 2>/dev/null || true)
 signal "$HOME_AGENT" TERM 'wireserve tls-daemon'
 sleep 1
@@ -295,7 +301,7 @@ AFTER=$(in_netns "$CLIENT" sh -c "echo | openssl s_client -connect $PLEX_VIP:443
 [ -z "$SERIAL" ] || [ "$SERIAL" = "$AFTER" ] || fail "a different certificate after the restart ($SERIAL → $AFTER)"
 pass "same certificate, no new issuance"
 
-log "8/10: a stopped terminator hands the address back to the mapping"
+log "8/11: a stopped terminator hands the address back to the mapping"
 signal "$HOME_AGENT" TERM 'wireserve tls-daemon'
 # The firewall stops relying on it after 30s without a check-in.
 wait_until "plain HTTP on :443 to reach the backend again" 60 \
@@ -305,7 +311,7 @@ start_terminator
 wait_until "TLS back on :443" 60 sh -c "podman run --rm --network container:$CLIENT -v $WORK:/work:ro,Z $DEBUG_IMG curl -s --max-time 3 --cacert /work/pebble-root.pem --resolve plex.$DOMAIN:443:$PLEX_VIP https://plex.$DOMAIN/ | grep -q backend:32400"
 pass "and TLS again once it is back"
 
-log "9/10: local routes go with the daemon, and a crash's are swept"
+log "9/11: local routes go with the daemon, and a crash's are swept"
 in_netns "$HOME_AGENT" ip -4 route show table local proto 247 | has "$PLEX_VIP" \
     || fail "no local route for $PLEX_VIP while terminated"
 signal "$HOME_AGENT" TERM 'wireserve daemon'
@@ -324,7 +330,7 @@ wait_until "the sweep" 20 podman exec "$HOME_AGENT" grep -q 'left behind' /var/l
 pass "the leftover route was swept at start"
 [ -n "$HOME_IP" ] || true
 
-log "10/10: a WebSocket through the terminator"
+log "10/11: a WebSocket through the terminator"
 wait_until "plex served again after the restarts" 60 sh -c "podman run --rm --network container:$CLIENT -v $WORK:/work:ro,Z $DEBUG_IMG curl -s --max-time 3 --cacert /work/pebble-root.pem --resolve plex.$DOMAIN:443:$PLEX_VIP https://plex.$DOMAIN/ | grep -q backend:32400"
 # The plain backend on 32400 makes way for a WebSocket one.
 for c in $(podman ps -q --filter "name=wireserve-tt-helper"); do
@@ -349,6 +355,36 @@ echo "$OUT" | has '^x-forwarded-proto=https$' || fail "no X-Forwarded-Proto"
 echo "$OUT" | has "^host=plex.$DOMAIN$" || fail "the backend did not see its own name as Host"
 echo "$OUT" | has '^echo=over the mesh$' || fail "no echo"
 pass "upgraded over verified TLS; subprotocol chat; node-client at $CLIENT_IP; echoed"
+
+log "11/11: port 80 through the terminator: its own name, nothing another site starts"
+WEB_VIP=$(entry "$HOME_AGENT" web vip4)
+[ -n "$WEB_VIP" ] || fail "web has no service address"
+http80() { in_netns "$CLIENT" curl -s --max-time 6 -D - "$@" -w '\nSTATUS %{http_code}\n'; }
+by_name() { http80 --resolve "web.$DOMAIN:80:$WEB_VIP" "$@" "http://web.$DOMAIN/"; }
+# Raw, the backend would see no X-Forwarded-For: only the terminator adds it.
+wait_until "the terminator to answer web's port 80" 60 eval 'by_name | has -i "^x-forwarded-for: $CLIENT_IP"'
+OUT=$(by_name -H 'X-Forwarded-For: 6.6.6.6' -H 'X-Auth-User: mallory') || true
+echo "$OUT" | sed 's/^/  /'
+echo "$OUT" | has '^STATUS 200' || fail "web's port 80 did not answer"
+echo "$OUT" | has 'backend:32402' || fail "the wrong backend answered"
+echo "$OUT" | has -i '6.6.6.6\|mallory' && fail "forged headers reached the backend"
+OUT=$(http80 -H 'Host: evil.example' "http://$WEB_VIP/") || true
+echo "$OUT" | has '^STATUS 421' || { echo "$OUT"; fail "a request naming another host was answered"; }
+echo "$OUT" | has 'backend:' && fail "a request naming another host reached the backend"
+http80 "http://$WEB_VIP/" | has '^STATUS 200' || fail "the service's own address, typed, was refused"
+OUT=$(by_name -X POST -H 'Origin: https://evil.example' -H 'Sec-Fetch-Site: cross-site') || true
+echo "$OUT" | has '^STATUS 403' || { echo "$OUT"; fail "a POST another site started was let through"; }
+by_name -X POST -H "Origin: http://web.$DOMAIN" -H 'Sec-Fetch-Site: same-origin' | has '^STATUS 200' \
+    || fail "the service's own page could not POST"
+if in_netns "$CLIENT" curl -s --max-time 4 -H "Host: web.$DOMAIN" "http://$HOME_LAN:11080/" | has backend; then
+    fail "the terminator's plain-HTTP port answers the LAN"
+fi
+pass "X-Forwarded-For $CLIENT_IP; another Host 421; a cross-site POST 403; 11080 closed to the LAN"
+signal "$HOME_AGENT" TERM 'wireserve tls-daemon'
+wait_until "port 80 handed back to the service" 60 sh -c "podman run --rm --network container:$CLIENT $DEBUG_IMG curl -s --max-time 3 -H 'Host: evil.example' http://$WEB_VIP/ | grep -q backend:32402"
+start_terminator
+wait_until "port 80 guarded again" 60 eval 'http80 -H "Host: evil.example" "http://$WEB_VIP/" | has "^STATUS 421"'
+pass "a stopped terminator hands port 80 back to the service, and takes it again"
 
 echo
 echo "=== TLS TERMINATION TEST COMPLETE ==="

@@ -50,6 +50,9 @@ fn service_row(s: &LocalServiceView, domain: Option<&str>) -> Vec<String> {
     if s.always_sign_in {
         ports.push_str(" --always-sign-in");
     }
+    if s.http_unguarded {
+        ports.push_str(" (80 unguarded)");
+    }
     vec![host, address, ports, node, service_state(s).into(), service_access(s).into()]
 }
 
@@ -274,6 +277,7 @@ mod tests {
             terminated: false,
             reach: Some(Reach::Allowed),
             always_sign_in: false,
+            http_unguarded: false,
         }
     }
 
