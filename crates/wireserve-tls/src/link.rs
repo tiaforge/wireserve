@@ -43,10 +43,10 @@ impl Link {
         &self.socket
     }
 
-    /// Tells the agent what is served now, on which port, and which known
-    /// devices connected since the last time; returns what should be served.
-    pub async fn check_in(&self, serving: Vec<String>, port: u16, seen: Vec<std::net::Ipv4Addr>) -> Result<TlsConfig, LinkError> {
-        match self.exchange(&TlsRequest::CheckIn { serving, port, seen }).await? {
+    /// Tells the agent what is served now, and on which port; returns what
+    /// should be served.
+    pub async fn check_in(&self, serving: Vec<String>, port: u16) -> Result<TlsConfig, LinkError> {
+        match self.exchange(&TlsRequest::CheckIn { serving, port }).await? {
             TlsResponse::Config(config) => Ok(*config),
             other => Err(unexpected(other)),
         }

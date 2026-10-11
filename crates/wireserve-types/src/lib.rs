@@ -14,7 +14,7 @@ pub mod token;
 pub mod validation;
 
 pub use access::{
-    is_valid_oidc_group, CallerIdentity, GrantSource, Reach, ServiceAccess, ServiceNotice, DEFAULT_GROUP, MAX_OIDC_GROUP_LEN,
+    is_valid_oidc_group, GrantSource, Reach, ServiceAccess, ServiceNotice, DEFAULT_GROUP, MAX_OIDC_GROUP_LEN,
     MAX_SOURCES_PER_SERVICE,
 };
 pub use api::*;

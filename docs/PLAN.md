@@ -4916,3 +4916,35 @@ polls.
     2026-10-11).
     Test: a service under a wildcard to an outside address is neither
     written nor given a challenge; under one into the mesh it is both.
+
+326. **No node is told who owns a device; a backend is named only when its
+    node declares it reads names.** A node reported which devices had
+    called its terminator (`callers_seen`), and was told their owners'
+    subjects, e-mail addresses and groups (`PollResponse.identities`) — on
+    its word alone, so any node with an approved 443 service could ask after
+    every owner, every owner at all when the service was in `default`. It
+    was only ever for the identity headers: admission is decided by the
+    grants on the coordinator, and owners' groups still count there. Removed
+    end to end: `callers_seen`, `identities`, `CallerIdentity`, the
+    terminator's seen-device report and the agent's caller cache and poll
+    wake-up, `owner_identity_released`.
+    In its place, `wireserve <svc> <ports> --always-sign-in` (migration 0027,
+    `ServiceDecl::always_sign_in`, `ServiceAccess::always_sign_in`): its
+    node says its backend reads the identity headers. Then every request to
+    its terminated 443 needs a session with a granted `oidc:` group —
+    granted and owned devices, and its own node, included — and every one
+    is named. Without it no request is named, signed in or not: a backend
+    that reads no names is sent none. A node's own to set on every
+    declaration, needing no approval, since it only ever narrows who gets
+    in. It needs an `oidc:` grant (`everyone` would admit every account the
+    login server has); until the sign-in can be offered for it, its node
+    gets a notice saying why nobody gets in. Shown in `status` and
+    `service list`. `access-control.md` now says a backend that believes
+    the headers must be reachable only through the terminator (security
+    audit 2026-10-11).
+    Tests: a device names nobody; for people only, a granted device is sent
+    to sign in and a session is named; without the flag a session is not;
+    the flag is stored, shown, switched off by the next declaration (and not
+    remembered by the access cache), and a notice says why nobody gets in;
+    `serve` refuses it without TCP 443; `reach` agrees with the access the
+    owner enforces with and without it. The sign-in e2e gains step 5b.

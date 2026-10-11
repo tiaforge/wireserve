@@ -15,12 +15,14 @@
 #   2. without a session the browser is sent to the coordinator's sign-in,
 #      and the backend never sees the request;
 #   3. alice signs in at the provider with `family` and lands back on
-#      jellyfin: the backend sees who she is, not a forged X-Auth-User, not
-#      the session cookie — other cookies kept;
+#      jellyfin: its backend is told nobody's name — it reads none — not a
+#      forged X-Auth-User, not the session cookie; other cookies kept;
 #   4. bob, signed in with another group, is told so by the coordinator and
 #      never handed a ticket; jellyfin's backend is untouched; and a ticket
 #      someone opens in another browser than their own signs nobody in;
 #   5. the tagged gate gets in without any session: its device is granted;
+#  5b. declared --always-sign-in, jellyfin's backend is told who alice is,
+#      and the tagged gate is sent to sign in like anyone (PLAN.md #326);
 #   6. grafana, still in `default`, needs no sign-in, and a session cookie
 #      or a forged identity sent to it never reaches its backend;
 #   7. jellyfin's other port admits the granted gate and refuses the client;
@@ -29,7 +31,8 @@
 #      that is restricted too, it gets her sent to sign in;
 #  10. past the refresh interval her session is renewed in place, `owner
 #      status` lists her, and signing out at jellyfin ends it;
-#  11. taking jellyfin out of `media` puts it back in `default`.
+#  11. declared without it again, and out of `media`, jellyfin is back in
+#      `default`.
 #
 #     ( net )──┬──────────┬───────┬────────┬────────┬──────────────┬──────────────────┬──────────┐
 #          [coordinator] [bind] [pebble] [mock    [gate agent    [home agent        [client agent]
@@ -312,7 +315,7 @@ echo "$OUT" | has "^STATUS 302 $PUBLIC/sign-in?service=jellyfin.$DOMAIN&to=%2F" 
 echo "$OUT" | has 'backend:' && fail "the backend was reached without a session"
 pass "redirected to the sign-in; the backend never saw the request"
 
-log "3/11: alice signs in with family and lands back on jellyfin, as herself"
+log "3/11: alice signs in with family and lands back on jellyfin, named to nobody"
 LANDED=$(sign_in alice '"family"')
 echo "  $LANDED"
 [ "$LANDED" = "200 https://jellyfin.$DOMAIN/" ] || { cat "$WORK/landed-alice.html"; fail "alice did not land on jellyfin: $LANDED"; }
@@ -322,13 +325,12 @@ grep -q '__Host-wireserve-session' "$WORK/jar-alice" || fail "the browser keeps 
 printf 'jellyfin.%s\tFALSE\t/\tTRUE\t0\ttheme\tdark\n' "$DOMAIN" >> "$WORK/jar-alice"
 OUT=$(browser alice -D - -H 'X-Auth-User: mallory' "https://jellyfin.$DOMAIN/") || true
 echo "$OUT" | sed 's/^/  /'
-echo "$OUT" | has -i '^x-auth-user: alice' || fail "the backend did not get the identity header"
-echo "$OUT" | has -i '^x-auth-groups: family' || fail "the backend did not get the groups header"
-echo "$OUT" | has -i '^x-auth-email: alice@example.com' || fail "the backend did not get the e-mail header"
+echo "$OUT" | has 'backend:8096' || { echo "$OUT"; fail "alice did not get into jellyfin"; }
+echo "$OUT" | has -i '^x-auth-' && fail "a backend that reads no names was told one"
 echo "$OUT" | has -i 'mallory' && fail "a forged X-Auth-User reached the backend"
 echo "$OUT" | has 'wireserve-session' && fail "the session cookie reached the backend"
 echo "$OUT" | has -i '^cookie: .*theme=dark' || fail "other cookies were lost"
-pass "X-Auth-User: alice, groups family; mallory and the session cookie gone; theme kept"
+pass "in, and named to nobody; mallory and the session cookie gone; theme kept"
 
 log "4/11: bob, signed in without a granted group, gets no ticket"
 LANDED=$(sign_in bob '"guests"') || true
@@ -355,6 +357,21 @@ echo "$OUT" | has '^STATUS 200' || { echo "$OUT"; fail "the tagged gate was aske
 echo "$OUT" | has 'backend:8096' || fail "the wrong backend answered"
 echo "$OUT" | has -i 'mallory' && fail "a forged X-Auth-User reached the backend from a granted device"
 pass "node-gate (tag tv) reached jellyfin with no session"
+
+log "5b/11: declared --always-sign-in, alice is named and the gate signs in too"
+podman exec "$HOME_AGENT" wireserve jellyfin 443:8096 8920:8920 --always-sign-in
+admin service list --json | jq -e '.services[] | select(.name == "jellyfin")' >/dev/null || fail "jellyfin is gone"
+wait_until "the gate to be asked to sign in" 60 eval 'fetch_from "$GATE" jellyfin | has "^STATUS 302 $PUBLIC/sign-in"'
+admin service list --json | jq -e '.services[] | select(.name == "jellyfin") | .always_sign_in' >/dev/null \
+    || fail "service list does not show jellyfin for people only"
+OUT=$(browser alice -D - -H 'X-Auth-User: mallory' "https://jellyfin.$DOMAIN/") || true
+echo "$OUT" | sed 's/^/  /'
+echo "$OUT" | has -i '^x-auth-user: alice' || fail "the backend did not get the identity header"
+echo "$OUT" | has -i '^x-auth-groups: family' || fail "the backend did not get the groups header"
+echo "$OUT" | has -i '^x-auth-email: alice@example.com' || fail "the backend did not get the e-mail header"
+echo "$OUT" | has -i 'mallory' && fail "a forged X-Auth-User reached the backend"
+echo "$OUT" | has 'wireserve-session' && fail "the session cookie reached the backend"
+pass "X-Auth-User: alice, groups family; the gate's grant no longer lets it into 443"
 
 log "6/11: a service in default needs no sign-in, and never sees a session cookie"
 ALICE_TOKEN=$(awk '$6 == "__Host-wireserve-session" {print $7}' "$WORK/jar-alice" | tail -1)
@@ -415,7 +432,8 @@ case "$OUT" in "STATUS 302 $PUBLIC/sign-in?"*) ;; *) fail "after signing out, je
 admin owner status | has 'alice@example.com' && fail "owner status still lists alice as signed in"
 pass "renewed after ${REFRESH}s; signed out, she is asked to sign in again"
 
-log "11/11: out of its group, jellyfin is back in default"
+log "11/11: declared without it, and out of its group, jellyfin is back in default"
+podman exec "$HOME_AGENT" wireserve jellyfin 443:8096 8920:8920
 admin group remove media jellyfin | has 'back in default' || fail "the admin was not told jellyfin is in default again"
 wait_until "jellyfin without a sign-in" 60 sh -c "podman run --rm --network container:$CLIENT -v $WORK:/work:ro,Z $DEBUG_IMG curl -s --max-time 5 --cacert /work/pebble-root.pem --resolve jellyfin.$DOMAIN:443:$JF_VIP https://jellyfin.$DOMAIN/ | grep -q backend:8096"
 wait_until "jellyfin's other port back" 30 sh -c "podman run --rm --network container:$CLIENT $DEBUG_IMG curl -s --max-time 3 http://$JF_VIP:8920/ | grep -q backend:8920"

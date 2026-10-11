@@ -186,6 +186,7 @@ pub struct DirectoryState {
 struct MemoEntry {
     generation: u64,
     owner: (i64, Option<String>),
+    always_sign_in: bool,
     facts: SignInFacts,
     access: ServiceAccess,
 }
@@ -242,7 +243,11 @@ impl DirectoryState {
         let mut memo = self.access_memo.lock().unwrap_or_else(PoisonError::into_inner);
         let owner_key = (owner.id, owner.ip4.clone());
         if let Some(m) = memo.get(&service.name) {
-            if m.generation == self.access_generation && m.owner == owner_key && m.facts == *facts {
+            if m.generation == self.access_generation
+                && m.owner == owner_key
+                && m.always_sign_in == service.always_sign_in
+                && m.facts == *facts
+            {
                 return m.access.clone();
             }
         }
@@ -250,7 +255,13 @@ impl DirectoryState {
         if access.sources.len() <= MEMO_MAX_SOURCES {
             memo.insert(
                 service.name.clone(),
-                MemoEntry { generation: self.access_generation, owner: owner_key, facts: *facts, access: access.clone() },
+                MemoEntry {
+                    generation: self.access_generation,
+                    owner: owner_key,
+                    always_sign_in: service.always_sign_in,
+                    facts: *facts,
+                    access: access.clone(),
+                },
             );
         } else {
             memo.remove(&service.name);
@@ -715,6 +726,7 @@ mod tests {
             denied_at: None,
             denied_reason: None,
             approved_ports: None,
+            always_sign_in: false,
         }
     }
 

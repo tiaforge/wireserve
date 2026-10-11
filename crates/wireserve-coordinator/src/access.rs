@@ -92,6 +92,11 @@ pub struct SignInFacts {
 /// `sources` always holds the owner's own address: the host's own programs
 /// reach its terminator from it, and would otherwise be refused by their
 /// own node.
+///
+/// A service for people only (`always_sign_in`, PLAN.md #326) keeps its
+/// sources for its other ports; its 443 is the sign-in's, and only for an
+/// `oidc:` group a grant names — `everyone` is no group anyone signs in
+/// with, or every account the identity provider has would get in.
 #[must_use]
 pub fn service_access<'a>(
     service: &ServiceRow,
@@ -100,9 +105,14 @@ pub fn service_access<'a>(
     rules: &Rules,
     sign_in: &SignInFacts,
 ) -> ServiceAccess {
-    let open = ServiceAccess { name: service.name.clone(), open: true, sources: vec![], sign_in: false, sign_in_groups: vec![] };
     let granted = rules.granted(&service.name);
     if granted.contains(&GrantSource::Everyone) {
+        let mut open = ServiceAccess { name: service.name.clone(), open: true, ..ServiceAccess::default() };
+        if service.always_sign_in {
+            open.sign_in_groups = sign_in_groups(&granted);
+            open.sign_in = sign_in.offered(&open.sign_in_groups);
+            open.always_sign_in = true;
+        }
         return open;
     }
     let mut sources: BTreeSet<Ipv4Addr> = peers
@@ -115,7 +125,14 @@ pub fn service_access<'a>(
     }
     let sign_in_groups = sign_in_groups(&granted);
     let sign_in = sign_in.offered(&sign_in_groups);
-    ServiceAccess { name: service.name.clone(), open: false, sources: sources.into_iter().collect(), sign_in, sign_in_groups }
+    ServiceAccess {
+        name: service.name.clone(),
+        open: false,
+        sources: sources.into_iter().collect(),
+        sign_in,
+        sign_in_groups,
+        always_sign_in: service.always_sign_in,
+    }
 }
 
 /// The identity provider's groups among `granted`.
@@ -136,6 +153,26 @@ impl SignInFacts {
     }
 }
 
+/// Why nobody gets into the 443 of a service its node declared for people
+/// only (PLAN.md #326), if nobody does: told to the node, which asked for
+/// something the mesh cannot give it yet.
+#[must_use]
+pub fn always_sign_in_notice(access: &ServiceAccess, facts: &SignInFacts) -> Option<String> {
+    if !access.always_sign_in || access.sign_in {
+        return None;
+    }
+    let why = if access.sign_in_groups.is_empty() {
+        "no oidc: group is granted to it; grant one, e.g. `wireserve-admin grant add oidc:family <its group>`"
+    } else if !facts.available {
+        "this mesh has no sign-in; it needs a login server and a service domain"
+    } else if !facts.owner_capable {
+        "this node's terminator is not running, or too old to offer the sign-in"
+    } else {
+        "this node does not serve it with TLS yet"
+    };
+    Some(format!("--always-sign-in: nobody gets into its 443: {why}"))
+}
+
 /// What `requester` gets at `service` (PLAN.md M45): [`service_access`]'s
 /// answer for one node, without working it out for every peer.
 #[must_use]
@@ -146,10 +183,15 @@ pub fn reach(
     rules: &Rules,
     sign_in: &SignInFacts,
 ) -> Reach {
+    let granted = rules.granted(&service.name);
+    // Its 443 is for people, whichever device they are on — its own node's
+    // included.
+    if service.always_sign_in {
+        return if sign_in.offered(&sign_in_groups(&granted)) { Reach::SignIn } else { Reach::Denied };
+    }
     if requester.id == owner.id {
         return Reach::Allowed;
     }
-    let granted = rules.granted(&service.name);
     if granted.contains(&GrantSource::Everyone) {
         return Reach::Allowed;
     }
@@ -187,6 +229,7 @@ mod tests {
             denied_at: None,
             denied_reason: None,
             approved_ports: None,
+            always_sign_in: false,
         }
     }
 
@@ -255,6 +298,9 @@ mod tests {
     /// access it is sent: the meaning `reach` must keep.
     fn enforced(a: &ServiceAccess, requester: &NodeRow) -> Reach {
         let ip: Option<Ipv4Addr> = requester.ip4.as_deref().and_then(|ip| ip.parse().ok());
+        if a.always_sign_in {
+            return if a.sign_in { Reach::SignIn } else { Reach::Denied };
+        }
         if a.open || ip.is_some_and(|ip| a.sources.contains(&ip)) {
             Reach::Allowed
         } else if a.sign_in {
@@ -287,15 +333,19 @@ mod tests {
         for grants in &grant_sets {
             let r = rules(grants);
             for svc in ["web", "db"] {
-                for si in &facts {
-                    let a = service_access(&service(svc), &peers[0], &peers, &r, si);
-                    for requester in &peers {
-                        assert_eq!(
-                            reach(&service(svc), &peers[0], requester, &r, si),
-                            enforced(&a, requester),
-                            "{svc} for {} with {grants:?}",
-                            requester.name,
-                        );
+                for always in [false, true] {
+                    let mut row = service(svc);
+                    row.always_sign_in = always;
+                    for si in &facts {
+                        let a = service_access(&row, &peers[0], &peers, &r, si);
+                        for requester in &peers {
+                            assert_eq!(
+                                reach(&row, &peers[0], requester, &r, si),
+                                enforced(&a, requester),
+                                "{svc} (always {always}) for {} with {grants:?}",
+                                requester.name,
+                            );
+                        }
                     }
                 }
             }
@@ -310,6 +360,45 @@ mod tests {
         assert_eq!(reach(&service("db"), &peers[0], tv, &rules(&g), &SIGN_IN), Reach::SignIn);
         assert_eq!(reach(&service("db"), &peers[0], tv, &rules(&g), &NO_SIGN_IN), Reach::Denied);
         assert_eq!(reach(&service("db"), &peers[0], &peers[2], &rules(&g), &SIGN_IN), Reach::Allowed, "its owner is in family");
+    }
+
+    #[test]
+    fn a_service_for_people_keeps_its_sources_and_lets_only_a_granted_group_into_443() {
+        let mut row = service("db");
+        row.always_sign_in = true;
+        let peers = peers();
+        let g = [grant("tag:ops", "infra"), grant("oidc:family", "infra")];
+        let a = service_access(&row, &peers[0], &peers, &rules(&g), &SIGN_IN);
+        assert!(a.always_sign_in && a.sign_in, "{a:?}");
+        assert_eq!(a.sources, ips(&["10.9.0.1", "10.9.0.2", "10.9.0.3"]), "its other ports stay with the grants");
+        assert_eq!(reach(&row, &peers[0], &peers[1], &rules(&g), &SIGN_IN), Reach::SignIn, "a tagged device signs in too");
+
+        // Open to everyone: open still, but `everyone` is no group to sign in with.
+        let mut web = service("web");
+        web.always_sign_in = true;
+        let a = service_access(&web, &peers[0], &peers, &rules(&[grant("everyone", "default")]), &SIGN_IN);
+        assert!(a.open && a.always_sign_in && !a.sign_in, "{a:?}");
+        assert!(always_sign_in_notice(&a, &SIGN_IN).unwrap().contains("no oidc: group"));
+        let a = service_access(&web, &peers[0], &peers, &rules(&[grant("everyone", "default"), grant("oidc:family", "default")]), &SIGN_IN);
+        assert!(a.open && a.sign_in && a.sign_in_groups == ["family"], "{a:?}");
+        assert_eq!(always_sign_in_notice(&a, &SIGN_IN), None);
+    }
+
+    #[test]
+    fn a_service_for_people_that_nobody_can_sign_in_to_says_why() {
+        let mut row = service("db");
+        row.always_sign_in = true;
+        let peers = peers();
+        let g = [grant("oidc:family", "infra")];
+        let why = |facts: &SignInFacts| {
+            let a = service_access(&row, &peers[0], &peers, &rules(&g), facts);
+            always_sign_in_notice(&a, facts)
+        };
+        assert!(why(&NO_SIGN_IN).unwrap().contains("no sign-in"));
+        assert!(why(&SignInFacts { owner_capable: false, ..SIGN_IN }).unwrap().contains("terminator"));
+        assert!(why(&SignInFacts { terminated: false, ..SIGN_IN }).unwrap().contains("TLS"));
+        assert_eq!(why(&SIGN_IN), None);
+        assert_eq!(always_sign_in_notice(&service_access(&service("db"), &peers[0], &peers, &rules(&g), &NO_SIGN_IN), &NO_SIGN_IN), None, "only when asked for");
     }
 
     #[test]

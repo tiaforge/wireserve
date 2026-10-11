@@ -15,6 +15,9 @@ pub enum IpcRequest {
         ports: Vec<PortMap>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group: Option<String>,
+        /// Its backend reads the identity headers (PLAN.md #326).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        always_sign_in: bool,
     },
     Unserve { name: String },
     /// This node's live opt-in to carry transit traffic for other mesh
@@ -63,6 +66,9 @@ pub struct LocalServiceView {
     /// coordinator did not say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reach: Option<wireserve_types::Reach>,
+    /// This node declared it for people only (PLAN.md #326).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub always_sign_in: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -180,7 +186,7 @@ mod tests {
 
     #[test]
     fn request_roundtrips_through_json() {
-        let req = IpcRequest::Serve { name: "plex".into(), ports: vec!["443:32400".parse().unwrap()], group: None };
+        let req = IpcRequest::Serve { name: "plex".into(), ports: vec!["443:32400".parse().unwrap()], group: None, always_sign_in: true };
         let json = serde_json::to_string(&req).unwrap();
         let back: IpcRequest = serde_json::from_str(&json).unwrap();
         match back {

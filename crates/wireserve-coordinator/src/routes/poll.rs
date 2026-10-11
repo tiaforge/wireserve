@@ -415,8 +415,6 @@ async fn answer(
     if changed {
         state.directory.refresh_node(&conn, &state, node.id)?;
     }
-    let seen: std::collections::HashSet<std::net::Ipv4Addr> =
-        req.callers_seen.iter().take(wireserve_types::MAX_CALLERS_SEEN_PER_POLL).copied().collect();
     let have = req.directory;
     // A whole directory is the expensive answer. Only so many at once: a
     // fleet that restarts together, or a coordinator that does, would
@@ -429,16 +427,6 @@ async fn answer(
         None
     } else {
         Some(FullTurn::take(&state, node.id)?)
-    };
-    let owners = {
-        let env = crate::directory_state::Env::of(&state);
-        let dir = state.directory.read();
-        let ctx = dir.context(&env);
-        if !seen.is_empty() && own_rows.iter().any(|r| ctx.terminates(r)) {
-            crate::db::owners::all(&conn)?
-        } else {
-            Vec::new()
-        }
     };
     drop(conn);
     let building = build_permit(&state).await?;
@@ -570,49 +558,19 @@ async fn answer(
         // (PLAN.md #315): its address is in phone configs exported while it was
         // approved, and the node's firewall is what keeps them from the change.
         let owner_capable = sign_in_capable(&node);
+        let mut notices = outcome.notices;
         let access: Vec<wireserve_types::ServiceAccess> = own_rows
             .iter()
             .filter(|s| (s.denied_at.is_none() || s.approved_at.is_some()) && !s.is_awaiting_review())
             .map(|s| {
                 let facts = crate::access::SignInFacts { available, owner_capable, terminated: ctx.terminates(s) };
-                dir.access_for(s, &node, &facts)
+                let access = dir.access_for(s, &node, &facts);
+                if let Some(reason) = crate::access::always_sign_in_notice(&access, &facts).filter(|_| s.is_approved()) {
+                    notices.push(wireserve_types::ServiceNotice { name: s.name.clone(), reason });
+                }
+                access
             })
             .collect();
-
-        // Who owns the devices its terminator lets in by their grants (PLAN.md
-        // M38), so it can name them to its backends: those allowed into any of
-        // its terminated services — every device, when one is open — and that
-        // the node says have connected to it. Without the second, a node with
-        // one open service would be told every owner's subject, e-mail address
-        // and groups; a node that lies about who came still gets no more than
-        // it asks for, one device at a time, each logged the first time.
-        let terminated: Vec<&wireserve_types::ServiceAccess> = access
-            .iter()
-            .filter(|a| own_rows.iter().any(|r| r.name == a.name && ctx.terminates(r)))
-            .collect();
-        let identities = if terminated.is_empty() || seen.is_empty() {
-            Vec::new()
-        } else {
-            let every = terminated.iter().any(|a| a.open);
-            let allowed: std::collections::BTreeSet<std::net::Ipv4Addr> =
-                terminated.iter().flat_map(|a| a.sources.iter().copied()).collect();
-            let now = chrono::Utc::now();
-            owners
-                .into_iter()
-                .filter(|o| o.groups_count(now))
-                .filter_map(|o| {
-                    let device = dir.nodes.get(&o.node_id)?;
-                    let addr: std::net::Ipv4Addr = device.ip4.as_deref()?.parse().ok()?;
-                    if !seen.contains(&addr) || !(every || allowed.contains(&addr)) {
-                        return None;
-                    }
-                    if state.first_release(node.id, device.id) {
-                        tracing::info!(event = "owner_identity_released", node_name = %node.name, device = %device.name, sub = %o.sub);
-                    }
-                    Some(wireserve_types::CallerIdentity { addr, user: o.sub, email: o.email, groups: o.groups })
-                })
-                .collect()
-        };
 
         let response = PollResponse {
             stamp: Some(stamp),
@@ -631,8 +589,7 @@ async fn answer(
             mesh: Some(state.config.mesh_info()),
             naming: state.config.service_naming(),
             access,
-            service_notices: outcome.notices,
-            identities,
+            service_notices: notices,
         };
         let rest = serde_json::to_vec(&response)?;
         Ok::<_, serde_json::Error>((match shared {

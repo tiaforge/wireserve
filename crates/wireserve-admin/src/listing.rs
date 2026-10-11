@@ -41,7 +41,10 @@ pub fn services(services: &[AdminServiceInfo]) -> String {
             };
             // In `wireserve <service>` syntax, target addresses included:
             // an approver should see that a node exposes its LAN.
-            let ports = s.ports.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ");
+            let mut ports = s.ports.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ");
+            if s.always_sign_in {
+                ports.push_str(" --always-sign-in");
+            }
             let mut row = vec![clean(&s.name), clean(&s.node), state.into(), opt(s.vip4.as_deref()), ports, list(&s.groups)];
             let mut note = s.denied_reason.as_deref().map(clean).unwrap_or_default();
             // Waiting again (PLAN.md #315): what the approval was given to.
@@ -372,6 +375,7 @@ mod tests {
             denied_reason: None,
             approved_ports: vec![],
             groups: vec!["default".into()],
+            always_sign_in: false,
             dns: None,
         }
     }

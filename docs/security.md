@@ -8,8 +8,8 @@ that lets a node do, and what it does not:
 | Sees | The whole directory: every node's name, mesh addresses, public endpoint and LAN address, and every approved service's name and ports (a service's LAN target address is left out). Do not join a machine that should not learn where the others are. |
 | Reports, unchecked | Its own endpoint, LAN and reflexive addresses. The coordinator checks their form, not their truth, so a node can make its peers send WireGuard handshake packets to addresses it names — one small fixed packet per attempt, including to addresses on the peer's own LAN. It gains no access by it. |
 | Declares services | Nothing is published without an admin's approval (the default), and only 16 may be waiting or denied at a time. An approval covers the service's target addresses and whether it answers on 443; adding either waits for approval again. A name is first come, first served; another node's name, the coordinator's own and `WIRESERVE_RESERVED_SERVICE_NAMES` cannot be taken. |
-| Owns an approved service on 443 | A real certificate for the name, and every request made to it and the cookies in them — the sign-in's session for that service among them, which it can use there and nowhere else (see [Signing in](access-control.md#signing-in-for-shared-devices)). And who owns the devices its grants let in — subject, e-mail address and groups — for each device it says has called it: the coordinator cannot check that one did, so a node that lies can ask about every such device, a few hundred a poll (each first answer is logged as `owner_identity_released`). For a service in `default`, that is every claimed device. Approve such a service the way you would hand someone a login page. |
-| Cannot | Carry other nodes' traffic (transit and exit each need an admin's approval and the node's own opt-in), change groups, grants, tags or owners, publish a DNS record the zone already holds, or be told who owns any device while it has no approved service on 443. |
+| Owns an approved service on 443 | A real certificate for the name, and every request made to it and the cookies in them — the sign-in's session for that service among them, which it can use there and nowhere else (see [Signing in](access-control.md#signing-in-for-shared-devices)). Who is calling only when they sign in to it: subject, e-mail address and groups, of the people who do — its backend is told them only when the node declared it `--always-sign-in`. Approve such a service the way you would hand someone a login page. |
+| Cannot | Carry other nodes' traffic (transit and exit each need an admin's approval and the node's own opt-in), change groups, grants, tags or owners, publish a DNS record the zone already holds, or be told who owns a device. |
 
 Two more things to know about a machine that runs an agent:
 
@@ -18,10 +18,11 @@ Two more things to know about a machine that runs an agent:
   approval then publishes to the mesh), withdraw one, `leave`, and switch transit
   and exit on. Treat membership as administering the node's network; give it to
   the people who could `sudo` anyway.
-- **Identity is the device's.** Whoever can send packets from a node — another
-  local user, a container — acts with its grants and, if it is claimed, its
-  owner's identity headers. On a machine several people use, tag the machine
-  for what all of them may use, and leave the rest to each service's own login.
+- **Access is the device's.** Whoever can send packets from a node — another
+  local user, a container — acts with its grants. A device names nobody to a
+  backend, claimed or not: only a sign-in does. On a machine several people
+  use, tag the machine for what all of them may use, and leave the rest to the
+  sign-in or each service's own login.
 
 And on the coordinator: there is one database connection behind one lock, so
 what a node does inside its allowance (`WIRESERVE_POLL_RATE_*`, the pending

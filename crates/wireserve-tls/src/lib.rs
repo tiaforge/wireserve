@@ -123,12 +123,9 @@ pub async fn run(opts: Options) -> Result<(), Error> {
             .filter(|s| issuance.get(&s.service.fqdn).and_then(|i| i.cert.as_ref()).is_some_and(|c| c.valid_at(SystemTime::now())))
             .map(|s| s.service.name.clone())
             .collect();
-        let seen = shared.take_seen();
-        let config = match link.check_in(serving, port, seen.clone()).await {
+        let config = match link.check_in(serving, port).await {
             Ok(c) => c,
             Err(e) => {
-                // Still to be told next time.
-                shared.note_seen(seen);
                 tracing::warn!(error = %e, "could not check in with the agent; keeping what is served");
                 continue;
             }
@@ -334,7 +331,7 @@ fn update_callers(callers: &Callers, config: &TlsConfig) {
     let map = config
         .callers
         .iter()
-        .map(|c| (c.addr, serve::CallerInfo { node: c.node.clone(), owner: c.owner.clone() }))
+        .map(|c| (c.addr, serve::CallerInfo { node: c.node.clone() }))
         .collect();
     *callers.write().unwrap_or_else(std::sync::PoisonError::into_inner) = map;
 }

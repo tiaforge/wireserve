@@ -110,9 +110,9 @@ optional: a device nobody claimed reaches what `everyone` and its tags reach,
 as before.
 
 An owner's e-mail is kept only when the provider marks it verified, and every
-refresh takes it afresh from the provider's ID token. It reaches backends as
-the owner's e-mail header, and one that knows people by e-mail would otherwise
-take whoever typed your address into their profile for you.
+refresh takes it afresh from the provider's ID token: anything else is
+whatever someone typed into their profile, your address among the
+possibilities. The same goes for the e-mail a sign-in tells a backend.
 
 The coordinator keeps each owner's refresh token, sealed with a key it
 generated into `coordinator-secrets.env` (`WIRESERVE_OIDC_TOKEN_KEY`), and
@@ -144,12 +144,12 @@ wireserve-admin grant add oidc:family media
 A request to a service in `media`, served with TLS by its node, then goes:
 
 1. from a device a grant names — its own node, a tagged one, one whose owner
-   is in `family`: straight through, nobody asked to sign in;
+   is in `family`: straight through, nobody asked to sign in — and nobody
+   named to the backend: a device does not say who is using it;
 2. from any other device, with a session for this service: the terminator
    checks it on its own — a token the coordinator signed, made out to this
    service's name, not past its time — and one of the granted groups in it
-   lets the request through, with who it is in `X-Auth-User`, `-Email` and
-   `-Groups`; any other group gets 403;
+   lets the request through; any other group gets 403;
 3. from any other device without one: a browser is sent to the coordinator's
    `/sign-in`, which sends it on to the login server. Back from there, the
    coordinator lets only someone in one of the service's granted groups go
@@ -162,11 +162,42 @@ A request to a service in `media`, served with TLS by its node, then goes:
    Anything but a GET gets 401 instead, which a redirect would lose the body
    of.
 
-So the sign-in is never a per-service switch: a restricted service offers it
-exactly when a grant names an `oidc:` group, and a service in `default` never
-asks. While it does, the service's terminated 443 is open to every node — the
-terminator decides — and its other ports stay with the grants, so nobody
-walks round the sign-in by dialling another one.
+So a restricted service offers the sign-in exactly when a grant names an
+`oidc:` group, and a service in `default` never asks. While it does, the
+service's terminated 443 is open to every node — the terminator decides — and
+its other ports stay with the grants, so nobody walks round the sign-in by
+dialling another one.
+
+**A backend that wants to know who is calling** is declared so, on its node:
+
+```sh
+wireserve grafana 443:3000 --always-sign-in
+```
+
+Then every request to its 443 needs a session, whatever device it comes
+from — a tagged or owned one included, and its own node — and every one
+reaches the backend with who it is in `X-Auth-User`, `-Email` and `-Groups`.
+Without `--always-sign-in` no request names anyone, signed in or not: a
+backend that reads no names is sent none. It needs a granted `oidc:` group:
+`everyone` is no group anyone signs in with, and would let in every account
+the login server has. Until there is one, and the sign-in is on, nobody gets
+into its 443, and `wireserve status` on its node says why. Its other ports
+stay with the grants. Each declaration says it afresh; leave it out and the
+service is back to letting devices in.
+
+A backend that believes these headers must hear them from the terminator
+alone. A client cannot send them through it, but the backend's own port is
+something else: a container published with `-p 3000:3000` listens on every
+address of the host, where anyone on the node's LAN, or any program or
+container on the node itself, can connect and send `X-Auth-User: admin`
+themselves. Bind it to the node's mesh address: the agent closes that to the
+LAN and to containers, the mesh reaches the backend only through the
+terminator, and what is left is programs on the node itself — trust the
+node's other users no further than that. Where the app has one, set its
+trusted-proxy list to that address too (Grafana's `[auth.proxy] whitelist`);
+the terminator connects from it. A backend on another device of the LAN
+(`443:192.168.1.10:3000`) is reached from the node's LAN address, in plain
+HTTP across the LAN: trust that address alone, and only on a LAN you trust.
 
 **A session is one service's.** Its cookie (`__Host-wireserve-session`)
 belongs to that service's name alone: the browser never sends it to another
@@ -241,10 +272,9 @@ Worth knowing:
   proxying into the mesh — keeps the last entry of its `X-Forwarded-For`
   (the client its proxy saw; the terminator appends the node's own address)
   and an `X-Forwarded-Host` that is one plain host name; every other
-  caller's are still removed. Nothing about *who* is calling is ever kept,
-  and such a node's owner is never named: it speaks for someone else.
+  caller's are still removed. Nothing about *who* is calling is ever kept.
 - **Another site's page cannot act here as your device.** A terminator lets
-  a device in by its grants and names its owner, and a browser sends whatever
+  a device in by its grants, and a browser sends whatever
   any page open on it asks for through the tunnel — no cookie, so no SameSite
   rule holds it back. So a POST, PUT or DELETE, or a WebSocket, that a page on
   another site started is refused with 403; another service under the same
@@ -260,13 +290,11 @@ Worth knowing:
   fails (Bitwarden says "unexpected error"). The service's node logs
   `refused a request another site started`. A browser extension is not
   affected.
-- **A node learns who owns a device it says called it.** The identity
-  headers name the owner of a calling device; the coordinator tells a node
-  an owner's subject, e-mail and groups only for a device its grants let into
-  one of its approved services on 443, and that the node reports having
-  seen. The report is the node's word: one that lies can ask about each such
-  device, and each first answer is logged as `owner_identity_released`. The
-  first request from a device not seen in the last day may reach the backend
-  unnamed, for a second or two.
+- **A device names nobody.** Its grants let it in; they never tell a backend
+  who is using it, and no node is told who owns a device. Until PLAN.md #326
+  a node was told the owners of the devices it said had called — on its word
+  alone, so any node with an approved 443 service could ask after every
+  owner. The identity headers now come from a sign-in only: the person's own
+  browser, at that very service.
 - **A deleted node's address**, once given to a new node, keeps the old one's
   grants until the serving node's next poll.

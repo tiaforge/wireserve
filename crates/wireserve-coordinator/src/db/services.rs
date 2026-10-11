@@ -24,6 +24,9 @@ pub struct ServiceRow {
     /// #315, migration 0025). `None` on a row never approved, and on a
     /// denied one.
     pub approved_ports: Option<Vec<PortMap>>,
+    /// Its node said its backend reads the identity headers (PLAN.md #326,
+    /// migration 0027): its terminated 443 is for people who sign in.
+    pub always_sign_in: bool,
 }
 
 impl ServiceRow {
@@ -115,6 +118,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRow> {
         approved_ports: row
             .get::<_, Option<String>>("approved_ports")?
             .map(|json| serde_json::from_str(&json).unwrap_or_default()),
+        always_sign_in: row.get("always_sign_in")?,
     })
 }
 
@@ -361,7 +365,7 @@ pub fn upsert_for_node(
     let stamp = mode.stamp();
     let mut reviews = Vec::new();
     let mut grouped = false;
-    for ServiceDecl { name, ports, group } in accepted {
+    for ServiceDecl { name, ports, group, always_sign_in } in accepted {
         // `port` and `proto` are the first mapping's target, kept only
         // because the columns are NOT NULL from migration 0001; nothing
         // reads them.
@@ -369,12 +373,13 @@ pub fn upsert_for_node(
         let (port, proto) = (first.target, first.proto);
         let ports_json = serde_json::to_string(ports).expect("PortMap always serializes");
         tx.execute(
-            "INSERT INTO services (node_id, name, port, proto, ports, declared_at, approved_at, declared_group) \
-             VALUES (?1, ?2, ?3, ?4, ?7, ?5, ?6, ?8) \
+            "INSERT INTO services (node_id, name, port, proto, ports, declared_at, approved_at, declared_group, always_sign_in) \
+             VALUES (?1, ?2, ?3, ?4, ?7, ?5, ?6, ?8, ?9) \
              ON CONFLICT(name) DO UPDATE SET \
                port = excluded.port, \
                proto = excluded.proto, \
                ports = excluded.ports, \
+               always_sign_in = excluded.always_sign_in, \
                approved_at = COALESCE(services.approved_at, excluded.approved_at), \
                denied_at = CASE \
                  WHEN COALESCE(services.approved_at, excluded.approved_at) IS NULL \
@@ -383,7 +388,7 @@ pub fn upsert_for_node(
                  WHEN COALESCE(services.approved_at, excluded.approved_at) IS NULL \
                  THEN services.denied_reason ELSE NULL END \
              WHERE node_id = excluded.node_id",
-            rusqlite::params![node_id, name, port, proto.as_str(), now, stamp, ports_json, group],
+            rusqlite::params![node_id, name, port, proto.as_str(), now, stamp, ports_json, group, always_sign_in],
         )?;
         reviews.extend(review(&tx, node_id, name, mode)?);
         assign_vip(&tx, node_id, name, vip_range)?;

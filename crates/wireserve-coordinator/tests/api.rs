@@ -4128,8 +4128,8 @@ mod dns_records {
         assert_eq!(access_entry(&body, "jellyfin")["open"], Value::Null, "{body}");
     }
 
-    /// One poll that declares `jellyfin` on 443, ready, and says which
-    /// devices have connected.
+    /// One poll that declares `jellyfin` on 443, ready, and says — as agents
+    /// before PLAN.md #326 did — which devices have connected.
     async fn poll_seen(app: &TestApp, bearer: &str, seen: &[&str]) -> Value {
         poll_full(
             &app.router,
@@ -4145,83 +4145,52 @@ mod dns_records {
     }
 
     #[tokio::test]
-    async fn a_terminating_node_learns_who_owns_the_devices_it_lets_in_and_that_have_connected() {
+    async fn a_service_for_people_is_its_nodes_to_declare_and_says_when_nobody_can_sign_in() {
+        // PLAN.md #326: the node knows whether its backend reads the
+        // identity headers; saying so only ever narrows who gets in.
+        let fake = Arc::new(FakeDns::default());
+        let app = app(&fake);
+        let home = node(&app, "home").await;
+        let decl = |always: bool| json!({ "services": [{"name": "grafana", "ports": [{"public": 443, "target": 3000, "proto": "tcp"}], "always_sign_in": always}], "tls_ready": ["grafana"] });
+
+        let body = poll_full(&app.router, &home, decl(true)).await.1;
+        let access = access_entry(&body, "grafana");
+        assert_eq!((&access["always_sign_in"], &access["sign_in"]), (&json!(true), &Value::Null), "{body}");
+        let notice = body["service_notices"].as_array().unwrap().iter().find(|n| n["name"] == "grafana").expect("told why");
+        assert!(notice["reason"].as_str().unwrap().contains("--always-sign-in: nobody gets into its 443"), "{notice}");
+        let req = json_request("GET", "/admin/services", Some(ADMIN), json!({}));
+        let list = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
+        let row = list["services"].as_array().unwrap().iter().find(|s| s["name"] == "grafana").unwrap().clone();
+        assert_eq!(row["always_sign_in"], json!(true), "{row}");
+
+        // Declared again without it: gone, at once — not remembered from before.
+        let body = poll_full(&app.router, &home, decl(false)).await.1;
+        assert_eq!(access_entry(&body, "grafana").get("always_sign_in"), None, "{body}");
+        assert!(body.get("service_notices").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn no_node_is_told_who_owns_a_device() {
+        // PLAN.md #326: a node said which devices had called, and was told
+        // their owners — on its word alone. Whoever a backend should know
+        // about signs in; a device names nobody.
         let fake = Arc::new(FakeDns::default());
         let app = app(&fake);
         let home = node(&app, "home").await;
         let _laptop = node(&app, "laptop").await;
-        let _tv = node(&app, "tv").await;
         own(&app, "laptop", "alice", &["family"]).await;
-        own(&app, "tv", "bob", &["guests"]).await;
+        let laptop = address_of(&poll_seen(&app, &home, &[]).await, "laptop");
+
+        // Open to everyone, then restricted to the owner's group.
+        let body = poll_seen(&app, &home, &[&laptop]).await;
+        assert_eq!(access_entry(&body, "jellyfin")["open"], json!(true), "{body}");
+        assert!(!body.to_string().contains("alice"), "{body}");
         admin_call(&app.router, "POST", "/admin/groups", json!({"name": "media"})).await;
         admin_call(&app.router, "PUT", "/admin/groups/media/services/jellyfin", json!(null)).await;
         admin_call(&app.router, "POST", "/admin/grants", json!({"source": "oidc:family", "group": "media"})).await;
-
-        // Nothing terminated yet: nobody's identity, whoever connected.
-        let body = poll_full(&app.router, &home, json!({ "services": [svc("jellyfin", 443, 8096)], "callers_seen": ["100.90.0.2"] })).await.1;
-        assert!(body.get("identities").is_none(), "{body}");
-        let (laptop, tv) = (address_of(&body, "laptop"), address_of(&body, "tv"));
-
-        // Terminated, and nobody has connected: nobody's identity either.
-        let body = poll_seen(&app, &home, &[]).await;
-        assert!(body.get("identities").is_none(), "{body}");
-
-        // The laptop connected: alice, and only her — bob's tv is not let in,
-        // and a device never named is not looked for.
         let body = poll_seen(&app, &home, &[&laptop]).await;
-        let ids = body["identities"].as_array().expect("identities for a terminating node");
-        assert_eq!(ids.len(), 1, "{body}");
-        assert_eq!(ids[0]["user"], "alice");
-        assert_eq!(ids[0]["groups"], json!(["family"]));
-
-        let body = poll_seen(&app, &home, &[&laptop, &tv, "100.90.0.99"]).await;
-        assert_eq!(body["identities"].as_array().unwrap().len(), 1, "the tv is seen but not let in: {body}");
-    }
-
-    #[tokio::test]
-    async fn an_open_service_does_not_hand_its_node_every_owner() {
-        let fake = Arc::new(FakeDns::default());
-        let app = app(&fake);
-        let home = node(&app, "home").await;
-        let _laptop = node(&app, "laptop").await;
-        let _tv = node(&app, "tv").await;
-        own(&app, "laptop", "alice", &["admins"]).await;
-        own(&app, "tv", "bob", &["family"]).await;
-
-        // `jellyfin` is in `default`, which everyone reaches: any device may
-        // call, so any owner may be named — once its device has.
-        let body = poll_seen(&app, &home, &[]).await;
-        assert!(body.get("identities").is_none(), "no owner is told to a node no device has visited: {body}");
-        let tv = address_of(&body, "tv");
-        let body = poll_seen(&app, &home, &[&tv]).await;
-        let ids = body["identities"].as_array().expect("the visiting device's owner");
-        assert_eq!((ids.len(), ids[0]["user"].as_str()), (1, Some("bob")), "{body}");
-    }
-
-    #[tokio::test]
-    async fn a_service_nobody_approved_names_no_owner_whatever_its_node_says() {
-        // Security audit 2026-10-11: a pending service can have no
-        // certificate, so a node calling one ready is lying — and with it,
-        // and devices it says called, it was told every owner.
-        let fake = Arc::new(FakeDns::default());
-        let mut config = test_config("");
-        config.service_domain = Some("int.example.com".into());
-        config.require_service_approval = true;
-        let app = app_with_dns(config, Some(fake.clone() as Arc<dyn DnsWriter>));
-        let home = node(&app, "home").await;
-        let _laptop = node(&app, "laptop").await;
-        own(&app, "laptop", "alice", &["admins"]).await;
-
-        let body = poll_seen(&app, &home, &[]).await;
-        assert!(body["pending_services"].as_array().unwrap().iter().any(|s| s["name"] == "jellyfin"), "{body}");
-        let laptop = address_of(&body, "laptop");
-        let body = poll_seen(&app, &home, &[&laptop]).await;
-        assert!(body.get("identities").is_none(), "a pending service released an owner: {body}");
-
-        // Approved, the same report is believed.
-        admin_call(&app.router, "POST", "/admin/nodes/home/services/jellyfin/approve", json!(null)).await;
-        let body = poll_seen(&app, &home, &[&laptop]).await;
-        assert_eq!(body["identities"][0]["user"], "alice", "{body}");
+        assert!(access_entry(&body, "jellyfin")["sources"].as_array().unwrap().contains(&json!(laptop)), "{body}");
+        assert!(!body.to_string().contains("alice"), "{body}");
     }
 
     #[tokio::test]

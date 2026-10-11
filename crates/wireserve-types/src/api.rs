@@ -333,10 +333,6 @@ pub const MAX_TLS_READY_PER_POLL: usize = 64;
 /// At most this many capability strings are read from one poll.
 pub const MAX_CAPABILITIES_PER_POLL: usize = 16;
 
-/// At most this many device addresses are read from one poll's
-/// `callers_seen`.
-pub const MAX_CALLERS_SEEN_PER_POLL: usize = 256;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceDecl {
     pub name: String,
@@ -348,6 +344,13 @@ pub struct ServiceDecl {
     /// an admin changes its groups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// Its backend reads who is calling from the identity headers (PLAN.md
+    /// #326): its terminated 443 lets in only people signed in with a granted
+    /// `oidc:` group, and names every one of them. Without it, no request
+    /// to the service names anyone. The node's own to say, every
+    /// declaration: it only ever narrows who gets in.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub always_sign_in: bool,
 }
 
 impl ServiceDecl {
@@ -355,7 +358,7 @@ impl ServiceDecl {
     /// [`crate::validate_service_ports`] first).
     #[must_use]
     pub fn new(name: impl Into<String>, ports: Vec<PortMap>) -> Self {
-        Self { name: name.into(), ports, group: None }
+        Self { name: name.into(), ports, group: None, always_sign_in: false }
     }
 }
 
@@ -422,14 +425,6 @@ pub struct PollRequest {
     /// had. Capped at [`MAX_TLS_READY_PER_POLL`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tls_ready: Vec<String>,
-    /// The devices (by mesh address) that have connected to this node's
-    /// terminator recently (PLAN.md M38). The coordinator names the owner
-    /// of a device to a node only once the node says the device has been
-    /// there: a node holds no directory of everyone's e-mail address and
-    /// groups on the chance one of them calls. Capped at
-    /// [`MAX_CALLERS_SEEN_PER_POLL`].
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub callers_seen: Vec<std::net::Ipv4Addr>,
     /// The listen port of this node's carry interface (PLAN.md M39), when
     /// it has one. Chosen by the kernel, so reported every poll.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -690,11 +685,6 @@ pub struct PollResponse {
     /// (PLAN.md M36). A declaration with a notice may not be published.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub service_notices: Vec<crate::ServiceNotice>,
-    /// Who owns the devices that may reach THIS node's terminated services
-    /// (PLAN.md M38), for its terminator to tell its backends. Only to a
-    /// node with a terminated service, and only those devices.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub identities: Vec<crate::CallerIdentity>,
     /// THIS node's own declarations awaiting approval — never anyone
     /// else's.
     ///
@@ -753,6 +743,9 @@ pub struct AdminServiceInfo {
     /// re-declare.
     #[serde(default)]
     pub groups: Vec<String>,
+    /// Its node declared it for people only (PLAN.md #326).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub always_sign_in: bool,
     /// Where the service's public DNS record stands (PLAN.md M32). Absent
     /// when the coordinator publishes no records, or this service has no
     /// public name.
@@ -1110,7 +1103,6 @@ mod tests {
             naming: None,
             access: vec![],
             service_notices: vec![],
-            identities: vec![],
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("pending_services"), "{json}");
@@ -1168,7 +1160,6 @@ mod tests {
             naming: None,
             access: vec![],
             service_notices: vec![],
-            identities: vec![],
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: PollResponse = serde_json::from_str(&json).unwrap();

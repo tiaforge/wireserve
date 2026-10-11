@@ -100,6 +100,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
             pending: pending_names.contains(s.name.as_str()),
             terminated: s.terminated,
             reach: s.reach,
+            always_sign_in: state.declared_services.iter().any(|d| d.name == s.name && d.always_sign_in),
         })
         .collect();
 
@@ -123,7 +124,8 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
                 pending: pending_names.contains(d.name.as_str()),
                 terminated: false,
                 // Its own: the coordinator says so too, once it is listed.
-                reach: Some(wireserve_types::Reach::Allowed),
+                reach: Some(if d.always_sign_in { wireserve_types::Reach::SignIn } else { wireserve_types::Reach::Allowed }),
+                always_sign_in: d.always_sign_in,
             });
         }
     }
@@ -159,7 +161,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
 /// shutdown (from `leave`) should be signalled after it's sent.
 async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
     match req {
-        IpcRequest::Serve { name, ports, group } => {
+        IpcRequest::Serve { name, ports, group, always_sign_in } => {
             if !wireserve_types::is_valid_dns_label(&name) {
                 return (
                     IpcResponse::error(format!("invalid service name: {name}")),
@@ -171,6 +173,13 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
             }
             if let Err(e) = wireserve_types::validate_service_ports(&ports) {
                 return (IpcResponse::error(e), false);
+            }
+            // The sign-in is the terminator's, and the terminator serves 443.
+            if always_sign_in && !ports.iter().any(wireserve_types::is_tls_map) {
+                return (
+                    IpcResponse::error("--always-sign-in is for a service on TCP 443, which is where people sign in".to_string()),
+                    false,
+                );
             }
             let mut state = ctx.state.lock().await;
             // A target address inside the mesh (PLAN.md M26) would be
@@ -257,6 +266,7 @@ async fn dispatch(ctx: &AgentContext, req: IpcRequest) -> (IpcResponse, bool) {
             state.pending_services.retain(|n| n != &name);
             let mut decl = ServiceDecl::new(name, ports);
             decl.group = group;
+            decl.always_sign_in = always_sign_in;
             state.declared_services.push(decl);
             match state.save(&ctx.state_path) {
                 Ok(()) => (IpcResponse::Ok, false),
@@ -630,6 +640,7 @@ mod tests {
                 name: "plex".into(),
                 ports: vec![],
                 group: None,
+                always_sign_in: false,
             });
             state.pending_services.push("plex".into());
         }
@@ -650,6 +661,7 @@ mod tests {
                 name: "plex".into(),
                 ports: vec![],
                 group: None,
+                always_sign_in: false,
             });
             // Approval is observed as the name leaving pending_services.
         }
@@ -657,6 +669,31 @@ mod tests {
         let view = build_list_view(&ctx, &*ctx.state.lock().await);
         assert_eq!(view.services.len(), 1);
         assert!(!view.services[0].pending);
+    }
+
+    #[tokio::test]
+    async fn a_service_for_people_is_one_on_443_and_is_kept_with_its_declaration() {
+        let (ctx, _dir, _rx) = test_ctx();
+        let serve = |ports: &[&str], always_sign_in: bool| IpcRequest::Serve {
+            name: "grafana".into(),
+            ports: ports.iter().map(|p| p.parse().unwrap()).collect(),
+            group: None,
+            always_sign_in,
+        };
+        let (resp, _) = dispatch(&ctx, serve(&["80:3000"], true)).await;
+        assert!(matches!(resp, IpcResponse::Error { ref message } if message.contains("443")), "{resp:?}");
+        assert!(ctx.state.lock().await.declared_services.is_empty());
+
+        let (resp, _) = dispatch(&ctx, serve(&["443:3000"], true)).await;
+        assert!(matches!(resp, IpcResponse::Ok));
+        assert!(ctx.state.lock().await.declared_services[0].always_sign_in);
+        let view = build_list_view(&ctx, &*ctx.state.lock().await);
+        assert!(view.services[0].always_sign_in);
+
+        // Every declaration says it afresh.
+        let (resp, _) = dispatch(&ctx, serve(&["443:3000"], false)).await;
+        assert!(matches!(resp, IpcResponse::Ok));
+        assert!(!ctx.state.lock().await.declared_services[0].always_sign_in);
     }
 
     #[tokio::test]
@@ -672,7 +709,7 @@ mod tests {
 
         let (resp, _) = dispatch(
             &ctx,
-            IpcRequest::Serve { name: "plex".into(), ports: vec!["32400".parse().unwrap()], group: None },
+            IpcRequest::Serve { name: "plex".into(), ports: vec!["32400".parse().unwrap()], group: None, always_sign_in: false },
         )
         .await;
         assert!(matches!(resp, IpcResponse::Ok));
@@ -722,6 +759,7 @@ mod tests {
                 name: "plex".into(),
                 ports: vec![],
                 group: None,
+                always_sign_in: false,
             });
         }
 
@@ -762,7 +800,7 @@ mod tests {
     #[tokio::test]
     async fn a_command_name_declared_before_it_was_reserved_can_still_change() {
         let (ctx, _dir, _rx) = test_ctx();
-        ctx.state.lock().await.declared_services.push(ServiceDecl { name: "status".into(), ports: vec![], group: None });
+        ctx.state.lock().await.declared_services.push(ServiceDecl { name: "status".into(), ports: vec![], group: None, always_sign_in: false });
         let (resp, _) = dispatch(&ctx, serve_req("status", &["80"])).await;
         assert!(matches!(resp, IpcResponse::Ok), "{resp:?}");
     }
@@ -804,7 +842,7 @@ mod tests {
 
     fn serve_req(name: &str, ports: &[&str]) -> IpcRequest {
         let ports: Vec<PortMap> = ports.iter().map(|p| p.parse().unwrap()).collect();
-        IpcRequest::Serve { name: name.into(), ports, group: None }
+        IpcRequest::Serve { name: name.into(), ports, group: None, always_sign_in: false }
     }
 
     #[tokio::test]

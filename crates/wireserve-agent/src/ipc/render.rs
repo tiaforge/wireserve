@@ -46,7 +46,11 @@ fn service_row(s: &LocalServiceView, domain: Option<&str>) -> Vec<String> {
         Some(d) => format!("{}.{}", clean(&s.name), clean(d)),
         None => format!("{}.wg", clean(&s.name)),
     };
-    vec![host, address, ports(&maps), node, service_state(s).into(), service_access(s).into()]
+    let mut ports = ports(&maps);
+    if s.always_sign_in {
+        ports.push_str(" --always-sign-in");
+    }
+    vec![host, address, ports, node, service_state(s).into(), service_access(s).into()]
 }
 
 /// This node's own name for whichever peer `view.peers` lists under
@@ -269,6 +273,7 @@ mod tests {
             pending: false,
             terminated: false,
             reach: Some(Reach::Allowed),
+            always_sign_in: false,
         }
     }
 

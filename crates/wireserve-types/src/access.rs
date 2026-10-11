@@ -138,6 +138,13 @@ pub struct ServiceAccess {
     /// The identity provider's groups granted this service.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sign_in_groups: Vec<String>,
+    /// Its terminated 443 is for people only
+    /// (`WIRESERVE_ALWAYS_SIGN_IN_SERVICES`): every request needs a session
+    /// with one of `sign_in_groups`, and no device's grants let one in
+    /// without — so its backend is always told who is calling. Its other
+    /// ports stay with `open` and `sources`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub always_sign_in: bool,
 }
 
 /// What one node gets at another node's service (PLAN.md M45): the answer
@@ -154,21 +161,6 @@ pub enum Reach {
     SignIn,
     /// Nothing gets through.
     Denied,
-}
-
-/// The person a calling device belongs to (PLAN.md M38), for a terminator
-/// to name to its backends when the device's own grants let it in.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CallerIdentity {
-    /// The device's mesh address.
-    pub addr: Ipv4Addr,
-    /// The owner's subject at the identity provider — the same user a
-    /// sign-in names them as.
-    pub user: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub email: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub groups: Vec<String>,
 }
 
 /// Something about a node's own declaration the node should know, but that
@@ -202,7 +194,7 @@ mod tests {
 
     #[test]
     fn an_open_service_is_small_on_the_wire() {
-        let open = ServiceAccess { name: "web".into(), open: true, sources: vec![], sign_in: false, sign_in_groups: vec![] };
+        let open = ServiceAccess { name: "web".into(), open: true, ..ServiceAccess::default() };
         assert_eq!(serde_json::to_value(&open).unwrap(), serde_json::json!({"name": "web", "open": true}));
         let closed: ServiceAccess = serde_json::from_value(serde_json::json!({"name": "db"})).unwrap();
         assert!(!closed.open && closed.sources.is_empty(), "missing fields read as closed");

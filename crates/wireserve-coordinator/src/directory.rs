@@ -165,6 +165,7 @@ pub fn admin_service_info(service: &ServiceRow, owner: &NodeRow, groups: Vec<Str
             Vec::new()
         },
         groups,
+        always_sign_in: service.always_sign_in,
         dns: None,
     }
 }
@@ -235,6 +236,7 @@ mod tests {
             denied_at: None,
             denied_reason: None,
             approved_ports: None,
+            always_sign_in: false,
         };
         let info = service_info(&svc, &n, 180, false);
         assert!(info.online);
@@ -253,6 +255,7 @@ mod tests {
             denied_at: None,
             denied_reason: None,
             approved_ports: None,
+            always_sign_in: false,
         };
         let fanned = service_info(&svc, &n, 180, false);
         assert_eq!(fanned.ports[0].addr, None);

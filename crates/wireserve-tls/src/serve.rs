@@ -31,11 +31,10 @@ use tokio::task::JoinHandle;
 use tower::ServiceExt as _;
 use wireserve_types::tls::NODE_HEADER;
 
-/// A calling node: its name, and its owner (PLAN.md M38) if it has one.
+/// A calling node.
 #[derive(Debug, Clone)]
 pub struct CallerInfo {
     pub node: String,
-    pub owner: Option<wireserve_types::CallerIdentity>,
 }
 
 /// Mesh address → the node calling from it, shared by every listener and
@@ -79,30 +78,9 @@ pub struct Shared {
     /// Calling nodes, by name, whose `X-Forwarded-For` and
     /// `X-Forwarded-Host` are kept (`WIRESERVE_FORWARDING_NODES`, PLAN.md M43).
     pub forwarders: Arc<RwLock<Vec<String>>>,
-    /// Known devices that connected since the last check-in (PLAN.md M38):
-    /// what the agent tells the coordinator, which then names their owners
-    /// to this node and nobody else's.
-    pub seen: Arc<Mutex<std::collections::BTreeSet<Ipv4Addr>>>,
 }
 
 impl Shared {
-    /// Takes the devices seen since the last call.
-    pub fn take_seen(&self) -> Vec<Ipv4Addr> {
-        std::mem::take(&mut *self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner)).into_iter().collect()
-    }
-
-    /// Records devices as seen, up to a cap: a mesh has far fewer devices
-    /// than this.
-    pub fn note_seen(&self, addrs: impl IntoIterator<Item = Ipv4Addr>) {
-        let mut seen = self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        for a in addrs {
-            if seen.len() >= wireserve_types::MAX_CALLERS_SEEN_PER_POLL {
-                break;
-            }
-            seen.insert(a);
-        }
-    }
-
     /// The forwarding node (PLAN.md M43) calling from `addr`, if it is one.
     pub fn forwarding_node(&self, addr: IpAddr) -> Option<String> {
         let node = read(&self.callers).get(&local_v4(addr)?)?.node.clone();
@@ -555,9 +533,6 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                     let stats = Arc::clone(&stats);
                     let policy = read(&shared.policies).get(&vip).cloned();
                     let caller = caller_addr.and_then(|a| read(&shared.callers).get(&a).cloned());
-                    if let (Some(addr), Some(_)) = (caller_addr, &caller) {
-                        shared.note_seen([addr]);
-                    }
                     let sign_in = read(&shared.sign_in).clone();
                     let identity = read(&shared.identity).clone();
                     let strip = read(&shared.strip).clone();
@@ -627,10 +602,7 @@ pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, 
                         let mut req = req.map(Body::new);
                         // As the client asked, for asking again while it is open.
                         let asked = upgrade.then(|| Arc::new(as_asked(&req)));
-                        // A forwarding node speaks for someone else: its owner
-                        // says nothing about who is calling (PLAN.md M43).
-                        let owner = if forwarder { None } else { caller.and_then(|c| c.owner) };
-                        let set_cookie = match guard(&mut req, sign_in.as_deref(), &policy, caller_addr, owner.as_ref(), &identity).await {
+                        let set_cookie = match guard(&mut req, sign_in.as_deref(), &policy, caller_addr, &identity).await {
                             Err(denied) => return Ok(*denied),
                             Ok(set_cookie) => set_cookie,
                         };
@@ -712,11 +684,10 @@ async fn still_admitted(shared: &Shared, vip: Ipv4Addr, caller_addr: Option<Ipv4
     if !for_this_service(asked, &policy.fqdn) {
         return false;
     }
-    let owner = caller_addr.and_then(|a| read(&shared.callers).get(&a).cloned()).and_then(|c| c.owner);
     let sign_in = read(&shared.sign_in).clone();
     let identity = read(&shared.identity).clone();
     let mut req = as_asked(asked).map(|()| Body::empty());
-    match guard(&mut req, sign_in.as_deref(), &policy, caller_addr, owner.as_ref(), &identity).await {
+    match guard(&mut req, sign_in.as_deref(), &policy, caller_addr, &identity).await {
         Ok(_) => true,
         Err(denied) => denied.status().is_server_error(),
     }
@@ -772,31 +743,34 @@ fn without_port(host: &str) -> &str {
 /// 1. Identity headers a client sent are removed, always, and so is the
 ///    sign-in's cookie: no backend needs it.
 /// 2. An open service, or a caller whose node the grants name, goes on —
-///    with its owner named, if it has one (PLAN.md M38).
+///    unnamed: a device says nothing about who is using it. Not on a
+///    service that is for people only (`always_sign_in`, PLAN.md #326).
 /// 3. Anyone else, where the grants name groups a sign-in can prove, is
-///    asked about: signed in with one of them, on — with who they are;
-///    signed in without, 403; not signed in, sent to sign in.
+///    asked about: signed in with one of them, on; signed in without, 403;
+///    not signed in, sent to sign in. Who they are goes to the backend in
+///    the identity headers only on a service for people only, whose node
+///    said its backend reads them.
 /// 4. Anyone else is refused with 403.
 async fn guard(
     req: &mut Request<Body>,
     sign_in: Option<&crate::sign_in::SignIn>,
     policy: &Policy,
     caller: Option<Ipv4Addr>,
-    owner: Option<&wireserve_types::CallerIdentity>,
     identity: &wireserve_types::IdentityHeaders,
 ) -> Result<Option<HeaderValue>, Box<axum::response::Response>> {
     use axum::http::StatusCode;
     crate::sign_in::strip_identity(req.headers_mut(), identity);
     let access = &policy.access;
-    let by_device = access.open || caller.is_some_and(|c| access.sources.contains(&c));
+    let by_device = !access.always_sign_in && (access.open || caller.is_some_and(|c| access.sources.contains(&c)));
     let mut set_cookie = None;
-    if by_device {
-        if let Some(owner) = owner {
-            name(req.headers_mut(), &owner.user, owner.email.as_deref(), &owner.groups, identity);
-        }
-    } else {
+    if !by_device {
         if !access.sign_in {
-            return Err(Box::new(crate::sign_in::plain(StatusCode::FORBIDDEN, "this device may not reach this service")));
+            let why = if access.always_sign_in {
+                "this service is for people who sign in, and no sign-in is offered for it"
+            } else {
+                "this device may not reach this service"
+            };
+            return Err(Box::new(crate::sign_in::plain(StatusCode::FORBIDDEN, why)));
         }
         let Some(si) = sign_in else {
             return Err(Box::new(crate::sign_in::plain(StatusCode::SERVICE_UNAVAILABLE, "this service's sign-in is not set up here yet")));
@@ -806,7 +780,11 @@ async fn guard(
                 if !session.groups.iter().any(|g| access.sign_in_groups.contains(g)) {
                     return Err(Box::new(crate::sign_in::plain(StatusCode::FORBIDDEN, "signed in, but not allowed here")));
                 }
-                name(req.headers_mut(), &session.sub, session.email.as_deref(), &session.groups, identity);
+                // Only to a backend its node said reads them (PLAN.md #326):
+                // any other is told nothing it has no use for.
+                if access.always_sign_in {
+                    name(req.headers_mut(), &session.sub, session.email.as_deref(), &session.groups, identity);
+                }
                 set_cookie = renewed;
             }
             crate::sign_in::Verdict::Deny(answer) => return Err(Box::new(answer)),
@@ -816,8 +794,7 @@ async fn guard(
     Ok(set_cookie)
 }
 
-/// Tells the backend who is calling — the device's owner, or whoever
-/// signed in — in the identity headers.
+/// Tells the backend who signed in, in the identity headers.
 fn name(headers: &mut HeaderMap, user: &str, email: Option<&str>, groups: &[String], identity: &wireserve_types::IdentityHeaders) {
     let mut set = |name: &str, value: &str| {
         if let (Ok(n), Ok(v)) = (axum::http::HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) {
@@ -1094,15 +1071,15 @@ mod tests {
         let granted = Some("10.9.0.2".parse().unwrap());
         let other = Some("10.9.0.3".parse().unwrap());
         let mut req = request();
-        assert!(guard(&mut req, None, &restricted("jf.int.test", false), granted, None, &ids()).await.is_ok());
+        assert!(guard(&mut req, None, &restricted("jf.int.test", false), granted, &ids()).await.is_ok());
         assert!(req.headers().get("x-auth-user").is_none(), "a forged identity is removed for a device too");
 
-        let answer = guard(&mut request(), None, &restricted("jf.int.test", false), other, None, &ids()).await;
+        let answer = guard(&mut request(), None, &restricted("jf.int.test", false), other, &ids()).await;
         assert_eq!(answer.expect_err("refused").status(), StatusCode::FORBIDDEN, "no sign-in to try");
-        let answer = guard(&mut request(), None, &restricted("jf.int.test", false), None, None, &ids()).await;
+        let answer = guard(&mut request(), None, &restricted("jf.int.test", false), None, &ids()).await;
         assert_eq!(answer.expect_err("refused").status(), StatusCode::FORBIDDEN, "an unknown caller neither");
 
-        let answer = guard(&mut request(), None, &restricted("jf.int.test", true), other, None, &ids()).await;
+        let answer = guard(&mut request(), None, &restricted("jf.int.test", true), other, &ids()).await;
         assert_eq!(answer.expect_err("refused").status(), StatusCode::SERVICE_UNAVAILABLE, "no sign-in here yet");
     }
 
@@ -1112,7 +1089,7 @@ mod tests {
         let si = sign_in(dir.path());
         for si in [Some(&si), None] {
             let mut req = request();
-            assert!(guard(&mut req, si, &open("grafana.int.test"), None, None, &ids()).await.is_ok());
+            assert!(guard(&mut req, si, &open("grafana.int.test"), None, &ids()).await.is_ok());
             assert_eq!(req.headers().get("cookie").unwrap(), "theme=dark");
             assert!(req.headers().get("x-auth-user").is_none());
         }
@@ -1132,43 +1109,58 @@ mod tests {
         let token = crate::sign_in::tests::token;
 
         let mut req = with(&token("jf.int.test", 60, &["family", "admins"]));
-        assert_eq!(guard(&mut req, Some(&si), &restricted("jf.int.test", true), other, None, &ids()).await.ok(), Some(None));
+        assert_eq!(guard(&mut req, Some(&si), &restricted("jf.int.test", true), other, &ids()).await.ok(), Some(None));
+        assert!(req.headers().get("x-auth-user").is_none(), "in, and named to nobody: its backend reads no names");
+        assert_eq!(req.headers()["cookie"], "theme=dark", "the session stays with the terminator");
+
+        // A backend its node said reads them is told who it is.
+        let mut people = restricted("jf.int.test", true);
+        people.access.always_sign_in = true;
+        let mut req = with(&token("jf.int.test", 60, &["family", "admins"]));
+        assert_eq!(guard(&mut req, Some(&si), &people, other, &ids()).await.ok(), Some(None));
         assert_eq!(req.headers()["x-auth-user"], "anna", "not mallory");
         assert_eq!(req.headers()["x-auth-email"], "anna@example.com");
         assert_eq!(req.headers()["x-auth-groups"], "family,admins");
         assert_eq!(req.headers()["cookie"], "theme=dark", "the session stays with the terminator");
 
-        let answer = guard(&mut with(&token("jf.int.test", 60, &["admins"])), Some(&si), &restricted("jf.int.test", true), other, None, &ids()).await;
+        let answer = guard(&mut with(&token("jf.int.test", 60, &["admins"])), Some(&si), &restricted("jf.int.test", true), other, &ids()).await;
         assert_eq!(answer.expect_err("not granted").status(), StatusCode::FORBIDDEN);
-        let answer = guard(&mut with(&token("vault.int.test", 60, &["family"])), Some(&si), &restricted("jf.int.test", true), other, None, &ids()).await;
+        let answer = guard(&mut with(&token("vault.int.test", 60, &["family"])), Some(&si), &restricted("jf.int.test", true), other, &ids()).await;
         assert_eq!(answer.expect_err("another service's").status(), StatusCode::FOUND, "off to sign in");
-        let answer = guard(&mut request(), Some(&si), &restricted("jf.int.test", false), other, None, &ids()).await;
+        let answer = guard(&mut request(), Some(&si), &restricted("jf.int.test", false), other, &ids()).await;
         assert_eq!(answer.expect_err("no group to prove").status(), StatusCode::FORBIDDEN);
 
         // Past its time: renewed, and the browser told.
-        let renewed = guard(&mut with(&token("jf.int.test", -1, &["family"])), Some(&si), &restricted("jf.int.test", true), other, None, &ids()).await;
+        let renewed = guard(&mut with(&token("jf.int.test", -1, &["family"])), Some(&si), &restricted("jf.int.test", true), other, &ids()).await;
         assert!(renewed.expect("renewed").is_some_and(|c| c.to_str().unwrap().starts_with("__Host-wireserve-session=wst1.")));
     }
 
     #[tokio::test]
-    async fn a_granted_devices_owner_is_named_and_nobody_elses() {
-        let owner = wireserve_types::CallerIdentity {
-            addr: "10.9.0.2".parse().unwrap(),
-            user: "sub-alice".into(),
-            email: Some("alice@example.com".into()),
-            groups: vec!["family".into(), "admins".into()],
-        };
+    async fn a_device_names_nobody_and_a_service_for_people_asks_every_device_to_sign_in() {
+        use axum::http::StatusCode;
+        let dir = tempfile::tempdir().unwrap();
+        let si = sign_in(dir.path());
         let granted = Some("10.9.0.2".parse().unwrap());
         let mut req = request();
-        assert!(guard(&mut req, None, &restricted("jf.int.test", false), granted, Some(&owner), &ids()).await.is_ok());
-        assert_eq!(req.headers()["x-auth-user"], "sub-alice", "not mallory");
-        assert_eq!(req.headers()["x-auth-email"], "alice@example.com");
-        assert_eq!(req.headers()["x-auth-groups"], "family,admins");
+        assert!(guard(&mut req, Some(&si), &restricted("jf.int.test", true), granted, &ids()).await.is_ok());
+        assert!(req.headers().get("x-auth-user").is_none(), "a device's grants say nobody's name");
 
-        // A device the grants do not name gets no one's identity.
-        let other = Some("10.9.0.3".parse().unwrap());
+        // For people only: the granted device is asked to sign in like any other.
+        let mut people = restricted("jf.int.test", true);
+        people.access.always_sign_in = true;
+        let answer = guard(&mut request(), Some(&si), &people, granted, &ids()).await;
+        assert_eq!(answer.expect_err("asked").status(), StatusCode::FOUND, "off to sign in");
         let mut req = request();
-        assert!(guard(&mut req, None, &restricted("jf.int.test", false), other, Some(&owner), &ids()).await.is_err());
+        let token = crate::sign_in::tests::token("jf.int.test", 60, &["family"]);
+        req.headers_mut().insert("cookie", HeaderValue::from_str(&format!("__Host-wireserve-session={token}")).unwrap());
+        assert!(guard(&mut req, Some(&si), &people, granted, &ids()).await.is_ok());
+        assert_eq!(req.headers()["x-auth-user"], "anna");
+
+        // And with no sign-in offered for it, nobody gets in at all.
+        let mut closed = restricted("jf.int.test", false);
+        closed.access.always_sign_in = true;
+        let answer = guard(&mut request(), Some(&si), &closed, granted, &ids()).await;
+        assert_eq!(answer.expect_err("refused").status(), StatusCode::FORBIDDEN);
     }
 
     #[test]
@@ -1415,38 +1407,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_forwarding_nodes_owner_is_never_named() {
-        let owner = wireserve_types::CallerIdentity {
-            addr: Ipv4Addr::LOCALHOST,
-            user: "sub-tia".into(),
-            email: Some("tia@example.com".into()),
-            groups: vec!["admins".into()],
-        };
-        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream = backend.local_addr().unwrap();
-        tokio::spawn(async move {
-            let app = axum::Router::new().fallback(|h: HeaderMap| async move {
-                format!("user={}", h.get("x-auth-user").map(|v| v.to_str().unwrap()).unwrap_or(""))
-            });
-            axum::serve(backend, app).await.unwrap();
-        });
-        let (port, client, shared) = in_front_of(upstream, quick());
-        shared.callers.write().unwrap().insert(Ipv4Addr::LOCALHOST, CallerInfo { node: "edge".into(), owner: Some(owner) });
-        let ask = || async {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let mut c = tls(port, &client).await;
-            c.write_all(b"GET / HTTP/1.1\r\nhost: svc.test\r\nconnection: close\r\n\r\n").await.unwrap();
-            let mut answer = String::new();
-            c.read_to_string(&mut answer).await.unwrap();
-            answer
-        };
-        assert!(ask().await.ends_with("user=sub-tia"), "an ordinary node is named by its owner");
-        shared.forwarders.write().unwrap().push("edge".into());
-        let answer = ask().await;
-        assert!(answer.ends_with("user="), "a forwarding node speaks for someone else: {answer}");
-    }
-
-    #[tokio::test]
     async fn a_forwarding_nodes_client_reaches_the_backend_and_anyone_elses_claim_does_not() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1459,7 +1419,7 @@ mod tests {
             axum::serve(backend, app).await.unwrap();
         });
         let (port, client, shared) = in_front_of(upstream, quick());
-        shared.callers.write().unwrap().insert(Ipv4Addr::LOCALHOST, CallerInfo { node: "edge".into(), owner: None });
+        shared.callers.write().unwrap().insert(Ipv4Addr::LOCALHOST, CallerInfo { node: "edge".into() });
         let ask = || async {
             let mut c = tls(port, &client).await;
             c.write_all(b"GET / HTTP/1.1\r\nhost: svc.test\r\nx-forwarded-for: 203.0.113.9\r\nx-forwarded-host: files.example.com\r\nconnection: close\r\n\r\n").await.unwrap();
@@ -1491,18 +1451,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_device_cannot_swap_its_owners_identity_for_one_of_its_own() {
+    async fn a_device_cannot_name_anyone_or_another_node() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (port, client, shared) = in_front_of(header_echo().await, quick());
-        shared.callers.write().unwrap().insert(Ipv4Addr::LOCALHOST, CallerInfo {
-            node: "phone".into(),
-            owner: Some(wireserve_types::CallerIdentity {
-                addr: Ipv4Addr::LOCALHOST,
-                user: "anna".into(),
-                email: None,
-                groups: vec!["family".into()],
-            }),
-        });
+        shared.callers.write().unwrap().insert(Ipv4Addr::LOCALHOST, CallerInfo { node: "phone".into() });
         let mut c = tls(port, &client).await;
         c.write_all(
             b"GET / HTTP/1.1\r\nhost: svc.test\r\nconnection: close, x-auth-user, x-auth-groups, x-wireserve-node\r\n\
@@ -1514,10 +1466,8 @@ mod tests {
         let mut answer = String::new();
         c.read_to_string(&mut answer).await.unwrap();
         assert!(!answer.contains('_'), "no underscore spelling reaches the backend: {answer}");
-        for line in ["\nx-auth-user=anna\n", "\nx-auth-groups=family\n", "\nx-wireserve-node=phone\n"] {
-            assert!(answer.contains(line), "{line:?} in {answer}");
-        }
-        assert!(!answer.contains("x-auth-email"), "anna has no email to name: {answer}");
+        assert!(answer.contains("\nx-wireserve-node=phone\n"), "{answer}");
+        assert!(!answer.contains("x-auth-"), "nobody is named: {answer}");
     }
 
     #[tokio::test]
@@ -1532,7 +1482,7 @@ mod tests {
         assert_eq!(cookies, ["theme=dark; __Host-wireserve-session=s3cret; auth_tokens=abc"]);
 
         // And the sign-in's cookie still comes out of the joined header.
-        assert!(guard(&mut req, None, &open("observe.int.test"), None, None, &ids()).await.is_ok());
+        assert!(guard(&mut req, None, &open("observe.int.test"), None, &ids()).await.is_ok());
         let cookies: Vec<_> = req.headers().get_all("cookie").iter().collect();
         assert_eq!(cookies, ["theme=dark; auth_tokens=abc"]);
     }
@@ -1734,27 +1684,6 @@ mod tests {
         assert!(client.connect(rustls_pki_types::ServerName::try_from("svc.test").unwrap(), tcp).await.is_err());
     }
 
-    #[tokio::test]
-    async fn only_known_devices_that_connected_are_reported_as_seen() {
-        let (port, client, shared) = limited_shared(quick()).await;
-        // 127.0.0.1 is nobody the agent named: not a device to report.
-        let mut c = tls(port, &client).await;
-        assert!(get(&mut c, "/").await.ends_with("ok"));
-        assert!(shared.take_seen().is_empty());
-
-        shared.callers.write().unwrap().insert(
-            Ipv4Addr::LOCALHOST,
-            CallerInfo { node: "laptop".into(), owner: None },
-        );
-        let mut c = tls(port, &client).await;
-        assert!(get(&mut c, "/").await.ends_with("ok"));
-        assert_eq!(shared.take_seen(), vec![Ipv4Addr::LOCALHOST]);
-        assert!(shared.take_seen().is_empty(), "taken once");
-
-        shared.note_seen((0..=255u8).flat_map(|a| (0..=3u8).map(move |b| Ipv4Addr::new(10, 9, b, a))));
-        assert_eq!(shared.take_seen().len(), wireserve_types::MAX_CALLERS_SEEN_PER_POLL, "capped");
-    }
-
     // ---- WebSockets (PLAN.md M42) ----
 
     use futures_util::{SinkExt as _, StreamExt as _};
@@ -1869,7 +1798,7 @@ mod tests {
     async fn a_websocket_cannot_swap_the_callers_name_for_one_of_its_own() {
         use tungstenite::client::IntoClientRequest;
         let (port, client, shared) = in_front_of(ws_backend().await, quick());
-        shared.callers.write().unwrap().insert(Ipv4Addr::LOCALHOST, CallerInfo { node: "phone".into(), owner: None });
+        shared.callers.write().unwrap().insert(Ipv4Addr::LOCALHOST, CallerInfo { node: "phone".into() });
         let mut req = "wss://svc.test/socket".into_client_request().unwrap();
         req.headers_mut().insert("connection", "Upgrade, x-wireserve-node".parse().unwrap());
         req.headers_mut().insert("x_wireserve_node", "admin-laptop".parse().unwrap());
@@ -1954,7 +1883,7 @@ mod tests {
     }
 
     fn forwarding(shared: &Shared) {
-        shared.callers.write().unwrap().insert(Ipv4Addr::LOCALHOST, CallerInfo { node: "edge".into(), owner: None });
+        shared.callers.write().unwrap().insert(Ipv4Addr::LOCALHOST, CallerInfo { node: "edge".into() });
         shared.forwarders.write().unwrap().push("edge".into());
     }
 

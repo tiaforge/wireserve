@@ -545,10 +545,9 @@ browser by a cookie; the pages forbid framing, scripts and caching. The owner's
 refresh token is sealed (XChaCha20-Poly1305, key in `coordinator-secrets.env`,
 the node as associated data) and exchanged every refresh interval for current
 groups: `invalid_grant` ends the ownership, other failures leave the groups
-counting for an hour. Revoke and rejoin clear the owner. A node with
-terminated services also gets `PollResponse.identities` — the owners of the
-devices allowed in — and its terminator names them to backends in the
-identity headers.
+counting for an hour. Revoke and rejoin clear the owner. An owner's groups
+count in the grants only, on the coordinator: no node is told who owns a
+device (PLAN.md #326), and identity headers come from the sign-in alone.
 
 ### 6.2 A resolver in a full tunnel (M27)
 

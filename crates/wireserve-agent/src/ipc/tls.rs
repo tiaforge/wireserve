@@ -79,7 +79,7 @@ async fn handle(ctx: &TlsContext, stream: tokio::net::UnixStream) {
 
 async fn dispatch(ctx: &TlsContext, req: TlsRequest) -> TlsResponse {
     match req {
-        TlsRequest::CheckIn { serving, port, seen } => {
+        TlsRequest::CheckIn { serving, port } => {
             // No port, nowhere to send anything: it serves nothing.
             let serving: BTreeSet<String> = serving
                 .into_iter()
@@ -94,7 +94,6 @@ async fn dispatch(ctx: &TlsContext, req: TlsRequest) -> TlsResponse {
             ctx.link.check_in(
                 serving.into_iter().filter(|n| asked.contains(n.as_str())).collect(),
                 port,
-                &seen,
                 std::time::Instant::now(),
             );
             TlsResponse::Config(Box::new(config))
@@ -141,8 +140,7 @@ pub fn build_config(state: &AgentState) -> TlsConfig {
         .iter()
         .filter_map(|p| {
             let addr = p.ip4.parse().ok()?;
-            let owner = state.own_identities.iter().find(|i| i.addr == addr).cloned();
-            Some(Caller { addr, node: p.name.clone(), owner })
+            Some(Caller { addr, node: p.name.clone() })
         })
         .collect();
     let (Some(naming), Some(node)) = (&directory.naming, node) else {

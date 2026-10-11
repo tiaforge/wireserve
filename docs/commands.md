@@ -8,7 +8,7 @@ members of the `wireserve` group have (see [Using it without sudo](nodes.md#usin
 | --- | --- |
 | `wireserve install [url] [--instance name]` | installs the binary + systemd unit, then joins — one command, needs root. On a node that already joined, with no URL or token: upgrades and restarts the agents instead |
 | `wireserve join [url] [token]` | one-time bootstrap, generates the keypair — prompts for either if omitted |
-| `wireserve <name> <[public:][address:]target[/tcp\|/udp]>... [--group <g>]` | publish a service on its own address — on this node, or on an address it reaches; a new one in group `g` |
+| `wireserve <name> <[public:][address:]target[/tcp\|/udp]>... [--group <g>] [--always-sign-in]` | publish a service on its own address — on this node, or on an address it reaches; a new one in group `g`; `--always-sign-in` for a backend that reads the identity headers (see [access control](access-control.md#signing-in-for-shared-devices)) |
 | `wireserve <name> off` | withdraw one |
 | `wireserve transit on\|off` | opt in/out of relaying for two other nodes that can't reach each other directly (also needs `transit approve`) |
 | `wireserve exit on\|off` | opt in/out of sending the internet traffic of devices exported with `--exit` through this node (also needs `transit on` and approval) |

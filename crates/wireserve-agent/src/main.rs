@@ -16,7 +16,7 @@ use wireserve_types::{FirewallBackend, PortMap};
     version,
     about = "Joins this machine to a wireserve mesh and publishes its services",
     allow_external_subcommands = true,
-    override_usage = "wireserve [OPTIONS] <SERVICE> [PORT]... [--group GROUP]\n       \
+    override_usage = "wireserve [OPTIONS] <SERVICE> [PORT]... [--group GROUP] [--always-sign-in]\n       \
                       wireserve [OPTIONS] <SERVICE> off\n       \
                       wireserve [OPTIONS] <COMMAND>",
     after_help = SERVICE_HELP
@@ -44,7 +44,12 @@ Services:
   wireserve web 80:5080
   wireserve dns 53/udp 53/tcp
   wireserve router 443:192.168.1.1:80
-  wireserve web off";
+  wireserve grafana 443:3000 --always-sign-in
+  wireserve web off
+
+  --always-sign-in is for a backend that reads who is calling from the
+  identity headers: only people who sign in reach its 443, and each is
+  named. Without it, no request names anyone.";
 
 /// Shared by `join` and `install` — the latter does everything the former
 /// does, plus installs the binary and systemd unit around it, so both
@@ -178,7 +183,7 @@ enum Command {
 #[command(
     name = "wireserve <service>",
     no_binary_name = true,
-    override_usage = "wireserve <SERVICE> [PORT]... [--group GROUP]\n       wireserve <SERVICE> off",
+    override_usage = "wireserve <SERVICE> [PORT]... [--group GROUP] [--always-sign-in]\n       wireserve <SERVICE> off",
     after_help = SERVICE_HELP
 )]
 struct ServiceArgs {
@@ -191,6 +196,9 @@ struct ServiceArgs {
     // Only the first time: after that an admin decides its groups.
     #[arg(long, value_name = "GROUP")]
     group: Option<String>,
+    /// Its backend reads the identity headers: only people who sign in reach its 443, each one named
+    #[arg(long)]
+    always_sign_in: bool,
     /// The agent instance to act on
     #[arg(long, value_parser = parse_instance)]
     instance: Option<Instance>,
@@ -200,7 +208,7 @@ struct ServiceArgs {
 #[derive(Debug, PartialEq)]
 enum ServiceAction {
     Show,
-    Declare { ports: Vec<String>, group: Option<String> },
+    Declare { ports: Vec<String>, group: Option<String>, always_sign_in: bool },
     Withdraw,
 }
 
@@ -208,15 +216,21 @@ impl ServiceArgs {
     fn action(&self) -> Result<ServiceAction, String> {
         match self.ports.as_slice() {
             [] if self.group.is_some() => Err("--group needs the service's ports".into()),
+            [] if self.always_sign_in => Err("--always-sign-in needs the service's ports".into()),
             [] => Ok(ServiceAction::Show),
-            [off] if off == "off" => match self.group {
-                Some(_) => Err("--group has nothing to do with withdrawing a service".into()),
-                None => Ok(ServiceAction::Withdraw),
+            [off] if off == "off" => match (&self.group, self.always_sign_in) {
+                (Some(_), _) => Err("--group has nothing to do with withdrawing a service".into()),
+                (_, true) => Err("--always-sign-in has nothing to do with withdrawing a service".into()),
+                (None, false) => Ok(ServiceAction::Withdraw),
             },
             ports if ports.iter().any(|p| p == "off") => {
                 Err("`off` withdraws a service and goes alone, without ports".into())
             }
-            ports => Ok(ServiceAction::Declare { ports: ports.to_vec(), group: self.group.clone() }),
+            ports => Ok(ServiceAction::Declare {
+                ports: ports.to_vec(),
+                group: self.group.clone(),
+                always_sign_in: self.always_sign_in,
+            }),
         }
     }
 }
@@ -802,14 +816,10 @@ async fn cmd_daemon(
                 teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, instance.hosts_label(), &socket_path, &shared_state, &state_path, false).await;
                 break;
             }
-            // The interval, or a device the terminator has just seen for the
-            // first time: its owner is asked after now, not at the next
-            // cycle, so its first requests wait a second or two for who it is
-            // rather than twenty. A moment's grace lets several arrive as one.
+            // The interval.
             scheduled = async {
                 tokio::select! {
                     _ = interval.tick() => true,
-                    () = tls_link.wake.notified() => { tokio::time::sleep(Duration::from_secs(1)).await; false }
                     // A port check answered: the coordinator is waiting on it.
                     () = port_checks.wake.notified() => false,
                     // A peer's path just went dead: ask for its relay now.
@@ -1131,7 +1141,9 @@ async fn cmd_service(instance: &Instance, words: &[String]) -> Result<(), Box<dy
     let instance = args.instance.as_ref().unwrap_or(instance);
     match args.action()? {
         ServiceAction::Show => cmd_show(instance, &args.name).await,
-        ServiceAction::Declare { ports, group } => cmd_declare(instance, args.name, &ports, group).await,
+        ServiceAction::Declare { ports, group, always_sign_in } => {
+            cmd_declare(instance, args.name, &ports, group, always_sign_in).await
+        }
         ServiceAction::Withdraw => cmd_withdraw(instance, args.name).await,
     }
 }
@@ -1149,10 +1161,11 @@ async fn cmd_declare(
     name: String,
     ports: &[String],
     group: Option<String>,
+    always_sign_in: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ports = parse_service_ports(ports)?;
     wireserve_types::validate_service_ports(&ports)?;
-    into_result(client::call(&instance.socket_path(), &IpcRequest::Serve { name, ports, group }).await?)?;
+    into_result(client::call(&instance.socket_path(), &IpcRequest::Serve { name, ports, group, always_sign_in }).await?)?;
     // "ok" alone overstates what just happened: the declaration is queued
     // locally and only reaches the coordinator on the next poll, and if
     // that coordinator requires approval it will sit pending until an
@@ -1332,7 +1345,7 @@ mod tests {
         let s = service(&["web", "80:5080", "--group", "g"]);
         assert_eq!(
             s.action().unwrap(),
-            ServiceAction::Declare { ports: args(&["80:5080"]), group: Some("g".into()) }
+            ServiceAction::Declare { ports: args(&["80:5080"]), group: Some("g".into()), always_sign_in: false }
         );
     }
 

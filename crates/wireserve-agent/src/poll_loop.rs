@@ -201,11 +201,6 @@ pub fn build_poll_request(
             ready.truncate(wireserve_types::MAX_TLS_READY_PER_POLL);
             ready
         },
-        callers_seen: {
-            let mut seen = tls.callers_seen;
-            seen.truncate(wireserve_types::MAX_CALLERS_SEEN_PER_POLL);
-            seen
-        },
     }
 }
 
@@ -216,9 +211,6 @@ pub fn build_poll_request(
 pub struct TlsSelfReport {
     pub capable: bool,
     pub ready: Vec<String>,
-    /// The devices that connected to the terminator recently, whose owners
-    /// the coordinator may name to this node (PLAN.md M38).
-    pub callers_seen: Vec<Ipv4Addr>,
 }
 
 /// This node's own services the directory says are terminated here AND the
@@ -370,21 +362,6 @@ pub fn service_rules(
         }
     }
     rules
-}
-
-/// Keeps the owners' identities to what a backend can be told: an address
-/// inside the mesh, a user with no control characters, groups a grant could
-/// name — the rest is dropped, which only means a backend is told less.
-pub fn sanitize_identities(ids: &mut Vec<wireserve_types::CallerIdentity>, mesh: Option<&wireserve_types::MeshRanges>) {
-    let clean = |s: &str| !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control);
-    ids.retain(|i| mesh.is_none_or(|m| m.contains4(i.addr)) && clean(&i.user));
-    ids.truncate(wireserve_types::MAX_SOURCES_PER_SERVICE);
-    for i in ids {
-        if i.email.as_deref().is_some_and(|e| !clean(e)) {
-            i.email = None;
-        }
-        i.groups.retain(|g| wireserve_types::is_valid_oidc_group(g));
-    }
 }
 
 /// Keeps the access list to what this node can act on: sources inside the
@@ -729,7 +706,6 @@ where
     let tls_report = ctx.tls.map_or_else(TlsSelfReport::default, |link| TlsSelfReport {
         capable: link.present(tls_now),
         ready: link.reported(tls_now),
-        callers_seen: link.callers_seen(tls_now),
     });
 
     // 1. send
@@ -802,7 +778,6 @@ where
     }
     crate::vip::sanitize(&mut directory);
     sanitize_access(&mut directory.access, mesh_ranges.as_ref());
-    sanitize_identities(&mut directory.identities, mesh_ranges.as_ref());
 
     // Approval verdicts are folded in BEFORE the firewall rules are
     // computed, and that ordering is the whole point.
@@ -829,11 +804,9 @@ where
         // terminator reads it at its next check-in, and must never enforce
         // grants older than the firewall below.
         let access_changed = s.own_access != directory.access
-            || s.service_notices != directory.service_notices
-            || s.own_identities != directory.identities;
+            || s.service_notices != directory.service_notices;
         if access_changed {
             s.own_access.clone_from(&directory.access);
-            s.own_identities.clone_from(&directory.identities);
             s.service_notices.clone_from(&directory.service_notices);
             for n in &s.service_notices {
                 tracing::warn!(service = %n.name.escape_debug(), reason = %n.reason.escape_debug(), "the coordinator about this service");
@@ -1369,7 +1342,7 @@ mod tests {
             None,
             None,
             TransitSelfReport { capable: false, exit_capable: false, reachable: vec![], wanted: vec![], carry_port: None, dialable_v4: None, port_checks_seen: vec![] },
-            TlsSelfReport { capable: true, ready: vec!["plex".into()], callers_seen: vec![] },
+            TlsSelfReport { capable: true, ready: vec!["plex".into()] },
         );
         assert!(req.capabilities.contains(&wireserve_types::CAP_TLS_TERMINATE.to_string()));
         assert_eq!(req.tls_ready, vec!["plex".to_string()]);
@@ -1511,7 +1484,6 @@ mod tests {
             naming: None,
             access: vec![],
             service_notices: vec![],
-            identities: vec![],
             peers: vec![],
             services: vec![],
             pending_services: pending
