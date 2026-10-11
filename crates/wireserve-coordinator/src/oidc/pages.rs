@@ -101,7 +101,7 @@ pub fn confirm(node: &str, tags: &[String], current: Option<&str>, who: &str, gr
         body.push_str(&format!("<p class=\"note\">It belongs to <strong>{}</strong> now; this replaces them.</p>", escape(current)));
     }
     body.push_str(&format!(
-        "<form method=\"post\" action=\"confirm\"><input type=\"hidden\" name=\"token\" value=\"{}\">\
+        "<form method=\"post\" action=\"/claim/confirm\"><input type=\"hidden\" name=\"token\" value=\"{}\">\
          <button type=\"submit\">Yes, this is my device</button></form>\
          <p class=\"note\">If nobody asked you to set up <strong>{}</strong> just now, close this page: \
          whoever sent you this link would get your access.</p>",

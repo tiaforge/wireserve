@@ -291,6 +291,8 @@ async fn a_device_is_claimed_confirmed_and_its_owners_groups_kept_current() {
     assert_eq!(resp.headers()["x-frame-options"], "DENY");
     let page = text(resp).await;
     assert!(page.contains("<strong>laptop</strong>") && page.contains("alice@example.com") && page.contains("family"), "{page}");
+    // The page is served at /oidc/callback: a relative action would post to /oidc/confirm.
+    assert!(page.contains("<form method=\"post\" action=\"/claim/confirm\">"), "{page}");
     let token = page.split("name=\"token\" value=\"").nth(1).unwrap().split('"').next().unwrap().to_string();
 
     // Not without the browser that started it, nor without its token.
@@ -661,7 +663,7 @@ async fn only_the_coordinators_own_page_signs_a_browser_out() {
     let live = || async { !wireserve_coordinator::db::sessions::all(&*app.state.db.conn.lock().await).unwrap().is_empty() };
 
     let resp = call(&app.router, "GET", "/signed-out", Some(&login), None).await;
-    assert!(text(resp).await.contains("<form method=\"post\""), "a button, not a sign-out");
+    assert!(text(resp).await.contains("<form method=\"post\" action=\"/signed-out\">"), "a button, not a sign-out");
     assert!(live().await);
 
     let post = |site: &'static str, origin: &'static str| {

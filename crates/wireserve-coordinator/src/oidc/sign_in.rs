@@ -288,7 +288,7 @@ pub async fn signed_out(State(state): State<AppState>, headers: HeaderMap) -> Re
     }
     if login_session(&state, &headers).await.is_some() {
         let body = "<p>Sign out of every service, in this browser?</p>\
-                    <form method=\"post\" action=\"signed-out\"><button type=\"submit\">Sign out</button></form>";
+                    <form method=\"post\" action=\"/signed-out\"><button type=\"submit\">Sign out</button></form>";
         return pages::html(StatusCode::OK, "Sign out", body, None);
     }
     let body = "<p>You are signed out. Every service you were signed in to asks again within a few minutes.</p>\
