@@ -8,6 +8,10 @@ use crate::db::DbError;
 pub enum AppError {
     #[error("{0}")]
     BadRequest(String),
+    /// One declaration of a poll is refused as it stands; the body names it
+    /// (`ErrorBody::bad_service`) so the agent sets it aside.
+    #[error("{message}")]
+    BadService { name: String, message: String },
     #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
@@ -44,8 +48,12 @@ impl IntoResponse for AppError {
             return (StatusCode::CONFLICT, Json(body)).into_response();
         }
 
+        if let AppError::BadService { name, message } = &self {
+            return (StatusCode::BAD_REQUEST, Json(ErrorBody::bad_service(message.clone(), name.clone()))).into_response();
+        }
         let (status, message) = match &self {
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            AppError::BadService { .. } => unreachable!("handled above"),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             AppError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),

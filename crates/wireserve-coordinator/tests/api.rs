@@ -2910,6 +2910,7 @@ async fn poll_rejects_a_malformed_port_mapping() {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{ports}: {body}");
+        assert_eq!(body["conflicting_service"], "web", "{ports}: {body}");
     }
 }
 
@@ -2940,7 +2941,7 @@ async fn poll_rejects_a_target_address_inside_the_mesh_or_that_cannot_answer() {
     let t1 = admin_create_node(&app.router, "n1").await;
     let r1 = register_node(&app.router, &t1, "pk1", 51820).await;
     let bearer = r1["bearer_token"].as_str().unwrap();
-    for addr in ["100.90.0.1", "100.90.0.77", "127.0.0.1", "224.0.0.1", "0.0.0.0"] {
+    for addr in ["100.90.0.1", "100.90.0.77", "127.0.0.1", "169.254.169.254", "224.0.0.1", "0.0.0.0"] {
         let ports = json!([{"public": 443, "target": 80, "proto": "tcp", "addr": addr}]);
         let (status, body) = poll_with(
             &app.router,
@@ -2949,6 +2950,8 @@ async fn poll_rejects_a_target_address_inside_the_mesh_or_that_cannot_answer() {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{addr}: {body}");
+        // Named, so the agent sets this one aside and polls on (PLAN.md #327).
+        assert_eq!(body["conflicting_service"], "x", "{addr}: {body}");
     }
 }
 

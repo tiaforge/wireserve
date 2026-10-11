@@ -328,9 +328,9 @@ echo "$OUT" | sed 's/^/  /'
 echo "$OUT" | has 'backend:8096' || { echo "$OUT"; fail "alice did not get into jellyfin"; }
 echo "$OUT" | has -i '^x-auth-' && fail "a backend that reads no names was told one"
 echo "$OUT" | has -i 'mallory' && fail "a forged X-Auth-User reached the backend"
-echo "$OUT" | has 'wireserve-session' && fail "the session cookie reached the backend"
+echo "$OUT" | has -i '__Host-wireserve-' && fail "a cookie of the sign-in's reached the backend"
 echo "$OUT" | has -i '^cookie: .*theme=dark' || fail "other cookies were lost"
-pass "in, and named to nobody; mallory and the session cookie gone; theme kept"
+pass "in, and named to nobody; mallory and the sign-in's cookies gone; theme kept"
 
 log "4/11: bob, signed in without a granted group, gets no ticket"
 LANDED=$(sign_in bob '"guests"') || true
@@ -370,7 +370,7 @@ echo "$OUT" | has -i '^x-auth-user: alice' || fail "the backend did not get the 
 echo "$OUT" | has -i '^x-auth-groups: family' || fail "the backend did not get the groups header"
 echo "$OUT" | has -i '^x-auth-email: alice@example.com' || fail "the backend did not get the e-mail header"
 echo "$OUT" | has -i 'mallory' && fail "a forged X-Auth-User reached the backend"
-echo "$OUT" | has 'wireserve-session' && fail "the session cookie reached the backend"
+echo "$OUT" | has -i '__Host-wireserve-' && fail "a cookie of the sign-in's reached the backend"
 pass "X-Auth-User: alice, groups family; the gate's grant no longer lets it into 443"
 
 log "6/11: a service in default needs no sign-in, and never sees a session cookie"

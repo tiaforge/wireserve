@@ -4948,3 +4948,21 @@ polls.
     remembered by the access cache), and a notice says why nobody gets in;
     `serve` refuses it without TCP 443; `reach` agrees with the access the
     owner enforces with and without it. The sign-in e2e gains step 5b.
+
+327. **A service could publish the cloud's metadata service; a refused
+    declaration cut its node off.** A target address could be link-local, so
+    `wireserve meta 80:169.254.169.254:80` — one approval away — handed a
+    cloud machine's instance credentials to the whole mesh; nothing a LAN
+    publishes lives there. `is_valid_target_addr` now refuses `169.254.0.0/16`
+    like loopback. And a declaration `/poll` refused as it stands (a bad
+    name, mapping or target address) failed the whole poll with a plain 400,
+    which the agent resent every cycle — no peers, no revocations, ever — so
+    tightening a rule would have cut off every node that had declared what
+    it now refuses. Those refusals now name the declaration
+    (`ErrorBody::bad_service`, the field the name-collision 409 already
+    used), and the agent sets that one aside, agents from before included.
+    Also: the terminator strips the sign-in's bind cookie before a backend,
+    as it does the session cookie (security audit 2026-10-11).
+    Tests: link-local targets refused; each per-declaration 400 names it;
+    the bind cookie never reaches a backend, and the sign-in e2e checks both
+    cookies.

@@ -156,9 +156,12 @@ address later waits for approval again. The rest of the mesh only ever sees
 - **IPv4 only**, and a literal address, not a hostname. A service's own
   address is IPv4, and the kernel can't forward an IPv4 connection to an
   IPv6 one.
-- Not loopback, and nothing inside the mesh range. A service on this node
-  is the form without an address; one on another node is that node's to
-  serve.
+- Not loopback, not link-local (`169.254.0.0/16`), and nothing inside the
+  mesh range. A service on this node is the form without an address; one on
+  another node is that node's to serve. Link-local is where a cloud machine's
+  metadata service answers, with that machine's credentials, and no LAN
+  device is published there. A declaration refused this way is set aside —
+  `wireserve status` says why — and the node's other services carry on.
 - **Forwarding.** Replies arrive on the interface facing the device, and
   Linux only forwards what arrives on an interface with forwarding on. If
   that interface's `net.ipv4.conf.<if>.forwarding` is off and the host

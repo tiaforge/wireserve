@@ -54,11 +54,15 @@ impl PortMap {
 /// something could answer on from the owning node's side. Loopback is out
 /// because a rewritten packet arriving from the mesh interface with a
 /// loopback destination is a martian the kernel drops, and a service bound
-/// only to loopback is out of scope anyway (PLAN.md M20). Whether it lies
-/// inside the mesh ranges is checked separately, by whoever knows them.
+/// only to loopback is out of scope anyway (PLAN.md M20). Link-local is
+/// out because no device of a LAN is published there, and what is — the
+/// cloud's instance metadata service, `169.254.169.254` — hands out the
+/// machine's credentials to whoever asks from it: published, to the whole
+/// mesh (PLAN.md #327). Whether it lies inside the mesh ranges is checked
+/// separately, by whoever knows them.
 #[must_use]
 pub fn is_valid_target_addr(addr: Ipv4Addr) -> bool {
-    !(addr.is_unspecified() || addr.is_loopback() || addr.is_multicast() || addr.is_broadcast())
+    !(addr.is_unspecified() || addr.is_loopback() || addr.is_link_local() || addr.is_multicast() || addr.is_broadcast())
 }
 
 /// `[PUBLIC:][ADDR:]TARGET[/tcp|/udp]` — the `serve` command-line form.
@@ -240,7 +244,7 @@ mod tests {
 
     #[test]
     fn refuses_target_addresses_that_cannot_answer() {
-        for bad in ["80:127.0.0.1:80", "80:0.0.0.0:80", "80:224.0.0.1:80", "80:255.255.255.255:80", "80:1.2.3:80", "80:1.2.3.4.5:80"] {
+        for bad in ["80:127.0.0.1:80", "80:0.0.0.0:80", "80:169.254.169.254:80", "80:169.254.1.1:80", "80:224.0.0.1:80", "80:255.255.255.255:80", "80:1.2.3:80", "80:1.2.3.4.5:80"] {
             assert!(bad.parse::<PortMap>().is_err(), "{bad:?} should not parse");
         }
         let mut m = remote(80, "192.168.1.1", 80);

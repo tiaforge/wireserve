@@ -135,27 +135,25 @@ async fn answer(
             req.services.len()
         )));
     }
+    // Each refusal names its declaration (`AppError::BadService`), so the
+    // agent sets that one aside and polls on: a rule tightened in a newer
+    // coordinator must not cut a node off for a service it declared before.
+    let bad = |decl: &wireserve_types::ServiceDecl, message: String| AppError::BadService { name: decl.name.clone(), message };
     for decl in &req.services {
         if !wireserve_types::is_valid_dns_label(&decl.name) {
-            return Err(AppError::BadRequest(format!(
-                "invalid service name: {}",
-                decl.name
-            )));
+            return Err(bad(decl, format!("invalid service name: {}", decl.name)));
         }
         // The same per-service check the agent's `serve` makes (no empty
         // list, no port 0). The per-node one (a target port mapped once) is
         // left to the agent: it concerns only its own firewall.
         if let Err(e) = wireserve_types::validate_service_ports(&decl.ports) {
-            return Err(AppError::BadRequest(format!("service '{}': {e}", decl.name)));
+            return Err(bad(decl, format!("service '{}': {e}", decl.name)));
         }
         // A target address inside the mesh (PLAN.md M26) — the agent's
         // `serve` refuses it too, against the ranges it pinned from here.
         let ranges = wireserve_types::MeshRanges::parse(&state.config.mesh_info());
         if let Some(m) = decl.ports.iter().find(|m| m.addr.is_some_and(|a| ranges.is_some_and(|r| r.contains4(a)))) {
-            return Err(AppError::BadRequest(format!(
-                "service '{}': {m} forwards to an address inside the mesh",
-                decl.name
-            )));
+            return Err(bad(decl, format!("service '{}': {m} forwards to an address inside the mesh", decl.name)));
         }
     }
     // S2 (security review): endpoint_addr is redistributed verbatim to

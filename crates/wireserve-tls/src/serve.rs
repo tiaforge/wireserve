@@ -740,8 +740,9 @@ fn without_port(host: &str) -> &str {
 /// passing the request on; `Ok` may carry a renewed session's cookie for
 /// the browser.
 ///
-/// 1. Identity headers a client sent are removed, always, and so is the
-///    sign-in's cookie: no backend needs it.
+/// 1. Identity headers a client sent are removed, always, and so are the
+///    sign-in's cookies, the session and the bind cookie: no backend needs
+///    them.
 /// 2. An open service, or a caller whose node the grants name, goes on —
 ///    unnamed: a device says nothing about who is using it. Not on a
 ///    service that is for people only (`always_sign_in`, PLAN.md #326).
@@ -791,6 +792,7 @@ async fn guard(
         }
     }
     crate::sign_in::strip_cookie(req.headers_mut(), wireserve_types::session::COOKIE);
+    crate::sign_in::strip_cookie(req.headers_mut(), wireserve_types::session::BIND_COOKIE);
     Ok(set_cookie)
 }
 
@@ -1059,7 +1061,7 @@ mod tests {
 
     fn request() -> Request<Body> {
         Request::builder()
-            .header("cookie", "theme=dark; __Host-wireserve-session=s3cret")
+            .header("cookie", "theme=dark; __Host-wireserve-session=s3cret; __Host-wireserve-bind=b1nd")
             .header("x-auth-user", "mallory")
             .body(Body::empty())
             .unwrap()

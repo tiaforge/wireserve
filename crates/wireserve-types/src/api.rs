@@ -36,6 +36,15 @@ impl ErrorBody {
             conflicting_service: Some(name.into()),
         }
     }
+
+    /// A declaration refused as it stands — not a mapping, a target address
+    /// that can't be one. Named like a collision, so the agent sets aside
+    /// that one declaration and its other services carry on: a rule that
+    /// tightens must not cut a node off the mesh for one it declared before.
+    #[must_use]
+    pub fn bad_service(error: impl Into<String>, name: impl Into<String>) -> Self {
+        Self::service_collision(error, name)
+    }
 }
 
 // ---- §4.1 Admin: create node ----
