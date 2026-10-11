@@ -4902,3 +4902,17 @@ polls.
     flow cookie from another browser, altered, or sealed for something else
     does not come back; a claim and a sign-in in one browser both finish;
     the limiter counts by the prefix it is given.
+
+325. **A wildcard record did not hold a name.** Before it first writes a
+    name, and before it publishes a challenge, the coordinator asks the
+    provider what the zone holds there (PLAN.md #272) — but a provider lists
+    only records made for that very name, never the wildcard that answers
+    for it. With `*.int.example.com` pointing at a real host, an approved
+    service named after anything it served took that name in DNS and was
+    issued its certificate. The wildcard one level up is now asked about
+    too; one pointing into the mesh is still the services' to override.
+    `names-and-https.md` also said a record with a service's name is
+    replaced, which has not been true since #231 (security audit
+    2026-10-11).
+    Test: a service under a wildcard to an outside address is neither
+    written nor given a challenge; under one into the mesh it is both.

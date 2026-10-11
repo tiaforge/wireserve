@@ -113,12 +113,12 @@ async fn not_held_elsewhere(
     fqdn: &str,
 ) -> Result<(), AppError> {
     let fqdn = fqdn.trim_end_matches('.').to_ascii_lowercase();
-    let found = dns.writer.existing(&fqdn).await.map_err(|e| {
+    let mesh = wireserve_types::MeshRanges::parse(&state.config.mesh_info());
+    let found = crate::dns::sync::held_elsewhere(dns.writer.as_ref(), &fqdn, mesh.as_ref()).await.map_err(|e| {
         tracing::warn!(node_name = %node.name, fqdn = %fqdn, error = %e, "could not check a name before publishing its challenge");
         AppError::Conflict(format!("could not check whether {fqdn} is already in use, so its challenge is not published: {e}"))
     })?;
-    let mesh = wireserve_types::MeshRanges::parse(&state.config.mesh_info());
-    if let Some(record) = found.iter().find(|r| !crate::dns::sync::is_ours_to_replace(r, mesh.as_ref())) {
+    if let Some(record) = found {
         tracing::warn!(event = "challenge_name_taken", node_name = %node.name, fqdn = %fqdn, record = %record, "refused a challenge for a name the zone holds for somebody else");
         return Err(AppError::Forbidden(format!(
             "{fqdn}: the zone already has a record here ({record}) that this coordinator did not write, so no certificate is issued for it"

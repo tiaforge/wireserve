@@ -4390,6 +4390,31 @@ mod dns_records {
     }
 
     #[tokio::test]
+    async fn a_wildcard_sending_names_elsewhere_holds_them_and_one_into_the_mesh_does_not() {
+        // Security audit 2026-10-11: `*.int.example.com` answers for every
+        // name under it without one of its own, and listing `grafana` shows
+        // nothing — so the service took the name, and its certificate, from
+        // whatever the wildcard sends it to.
+        let fake = Arc::new(FakeDns::default());
+        let app = app(&fake);
+        let home = node(&app, "home").await;
+        fake.zone.lock().unwrap().insert("*.int.example.com".into(), vec!["A 203.0.113.80".into()]);
+        poll_with(&app.router, &home, json!([svc("grafana", 443, 3000)])).await;
+        pass(&app).await;
+        assert!(fake.take().iter().all(|c| !c.starts_with("set ")), "not written over the wildcard");
+        let dns = admin_dns(&app, "grafana").await;
+        assert!(dns["error"].as_str().unwrap().contains("*.int.example.com"), "{dns}");
+        assert_eq!(challenge(&app, &home, "POST", "grafana.int.example.com", DIGEST).await, StatusCode::FORBIDDEN);
+
+        // A wildcard into the mesh — names nobody declared went to a node —
+        // is for the services' own records to override.
+        fake.zone.lock().unwrap().insert("*.int.example.com".into(), vec!["A 100.90.0.1".into()]);
+        pass(&app).await;
+        assert!(fake.take().iter().any(|c| c.starts_with("set grafana.int.example.com")));
+        assert_eq!(challenge(&app, &home, "POST", "grafana.int.example.com", DIGEST).await, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
     async fn without_a_provider_there_are_no_challenges() {
         let app = named_app();
         let home = node(&app, "home").await;

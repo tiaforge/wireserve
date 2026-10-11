@@ -181,15 +181,14 @@ pub async fn pass(state: &AppState, dns: &Dns, moving: &mut BTreeMap<String, (Ip
         // later deletes what was written, so an existing record would be
         // lost the moment a node declared a service by that name.
         if !written.contains_key(fqdn) {
-            match dns.writer.existing(fqdn).await {
-                Ok(found) => {
-                    if let Some(record) = found.iter().find(|r| !is_ours_to_replace(r, mesh.as_ref())) {
-                        conflicts.insert(
-                            fqdn.clone(),
-                            format!("the zone already has a record here ({record}) that this coordinator did not write; not overwriting it"),
-                        );
-                        continue;
-                    }
+            match held_elsewhere(dns.writer.as_ref(), fqdn, mesh.as_ref()).await {
+                Ok(None) => {}
+                Ok(Some(record)) => {
+                    conflicts.insert(
+                        fqdn.clone(),
+                        format!("the zone already has a record here ({record}) that this coordinator did not write; not overwriting it"),
+                    );
+                    continue;
                 }
                 Err(e) => {
                     tracing::warn!(fqdn = %fqdn, error = %e, "could not check what a name already holds; not writing it yet");
@@ -255,6 +254,34 @@ pub async fn pass(state: &AppState, dns: &Dns, moving: &mut BTreeMap<String, (Ip
     *dns.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = status;
 
     PassOutcome { failed: !errors.is_empty(), next_due: todo.next_due }
+}
+
+/// A record the zone holds `fqdn` with for somebody else, if it holds one:
+/// at the name itself, or a wildcard one label up (`*.int.example.com` for
+/// `grafana.int.example.com`). A wildcard answers for every name under it
+/// that has no record of its own, and listing a name shows only records
+/// made for it — so without asking about the wildcard too, a service could
+/// take a name the wildcard sends to a real host, and be issued its
+/// certificate (security audit 2026-10-11). A wildcard pointing into the
+/// mesh is ours to override, like a record at the name.
+///
+/// Only one label up: every service is one label under the service domain,
+/// and a wildcard further up answers for its names only while the service
+/// domain has no name of its own in the zone.
+pub(crate) async fn held_elsewhere(
+    writer: &dyn super::provider::DnsWriter,
+    fqdn: &str,
+    mesh: Option<&wireserve_types::MeshRanges>,
+) -> Result<Option<String>, String> {
+    let foreign = |found: Vec<String>| found.into_iter().find(|r| !is_ours_to_replace(r, mesh));
+    if let Some(record) = foreign(writer.existing(fqdn).await?) {
+        return Ok(Some(record));
+    }
+    let Some((_, parent)) = fqdn.split_once('.') else {
+        return Ok(None);
+    };
+    let wildcard = format!("*.{parent}");
+    Ok(foreign(writer.existing(&wildcard).await?).map(|record| format!("{record} at {wildcard}")))
 }
 
 /// Whether an existing record (as `DnsWriter::existing` words it) may be

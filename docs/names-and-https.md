@@ -79,9 +79,12 @@ defaults to 300 seconds.
 
 What to know first:
 
-- **The coordinator manages service names under the domain.** A record with
-  the same name as a service is replaced. It deletes only records it wrote
-  itself, and never touches anything else in the zone.
+- **The coordinator manages service names under the domain.** It writes an
+  A record for each approved service, and deletes only records it wrote
+  itself. A name the zone already holds — any record there, or a wildcard
+  one level up, except an A record inside the mesh range — is left alone,
+  gets no certificate, and shows as `error` in `wireserve-admin service
+  list` until you free it.
 - **Keep the domain to itself.** Most providers' tokens cover a whole zone,
   so a token for `example.com` could also change its mail records. A zone of
   its own (a subdomain delegated to its own zone, or a spare domain) keeps
