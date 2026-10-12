@@ -23,6 +23,12 @@ Two more things to know about a machine that runs an agent:
   backend, claimed or not: only a sign-in does. On a machine several people
   use, tag the machine for what all of them may use, and leave the rest to the
   sign-in or each service's own login.
+- **So is every page that device's browser opens.** A website a mesh user
+  visits can send requests through the tunnel with the device's grants. On
+  443 and 80 the terminator refuses what another site started and any name
+  that isn't the service's (see [Access control](access-control.md)); every
+  other port is raw, so put web apps on `80:<port>` or `443:<port>`, and
+  give anything on a raw port a login of its own.
 
 And on the coordinator: there is one database connection behind one lock, so
 what a node does inside its allowance (`WIRESERVE_POLL_RATE_*`, the pending

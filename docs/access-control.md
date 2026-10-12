@@ -273,11 +273,13 @@ Worth knowing:
   (the client its proxy saw; the terminator appends the node's own address)
   and an `X-Forwarded-Host` that is one plain host name; every other
   caller's are still removed. Nothing about *who* is calling is ever kept.
-- **Another site's page cannot act here as your device.** A terminator lets
-  a device in by its grants, and a browser sends whatever
-  any page open on it asks for through the tunnel — no cookie, so no SameSite
-  rule holds it back. So a POST, PUT or DELETE, or a WebSocket, that a page on
-  another site started is refused with 403; another service under the same
+- **Another site's page cannot act here as your device — on 443 and 80.**
+  Grants let a device in, and a browser sends whatever any page open on it
+  asks for through the tunnel — no cookie, so no SameSite rule holds it
+  back. The terminator answers a service's 443 and, where it runs, its 80:
+  a request must name the service or its address (another name is 421, so a
+  rebound DNS name reads nothing), and a POST, PUT or DELETE, or a
+  WebSocket, that a page on another site started is refused with 403; another service under the same
   domain counts as another site, since a node's own 443 service is one of
   them. Following a link, reads (which the browser keeps from the other page)
   and programs that aren't browsers are unaffected. Through a forwarding node, the public name it was
@@ -289,7 +291,10 @@ Worth knowing:
   every request to the service cross-site, so reads work and logging in
   fails (Bitwarden says "unexpected error"). The service's node logs
   `refused a request another site started`. A browser extension is not
-  affected.
+  affected. Any other port is passed on raw, unchecked: a web app there can
+  be driven by any page a mesh user opens. Publish it as `80:<port>`
+  instead; `wireserve status` marks a port 80 that no terminator answers
+  `(80 unguarded)`.
 - **A device names nobody.** Its grants let it in; they never tell a backend
   who is using it, and no node is told who owns a device. Until PLAN.md #326
   a node was told the owners of the devices it said had called — on its word
