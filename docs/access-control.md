@@ -121,9 +121,8 @@ removed from a group loses what it gave them within that. If the provider
 refuses the token, the device belongs to nobody again; if the provider cannot
 be reached, the groups keep counting for an hour, then not until it answers.
 Revoking or rejoining a node clears its owner — the new identity may be
-another device. A terminator lets a claimed device's backends know who it is
-in the same `X-Auth-*` headers a sign-in fills (the user is the provider's
-`sub`).
+another device. An owner's groups only let the device in: no backend is
+told who owns it (see "A device names nobody" below).
 
 ## Signing in, for shared devices
 

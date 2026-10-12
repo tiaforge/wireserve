@@ -912,8 +912,8 @@ fn name(headers: &mut HeaderMap, user: &str, email: Option<&str>, groups: &[Stri
 /// believe, so none may arrive from a client: where the request came from,
 /// which URL it asked for, and who is calling, in the spellings the common
 /// proxies and providers use. (The identity headers of *this* deployment are
-/// removed separately, whatever their names, and set again only from the
-/// sign-in or the device's owner.)
+/// removed separately, whatever their names, and set again only from a
+/// sign-in.)
 const UNTRUSTED_EXACT: &[&str] = &[
     "forwarded", "x-real-ip", "true-client-ip", "cf-connecting-ip", "x-client-ip", "x-cluster-client-ip",
     "x-url-scheme", "front-end-https", "x-rewrite-url", "x-http-host-override",
