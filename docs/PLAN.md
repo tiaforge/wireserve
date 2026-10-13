@@ -5009,11 +5009,18 @@ polls.
     listener (#328), for ordinary requests and WebSockets alike: a backend
     told `https` there hands out `Secure` cookies and links a plain-HTTP
     browser cannot use. CONNECT is 501, an unreachable backend 502, logged
-    with the error's whole chain. Measured with mimalloc in the benchmark:
-    HTTP/1.1 +52% (about 0.9x nginx), HTTP/2 +34%. mimalloc in `wireserve`
-    itself was measured too (+7% HTTP/1.1, +16% HTTP/2, handshakes no
-    faster) and left out: peak memory rose from 23 to 32 MB, and on a mesh
-    WireGuard and the network run out long before the terminator's core.
+    with the error's whole chain. The comparison above, and +52% HTTP/1.1
+    (about 0.9x nginx) / +34% HTTP/2, came from a 4-core cloud VM. On a
+    Steam Deck (2026-10-13; terminator on one fast core, `oha` on others,
+    3 alternated runs of 10 s, before = e29600b), where loopback's kernel
+    time is most of a request: HTTP/1.1 20x5 +18% (57.7k to 67.9k req/s),
+    1x100 +17%, HTTP/2 +11%, a new TLS connection per request +26%; user
+    time per kept-open request 5.4 to 3.5 us, peak memory a little lower.
+    mimalloc was measured in both places and left out: on the VM +7%
+    HTTP/1.1, +16% HTTP/2 at 32 MB peak against 23; on the Deck nothing on
+    HTTP/1.1 or new connections, +5% HTTP/2 (within the spread), at 24 MB
+    peak against 15. On a mesh WireGuard and the network run out long
+    before the terminator's core.
     Tests: forwarded and hop-by-hop headers to the backend, `Host` and
     `Forwarded` over HTTP/2, the backend's hop-by-hop headers kept from the
     client, `proto=http` on port 80; TLS and service-auth e2e pass.
