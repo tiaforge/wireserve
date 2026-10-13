@@ -414,32 +414,178 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
 #[derive(Clone)]
 pub struct Route {
     upstream: SocketAddr,
-    authority: axum::http::uri::Authority,
-    client: hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, Body>,
+    /// `Host` for a request that named none (HTTP/1.0).
+    authority: HeaderValue,
+    pool: Arc<Pool>,
+}
+
+/// How long a backend connection may wait unused, and how many may.
+const POOL_IDLE: Duration = Duration::from_secs(60);
+const POOL_MAX_IDLE: usize = 32;
+/// A backend on another machine (PLAN.md M26) that is off answers nothing
+/// at all; without a limit a request waits out the kernel.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+type BackendConn = hyper::client::conn::http1::Connection<TokioIo<tokio::net::TcpStream>, Body>;
+
+/// One backend connection: the half requests go in by, and the connection
+/// itself, which whoever holds it drives (PLAN.md #331).
+struct Lease {
+    send: hyper::client::conn::http1::SendRequest<Body>,
+    conn: BackendConn,
+    /// Not yet closed: the connection's future has not finished.
+    open: bool,
+}
+
+impl Lease {
+    /// Drives the connection as far as it goes now; whether it is still
+    /// open.
+    fn drive(&mut self, cx: &mut Context<'_>) -> bool {
+        if self.open && Pin::new(&mut self.conn).poll(cx).is_ready() {
+            self.open = false;
+        }
+        self.open
+    }
+
+    /// Whether another request may go in now.
+    fn reusable(&mut self, cx: &mut Context<'_>) -> bool {
+        self.drive(cx) && matches!(self.send.poll_ready(cx), Poll::Ready(Ok(())))
+    }
+}
+
+/// A backend's idle connections, the most recently used on top.
+#[derive(Default)]
+struct Pool {
+    idle: std::sync::Mutex<Vec<(Lease, Instant)>>,
+    reaping: std::sync::atomic::AtomicBool,
+}
+
+impl Pool {
+    fn idle(&self) -> std::sync::MutexGuard<'_, Vec<(Lease, Instant)>> {
+        self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// An idle connection a request can go in by now, if there is one.
+    fn take(&self, cx: &mut Context<'_>) -> Option<Lease> {
+        loop {
+            let (mut lease, since) = self.idle().pop()?;
+            // One the backend closed meanwhile is seen closed here.
+            if since.elapsed() < POOL_IDLE && lease.reusable(cx) {
+                return Some(lease);
+            }
+        }
+    }
+
+    /// Keeps `lease` for the next request, if it can take one.
+    fn give_back(self: &Arc<Self>, mut lease: Lease, cx: &mut Context<'_>) {
+        if !lease.reusable(cx) {
+            return;
+        }
+        {
+            let mut idle = self.idle();
+            if idle.len() >= POOL_MAX_IDLE {
+                return;
+            }
+            idle.push((lease, Instant::now()));
+        }
+        self.reap_idle();
+    }
+
+    /// Closes, every half `POOL_IDLE`, what waited too long or the backend
+    /// closed — while the route lasts, from the first connection kept.
+    fn reap_idle(self: &Arc<Self>) {
+        if self.reaping.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let pool = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(POOL_IDLE / 2);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let Some(pool) = pool.upgrade() else { return };
+                let mut idle = std::mem::take(&mut *pool.idle());
+                std::future::poll_fn(|cx| {
+                    idle.retain_mut(|(lease, since)| since.elapsed() < POOL_IDLE && lease.drive(cx));
+                    Poll::Ready(())
+                })
+                .await;
+                // Those given back meanwhile are newer: they stay on top.
+                let mut now = pool.idle();
+                idle.append(&mut now);
+                *now = idle;
+            }
+        });
+    }
+}
+
+/// A backend's response body, driving its connection as it is read, and
+/// giving the connection back once the body is done.
+struct Driven {
+    body: hyper::body::Incoming,
+    lease: Option<Lease>,
+    pool: Arc<Pool>,
+}
+
+impl Driven {
+    fn done(&mut self, cx: &mut Context<'_>) {
+        if let Some(lease) = self.lease.take() {
+            self.pool.give_back(lease, cx);
+        }
+    }
+}
+
+impl hyper::body::Body for Driven {
+    type Data = <hyper::body::Incoming as hyper::body::Body>::Data;
+    type Error = hyper::Error;
+
+    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let this = &mut *self;
+        // The connection reads what the body is given.
+        if let Some(lease) = &mut this.lease {
+            lease.drive(cx);
+        }
+        let frame = std::task::ready!(Pin::new(&mut this.body).poll_frame(cx));
+        match &frame {
+            None => this.done(cx),
+            Some(Ok(_)) if this.body.is_end_stream() => this.done(cx),
+            // Cut short: the connection is in no state for another.
+            Some(Err(_)) => this.lease = None,
+            Some(Ok(_)) => {}
+        }
+        Poll::Ready(frame)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
 }
 
 impl Route {
     /// Proxies to `upstream` in plain HTTP.
     pub fn new(upstream: SocketAddr) -> Self {
-        let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
-        connector.set_nodelay(true);
-        // A backend on another machine (PLAN.md M26) that is off answers
-        // nothing at all; without a limit the client waits out the kernel.
-        connector.set_connect_timeout(Some(Duration::from_secs(10)));
-        connector.set_keepalive(Some(Duration::from_secs(60)));
-        let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
-            .pool_idle_timeout(Duration::from_secs(60))
-            .pool_max_idle_per_host(32)
-            .retry_canceled_requests(true)
-            .set_host(true)
-            .build(connector);
-        let authority = upstream.to_string().parse().expect("a socket address is an authority");
-        Self { upstream, authority, client }
+        let authority = HeaderValue::from_str(&upstream.to_string()).expect("a socket address is a header value");
+        Self { upstream, authority, pool: Arc::default() }
+    }
+
+    async fn connect(&self) -> Result<Lease, Box<dyn std::error::Error + Send + Sync>> {
+        let tcp = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(self.upstream))
+            .await
+            .map_err(|_| "connecting timed out")??;
+        tcp.set_nodelay(true)?;
+        socket2::SockRef::from(&tcp).set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(Duration::from_secs(60)))?;
+        let (send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp)).await?;
+        Ok(Lease { send, conn, open: true })
     }
 
     /// Passes `req` on to the backend, edited in place: its hop-by-hop
     /// headers gone, the backend told where it came from, and the name it
-    /// asked for kept.
+    /// asked for kept. It goes by a connection of the route's own, driven
+    /// by this very request rather than a task of its own (PLAN.md #331).
     async fn forward(&self, mut req: Request<Body>, peer: SocketAddr, scheme: &'static str) -> axum::response::Response {
         use axum::http::header::{HOST, TE};
         // A tunnel has no meaning to one fixed backend.
@@ -451,9 +597,9 @@ impl Route {
             // HTTP/2 names it in its authority alone.
             None => req.uri().authority().and_then(|a| HeaderValue::from_str(a.as_str()).ok()),
         };
+        // The origin form: the backend is the connection's other end.
         let path = req.uri().path_and_query().cloned().unwrap_or_else(|| axum::http::uri::PathAndQuery::from_static("/"));
-        let uri = axum::http::Uri::builder().scheme("http").authority(self.authority.clone()).path_and_query(path).build();
-        let Ok(uri) = uri else {
+        let Ok(uri) = axum::http::Uri::builder().path_and_query(path).build() else {
             return crate::sign_in::plain(axum::http::StatusCode::BAD_REQUEST, "bad request target");
         };
         *req.uri_mut() = uri;
@@ -465,29 +611,77 @@ impl Route {
         if trailers {
             headers.insert(TE, HeaderValue::from_static("trailers"));
         }
-        if let Some(host) = host {
-            headers.insert(HOST, host);
-        }
+        headers.insert(HOST, host.unwrap_or_else(|| self.authority.clone()));
         crate::upgrade::set_forwarded(headers, peer, scheme);
-        match self.client.request(req).await {
-            Ok(res) => {
-                let (mut parts, body) = res.into_parts();
-                crate::upgrade::strip_hop_by_hop(&mut parts.headers, false);
-                axum::response::Response::from_parts(parts, Body::new(body))
-            }
-            Err(e) => {
-                // The client's own error says little more than that it failed.
-                let mut error = e.to_string();
-                let mut source = std::error::Error::source(&e);
-                while let Some(inner) = source {
-                    error.push_str(": ");
-                    error.push_str(&inner.to_string());
-                    source = inner.source();
-                }
-                tracing::warn!(upstream = %self.upstream, %error, "backend unreachable");
-                crate::sign_in::plain(axum::http::StatusCode::BAD_GATEWAY, "Bad Gateway")
+
+        let mut pooled = true;
+        loop {
+            let lease = match pooled.then(|| std::future::poll_fn(|cx| Poll::Ready(self.pool.take(cx)))) {
+                Some(take) => take.await,
+                None => None,
+            };
+            let reused = lease.is_some();
+            let lease = match lease {
+                Some(lease) => lease,
+                None => match self.connect().await {
+                    Ok(lease) => lease,
+                    Err(e) => return self.unreachable(&*e),
+                },
+            };
+            match self.exchange(lease, req).await {
+                Ok(answer) => return answer,
+                Err(mut e) => match e.take_message() {
+                    // Closed before the request went out: one a backend
+                    // closed as it was taken. Again, on a new connection.
+                    Some(back) if reused => {
+                        req = back;
+                        pooled = false;
+                    }
+                    _ => return self.unreachable(&(*e).into_error()),
+                },
             }
         }
+    }
+
+    /// Sends `req` by `lease`, driving the connection until the backend
+    /// answers; the answer's body drives it on.
+    async fn exchange(
+        &self,
+        mut lease: Lease,
+        req: Request<Body>,
+    ) -> Result<axum::response::Response, Box<hyper::client::conn::TrySendError<Request<Body>>>> {
+        let mut answer = std::pin::pin!(lease.send.try_send_request(req));
+        let res = std::future::poll_fn(|cx| {
+            lease.drive(cx);
+            answer.as_mut().poll(cx)
+        })
+        .await
+        .map_err(Box::new)?;
+        let (mut parts, body) = res.into_parts();
+        crate::upgrade::strip_hop_by_hop(&mut parts.headers, false);
+        let mut body = Driven { body, lease: Some(lease), pool: Arc::clone(&self.pool) };
+        // Nothing to read (HEAD, 204, 304): the connection is free now.
+        if hyper::body::Body::is_end_stream(&body.body) {
+            std::future::poll_fn(|cx| {
+                body.done(cx);
+                Poll::Ready(())
+            })
+            .await;
+        }
+        Ok(axum::response::Response::from_parts(parts, Body::new(body)))
+    }
+
+    fn unreachable(&self, e: &(dyn std::error::Error + 'static)) -> axum::response::Response {
+        // The client's own error says little more than that it failed.
+        let mut error = e.to_string();
+        let mut source = e.source();
+        while let Some(inner) = source {
+            error.push_str(": ");
+            error.push_str(&inner.to_string());
+            source = inner.source();
+        }
+        tracing::warn!(upstream = %self.upstream, %error, "backend unreachable");
+        crate::sign_in::plain(axum::http::StatusCode::BAD_GATEWAY, "Bad Gateway")
     }
 }
 
@@ -1722,6 +1916,115 @@ mod tests {
         for gone in ["x-hop", "keep-alive", "proxy-connection"] {
             assert!(!answer.contains(gone), "{gone}: {answer}");
         }
+    }
+
+    /// A backend counting the connections it accepted: `/empty` is a 204,
+    /// anything else answers with its method and how long its body was.
+    async fn counting_backend(keep_alive: bool) -> (SocketAddr, Arc<AtomicUsize>) {
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = backend.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                let (s, _) = backend.accept().await.unwrap();
+                count.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let svc = hyper::service::service_fn(|req: Request<hyper::body::Incoming>| async move {
+                        let method = req.method().clone();
+                        let empty = req.uri().path() == "/empty";
+                        let body = axum::body::to_bytes(Body::new(req.into_body()), 1 << 16).await.unwrap();
+                        let res = if empty {
+                            axum::response::Response::builder().status(204).body(Body::empty()).unwrap()
+                        } else {
+                            axum::response::Response::new(Body::from(format!("{method} {}", body.len())))
+                        };
+                        Ok::<_, std::convert::Infallible>(res)
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new().keep_alive(keep_alive).serve_connection(TokioIo::new(s), svc).await;
+                });
+            }
+        });
+        (upstream, accepted)
+    }
+
+    /// One kept-open client connection to the terminator.
+    async fn kept_open(port: u16, client: &tokio_rustls::TlsConnector) -> hyper::client::conn::http1::SendRequest<Body> {
+        let (send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls(port, client).await)).await.unwrap();
+        tokio::spawn(conn);
+        send
+    }
+
+    async fn ask(send: &mut hyper::client::conn::http1::SendRequest<Body>, method: &str, path: &str, body: &'static str) -> (u16, String) {
+        send.ready().await.unwrap();
+        let req = Request::builder().method(method).uri(path).header("host", "svc.test").body(Body::from(body)).unwrap();
+        let res = send.send_request(req).await.unwrap();
+        let status = res.status().as_u16();
+        let body = axum::body::to_bytes(Body::new(res.into_body()), 1 << 16).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn requests_one_after_another_share_one_backend_connection() {
+        let (upstream, accepted) = counting_backend(true).await;
+        let (port, client, _) = in_front_of(upstream, quick());
+        let mut send = kept_open(port, &client).await;
+        assert_eq!(ask(&mut send, "GET", "/", "").await, (200, "GET 0".into()));
+        assert_eq!(ask(&mut send, "POST", "/", "hello").await, (200, "POST 5".into()));
+        assert_eq!(ask(&mut send, "GET", "/empty", "").await, (204, String::new()), "nothing to read");
+        assert_eq!(ask(&mut send, "HEAD", "/", "").await.0, 200);
+        // Another client's connection takes the same one, now idle.
+        let mut other = kept_open(port, &client).await;
+        assert_eq!(ask(&mut other, "GET", "/", "").await, (200, "GET 0".into()));
+        assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_backend_closing_every_connection_gets_a_new_one_each_time() {
+        let (upstream, accepted) = counting_backend(false).await;
+        let (port, client, _) = in_front_of(upstream, quick());
+        let mut send = kept_open(port, &client).await;
+        for _ in 0..3 {
+            assert_eq!(ask(&mut send, "GET", "/", "").await, (200, "GET 0".into()));
+        }
+        assert_eq!(accepted.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn a_connection_the_backend_closed_while_idle_is_not_used_again() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Keeps the connection open after answering, as if for more, then
+        // closes it a moment later — as a backend's idle timeout does.
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = backend.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = backend.accept().await.unwrap();
+                count.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await.unwrap();
+                    s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok").await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                });
+            }
+        });
+        let (port, client, _) = in_front_of(upstream, quick());
+        let mut send = kept_open(port, &client).await;
+        assert_eq!(ask(&mut send, "GET", "/", "").await, (200, "ok".into()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(ask(&mut send, "GET", "/", "").await, (200, "ok".into()));
+        assert_eq!(accepted.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_backend_is_a_bad_gateway() {
+        let unused = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let (port, client, _) = in_front_of(unused, quick());
+        let mut send = kept_open(port, &client).await;
+        assert_eq!(ask(&mut send, "GET", "/", "").await.0, 502);
     }
 
     #[tokio::test]

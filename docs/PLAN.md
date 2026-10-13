@@ -4999,8 +4999,8 @@ polls.
     library: an axum `Router` per request, a clone of the proxy and its pool
     handle, every header copied into a new map, a hashed set of hop-by-hop
     names built per request and per response. `Route::forward` now edits the
-    request in place and sends it through hyper's pooled client with the
-    library's settings (60 s idle, 32 idle per backend, canceled requests
+    request in place and sends it through hyper's pooled client (replaced
+    by our own connections in #331) with the library's settings (60 s idle, 32 idle per backend, canceled requests
     retried, TCP_NODELAY, 10 s connect timeout, 60 s TCP keepalive). It
     shares `upgrade.rs`'s hop-by-hop stripping (both ways; `TE: trailers`
     kept for gRPC) and forwarding headers: `Host` kept (from `:authority` on
@@ -5039,3 +5039,30 @@ polls.
     +13% (51.1k to 57.8k). The kernel is two thirds of a request there, and
     a request takes four system calls, so what is left is user time.
     Tests: IPv4 written as `Display` writes it, `Forwarded` for IPv6.
+
+331. **Each request drives its backend connection itself.** After #330 a
+    third of the terminator's user time was hyper-util's pooled client:
+    checking a connection out of a shared pool, handing every request over
+    a channel to the connection's own task and its answer back, a large
+    future copied on the way. Now each route keeps its own idle backend
+    connections (hyper's `client::conn::http1`), the most recent on top, at
+    most 32, none older than 60 s; a request takes one, or connects (10 s
+    timeout, TCP_NODELAY, 60 s keepalive), and polls the connection itself
+    — while it waits for the answer, then through the answer's body — so
+    nothing crosses tasks. The connection goes back once the body is done
+    (at once for HEAD, 204, 304), only if it can take another request; a
+    body cut short closes it. One the backend closed while idle is seen
+    closed as it is taken; one that closes before the request is written
+    hands the request back, and it goes again on a new connection, as
+    hyper-util's `retry_canceled_requests` did. A task per route, from its
+    first idle connection on, closes every 30 s what waited too long or the
+    backend closed, and ends with the route. On a Steam Deck (medians of 5
+    alternated runs, one core): HTTP/1.1 20x5 +5% over #330 (+9% over
+    #329, 73.7k req/s), 1x100 +6% (+10%), HTTP/2 +2% (+7%). Beside nginx
+    1.28 and HAProxy 3.2 on the same core: HTTP/1.1 0.97-0.98x nginx and
+    1.0-1.12x HAProxy; HTTP/2 1.02x nginx and 0.92x HAProxy; a new TLS
+    connection per request 2.0x nginx and 2.6x HAProxy.
+    Tests: requests one after another (GET, POST with a body, 204, HEAD,
+    another client) share one backend connection; a backend closing every
+    connection gets a new one each time; one closed while idle is not used
+    again; an unreachable backend is a 502.
