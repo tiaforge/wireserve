@@ -5024,3 +5024,18 @@ polls.
     Tests: forwarded and hop-by-hop headers to the backend, `Host` and
     `Forwarded` over HTTP/2, the backend's hop-by-hop headers kept from the
     client, `proto=http` on port 80; TLS and service-auth e2e pass.
+
+330. **Forwarding headers written once; no `log` bridge under HTTP/2.**
+    A profile of #329's terminator under load: `set_forwarded` and
+    `strip_hop_by_hop` were 12% of its user time — `format!` per value, the
+    address formatted twice, every hop-by-hop name looked up (two of them
+    parsed from strings each time). Now the headers are looked over once and
+    only what is there is removed, names are constants, and each forwarding
+    value is written once into the string that becomes it. And `axum`'s
+    default `tower-log` turned on `tracing`'s `log` bridge workspace-wide, so
+    every span hyper's HTTP/2 opens per request asked `log` too; `axum` now
+    takes its defaults but that one. On a Steam Deck (5 alternated runs,
+    one core): HTTP/1.1 20x5 +5% (67.2k to 70.6k req/s), 1x100 +3%, HTTP/2
+    +13% (51.1k to 57.8k). The kernel is two thirds of a request there, and
+    a request takes four system calls, so what is left is user time.
+    Tests: IPv4 written as `Display` writes it, `Forwarded` for IPv6.

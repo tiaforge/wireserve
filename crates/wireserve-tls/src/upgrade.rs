@@ -44,7 +44,12 @@ const HOP_BY_HOP: &[HeaderName] = &[
     header::PROXY_AUTHORIZATION,
     header::PROXY_AUTHENTICATE,
 ];
-const HOP_BY_HOP_NAMED: &[&str] = &["keep-alive", "proxy-connection"];
+const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
+const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
+const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
+const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
+const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
+const FORWARDED: HeaderName = HeaderName::from_static("forwarded");
 
 /// The GUID RFC 6455 §1.3 appends to a WebSocket key.
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -139,21 +144,26 @@ fn connection_tokens(headers: &HeaderMap) -> impl Iterator<Item = String> + '_ {
 /// Removes what belongs to one hop: the fixed list, and whatever
 /// `Connection` names — but `upgrade` stays when `keep_upgrade`, with a
 /// `Connection: upgrade` of our own, since the next hop must see both.
+///
+/// Every request through the terminator comes here, and most carry none
+/// of these, so the headers are looked over once rather than each name
+/// looked up (PLAN.md #330).
 pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap, keep_upgrade: bool) {
-    let named: Vec<String> = connection_tokens(headers).filter(|t| t != "upgrade").collect();
-    for name in named {
-        headers.remove(name.as_str());
+    if headers.contains_key(header::CONNECTION) {
+        let named: Vec<String> = connection_tokens(headers).filter(|t| t != "upgrade").collect();
+        for name in named {
+            headers.remove(name.as_str());
+        }
     }
-    for name in HOP_BY_HOP {
+    let hop = |name: &HeaderName| {
+        HOP_BY_HOP.contains(name) || *name == KEEP_ALIVE || *name == PROXY_CONNECTION || (!keep_upgrade && name == header::UPGRADE)
+    };
+    let found: Vec<HeaderName> = headers.keys().filter(|name| hop(name)).cloned().collect();
+    for name in found {
         headers.remove(name);
-    }
-    for name in HOP_BY_HOP_NAMED {
-        headers.remove(*name);
     }
     if keep_upgrade {
         headers.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
-    } else {
-        headers.remove(header::UPGRADE);
     }
 }
 
@@ -162,34 +172,76 @@ pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap, keep_upgrade: bool) {
 /// `X-Forwarded-Host` from `Host` unless kept, `X-Forwarded-Proto` as the
 /// request came, and `Forwarded` with all three. `prepare` removed a
 /// client's copies, unless it is a forwarding node, whose `X-Forwarded-For`
-/// and `-Host` stay (PLAN.md M43).
+/// and `-Host` stay (PLAN.md M43). Each value is written once, into the
+/// string that becomes it (PLAN.md #330).
 pub(crate) fn set_forwarded(headers: &mut HeaderMap, peer: SocketAddr, scheme: &'static str) {
-    let xff = HeaderName::from_static("x-forwarded-for");
     let ip = peer.ip().to_canonical();
-    let before: Vec<&str> = headers.get_all(&xff).iter().filter_map(|v| v.to_str().ok()).collect();
-    let chain = if before.is_empty() { ip.to_string() } else { format!("{}, {ip}", before.join(", ")) };
-    if let Ok(v) = HeaderValue::from_str(&chain) {
-        headers.insert(xff, v);
-    }
-    headers.insert(HeaderName::from_static("x-forwarded-proto"), HeaderValue::from_static(scheme));
-    let host = headers.get(header::HOST).cloned();
-    let xfh = HeaderName::from_static("x-forwarded-host");
-    if !headers.contains_key(&xfh) {
-        if let Some(host) = &host {
-            headers.insert(xfh, host.clone());
+    let mut addr = String::with_capacity(48);
+    match ip {
+        std::net::IpAddr::V4(ip) => push_v4(&mut addr, ip),
+        std::net::IpAddr::V6(ip) => {
+            use std::fmt::Write as _;
+            let _ = write!(addr, "{ip}");
         }
     }
-    // RFC 7239: an IPv6 address bracketed and quoted.
-    let mut forwarded = match ip {
-        std::net::IpAddr::V4(ip) => format!("for={ip}"),
-        std::net::IpAddr::V6(ip) => format!("for=\"[{ip}]\""),
+    headers.reserve(4);
+    let chain = if headers.contains_key(&X_FORWARDED_FOR) {
+        let mut chain = String::with_capacity(64);
+        for v in headers.get_all(&X_FORWARDED_FOR).iter().filter_map(|v| v.to_str().ok()) {
+            chain.push_str(v);
+            chain.push_str(", ");
+        }
+        chain.push_str(&addr);
+        chain
+    } else {
+        addr.clone()
     };
-    if let Some(host) = host.as_ref().and_then(|h| h.to_str().ok()) {
-        forwarded.push_str(&format!(";host=\"{host}\""));
+    if let Ok(v) = HeaderValue::try_from(chain) {
+        headers.insert(X_FORWARDED_FOR, v);
     }
-    forwarded.push_str(&format!(";proto={scheme}"));
-    if let Ok(v) = HeaderValue::from_str(&forwarded) {
-        headers.insert(HeaderName::from_static("forwarded"), v);
+    headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static(scheme));
+    let host = headers.get(header::HOST).cloned();
+    if let Some(host) = &host {
+        if !headers.contains_key(&X_FORWARDED_HOST) {
+            headers.insert(X_FORWARDED_HOST, host.clone());
+        }
+    }
+    let host = host.as_ref().and_then(|h| h.to_str().ok());
+    let mut forwarded = String::with_capacity(32 + addr.len() + host.map_or(0, str::len));
+    // RFC 7239: an IPv6 address bracketed and quoted.
+    if ip.is_ipv4() {
+        forwarded.push_str("for=");
+        forwarded.push_str(&addr);
+    } else {
+        forwarded.push_str("for=\"[");
+        forwarded.push_str(&addr);
+        forwarded.push_str("]\"");
+    }
+    if let Some(host) = host {
+        forwarded.push_str(";host=\"");
+        forwarded.push_str(host);
+        forwarded.push('"');
+    }
+    forwarded.push_str(";proto=");
+    forwarded.push_str(scheme);
+    if let Ok(v) = HeaderValue::try_from(forwarded) {
+        headers.insert(FORWARDED, v);
+    }
+}
+
+/// `ip` as `Display` writes it, without the formatter.
+fn push_v4(out: &mut String, ip: std::net::Ipv4Addr) {
+    for (i, octet) in ip.octets().into_iter().enumerate() {
+        if i > 0 {
+            out.push('.');
+        }
+        if octet >= 100 {
+            out.push(char::from(b'0' + octet / 100));
+        }
+        if octet >= 10 {
+            out.push(char::from(b'0' + octet / 10 % 10));
+        }
+        out.push(char::from(b'0' + octet % 10));
     }
 }
 
@@ -382,6 +434,22 @@ mod tests {
         strip_hop_by_hop(&mut h, false);
         let left: Vec<&str> = h.keys().map(|k| k.as_str()).collect();
         assert_eq!(left, ["sec-websocket-extensions"], "a refusal upgrades nothing");
+    }
+
+    #[test]
+    fn an_address_is_written_as_display_writes_it() {
+        for ip in ["0.0.0.0", "1.2.3.4", "9.10.99.100", "10.0.0.255", "100.64.7.1", "255.255.255.255", "127.0.0.11"] {
+            let ip: std::net::Ipv4Addr = ip.parse().unwrap();
+            let mut out = String::new();
+            push_v4(&mut out, ip);
+            assert_eq!(out, ip.to_string());
+        }
+        let mut h = HeaderMap::new();
+        h.insert("host", HeaderValue::from_static("chat.int.test"));
+        set_forwarded(&mut h, "[fd7a:115c::7]:5555".parse().unwrap(), "http");
+        assert_eq!(h["x-forwarded-for"], "fd7a:115c::7");
+        assert_eq!(h["forwarded"], "for=\"[fd7a:115c::7]\";host=\"chat.int.test\";proto=http");
+        assert_eq!(h["x-forwarded-proto"], "http");
     }
 
     #[test]

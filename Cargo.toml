@@ -30,7 +30,9 @@ rand = "0.10"
 subtle = "2"
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "signal", "sync", "fs"] }
-axum = { version = "0.8", features = ["macros"] }
+# Defaults but `tower-log`: it turns on `tracing`'s `log` bridge, and then
+# every span hyper's HTTP/2 opens per request asks `log` too (PLAN.md #330).
+axum = { version = "0.8", default-features = false, features = ["form", "http1", "json", "macros", "matched-path", "original-uri", "query", "tokio", "tracing"] }
 futures-util = { version = "0.3", default-features = false }
 mimalloc = { version = "0.1.52", default-features = false }
 tower = "0.5"
