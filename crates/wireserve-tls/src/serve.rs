@@ -3,10 +3,11 @@
 //! service address's 443; each connection goes to the service whose
 //! address it arrived on, and each request to its backend in plain HTTP.
 //!
-//! The proxying itself is `axum-reverse-proxy` over hyper — hop-by-hop
-//! headers, HTTP/2, trailers. What is ours is the edge of it — which
-//! headers a backend may believe — and upgrades: a WebSocket goes to its
-//! backend as bytes, through [`crate::upgrade`] (PLAN.md M42).
+//! The proxying itself is hyper's pooled client, with each request's headers
+//! edited in place ([`Route::forward`], PLAN.md #329). What is ours is the
+//! edge of it — which headers a backend may believe — and upgrades: a
+//! WebSocket goes to its backend as bytes, through [`crate::upgrade`]
+//! (PLAN.md M42).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -18,9 +19,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, HeaderValue, Request};
-use axum_reverse_proxy::{HostBehaviour, ProxyPolicy, ReverseProxy, XForwardedFor};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use hyper_util::server::conn::auto;
@@ -28,7 +27,6 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tower::ServiceExt as _;
 use wireserve_types::tls::NODE_HEADER;
 
 /// A calling node.
@@ -416,20 +414,80 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
 #[derive(Clone)]
 pub struct Route {
     upstream: SocketAddr,
-    router: axum::Router,
+    authority: axum::http::uri::Authority,
+    client: hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, Body>,
 }
 
 impl Route {
     /// Proxies to `upstream` in plain HTTP.
     pub fn new(upstream: SocketAddr) -> Self {
-        let proxy_policy = ProxyPolicy::new()
-            // The backend sees the name it is served under, as it would behind
-            // any reverse proxy; its configured base URL depends on it.
-            .with_host_behaviour(HostBehaviour::Preserve)
-            .with_x_forwarded_for(XForwardedFor::Append)
-            .with_public_scheme("https");
-        let router = ReverseProxy::new("/", format!("http://{upstream}")).with_policy(proxy_policy).into();
-        Self { upstream, router }
+        let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
+        connector.set_nodelay(true);
+        // A backend on another machine (PLAN.md M26) that is off answers
+        // nothing at all; without a limit the client waits out the kernel.
+        connector.set_connect_timeout(Some(Duration::from_secs(10)));
+        connector.set_keepalive(Some(Duration::from_secs(60)));
+        let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+            .pool_idle_timeout(Duration::from_secs(60))
+            .pool_max_idle_per_host(32)
+            .retry_canceled_requests(true)
+            .set_host(true)
+            .build(connector);
+        let authority = upstream.to_string().parse().expect("a socket address is an authority");
+        Self { upstream, authority, client }
+    }
+
+    /// Passes `req` on to the backend, edited in place: its hop-by-hop
+    /// headers gone, the backend told where it came from, and the name it
+    /// asked for kept.
+    async fn forward(&self, mut req: Request<Body>, peer: SocketAddr, scheme: &'static str) -> axum::response::Response {
+        use axum::http::header::{HOST, TE};
+        // A tunnel has no meaning to one fixed backend.
+        if req.method() == axum::http::Method::CONNECT {
+            return crate::sign_in::plain(axum::http::StatusCode::NOT_IMPLEMENTED, "CONNECT is not supported");
+        }
+        let host = match req.headers().get(HOST) {
+            Some(h) => Some(h.clone()),
+            // HTTP/2 names it in its authority alone.
+            None => req.uri().authority().and_then(|a| HeaderValue::from_str(a.as_str()).ok()),
+        };
+        let path = req.uri().path_and_query().cloned().unwrap_or_else(|| axum::http::uri::PathAndQuery::from_static("/"));
+        let uri = axum::http::Uri::builder().scheme("http").authority(self.authority.clone()).path_and_query(path).build();
+        let Ok(uri) = uri else {
+            return crate::sign_in::plain(axum::http::StatusCode::BAD_REQUEST, "bad request target");
+        };
+        *req.uri_mut() = uri;
+        *req.version_mut() = axum::http::Version::HTTP_11;
+        let headers = req.headers_mut();
+        // gRPC needs `TE: trailers` end to end; any other `TE` is the hop's.
+        let trailers = headers.get(TE).is_some_and(|v| v.to_str().is_ok_and(|v| v.trim().eq_ignore_ascii_case("trailers")));
+        crate::upgrade::strip_hop_by_hop(headers, false);
+        if trailers {
+            headers.insert(TE, HeaderValue::from_static("trailers"));
+        }
+        if let Some(host) = host {
+            headers.insert(HOST, host);
+        }
+        crate::upgrade::set_forwarded(headers, peer, scheme);
+        match self.client.request(req).await {
+            Ok(res) => {
+                let (mut parts, body) = res.into_parts();
+                crate::upgrade::strip_hop_by_hop(&mut parts.headers, false);
+                axum::response::Response::from_parts(parts, Body::new(body))
+            }
+            Err(e) => {
+                // The client's own error says little more than that it failed.
+                let mut error = e.to_string();
+                let mut source = std::error::Error::source(&e);
+                while let Some(inner) = source {
+                    error.push_str(": ");
+                    error.push_str(&inner.to_string());
+                    source = inner.source();
+                }
+                tracing::warn!(upstream = %self.upstream, %error, "backend unreachable");
+                crate::sign_in::plain(axum::http::StatusCode::BAD_GATEWAY, "Bad Gateway")
+            }
+        }
     }
 }
 
@@ -636,7 +694,7 @@ impl Conn {
                     "misdirected request: it names another host"
                 );
             }
-            let router = route.router.clone();
+            let route = Arc::clone(&route);
             let (upstream, recheck) = (route.upstream, limits.recheck);
             let max_upgrades = limits.max_upgrades_per_forwarded_client;
             let upgrade_slots = Arc::clone(&upgrade_slots);
@@ -647,7 +705,6 @@ impl Conn {
                 crate::upgrade::ignore(req.headers_mut());
             }
             prepare(req.headers_mut(), caller.as_ref().map(|c| c.node.as_str()), forwarder, &strip);
-            req.extensions_mut().insert(ConnectInfo(peer));
             let shared = shared.clone();
             async move {
                 let _in_flight = in_flight;
@@ -695,7 +752,7 @@ impl Conn {
                     Err(denied) => return Ok(*denied),
                     Ok(set_cookie) => set_cookie,
                 };
-                let answer = match asked {
+                let answer: Result<axum::response::Response, std::convert::Infallible> = match asked {
                     Some(asked) => {
                         // A forwarding node's client, by the address it
                         // vouched for — or, without one, the node's own.
@@ -721,13 +778,13 @@ impl Conn {
                             let (shared, asked) = (shared.clone(), Arc::clone(&asked));
                             async move { still_admitted(&shared, http, vip, caller_addr, &asked).await }
                         };
-                        let answer = crate::upgrade::proxy(req, upstream, peer, recheck, again, slot).await;
+                        let answer = crate::upgrade::proxy(req, upstream, peer, scheme, recheck, again, slot).await;
                         if answer.status() == axum::http::StatusCode::SWITCHING_PROTOCOLS {
                             stats.upgraded.store(true, Ordering::Relaxed);
                         }
                         Ok(answer)
                     }
-                    None => router.oneshot(req).await,
+                    None => Ok(route.forward(req, peer, scheme).await),
                 };
                 // A renewed session goes back to the browser with
                 // whatever the backend answered.
@@ -1577,6 +1634,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_backend_is_told_where_a_request_came_from_and_nothing_of_its_hop() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (port, client, _) = in_front_of(header_echo().await, quick());
+        let mut c = tls(port, &client).await;
+        c.write_all(
+            b"GET /a/b?c=d HTTP/1.1\r\nhost: svc.test\r\nconnection: close, x-hop\r\nx-hop: 1\r\nkeep-alive: timeout=5\r\n\
+              proxy-connection: keep-alive\r\nte: trailers\r\ntrailer: x-sum\r\nforwarded: for=10.0.0.1\r\n\
+              x-forwarded-proto: http\r\nx-app: kept\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut answer = String::new();
+        c.read_to_string(&mut answer).await.unwrap();
+        for line in [
+            "host=svc.test",
+            "x-forwarded-for=127.0.0.1",
+            "x-forwarded-host=svc.test",
+            "x-forwarded-proto=https",
+            "forwarded=for=127.0.0.1;host=\"svc.test\";proto=https",
+            "te=trailers",
+            "x-app=kept",
+        ] {
+            assert!(answer.contains(&format!("\n{line}\n")), "{line}: {answer}");
+        }
+        for gone in ["x-hop=", "keep-alive=", "proxy-connection=", "trailer=", "10.0.0.1", "proto=http\n"] {
+            assert!(!answer.contains(gone), "{gone}: {answer}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_http2_request_reaches_the_backend_with_the_name_it_asked_for() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let key = rcgen::generate_simple_self_signed(vec!["svc.test".into()]).unwrap();
+        let der = key.cert.der().clone();
+        let private = rustls_pki_types::PrivateKeyDer::try_from(key.signing_key.serialize_der()).unwrap();
+        let certs = Arc::new(Certs::default());
+        certs.set("svc.test", Arc::new(CertifiedKey::new(vec![der.clone()], rustls::crypto::aws_lc_rs::sign::any_supported_type(&private).unwrap())));
+        let listener = listener(0).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shared = Shared::default();
+        let upstream = header_echo().await;
+        shared.routes.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(Route::new(upstream)));
+        shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(open("svc.test")));
+        spawn_with_limits(listener, server_config(certs), shared, quick());
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(der).unwrap();
+        let mut config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let c = tls(port, &tokio_rustls::TlsConnector::from(Arc::new(config))).await;
+        assert_eq!(c.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+        let (mut send, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(c)).await.unwrap();
+        tokio::spawn(conn);
+        let req = Request::get("https://svc.test/x").body(Body::empty()).unwrap();
+        let res = send.send_request(req).await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(Body::new(res.into_body()), 1 << 16).await.unwrap();
+        let answer = String::from_utf8_lossy(&body);
+        assert!(answer.contains("\nhost=svc.test\n"), "{answer}");
+        assert!(answer.contains("\nforwarded=for=127.0.0.1;host=\"svc.test\";proto=https\n"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn the_client_hears_nothing_of_the_backends_hop() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = backend.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf).await.unwrap();
+            s.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: x-hop\r\nx-hop: 1\r\nkeep-alive: timeout=5\r\n\
+                  proxy-connection: keep-alive\r\nx-app: kept\r\n\r\nok",
+            )
+            .await
+            .unwrap();
+        });
+        let (port, client, _) = in_front_of(upstream, quick());
+        let mut c = tls(port, &client).await;
+        c.write_all(b"GET / HTTP/1.1\r\nhost: svc.test\r\nconnection: close\r\n\r\n").await.unwrap();
+        let mut answer = String::new();
+        c.read_to_string(&mut answer).await.unwrap();
+        let answer = answer.to_ascii_lowercase();
+        assert!(answer.starts_with("http/1.1 200") && answer.contains("x-app: kept"), "{answer}");
+        for gone in ["x-hop", "keep-alive", "proxy-connection"] {
+            assert!(!answer.contains(gone), "{gone}: {answer}");
+        }
+    }
+
+    #[tokio::test]
     async fn cookies_sent_one_per_header_reach_the_backend_as_one() {
         let mut req = request();
         req.headers_mut().remove("cookie");
@@ -1706,6 +1854,10 @@ mod tests {
         assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
         assert!(answer.contains("\nx-forwarded-for=127.0.0.1\n"), "the caller, not what it claimed: {answer}");
         assert!(!answer.contains("mallory") && !answer.contains("10.0.0.1"), "{answer}");
+        // A backend told https would send cookies and links no browser
+        // keeps over plain HTTP.
+        assert!(answer.contains("\nx-forwarded-proto=http\n"), "{answer}");
+        assert!(answer.contains("\nforwarded=for=127.0.0.1;host=\"svc.wg\";proto=http\n"), "{answer}");
         assert!(plain_http(port, &get("127.0.0.1", "")).await.starts_with("HTTP/1.1 200"), "its address, typed as it is");
 
         // DNS rebinding: someone's name pointed at the address.

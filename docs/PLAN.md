@@ -3017,6 +3017,7 @@ every HTTPS service depends on, no wildcard key on one box.
     on SIGTERM), so nothing survives a restart that HTTPS alone would lose.
 
 183. **Reused, not written: `instant-acme`, `rustls`, `axum-reverse-proxy`.**
+    (The proxy library was replaced by our own forwarding in #329.)
     ACME (DNS-01, ARI renewal windows, `replaces`) is djc's crate; SNI
     selection is one `ResolvesServerCert`; proxying — hop-by-hop headers,
     WebSocket upgrades, HTTP/2 — is `axum-reverse-proxy` over hyper with
@@ -4988,3 +4989,31 @@ polls.
     Tests: terminator port-80 listener (own names, rebinding 421, cross-site
     403, no sign-in, unrouted closed); agent rules, config, link, install
     ports and socket fds; TLS e2e step 11 (unrun).
+
+329. **The terminator forwards on its own; `axum-reverse-proxy` is gone.**
+    Against Caddy, Traefik, nginx and HAProxy, each on one core in front of
+    the same 20 services (`wireserve-tls/examples/terminator_bench.rs`), the
+    terminator beat Caddy and Traefik 2-3x but served about 0.6x what nginx
+    and HAProxy did on kept-open connections. Kernel time per request was
+    close to nginx's; user time was 2.3x, and 41% of it was the proxy
+    library: an axum `Router` per request, a clone of the proxy and its pool
+    handle, every header copied into a new map, a hashed set of hop-by-hop
+    names built per request and per response. `Route::forward` now edits the
+    request in place and sends it through hyper's pooled client with the
+    library's settings (60 s idle, 32 idle per backend, canceled requests
+    retried, TCP_NODELAY, 10 s connect timeout, 60 s TCP keepalive). It
+    shares `upgrade.rs`'s hop-by-hop stripping (both ways; `TE: trailers`
+    kept for gRPC) and forwarding headers: `Host` kept (from `:authority` on
+    HTTP/2), `X-Forwarded-For` appended, `X-Forwarded-Host` unless kept,
+    `X-Forwarded-Proto` and `Forwarded`. Those now say `http` on the port-80
+    listener (#328), for ordinary requests and WebSockets alike: a backend
+    told `https` there hands out `Secure` cookies and links a plain-HTTP
+    browser cannot use. CONNECT is 501, an unreachable backend 502, logged
+    with the error's whole chain. Measured with mimalloc in the benchmark:
+    HTTP/1.1 +52% (about 0.9x nginx), HTTP/2 +34%. mimalloc in `wireserve`
+    itself was measured too (+7% HTTP/1.1, +16% HTTP/2, handshakes no
+    faster) and left out: peak memory rose from 23 to 32 MB, and on a mesh
+    WireGuard and the network run out long before the terminator's core.
+    Tests: forwarded and hop-by-hop headers to the backend, `Host` and
+    `Forwarded` over HTTP/2, the backend's hop-by-hop headers kept from the
+    client, `proto=http` on port 80; TLS and service-auth e2e (unrun).

@@ -139,7 +139,7 @@ fn connection_tokens(headers: &HeaderMap) -> impl Iterator<Item = String> + '_ {
 /// Removes what belongs to one hop: the fixed list, and whatever
 /// `Connection` names — but `upgrade` stays when `keep_upgrade`, with a
 /// `Connection: upgrade` of our own, since the next hop must see both.
-fn strip_hop_by_hop(headers: &mut HeaderMap, keep_upgrade: bool) {
+pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap, keep_upgrade: bool) {
     let named: Vec<String> = connection_tokens(headers).filter(|t| t != "upgrade").collect();
     for name in named {
         headers.remove(name.as_str());
@@ -157,24 +157,39 @@ fn strip_hop_by_hop(headers: &mut HeaderMap, keep_upgrade: bool) {
     }
 }
 
-/// The forwarding headers the ordinary proxy sets, set the same way: the
-/// peer appended to `X-Forwarded-For`, and `X-Forwarded-Host` kept if
-/// there. `prepare` removed a client's copies, unless it is a forwarding
-/// node (PLAN.md M43).
-fn set_forwarded(headers: &mut HeaderMap, peer: SocketAddr) {
+/// Tells the backend where a request came from, for an upgrade and an
+/// ordinary request alike: the peer appended to `X-Forwarded-For`,
+/// `X-Forwarded-Host` from `Host` unless kept, `X-Forwarded-Proto` as the
+/// request came, and `Forwarded` with all three. `prepare` removed a
+/// client's copies, unless it is a forwarding node, whose `X-Forwarded-For`
+/// and `-Host` stay (PLAN.md M43).
+pub(crate) fn set_forwarded(headers: &mut HeaderMap, peer: SocketAddr, scheme: &'static str) {
     let xff = HeaderName::from_static("x-forwarded-for");
-    let peer = peer.ip().to_canonical().to_string();
+    let ip = peer.ip().to_canonical();
     let before: Vec<&str> = headers.get_all(&xff).iter().filter_map(|v| v.to_str().ok()).collect();
-    let chain = if before.is_empty() { peer } else { format!("{}, {peer}", before.join(", ")) };
+    let chain = if before.is_empty() { ip.to_string() } else { format!("{}, {ip}", before.join(", ")) };
     if let Ok(v) = HeaderValue::from_str(&chain) {
         headers.insert(xff, v);
     }
-    headers.insert(HeaderName::from_static("x-forwarded-proto"), HeaderValue::from_static("https"));
+    headers.insert(HeaderName::from_static("x-forwarded-proto"), HeaderValue::from_static(scheme));
+    let host = headers.get(header::HOST).cloned();
     let xfh = HeaderName::from_static("x-forwarded-host");
     if !headers.contains_key(&xfh) {
-        if let Some(host) = headers.get(header::HOST).cloned() {
-            headers.insert(xfh, host);
+        if let Some(host) = &host {
+            headers.insert(xfh, host.clone());
         }
+    }
+    // RFC 7239: an IPv6 address bracketed and quoted.
+    let mut forwarded = match ip {
+        std::net::IpAddr::V4(ip) => format!("for={ip}"),
+        std::net::IpAddr::V6(ip) => format!("for=\"[{ip}]\""),
+    };
+    if let Some(host) = host.as_ref().and_then(|h| h.to_str().ok()) {
+        forwarded.push_str(&format!(";host=\"{host}\""));
+    }
+    forwarded.push_str(&format!(";proto={scheme}"));
+    if let Ok(v) = HeaderValue::from_str(&forwarded) {
+        headers.insert(HeaderName::from_static("forwarded"), v);
     }
 }
 
@@ -190,6 +205,7 @@ pub(crate) async fn proxy<F, Fut, H>(
     mut req: Request<Body>,
     upstream: SocketAddr,
     peer: SocketAddr,
+    scheme: &'static str,
     recheck: Duration,
     still_admitted: F,
     hold: H,
@@ -205,7 +221,7 @@ where
     };
     let client_side = hyper::upgrade::on(&mut req);
     strip_hop_by_hop(req.headers_mut(), true);
-    set_forwarded(req.headers_mut(), peer);
+    set_forwarded(req.headers_mut(), peer, scheme);
     // The backend gets the origin form; `Host` carries the name.
     let path = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/").to_owned();
     *req.uri_mut() = path.parse::<Uri>().unwrap_or_else(|_| Uri::from_static("/"));
@@ -372,7 +388,7 @@ mod tests {
     fn the_forwarding_headers_come_from_the_connection() {
         let mut h = HeaderMap::new();
         h.insert("host", HeaderValue::from_static("chat.int.test"));
-        set_forwarded(&mut h, "[::ffff:10.9.0.7]:5555".parse().unwrap());
+        set_forwarded(&mut h, "[::ffff:10.9.0.7]:5555".parse().unwrap(), "https");
         assert_eq!(h["x-forwarded-for"], "10.9.0.7");
         assert_eq!(h["x-forwarded-proto"], "https");
         assert_eq!(h["x-forwarded-host"], "chat.int.test");
@@ -382,7 +398,7 @@ mod tests {
         h.insert("host", HeaderValue::from_static("chat.int.test"));
         h.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.9"));
         h.insert("x-forwarded-host", HeaderValue::from_static("chat.example.com"));
-        set_forwarded(&mut h, "10.9.0.7:5555".parse().unwrap());
+        set_forwarded(&mut h, "10.9.0.7:5555".parse().unwrap(), "https");
         assert_eq!(h["x-forwarded-for"], "203.0.113.9, 10.9.0.7");
         assert_eq!(h["x-forwarded-host"], "chat.example.com");
     }
