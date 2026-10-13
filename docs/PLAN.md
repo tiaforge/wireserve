@@ -5078,5 +5078,5 @@ polls.
     12.5 MB at start; at peak 13.8 against 21.9 MB (HTTP/1.1), 25.7 against
     32.1 MB (HTTP/2), 10.9 against 17.8 MB (new connections); 95 s after a
     10 s load, once the pool had closed every idle backend connection,
-    13.5 against 18.5 MB (HTTP/1.1) and 24.0 against 22.9 MB (HTTP/2) —
+    13.5 against 18.5 MB (HTTP/1.1) and 23-24 against 23 MB (HTTP/2) —
     mimalloc gives back more after HTTP/2, glibc holds less throughout.
