@@ -5065,4 +5065,4 @@ polls.
     Tests: requests one after another (GET, POST with a body, 204, HEAD,
     another client) share one backend connection; a backend closing every
     connection gets a new one each time; one closed while idle is not used
-    again; an unreachable backend is a 502.
+    again; an unreachable backend is a 502. TLS and service-auth e2e pass.
