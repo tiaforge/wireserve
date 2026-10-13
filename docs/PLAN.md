@@ -5066,3 +5066,17 @@ polls.
     another client) share one backend connection; a backend closing every
     connection gets a new one each time; one closed while idle is not used
     again; an unreachable backend is a 502. TLS and service-auth e2e pass.
+
+332. **`wireserve` keeps glibc's allocator.** #329 left mimalloc out on a
+    gain of 7-16% for 9 MB; measured again on #331 (Steam Deck, one core,
+    medians of 5 alternated runs, 20 services), it is slower in every case:
+    HTTP/1.1 20x5 -1.8% (76.3k against 74.9k req/s), 1x100 -1.4%, HTTP/2
+    -2.5%, a new TLS connection per request -0.6%, with p99 1.4 to 2.2 ms
+    on HTTP/1.1 and 2.0 to 3.1 ms on HTTP/2. #330 and #331 took away most
+    of what a request allocated, and what is left does not pay for
+    mimalloc's footprint. Memory, glibc against mimalloc: 6.5 against
+    12.5 MB at start; at peak 13.8 against 21.9 MB (HTTP/1.1), 25.7 against
+    32.1 MB (HTTP/2), 10.9 against 17.8 MB (new connections); 95 s after a
+    10 s load, once the pool had closed every idle backend connection,
+    13.5 against 18.5 MB (HTTP/1.1) and 24.0 against 22.9 MB (HTTP/2) —
+    mimalloc gives back more after HTTP/2, glibc holds less throughout.
