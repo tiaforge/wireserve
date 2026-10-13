@@ -5016,4 +5016,4 @@ polls.
     WireGuard and the network run out long before the terminator's core.
     Tests: forwarded and hop-by-hop headers to the backend, `Host` and
     `Forwarded` over HTTP/2, the backend's hop-by-hop headers kept from the
-    client, `proto=http` on port 80; TLS and service-auth e2e (unrun).
+    client, `proto=http` on port 80; TLS and service-auth e2e pass.
