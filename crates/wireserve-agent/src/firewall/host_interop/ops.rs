@@ -25,12 +25,13 @@ pub struct RealOps {
     own_table: Option<SharedRuleset>,
     /// Whether this `nft` understands `-t` — see [`RealOps::list_ruleset`].
     terse: bool,
+    firewalld_seen: firewalld::Cache,
 }
 
 impl RealOps {
     #[must_use]
     pub fn new(nft: Nft) -> Self {
-        Self { nft, firewalld: true, own_table: None, terse: true }
+        Self { nft, firewalld: true, own_table: None, terse: true, firewalld_seen: firewalld::Cache::default() }
     }
 
     /// The ruleset, without the contents of anyone's sets.
@@ -83,7 +84,7 @@ impl RealOps {
     #[cfg(test)]
     #[must_use]
     pub fn without_firewalld(nft: Nft) -> Self {
-        Self { nft, firewalld: false, own_table: None, terse: true }
+        Self { nft, firewalld: false, own_table: None, terse: true, firewalld_seen: firewalld::Cache::default() }
     }
 }
 
@@ -109,16 +110,12 @@ impl HostOps for RealOps {
         let live = live_owners(nft.as_ref(), &iptables, ifname, |o| {
             crate::lock::holder(o).is_agent()
         });
-        Observed {
-            nft,
-            iptables,
-            firewalld: if self.firewalld {
-                firewalld::observe(ifname)
-            } else {
-                FirewalldState::Unavailable
-            },
-            live,
-        }
+        let firewalld = if self.firewalld {
+            self.firewalld_seen.get(nft.as_ref(), ifname, || firewalld::observe(ifname))
+        } else {
+            FirewalldState::Unavailable
+        };
+        Observed { nft, iptables, firewalld, live }
     }
 
     fn execute(&mut self, action: &Action) -> Result<(), String> {
@@ -137,8 +134,14 @@ impl HostOps for RealOps {
             Action::FirewalldTrust { .. } | Action::FirewalldUntrust { .. } if !self.firewalld => {
                 Err("firewalld disabled".into())
             }
-            Action::FirewalldTrust { ifname } => firewalld::execute(&firewalld::trust_args(ifname)),
-            Action::FirewalldUntrust { ifname } => firewalld::execute(&firewalld::untrust_args(ifname)),
+            Action::FirewalldTrust { ifname } => {
+                self.firewalld_seen.forget();
+                firewalld::execute(&firewalld::trust_args(ifname))
+            }
+            Action::FirewalldUntrust { ifname } => {
+                self.firewalld_seen.forget();
+                firewalld::execute(&firewalld::untrust_args(ifname))
+            }
         }
     }
 

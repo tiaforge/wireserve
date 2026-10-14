@@ -5080,3 +5080,24 @@ polls.
     10 s load, once the pool had closed every idle backend connection,
     13.5 against 18.5 MB (HTTP/1.1) and 23-24 against 23 MB (HTTP/2) —
     mimalloc gives back more after HTTP/2, glibc holds less throughout.
+
+333. **`firewall-cmd` only when firewalld's table says so.** The agent's
+    service sat at 61.5 MB (peak 68.2 MB) on a Fedora host with firewalld
+    stopped, against 23 MB RSS for the agent itself: every reconcile — each
+    poll tick, each nftables event — ran `firewall-cmd --state`, a Python
+    process of 25-30 MB charged to the agent's cgroup, just to hear "not
+    running". With firewalld running (Steam Deck) it was three of them in
+    a row, about 1.5 s, the cgroup going from 7.6 to 62 MB each time.
+    Now firewalld is asked only when `table inet firewalld` is in the
+    ruleset the reconcile lists anyway, and only when that table has
+    changed since its last `Running` answer, or after we changed a zone
+    ourselves. Any runtime zone change, `--reload` or restart rewrites the
+    table, so those are seen as quickly as before; counter values, a
+    quota's use and `last` are left out of the comparison so counting rules
+    don't defeat it. Given up: a `--permanent` binding made without a
+    reload is seen at the next reload (when firewalld applies it too), and
+    firewalld on its iptables backend (deprecated, off by default since
+    0.6) counts as not running — the iptables side still opens INPUT there.
+    A stopped firewalld that leaves its table behind (`CleanupOnExit=no`)
+    is still asked every time, since "unavailable" is not kept: a starting
+    firewalld fills its table before it answers on D-Bus.
