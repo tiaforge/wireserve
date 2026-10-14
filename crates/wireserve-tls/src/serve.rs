@@ -2015,7 +2015,9 @@ mod tests {
         let mut send = kept_open(port, &client).await;
         assert_eq!(ask(&mut send, "GET", "/", "").await, (200, "ok".into()));
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(ask(&mut send, "GET", "/", "").await, (200, "ok".into()));
+        // A request sent on the dead connection would wait forever.
+        let again = tokio::time::timeout(Duration::from_secs(3), ask(&mut send, "GET", "/", "")).await.expect("answered");
+        assert_eq!(again, (200, "ok".into()));
         assert_eq!(accepted.load(Ordering::Relaxed), 2);
     }
 
@@ -2025,6 +2027,377 @@ mod tests {
         let (port, client, _) = in_front_of(unused, quick());
         let mut send = kept_open(port, &client).await;
         assert_eq!(ask(&mut send, "GET", "/", "").await.0, 502);
+    }
+
+    /// How a backend saw one request: what framed it, and what it read.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Seen {
+        method: String,
+        path: String,
+        content_length: Option<String>,
+        transfer_encoding: Option<String>,
+        body: Result<usize, String>,
+    }
+
+    /// A body sent a piece at a time, `pause` apart.
+    struct Trickle {
+        left: usize,
+        pause: Duration,
+        sleep: Pin<Box<tokio::time::Sleep>>,
+    }
+
+    impl hyper::body::Body for Trickle {
+        type Data = axum::body::Bytes;
+        type Error = std::convert::Infallible;
+        fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            if self.left == 0 {
+                return Poll::Ready(None);
+            }
+            std::task::ready!(self.sleep.as_mut().poll(cx));
+            self.left -= 1;
+            let next = tokio::time::Instant::now() + self.pause;
+            self.sleep.as_mut().reset(next);
+            Poll::Ready(Some(Ok(hyper::body::Frame::data(axum::body::Bytes::from(vec![b'x'; 16 * 1024])))))
+        }
+    }
+
+    /// A backend that records every request as it saw it, and counts the
+    /// connections it accepted and those that have closed. It answers
+    /// `<method> <path> <body length>`; `/big` is a slow 1 MiB answer.
+    struct Recording {
+        addr: SocketAddr,
+        seen: Arc<std::sync::Mutex<Vec<Seen>>>,
+        accepted: Arc<AtomicUsize>,
+        closed: Arc<AtomicUsize>,
+    }
+
+    async fn recording_backend() -> Recording {
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rec = Recording {
+            addr: backend.local_addr().unwrap(),
+            seen: Arc::default(),
+            accepted: Arc::default(),
+            closed: Arc::default(),
+        };
+        let (seen, accepted, closed) = (Arc::clone(&rec.seen), Arc::clone(&rec.accepted), Arc::clone(&rec.closed));
+        tokio::spawn(async move {
+            loop {
+                let (s, _) = backend.accept().await.unwrap();
+                accepted.fetch_add(1, Ordering::SeqCst);
+                let (seen, closed) = (Arc::clone(&seen), Arc::clone(&closed));
+                tokio::spawn(async move {
+                    let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                        let seen = Arc::clone(&seen);
+                        async move {
+                            let header = |n: &str| req.headers().get(n).map(|v| v.to_str().unwrap_or("?").to_owned());
+                            let (method, path) = (req.method().to_string(), req.uri().path().to_owned());
+                            let (content_length, transfer_encoding) = (header("content-length"), header("transfer-encoding"));
+                            let body = axum::body::to_bytes(Body::new(req.into_body()), 1 << 20).await.map(|b| b.len()).map_err(|e| e.to_string());
+                            seen.lock().unwrap().push(Seen { method: method.clone(), path: path.clone(), content_length, transfer_encoding, body: body.clone() });
+                            let res = if path == "/big" {
+                                Body::new(Trickle { left: 64, pause: Duration::from_millis(20), sleep: Box::pin(tokio::time::sleep(Duration::ZERO)) })
+                            } else {
+                                Body::from(format!("{method} {path} {}", body.unwrap_or(0)))
+                            };
+                            Ok::<_, std::convert::Infallible>(axum::response::Response::new(res))
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(s), svc).await;
+                    closed.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+        rec
+    }
+
+    /// Waits up to two seconds for `cond`.
+    async fn eventually(cond: impl Fn() -> bool) -> bool {
+        let end = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < end {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cond()
+    }
+
+    /// Everything the terminator says on `s` until it closes, at most five
+    /// seconds.
+    async fn read_all<S: tokio::io::AsyncRead + Unpin>(s: &mut S) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await;
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_client_gone_mid_answer_leaves_its_backend_connection_unused() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let rec = recording_backend().await;
+        let (port, client, _) = in_front_of(rec.addr, quick());
+        let mut c = tls(port, &client).await;
+        c.write_all(b"GET /big HTTP/1.1\r\nhost: svc.test\r\n\r\n").await.unwrap();
+        let mut buf = [0u8; 4096];
+        let n = c.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+        drop(c);
+        assert!(eventually(|| rec.closed.load(Ordering::SeqCst) == 1).await, "the half-read answer's connection is closed");
+        let mut send = kept_open(port, &client).await;
+        assert_eq!(ask(&mut send, "GET", "/after", "").await, (200, "GET /after 0".into()));
+        assert_eq!(rec.accepted.load(Ordering::SeqCst), 2, "never the one cut short");
+    }
+
+    #[tokio::test]
+    async fn an_http2_stream_reset_mid_answer_leaves_its_backend_connection_unused() {
+        let rec = recording_backend().await;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let key = rcgen::generate_simple_self_signed(vec!["svc.test".into()]).unwrap();
+        let der = key.cert.der().clone();
+        let private = rustls_pki_types::PrivateKeyDer::try_from(key.signing_key.serialize_der()).unwrap();
+        let certs = Arc::new(Certs::default());
+        certs.set("svc.test", Arc::new(CertifiedKey::new(vec![der.clone()], rustls::crypto::aws_lc_rs::sign::any_supported_type(&private).unwrap())));
+        let listener = listener(0).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shared = Shared::default();
+        shared.routes.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(Route::new(rec.addr)));
+        shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(open("svc.test")));
+        spawn_with_limits(listener, server_config(certs), shared, quick());
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(der).unwrap();
+        let mut config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let c = tls(port, &tokio_rustls::TlsConnector::from(Arc::new(config))).await;
+        let (mut send, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(c)).await.unwrap();
+        tokio::spawn(conn);
+
+        let res = send.send_request(Request::get("https://svc.test/big").body(Body::empty()).unwrap()).await.unwrap();
+        let mut body = res.into_body();
+        let first = std::future::poll_fn(|cx| hyper::body::Body::poll_frame(Pin::new(&mut body), cx)).await;
+        assert!(matches!(first, Some(Ok(_))), "the answer began");
+        drop(body); // RST_STREAM; the client's connection stays open.
+        assert!(eventually(|| rec.closed.load(Ordering::SeqCst) == 1).await, "the half-read answer's connection is closed");
+
+        let res = send.send_request(Request::get("https://svc.test/after").body(Body::empty()).unwrap()).await.unwrap();
+        let body = axum::body::to_bytes(Body::new(res.into_body()), 1 << 16).await.unwrap();
+        assert_eq!(&body[..], b"GET /after 0");
+        assert_eq!(rec.accepted.load(Ordering::SeqCst), 2, "never the one cut short");
+    }
+
+    #[tokio::test]
+    async fn a_client_gone_mid_request_body_leaves_its_backend_connection_unused() {
+        use tokio::io::AsyncWriteExt;
+        let rec = recording_backend().await;
+        let (port, client, _) = in_front_of(rec.addr, quick());
+        let mut c = tls(port, &client).await;
+        c.write_all(b"POST /cut HTTP/1.1\r\nhost: svc.test\r\ncontent-length: 100000\r\n\r\n0123456789").await.unwrap();
+        assert!(eventually(|| rec.accepted.load(Ordering::SeqCst) == 1).await, "the request reached the backend");
+        drop(c);
+        assert!(eventually(|| rec.closed.load(Ordering::SeqCst) == 1).await, "the half-sent request's connection is closed");
+        let mut send = kept_open(port, &client).await;
+        assert_eq!(ask(&mut send, "GET", "/after", "").await, (200, "GET /after 0".into()));
+        assert_eq!(rec.accepted.load(Ordering::SeqCst), 2);
+        let seen = rec.seen.lock().unwrap().clone();
+        assert!(seen.iter().any(|s| s.path == "/cut" && s.body.is_err()), "the backend saw the body end early: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_chunked_request_body_arrives_whole_and_the_connection_goes_on() {
+        use tokio::io::AsyncWriteExt;
+        let rec = recording_backend().await;
+        let (port, client, _) = in_front_of(rec.addr, quick());
+        let mut c = tls(port, &client).await;
+        c.write_all(
+            b"POST /chunked HTTP/1.1\r\nhost: svc.test\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n\
+              GET /next HTTP/1.1\r\nhost: svc.test\r\nconnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let answer = read_all(&mut c).await;
+        let (first, second) = (answer.find("POST /chunked 11"), answer.find("GET /next 0"));
+        assert!(first.is_some() && second.is_some() && first < second, "both answered, in order: {answer}");
+        assert_eq!(rec.accepted.load(Ordering::SeqCst), 1);
+        for s in rec.seen.lock().unwrap().iter() {
+            assert!(!(s.content_length.is_some() && s.transfer_encoding.is_some()), "one framing only: {s:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_that_expects_100_continue_is_told_to_go_on() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let rec = recording_backend().await;
+        let (port, client, _) = in_front_of(rec.addr, quick());
+        let mut c = tls(port, &client).await;
+        c.write_all(b"POST /expect HTTP/1.1\r\nhost: svc.test\r\nexpect: 100-continue\r\ncontent-length: 5\r\nconnection: close\r\n\r\n").await.unwrap();
+        // curl waits a second for this before it sends the body anyway.
+        let mut buf = [0u8; 256];
+        let n = tokio::time::timeout(Duration::from_millis(900), c.read(&mut buf)).await.expect("100 Continue within a second").unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 100 Continue"), "{}", String::from_utf8_lossy(&buf[..n]));
+        c.write_all(b"hello").await.unwrap();
+        let answer = read_all(&mut c).await;
+        assert!(answer.contains("POST /expect 5"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn an_answer_before_the_body_is_read_does_not_desynchronise_the_backend_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // A backend that refuses `/early` from its headers alone, then reads
+        // the body it was sent and goes on — as a correct one does without
+        // closing — and answers anything else with its path.
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = backend.local_addr().unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = backend.accept().await.unwrap();
+                let log = Arc::clone(&log);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    loop {
+                        let end = loop {
+                            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break i + 4;
+                            }
+                            let mut chunk = [0u8; 4096];
+                            match s.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                        let line = head.lines().next().unwrap_or_default().to_owned();
+                        log.lock().unwrap().push(line.clone());
+                        let length: usize = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        buf.drain(..end);
+                        let path = line.split(' ').nth(1).unwrap_or("?").to_owned();
+                        if path == "/early" {
+                            let _ = s.write_all(b"HTTP/1.1 413 Payload Too Large\r\ncontent-length: 4\r\n\r\nnope").await;
+                        }
+                        while buf.len() < length {
+                            let mut chunk = [0u8; 16384];
+                            match s.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        buf.drain(..length);
+                        if path != "/early" {
+                            let body = format!("ok {path}");
+                            let _ = s.write_all(format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}", body.len()).as_bytes()).await;
+                        }
+                    }
+                });
+            }
+        });
+        let (port, client, _) = in_front_of(upstream, quick());
+        let mut send = kept_open(port, &client).await;
+        static BIG: [u8; 200_000] = [b'y'; 200_000];
+        send.ready().await.unwrap();
+        let req = Request::post("/early").header("host", "svc.test").body(Body::from(&BIG[..])).unwrap();
+        let res = send.send_request(req).await.unwrap();
+        assert_eq!(res.status().as_u16(), 413);
+        let _ = axum::body::to_bytes(Body::new(res.into_body()), 1 << 16).await;
+        let mut other = kept_open(port, &client).await;
+        for path in ["/a", "/b", "/c"] {
+            let (status, body) = tokio::time::timeout(Duration::from_secs(3), ask(&mut other, "GET", path, "")).await.expect("answered");
+            assert_eq!((status, body), (200, format!("ok {path}")));
+        }
+        let lines = requests.lock().unwrap().clone();
+        assert!(lines.iter().all(|l| l.starts_with("post /early ") || l.starts_with("get /")), "only requests the clients sent: {lines:?}");
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_ends_when_its_connection_closes_arrives_whole() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = backend.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = backend.accept().await.unwrap();
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    // No length and no chunks: the answer is all there is until the close.
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\r\n").await;
+                    for part in ["all of it, ", "until ", "the close"] {
+                        let _ = s.write_all(part.as_bytes()).await;
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                });
+            }
+        });
+        let (port, client, _) = in_front_of(upstream, quick());
+        let mut send = kept_open(port, &client).await;
+        for _ in 0..2 {
+            assert_eq!(ask(&mut send, "GET", "/", "").await, (200, "all of it, until the close".into()));
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 2, "a connection that ended its answer by closing is not used again");
+    }
+
+    #[tokio::test]
+    async fn requests_framed_two_ways_never_reach_the_backend_as_something_else() {
+        use tokio::io::AsyncWriteExt;
+        let rec = recording_backend().await;
+        let (port, client, _) = in_front_of(rec.addr, quick());
+
+        // Both lengths: `Transfer-Encoding` wins (RFC 9112 §6.3), or the
+        // request is refused; either way the backend sees one framing.
+        let mut c = tls(port, &client).await;
+        c.write_all(
+            b"POST /both HTTP/1.1\r\nhost: svc.test\r\ncontent-length: 4\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n\
+              GET /second HTTP/1.1\r\nhost: svc.test\r\nconnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let answer = read_all(&mut c).await;
+        let seen = rec.seen.lock().unwrap().clone();
+        for s in &seen {
+            assert!(!(s.content_length.is_some() && s.transfer_encoding.is_some()), "one framing only: {s:?}");
+            assert!(matches!(s.path.as_str(), "/both" | "/second"), "nothing the client did not ask: {seen:?}");
+            assert_eq!(s.body, Ok(0), "{seen:?}");
+        }
+        assert!(answer.matches("HTTP/1.1 ").count() >= seen.len(), "an answer per request that went on: {answer}");
+
+        // Lengths that disagree, or an encoding that does not end in
+        // `chunked`: refused, and nothing reaches the backend.
+        let before = rec.seen.lock().unwrap().len();
+        for head in [
+            "POST /dup HTTP/1.1\r\nhost: svc.test\r\ncontent-length: 4\r\ncontent-length: 40\r\nconnection: close\r\n\r\nabcd",
+            "POST /gzip HTTP/1.1\r\nhost: svc.test\r\ntransfer-encoding: gzip\r\nconnection: close\r\n\r\nabcd",
+            "POST /space HTTP/1.1\r\nhost: svc.test\r\ntransfer-encoding : chunked\r\ncontent-length: 4\r\nconnection: close\r\n\r\nabcd",
+        ] {
+            let mut c = tls(port, &client).await;
+            c.write_all(head.as_bytes()).await.unwrap();
+            let answer = read_all(&mut c).await;
+            let status = answer.get(9..12).unwrap_or("");
+            assert!(answer.is_empty() || status.starts_with('4') || status.starts_with('5'), "refused: {head:?} -> {answer}");
+        }
+        assert_eq!(rec.seen.lock().unwrap().len(), before, "none reached the backend: {:?}", rec.seen.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn pipelined_requests_are_answered_in_order() {
+        use tokio::io::AsyncWriteExt;
+        let rec = recording_backend().await;
+        let (port, client, _) = in_front_of(rec.addr, quick());
+        let mut c = tls(port, &client).await;
+        c.write_all(
+            b"GET /one HTTP/1.1\r\nhost: svc.test\r\n\r\nPOST /two HTTP/1.1\r\nhost: svc.test\r\ncontent-length: 3\r\n\r\nabc\
+              GET /three HTTP/1.1\r\nhost: svc.test\r\nconnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let answer = read_all(&mut c).await;
+        let at = |s: &str| answer.find(s).unwrap_or_else(|| panic!("{s}: {answer}"));
+        assert!(at("GET /one 0") < at("POST /two 3") && at("POST /two 3") < at("GET /three 0"), "{answer}");
     }
 
     #[tokio::test]
