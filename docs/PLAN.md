@@ -4061,7 +4061,7 @@ and could not tell which public name was asked for.
 264. **Only where, never who.** `X-Forwarded-Proto` is still always set
     afresh (`https`; kept since #334), every identity header still goes, and the operator's
     `WIRESERVE_STRIP_HEADERS` still removes the two if listed. The `Host`
-    check (421 for another name) is unchanged: the proxy must send the
+    check (421 for another name) is unchanged (until #335): the proxy must send the
     service's own name as `Host` and the public one in `X-Forwarded-Host`.
 265. **Verification.** Unit tests: `prepare` keeps exactly the two for a
     forwarding node and the operator's list wins; through a real TLS
@@ -5129,3 +5129,23 @@ polls.
     TLS listener and a port-80 one, a caller becoming a forwarding node
     changes the backend's `X-Forwarded-Proto` and `Forwarded` while an
     ordinary caller's claim is replaced. No e2e.
+
+335. **A forwarding node may send the public name as `Host`.** #264 kept
+    the `Host` check (421 for another name) for forwarding nodes too, so
+    every `reverse_proxy` into the mesh needed `header_up Host
+    {upstream_hostport}`. The check keeps a rebound DNS name out: a page
+    whose name points at a service address would otherwise read it as the
+    device the browser runs on. A forwarding node is a proxy, not a
+    browser, so its request naming another host is now taken as naming
+    the public one (`take_public_name`): that name goes to
+    `X-Forwarded-Host` unless the node sent one itself, `Host` becomes the
+    service's own name and an absolute target its origin form — what the
+    backend got with `header_up` — and `prepare` then checks the public
+    name as any it vouches for (#268). On 443 a rebound name never gets
+    this far (no certificate for it); on port 80, where most such proxies
+    point, it rests on nobody browsing the web on a forwarding node, which
+    the docs now say. Unit test through a port-80 and a TLS listener: 421
+    before the node is a forwarding node and for anyone else; afterwards
+    `Host` is the service's, `X-Forwarded-Host` the public name (with a
+    port, or the node's own), an invalid one dropped, the public origin's
+    POST let in and another site's refused. No e2e.

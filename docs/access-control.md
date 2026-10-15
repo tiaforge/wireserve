@@ -274,7 +274,12 @@ Worth knowing:
   `X-Forwarded-Proto` of `http` or `https` — so a backend behind a proxy
   that takes HTTPS and forwards to port 80 still knows the visitor used
   HTTPS. `Forwarded` says the same: the client's element first, then the
-  terminator's own. Every other caller's are still removed, and the
+  terminator's own. Its proxy may also send the public name as `Host`, so
+  Caddy needs no `header_up Host`: the backend gets the service's own name
+  as `Host` and the public one as `X-Forwarded-Host`, as if the proxy had
+  sent them so. Since a request naming another host is otherwise refused to
+  keep rebound DNS names out of a browser, list only machines nobody browses
+  the web on. Every other caller's are still removed, and the
   terminator names the scheme it was reached over. Nothing about *who* is
   calling is ever kept.
 - **Another site's page cannot act here as your device — on 443 and 80.**

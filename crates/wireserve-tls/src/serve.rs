@@ -878,7 +878,10 @@ impl Conn {
             let identity = read(&shared.identity).clone();
             let strip = read(&shared.strip).clone();
             let forwarder = shared.forwarding_node(peer.ip()).is_some();
-            let misdirected = policy.as_ref().is_some_and(|p| !for_this_service(&req, &p.hosts()));
+            let misdirected = match &policy {
+                Some(p) if !for_this_service(&req, &p.hosts()) => !(forwarder && take_public_name(&mut req, &p.fqdn)),
+                _ => false,
+            };
             if misdirected {
                 tracing::info!(
                     service = policy.as_ref().map(|p| p.fqdn.as_str()).unwrap_or_default(),
@@ -1075,6 +1078,38 @@ fn for_this_service<B>(req: &Request<B>, hosts: &[&str]) -> bool {
         return false;
     }
     authority.is_none_or(same) && header.is_none_or(same)
+}
+
+/// A forwarding node's request naming the public name its proxy was asked
+/// for (PLAN.md #335): that name goes to `X-Forwarded-Host`, unless the
+/// node named one there itself, and the request names the service's own
+/// `fqdn` instead — what the backend sees when the proxy sends it as `Host`
+/// (Caddy's `header_up Host {upstream_hostport}`). The `Host` check keeps a
+/// rebound name in a browser out, and a forwarding node is a proxy, not a
+/// browser: naming one says nobody browses there. `prepare` then checks the
+/// public name as it does any the node vouches for. False when `fqdn` is
+/// not a header value, and the request is refused as before.
+fn take_public_name<B>(req: &mut Request<B>, fqdn: &str) -> bool {
+    use axum::http::header::HOST;
+    let Ok(own) = HeaderValue::from_str(fqdn) else {
+        return false;
+    };
+    let xfh = axum::http::HeaderName::from_static("x-forwarded-host");
+    let public = match req.headers().get(HOST) {
+        Some(h) => Some(h.clone()),
+        // HTTP/2 names it in its authority alone.
+        None => req.uri().authority().and_then(|a| HeaderValue::from_str(a.as_str()).ok()),
+    };
+    if let Some(public) = public.filter(|_| !req.headers().contains_key(&xfh)) {
+        req.headers_mut().insert(xfh, public);
+    }
+    req.headers_mut().insert(HOST, own);
+    // The origin form: the authority named the public name too.
+    if req.uri().authority().is_some() {
+        let path = req.uri().path_and_query().cloned().unwrap_or_else(|| axum::http::uri::PathAndQuery::from_static("/"));
+        *req.uri_mut() = axum::http::Uri::from(path);
+    }
+    true
 }
 
 /// `name:port` without the port; anything else as it is.
@@ -2587,6 +2622,65 @@ mod tests {
         let mut answer = String::new();
         let _ = c.read_to_string(&mut answer).await;
         answer
+    }
+
+    #[tokio::test]
+    async fn a_forwarding_node_may_name_the_public_name_as_host() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let echo = header_echo().await;
+        let own = Policy {
+            fqdn: "svc.wg".into(),
+            aliases: vec![],
+            access: wireserve_types::ServiceAccess { open: true, ..Default::default() },
+            cross_site: false,
+        };
+        let (port, shared) = http_in_front_of(echo, own);
+        shared.callers.write().unwrap().insert(Ipv4Addr::LOCALHOST, CallerInfo { node: "edge".into() });
+        let get = |extra: &str| format!("GET / HTTP/1.1\r\nhost: files.example.com\r\nconnection: close\r\n{extra}\r\n");
+
+        let answer = plain_http(port, &get("")).await;
+        assert!(answer.starts_with("HTTP/1.1 421"), "not yet a forwarding node: {answer}");
+        shared.forwarders.write().unwrap().push("edge".into());
+
+        // Caddy's `reverse_proxy http://svc.wg` as it comes, `Host` the
+        // public name: the backend sees what `header_up Host` would give it.
+        let answer = plain_http(port, &get("")).await;
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(answer.contains("\nhost=svc.wg\n"), "{answer}");
+        assert!(answer.contains("\nx-forwarded-host=files.example.com\n"), "{answer}");
+        // The node's own wins, and is checked as ever.
+        let answer = plain_http(port, &get("x-forwarded-host: www.example.com\r\n")).await;
+        assert!(answer.contains("\nhost=svc.wg\n") && answer.contains("\nx-forwarded-host=www.example.com\n"), "{answer}");
+        let answer = plain_http(port, &get("x-forwarded-host: a.example, b.example\r\n")).await;
+        assert!(answer.contains("\nx-forwarded-host=svc.wg\n"), "{answer}");
+        // A port, as `Host` may carry; a public name that isn't one is not kept.
+        let answer = plain_http(port, "GET / HTTP/1.1\r\nhost: files.example.com:8080\r\nconnection: close\r\n\r\n").await;
+        assert!(answer.contains("\nx-forwarded-host=files.example.com:8080\n"), "{answer}");
+        let answer = plain_http(port, "GET / HTTP/1.1\r\nhost: files_example.com\r\nconnection: close\r\n\r\n").await;
+        assert!(answer.contains("\nhost=svc.wg\n") && answer.contains("\nx-forwarded-host=svc.wg\n"), "{answer}");
+        // Its pages are the service's own; another site's still are not.
+        let post = |origin: &str| {
+            format!(
+                "POST / HTTP/1.1\r\nhost: files.example.com\r\nx-forwarded-proto: https\r\norigin: {origin}\r\n\
+                 content-length: 0\r\nconnection: close\r\n\r\n"
+            )
+        };
+        assert!(plain_http(port, &post("https://files.example.com")).await.starts_with("HTTP/1.1 200"));
+        assert!(plain_http(port, &post("https://evil.example")).await.starts_with("HTTP/1.1 403"));
+        // Anyone else is refused, as before.
+        shared.callers.write().unwrap().insert(Ipv4Addr::LOCALHOST, CallerInfo { node: "phone".into() });
+        assert!(plain_http(port, &get("")).await.starts_with("HTTP/1.1 421"));
+
+        // And over TLS, absolute form naming the public name too.
+        let (port, client, shared) = in_front_of(echo, quick());
+        shared.callers.write().unwrap().insert(Ipv4Addr::LOCALHOST, CallerInfo { node: "edge".into() });
+        shared.forwarders.write().unwrap().push("edge".into());
+        let mut c = tls(port, &client).await;
+        c.write_all(b"GET https://files.example.com/x HTTP/1.1\r\nhost: files.example.com\r\nconnection: close\r\n\r\n").await.unwrap();
+        let mut answer = String::new();
+        c.read_to_string(&mut answer).await.unwrap();
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(answer.contains("\nhost=svc.test\n") && answer.contains("\nx-forwarded-host=files.example.com\n"), "{answer}");
     }
 
     #[tokio::test]
