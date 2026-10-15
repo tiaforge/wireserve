@@ -269,9 +269,14 @@ Worth knowing:
 - **A reverse proxy of your own can name its client.** A node listed in
   `WIRESERVE_FORWARDING_NODES` on the coordinator — a Caddy on a public host
   proxying into the mesh — keeps the last entry of its `X-Forwarded-For`
-  (the client its proxy saw; the terminator appends the node's own address)
-  and an `X-Forwarded-Host` that is one plain host name; every other
-  caller's are still removed. Nothing about *who* is calling is ever kept.
+  (the client its proxy saw; the terminator appends the node's own address),
+  an `X-Forwarded-Host` that is one plain host name, and an
+  `X-Forwarded-Proto` of `http` or `https` — so a backend behind a proxy
+  that takes HTTPS and forwards to port 80 still knows the visitor used
+  HTTPS. `Forwarded` says the same: the client's element first, then the
+  terminator's own. Every other caller's are still removed, and the
+  terminator names the scheme it was reached over. Nothing about *who* is
+  calling is ever kept.
 - **Another site's page cannot act here as your device — on 443 and 80.**
   Grants let a device in, and a browser sends whatever any page open on it
   asks for through the tunnel — no cookie, so no SameSite rule holds it
@@ -282,7 +287,7 @@ Worth knowing:
   domain counts as another site, since a node's own 443 service is one of
   them. Following a link, reads (which the browser keeps from the other page)
   and programs that aren't browsers are unaffected. Through a forwarding node, the public name it was
-  asked for counts as the service's own. A service that must take such requests — itself a
+  asked for, at the scheme it vouched for (`https` if it named none), counts as the service's own. A service that must take such requests — itself a
   sign-in client answered by form POST, say — goes in
   `WIRESERVE_CROSS_SITE_SERVICES` on the coordinator. So does one with a
   desktop app built on Electron, such as Bitwarden's for Vaultwarden: its

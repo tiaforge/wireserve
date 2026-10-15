@@ -169,22 +169,24 @@ pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap, keep_upgrade: bool) {
 
 /// Tells the backend where a request came from, for an upgrade and an
 /// ordinary request alike: the peer appended to `X-Forwarded-For`,
-/// `X-Forwarded-Host` from `Host` unless kept, `X-Forwarded-Proto` as the
-/// request came, and `Forwarded` with all three. `prepare` removed a
-/// client's copies, unless it is a forwarding node, whose `X-Forwarded-For`
-/// and `-Host` stay (PLAN.md M43). Each value is written once, into the
-/// string that becomes it (PLAN.md #330).
+/// `X-Forwarded-Host` from `Host` and `X-Forwarded-Proto` as the request
+/// came, unless kept, and `Forwarded` saying the same. `prepare` removed a
+/// client's copies, unless it is a forwarding node, whose `X-Forwarded-*`
+/// stay (PLAN.md M43, #334); then `Forwarded` has two elements, as two
+/// proxies write it (RFC 7239 §4): first the client its proxy saw, the
+/// public name and scheme, then this hop's own. Each value is written
+/// once, into the string that becomes it (PLAN.md #330).
 pub(crate) fn set_forwarded(headers: &mut HeaderMap, peer: SocketAddr, scheme: &'static str) {
     let ip = peer.ip().to_canonical();
     let mut addr = String::with_capacity(48);
-    match ip {
-        std::net::IpAddr::V4(ip) => push_v4(&mut addr, ip),
-        std::net::IpAddr::V6(ip) => {
-            use std::fmt::Write as _;
-            let _ = write!(addr, "{ip}");
-        }
-    }
+    push_ip(&mut addr, ip);
     headers.reserve(4);
+    let text = |headers: &HeaderMap, name: &HeaderName| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
+    // What a forwarding node vouched for; `prepare` left one of each at most.
+    let client_for = text(headers, &X_FORWARDED_FOR).and_then(|v| v.trim().parse::<std::net::IpAddr>().ok());
+    let client_host = text(headers, &X_FORWARDED_HOST);
+    let client_proto = text(headers, &X_FORWARDED_PROTO);
+    let vouched = client_for.is_some() || client_host.is_some() || client_proto.is_some();
     let chain = if headers.contains_key(&X_FORWARDED_FOR) {
         let mut chain = String::with_capacity(64);
         for v in headers.get_all(&X_FORWARDED_FOR).iter().filter_map(|v| v.to_str().ok()) {
@@ -199,33 +201,69 @@ pub(crate) fn set_forwarded(headers: &mut HeaderMap, peer: SocketAddr, scheme: &
     if let Ok(v) = HeaderValue::try_from(chain) {
         headers.insert(X_FORWARDED_FOR, v);
     }
-    headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static(scheme));
+    if client_proto.is_none() {
+        headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static(scheme));
+    }
     let host = headers.get(header::HOST).cloned();
     if let Some(host) = &host {
-        if !headers.contains_key(&X_FORWARDED_HOST) {
+        if client_host.is_none() {
             headers.insert(X_FORWARDED_HOST, host.clone());
         }
     }
     let host = host.as_ref().and_then(|h| h.to_str().ok());
-    let mut forwarded = String::with_capacity(32 + addr.len() + host.map_or(0, str::len));
-    // RFC 7239: an IPv6 address bracketed and quoted.
-    if ip.is_ipv4() {
-        forwarded.push_str("for=");
-        forwarded.push_str(&addr);
-    } else {
-        forwarded.push_str("for=\"[");
-        forwarded.push_str(&addr);
-        forwarded.push_str("]\"");
+    let mut forwarded = String::with_capacity(96 + addr.len() + host.map_or(0, str::len));
+    if vouched {
+        let mut client = String::new();
+        if let Some(ip) = client_for {
+            push_ip(&mut client, ip.to_canonical());
+        }
+        push_element(&mut forwarded, client_for.map(|_| client.as_str()), client_host.as_deref(), client_proto.as_deref());
+        forwarded.push_str(", ");
     }
-    if let Some(host) = host {
-        forwarded.push_str(";host=\"");
-        forwarded.push_str(host);
-        forwarded.push('"');
-    }
-    forwarded.push_str(";proto=");
-    forwarded.push_str(scheme);
+    push_element(&mut forwarded, Some(&addr), host, Some(scheme));
     if let Ok(v) = HeaderValue::try_from(forwarded) {
         headers.insert(FORWARDED, v);
+    }
+}
+
+/// One element of `Forwarded` (RFC 7239 §4), its pairs in the order
+/// `for`, `host`, `proto`, each only when known. `addr` is as [`push_ip`]
+/// wrote it: an IPv6 address is bracketed and quoted.
+fn push_element(out: &mut String, addr: Option<&str>, host: Option<&str>, proto: Option<&str>) {
+    let mut sep = "";
+    if let Some(addr) = addr {
+        if addr.contains(':') {
+            out.push_str("for=\"[");
+            out.push_str(addr);
+            out.push_str("]\"");
+        } else {
+            out.push_str("for=");
+            out.push_str(addr);
+        }
+        sep = ";";
+    }
+    if let Some(host) = host {
+        out.push_str(sep);
+        out.push_str("host=\"");
+        out.push_str(host);
+        out.push('"');
+        sep = ";";
+    }
+    if let Some(proto) = proto {
+        out.push_str(sep);
+        out.push_str("proto=");
+        out.push_str(proto);
+    }
+}
+
+/// `ip` as `Display` writes it, an IPv4 address without the formatter.
+fn push_ip(out: &mut String, ip: std::net::IpAddr) {
+    match ip {
+        std::net::IpAddr::V4(ip) => push_v4(out, ip),
+        std::net::IpAddr::V6(ip) => {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{ip}");
+        }
     }
 }
 
@@ -469,5 +507,21 @@ mod tests {
         set_forwarded(&mut h, "10.9.0.7:5555".parse().unwrap(), "https");
         assert_eq!(h["x-forwarded-for"], "203.0.113.9, 10.9.0.7");
         assert_eq!(h["x-forwarded-host"], "chat.example.com");
+        assert_eq!(h["x-forwarded-proto"], "https");
+        assert_eq!(h["forwarded"], "for=203.0.113.9;host=\"chat.example.com\", for=10.9.0.7;host=\"chat.int.test\";proto=https");
+
+        // And the scheme its client came over: `Forwarded` says the same (#334).
+        let mut h = HeaderMap::new();
+        h.insert("host", HeaderValue::from_static("chat.int.test"));
+        h.insert("x-forwarded-for", HeaderValue::from_static("2001:db8::9"));
+        h.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        set_forwarded(&mut h, "[fd7a:115c::7]:5555".parse().unwrap(), "http");
+        assert_eq!(h["x-forwarded-for"], "2001:db8::9, fd7a:115c::7");
+        assert_eq!(h["x-forwarded-host"], "chat.int.test");
+        assert_eq!(h["x-forwarded-proto"], "https");
+        assert_eq!(
+            h["forwarded"],
+            "for=\"[2001:db8::9]\";proto=https, for=\"[fd7a:115c::7]\";host=\"chat.int.test\";proto=http"
+        );
     }
 }

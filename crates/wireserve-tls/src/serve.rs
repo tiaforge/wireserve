@@ -1173,9 +1173,9 @@ const UNTRUSTED_EXACT: &[&str] = &[
 /// The same, for families of names.
 const UNTRUSTED_PREFIX: &[&str] = &["x-forwarded-", "x-original-", "x-remote-", "x-auth-request-", "x-webauth-", "x-authentik-", "x-authelia-"];
 /// What a forwarding node — the operator's own reverse proxy — says about
-/// its client (PLAN.md M43): where the client is, and the name it asked
-/// for. Never who it is.
-const FORWARDER_KEEPS: &[&str] = &["x-forwarded-for", "x-forwarded-host"];
+/// its client (PLAN.md M43): where the client is, the name it asked for,
+/// and whether it came over HTTP or HTTPS (#334). Never who it is.
+const FORWARDER_KEEPS: &[&str] = &["x-forwarded-for", "x-forwarded-host", "x-forwarded-proto"];
 
 /// `name` is lowercase, as hyper hands it over. A name with an underscore is
 /// never passed on, whatever it says: WSGI, Rack and Django's ASGI handler
@@ -1212,18 +1212,23 @@ fn is_untrusted(name: &str, forwarder: bool, extra: &[String]) -> bool {
 /// `forwarder`: the caller is a forwarding node (PLAN.md M43), whose
 /// browsers are on the public name it was asked for — the
 /// `X-Forwarded-Host` it vouched for, which `prepare` kept only then — so
-/// that name's pages are the service's own too.
+/// that name's pages are the service's own too, at the scheme it vouched
+/// for in `X-Forwarded-Proto`, or `https` without one (#334).
 fn started_elsewhere<B>(req: &Request<B>, hosts: &[&str], scheme: &str, websocket: bool, forwarder: bool) -> bool {
     use axum::http::Method;
     let headers = req.headers();
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(|v| v.trim().to_ascii_lowercase());
     let public = header("x-forwarded-host").filter(|_| forwarder);
+    let public_scheme = header("x-forwarded-proto").filter(|_| forwarder).unwrap_or_else(|| "https".to_owned());
     let own_origin = |origin: &str| {
         let ours = origin
             .strip_prefix(scheme)
             .and_then(|rest| rest.strip_prefix("://"))
             .is_some_and(|host| hosts.iter().any(|h| host.eq_ignore_ascii_case(h)));
-        ours || origin.strip_prefix("https://").is_some_and(|host| public.as_deref().is_some_and(|p| host.eq_ignore_ascii_case(p)))
+        ours || origin
+            .strip_prefix(public_scheme.as_str())
+            .and_then(|rest| rest.strip_prefix("://"))
+            .is_some_and(|host| public.as_deref().is_some_and(|p| host.eq_ignore_ascii_case(p)))
     };
     let origin = header("origin");
     let elsewhere = match header("sec-fetch-site").as_deref() {
@@ -1247,11 +1252,12 @@ fn started_elsewhere<B>(req: &Request<B>, hosts: &[&str], scheme: &str, websocke
 /// away; and any name with an underscore goes too ([`is_untrusted`]).
 ///
 /// `forwarder`: the caller is a node named in `WIRESERVE_FORWARDING_NODES`
-/// (PLAN.md M43), whose `X-Forwarded-For` and `X-Forwarded-Host` stay, cut
+/// (PLAN.md M43), whose `X-Forwarded-For`, `-Host` and `-Proto` stay, cut
 /// down to what the node itself can vouch for ([`vouched_for`]): the proxy
-/// appends this connection's peer to the first and keeps the second, so the
-/// backend sees the client the forwarding node saw, and the name it was
-/// asked for. The operator's own `extra` list still removes them.
+/// appends this connection's peer to the first and keeps the others, so the
+/// backend sees the client the forwarding node saw, the name it was asked
+/// for and the scheme it was asked over (#334). The operator's own `extra`
+/// list still removes them.
 pub fn prepare(headers: &mut HeaderMap, caller: Option<&str>, forwarder: bool, extra: &[String]) {
     take_connection_options(headers);
     let doomed: Vec<axum::http::HeaderName> =
@@ -1321,6 +1327,12 @@ fn take_connection_options(headers: &mut HeaderMap) {
 /// - `X-Forwarded-Host`: one value, a host name with an optional port, as
 ///   `Host` may carry; anything else is dropped, and the proxy names the
 ///   request's own `Host` instead.
+/// - `X-Forwarded-Proto`: one value, `http` or `https` in any case, written
+///   lowercase; anything else is dropped, and the proxy names the scheme
+///   this request came over (#334). The node's proxy terminated the
+///   client's TLS, so only it knows: a public Caddy taking HTTPS and
+///   forwarding to the service's port 80 had the backend told `http`, and
+///   an app that insists on HTTPS redirected in a loop.
 fn vouched_for(headers: &mut HeaderMap) {
     let xff = axum::http::HeaderName::from_static("x-forwarded-for");
     let last = headers
@@ -1345,6 +1357,19 @@ fn vouched_for(headers: &mut HeaderMap) {
     headers.remove(&xfh);
     if let Some(v) = single.and_then(|v| HeaderValue::from_str(&v).ok()) {
         headers.insert(xfh, v);
+    }
+
+    let xfp = axum::http::HeaderName::from_static("x-forwarded-proto");
+    let mut values = headers.get_all(&xfp).iter();
+    let scheme = match (values.next(), values.next()) {
+        (Some(v), None) => v.to_str().ok().map(str::trim).and_then(|v| {
+            ["http", "https"].into_iter().find(|s| v.eq_ignore_ascii_case(s))
+        }),
+        _ => None,
+    };
+    headers.remove(&xfp);
+    if let Some(scheme) = scheme {
+        headers.insert(xfp, HeaderValue::from_static(scheme));
     }
 }
 
@@ -1720,13 +1745,18 @@ mod tests {
         prepare(&mut h, Some("edge"), true, &[]);
         let mut left: Vec<&str> = h.keys().map(|k| k.as_str()).collect();
         left.sort_unstable();
-        assert_eq!(left, ["x-forwarded-for", "x-forwarded-host", NODE_HEADER]);
+        assert_eq!(left, ["x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", NODE_HEADER]);
+        assert_eq!(h["x-forwarded-proto"], "http");
 
         // Anyone else's go, and the operator's own list wins over the forwarding node.
         let mut h = HeaderMap::new();
         sent(&mut h);
         prepare(&mut h, Some("laptop"), false, &[]);
-        assert!(h.get("x-forwarded-for").is_none() && h.get("x-forwarded-host").is_none());
+        assert!(h.get("x-forwarded-for").is_none() && h.get("x-forwarded-host").is_none() && h.get("x-forwarded-proto").is_none());
+        let mut h = HeaderMap::new();
+        sent(&mut h);
+        prepare(&mut h, Some("edge"), true, &["X-Forwarded-Proto".to_string()]);
+        assert!(h.get("x-forwarded-proto").is_none());
         let mut h = HeaderMap::new();
         sent(&mut h);
         prepare(&mut h, Some("edge"), true, &["x-forwarded-host".to_string()]);
@@ -1743,7 +1773,7 @@ mod tests {
             }
             prepare(&mut h, Some("edge"), true, &[]);
             let get = |n: &str| h.get_all(n).iter().map(|v| v.to_str().unwrap().to_string()).collect::<Vec<_>>();
-            (get("x-forwarded-for"), get("x-forwarded-host"))
+            (get("x-forwarded-for"), get("x-forwarded-host"), get("x-forwarded-proto"))
         };
         // A proxy that appends: the client's own claim goes, what the proxy saw stays.
         assert_eq!(forwarded(&[("x-forwarded-for", "1.2.3.4, 203.0.113.9")]).0, ["203.0.113.9"]);
@@ -1761,6 +1791,13 @@ mod tests {
             assert!(forwarded(&[("x-forwarded-host", junk)]).1.is_empty(), "{junk:?}");
         }
         assert!(forwarded(&[("x-forwarded-host", "a.example"), ("x-forwarded-host", "b.example")]).1.is_empty(), "two of them");
+
+        assert_eq!(forwarded(&[("x-forwarded-proto", "https")]).2, ["https"]);
+        assert_eq!(forwarded(&[("x-forwarded-proto", " HTTP ")]).2, ["http"]);
+        for junk in ["", "ftp", "https, http", "wss", "https://", "httpsx"] {
+            assert!(forwarded(&[("x-forwarded-proto", junk)]).2.is_empty(), "{junk:?}");
+        }
+        assert!(forwarded(&[("x-forwarded-proto", "https"), ("x-forwarded-proto", "http")]).2.is_empty(), "two of them");
     }
 
     #[tokio::test]
@@ -1771,7 +1808,13 @@ mod tests {
         tokio::spawn(async move {
             let app = axum::Router::new().fallback(|h: HeaderMap| async move {
                 let get = |n: &str| h.get(n).map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
-                format!("xff={} xfh={}", get("x-forwarded-for"), get("x-forwarded-host"))
+                format!(
+                    "xff={} xfh={} xfp={} fwd={}",
+                    get("x-forwarded-for"),
+                    get("x-forwarded-host"),
+                    get("x-forwarded-proto"),
+                    get("forwarded")
+                )
             });
             axum::serve(backend, app).await.unwrap();
         });
@@ -1779,17 +1822,48 @@ mod tests {
         shared.callers.write().unwrap().insert(Ipv4Addr::LOCALHOST, CallerInfo { node: "edge".into() });
         let ask = || async {
             let mut c = tls(port, &client).await;
-            c.write_all(b"GET / HTTP/1.1\r\nhost: svc.test\r\nx-forwarded-for: 203.0.113.9\r\nx-forwarded-host: files.example.com\r\nconnection: close\r\n\r\n").await.unwrap();
+            c.write_all(
+                b"GET / HTTP/1.1\r\nhost: svc.test\r\nx-forwarded-for: 203.0.113.9\r\nx-forwarded-host: files.example.com\r\n\
+                  x-forwarded-proto: http\r\nforwarded: for=6.6.6.6\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
             let mut answer = String::new();
             c.read_to_string(&mut answer).await.unwrap();
             answer
         };
         let answer = ask().await;
-        assert!(answer.ends_with("xff=127.0.0.1 xfh=svc.test"), "not yet a forwarding node: {answer}");
+        assert!(
+            answer.ends_with("xff=127.0.0.1 xfh=svc.test xfp=https fwd=for=127.0.0.1;host=\"svc.test\";proto=https"),
+            "not yet a forwarding node: {answer}"
+        );
 
         shared.forwarders.write().unwrap().push("Edge".into());
         let answer = ask().await;
-        assert!(answer.ends_with("xff=203.0.113.9, 127.0.0.1 xfh=files.example.com"), "{answer}");
+        assert!(
+            answer.ends_with(
+                "xff=203.0.113.9, 127.0.0.1 xfh=files.example.com xfp=http \
+                 fwd=for=203.0.113.9;host=\"files.example.com\";proto=http, for=127.0.0.1;host=\"svc.test\";proto=https"
+            ),
+            "{answer}"
+        );
+
+        // Port 80 (#334): the visitor came over HTTPS to the node's proxy,
+        // which forwards over plain HTTP; the backend hears `https`.
+        let own = Policy {
+            fqdn: "svc.wg".into(),
+            aliases: vec![],
+            access: wireserve_types::ServiceAccess { open: true, ..Default::default() },
+            cross_site: false,
+        };
+        let (port, shared) = http_in_front_of(upstream, own);
+        shared.callers.write().unwrap().insert(Ipv4Addr::LOCALHOST, CallerInfo { node: "edge".into() });
+        let request = "GET / HTTP/1.1\r\nhost: svc.wg\r\nx-forwarded-proto: https\r\nconnection: close\r\n\r\n";
+        let answer = plain_http(port, request).await;
+        assert!(answer.contains("xfp=http fwd=for=127.0.0.1;host=\"svc.wg\";proto=http"), "not yet a forwarding node: {answer}");
+        shared.forwarders.write().unwrap().push("edge".into());
+        let answer = plain_http(port, request).await;
+        assert!(answer.ends_with("xfp=https fwd=proto=https, for=127.0.0.1;host=\"svc.wg\";proto=http"), "{answer}");
     }
 
     /// A backend that answers with every header it got, sorted, one a line.
@@ -3137,6 +3211,12 @@ mod tests {
         let elsewhere = [("x-forwarded-host", "files.example.com"), ("origin", "https://evil.example")];
         assert!(started_elsewhere(&req("GET", &elsewhere), &[own], "https", true, true));
         assert!(started_elsewhere(&req("POST", &[("sec-fetch-site", "cross-site"), public[0], public[1]]), &[own], "https", false, true));
+        // The scheme it vouched for is the public page's (#334); none means https.
+        let plain = [("x-forwarded-host", "files.example.com"), ("x-forwarded-proto", "http"), ("origin", "http://files.example.com")];
+        assert!(!started_elsewhere(&req("GET", &plain), &[own], "https", true, true));
+        assert!(started_elsewhere(&req("GET", &plain[1..]), &[own], "https", true, true), "no public name");
+        assert!(started_elsewhere(&req("GET", &[public[0], public[1], plain[1]]), &[own], "https", true, true), "another scheme");
+        assert!(started_elsewhere(&req("GET", &[public[0], plain[2]]), &[own], "https", true, true), "http without its word");
     }
 
     /// Sends `method` to `/` with `headers` and a small body; the status line.

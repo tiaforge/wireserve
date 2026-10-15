@@ -4059,7 +4059,7 @@ and could not tell which public name was asked for.
     (`upgrade::set_forwarded`) the same. Node names are one namespace with
     phones (`nodes.name UNIQUE`), so a name means one device.
 264. **Only where, never who.** `X-Forwarded-Proto` is still always set
-    afresh (`https`), every identity header still goes, and the operator's
+    afresh (`https`; kept since #334), every identity header still goes, and the operator's
     `WIRESERVE_STRIP_HEADERS` still removes the two if listed. The `Host`
     check (421 for another name) is unchanged: the proxy must send the
     service's own name as `Host` and the public one in `X-Forwarded-Host`.
@@ -5101,3 +5101,31 @@ polls.
     A stopped firewalld that leaves its table behind (`CleanupOnExit=no`)
     is still asked every time, since "unavailable" is not kept: a starting
     firewalld fills its table before it answers on D-Bus.
+
+334. **A forwarding node's `X-Forwarded-Proto` is kept.** #264 set it from
+    the terminator's own listener for every caller, and since #328 that
+    is wrong for a forwarding node: its proxy terminated the client's TLS
+    and is the only one that knows the scheme. A public Caddy taking HTTPS
+    and forwarding to a service's port 80 had the backend told `http`, and
+    an app that insists on HTTPS (Django's `SECURE_SSL_REDIRECT`, Rails'
+    `force_ssl`, Nextcloud) redirected in a loop or wrote `http://` links;
+    one taking plain HTTP and forwarding to 443 had it told `https`, and
+    `Secure` cookies went to a browser that won't send them back. Now
+    `vouched_for` keeps one value, `http` or `https` in any case, written
+    lowercase; anything else (a list, two headers, `wss`) is dropped and
+    the terminator names its own scheme, as before. Everyone else's is
+    still replaced — a client choosing it could have a backend's redirect
+    cached for everyone (web cache poisoning), and nginx, Caddy and
+    Traefik trust it only from proxies named as such; the operator's
+    `WIRESERVE_STRIP_HEADERS` still removes it. `Forwarded` now says what
+    the `X-Forwarded-*` headers say: for a forwarding node it has two
+    elements, as two proxies write it (RFC 7239 §4) — the client, public
+    name and scheme it vouched for, each only when it did, then this hop's
+    own `for`, `host`, `proto`; before, it named only the node and the
+    service's own name. `started_elsewhere` takes the public page's origin
+    at the vouched scheme, `https` when none. Unit tests: `prepare` keeps
+    it only for a forwarding node and drops what isn't one scheme;
+    `set_forwarded` writes both elements, IPv6 bracketed; through a real
+    TLS listener and a port-80 one, a caller becoming a forwarding node
+    changes the backend's `X-Forwarded-Proto` and `Forwarded` while an
+    ordinary caller's claim is replaced. No e2e.
