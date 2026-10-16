@@ -61,7 +61,29 @@ WG_PORT=51820
 
 log()  { echo; echo "=== $* ==="; }
 pass() { echo "PASS: $*"; }
-fail() { echo "FAIL: $*" >&2; exit 1; }
+fail() { echo "FAIL: $*" >&2; [ -z "${DIAGNOSE:-}" ] || diagnose >&2; exit 1; }
+
+# What a failure once the daemons run leaves behind: the relay's state on
+# every side, for a failure in CI, where nobody can look afterwards.
+diagnose() {
+    DIAGNOSE=
+    echo
+    echo "=== diagnostics ==="
+    for a in "$AGENT1" "$AGENT2" "$AGENT4"; do
+        echo "--- $a: status ---"
+        podman exec "$a" wireserve status --json 2>&1 || true
+        echo "--- $a: wg show ---"
+        in_netns "$a" wg show all 2>&1 || true
+        echo "--- $a: daemon log (last 60 lines) ---"
+        podman exec "$a" tail -n 60 /tmp/daemon.log 2>&1 || true
+    done
+    echo "--- $AGENT1: our table ---"
+    in_netns "$AGENT1" nft list table inet wireserve.wireserve0 2>&1 || true
+    echo "--- coordinator: refused polls ---"
+    podman logs "$COORD" 2>&1 | grep -c poll_rate_limited || true
+    echo "--- coordinator: log (last 40 lines) ---"
+    podman logs --tail 40 "$COORD" 2>&1 || true
+}
 note() { echo "NOTE: $*"; }
 
 cleanup() {
@@ -207,8 +229,9 @@ podman exec "$AGENT4" wireserve join "http://$COORD_IP:47820" --allow-plaintext-
 pass "all three nodes registered"
 
 for a in "$AGENT1" "$AGENT2" "$AGENT4"; do
-    podman exec -d "$a" wireserve daemon --poll-interval-secs "$POLL"
+    podman exec -d "$a" sh -c "exec wireserve daemon --poll-interval-secs $POLL >/tmp/daemon.log 2>&1"
 done
+DIAGNOSE=1
 log "waiting for the nodes to see each other (transit still off everywhere)"
 for pair in "$AGENT1:node2" "$AGENT1:node4" "$AGENT2:node4" "$AGENT4:node2"; do
     wait_for 30 sees "${pair%%:*}" "${pair#*:}" || fail "${pair%%:*} never got ${pair#*:} into its peers"
@@ -275,7 +298,28 @@ log "confirming the coordinator names agent1 as the relay for this pair"
 NODE2_RELAY_VIA=$(relay_via "$AGENT4" node2)
 [ -n "$NODE2_RELAY_VIA" ] || fail "agent4's poll response never named a relay for node2"
 podman exec "$AGENT4" wireserve status | has "relayed by node1" || fail "wireserve status does not say node2 is relayed by node1"
-pass "agent4 was told to reach node2 through a relay, and says so"
+[ -n "$(relay_via "$AGENT2" node4)" ] || fail "agent2's poll response never named a relay for node4"
+pass "agent2 and agent4 were each told to reach the other through a relay, and agent4 says so"
+
+# Each step of the relay coming up is checked on its own, so that a
+# failure says which one did not.
+log "waiting for agent1 to forward the pair, both ways"
+relay_dnats() { in_netns "$AGENT1" nft list chain inet wireserve.wireserve0 relay-pre | grep -c ' dnat '; }
+wait_for 30 eval '[ "$(relay_dnats)" -ge 2 ]' || fail "agent1 never put in the relay's forwarding for the pair"
+pass "agent1 forwards the pair's session both ways"
+
+pubkey_of() {
+    podman exec "$1" wireserve status --json \
+        | python3 -c "import json,sys; d=json.load(sys.stdin); print(next((p.get('pubkey') for p in d['peers'] if p.get('name')=='$2'), ''))"
+}
+log "waiting for the relayed session between agent4 and agent2 to complete a handshake"
+NODE2_PUBKEY=$(pubkey_of "$AGENT4" node2)
+[ -n "$NODE2_PUBKEY" ] || fail "agent4 has no pubkey for node2"
+carry_handshake() {
+    in_netns "$AGENT4" wg show wireserve0-t latest-handshakes | awk -v k="$NODE2_PUBKEY" '$1 == k && $2 > 0 { ok = 1 } END { exit !ok }'
+}
+wait_for 30 carry_handshake || fail "the relayed session between agent4 and agent2 never completed a handshake through agent1"
+pass "agent4 and agent2 hold a session over their carry interfaces"
 
 log "counting what agent1 forwards, by protocol"
 in_netns_stdin "$AGENT1" nft -f - <<'NFT'
@@ -314,10 +358,8 @@ pass "agent1 forwarded $UDP_SEEN UDP packets and 0 TCP: it relayed ciphertext on
 in_netns "$AGENT1" nft delete table inet relayprobe
 
 log "confirming agent4's addresses sit on agent2's carry interface, not its mesh interface"
-AGENT4_PUBKEY=$(podman exec "$AGENT4" wireserve status --json \
-    | python3 -c "import json,sys; d=json.load(sys.stdin); print(next((p.get('pubkey') for p in d['peers'] if p.get('name')=='node4'), ''))")
-AGENT2_PUBKEY=$(podman exec "$AGENT2" wireserve status --json \
-    | python3 -c "import json,sys; d=json.load(sys.stdin); print(next((p.get('pubkey') for p in d['peers'] if p.get('name')=='node2'), ''))")
+AGENT4_PUBKEY=$(pubkey_of "$AGENT4" node4)
+AGENT2_PUBKEY=$(pubkey_of "$AGENT2" node2)
 in_netns "$AGENT2" wg show wireserve0 allowed-ips | grep "$AGENT4_PUBKEY" | has "(none)" \
     || fail "agent2's mesh-interface entry for agent4 still routes something — it should only probe"
 in_netns "$AGENT2" wg show wireserve0-t allowed-ips | grep "$AGENT4_PUBKEY" | has -F "$SVC4" \
