@@ -281,13 +281,21 @@ async fn main() {
 
     let result = match cli.command {
         Command::Join(args) => cmd_join(&instance, args).await,
+        #[cfg(unix)]
         Command::Install(args) => cmd_install(&instance, args).await,
+        #[cfg(not(unix))]
+        Command::Install(_) => Err("`install` is not available on Windows yet: run `wireserve join`, then \
+            `wireserve daemon`, from an elevated terminal"
+            .into()),
         Command::Daemon {
             poll_interval_secs,
             ifname,
         } => {
             cmd_daemon(&instance, poll_interval_secs, ifname).await
         }
+        #[cfg(not(unix))]
+        Command::TlsDaemon { .. } => Err("the TLS terminator is not supported on this platform".into()),
+        #[cfg(unix)]
         Command::TlsDaemon { state_dir, acme_ca_file, check_in_secs, port } => {
             // systemd may list several colon-separated state directories;
             // the unit names exactly one.
@@ -370,6 +378,7 @@ async fn cmd_join(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn std
 ///
 /// On a node that has already joined, with no URL or token given, it is an
 /// upgrade instead: same installs, no join, every running agent restarted.
+#[cfg(unix)]
 async fn cmd_install(instance: &Instance, args: InstallArgs) -> Result<(), Box<dyn std::error::Error>> {
     let InstallArgs { join: args, tls_port } = args;
     // Refused before anything is installed, not after.
@@ -726,8 +735,9 @@ async fn cmd_daemon(
     let tls_link = Arc::new(wireserve_agent::tls_link::TlsLink::default());
     // Relay port checks (PLAN.md M40).
     let port_checks = Arc::new(wireserve_agent::port_check::PortChecker::default());
-    let tls_socket_path = instance.tls_socket_path();
+    #[cfg(unix)]
     {
+        let tls_socket_path = instance.tls_socket_path();
         let ctx = wireserve_agent::ipc::tls::TlsContext {
             state: shared_state.clone(),
             link: tls_link.clone(),
@@ -807,11 +817,17 @@ async fn cmd_daemon(
     // leave a live-looking interface sitting on the host. The next `daemon`
     // start rejoins the mesh with the same identity, without needing
     // `join` again.
+    #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     loop {
         tokio::select! {
-            _ = async { tokio::select! { _ = sigterm.recv() => {}, _ = tokio::signal::ctrl_c() => {} } } => {
+            _ = async {
+                #[cfg(unix)]
+                tokio::select! { _ = sigterm.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
+                #[cfg(not(unix))]
+                let _ = tokio::signal::ctrl_c().await;
+            } => {
                 tracing::info!("termination signal received — tearing down");
                 teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, instance.hosts_label(), &socket_path, &shared_state, &state_path, false).await;
                 break;
@@ -1008,6 +1024,7 @@ fn remove_leftover_interfaces(chosen: &str, previous: Option<&str>, private_key:
             Ok(Ok(())) => {}
             Ok(Err(e)) | Err(e) => tracing::warn!(ifname = %name, error = %e, "could not remove it"),
         }
+        #[cfg(not(windows))]
         remove_leftover_carry(&name, private_key);
         drop(claim);
     }
@@ -1015,6 +1032,7 @@ fn remove_leftover_interfaces(chosen: &str, previous: Option<&str>, private_key:
 
 /// Removes the carry interface (PLAN.md M39) that went with the mesh
 /// interface `main`, if it is this node's own, with its firewall.
+#[cfg(not(windows))]
 fn remove_leftover_carry(main: &str, private_key: &str) {
     let name = wireserve_agent::wg::carry_ifname(main);
     let Ok(carry) = WgInterface::new(&name) else {

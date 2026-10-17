@@ -5,6 +5,7 @@ pub mod fsutil;
 pub mod held;
 pub mod hosts;
 pub mod ifname;
+#[cfg(unix)]
 pub mod install;
 pub mod ipc;
 pub mod lock;
@@ -17,12 +18,20 @@ pub mod reflexive;
 pub mod register;
 #[cfg(target_os = "linux")]
 pub mod routes;
+#[cfg(windows)]
+#[path = "routes_windows.rs"]
+pub mod routes;
 pub mod state;
 pub mod tls_link;
-#[cfg(test)]
+// Only the Linux host-firewall interop's tests measure allocations.
+#[cfg(all(test, target_os = "linux"))]
 mod test_alloc;
 pub mod vip;
 pub mod wg;
+#[cfg(windows)]
+pub mod winnet;
+#[cfg(windows)]
+pub mod winsec;
 
 /// Words that can't name a service declared here: `wireserve <word>` runs
 /// that command instead (PLAN.md M44). `off` is what withdraws one.

@@ -158,6 +158,7 @@ pub fn sync(
 /// until the two agree — the usual protocol for locking a file that is
 /// updated by rename. A missing file has nothing to lock; the write that
 /// creates it goes ahead unlocked.
+#[cfg(unix)]
 fn with_lock<T>(path: &Path, f: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
@@ -180,6 +181,29 @@ fn with_lock<T>(path: &Path, f: impl FnOnce() -> std::io::Result<T>) -> std::io:
             Err(e) => return Err(e),
         }
     }
+}
+
+/// On Windows the lock is on a file of its own next to the hosts file,
+/// `.<name>.wireserve-lock`, which is never renamed over, so there is no
+/// retry dance. It lives in `drivers\etc`, where only administrators can
+/// create files, so no one else can hold it. Released by the kernel when
+/// the handle closes, the holder dying included. The file stays behind,
+/// empty: removing it would race the next writer opening it.
+#[cfg(windows)]
+fn with_lock<T>(path: &Path, f: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let mut lock_name = std::ffi::OsString::from(".");
+    lock_name.push(name);
+    lock_name.push(".wireserve-lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_file_name(lock_name))?;
+    lock.lock()?;
+    f()
 }
 
 /// Reads the current hosts file. A missing file is treated as empty (the
@@ -236,6 +260,14 @@ fn strip_managed_block(contents: &str, label: Option<&str>) -> Option<String> {
     Some(out)
 }
 
+#[cfg(windows)]
+fn write_preserving_mode(path: &Path, contents: &str) -> std::io::Result<()> {
+    // No mode to preserve: the new file takes the `etc` directory's ACL,
+    // which is what the hosts file it replaces had.
+    atomic_write(path, contents.as_bytes(), 0o644)
+}
+
+#[cfg(unix)]
 fn write_preserving_mode(path: &Path, contents: &str) -> std::io::Result<()> {
     let mode = std::fs::metadata(path)
         .map(|m| {

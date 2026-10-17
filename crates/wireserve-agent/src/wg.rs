@@ -1,6 +1,7 @@
-//! Wraps `defguard_wireguard_rs`'s `WGApi<Kernel>` for the agent's own
-//! interface: bring-up with this node's own keypair/addresses, and
-//! reconciling the kernel peer set against each poll's `peers` array.
+//! Wraps `defguard_wireguard_rs`'s `WGApi<Kernel>` — on Windows, our own
+//! wireguard-nt binding, [`nt`] — for the agent's own interface: bring-up
+//! with this node's own keypair/addresses, and reconciling the kernel peer
+//! set against each poll's `peers` array.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -9,8 +10,19 @@ use defguard_wireguard_rs::error::WireguardInterfaceError;
 use defguard_wireguard_rs::key::Key;
 use defguard_wireguard_rs::net::IpAddrMask;
 use defguard_wireguard_rs::peer::Peer;
-use defguard_wireguard_rs::{InterfaceConfiguration, Kernel, WGApi, WireguardInterfaceApi};
+use defguard_wireguard_rs::InterfaceConfiguration;
+#[cfg(not(windows))]
+use defguard_wireguard_rs::{Kernel, WGApi, WireguardInterfaceApi};
 use wireserve_types::{PeerInfo, RelayEnd, RelayForward, ServiceInfo, TransitPair};
+
+#[cfg(windows)]
+pub mod nt;
+
+/// The kernel WireGuard API: defguard's, or on Windows our own (see [`nt`]).
+#[cfg(not(windows))]
+type Api = WGApi<Kernel>;
+#[cfg(windows)]
+type Api = nt::NtApi;
 
 /// Why `bring_up` can fail before it has touched anything.
 #[derive(Debug, thiserror::Error)]
@@ -78,6 +90,7 @@ pub fn validate_ifname(name: &str) -> Result<(), InvalidIfname> {
 }
 
 /// Every interface other than `except` that has `addr` assigned.
+#[cfg(unix)]
 pub fn interfaces_with_address(addr: IpAddr, except: &str) -> std::io::Result<Vec<String>> {
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs fills `head` with a list we free below.
@@ -115,6 +128,18 @@ pub fn interfaces_with_address(addr: IpAddr, except: &str) -> std::io::Result<Ve
     Ok(out)
 }
 
+/// Every interface other than `except` that has `addr` assigned.
+#[cfg(windows)]
+pub fn interfaces_with_address(addr: IpAddr, except: &str) -> std::io::Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for a in crate::winnet::host_addresses()? {
+        if a.addr == addr && a.ifname != except && !out.contains(&a.ifname) {
+            out.push(a.ifname);
+        }
+    }
+    Ok(out)
+}
+
 // ---- NAT-hairpin fix: LAN-address candidates (PLAN.md decisions log #85) ----
 
 /// One of this node's own IPv4 interfaces that looks like a real LAN
@@ -130,10 +155,12 @@ pub struct LocalLan {
 /// VPN overlay, not the home network this feature means to reach.
 /// Judgment call, not exhaustive; worth revisiting if a real deployment's
 /// LAN NIC gets misclassified.
+#[cfg(unix)]
 const VIRTUAL_IFACE_PREFIXES: &[&str] = &[
     "lo", "docker", "veth", "br-", "virbr", "tun", "tap", "wg", "tailscale", "zt", "cni", "flannel", "podman",
 ];
 
+#[cfg(unix)]
 fn looks_virtual(name: &str) -> bool {
     VIRTUAL_IFACE_PREFIXES.iter().any(|p| name.starts_with(p))
 }
@@ -146,6 +173,7 @@ fn looks_virtual(name: &str) -> bool {
 /// the actual syscall; kept separate from the pure functions below so
 /// those stay unit-testable without a live interface, same probe/choice
 /// split as `interfaces_with_address` itself.
+#[cfg(unix)]
 pub fn local_lan_ifaces(except: &str) -> std::io::Result<Vec<LocalLan>> {
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs fills `head` with a list we free below.
@@ -180,6 +208,35 @@ pub fn local_lan_ifaces(except: &str) -> std::io::Result<Vec<LocalLan>> {
     // SAFETY: `head` came from getifaddrs and is freed exactly once.
     unsafe { libc::freeifaddrs(head) };
     Ok(out)
+}
+
+/// See the Unix version. Windows names its interfaces "Ethernet", "Wi-Fi",
+/// "vEthernet (WSL)", so the name prefixes say little here; the interface
+/// type and the driver's own description say more.
+#[cfg(windows)]
+pub fn local_lan_ifaces(except: &str) -> std::io::Result<Vec<LocalLan>> {
+    Ok(crate::winnet::host_addresses()?
+        .into_iter()
+        .filter(|a| a.ifname != except && !looks_virtual_windows(a))
+        .filter_map(|a| match a.addr {
+            IpAddr::V4(addr) if addr.is_private() => Some(LocalLan { addr, prefix_len: a.prefix_len }),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Loopback, tunnels (wireguard-nt and Wintun adapters, Tailscale's
+/// among them), and the virtual switches of Hyper-V, WSL and the desktop
+/// hypervisors.
+#[cfg(windows)]
+fn looks_virtual_windows(a: &crate::winnet::HostAddress) -> bool {
+    const IF_TYPE_PROP_VIRTUAL: u32 = 53;
+    const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
+    const IF_TYPE_TUNNEL: u32 = 131;
+    const VIRTUAL_DESCRIPTIONS: &[&str] = &["Hyper-V", "VMware", "VirtualBox", "Virtual Ethernet", "TAP-Windows"];
+    matches!(a.if_type, IF_TYPE_PROP_VIRTUAL | IF_TYPE_SOFTWARE_LOOPBACK | IF_TYPE_TUNNEL)
+        || a.ifname.starts_with("vEthernet")
+        || VIRTUAL_DESCRIPTIONS.iter().any(|d| a.description.contains(d))
 }
 
 /// This node's single "best" LAN address to advertise on `/register` and
@@ -1251,7 +1308,7 @@ pub fn peers_to_configure(applied: &HashMap<Key, Peer>, desired: &HashMap<Key, P
 /// through its own handle rather than the daemon's `WgInterface`, which
 /// the poll loop owns; reading is harmless alongside it.
 pub fn tunnel_peers(ifname: &str) -> Result<Vec<crate::ipc::protocol::TunnelPeer>, WireguardInterfaceError> {
-    let host = WGApi::<Kernel>::new(ifname.to_string())?.read_interface_data()?;
+    let host = Api::new(ifname.to_string())?.read_interface_data()?;
     Ok(host
         .peers
         .values()
@@ -1277,7 +1334,7 @@ pub enum Slot {
 }
 
 pub struct WgInterface {
-    api: WGApi<Kernel>,
+    api: Api,
     ifname: String,
     applied: HashMap<Key, Peer>,
     /// What `routes::sync` last installed, so it only runs on a change.
@@ -1292,7 +1349,7 @@ pub struct WgInterface {
 /// address of its own (its routes name the node's mesh address as their
 /// source), and a port the kernel picked.
 struct Carry {
-    api: WGApi<Kernel>,
+    api: Api,
     ifname: String,
     port: u16,
     src: (Ipv4Addr, Ipv6Addr),
@@ -1303,7 +1360,7 @@ struct Carry {
 impl WgInterface {
     pub fn new(ifname: impl Into<String>) -> Result<Self, WireguardInterfaceError> {
         let ifname = ifname.into();
-        let api = WGApi::<Kernel>::new(ifname.clone())?;
+        let api = Api::new(ifname.clone())?;
         Ok(Self {
             api,
             ifname,
@@ -1403,6 +1460,7 @@ impl WgInterface {
     /// `unshare -n`) — there it would call a name that is taken here free.
     /// Anything but "no such device" counts as taken: when in doubt, the
     /// name is not ours to configure.
+    #[cfg(unix)]
     fn interface_exists(ifname: &str) -> bool {
         let Ok(name) = std::ffi::CString::new(ifname) else {
             return true;
@@ -1412,6 +1470,16 @@ impl WgInterface {
             return true;
         }
         std::io::Error::last_os_error().raw_os_error() != Some(libc::ENODEV)
+    }
+
+    /// See the Unix version; Windows looks an interface up by its alias.
+    /// One still listed is given the moment its removal takes: this
+    /// agent's own adapter from a run that just ended goes away with that
+    /// run (see [`nt`]). Anything but "no such interface" then counts as
+    /// taken.
+    #[cfg(windows)]
+    fn interface_exists(ifname: &str) -> bool {
+        !nt::gone_within(ifname, nt::REMOVAL_WAIT)
     }
 
     /// Who has this interface name right now, as far as the host itself
@@ -1648,6 +1716,7 @@ impl WgInterface {
 
     /// Deletes the interface, and with it its addresses and routes. Not
     /// defguard's `remove_interface`; see `routes::delete_link` for why.
+    #[cfg(not(windows))]
     pub fn teardown(&mut self) -> Result<(), WireguardInterfaceError> {
         // The carry interface first, and whatever happens to it the mesh
         // interface still goes.
@@ -1656,6 +1725,16 @@ impl WgInterface {
         self.applied.clear();
         self.routed.clear();
         carry.transpose()?;
+        Ok(())
+    }
+
+    /// Closes the adapter, which removes it with its addresses and routes
+    /// (see [`nt`]). There is never a carry interface on Windows.
+    #[cfg(windows)]
+    pub fn teardown(&mut self) -> Result<(), WireguardInterfaceError> {
+        self.api.remove_interface();
+        self.applied.clear();
+        self.routed.clear();
         Ok(())
     }
 }

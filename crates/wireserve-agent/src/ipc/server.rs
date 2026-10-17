@@ -1,4 +1,5 @@
-//! Unix-socket IPC server backing `wireserve <service>`/`status`/`leave` (§4.6).
+//! Unix-socket IPC server backing `wireserve <service>`/`status`/`leave` (§4.6);
+//! a named pipe on Windows.
 //! One request/response per connection, newline-delimited JSON. Who may
 //! connect is decided by the socket's file permissions alone (see `serve`):
 //! root, plus the members of the `wireserve` group when there is one.
@@ -8,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, Mutex};
 use wireserve_types::ServiceDecl;
@@ -436,6 +438,7 @@ pub(crate) fn lookup_group(_name: &str) -> Option<u32> {
 /// set explicitly rather than left to umask, and the directory is only
 /// opened to the group after the socket is final, so there is no moment
 /// when the group can reach a socket with default permissions.
+#[cfg(unix)]
 pub async fn serve(ctx: AgentContext, socket_path: &Path) -> std::io::Result<()> {
     let group = socket_group();
     match &group {
@@ -453,6 +456,7 @@ pub async fn serve(ctx: AgentContext, socket_path: &Path) -> std::io::Result<()>
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn bind_socket(socket_path: &Path, gid: Option<u32>) -> std::io::Result<UnixListener> {
     let parent = socket_path.parent();
     if let Some(parent) = parent {
@@ -487,6 +491,7 @@ pub(crate) fn bind_socket(socket_path: &Path, gid: Option<u32>) -> std::io::Resu
 
 /// The socket first, the directory last: until the directory opens, the
 /// group cannot reach the socket whatever its permissions are.
+#[cfg(unix)]
 fn share_with_group(socket_path: &Path, parent: Option<&Path>, gid: u32) -> std::io::Result<()> {
     set_group(socket_path, gid)?;
     set_mode(socket_path, 0o660)?;
@@ -502,21 +507,54 @@ fn set_group(path: &Path, gid: u32) -> std::io::Result<()> {
     std::os::unix::fs::chown(path, None, Some(gid))
 }
 
-#[cfg(not(unix))]
-fn set_group(_path: &Path, _gid: u32) -> std::io::Result<()> {
-    Ok(())
-}
-
 #[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
-#[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
-    Ok(())
+/// The Windows server: a named pipe at `socket_path` (see
+/// `paths::run_root`), open to SYSTEM and Administrators only — the
+/// counterpart of the root-only socket. An administrator's shell has to be
+/// elevated to use it; unelevated, its token carries Administrators as a
+/// deny-only group. Sharing it with a `wireserve` group, as on Linux, is
+/// not done yet.
+///
+/// The first instance is created with `first_pipe_instance`, so a pipe of
+/// that name someone else created first is an error rather than a server
+/// we'd be talking through. Each accepted client gets the instance it
+/// connected to, and a fresh one takes over listening.
+#[cfg(windows)]
+pub async fn serve(ctx: AgentContext, socket_path: &Path) -> std::io::Result<()> {
+    use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+
+    let name = socket_path.as_os_str();
+    let sd = crate::winsec::SecurityDescriptor::from_sddl(PIPE_SDDL)?;
+    let create = |first: bool| -> std::io::Result<NamedPipeServer> {
+        let mut sa = sd.attributes();
+        // SAFETY: `sa` and the descriptor it points to outlive the call.
+        unsafe {
+            ServerOptions::new()
+                .first_pipe_instance(first)
+                .reject_remote_clients(true)
+                .create_with_security_attributes_raw(name, std::ptr::from_mut(&mut sa).cast())
+        }
+    };
+    let mut server = create(true)?;
+    tracing::info!(pipe = %socket_path.display(), "IPC pipe is administrators-only");
+    loop {
+        server.connect().await?;
+        let connected = std::mem::replace(&mut server, create(false)?);
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            handle_connection(&ctx, connected).await;
+        });
+    }
 }
+
+/// SYSTEM and Administrators, full access; nothing inherited.
+#[cfg(windows)]
+const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)";
 
 #[cfg(test)]
 mod tests {
@@ -542,6 +580,8 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+
     #[tokio::test]
     async fn socket_without_a_group_is_root_only() {
         use std::os::unix::fs::PermissionsExt;
@@ -552,6 +592,8 @@ mod tests {
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(path.parent().unwrap()), 0o700);
     }
+
+    #[cfg(unix)]
 
     #[tokio::test]
     async fn socket_with_a_group_is_shared_with_exactly_that_group() {
@@ -567,6 +609,8 @@ mod tests {
         assert_eq!(parent.permissions().mode() & 0o777, 0o750);
         assert_eq!((sock.gid(), parent.gid()), (gid, gid));
     }
+
+    #[cfg(unix)]
 
     #[tokio::test]
     async fn failing_to_share_leaves_a_root_only_socket_not_an_error() {
@@ -584,11 +628,15 @@ mod tests {
         assert_eq!(mode(path.parent().unwrap()), 0o700);
     }
 
+    #[cfg(unix)]
+
     #[test]
     fn a_missing_group_means_no_sharing() {
         assert_eq!(lookup_group("wireserve-no-such-group-xyz"), None);
         assert_eq!(lookup_group("root"), Some(0));
     }
+
+    #[cfg(unix)]
 
     #[test]
     fn group_env_empty_disables_sharing() {

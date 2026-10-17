@@ -6,6 +6,7 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -18,12 +19,24 @@ use std::path::Path;
 /// opposite direction: a read-only or non-writable *directory* with a
 /// writable file bind-mounted into it, which is exactly what
 /// `ProtectSystem=strict` plus `ReadWritePaths=/etc/hosts` produces.
+#[cfg(unix)]
 const FALLBACK_ERRNOS: [i32; 5] = [
     1,  // EPERM
     13, // EACCES
     16, // EBUSY
     18, // EXDEV
     30, // EROFS
+];
+
+/// The Windows counterparts (these are Win32 error codes, not errnos):
+/// a file another process has open without delete sharing — the DNS
+/// Client reading the hosts file, say — can't be renamed over.
+#[cfg(windows)]
+const FALLBACK_ERRNOS: [i32; 4] = [
+    5,  // ERROR_ACCESS_DENIED
+    17, // ERROR_NOT_SAME_DEVICE
+    19, // ERROR_WRITE_PROTECT
+    32, // ERROR_SHARING_VIOLATION
 ];
 
 fn is_fallback_errno(e: &std::io::Error) -> bool {
@@ -33,6 +46,10 @@ fn is_fallback_errno(e: &std::io::Error) -> bool {
 /// Writes `contents` to `path` atomically, creating the file at exactly
 /// `mode` from the moment it's created (not a post-hoc `chmod`, which would
 /// leave a window where the file exists with default permissions).
+///
+/// On Windows `mode` means nothing: the file takes the ACL its directory
+/// passes on, which is what protects it (the state directory's own is set
+/// by `crate::winsec`).
 ///
 /// The temp file is created in the same directory as `path` so the final
 /// `rename` is guaranteed to be on the same filesystem (required for
@@ -84,11 +101,13 @@ pub fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<
     // The directories these files live in are root-only in every shipped
     // deployment, so this is a second layer rather than the only one.
     let _ = std::fs::remove_file(&tmp_path);
-    let opened = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(&tmp_path);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(mode);
+    #[cfg(not(unix))]
+    let _ = mode;
+    let opened = options.open(&tmp_path);
 
     let mut f = match opened {
         Ok(f) => f,
@@ -130,6 +149,7 @@ fn write_in_place(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     // The EBUSY/EXDEV-triggering condition itself (a real bind mount) needs
@@ -140,6 +160,7 @@ mod tests {
     // bits untouched, since a container's already-bind-mounted /etc/hosts
     // typically isn't mode 600 the way atomic_write's happy path creates
     // new files.
+    #[cfg(unix)]
     #[test]
     fn write_in_place_writes_contents_and_preserves_existing_mode() {
         let dir = tempfile::tempdir().unwrap();
@@ -153,6 +174,8 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644, "write_in_place must not alter existing permissions");
     }
+
+    #[cfg(unix)]
 
     #[test]
     fn falls_back_to_in_place_when_the_directory_refuses_a_temp_file() {
@@ -192,6 +215,8 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+
     #[test]
     fn writes_contents_and_exact_mode() {
         let dir = tempfile::tempdir().unwrap();
@@ -204,6 +229,8 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "file must be created at exactly the requested mode");
     }
+
+    #[cfg(unix)]
 
     #[test]
     fn does_not_follow_a_symlink_planted_at_the_temp_path() {
@@ -228,9 +255,11 @@ mod tests {
         atomic_write(&path, b"fresh", 0o600).unwrap();
 
         assert_eq!(std::fs::read(&path).unwrap(), b"fresh");
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        #[cfg(unix)]
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
+
+    #[cfg(unix)]
 
     #[test]
     fn overwrites_existing_file_atomically() {
