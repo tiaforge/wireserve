@@ -30,6 +30,7 @@
 
 use std::fs::File;
 use std::io;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
@@ -58,6 +59,7 @@ pub fn lock_instance(instance: &Instance) -> Result<InstanceLock, LockError> {
     lock_file(instance.name(), instance.lock_path())
 }
 
+#[cfg(unix)]
 fn lock_file(instance: &str, path: PathBuf) -> Result<InstanceLock, LockError> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
@@ -100,6 +102,38 @@ fn lock_file(instance: &str, path: PathBuf) -> Result<InstanceLock, LockError> {
     Ok(InstanceLock { _file: file })
 }
 
+/// The Windows instance lock: a byte-range lock on the same file
+/// (`LockFileEx`), released by the kernel when the handle closes or the
+/// process dies, like `flock`. The directory is given its admins-only ACL
+/// (`crate::winsec`) as it is created — it is the state directory.
+#[cfg(windows)]
+fn lock_file(instance: &str, path: PathBuf) -> Result<InstanceLock, LockError> {
+    let io_err = |source| LockError::Io {
+        path: path.clone(),
+        source,
+    };
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent).map_err(io_err)?;
+            crate::winsec::restrict_to_admins(parent).map_err(io_err)?;
+        }
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(io_err)?;
+    match file.try_lock() {
+        Ok(()) => Ok(InstanceLock { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => Err(LockError::Busy {
+            instance: instance.to_string(),
+            path,
+        }),
+        Err(std::fs::TryLockError::Error(e)) => Err(io_err(e)),
+    }
+}
+
 /// Who holds an interface name's claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Holder {
@@ -107,6 +141,10 @@ pub enum Holder {
     /// A process running as our own effective uid — for all practical
     /// purposes another wireserve agent.
     Agent { pid: i32 },
+    /// Another wireserve agent, where the claim doesn't say which process
+    /// (Windows: only an administrator can create one, see `windows`).
+    #[cfg(windows)]
+    AnotherAgent,
     /// Bound by a process of another user. Never counts as an agent.
     Other { pid: i32, uid: u32 },
     /// Couldn't tell (the probe failed in some unexpected way). Treated
@@ -120,6 +158,10 @@ impl Holder {
     /// deleted as leftovers, and when in doubt they stay.
     #[must_use]
     pub fn is_agent(&self) -> bool {
+        #[cfg(windows)]
+        if *self == Holder::AnotherAgent {
+            return true;
+        }
         matches!(self, Holder::Agent { .. } | Holder::Unknown(_))
     }
 }
@@ -129,6 +171,8 @@ impl std::fmt::Display for Holder {
         match self {
             Holder::Nobody => write!(f, "not claimed"),
             Holder::Agent { pid } => write!(f, "claimed by another wireserve agent (pid {pid})"),
+            #[cfg(windows)]
+            Holder::AnotherAgent => write!(f, "claimed by another wireserve agent"),
             Holder::Other { pid, uid } => {
                 write!(f, "its claim socket is held by pid {pid}, which runs as uid {uid} and is not a wireserve agent")
             }
@@ -278,13 +322,117 @@ mod linux {
     }
 }
 
+#[cfg(windows)]
+pub use windows::{holder, IfnameClaim};
+
+/// Interface claims on Windows: a named file mapping,
+/// `Global\wireserve-if-<ifname>`. What makes the abstract socket right on
+/// Linux holds here too: creating one is atomic, the kernel destroys it
+/// when the last handle closes — the holder dying included — and the
+/// `Global\` namespace is host-wide.
+///
+/// A file mapping, not an event or a mutex, because it is the one kind of
+/// object whose creation in `Global\` takes `SeCreateGlobalPrivilege`
+/// (outside session 0), which only administrators and services hold. So
+/// a user can't take a name first, and whoever holds one is another
+/// agent. Its contents are never used: one page, never mapped.
+#[cfg(windows)]
+mod windows {
+    use std::io;
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Memory::{CreateFileMappingW, OpenFileMappingW, FILE_MAP_READ, PAGE_READONLY};
+
+    use super::Holder;
+    use crate::winnet::wide;
+    use crate::winsec::{SecurityDescriptor, ADMINS_ONLY};
+
+    fn claim_name(ifname: &str) -> String {
+        format!(r"Global\wireserve-if-{ifname}")
+    }
+
+    /// This process's claim on an interface name.
+    #[derive(Debug)]
+    pub struct IfnameClaim {
+        ifname: String,
+        handle: HANDLE,
+    }
+
+    // SAFETY: kernel object handles may be used and closed from any thread.
+    unsafe impl Send for IfnameClaim {}
+
+    impl Drop for IfnameClaim {
+        fn drop(&mut self) {
+            // SAFETY: a handle we own, closed once.
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
+
+    impl IfnameClaim {
+        /// Takes the claim, or reports who has it.
+        pub fn take(ifname: &str) -> io::Result<Result<Self, Holder>> {
+            let sd = SecurityDescriptor::from_sddl(ADMINS_ONLY)?;
+            let sa = sd.attributes();
+            let name = wide(&claim_name(ifname));
+            // SAFETY: valid attributes and a NUL-terminated name for the call;
+            // a page-file-backed mapping of one page.
+            let handle = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READONLY, 0, 1, name.as_ptr()) };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: read straight after the call that set it.
+            if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+                // SAFETY: the handle the call just returned.
+                unsafe { CloseHandle(handle) };
+                return Ok(Err(Holder::AnotherAgent));
+            }
+            Ok(Ok(Self {
+                ifname: ifname.to_string(),
+                handle,
+            }))
+        }
+
+        #[must_use]
+        pub fn ifname(&self) -> &str {
+            &self.ifname
+        }
+
+        /// Keeps the claim for the rest of this process's life.
+        pub fn hold(self) {
+            std::mem::forget(self);
+        }
+    }
+
+    /// Who holds `ifname`'s claim: whoever has the mapping open. Opening it
+    /// keeps it alive for a moment, so a claim taken at that very instant
+    /// sees it taken — the safe way round.
+    #[must_use]
+    pub fn holder(ifname: &str) -> Holder {
+        let name = wide(&claim_name(ifname));
+        // SAFETY: a NUL-terminated name.
+        let handle = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, name.as_ptr()) };
+        if !handle.is_null() {
+            // SAFETY: the handle the call just returned.
+            unsafe { CloseHandle(handle) };
+            return Holder::AnotherAgent;
+        }
+        // SAFETY: read straight after the call that set it.
+        match unsafe { GetLastError() } {
+            ERROR_FILE_NOT_FOUND => Holder::Nobody,
+            code => Holder::Unknown(io::Error::from_raw_os_error(code as i32).to_string()),
+        }
+    }
+}
+
 /// Stand-ins where there are no abstract sockets: every claim succeeds
 /// and nobody else ever holds one, which is what a single agent per host
 /// amounts to.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 pub use fallback::{holder, IfnameClaim};
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 mod fallback {
     use super::Holder;
 
@@ -319,6 +467,7 @@ mod tests {
     /// Abstract names are shared with everything else in this network
     /// namespace — a real agent included — so tests use names nothing
     /// else will.
+    #[cfg(target_os = "linux")]
     fn unique(tag: &str) -> String {
         format!("t{}{tag}", std::process::id())
     }
@@ -333,6 +482,8 @@ mod tests {
         drop(first);
         lock_file("t", path).unwrap();
     }
+
+    #[cfg(unix)]
 
     #[test]
     fn a_symlink_at_the_lock_path_is_refused_not_followed() {

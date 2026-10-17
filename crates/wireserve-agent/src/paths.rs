@@ -145,16 +145,39 @@ impl Instance {
     }
 }
 
+#[cfg(not(windows))]
 fn state_root() -> PathBuf {
     std::env::var("WIRESERVE_STATE_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/var/lib/wireserve"))
 }
 
+/// `%ProgramData%\wireserve`. The directory gets an ACL of its own when
+/// created (`crate::winsec`): what ProgramData's children inherit lets
+/// every local user read them.
+#[cfg(windows)]
+fn state_root() -> PathBuf {
+    std::env::var("WIRESERVE_STATE_ROOT").map(PathBuf::from).unwrap_or_else(|_| {
+        let data = std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into());
+        PathBuf::from(data).join("wireserve")
+    })
+}
+
+/// Where the IPC endpoints live. On Windows that is the named-pipe
+/// namespace, so `socket_path` is a pipe name such as
+/// `\\.\pipe\wireserve\agent.sock`.
+#[cfg(not(windows))]
 fn run_root() -> PathBuf {
     std::env::var("WIRESERVE_RUN_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/run"))
+}
+
+#[cfg(windows)]
+fn run_root() -> PathBuf {
+    std::env::var("WIRESERVE_RUN_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"\\.\pipe"))
 }
 
 /// Every instance that has a state directory, the default one included.
@@ -195,16 +218,22 @@ pub fn other_instances(own: &Instance) -> Vec<(Instance, AgentState)> {
     out
 }
 
-/// Linux/macOS/BSD hosts file. Spec §6 names the Windows path too
-/// (`C:\Windows\System32\drivers\etc\hosts`), but Windows support is
-/// explicitly deferred (spec "open items"), and this crate's atomic file
-/// writer is Unix-only, so no Windows branch is kept here — it would be
-/// dead code that cannot compile on the platform it claims to support.
-/// Shared by every instance; each one owns only its own marked block.
+/// The hosts file (spec §6). Shared by every instance; each one owns only
+/// its own marked block.
+#[cfg(not(windows))]
 pub fn hosts_path() -> PathBuf {
     std::env::var("WIRESERVE_HOSTS_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/etc/hosts"))
+}
+
+/// `%SystemRoot%\System32\drivers\etc\hosts`.
+#[cfg(windows)]
+pub fn hosts_path() -> PathBuf {
+    std::env::var("WIRESERVE_HOSTS_PATH").map(PathBuf::from).unwrap_or_else(|_| {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        PathBuf::from(root).join(r"System32\drivers\etc\hosts")
+    })
 }
 
 #[cfg(test)]

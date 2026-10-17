@@ -52,7 +52,9 @@
 //! agent's successor still knows what it has to guard and turn back off.
 
 use std::collections::BTreeSet;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "linux")]
 use std::sync::Mutex;
 
 /// The interfaces *this process* last turned forwarding on for — so a
@@ -61,6 +63,7 @@ use std::sync::Mutex;
 /// some other process or a previous run left behind. Same "don't own
 /// state we didn't set" discipline as the host-firewall-interop code. Per
 /// interface: the carry interface (PLAN.md #279) has its own.
+#[cfg(target_os = "linux")]
 static ENABLED_BY_US: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 /// Enables or disables forwarding on `ifname` alone. Called once per poll
@@ -194,6 +197,7 @@ pub fn plan_egress(
 
 /// Whether `name` could be a kernel interface name, so it is safe to put
 /// in a `/proc` path — the owned set comes back from the state file.
+#[cfg(target_os = "linux")]
 fn plausible_ifname(name: &str) -> bool {
     !name.is_empty() && name.len() < 16 && name != "." && name != ".." && !name.contains(['/', '\0'])
 }
@@ -319,6 +323,8 @@ mod egress_tests {
         let plan = plan_egress(&set(&["usb0"]), &set(&["usb0"]), false, flags(&[], &[]));
         assert_eq!(plan, EgressPlan::default());
     }
+
+    #[cfg(target_os = "linux")]
 
     #[test]
     fn implausible_names_never_reach_a_proc_path() {
