@@ -387,8 +387,10 @@ struct ServiceRule {
   atomic `nft -j -f -` transaction per `apply()`), scoped to the WireGuard
   interface, default `DROP`. (Originally netlink via `rustables` with "no
   shelling out to `nft`"; reversed — see PLAN.md decisions log #69.)
-- **Windows v1.1**: `WindowsFirewallBackend` implementing the same trait —
-  backend swap only, no change to the sync logic that calls `apply()`.
+- **Windows**: `WfpBackend`, the Windows Filtering Platform directly,
+  implementing the same trait — backend swap only, no change to the sync
+  logic that calls `apply()`. A Windows node serves nothing, so its
+  ruleset is the default-deny alone (PLAN.md M49).
 - **Startup ordering**: `teardown()`-then-deny-all must run *before* the
   first successful `apply()` — the interface should never come up
   permissive-by-default while waiting on the first poll response.
@@ -753,7 +755,8 @@ What it does, end to end:
 
 ## Open items intentionally deferred (not v1)
 
-- Windows/BSD firewall backends (trait exists now, implementations later)
+- BSD firewall backend (trait exists; Windows has one since PLAN.md M49,
+  for nodes that serve nothing)
 - Multi-tenant coordinator, web UI
 - OIDC-backed admin auth with per-admin attribution (through the
   coordinator's own identity provider client, revisited later) — v1 uses a

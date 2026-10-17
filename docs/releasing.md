@@ -26,6 +26,10 @@ GitHub Actions there run the checks and publish releases.
   - `wireserve-<version>-<arch>-linux.tar.gz`: the agent, for bare metal.
   - `wireserve-coordinator-<version>-<arch>-linux.tar.gz`: the
     coordinator and `wireserve-admin`.
+  - `wireserve-<version>-x86_64-windows.zip`: the Windows agent with the
+    `wireguard.dll` it was tested against (the release's `build-windows`
+    job builds it and runs the agent's tests, the real-driver ones
+    included, on an elevated Windows runner).
   - `SHA256SUMS`.
   - `ghcr.io/<owner>/wireserve-coordinator:<version>` for amd64 and
     arm64, with `wireserve-admin` inside. A pre-release does not move

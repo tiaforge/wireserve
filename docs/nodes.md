@@ -54,7 +54,8 @@ ever lands in shell history. It also creates a `wireserve` group (see
 [Using it without sudo](#using-it-without-sudo)); it does not add anyone to it. Running an *additional* agent on a host that
 already runs one? Add `--instance work` (see [Several agents on one host](#several-agents-on-one-host)); `wireserve-admin node create --instance work` fills that flag into
 the printed command for you. `install` needs Linux/systemd — Quadlet/podman
-deployments install by hand, per `deploy/quadlet/`.
+deployments install by hand, per `deploy/quadlet/`. For a Windows computer,
+see [Windows nodes](windows.md).
 
 **Run the agent on the host, not in a container, on any node that forwards**:
 a carrier, an exit, or a node serving a device on its LAN. Those need the agent to switch on forwarding for its own interfaces
