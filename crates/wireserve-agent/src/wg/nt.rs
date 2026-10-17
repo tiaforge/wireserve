@@ -67,12 +67,14 @@ const PEER_REMOVE: i32 = 1 << 6;
 
 const ADAPTER_STATE_UP: i32 = 1;
 
-// The padding the C compiler puts into these structs is spelled out as
-// fields here, and always zero. `ConfigBuf::push` copies a struct out as
-// whole words, and implicit padding is uninitialized memory: reading it is
-// undefined behaviour, which the compiler may take as licence to treat
-// the whole word — an allowed IP's family and prefix length among it — as
-// garbage. Driver runs that dropped allowed IPs at random are what found it.
+// The layouts are wireguard-nt 1.1's `wireguard.h`. The padding the C
+// compiler puts into these structs is spelled out as fields here, and
+// always zero: `ConfigBuf::push` copies a struct out as whole words, and
+// implicit padding is uninitialized memory. It was once, and it cost real
+// allowed IPs: what 0.10 left as padding after an allowed IP's prefix
+// length, 1.x reads as that allowed IP's flags, and the driver is shared
+// by every wireguard-nt user on the host — so a 1.x driver, there from
+// another WireGuard install, removed the allowed IPs garbage told it to.
 
 /// `WIREGUARD_INTERFACE`, followed in memory by `peers_count` peers.
 #[repr(C, align(8))]
@@ -112,20 +114,23 @@ struct NtPeer {
     _pad1: u32,
 }
 
-/// `WIREGUARD_ALLOWED_IP`: an `IN_ADDR`/`IN6_ADDR` union, then its family
-/// and prefix length.
+/// `WIREGUARD_ALLOWED_IP`: an `IN_ADDR`/`IN6_ADDR` union, its family and
+/// prefix length, and flags. The one flag, `WIREGUARD_ALLOWED_IP_REMOVE`
+/// (remove this allowed IP rather than add it), is never used here:
+/// a peer's allowed IPs are always replaced whole.
 #[repr(C, align(8))]
 #[derive(Clone, Copy)]
 struct NtAllowedIp {
     address: [u8; 16],
     family: ADDRESS_FAMILY,
     cidr: u8,
-    _pad: [u8; 5],
+    _pad: u8,
+    flags: i32,
 }
 
-// The layout wireguard.h has, as the `wireguard-nt` crate's bindgen tests
-// pin it: every size a multiple of 8 (which `ConfigBuf` relies on), and
-// no byte left to padding the explicit fields don't cover.
+// The layout wireguard.h has: every size a multiple of 8 (which
+// `ConfigBuf` relies on), and no byte left to padding the explicit fields
+// don't cover.
 const _: () = {
     use std::mem::{offset_of, size_of};
     assert!(size_of::<NtInterface>() == 80);
@@ -136,6 +141,7 @@ const _: () = {
     assert!(offset_of!(NtPeer, tx_bytes) == 104 && offset_of!(NtPeer, allowed_ips_count) == 128);
     assert!(size_of::<NtAllowedIp>() == 24);
     assert!(offset_of!(NtAllowedIp, family) == 16 && offset_of!(NtAllowedIp, cidr) == 18);
+    assert!(offset_of!(NtAllowedIp, flags) == 20);
     // The fields' own sizes add up to the whole: no implicit padding anywhere.
     let key = size_of::<[u8; 32]>();
     assert!(size_of::<i32>() + size_of::<u16>() + 2 * key + size_of::<[u8; 2]>() + 2 * size_of::<u32>() == 80);
@@ -144,7 +150,7 @@ const _: () = {
             + size_of::<SOCKADDR_INET>() + 3 * size_of::<u64>() + 2 * size_of::<u32>()
             == 136
     );
-    assert!(size_of::<[u8; 16]>() + size_of::<ADDRESS_FAMILY>() + size_of::<u8>() + size_of::<[u8; 5]>() == 24);
+    assert!(size_of::<[u8; 16]>() + size_of::<ADDRESS_FAMILY>() + 2 * size_of::<u8>() + size_of::<i32>() == 24);
 };
 
 type CreateAdapter = unsafe extern "system" fn(*const u16, *const u16, *const GUID) -> AdapterHandle;
@@ -403,7 +409,7 @@ fn allowed_ip(ip: &IpAddrMask) -> NtAllowedIp {
             AF_INET6
         }
     };
-    NtAllowedIp { address, family, cidr: ip.cidr, _pad: [0; 5] }
+    NtAllowedIp { address, family, cidr: ip.cidr, _pad: 0, flags: 0 }
 }
 
 /// Reads a `WIREGUARD_INTERFACE` with its peers, as `get_config` returns it.
