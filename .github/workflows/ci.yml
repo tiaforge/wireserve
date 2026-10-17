@@ -87,3 +87,45 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # The agent alone: a Windows node runs nothing else. GitHub's Windows
+  # runners are elevated, so the wireguard-nt driver test runs for real
+  # here (and, under WIRESERVE_TEST_STRICT, may not skip).
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 40
+    env:
+      WIRESERVE_TEST_STRICT: "1"
+      # aws-lc's assembly, prebuilt in its own sources, instead of NASM on
+      # the runner.
+      AWS_LC_SYS_PREBUILT_NASM: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: cargo clippy
+        run: cargo clippy -p wireserve-agent --all-targets --locked -- -D warnings
+
+      # The agent loads wireguard.dll from its own directory only, so the
+      # tests need it next to their binary. The official release, refused
+      # unless it is exactly the archive pinned here and the DLL is signed
+      # by WireGuard LLC.
+      - name: wireguard-nt
+        shell: pwsh
+        run: |
+          $zip = "$env:RUNNER_TEMP\wireguard-nt.zip"
+          Invoke-WebRequest https://download.wireguard.com/wireguard-nt/wireguard-nt-1.1.zip -OutFile $zip
+          $sum = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($sum -ne "dceb30a9bc4be48cce0f74160fc88a585a2c2627366e8f846fc6658f9038dace") { throw "wireguard-nt archive checksum mismatch: $sum" }
+          Expand-Archive $zip -DestinationPath "$env:RUNNER_TEMP\wireguard-nt"
+          $dll = "$env:RUNNER_TEMP\wireguard-nt\wireguard-nt\bin\amd64\wireguard.dll"
+          $sig = Get-AuthenticodeSignature -LiteralPath $dll
+          if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notlike "CN=WireGuard LLC,*") { throw "wireguard.dll is not signed by WireGuard LLC: $($sig.Status)" }
+          New-Item -ItemType Directory -Force target\debug\deps | Out-Null
+          Copy-Item $dll target\debug\deps\
+
+      - name: cargo test
+        run: cargo test -p wireserve-agent --locked
