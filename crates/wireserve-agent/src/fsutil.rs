@@ -176,7 +176,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-
     #[test]
     fn falls_back_to_in_place_when_the_directory_refuses_a_temp_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -216,7 +215,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-
     #[test]
     fn writes_contents_and_exact_mode() {
         let dir = tempfile::tempdir().unwrap();
@@ -231,7 +229,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-
     #[test]
     fn does_not_follow_a_symlink_planted_at_the_temp_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -260,7 +257,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-
     #[test]
     fn overwrites_existing_file_atomically() {
         let dir = tempfile::tempdir().unwrap();
