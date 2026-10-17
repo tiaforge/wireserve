@@ -20,6 +20,7 @@ exists.
 
 - [Running the coordinator](coordinator.md)
 - [Adding nodes](nodes.md)
+- [Windows nodes](windows.md)
 - [Publishing services](services.md)
 - [Phones and laptops](devices.md)
 - [Real names and HTTPS](names-and-https.md)

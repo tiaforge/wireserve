@@ -24,6 +24,32 @@ API and refuses to start without it. The container image already includes
 it.
 
 
+## Building the Windows agent
+
+Only the agent builds for Windows, and only for the MSVC target. From
+Linux (WSL included), cross-compile with
+[cargo-xwin](https://github.com/rust-cross/cargo-xwin), which fetches
+Microsoft's C runtime and Windows SDK (accepting Microsoft's license) and
+builds the C dependencies with `clang-cl`:
+
+```sh
+sudo apt-get install clang lld llvm nasm     # Debian/Ubuntu
+rustup target add x86_64-pc-windows-msvc
+cargo install --locked cargo-xwin
+cargo xwin build -p wireserve-agent --release --target x86_64-pc-windows-msvc
+```
+
+On Windows itself, with the Visual Studio build tools, a plain `cargo
+build -p wireserve-agent --release` does it; set
+`AWS_LC_SYS_PREBUILT_NASM=1` if NASM isn't installed.
+
+The agent needs `wireguard.dll` beside it.
+`deploy/windows/fetch-wireguard-nt.ps1 <dir>` fetches the pinned, checked
+release (CI and the release job use the same script). To move to a newer
+wireguard-nt, change the version and checksum there, and first compare its
+`include/wireguard.h` with the layouts in
+`crates/wireserve-agent/src/wg/nt.rs`.
+
 ## Building the container images
 
 Both Dockerfiles use build cache mounts for the cargo registry and the
@@ -80,3 +106,10 @@ unprivileged network namespaces, and skip where those are unavailable.
 `WIRESERVE_TEST_STRICT=1` makes such a skip a failure, as CI does. One
 test, for the service addresses' header rewrites, needs real root and
 skips otherwise; CI runs it with sudo.
+
+On Windows, `cargo test -p wireserve-agent` runs the agent's tests; the
+ones against the wireguard-nt driver and the filtering engine need an
+elevated terminal and `wireguard.dll` in `target\debug\deps`. Built with
+cargo-xwin under WSL, the test binary runs from WSL as it is (WSL starts
+Windows executables), but elevated only if WSL itself was started from an
+elevated terminal.
