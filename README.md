@@ -56,7 +56,9 @@ wireserve plex 80:32400    # plex.wg now reaches Plex from anywhere in your mesh
 - Linux with systemd on every machine that joins (phones excepted), with
   `nftables` installed. The prebuilt binaries are for x86_64 and aarch64
   and need glibc 2.34 or newer: Debian 12, Ubuntu 22.04, RHEL 9 or later.
-  Anything else can [build from source](docs/building.md).
+  Anything else can [build from source](docs/building.md). Windows 10 and
+  11 (x86_64) can join too, to use the mesh's services rather than serve
+  any: see [Windows nodes](docs/windows.md).
 - A host for the coordinator that every machine can reach over HTTPS, with
   a reverse proxy such as Caddy or nginx in front of it.
 

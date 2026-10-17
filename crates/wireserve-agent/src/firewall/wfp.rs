@@ -7,7 +7,7 @@
 //! ALE layers only ever see the first packet of a flow, which is what
 //! nftables' `ct state established` amounts to on Linux.
 //!
-//! Why WFP and not Windows Defender Firewall rules (PLAN.md): the blocks
+//! Why WFP and not Windows Defender Firewall rules (PLAN.md #338): the blocks
 //! sit in a sublayer of our own at the highest weight and clear the
 //! action right, so no other firewall on the host — Defender, or whatever
 //! replaced it, all of them WFP clients — can permit what they refuse;
@@ -276,7 +276,7 @@ impl FirewallBackend for WfpBackend {
     type Error = io::Error;
 
     /// The default-deny, and nothing else: a Windows node serves nothing
-    /// (PLAN.md), so `rules` and `forwarding` are always empty here.
+    /// (PLAN.md M49), so `rules` and `forwarding` are always empty here.
     fn apply(&mut self, rules: &[ServiceRule], forwarding: &Forwarding) -> Result<(), Self::Error> {
         if (!rules.is_empty() || *forwarding != Forwarding::default()) && !self.warned_rules {
             tracing::warn!("services and forwarding are not supported on Windows; inbound traffic stays blocked");
