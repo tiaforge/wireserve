@@ -14,7 +14,6 @@ path = "src/main.rs"
 
 [dependencies]
 wireserve-types.workspace = true
-wireserve-tls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
@@ -29,11 +28,18 @@ rpassword.workspace = true
 libc.workspace = true
 rand.workspace = true
 
+# The TLS terminator (`tls-daemon`) runs on Unix hosts only.
+[target.'cfg(unix)'.dependencies]
+wireserve-tls.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
 nftables.workspace = true
 netlink-packet-core.workspace = true
 netlink-packet-route.workspace = true
 netlink-sys.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

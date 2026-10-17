@@ -176,7 +176,13 @@ fn set_dir_mode_700(path: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
-#[cfg(not(unix))]
+/// The Windows counterpart of `0700`: SYSTEM and Administrators only.
+#[cfg(windows)]
+fn set_dir_mode_700(path: &Path) -> std::io::Result<()> {
+    crate::winsec::restrict_to_admins(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn set_dir_mode_700(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -235,6 +241,7 @@ impl AgentState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -305,6 +312,8 @@ mod tests {
         assert_eq!(loaded.declared_services.len(), 1);
     }
 
+    #[cfg(unix)]
+
     #[test]
     fn save_creates_file_at_mode_600() {
         let dir = tempfile::tempdir().unwrap();
@@ -319,6 +328,8 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "state file containing secrets must be mode 600");
     }
+
+    #[cfg(unix)]
 
     #[test]
     fn save_creates_parent_directory_root_only() {
