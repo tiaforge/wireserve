@@ -634,7 +634,9 @@ async fn cmd_daemon(
     let mut fw = firewall::nftables::NftablesBackend::new(ifname.clone())?
         .with_carry(carry.clone())
         .with_own(&[ip4.into(), ip6.into()]);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    let mut fw = firewall::wfp::WfpBackend::new(&ifname, &[ip4.into(), ip6.into()])?;
+    #[cfg(not(any(target_os = "linux", windows)))]
     let mut fw = NoopFirewall;
 
     // Spec §5: teardown-then-deny-all must run before the first successful
@@ -702,6 +704,11 @@ async fn cmd_daemon(
                 .map_err(Into::<Box<dyn std::error::Error>>::into)
         },
     )?;
+    // The adapter exists now: its own blocks join the mesh addresses'
+    // (see `firewall::wfp`). Failing here leaves the address blocks only,
+    // which is not enough to run on.
+    #[cfg(windows)]
+    fw.refresh()?;
     if carry.is_some() {
         match wg.bring_up_carry(&private_key, ip4, ip6, state.carry_port) {
             Ok(port) => {
@@ -1335,13 +1342,13 @@ fn start_interop(_ifname: &str, _forward_wanted: firewall::ForwardWanted, _own_t
     firewall::NoopInterop
 }
 
-/// Used only on non-Linux targets, where there is no nftables backend —
-/// never a supported production configuration, just keeps `daemon`
-/// linkable there.
-#[cfg(not(target_os = "linux"))]
+/// Used only where there is no firewall backend (neither Linux nor
+/// Windows) — never a supported production configuration, just keeps
+/// `daemon` linkable there.
+#[cfg(not(any(target_os = "linux", windows)))]
 struct NoopFirewall;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 impl FirewallBackend for NoopFirewall {
     type Error = std::convert::Infallible;
     fn apply(

@@ -1,13 +1,15 @@
 //! Firewall backend wiring (spec §5). The trait itself and `ServiceRule`
-//! live in `wireserve_types` (shared with any future Windows backend); this
-//! module holds the concrete Linux implementation plus the startup
-//! sequencing that's a hard spec requirement regardless of which backend is
-//! in use.
+//! live in `wireserve_types`; this module holds the concrete backends —
+//! nftables on Linux, the Windows Filtering Platform on Windows (`wfp`) —
+//! plus the startup sequencing that's a hard spec requirement regardless of
+//! which backend is in use.
 
 #[cfg(target_os = "linux")]
 pub mod nft;
 #[cfg(target_os = "linux")]
 pub mod nftables;
+#[cfg(windows)]
+pub mod wfp;
 #[cfg(target_os = "linux")]
 pub mod host_interop;
 pub mod ip_forward;
