@@ -94,6 +94,7 @@ log "starting the coordinator on the back segment only"
 podman run -d --name "$COORD" --network "$BACK" \
     -e WIRESERVE_ADMIN_TOKEN="$ADMIN_TOKEN" \
     -e WIRESERVE_TRUST_PROXY_HEADERS=true \
+    -e WIRESERVE_NET_V4_CIDR="$MESH_V4" \
     wireserve-coordinator:e2e >/dev/null
 sleep 2
 COORD_IP=$(podman inspect "$COORD" --format "{{(index .NetworkSettings.Networks \"$BACK\").IPAddress}}")

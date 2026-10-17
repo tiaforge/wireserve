@@ -132,6 +132,7 @@ log "coordinator, approval off"
 podman network create --internal "$NET" >/dev/null
 podman run -d --name "$COORD" --network "$NET" \
     -e WIRESERVE_ADMIN_TOKEN="$ADMIN_TOKEN" -e WIRESERVE_REQUIRE_SERVICE_APPROVAL=false \
+    -e WIRESERVE_NET_V4_CIDR="$MESH_V4" \
     wireserve-coordinator:e2e >/dev/null
 sleep 2
 COORD_IP=$(ip_on "$COORD" "$NET")

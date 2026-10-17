@@ -55,7 +55,8 @@ log "building images"
 log "starting coordinator"
 podman network create "$NET" >/dev/null 2>&1 || true
 podman run -d --name "$COORD" --network "$NET" \
-    -e WIRESERVE_ADMIN_TOKEN="$ADMIN_TOKEN" wireserve-coordinator:e2e >/dev/null
+    -e WIRESERVE_ADMIN_TOKEN="$ADMIN_TOKEN" -e WIRESERVE_NET_V4_CIDR="$MESH_V4" \
+    wireserve-coordinator:e2e >/dev/null
 sleep 1
 COORD_IP=$(podman inspect "$COORD" --format "{{(index .NetworkSettings.Networks \"$NET\").IPAddress}}")
 

@@ -196,6 +196,7 @@ podman run -d --name "$COORD" --network "$NET" \
     -e WIRESERVE_DNS_TSIG_KEY_NAME=wireserve -e WIRESERVE_DNS_TSIG_SECRET="$TSIG_SECRET" \
     -e WIRESERVE_DNS_TTL=60 \
     -e WIRESERVE_ACME_DIRECTORY=https://pebble:14000/dir -e WIRESERVE_ACME_PROPAGATION_SECS=0 \
+    -e WIRESERVE_NET_V4_CIDR="$MESH_V4" \
     wireserve-coordinator:e2e >/dev/null
 sleep 2
 COORD_IP=$(ip_on "$COORD" "$NET")

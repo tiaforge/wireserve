@@ -260,6 +260,7 @@ podman run -d --name "$COORD" --network "$NET" --network-alias coord \
     -e WIRESERVE_PUBLIC_URL="$PUBLIC" \
     -e WIRESERVE_OIDC_ISSUER="$ISSUER" -e WIRESERVE_OIDC_CLIENT_ID=wireserve \
     -e WIRESERVE_OIDC_CLIENT_SECRET=anything -e WIRESERVE_OIDC_REFRESH_SECS="$REFRESH" \
+    -e WIRESERVE_NET_V4_CIDR="$MESH_V4" \
     wireserve-coordinator:e2e >/dev/null
 sleep 2
 COORD_IP=$(ip_on "$COORD" "$NET")

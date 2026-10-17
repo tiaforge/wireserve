@@ -6,6 +6,13 @@
 # is for real nodes, where it is a load on the coordinator.
 POLL=1
 
+# The mesh's IPv4 range in every suite's coordinator. Left to itself, a
+# fresh coordinator draws a random 10.X.0.0/16, and one draw in 256 lands
+# on podman's own networks (10.88.0.0/16, then 10.89.N.0/24): a node is then
+# handed the coordinator's own address, and every poll after the first is
+# routed into the tunnel. Clear of both, and of what the suites use.
+MESH_V4=10.77.0.0/16
+
 # wait_for SECS CMD [ARGS...]: runs CMD every half second until it
 # succeeds, for at most SECS seconds, and returns 1 if it never did — so
 # it reads as the check it waits for:

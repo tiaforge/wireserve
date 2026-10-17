@@ -137,6 +137,7 @@ pass "an 'internet' on a public-looking range, the gateway's LAN, and the phone'
 log "starting the coordinator and the internet host"
 podman run -d --name "$COORD" --network "$INET" \
     -e WIRESERVE_ADMIN_TOKEN="$ADMIN_TOKEN" \
+    -e WIRESERVE_NET_V4_CIDR="$MESH_V4" \
     wireserve-coordinator:e2e >/dev/null
 podman run -d --name "$WEB" --network "$INET" "$DEBUG_IMG" \
     socat TCP-LISTEN:8080,fork,reuseaddr SYSTEM:'echo $SOCAT_PEERADDR' >/dev/null

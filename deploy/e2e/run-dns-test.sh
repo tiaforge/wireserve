@@ -166,6 +166,7 @@ start_coordinator() {
         -e WIRESERVE_DNS_TSIG_SECRET="$TSIG_SECRET" \
         -e WIRESERVE_DNS_TTL=60 \
         -e RUST_LOG=info \
+        -e WIRESERVE_NET_V4_CIDR="$MESH_V4" \
         wireserve-coordinator:e2e >/dev/null
     sleep 2
 }
