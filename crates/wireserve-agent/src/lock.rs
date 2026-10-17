@@ -104,8 +104,8 @@ fn lock_file(instance: &str, path: PathBuf) -> Result<InstanceLock, LockError> {
 
 /// The Windows instance lock: a byte-range lock on the same file
 /// (`LockFileEx`), released by the kernel when the handle closes or the
-/// process dies, like `flock`. The directory is given its admins-only ACL
-/// (`crate::winsec`) as it is created — it is the state directory.
+/// process dies, like `flock`. The directory is made private
+/// (`crate::winsec`) first — it is the state directory.
 #[cfg(windows)]
 fn lock_file(instance: &str, path: PathBuf) -> Result<InstanceLock, LockError> {
     let io_err = |source| LockError::Io {
@@ -113,10 +113,7 @@ fn lock_file(instance: &str, path: PathBuf) -> Result<InstanceLock, LockError> {
         source,
     };
     if let Some(parent) = path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent).map_err(io_err)?;
-            crate::winsec::restrict_to_admins(parent).map_err(io_err)?;
-        }
+        crate::winsec::ensure_private_dir(parent).map_err(io_err)?;
     }
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -484,7 +481,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-
     #[test]
     fn a_symlink_at_the_lock_path_is_refused_not_followed() {
         let dir = tempfile::tempdir().unwrap();
