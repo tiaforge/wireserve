@@ -102,12 +102,14 @@ enum Command {
     /// Join a mesh with a token from `wireserve-admin node create`
     // The keypair is generated locally; only the public key leaves.
     Join(JoinArgs),
-    /// Install wireserve as a systemd service and join a mesh (needs root)
-    // Installs the binary to /usr/local/bin and the right unit for this
-    // instance (plain, or the `@.service` template for a named instance),
-    // creates the `wireserve` group whose members can run the other
-    // commands without sudo, then joins. Linux/systemd only: Quadlet/podman
-    // deployments install by hand, per `deploy/quadlet/`.
+    /// Install wireserve as a service and join a mesh (needs root, or an elevated terminal on Windows)
+    // Linux: installs the binary to /usr/local/bin and the right unit for
+    // this instance (plain, or the `@.service` template for a named
+    // instance), creates the `wireserve` group whose members can run the
+    // other commands without sudo, then joins. Quadlet/podman deployments
+    // install by hand, per `deploy/quadlet/`. Windows: the binary and
+    // wireguard.dll into %ProgramFiles%\wireserve and a Windows Service
+    // per instance (`winservice`), then joins.
     Install(InstallArgs),
     /// Run the agent in the foreground
     Daemon {
@@ -121,6 +123,10 @@ enum Command {
         // refuses to start.
         #[arg(long, value_parser = parse_ifname_flag)]
         ifname: Option<ifname::Flag>,
+        /// Run under the Service Control Manager (`install` sets this up)
+        #[cfg(windows)]
+        #[arg(long, hide = true)]
+        service: bool,
     },
     /// Relay traffic for nodes that can't reach each other (also needs an admin's approval)
     // PLAN.md M23. A live toggle: takes effect next poll, no rejoin. Off by
@@ -261,6 +267,68 @@ fn init_logging() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
+/// The service's logging: appended to `path`, in the private state
+/// directory. A log past 10 MiB at start is kept as `agent.log.old`, the
+/// one before that dropped.
+#[cfg(windows)]
+fn init_file_logging(path: &std::path::Path) -> std::io::Result<()> {
+    use tracing_subscriber::EnvFilter;
+    const KEEP: u64 = 10 * 1024 * 1024;
+    if let Some(dir) = path.parent() {
+        wireserve_agent::winsec::ensure_private_dir(dir)?;
+    }
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > KEEP) {
+        let _ = std::fs::rename(path, path.with_extension("log.old"));
+    }
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(std::sync::Mutex::new(file)).init();
+    Ok(())
+}
+
+/// `daemon --service`: the daemon, under the Service Control Manager. The
+/// process's exit code; the service's own, which decides whether it is
+/// restarted, is the daemon's (see `winservice`).
+#[cfg(windows)]
+fn run_service(cli: Cli) -> i32 {
+    use wireserve_agent::winservice;
+    let Command::Daemon { poll_interval_secs, ifname, .. } = cli.command else {
+        unreachable!("only `daemon --service` runs as a service")
+    };
+    let instance = cli.instance;
+    let log = instance.log_path();
+    if let Err(e) = init_file_logging(&log) {
+        eprintln!("error: could not open the log {}: {e}", log.display());
+        return 1;
+    }
+    let name = winservice::service_name(&instance);
+    let dispatched = winservice::dispatch(&name, move || {
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, "could not start the async runtime");
+                return 1;
+            }
+        };
+        match runtime.block_on(cmd_daemon(&instance, poll_interval_secs, ifname.clone())) {
+            Ok(()) => 0,
+            Err(e) => {
+                tracing::error!(error = %e, "the agent stopped");
+                1
+            }
+        }
+    });
+    match dispatched {
+        Ok(()) => 0,
+        Err(e) => {
+            let msg = format!("`daemon --service` runs only as the {name} service, which `wireserve install` sets up ({e})");
+            tracing::error!("{msg}");
+            eprintln!("error: {msg}");
+            1
+        }
+    }
+}
+
 fn parse_ifname_flag(s: &str) -> Result<ifname::Flag, wireserve_agent::wg::InvalidIfname> {
     let flag = ifname::Flag::parse(s);
     if let ifname::Flag::Name(n) = &flag {
@@ -273,23 +341,29 @@ fn parse_instance(name: &str) -> Result<Instance, paths::InvalidInstance> {
     Instance::new(name)
 }
 
-#[tokio::main]
-async fn main() {
-    init_logging();
+fn main() {
     let cli = Cli::parse();
+    // A service hands the process to the Service Control Manager before
+    // anything else, and logs to a file: it has no console.
+    #[cfg(windows)]
+    if let Command::Daemon { service: true, .. } = &cli.command {
+        std::process::exit(run_service(cli));
+    }
+    init_logging();
+    let runtime = tokio::runtime::Runtime::new().expect("could not start the async runtime");
+    runtime.block_on(run(cli));
+}
+
+async fn run(cli: Cli) {
     let instance = cli.instance;
 
     let result = match cli.command {
         Command::Join(args) => cmd_join(&instance, args).await,
-        #[cfg(unix)]
         Command::Install(args) => cmd_install(&instance, args).await,
-        #[cfg(not(unix))]
-        Command::Install(_) => Err("`install` is not available on Windows yet: run `wireserve join`, then \
-            `wireserve daemon`, from an elevated terminal"
-            .into()),
         Command::Daemon {
             poll_interval_secs,
             ifname,
+            ..
         } => {
             cmd_daemon(&instance, poll_interval_secs, ifname).await
         }
@@ -443,6 +517,88 @@ async fn cmd_install(instance: &Instance, args: InstallArgs) -> Result<(), Box<d
         }
     }
     Ok(())
+}
+
+/// `install` on Windows: the files into `%ProgramFiles%\wireserve`, the
+/// instance's service (see `winservice`), a join unless this is an
+/// upgrade, and the service started. Every running agent service is
+/// stopped while the binary it runs is replaced, and started again after.
+#[cfg(windows)]
+async fn cmd_install(instance: &Instance, args: InstallArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use wireserve_agent::winservice;
+    let InstallArgs { join: args, tls_port } = args;
+    if tls_port.is_some() {
+        return Err("--tls-port: Windows nodes serve nothing, so there is no TLS terminator to give a port".into());
+    }
+    if let Some(url) = &args.coordinator_url {
+        register::check_coordinator_transport(url, args.allow_plaintext_http)?;
+    }
+    if !wireserve_agent::winsec::is_elevated()? {
+        return Err("`install` needs an elevated terminal: open it with \"Run as administrator\"".into());
+    }
+    // As on Linux (`install::is_upgrade`): an identity, and nothing given
+    // to join with, is an upgrade.
+    let registered = AgentState::load(&instance.state_path())?.bearer_token.is_some();
+    let join_args_given =
+        args.coordinator_url.is_some() || args.join_token.is_some() || args.join_token_file.is_some();
+    let upgrade = registered && !join_args_given;
+
+    let running = winservice::running_instances(paths::all_instances())?;
+    for other in &running {
+        winservice::stop_and_wait(&winservice::service_name(other))?;
+    }
+    let exe = install_files()?;
+    let name = winservice::service_name(instance);
+    winservice::install(&name, instance, &exe)?;
+    if !upgrade {
+        cmd_join(instance, args).await?;
+    }
+    winservice::start(&name, &instance.log_path())?;
+    for other in running.iter().filter(|i| *i != instance) {
+        winservice::start(&winservice::service_name(other), &other.log_path())?;
+    }
+
+    let instance_flag = if instance.is_default() { String::new() } else { format!(" --instance {}", instance.name()) };
+    println!();
+    if upgrade {
+        println!("upgraded; {name} is running again");
+    } else {
+        println!("{name} is running");
+    }
+    println!("From an elevated terminal, `{}{instance_flag} status` shows its peers.", exe.display());
+    println!("Its log: {}", instance.log_path().display());
+    Ok(())
+}
+
+/// Copies this executable and the `wireguard.dll` beside it into
+/// `%ProgramFiles%\wireserve`, where only administrators can change them —
+/// the service runs them as LocalSystem. Returns the installed executable.
+#[cfg(windows)]
+fn install_files() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let program_files = std::env::var_os("ProgramFiles").unwrap_or_else(|| r"C:\Program Files".into());
+    let dir = std::path::PathBuf::from(program_files).join("wireserve");
+    let current = std::env::current_exe()?.canonicalize()?;
+    let dll = current.with_file_name("wireguard.dll");
+    if !dll.is_file() {
+        return Err(format!(
+            "wireguard.dll must be next to {} (both come in the release zip)",
+            current.display()
+        )
+        .into());
+    }
+    std::fs::create_dir_all(&dir)?;
+    for (from, file) in [(&current, "wireserve.exe"), (&dll, "wireguard.dll")] {
+        let to = dir.join(file);
+        if to.canonicalize().is_ok_and(|t| t == *from) {
+            continue;
+        }
+        // Copied beside, then renamed over: never a half-written file where
+        // the service looks for it.
+        let tmp = dir.join(format!(".{file}.tmp"));
+        std::fs::copy(from, &tmp).map_err(|e| format!("could not copy {} to {}: {e}", from.display(), dir.display()))?;
+        std::fs::rename(&tmp, &to).map_err(|e| format!("could not replace {}: {e}", to.display()))?;
+    }
+    Ok(dir.join("wireserve.exe"))
 }
 
 /// Whether stdin is an interactive terminal — the gate for every prompt
@@ -832,8 +988,12 @@ async fn cmd_daemon(
             _ = async {
                 #[cfg(unix)]
                 tokio::select! { _ = sigterm.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
-                #[cfg(not(unix))]
-                let _ = tokio::signal::ctrl_c().await;
+                // A failure to listen for Ctrl-C must not read as Ctrl-C.
+                #[cfg(windows)]
+                tokio::select! {
+                    () = async { if tokio::signal::ctrl_c().await.is_err() { std::future::pending::<()>().await } } => {}
+                    () = wireserve_agent::winservice::stop_requested() => {}
+                }
             } => {
                 tracing::info!("termination signal received — tearing down");
                 teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, instance.hosts_label(), &socket_path, &shared_state, &state_path, false).await;
@@ -1310,6 +1470,13 @@ async fn cmd_status(instance: &Instance, json: bool) -> Result<(), Box<dyn std::
 
 async fn cmd_leave(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
     let resp = client::call(&instance.socket_path(), &IpcRequest::Leave).await?;
+    // On Windows the service goes too: started at boot with no identity to
+    // run on, it would fail and be restarted over and over.
+    #[cfg(windows)]
+    if matches!(resp, wireserve_agent::ipc::IpcResponse::Ok) {
+        let name = wireserve_agent::winservice::service_name(instance);
+        wireserve_agent::winservice::delete(&name).map_err(|e| format!("left the mesh, but could not remove the {name} service: {e}"))?;
+    }
     print_response(resp);
     Ok(())
 }

@@ -325,7 +325,6 @@ mod egress_tests {
     }
 
     #[cfg(target_os = "linux")]
-
     #[test]
     fn implausible_names_never_reach_a_proc_path() {
         for bad in ["", ".", "..", "../all", "a/b", "sixteen-chars-xx"] {

@@ -32,6 +32,8 @@ pub mod wg;
 pub mod winnet;
 #[cfg(windows)]
 pub mod winsec;
+#[cfg(windows)]
+pub mod winservice;
 
 /// Words that can't name a service declared here: `wireserve <word>` runs
 /// that command instead (PLAN.md M44). `off` is what withdraws one.

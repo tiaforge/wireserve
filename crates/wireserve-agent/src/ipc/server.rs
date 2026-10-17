@@ -356,13 +356,16 @@ where
     let response = match reader.read_line(&mut line).await {
         Ok(0) => return, // client closed without sending anything
         Ok(_) => match crate::ipc::protocol::parse_request(&line) {
-            Ok(req) => {
-                let (resp, shutdown) = dispatch(ctx, req).await;
-                if shutdown {
-                    let _ = ctx.shutdown.send(()).await;
+            Ok(req) => match refused_here(&req) {
+                Some(why) => IpcResponse::error(why),
+                None => {
+                    let (resp, shutdown) = dispatch(ctx, req).await;
+                    if shutdown {
+                        let _ = ctx.shutdown.send(()).await;
+                    }
+                    resp
                 }
-                resp
-            }
+            },
             Err(e) => IpcResponse::error(format!("bad request: {e}")),
         },
         Err(e) => IpcResponse::error(format!("read error: {e}")),
@@ -373,6 +376,21 @@ where
     });
     out.push('\n');
     let _ = write_half.write_all(out.as_bytes()).await;
+}
+
+/// Why this platform's daemon refuses `req`, if it does. A Windows node
+/// uses the mesh's services and serves none of its own (PLAN.md): no
+/// service declarations, transit or exit — what turns any of those off
+/// is still accepted, so a state file copied from elsewhere can be undone.
+fn refused_here(req: &IpcRequest) -> Option<&'static str> {
+    let serves = matches!(
+        req,
+        IpcRequest::Serve { .. } | IpcRequest::TransitCapable { enabled: true } | IpcRequest::ExitCapable { enabled: true }
+    );
+    (cfg!(windows) && serves).then_some(
+        "not supported on Windows: a Windows node uses the mesh's services, but declares none, \
+         and carries no one else's traffic",
+    )
 }
 
 /// The group the daemon's socket is shared with when it exists on this
@@ -581,7 +599,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-
     #[tokio::test]
     async fn socket_without_a_group_is_root_only() {
         use std::os::unix::fs::PermissionsExt;
@@ -594,7 +611,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-
     #[tokio::test]
     async fn socket_with_a_group_is_shared_with_exactly_that_group() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -611,7 +627,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-
     #[tokio::test]
     async fn failing_to_share_leaves_a_root_only_socket_not_an_error() {
         use std::os::unix::fs::PermissionsExt;
@@ -628,8 +643,18 @@ mod tests {
         assert_eq!(mode(path.parent().unwrap()), 0o700);
     }
 
-    #[cfg(unix)]
+    #[test]
+    fn a_windows_node_serves_nothing_but_may_turn_things_off() {
+        let serve = IpcRequest::Serve { name: "web".into(), ports: vec![], group: None, always_sign_in: false };
+        assert_eq!(refused_here(&serve).is_some(), cfg!(windows));
+        assert_eq!(refused_here(&IpcRequest::TransitCapable { enabled: true }).is_some(), cfg!(windows));
+        assert_eq!(refused_here(&IpcRequest::ExitCapable { enabled: true }).is_some(), cfg!(windows));
+        assert!(refused_here(&IpcRequest::TransitCapable { enabled: false }).is_none());
+        assert!(refused_here(&IpcRequest::Unserve { name: "web".into() }).is_none());
+        assert!(refused_here(&IpcRequest::List).is_none());
+    }
 
+    #[cfg(unix)]
     #[test]
     fn a_missing_group_means_no_sharing() {
         assert_eq!(lookup_group("wireserve-no-such-group-xyz"), None);
@@ -637,7 +662,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-
     #[test]
     fn group_env_empty_disables_sharing() {
         // Only this test touches the variable; it restores it.
@@ -773,6 +797,8 @@ mod tests {
         assert!(ctx.state.lock().await.pending_services.is_empty());
     }
 
+    // Over a connection, which a Windows daemon refuses (`refused_here`).
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn serve_then_list_shows_declared_service_as_local() {
         let (ctx, _dir, _rx) = test_ctx();
@@ -1019,6 +1045,8 @@ mod tests {
         assert!(!state.declared_services.iter().any(|d| d.name == "one-too-many"));
     }
 
+    // Over a connection, which a Windows daemon refuses (`refused_here`).
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn serve_can_still_update_an_existing_service_when_at_the_limit() {
         // Re-declaring a name already present replaces it rather than
