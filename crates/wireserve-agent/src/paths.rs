@@ -130,6 +130,14 @@ impl Instance {
         }
     }
 
+    /// The service's log on Windows, beside the state: a service has no
+    /// console, and the state directory is already private.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn log_path(&self) -> PathBuf {
+        self.state_path().with_file_name("agent.log")
+    }
+
     /// Next to the state file: the lock guards that file, so it has to
     /// live wherever the state does.
     #[must_use]
@@ -181,7 +189,7 @@ fn run_root() -> PathBuf {
 }
 
 /// Every instance that has a state directory, the default one included.
-fn all_instances() -> Vec<Instance> {
+pub fn all_instances() -> Vec<Instance> {
     let mut out = vec![Instance::default()];
     if let Ok(entries) = std::fs::read_dir(state_root().join(INSTANCES_DIR)) {
         out.extend(

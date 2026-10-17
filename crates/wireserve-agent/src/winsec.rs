@@ -117,6 +117,14 @@ pub fn restrict_to_admins(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Creates `dir` if need be and makes it private (see
+/// [`restrict_to_admins`]) — every time, not only when it is new: one that
+/// was already there may have been put there by another user.
+pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    restrict_to_admins(dir)
+}
+
 /// Refuses a `path` owned by anyone but SYSTEM, Administrators or this
 /// process's own user.
 fn check_owner(path: &Path, name: &[u16]) -> io::Result<()> {

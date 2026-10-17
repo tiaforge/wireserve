@@ -344,7 +344,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-
     #[test]
     fn save_creates_file_at_mode_600() {
         let dir = tempfile::tempdir().unwrap();
@@ -361,7 +360,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-
     #[test]
     fn save_creates_parent_directory_root_only() {
         let dir = tempfile::tempdir().unwrap();
