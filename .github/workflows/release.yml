@@ -117,6 +117,43 @@ jobs:
           path: out/
           if-no-files-found: error
 
+  # The Windows agent (docs/windows.md): built and tested on an elevated
+  # Windows runner, the wireguard-nt driver test included, and packed with
+  # the wireguard.dll it was tested against. The e2e suites are Linux
+  # only; this test run is what stands in for them here.
+  build-windows:
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      WIRESERVE_TEST_STRICT: "1"
+      AWS_LC_SYS_PREBUILT_NASM: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: wireguard-nt
+        shell: pwsh
+        run: |
+          deploy/windows/fetch-wireguard-nt.ps1 target/debug/deps
+          deploy/windows/fetch-wireguard-nt.ps1 out
+      - name: cargo test
+        run: cargo test -p wireserve-agent --locked
+      - name: cargo build --release
+        shell: pwsh
+        run: |
+          cargo build --release --locked -p wireserve-agent
+          Copy-Item target/release/wireserve.exe out/
+          out/wireserve.exe --version
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bin-windows-x86_64
+          path: out/
+          if-no-files-found: error
+
   e2e:
     needs: [prepare, build]
     name: e2e (${{ matrix.arch }}, ${{ matrix.suite }})
@@ -172,7 +209,7 @@ jobs:
   publish:
     # Only a tag publishes; a dry run ends after e2e.
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [prepare, build, e2e]
+    needs: [prepare, build, build-windows, e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -212,7 +249,16 @@ jobs:
             cp "bins/bin-$arch/wireserve-coordinator" "bins/bin-$arch/wireserve-admin" LICENSE.md README.md "$coord/"
             tar -czf "upload/$coord.tar.gz" --owner=0 --group=0 "$coord"
           done
-          (cd upload && sha256sum -- *.tar.gz > SHA256SUMS)
+
+          # The Windows agent: wireserve.exe with the wireguard.dll it loads
+          # from its own directory, and docs/windows.md for how to install.
+          win=wireserve-$VERSION-x86_64-windows
+          mkdir -p "$win"
+          cp bins/bin-windows-x86_64/wireserve.exe bins/bin-windows-x86_64/wireguard.dll LICENSE.md README.md "$win/"
+          cp docs/windows.md "$win/WINDOWS.md"
+          zip -qr "upload/$win.zip" "$win"
+
+          (cd upload && sha256sum -- *.tar.gz *.zip > SHA256SUMS)
           cat upload/SHA256SUMS
 
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
