@@ -5181,3 +5181,108 @@ polls.
     with approval. Through `/poll`: ignored from an unapproved carrier and
     for a LAN address, published from an approved one, kept over a
     resent probe and replaced by a new one. No e2e.
+
+## M49 — Windows nodes
+
+A Windows 10/11 computer joins as a node that uses the mesh and serves
+nothing: peers, `<service>.wg` names, routes to peers and service addresses,
+the default-deny, `status`, `leave`, and `install` as a Windows Service.
+Declaring services, the TLS terminator, transit, exit and the carry
+interface stay Linux-only. Decided with the user (2026-10-17): consumer only
+for a first version, the agent alone (no `wireserve-admin`, no
+coordinator), a zip with `install` rather than an MSI. Tested on Windows 11
+against a real coordinator: joined, reached a Linux node's services by
+name, a Linux peer's connection to the Windows node timed out, restart and
+`leave` clean.
+
+336. **Our own wireguard-nt binding** (`wg/nt.rs`). defguard's Windows
+    backend makes `configure_peer` and `remove_peer` no-ops, loads
+    `wireguard.dll` from a path relative to the working directory (a
+    service's is `System32`; a planted DLL would be loaded), panics without
+    it, and routes every `AllowedIPs` entry itself. The `wireguard-nt`
+    crate's only configuration call sets `REPLACE_PEERS`, so every poll
+    would drop every session and the endpoint roaming F6 keeps. The
+    embeddable DLL service wireguard-nt's README points embedders to was
+    weighed and refused: a separate service from a `.conf` with its own
+    routing (wg-quick's), shipped only as Go sources to build, and a tunnel
+    outliving the agent. The C API has what is needed — per-peer add,
+    update and remove in one `WireGuardSetConfiguration` — and is
+    documented for loading beside the application. The DLL is loaded with
+    `LOAD_LIBRARY_SEARCH_APPLICATION_DIR` only. defguard's `Key`, `Peer`
+    and `Host` types stay, so `wg.rs`'s peer logic is shared. An adapter
+    lives as long as the handle that created it and is removed
+    asynchronously after: `create_interface` waits a dying one out rather
+    than adopt it (a handle opened on it went dead under the next run), and
+    `remove_interface` waits until it is gone.
+
+337. **The driver is shared, so its ABI is the newest one installed.**
+    Driver runs dropped allowed IPs at random. Two things together:
+    `ConfigBuf` copied the FFI structs out as whole words, implicit padding
+    and all (uninitialized memory), and the host's driver was 1.1 —
+    installed by another WireGuard — while the DLL was 0.10.1. 1.x reads
+    what 0.10 left as padding after an allowed IP's prefix length as that
+    allowed IP's flags, and `WIREGUARD_ALLOWED_IP_REMOVE` removed it. All
+    padding is now explicit fields, always zero, with compile-time offset
+    and size checks against 1.1's `wireguard.h`; the pinned DLL is 1.1
+    (`deploy/windows/fetch-wireguard-nt.ps1`, checksum and WireGuard LLC
+    signature checked, used by CI and the release alike). Moving to a newer
+    wireguard-nt starts with diffing its header against `nt.rs`.
+
+338. **WFP, not Windows Defender Firewall rules** (`firewall/wfp.rs`).
+    Hard blocks (`FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT`) at
+    `ALE_AUTH_RECV_ACCEPT_V4/V6`, in a sublayer of ours at the highest
+    weight: no other WFP client — Defender, or the antivirus that replaced
+    it — can permit what they refuse, whatever network profile Windows gave
+    the adapter (it calls it an unidentified public network). Defender's
+    rules would depend on that profile, vanish when a third-party firewall
+    turns Defender off, and offer no transactional replace; WFP has
+    transactions, like `nft -f`. The blocks match the mesh addresses from
+    before bring-up (spec §5's order unchanged) and the adapter's LUID once
+    it is up; loopback is exempt, as the Linux table matches on the
+    interface name. Replies need no rule: ALE only classifies a flow's
+    first packet. The session is dynamic, so the filters go with the
+    process — as the adapter does (#336), leaving nothing to guard. A
+    shared sublayer was wrong: what a dynamic session adds only it may use
+    (`FWP_E_WRONG_SESSION`), so a second instance could not use the first's.
+    The sublayer is now per interface name. What the tests can't show on
+    one machine — Windows routes a connection to one of its own addresses
+    through loopback — the real-mesh test did: a Linux peer's connection
+    timed out.
+
+339. **Access control where Linux has modes and sockets.** The state
+    directory gets a protected ACL (SYSTEM, Administrators, owner) and is
+    refused when owned by anyone else: any user can create a folder in
+    ProgramData, and its owner can always rewrite its ACL, so a
+    pre-created `wireserve` would have read the keys
+    (`winsec::check_owner`). The IPC endpoint is a named pipe for SYSTEM
+    and Administrators, refusing remote clients and created as the first
+    instance; sharing it with a group, as Linux does, is not done.
+    Interface claims are `Global\` file mappings: only file mappings need
+    `SeCreateGlobalPrivilege` there (the first version used events and a
+    mutex, which any user can create first — a held mutex would have hung
+    the poll loop). The hosts file is locked through a sidecar file in
+    `drivers\etc`, where only administrators create files; it stays
+    behind.
+
+340. **The service through `windows-sys`, not a crate.** About 300 lines
+    of Service Control Manager calls (`winservice.rs`), against a new
+    dependency. `main` builds its runtime itself so `daemon --service` can
+    hand the process to the SCM first; a stop or shutdown wakes the same
+    teardown as SIGTERM. A nonzero exit counts as a failure for the
+    restart actions (5 s, 30 s, then every minute), like
+    `Restart=on-failure`. `leave` deletes the service: started at boot
+    with no identity it would only fail. The log is a file in the private
+    state directory, rolled at 10 MiB.
+
+341. **Refused at the connection, not the command.** A Windows daemon
+    refuses service declarations, transit and exit on its IPC connections
+    (`refused_here`), so nothing reaches its state however it is asked;
+    turning them off is still accepted. Tests call `dispatch` directly and
+    keep running on Windows.
+
+342. **Left for later:** adding `C:\Program Files\wireserve` to `PATH`;
+    Authenticode-signing `wireserve.exe` (no certificate yet; SmartScreen
+    warns on an unsigned download); an aarch64 build (wireguard-nt ships
+    an arm64 DLL); sharing the IPC pipe with a group; serving on Windows
+    (service rules in WFP, and the address rewrites nftables does, which
+    WFP has no plain counterpart for).

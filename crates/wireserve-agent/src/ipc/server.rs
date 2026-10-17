@@ -379,7 +379,7 @@ where
 }
 
 /// Why this platform's daemon refuses `req`, if it does. A Windows node
-/// uses the mesh's services and serves none of its own (PLAN.md): no
+/// uses the mesh's services and serves none of its own (PLAN.md M49, #341): no
 /// service declarations, transit or exit — what turns any of those off
 /// is still accepted, so a state file copied from elsewhere can be undone.
 fn refused_here(req: &IpcRequest) -> Option<&'static str> {
