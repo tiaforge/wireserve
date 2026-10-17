@@ -314,9 +314,14 @@ impl Adapter {
 
 /// The adapter GUID for `name`: the same one every time, so Windows sees
 /// the same network on every start instead of adding "Network 2", "3", …
-/// to its list, each with its own firewall profile. Two FNV-1a hashes of
-/// the name; nothing about it needs to be secret or unguessable.
+/// to its list, each with its own firewall profile.
 fn adapter_guid(name: &str) -> GUID {
+    name_guid(name)
+}
+
+/// A GUID that is the same for the same `name` every time: two FNV-1a
+/// hashes of it. Nothing about it needs to be secret or unguessable.
+pub(crate) fn name_guid(name: &str) -> GUID {
     let fnv = |seed: u64| {
         name.bytes()
             .fold(seed, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
