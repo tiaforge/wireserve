@@ -170,23 +170,6 @@ pub struct RejectedService {
     pub reason: String,
 }
 
-#[cfg(unix)]
-fn set_dir_mode_700(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-}
-
-/// The Windows counterpart of `0700`: SYSTEM and Administrators only.
-#[cfg(windows)]
-fn set_dir_mode_700(path: &Path) -> std::io::Result<()> {
-    crate::winsec::restrict_to_admins(path)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn set_dir_mode_700(_path: &Path) -> std::io::Result<()> {
-    Ok(())
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
     #[error("I/O error: {0}")]
@@ -216,7 +199,7 @@ impl AgentState {
             // world-writable-by-default parent is what makes temp-file
             // games against `atomic_write` worth attempting in the first
             // place.
-            set_dir_mode_700(parent)?;
+            crate::platform::fs::make_private_dir(parent)?;
         }
         let json = serde_json::to_vec_pretty(self)?;
         atomic_write(path, &json, 0o600)?;

@@ -18,7 +18,6 @@ use std::path::Path;
 use wireserve_types::naming::own_address;
 use wireserve_types::{ServiceInfo, ServiceNames};
 
-use crate::fsutil::atomic_write;
 
 const BEGIN_MARKER: &str = "# BEGIN WIRESERVE";
 const END_MARKER: &str = "# END WIRESERVE";
@@ -132,78 +131,19 @@ pub fn sync(
     services: &[ServiceInfo],
     naming: Naming<'_>,
 ) -> std::io::Result<()> {
-    with_lock(path, || {
+    crate::platform::fs::lock_for_update(path, || {
         let existing = read_existing(path)?;
         let updated = replace_managed_block(&existing, label, services, naming);
         if updated == existing {
             return Ok(());
         }
-        write_preserving_mode(path, &updated)?;
+        crate::platform::fs::replace_keeping_mode(path, &updated)?;
         // Once per actual change, never per cycle: enough to tell from the
         // log alone what the block held at any moment.
         let names: Vec<&str> = services.iter().map(|s| s.name.as_str()).collect();
         tracing::info!(path = %path.display(), services = ?names, "hosts-file block rewritten");
         Ok(())
     })
-}
-
-/// Runs a read-modify-write of `path` under an exclusive `flock`, so two
-/// agent instances rewriting their own blocks at the same moment can't
-/// each write back a copy missing the other's change.
-///
-/// The lock is on the file itself, and `atomic_write` replaces the file by
-/// renaming a new one over it, so a lock taken while waiting may end up on
-/// the replaced file rather than the current one. Checked after locking,
-/// by comparing the locked descriptor's inode with the path's, and retried
-/// until the two agree — the usual protocol for locking a file that is
-/// updated by rename. A missing file has nothing to lock; the write that
-/// creates it goes ahead unlocked.
-#[cfg(unix)]
-fn with_lock<T>(path: &Path, f: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::MetadataExt;
-
-    loop {
-        let file = match std::fs::File::open(path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return f(),
-            Err(e) => return Err(e),
-        };
-        // SAFETY: a plain syscall on a descriptor that outlives the call.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let locked = file.metadata()?;
-        match std::fs::metadata(path) {
-            Ok(now) if now.dev() == locked.dev() && now.ino() == locked.ino() => return f(),
-            Ok(_) => continue,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return f(),
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// On Windows the lock is on a file of its own next to the hosts file,
-/// `.<name>.wireserve-lock`, which is never renamed over, so there is no
-/// retry dance. It lives in `drivers\etc`, where only administrators can
-/// create files, so no one else can hold it. Released by the kernel when
-/// the handle closes, the holder dying included. The file stays behind,
-/// empty: removing it would race the next writer opening it.
-#[cfg(windows)]
-fn with_lock<T>(path: &Path, f: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
-    let name = path
-        .file_name()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name"))?;
-    let mut lock_name = std::ffi::OsString::from(".");
-    lock_name.push(name);
-    lock_name.push(".wireserve-lock");
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path.with_file_name(lock_name))?;
-    lock.lock()?;
-    f()
 }
 
 /// Reads the current hosts file. A missing file is treated as empty (the
@@ -228,12 +168,12 @@ fn read_existing(path: &Path) -> std::io::Result<String> {
 /// implementation was only doing the first two). A no-op if the markers
 /// aren't present.
 pub fn remove_block(path: &Path, label: Option<&str>) -> std::io::Result<()> {
-    with_lock(path, || {
+    crate::platform::fs::lock_for_update(path, || {
         let existing = read_existing(path)?;
         let Some(stripped) = strip_managed_block(&existing, label) else {
             return Ok(());
         };
-        write_preserving_mode(path, &stripped)
+        crate::platform::fs::replace_keeping_mode(path, &stripped)
     })
 }
 
@@ -258,25 +198,6 @@ fn strip_managed_block(contents: &str, label: Option<&str>) -> Option<String> {
     }
     out.push_str(after);
     Some(out)
-}
-
-#[cfg(windows)]
-fn write_preserving_mode(path: &Path, contents: &str) -> std::io::Result<()> {
-    // No mode to preserve: the new file takes the `etc` directory's ACL,
-    // which is what the hosts file it replaces had.
-    atomic_write(path, contents.as_bytes(), 0o644)
-}
-
-#[cfg(unix)]
-fn write_preserving_mode(path: &Path, contents: &str) -> std::io::Result<()> {
-    let mode = std::fs::metadata(path)
-        .map(|m| {
-            use std::os::unix::fs::PermissionsExt;
-            m.permissions().mode() & 0o777
-        })
-        .unwrap_or(0o644);
-
-    atomic_write(path, contents.as_bytes(), mode)
 }
 
 #[cfg(test)]

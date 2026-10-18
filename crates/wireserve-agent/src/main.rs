@@ -7,7 +7,7 @@ use wireserve_agent::ipc::{client, protocol::IpcRequest, AgentContext};
 use wireserve_agent::state::AgentState;
 use wireserve_agent::firewall::InteropHandle;
 use wireserve_agent::paths::{self, Instance};
-use wireserve_agent::{firewall, ifname, lock, poll_loop, register, wg::WgInterface};
+use wireserve_agent::{firewall, ifname, lock, platform, poll_loop, register, wg::WgInterface};
 use wireserve_types::{FirewallBackend, PortMap};
 
 #[derive(Parser)]
@@ -123,8 +123,7 @@ enum Command {
         // refuses to start.
         #[arg(long, value_parser = parse_ifname_flag)]
         ifname: Option<ifname::Flag>,
-        /// Run under the Service Control Manager (`install` sets this up)
-        #[cfg(windows)]
+        /// Run under the service manager: the Service Control Manager on Windows (`install` sets this up)
         #[arg(long, hide = true)]
         service: bool,
     },
@@ -175,8 +174,7 @@ enum Command {
         // address's 443 and 80 (PLAN.md M50).
         #[arg(long, env = "WIRESERVE_TLS_PORT", default_value_t = wireserve_types::TLS_LISTEN_PORT, hide = true)]
         port: u16,
-        /// Run under the Service Control Manager (`install` sets this up)
-        #[cfg(windows)]
+        /// Run under the service manager: the Service Control Manager on Windows (`install` sets this up)
         #[arg(long, hide = true)]
         service: bool,
     },
@@ -272,47 +270,15 @@ fn init_logging() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-/// The service's logging: appended to `path`, in the private state
-/// directory. A log past 10 MiB at start is kept as `agent.log.old`, the
-/// one before that dropped. `private_dir` makes the directory private
-/// first, as the agent's own; the terminator's is `install`'s to set up,
-/// which the terminator's account could not.
-#[cfg(windows)]
-fn init_file_logging(path: &std::path::Path, private_dir: bool) -> std::io::Result<()> {
-    use tracing_subscriber::EnvFilter;
-    const KEEP: u64 = 10 * 1024 * 1024;
-    if let Some(dir) = path.parent().filter(|_| private_dir) {
-        wireserve_agent::winsec::ensure_private_dir(dir)?;
-    }
-    if std::fs::metadata(path).is_ok_and(|m| m.len() > KEEP) {
-        let _ = std::fs::rename(path, path.with_extension("log.old"));
-    }
-    let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(std::sync::Mutex::new(file)).init();
-    Ok(())
-}
-
 /// `daemon --service` or `tls-daemon --service`: the agent or its TLS
-/// terminator, under the Service Control Manager. The process's exit code;
-/// the service's own, which decides whether it is restarted, is the
-/// daemon's (see `winservice`).
-#[cfg(windows)]
+/// terminator, under the platform's service manager (see
+/// `platform::service::run`). The process's exit code.
 fn run_service(cli: Cli) -> i32 {
-    use wireserve_agent::winservice;
     let instance = cli.instance;
     let tls = matches!(cli.command, Command::TlsDaemon { .. });
-    let (name, log) = if tls {
-        (winservice::tls_service_name(&instance), instance.tls_log_path())
-    } else {
-        (winservice::service_name(&instance), instance.log_path())
-    };
-    if let Err(e) = init_file_logging(&log, !tls) {
-        eprintln!("error: could not open the log {}: {e}", log.display());
-        return 1;
-    }
     let command = std::sync::Mutex::new(Some(cli.command));
-    let dispatched = winservice::dispatch(&name, move || {
+    let runs = instance.clone();
+    wireserve_agent::platform::service::run(&instance, tls, move || {
         let runtime = match tokio::runtime::Runtime::new() {
             Ok(r) => r,
             Err(e) => {
@@ -322,10 +288,10 @@ fn run_service(cli: Cli) -> i32 {
         };
         let result = match command.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
             Some(Command::Daemon { poll_interval_secs, ifname, .. }) => {
-                runtime.block_on(cmd_daemon(&instance, poll_interval_secs, ifname))
+                runtime.block_on(cmd_daemon(&runs, poll_interval_secs, ifname))
             }
             Some(Command::TlsDaemon { state_dir, acme_ca_file, check_in_secs, port, .. }) => {
-                runtime.block_on(cmd_tls_daemon(&instance, state_dir, acme_ca_file, check_in_secs, port))
+                runtime.block_on(cmd_tls_daemon(&runs, state_dir, acme_ca_file, check_in_secs, port))
             }
             _ => Err("only `daemon --service` and `tls-daemon --service` run as a service".into()),
         };
@@ -336,16 +302,7 @@ fn run_service(cli: Cli) -> i32 {
                 1
             }
         }
-    });
-    match dispatched {
-        Ok(()) => 0,
-        Err(e) => {
-            let msg = format!("`daemon --service` runs only as the {name} service, which `wireserve install` sets up ({e})");
-            tracing::error!("{msg}");
-            eprintln!("error: {msg}");
-            1
-        }
-    }
+    })
 }
 
 fn parse_ifname_flag(s: &str) -> Result<ifname::Flag, wireserve_agent::wg::InvalidIfname> {
@@ -364,7 +321,6 @@ fn main() {
     let cli = Cli::parse();
     // A service hands the process to the Service Control Manager before
     // anything else, and logs to a file: it has no console.
-    #[cfg(windows)]
     if matches!(&cli.command, Command::Daemon { service: true, .. } | Command::TlsDaemon { service: true, .. }) {
         std::process::exit(run_service(cli));
     }
@@ -410,11 +366,7 @@ async fn cmd_tls_daemon(
     check_in_secs: u64,
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // systemd may list several colon-separated state directories; the unit
-    // names exactly one. A Windows path has a colon of its own.
-    #[cfg(unix)]
-    let state_dir = state_dir.and_then(|d| d.to_str().and_then(|s| s.split(':').next()).map(std::path::PathBuf::from));
-    let state_dir = state_dir.unwrap_or_else(|| instance.tls_state_dir());
+    let state_dir = wireserve_agent::platform::paths::named_state_dir(state_dir).unwrap_or_else(|| instance.tls_state_dir());
     let run = wireserve_tls::run(wireserve_tls::Options {
         socket: instance.tls_socket_path(),
         state_dir,
@@ -422,12 +374,11 @@ async fn cmd_tls_daemon(
         check_in_every: Duration::from_secs(check_in_secs.max(1)),
         port,
     });
-    // The service's stop, as SIGTERM is under systemd.
-    #[cfg(windows)]
+    // The service's stop on Windows; under systemd, SIGTERM as it is.
     let run = async {
         tokio::select! {
             result = run => result,
-            () = wireserve_agent::winservice::stop_requested() => Ok(()),
+            () = wireserve_agent::platform::service::stop_requested() => Ok(()),
         }
     };
     run.await.map_err(Into::into)
@@ -476,267 +427,21 @@ async fn cmd_join(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn std
     Ok(())
 }
 
-/// Installs the binary and this instance's systemd unit, then joins via
-/// exactly the same `cmd_join` a plain `wireserve join` runs — the
+/// `install`: the platform's (`platform::unix::install::run`, systemd;
+/// `platform::windows::install::run`, the Service Control Manager), joining
+/// through exactly the same `cmd_join` a plain `wireserve join` runs — the
 /// token prompt and every other bit of that behaviour lives in one place.
-/// Order: root/platform check, then the two installs (both idempotent),
-/// `daemon-reload`, the join itself, then `enable --now`. A failure at
-/// any step after the installs leaves them in place, so re-running
-/// `install` picks up where it left off.
-///
-/// On a node that has already joined, with no URL or token given, it is an
-/// upgrade instead: same installs, no join, every running agent restarted.
-#[cfg(unix)]
 async fn cmd_install(instance: &Instance, args: InstallArgs) -> Result<(), Box<dyn std::error::Error>> {
     let InstallArgs { join: args, tls_port } = args;
-    // Refused before anything is installed, not after.
-    if let Some(url) = &args.coordinator_url {
-        register::check_coordinator_transport(url, args.allow_plaintext_http)?;
-    }
-    wireserve_agent::install::require_root()?;
-    // A corrupt state file is an error here, not "not registered yet": that
-    // would go on to ask for a token and replace an identity.
-    let registered = AgentState::load(&instance.state_path())?.bearer_token.is_some();
-    let join_args_given =
-        args.coordinator_url.is_some() || args.join_token.is_some() || args.join_token_file.is_some();
-    let upgrade = wireserve_agent::install::is_upgrade(registered, join_args_given);
-    wireserve_agent::install::install_self()?;
-    // Before the daemon starts: it looks the group up once, when it binds.
-    let group = wireserve_agent::install::ensure_socket_group()?;
-    // The TLS terminator (PLAN.md M33): its user before the daemon binds
-    // the socket it hands to that user's group.
-    wireserve_agent::install::ensure_tls_user()?;
-    let unit = wireserve_agent::install::install_unit(instance)?;
-    let tls = wireserve_agent::install::install_tls_units(instance, tls_port)?;
-    if upgrade {
-        wireserve_agent::install::refresh_other_unit(instance)?;
-    }
-    wireserve_agent::install::systemctl_daemon_reload()?;
-    if upgrade {
-        // Every running agent, not only this instance's: they share the
-        // binary that was just replaced. Restarting is safe by design — the
-        // firewall is torn down and re-applied deny-first on every start.
-        let mut restarted = wireserve_agent::install::active_agent_units()?;
-        if !restarted.contains(&format!("{unit}.service")) {
-            wireserve_agent::install::systemctl_enable_now(&unit)?;
-        }
-        for running in &restarted {
-            wireserve_agent::install::systemctl_restart(running)?;
-        }
-        restarted.sort();
-        println!("upgraded; restarted: {}", if restarted.is_empty() { "nothing was running".to_string() } else { restarted.join(", ") });
-    } else {
-        cmd_join(instance, args).await?;
-        wireserve_agent::install::systemctl_enable_now(&unit)?;
-    }
-    // Started with the agent from now on (`WantedBy=`), and stopped and
-    // restarted with it (`PartOf=`). A node with nothing to serve over TLS
-    // runs it idle: it checks in and waits.
-    // Its socket from boot on, whatever the terminator does (PLAN.md M35).
-    wireserve_agent::install::start_tls(&tls)?;
-    let instance_flag = if instance.is_default() { String::new() } else { format!(" --instance {}", instance.name()) };
-    println!();
-    println!("{unit} is running — `wireserve{instance_flag} status` shows its services and peers");
-    if let Some(note) = &tls.note {
-        println!("{note}");
-    }
-    if let Some(group) = group {
-        // The user who ran sudo, not root: root needs no group.
-        let who = std::env::var("SUDO_USER").ok().filter(|u| !u.is_empty() && u != "root");
-        println!();
-        println!("To use it without sudo, join the `{group}` group and log in again:");
-        println!("  sudo usermod -aG {group} {}", who.as_deref().unwrap_or("$USER"));
-        if !upgrade {
-            println!("If {unit} was already running, `sudo systemctl restart {unit}` makes it share its socket with that group.");
-        }
-    }
-    Ok(())
-}
-
-/// `install` on Windows: the files into `%ProgramFiles%\wireserve`, the
-/// instance's service (see `winservice`), a join unless this is an
-/// upgrade, and the service started. Every running agent service is
-/// stopped while the binary it runs is replaced, and started again after.
-#[cfg(windows)]
-async fn cmd_install(instance: &Instance, args: InstallArgs) -> Result<(), Box<dyn std::error::Error>> {
-    use wireserve_agent::winservice;
-    let InstallArgs { join: args, tls_port } = args;
-    if tls_port.is_some() {
-        return Err("--tls-port: on Windows the TLS terminator listens on each service's own 443 and 80".into());
-    }
-    if let Some(url) = &args.coordinator_url {
-        register::check_coordinator_transport(url, args.allow_plaintext_http)?;
-    }
-    if !wireserve_agent::winsec::is_elevated()? {
-        return Err("`install` needs an elevated terminal: open it with \"Run as administrator\"".into());
-    }
-    // As on Linux (`install::is_upgrade`): an identity, and nothing given
-    // to join with, is an upgrade.
-    let registered = AgentState::load(&instance.state_path())?.bearer_token.is_some();
-    let join_args_given =
-        args.coordinator_url.is_some() || args.join_token.is_some() || args.join_token_file.is_some();
-    let upgrade = registered && !join_args_given;
-
-    // Terminators first: each checks in with its agent.
-    let instances = paths::all_instances();
-    let mut running_tls = Vec::new();
-    for other in &instances {
-        if winservice::stop_and_wait(&winservice::tls_service_name(other))? {
-            running_tls.push(other.clone());
-        }
-    }
-    let running = winservice::running_instances(instances)?;
-    for other in &running {
-        winservice::stop_and_wait(&winservice::service_name(other))?;
-    }
-    // Whatever fails from here on, what was running runs again, on whichever
-    // files are in place: a failed upgrade must not leave the node offline.
-    let installed = install_and_start(instance, args, upgrade, &running, &running_tls).await;
-    if let Err(e) = &installed {
-        let mut restarted = Vec::new();
-        for other in &running {
-            if winservice::start(&winservice::service_name(other), &other.log_path()).is_ok() {
-                restarted.push(winservice::service_name(other));
-            }
-        }
-        for other in &running_tls {
-            if winservice::start(&winservice::tls_service_name(other), &other.tls_log_path()).is_ok() {
-                restarted.push(winservice::tls_service_name(other));
-            }
-        }
-        if !restarted.is_empty() {
-            return Err(format!("{e} (started again what was running: {})", restarted.join(", ")).into());
-        }
-    }
-    let (exe, name, tls_name, group, on_path) = installed?;
-    let dir = exe.parent().ok_or("the installed wireserve.exe has no folder")?;
-    let instance_flag = if instance.is_default() { String::new() } else { format!(" --instance {}", instance.name()) };
-    println!();
-    if upgrade {
-        println!("upgraded; {name} is running again");
-    } else {
-        println!("{name} is running");
-    }
-    let command = if on_path { "wireserve".to_string() } else { format!("& \"{}\"", exe.display()) };
-    println!("From an elevated terminal, `{command}{instance_flag} status` shows its peers.");
-    if on_path {
-        println!("({} is on the system Path now; a terminal opened before this one does not see it yet.)", dir.display());
-    }
-    println!("Its log: {}; its TLS terminator's, {tls_name}: {}", instance.log_path().display(), instance.tls_log_path().display());
-    if let Some(group) = group {
-        // Who this terminal runs as: the one to add, unless the elevation
-        // prompt took another administrator's password. Every service was
-        // (re)started above, after the group existed: no restart to suggest.
-        let who = std::env::var("USERNAME").ok().filter(|u| !u.is_empty());
-        println!();
-        println!("To use it without an elevated terminal, join the `{group}` group and sign out and in again:");
-        println!("  net localgroup {group} {} /add", who.as_deref().unwrap_or("<user>"));
-    }
-    Ok(())
-}
-
-/// The part of a Windows `install` after every service is stopped: the
-/// files, the group, the `Path`, both services, the join, and starting
-/// what should run. The installed executable, the two services' names,
-/// the group and whether the `Path` has the folder.
-#[cfg(windows)]
-#[allow(clippy::type_complexity)]
-async fn install_and_start(
-    instance: &Instance,
-    args: JoinArgs,
-    upgrade: bool,
-    running: &[Instance],
-    running_tls: &[Instance],
-) -> Result<(std::path::PathBuf, String, String, Option<String>, bool), Box<dyn std::error::Error>> {
-    use wireserve_agent::winservice;
-    let exe = install_files()?;
-    // Before the service starts: it looks the group up once, when it
-    // creates its pipe.
-    let group = match wireserve_agent::ipc::server::socket_group_name() {
-        Some(group) => {
-            wireserve_agent::winsec::ensure_local_group(&group, "May use the wireserve agent without elevation")?;
-            Some(group)
-        }
-        None => None,
+    let request = wireserve_agent::platform::install::Request {
+        coordinator_url: args.coordinator_url.clone(),
+        allow_plaintext_http: args.allow_plaintext_http,
+        join_args_given: args.coordinator_url.is_some() || args.join_token.is_some() || args.join_token_file.is_some(),
+        tls_port,
     };
-    let dir = exe.parent().ok_or("the installed wireserve.exe has no folder")?.to_path_buf();
-    let on_path = match wireserve_agent::winpath::add_to_system_path(&dir) {
-        Ok(_) => true,
-        // Only a convenience: the full path still works.
-        Err(e) => {
-            eprintln!("warning: could not add {} to the system Path: {e}", dir.display());
-            false
-        }
-    };
-    let name = winservice::service_name(instance);
-    winservice::install(&name, instance, &exe)?;
-    // The TLS terminator (PLAN.md M50), under an account of its own whose
-    // state directory only it and administrators may read. Before the
-    // agent starts: the agent looks its account up once, at start.
-    let tls_name = winservice::tls_service_name(instance);
-    winservice::install_tls(&tls_name, instance, &exe)?;
-    let tls_account = wireserve_agent::winsec::service_sid(&tls_name)?
-        .ok_or_else(|| format!("the {tls_name} service was created, but Windows knows no account NT SERVICE\\{tls_name}"))?;
-    wireserve_agent::winsec::ensure_private_dir_for(&instance.tls_state_dir(), &tls_account)?;
-    if !upgrade {
-        cmd_join(instance, args).await?;
-    }
-    winservice::start(&name, &instance.log_path())?;
-    winservice::start(&tls_name, &instance.tls_log_path())?;
-    for other in running.iter().filter(|i| *i != instance) {
-        winservice::start(&winservice::service_name(other), &other.log_path())?;
-    }
-    for other in running_tls.iter().filter(|i| *i != instance) {
-        winservice::start(&winservice::tls_service_name(other), &other.tls_log_path())?;
-    }
-    Ok((exe, name, tls_name, group, on_path))
+    wireserve_agent::platform::install::run(instance, request, || cmd_join(instance, args)).await
 }
 
-/// Copies this executable and the `wireguard.dll` beside it into
-/// `%ProgramFiles%\wireserve`, where only administrators can change them —
-/// the service runs them as LocalSystem. Returns the installed executable.
-#[cfg(windows)]
-fn install_files() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    let program_files = std::env::var_os("ProgramFiles").unwrap_or_else(|| r"C:\Program Files".into());
-    let dir = std::path::PathBuf::from(program_files).join("wireserve");
-    let current = std::env::current_exe()?.canonicalize()?;
-    let dll = current.with_file_name("wireguard.dll");
-    if !dll.is_file() {
-        return Err(format!(
-            "wireguard.dll must be next to {} (both come in the release zip)",
-            current.display()
-        )
-        .into());
-    }
-    std::fs::create_dir_all(&dir)?;
-    for (from, file) in [(&current, "wireserve.exe"), (&dll, "wireguard.dll")] {
-        let to = dir.join(file);
-        if to.canonicalize().is_ok_and(|t| t == *from) {
-            continue;
-        }
-        // The same file already (the DLL, most upgrades): nothing to replace,
-        // and nothing to wait for a process to let go of.
-        if std::fs::read(&to).is_ok_and(|have| std::fs::read(from).is_ok_and(|want| want == have)) {
-            continue;
-        }
-        // Copied beside, then renamed over: never a half-written file where
-        // the service looks for it.
-        let tmp = dir.join(format!(".{file}.tmp"));
-        std::fs::copy(from, &tmp).map_err(|e| format!("could not copy {} to {}: {e}", from.display(), dir.display()))?;
-        // A stopped service's process may still be exiting, and holding the
-        // file, for a moment after the service reports stopped.
-        let mut tries = 0;
-        while let Err(e) = std::fs::rename(&tmp, &to) {
-            tries += 1;
-            if tries == 20 {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(format!("could not replace {}: {e}", to.display()).into());
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
-    }
-    Ok(dir.join("wireserve.exe"))
-}
 
 /// Whether stdin is an interactive terminal — the gate for every prompt
 /// `join` can make. A script or CI invocation (stdin redirected from a
@@ -923,18 +628,7 @@ async fn cmd_daemon(
         }
     };
 
-    #[cfg(target_os = "linux")]
-    let mut fw = firewall::nftables::NftablesBackend::new(ifname.clone())?
-        .with_carry(carry.clone())
-        .with_own(&[ip4.into(), ip6.into()]);
-    // Who the terminator's holes are for (PLAN.md M50): its service's own
-    // account, which exists once `install` made the service.
-    #[cfg(windows)]
-    let terminator = wireserve_agent::winsec::service_sid(&wireserve_agent::winservice::tls_service_name(instance))?;
-    #[cfg(windows)]
-    let mut fw = firewall::wfp::WfpBackend::new(&ifname, &[ip4.into(), ip6.into()], terminator.as_deref())?;
-    #[cfg(not(any(target_os = "linux", windows)))]
-    let mut fw = NoopFirewall;
+    let mut fw = platform::firewall::backend(&ifname, carry.clone(), &[ip4.into(), ip6.into()], instance)?;
 
     // Spec §5: teardown-then-deny-all must run before the first successful
     // apply() from a poll response — the interface must never come up
@@ -980,32 +674,25 @@ async fn cmd_daemon(
     tracing::info!(reflexive_addr = ?own_reflexive_addr, dialable = ?own_dialable_v4, "one-shot reflexive-address probe");
 
     // Where the interop restores our own table from, if something else on
-    // the host removes it (see `nftables::SharedRuleset`).
-    #[cfg(target_os = "linux")]
-    let own_table = fw.last_applied();
-    #[cfg(not(target_os = "linux"))]
-    let own_table = ();
+    // the host removes it (see `platform::firewall::OwnTable`).
+    let own_table = platform::firewall::own_table(&fw);
     let mut interop = firewall::guarded_bring_up(
         &mut fw,
         &mut wg,
         |wg| wg.preflight(&private_key).map_err(Into::into),
         || firewall::Interops {
-            #[cfg(target_os = "linux")]
-            carry: carry.as_deref().map(|c| start_interop(c, firewall::ForwardWanted::default(), own_table.clone())),
-            #[cfg(not(target_os = "linux"))]
-            carry: carry.as_deref().map(|c| start_interop(c, firewall::ForwardWanted::default(), ())),
-            main: start_interop(&ifname, firewall::ForwardWanted::of(&state), own_table),
+            carry: carry
+                .as_deref()
+                .map(|c| platform::firewall::start_interop(c, firewall::ForwardWanted::default(), own_table.clone())),
+            main: platform::firewall::start_interop(&ifname, firewall::ForwardWanted::of(&state), own_table),
         },
         |wg| {
             wg.bring_up(&private_key, ip4, ip6, listen_port)
                 .map_err(Into::<Box<dyn std::error::Error>>::into)
         },
     )?;
-    // The adapter exists now: its own blocks join the mesh addresses'
-    // (see `firewall::wfp`). Failing here leaves the address blocks only,
-    // which is not enough to run on.
-    #[cfg(windows)]
-    fw.refresh()?;
+    // The interface exists now (see `platform::firewall::after_bring_up`).
+    platform::firewall::after_bring_up(&mut fw)?;
     if carry.is_some() {
         match wg.bring_up_carry(&private_key, ip4, ip6, state.carry_port) {
             Ok(port) => {
@@ -1029,7 +716,6 @@ async fn cmd_daemon(
     // A crashed run leaves its terminator's local routes behind (PLAN.md
     // M33): the kernel keeps them, and nothing else records them. Swept
     // before the first poll, which adds back whatever is still wanted.
-    #[cfg(target_os = "linux")]
     sweep_local_routes(&mut state, &state_path);
 
     let shared_state = Arc::new(Mutex::new(state));
@@ -1050,13 +736,8 @@ async fn cmd_daemon(
             client: client.clone(),
         };
         let path = instance.tls_socket_path();
-        #[cfg(unix)]
-        let serving = async move { wireserve_agent::ipc::tls::serve(ctx, &path).await };
-        #[cfg(windows)]
-        let serving = {
-            let terminator = terminator.clone();
-            async move { wireserve_agent::ipc::tls::serve(ctx, &path, terminator).await }
-        };
+        let terminator = wireserve_agent::platform::ipc::terminator(instance);
+        let serving = async move { wireserve_agent::ipc::tls::serve(ctx, &path, terminator).await };
         tokio::spawn(async move {
             if let Err(e) = serving.await {
                 tracing::error!(error = %e, "TLS terminator socket exited");
@@ -1130,21 +811,11 @@ async fn cmd_daemon(
     // leave a live-looking interface sitting on the host. The next `daemon`
     // start rejoins the mesh with the same identity, without needing
     // `join` again.
-    #[cfg(unix)]
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut shutdown = wireserve_agent::platform::service::Shutdown::listen()?;
 
     loop {
         tokio::select! {
-            _ = async {
-                #[cfg(unix)]
-                tokio::select! { _ = sigterm.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
-                // A failure to listen for Ctrl-C must not read as Ctrl-C.
-                #[cfg(windows)]
-                tokio::select! {
-                    () = async { if tokio::signal::ctrl_c().await.is_err() { std::future::pending::<()>().await } } => {}
-                    () = wireserve_agent::winservice::stop_requested() => {}
-                }
-            } => {
+            () = shutdown.requested() => {
                 tracing::info!("termination signal received — tearing down");
                 teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, instance.hosts_label(), &socket_path, &shared_state, &state_path, false).await;
                 break;
@@ -1287,26 +958,16 @@ async fn cmd_daemon(
     Ok(())
 }
 
-/// Removes the terminator's local routes (PLAN.md M33) a previous run left
-/// behind: the ones recorded in the state file, plus any carrying our
-/// protocol number inside this instance's own mesh range — a run that
-/// crashed between adding a route and saving the state file recorded
-/// nothing. Another instance's routes lie in its own range and are left.
-#[cfg(target_os = "linux")]
+/// Removes the service addresses (PLAN.md M33, M50) a previous run left
+/// the host holding (see `platform::host_addresses::left_behind`).
 fn sweep_local_routes(state: &mut AgentState, state_path: &std::path::Path) {
     let range = state.mesh.as_ref().and_then(wireserve_types::MeshRanges::parse);
-    let mut stale: Vec<std::net::Ipv4Addr> = state.local_routes.clone();
-    match wireserve_agent::routes::own_local_routes() {
-        Ok(found) => stale.extend(found.into_iter().filter(|a| range.as_ref().is_some_and(|r| r.contains4(*a)))),
-        Err(e) => tracing::warn!(error = %e, "could not list local routes to sweep"),
-    }
-    stale.sort_unstable();
-    stale.dedup();
+    let stale = platform::host_addresses::left_behind(&state.local_routes, range.as_ref());
     if stale.is_empty() {
         return;
     }
     tracing::info!(routes = ?stale, "removing local routes a previous run left behind");
-    let _ = wireserve_agent::routes::remove_local(&stale);
+    platform::host_addresses::remove(&stale);
     state.local_routes.clear();
     if let Err(e) = state.save(state_path) {
         tracing::warn!(error = %e, "failed to record the swept local routes");
@@ -1325,53 +986,13 @@ fn remove_leftover_interfaces(chosen: &str, previous: Option<&str>, private_key:
             continue;
         };
         tracing::info!(ifname = %name, "removing this node's own interface left behind under another name");
-        #[cfg(target_os = "linux")]
-        {
-            firewall::host_interop::remove_for(&name);
-            match firewall::nftables::NftablesBackend::new(name.clone()) {
-                Ok(mut fw) => {
-                    if let Err(e) = fw.teardown() {
-                        tracing::warn!(ifname = %name, error = %e, "could not remove its firewall table");
-                    }
-                }
-                Err(e) => tracing::warn!(ifname = %name, error = %e, "could not remove its firewall table"),
-            }
-        }
+        platform::firewall::remove_leftover(&name);
         match WgInterface::new(&name).map(|mut wg| wg.teardown()) {
             Ok(Ok(())) => {}
             Ok(Err(e)) | Err(e) => tracing::warn!(ifname = %name, error = %e, "could not remove it"),
         }
-        #[cfg(not(windows))]
-        remove_leftover_carry(&name, private_key);
+        platform::firewall::remove_leftover_carry(&name, private_key);
         drop(claim);
-    }
-}
-
-/// Removes the carry interface (PLAN.md M39) that went with the mesh
-/// interface `main`, if it is this node's own, with its firewall.
-#[cfg(not(windows))]
-fn remove_leftover_carry(main: &str, private_key: &str) {
-    let name = wireserve_agent::wg::carry_ifname(main);
-    let Ok(carry) = WgInterface::new(&name) else {
-        return;
-    };
-    if carry.classify(private_key) != wireserve_agent::wg::Slot::Ours {
-        return;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        firewall::host_interop::remove_for(&name);
-        // The mesh interface's table is gone already; removing it again is
-        // a no-op, and this is the one call that knows both.
-        if let Ok(fw) = firewall::nftables::NftablesBackend::new(main.to_string()) {
-            let mut fw = fw.with_carry(Some(name.clone()));
-            if let Err(e) = fw.teardown() {
-                tracing::warn!(ifname = %name, error = %e, "could not remove its firewall table");
-            }
-        }
-    }
-    if let Err(e) = wireserve_agent::routes::delete_link(&name) {
-        tracing::warn!(ifname = %name, error = %e, "could not remove a leftover carry interface");
     }
 }
 
@@ -1421,13 +1042,12 @@ async fn teardown_everything<F: FirewallBackend>(
     if let Err(e) = fw.teardown() {
         tracing::warn!(error = %e, "failed to tear down firewall rules during teardown");
     }
-    // The terminator's service addresses stop being this host's own
-    // (PLAN.md M33) — after the firewall, which marked traffic for them.
-    #[cfg(target_os = "linux")]
+    // The service addresses stop being this host's own (PLAN.md M33, M50)
+    // — after the firewall, which marked traffic for them.
     {
         let mut state = state.lock().await;
         if !state.local_routes.is_empty() {
-            let _ = wireserve_agent::routes::remove_local(&state.local_routes);
+            platform::host_addresses::remove(&state.local_routes);
             state.local_routes.clear();
             if let Err(e) = state.save(state_path) {
                 tracing::warn!(error = %e, "failed to record removed local routes during teardown");
@@ -1620,14 +1240,9 @@ async fn cmd_status(instance: &Instance, json: bool) -> Result<(), Box<dyn std::
 
 async fn cmd_leave(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
     let resp = client::call(&instance.socket_path(), &IpcRequest::Leave).await?;
-    // On Windows the service goes too: started at boot with no identity to
-    // run on, it would fail and be restarted over and over.
-    #[cfg(windows)]
+    // What the platform does after it: Windows removes the services.
     if matches!(resp, wireserve_agent::ipc::IpcResponse::Ok) {
-        use wireserve_agent::winservice;
-        for name in [winservice::tls_service_name(instance), winservice::service_name(instance)] {
-            winservice::delete(&name).map_err(|e| format!("left the mesh, but could not remove the {name} service: {e}"))?;
-        }
+        wireserve_agent::platform::service::after_leave(instance)?;
     }
     print_response(resp);
     Ok(())
@@ -1640,42 +1255,6 @@ fn print_response(resp: wireserve_agent::ipc::IpcResponse) {
         wireserve_agent::ipc::IpcResponse::List(view) => {
             println!("{}", serde_json::to_string_pretty(&view).unwrap_or_default());
         }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn start_interop(
-    ifname: &str,
-    forward_wanted: firewall::ForwardWanted,
-    own_table: firewall::nftables::SharedRuleset,
-) -> firewall::host_interop::HostInterop {
-    firewall::host_interop::HostInterop::start(ifname, forward_wanted, own_table)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn start_interop(_ifname: &str, _forward_wanted: firewall::ForwardWanted, _own_table: ()) -> firewall::NoopInterop {
-    firewall::NoopInterop
-}
-
-/// Used only where there is no firewall backend (neither Linux nor
-/// Windows) — never a supported production configuration, just keeps
-/// `daemon` linkable there.
-#[cfg(not(any(target_os = "linux", windows)))]
-struct NoopFirewall;
-
-#[cfg(not(any(target_os = "linux", windows)))]
-impl FirewallBackend for NoopFirewall {
-    type Error = std::convert::Infallible;
-    fn apply(
-        &mut self,
-        _rules: &[wireserve_types::ServiceRule],
-        _forwarding: &wireserve_types::Forwarding,
-    ) -> Result<(), Self::Error> {
-        tracing::warn!("nftables backend not compiled in — firewall rules are NOT being applied");
-        Ok(())
-    }
-    fn teardown(&mut self) -> Result<(), Self::Error> {
-        Ok(())
     }
 }
 

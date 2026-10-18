@@ -9,8 +9,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(unix)]
-use tokio::net::UnixListener;
 use tokio::sync::{mpsc, Mutex};
 use wireserve_types::ServiceDecl;
 
@@ -164,9 +162,11 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
 /// Whether this node publishes `name` on TCP 80 and its terminator did not
 /// answer that on the last cycle (PLAN.md #328).
 fn unguarded(state: &AgentState, name: &str) -> bool {
-    // On Windows a remapped 80 the terminator does not answer is closed,
-    // not unguarded: nothing rewrites it onto the backend (PLAN.md M50).
-    let reaches_backend = |m: &wireserve_types::PortMap| wireserve_types::is_http_map(m) && (!cfg!(windows) || m.public == m.target);
+    // Where nothing rewrites ports (Windows), a remapped 80 the terminator
+    // does not answer is closed, not unguarded (PLAN.md M50).
+    let reaches_backend = |m: &wireserve_types::PortMap| {
+        wireserve_types::is_http_map(m) && (crate::platform::capabilities::REWRITES_PORTS || m.public == m.target)
+    };
     state.declared_services.iter().any(|d| d.name == name && d.ports.iter().any(reaches_backend))
         && !state.http_answered.contains(name)
 }
@@ -381,21 +381,19 @@ where
     let _ = write_half.write_all(out.as_bytes()).await;
 }
 
-/// Why this platform's daemon refuses `req`, if it does. A Windows node
-/// carries nobody's traffic (PLAN.md M49, #341): no transit or exit — what
-/// turns either off is still accepted, so a state file copied from
-/// elsewhere can be undone. It serves (PLAN.md M50), but nothing there
-/// rewrites one port to another or forwards elsewhere (see
-/// [`unsupported_on_windows`]).
+/// Why this platform's daemon refuses `req`, if it does (see
+/// `platform::capabilities`). Where nodes carry nobody's traffic (Windows,
+/// PLAN.md M49, #341): no transit or exit — what turns either off is still
+/// accepted, so a state file copied from elsewhere can be undone. Where
+/// nothing rewrites one port to another or forwards elsewhere (Windows,
+/// PLAN.md M50), what would need it (see [`unsupported_on_windows`]).
 fn refused_here(req: &IpcRequest) -> Option<String> {
-    if !cfg!(windows) {
-        return None;
-    }
+    use crate::platform::capabilities::{CARRIES_TRAFFIC, REWRITES_PORTS};
     match req {
-        IpcRequest::TransitCapable { enabled: true } | IpcRequest::ExitCapable { enabled: true } => {
+        IpcRequest::TransitCapable { enabled: true } | IpcRequest::ExitCapable { enabled: true } if !CARRIES_TRAFFIC => {
             Some("not supported on Windows: a Windows node carries no one else's traffic".to_string())
         }
-        IpcRequest::Serve { ports, .. } => unsupported_on_windows(ports),
+        IpcRequest::Serve { ports, .. } if !REWRITES_PORTS => unsupported_on_windows(ports),
         _ => None,
     }
 }
@@ -429,10 +427,10 @@ pub const DEFAULT_SOCKET_GROUP: &str = "wireserve";
 /// `wireserve`), if that group exists. Absent means root-only, which is what
 /// every deployment had before the group did, and what a container gets, as
 /// it does not see the host's groups.
-pub fn socket_group() -> Option<(String, u32)> {
+pub fn socket_group() -> Option<(String, crate::platform::ipc::Principal)> {
     let name = socket_group_name()?;
-    let gid = lookup_group(&name)?;
-    Some((name, gid))
+    let who = crate::platform::ipc::group(&name)?;
+    Some((name, who))
 }
 
 /// The configured group's name, whether or not it exists yet; `None` when
@@ -447,202 +445,28 @@ pub fn socket_group_name() -> Option<String> {
 
 /// Whether the group exists on this host.
 pub fn group_exists(name: &str) -> bool {
-    lookup_group(name).is_some()
+    crate::platform::ipc::group(name).is_some()
 }
 
-#[cfg(unix)]
-pub(crate) fn lookup_group(name: &str) -> Option<u32> {
-    let cname = std::ffi::CString::new(name).ok()?;
-    let mut buf = vec![0u8; 4096];
-    loop {
-        let mut grp: libc::group = unsafe { std::mem::zeroed() };
-        let mut out: *mut libc::group = std::ptr::null_mut();
-        let rc = unsafe {
-            libc::getgrnam_r(cname.as_ptr(), &mut grp, buf.as_mut_ptr().cast(), buf.len(), &mut out)
-        };
-        if rc == libc::ERANGE && buf.len() < 1 << 20 {
-            let doubled = buf.len() * 2;
-            buf.resize(doubled, 0);
-            continue;
-        }
-        return if rc == 0 && !out.is_null() { Some(grp.gr_gid) } else { None };
-    }
-}
-
-#[cfg(not(unix))]
-pub(crate) fn lookup_group(_name: &str) -> Option<u32> {
-    None
-}
-
-/// Binds the socket (removing any stale one from a previous run) and
-/// serves connections until the process exits.
-///
-/// With no `group` the socket and its parent directory are root-only
-/// (0600/0700). With one, the same two are handed to that group (0660/0750),
-/// so its members can use `wireserve <service>`/`status`/... without sudo. Modes are
-/// set explicitly rather than left to umask, and the directory is only
-/// opened to the group after the socket is final, so there is no moment
-/// when the group can reach a socket with default permissions.
-#[cfg(unix)]
+/// Opens the IPC endpoint at `socket_path` — a Unix socket, a named pipe
+/// on Windows — and serves connections until the process exits. Who may
+/// connect is the platform's to enforce (see `platform::ipc::Listener`):
+/// root (administrators), plus the `wireserve` group's members when the
+/// group exists.
 pub async fn serve(ctx: AgentContext, socket_path: &Path) -> std::io::Result<()> {
+    use crate::platform::ipc::{Listener, ENDPOINT, PRIVATE};
     let group = socket_group();
+    let mut listener = Listener::bind(socket_path, group.as_ref().map(|(_, who)| who))?;
     match &group {
-        Some((name, _)) => tracing::info!(group = %name, socket = %socket_path.display(), "IPC socket shared with group"),
-        None => tracing::info!(socket = %socket_path.display(), "IPC socket is root-only (no `wireserve` group)"),
+        Some((name, _)) => tracing::info!(group = %name, path = %socket_path.display(), "IPC {ENDPOINT} shared with group"),
+        None => tracing::info!(path = %socket_path.display(), "IPC {ENDPOINT} is {PRIVATE} (no `wireserve` group)"),
     }
-    let listener = bind_socket(socket_path, group.map(|(_, gid)| gid))?;
-
     loop {
-        let (stream, _addr) = listener.accept().await?;
+        let stream = listener.accept().await?;
         let ctx = ctx.clone();
         tokio::spawn(async move {
             handle_connection(&ctx, stream).await;
         });
-    }
-}
-
-#[cfg(unix)]
-pub(crate) fn bind_socket(socket_path: &Path, gid: Option<u32>) -> std::io::Result<UnixListener> {
-    let parent = socket_path.parent();
-    if let Some(parent) = parent {
-        std::fs::create_dir_all(parent)?;
-        set_mode(parent, 0o700)?;
-    }
-    if socket_path.exists() {
-        std::fs::remove_file(socket_path)?;
-    }
-    let listener = UnixListener::bind(socket_path)?;
-    let shared = match gid {
-        None => false,
-        // Sharing is a convenience; failing at it (a hand-written unit
-        // without CAP_CHOWN, say) must leave a working root-only socket,
-        // not a daemon nobody can talk to.
-        Some(gid) => match share_with_group(socket_path, parent, gid) {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!(error = %e, "could not share the IPC socket with the group; it stays root-only");
-                false
-            }
-        },
-    };
-    if !shared {
-        set_mode(socket_path, 0o600)?;
-        if let Some(parent) = parent {
-            set_mode(parent, 0o700)?;
-        }
-    }
-    Ok(listener)
-}
-
-/// The socket first, the directory last: until the directory opens, the
-/// group cannot reach the socket whatever its permissions are.
-#[cfg(unix)]
-fn share_with_group(socket_path: &Path, parent: Option<&Path>, gid: u32) -> std::io::Result<()> {
-    set_group(socket_path, gid)?;
-    set_mode(socket_path, 0o660)?;
-    if let Some(parent) = parent {
-        set_group(parent, gid)?;
-        set_mode(parent, 0o750)?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_group(path: &Path, gid: u32) -> std::io::Result<()> {
-    std::os::unix::fs::chown(path, None, Some(gid))
-}
-
-#[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-}
-
-/// The Windows server: a named pipe at `socket_path` (see
-/// `paths::run_root`), open to SYSTEM and Administrators only — the
-/// counterpart of the root-only socket. An administrator's shell has to be
-/// elevated to use it; unelevated, its token carries Administrators as a
-/// deny-only group. Sharing it with a `wireserve` group, as on Linux, is
-/// not done yet.
-///
-/// The first instance is created with `first_pipe_instance`, so a pipe of
-/// that name someone else created first is an error rather than a server
-/// we'd be talking through. Each accepted client gets the instance it
-/// connected to, and a fresh one takes over listening.
-#[cfg(windows)]
-pub async fn serve(ctx: AgentContext, socket_path: &Path) -> std::io::Result<()> {
-    let group = pipe_group();
-    let sd = crate::winsec::SecurityDescriptor::from_sddl(&pipe_sddl(group.as_ref().map(|(_, sid)| sid.as_str())))?;
-    let create = |first: bool| pipe_instance(socket_path, &sd, first);
-    let mut server = create(true)?;
-    match &group {
-        Some((name, _)) => tracing::info!(group = %name, pipe = %socket_path.display(), "IPC pipe shared with group"),
-        None => tracing::info!(pipe = %socket_path.display(), "IPC pipe is administrators-only (no `wireserve` group)"),
-    }
-    loop {
-        server.connect().await?;
-        let connected = std::mem::replace(&mut server, create(false)?);
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-            handle_connection(&ctx, connected).await;
-        });
-    }
-}
-
-/// One instance of the pipe `name`, local clients only. The first is
-/// created as the first instance of that name, so a pipe someone else made
-/// before the agent started is an error, never one the agent shares.
-#[cfg(windows)]
-pub(crate) fn pipe_instance(
-    name: &Path,
-    sd: &crate::winsec::SecurityDescriptor,
-    first: bool,
-) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
-    let mut sa = sd.attributes();
-    // SAFETY: `sa` and the descriptor it points to outlive the call.
-    unsafe {
-        tokio::net::windows::named_pipe::ServerOptions::new()
-            .first_pipe_instance(first)
-            .reject_remote_clients(true)
-            .create_with_security_attributes_raw(name.as_os_str(), std::ptr::from_mut(&mut sa).cast())
-    }
-}
-
-/// The local group to share the pipe with, and its SID: as on Linux, the
-/// configured name (`socket_group_name`) if the group exists, looked up
-/// once, here. A lookup that fails leaves the pipe administrators-only.
-#[cfg(windows)]
-fn pipe_group() -> Option<(String, String)> {
-    let name = socket_group_name()?;
-    match crate::winsec::local_group_sid(&name) {
-        Ok(sid) => sid.map(|sid| (name, sid)),
-        Err(e) => {
-            tracing::warn!(group = %name, error = %e, "could not look up the group; the IPC pipe stays administrators-only");
-            None
-        }
-    }
-}
-
-/// SYSTEM and Administrators, full access; nothing inherited.
-#[cfg(windows)]
-const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)";
-
-/// What the group (or the TLS terminator's account, `ipc::tls`) may do
-/// with the pipe: read it and write to it, and no more. `GENERIC_WRITE` would include `FILE_CREATE_PIPE_INSTANCE` (the
-/// same bit as `FILE_APPEND_DATA`), with which a member could create
-/// instances of the pipe itself and answer clients, administrators
-/// included, in the daemon's place. The client asks for no more than
-/// this (`client::connect`).
-#[cfg(windows)]
-pub(crate) const GROUP_PIPE_ACCESS: u32 = windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ
-    | windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA;
-
-/// [`PIPE_SDDL`], and the group's access when there is one.
-#[cfg(windows)]
-pub(crate) fn pipe_sddl(group_sid: Option<&str>) -> String {
-    match group_sid {
-        Some(sid) => format!("{PIPE_SDDL}(A;;0x{GROUP_PIPE_ACCESS:x};;;{sid})"),
-        None => PIPE_SDDL.to_string(),
     }
 }
 
@@ -670,63 +494,6 @@ mod tests {
         )
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn the_pipe_grants_the_group_reading_and_writing_only() {
-        use windows_sys::Win32::Storage::FileSystem::FILE_CREATE_PIPE_INSTANCE;
-        assert_eq!(pipe_sddl(None), PIPE_SDDL);
-        // Users, standing in for a local group's SID.
-        let shared = pipe_sddl(Some("S-1-5-32-545"));
-        assert_eq!(shared, "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12008b;;;S-1-5-32-545)");
-        assert_eq!(GROUP_PIPE_ACCESS & FILE_CREATE_PIPE_INSTANCE, 0);
-        crate::winsec::SecurityDescriptor::from_sddl(&shared).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn socket_without_a_group_is_root_only() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("run/agent.sock");
-        let _l = bind_socket(&path, None).unwrap();
-        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&path), 0o600);
-        assert_eq!(mode(path.parent().unwrap()), 0o700);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn socket_with_a_group_is_shared_with_exactly_that_group() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("run/agent.sock");
-        // A group the test process may chown to without privilege.
-        let gid = unsafe { libc::getegid() };
-        let _l = bind_socket(&path, Some(gid)).unwrap();
-        let sock = std::fs::metadata(&path).unwrap();
-        let parent = std::fs::metadata(path.parent().unwrap()).unwrap();
-        assert_eq!(sock.permissions().mode() & 0o777, 0o660);
-        assert_eq!(parent.permissions().mode() & 0o777, 0o750);
-        assert_eq!((sock.gid(), parent.gid()), (gid, gid));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn failing_to_share_leaves_a_root_only_socket_not_an_error() {
-        use std::os::unix::fs::PermissionsExt;
-        // Root may chown to any group, so there is nothing to fail.
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("run/agent.sock");
-        // Group 0 is one an unprivileged test process is not in.
-        let _l = bind_socket(&path, Some(0)).unwrap();
-        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&path), 0o600);
-        assert_eq!(mode(path.parent().unwrap()), 0o700);
-    }
-
     #[test]
     fn a_windows_node_serves_only_what_needs_no_rewrite_and_carries_nothing() {
         let serve = |ports: &[&str]| IpcRequest::Serve {
@@ -736,22 +503,17 @@ mod tests {
             always_sign_in: false,
         };
         assert!(refused_here(&serve(&["22", "53/udp", "80:8080", "443:8443", "80"])).is_none());
-        assert_eq!(refused_here(&serve(&["22", "2222:22"])).is_some(), cfg!(windows));
-        assert_eq!(refused_here(&serve(&["80:8080/udp"])).is_some(), cfg!(windows), "80 over UDP is no web app");
-        assert_eq!(refused_here(&serve(&["8080:192.168.1.1:80"])).is_some(), cfg!(windows));
+        let rewrites = crate::platform::capabilities::REWRITES_PORTS;
+        assert_eq!(refused_here(&serve(&["22", "2222:22"])).is_some(), !rewrites);
+        assert_eq!(refused_here(&serve(&["80:8080/udp"])).is_some(), !rewrites, "80 over UDP is no web app");
+        assert_eq!(refused_here(&serve(&["8080:192.168.1.1:80"])).is_some(), !rewrites);
         assert!(unsupported_on_windows(&["2222:22".parse().unwrap()]).unwrap().contains("`22/tcp`"));
-        assert_eq!(refused_here(&IpcRequest::TransitCapable { enabled: true }).is_some(), cfg!(windows));
-        assert_eq!(refused_here(&IpcRequest::ExitCapable { enabled: true }).is_some(), cfg!(windows));
+        let carries = crate::platform::capabilities::CARRIES_TRAFFIC;
+        assert_eq!(refused_here(&IpcRequest::TransitCapable { enabled: true }).is_some(), !carries);
+        assert_eq!(refused_here(&IpcRequest::ExitCapable { enabled: true }).is_some(), !carries);
         assert!(refused_here(&IpcRequest::TransitCapable { enabled: false }).is_none());
         assert!(refused_here(&IpcRequest::Unserve { name: "web".into() }).is_none());
         assert!(refused_here(&IpcRequest::List).is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_missing_group_means_no_sharing() {
-        assert_eq!(lookup_group("wireserve-no-such-group-xyz"), None);
-        assert_eq!(lookup_group("root"), Some(0));
     }
 
     #[cfg(unix)]

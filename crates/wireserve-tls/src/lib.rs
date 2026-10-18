@@ -24,6 +24,7 @@
 
 pub mod acme;
 pub mod link;
+mod platform;
 pub mod serve;
 pub mod sign_in;
 pub mod store;
@@ -106,11 +107,11 @@ pub async fn run(opts: Options) -> Result<(), Error> {
     let certs = Arc::new(Certs::default());
     let tls = serve::server_config(certs.clone());
     let shared = serve::Shared::default();
-    let (incoming, mut listening, port) = serve::open_tls(opts.port).map_err(|e| Error::Listen(opts.port, e))?;
+    let (incoming, mut listening, port) = platform::open_tls(opts.port).map_err(|e| Error::Listen(opts.port, e))?;
     // Plain HTTP on services' port 80 (PLAN.md #328). Without its socket the
     // agent leaves port 80 to the services themselves, as before.
     let http_wanted = wireserve_types::http_listen_port(port);
-    let http_listener = match serve::open_http(http_wanted) {
+    let http_listener = match platform::open_http(http_wanted) {
         Ok(Some(l)) => Some(l),
         Ok(None) => {
             tracing::warn!("systemd passed no plain-HTTP socket; port 80 is not guarded — `wireserve install` again to add it");

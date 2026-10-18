@@ -422,59 +422,6 @@ pub fn sanitize_access(access: &mut [wireserve_types::ServiceAccess], mesh: Opti
     }
 }
 
-/// The interfaces replies from this cycle's target addresses (PLAN.md M26)
-/// arrive on, as the kernel routes to them now. A target the host delivers
-/// locally needs none; one routed into the mesh interface is refused
-/// earlier (`service_rules`) and never needs forwarding turned on here.
-#[cfg(target_os = "linux")]
-fn egress_interfaces(rules: &[ServiceRule], mesh_ifname: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let targets: BTreeSet<Ipv4Addr> = rules.iter().filter_map(ServiceRule::remote_target).collect();
-    for addr in targets {
-        match crate::routes::egress_ifname(addr) {
-            Ok(Some(name)) if name == mesh_ifname => {
-                tracing::warn!(%addr, "a service's target address is routed into the mesh; not forwarding to it");
-            }
-            Ok(Some(name)) => {
-                out.insert(name);
-            }
-            Ok(None) => {}
-            Err(e) => tracing::warn!(%addr, error = %e, "no route to a service's target address"),
-        }
-    }
-    out
-}
-
-#[cfg(not(target_os = "linux"))]
-fn egress_interfaces(_rules: &[ServiceRule], _mesh_ifname: &str) -> BTreeSet<String> {
-    BTreeSet::new()
-}
-
-/// The interface this host reaches the internet through, for an exit
-/// (PLAN.md M27): where the replies to its clients' traffic arrive. A route
-/// lookup only — nothing is sent to the address. A real global one rather
-/// than a documentation range, which a host may route to a blackhole.
-#[cfg(target_os = "linux")]
-fn internet_egress(mesh_ifname: &str) -> Option<String> {
-    const ANY_GLOBAL: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
-    match crate::routes::egress_ifname(ANY_GLOBAL) {
-        Ok(Some(name)) if name != mesh_ifname => Some(name),
-        Ok(_) => {
-            tracing::warn!("this node's default route leads into the mesh; not acting as an exit");
-            None
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "this node has no route to the internet; not acting as an exit");
-            None
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn internet_egress(_mesh_ifname: &str) -> Option<String> {
-    None
-}
-
 /// The mesh IPv4 addresses of the devices this node is the exit for, from
 /// the pubkeys the coordinator named and the directory's own entries for
 /// them. A pubkey not in the directory is skipped: its address is exactly
@@ -637,48 +584,6 @@ pub struct PollContext<'a, F: FirewallBackend> {
     pub held: &'a mut Option<crate::held::Held>,
 }
 
-/// Moves the terminator's local routes from `old` to `new` (see
-/// `routes::sync_local`), returning what is routed afterwards. A failure is
-/// logged there and never fails the cycle: the route it concerns simply
-/// stays as it was, and the firewall still marks only what the directory
-/// and the terminator agree on.
-#[cfg(target_os = "linux")]
-fn sync_local_routes(old: &BTreeSet<Ipv4Addr>, new: &BTreeSet<Ipv4Addr>, node: Option<Ipv4Addr>, _ifname: &str) -> BTreeSet<Ipv4Addr> {
-    if old == new {
-        return old.clone();
-    }
-    let Some(node) = node else {
-        return old.clone();
-    };
-    crate::routes::sync_local(old, new, node).0
-}
-
-/// Windows (PLAN.md M50): the service addresses, as addresses of the mesh
-/// adapter itself — what the host receives on, nothing rewriting them. Read
-/// back from the adapter every time, not only on a change: one that came
-/// back up has none.
-#[cfg(windows)]
-fn sync_local_routes(old: &BTreeSet<Ipv4Addr>, new: &BTreeSet<Ipv4Addr>, _node: Option<Ipv4Addr>, ifname: &str) -> BTreeSet<Ipv4Addr> {
-    let luid = match crate::winnet::luid_by_alias(ifname) {
-        Ok(Some(luid)) => luid,
-        Ok(None) => return BTreeSet::new(),
-        Err(e) => {
-            tracing::warn!(error = %e, "could not find the mesh adapter to give it its service addresses");
-            return old.clone();
-        }
-    };
-    let (now, result) = crate::winnet::sync_service_addresses(luid, old, new);
-    if let Err(e) = result {
-        tracing::warn!(error = %e, "could not move every service address onto the mesh adapter");
-    }
-    now
-}
-
-#[cfg(not(any(target_os = "linux", windows)))]
-fn sync_local_routes(old: &BTreeSet<Ipv4Addr>, _new: &BTreeSet<Ipv4Addr>, _node: Option<Ipv4Addr>, _ifname: &str) -> BTreeSet<Ipv4Addr> {
-    old.clone()
-}
-
 /// The service addresses the host must receive on itself (PLAN.md M33): on
 /// Linux those its terminator answers, which a rewrite sends to the host's
 /// own sockets; everything else is rewritten onto the node's address. On
@@ -691,7 +596,7 @@ fn host_addresses_wanted(
     node: Option<Ipv4Addr>,
     directory: &PollResponse,
 ) -> BTreeSet<Ipv4Addr> {
-    if cfg!(windows) {
+    if crate::platform::host_addresses::EVERY_SERVICE {
         let Some(node) = node else {
             return BTreeSet::new();
         };
@@ -1066,8 +971,8 @@ where
         //    So is a public relay (PLAN.md M40): IPv4 forwarding is decided on
         //    the interface a packet arrives on, which for a phone's is the
         //    default route's.
-        let mut egress = egress_interfaces(&rules, &ifname);
-        let public_iface = internet_egress(&ifname);
+        let mut egress = crate::platform::forwarding::egress_interfaces(&rules, &ifname);
+        let public_iface = crate::platform::forwarding::internet_egress(&ifname);
         if !exit.is_empty() || !relay_public.is_empty() {
             egress.extend(public_iface.clone());
         }
@@ -1089,7 +994,7 @@ where
         // them, stale ones come out after the ruleset that stopped: a
         // service address is never marked for a terminator it cannot reach,
         // nor routed to the host while the rewrite still expects it not to be.
-        let local_routes = sync_local_routes(
+        let local_routes = crate::platform::host_addresses::sync(
             &local_routes_before,
             &local_routes_before.union(&local_routes_wanted).copied().collect(),
             node_ip,
@@ -1113,7 +1018,7 @@ where
         // the host's forwarding posture is left completely alone. See
         // `ip_forward` module doc for why this is scoped to `ifname` and
         // never the host's global/`all` forwarding switches.
-        let local_routes = sync_local_routes(&local_routes, &local_routes_wanted, node_ip, &ifname);
+        let local_routes = crate::platform::host_addresses::sync(&local_routes, &local_routes_wanted, node_ip, &ifname);
         let forwards_services = rules.iter().any(|r| r.remote_target().is_some());
         crate::firewall::ip_forward::set_enabled(
             &ifname,
@@ -1395,7 +1300,7 @@ mod tests {
             ServiceRule::Mapped { vip: other, node: NODE, map: pm("22"), sources: None },
         ];
         let wanted = host_addresses_wanted(&rules, &declared, Some(NODE), &dir);
-        if cfg!(windows) {
+        if crate::platform::host_addresses::EVERY_SERVICE {
             assert_eq!(wanted, BTreeSet::from([VIP, other]));
             // Before anything is opened: the terminator binds it first.
             assert_eq!(host_addresses_wanted(&[], &declared, Some(NODE), &dir), BTreeSet::from([VIP, other]));

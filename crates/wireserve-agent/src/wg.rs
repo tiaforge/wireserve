@@ -1,5 +1,5 @@
 //! Wraps `defguard_wireguard_rs`'s `WGApi<Kernel>` — on Windows, our own
-//! wireguard-nt binding, [`nt`] — for the agent's own interface: bring-up
+//! wireguard-nt binding, `platform::windows::nt` — for the agent's own interface: bring-up
 //! with this node's own keypair/addresses, and reconciling the kernel peer
 //! set against each poll's `peers` array.
 
@@ -11,18 +11,12 @@ use defguard_wireguard_rs::key::Key;
 use defguard_wireguard_rs::net::IpAddrMask;
 use defguard_wireguard_rs::peer::Peer;
 use defguard_wireguard_rs::InterfaceConfiguration;
-#[cfg(not(windows))]
-use defguard_wireguard_rs::{Kernel, WGApi, WireguardInterfaceApi};
+// The kernel API's methods, where they are a trait's (Linux).
+#[allow(unused_imports)]
+use crate::platform::wg::InterfaceApi as _;
+use crate::platform::wg::Api;
 use wireserve_types::{PeerInfo, RelayEnd, RelayForward, ServiceInfo, TransitPair};
 
-#[cfg(windows)]
-pub mod nt;
-
-/// The kernel WireGuard API: defguard's, or on Windows our own (see [`nt`]).
-#[cfg(not(windows))]
-type Api = WGApi<Kernel>;
-#[cfg(windows)]
-type Api = nt::NtApi;
 
 /// Why `bring_up` can fail before it has touched anything.
 #[derive(Debug, thiserror::Error)]
@@ -89,56 +83,9 @@ pub fn validate_ifname(name: &str) -> Result<(), InvalidIfname> {
     }
 }
 
-/// Every interface other than `except` that has `addr` assigned.
-#[cfg(unix)]
-pub fn interfaces_with_address(addr: IpAddr, except: &str) -> std::io::Result<Vec<String>> {
-    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: getifaddrs fills `head` with a list we free below.
-    if unsafe { libc::getifaddrs(&mut head) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let mut out = Vec::new();
-    let mut cursor = head;
-    while !cursor.is_null() {
-        // SAFETY: every node of the list is valid until freeifaddrs; the
-        // sockaddr is read as the type its family says it is.
-        let ifa = unsafe { &*cursor };
-        cursor = ifa.ifa_next;
-        if ifa.ifa_addr.is_null() {
-            continue;
-        }
-        let found = match i32::from(unsafe { (*ifa.ifa_addr).sa_family }) {
-            libc::AF_INET => {
-                let sin = unsafe { &*ifa.ifa_addr.cast::<libc::sockaddr_in>() };
-                IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)))
-            }
-            libc::AF_INET6 => {
-                let sin6 = unsafe { &*ifa.ifa_addr.cast::<libc::sockaddr_in6>() };
-                IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr))
-            }
-            _ => continue,
-        };
-        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_string_lossy().into_owned();
-        if found == addr && name != except && !out.contains(&name) {
-            out.push(name);
-        }
-    }
-    // SAFETY: `head` came from getifaddrs and is freed exactly once.
-    unsafe { libc::freeifaddrs(head) };
-    Ok(out)
-}
-
-/// Every interface other than `except` that has `addr` assigned.
-#[cfg(windows)]
-pub fn interfaces_with_address(addr: IpAddr, except: &str) -> std::io::Result<Vec<String>> {
-    let mut out: Vec<String> = Vec::new();
-    for a in crate::winnet::host_addresses()? {
-        if a.addr == addr && a.ifname != except && !out.contains(&a.ifname) {
-            out.push(a.ifname);
-        }
-    }
-    Ok(out)
-}
+/// Listing the host's interfaces is the platform's (`getifaddrs`, or the
+/// IP Helper on Windows).
+pub use crate::platform::net::{interfaces_with_address, local_lan_ifaces};
 
 // ---- NAT-hairpin fix: LAN-address candidates (PLAN.md decisions log #85) ----
 
@@ -149,96 +96,6 @@ pub struct LocalLan {
     pub addr: Ipv4Addr,
     pub prefix_len: u8,
 }
-
-/// Interface-name prefixes treated as virtual rather than a real LAN
-/// uplink — a private address on one of these is a container bridge or
-/// VPN overlay, not the home network this feature means to reach.
-/// Judgment call, not exhaustive; worth revisiting if a real deployment's
-/// LAN NIC gets misclassified.
-#[cfg(unix)]
-const VIRTUAL_IFACE_PREFIXES: &[&str] = &[
-    "lo", "docker", "veth", "br-", "virbr", "tun", "tap", "wg", "tailscale", "zt", "cni", "flannel", "podman",
-];
-
-#[cfg(unix)]
-fn looks_virtual(name: &str) -> bool {
-    VIRTUAL_IFACE_PREFIXES.iter().any(|p| name.starts_with(p))
-}
-
-/// This node's own private-range (RFC1918) IPv4 interfaces, in
-/// `getifaddrs` enumeration order, excluding `except` (this node's own
-/// mesh interface — same hygiene `interfaces_with_address` applies) and
-/// anything that `looks_virtual`. IPv4 only: v1 of the NAT-hairpin fix has
-/// no IPv6 LAN candidate — real hairpin is an IPv4 NAT problem. Impure —
-/// the actual syscall; kept separate from the pure functions below so
-/// those stay unit-testable without a live interface, same probe/choice
-/// split as `interfaces_with_address` itself.
-#[cfg(unix)]
-pub fn local_lan_ifaces(except: &str) -> std::io::Result<Vec<LocalLan>> {
-    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: getifaddrs fills `head` with a list we free below.
-    if unsafe { libc::getifaddrs(&mut head) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let mut out = Vec::new();
-    let mut cursor = head;
-    while !cursor.is_null() {
-        // SAFETY: every node of the list is valid until freeifaddrs; the
-        // sockaddr is read as the type its family says it is.
-        let ifa = unsafe { &*cursor };
-        cursor = ifa.ifa_next;
-        if ifa.ifa_addr.is_null() || ifa.ifa_netmask.is_null() {
-            continue;
-        }
-        if i32::from(unsafe { (*ifa.ifa_addr).sa_family }) != libc::AF_INET {
-            continue;
-        }
-        // SAFETY: family checked above.
-        let sin = unsafe { &*ifa.ifa_addr.cast::<libc::sockaddr_in>() };
-        let addr = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-        // SAFETY: ifa_netmask is non-null and shares ifa_addr's family for
-        // an AF_INET entry.
-        let mask_sin = unsafe { &*ifa.ifa_netmask.cast::<libc::sockaddr_in>() };
-        let prefix_len = u32::from_be(mask_sin.sin_addr.s_addr).count_ones() as u8;
-        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_string_lossy().into_owned();
-        if addr.is_private() && name != except && !looks_virtual(&name) {
-            out.push(LocalLan { addr, prefix_len });
-        }
-    }
-    // SAFETY: `head` came from getifaddrs and is freed exactly once.
-    unsafe { libc::freeifaddrs(head) };
-    Ok(out)
-}
-
-/// See the Unix version. Windows names its interfaces "Ethernet", "Wi-Fi",
-/// "vEthernet (WSL)", so the name prefixes say little here; the interface
-/// type and the driver's own description say more.
-#[cfg(windows)]
-pub fn local_lan_ifaces(except: &str) -> std::io::Result<Vec<LocalLan>> {
-    Ok(crate::winnet::host_addresses()?
-        .into_iter()
-        .filter(|a| a.ifname != except && !looks_virtual_windows(a))
-        .filter_map(|a| match a.addr {
-            IpAddr::V4(addr) if addr.is_private() => Some(LocalLan { addr, prefix_len: a.prefix_len }),
-            _ => None,
-        })
-        .collect())
-}
-
-/// Loopback, tunnels (wireguard-nt and Wintun adapters, Tailscale's
-/// among them), and the virtual switches of Hyper-V, WSL and the desktop
-/// hypervisors.
-#[cfg(windows)]
-fn looks_virtual_windows(a: &crate::winnet::HostAddress) -> bool {
-    const IF_TYPE_PROP_VIRTUAL: u32 = 53;
-    const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
-    const IF_TYPE_TUNNEL: u32 = 131;
-    const VIRTUAL_DESCRIPTIONS: &[&str] = &["Hyper-V", "VMware", "VirtualBox", "Virtual Ethernet", "TAP-Windows"];
-    matches!(a.if_type, IF_TYPE_PROP_VIRTUAL | IF_TYPE_SOFTWARE_LOOPBACK | IF_TYPE_TUNNEL)
-        || a.ifname.starts_with("vEthernet")
-        || VIRTUAL_DESCRIPTIONS.iter().any(|d| a.description.contains(d))
-}
-
 /// This node's single "best" LAN address to advertise on `/register` and
 /// `/poll`: the first entry `local_lan_ifaces` found.
 #[must_use]
@@ -1477,48 +1334,13 @@ impl WgInterface {
         &self.ifname
     }
 
-    /// Whether a network interface with this name already exists on the
-    /// host, WireGuard or otherwise. Asked directly rather than inferred
-    /// from a netlink error, because the distinction that matters here
-    /// ("something already owns this name") is not one the WireGuard API
-    /// reports cleanly: `create_interface` deliberately treats `EEXIST` as
-    /// success so that restarts are idempotent.
-    ///
-    /// `if_nametoindex`, not `/sys/class/net`: sysfs shows the network
-    /// namespace of whoever mounted it, which is not ours when the agent is
-    /// started in a namespace without its own sysfs mount (`nsenter`,
-    /// `unshare -n`) — there it would call a name that is taken here free.
-    /// Anything but "no such device" counts as taken: when in doubt, the
-    /// name is not ours to configure.
-    #[cfg(unix)]
-    fn interface_exists(ifname: &str) -> bool {
-        let Ok(name) = std::ffi::CString::new(ifname) else {
-            return true;
-        };
-        // SAFETY: `name` is a valid NUL-terminated string for the call.
-        if unsafe { libc::if_nametoindex(name.as_ptr()) } != 0 {
-            return true;
-        }
-        std::io::Error::last_os_error().raw_os_error() != Some(libc::ENODEV)
-    }
-
-    /// See the Unix version; Windows looks an interface up by its alias.
-    /// One still listed is given the moment its removal takes: this
-    /// agent's own adapter from a run that just ended goes away with that
-    /// run (see [`nt`]). Anything but "no such interface" then counts as
-    /// taken.
-    #[cfg(windows)]
-    fn interface_exists(ifname: &str) -> bool {
-        !nt::gone_within(ifname, nt::REMOVAL_WAIT)
-    }
-
     /// Who has this interface name right now, as far as the host itself
     /// can tell: nobody, this node (a WireGuard device carrying our own
     /// private key — our interface from a previous run), or something
     /// else. Claims by other agents are a separate question
     /// (`crate::lock`).
     pub fn classify(&self, private_key_b64: &str) -> Slot {
-        if !Self::interface_exists(&self.ifname) {
+        if !crate::platform::net::interface_exists(&self.ifname) {
             return Slot::Free;
         }
         match self.api.read_interface_data() {
@@ -1706,7 +1528,7 @@ impl WgInterface {
         //
         // Our own routes, not defguard's `configure_peer_routing`, which
         // also routes every peer *endpoint* via the default gateway — and
-        // blackholes it on a host without one. See `crate::routes`.
+        // blackholes it on a host without one. See `crate::platform::routes`.
         //
         // Only run when the routed set actually changed, to keep it off the
         // steady-state path.
@@ -1725,11 +1547,11 @@ impl WgInterface {
             // resets WireGuard's own endpoint roaming (see above). Both
             // interfaces in one go, so an address changing interface loses
             // its old route before it gets the new one.
-            let mut sets = vec![crate::routes::RouteSet { ifname: &self.ifname, old: &self.routed, new: &routes, prefsrc: None }];
+            let mut sets = vec![crate::platform::routes::RouteSet { ifname: &self.ifname, old: &self.routed, new: &routes, prefsrc: None }];
             if let Some(c) = &self.carry {
-                sets.push(crate::routes::RouteSet { ifname: &c.ifname, old: &c.routed, new: &carry_routes, prefsrc: Some(c.src) });
+                sets.push(crate::platform::routes::RouteSet { ifname: &c.ifname, old: &c.routed, new: &carry_routes, prefsrc: Some(c.src) });
             }
-            match crate::routes::sync_all(&sets) {
+            match crate::platform::routes::sync_all(&sets) {
                 Ok(()) => {
                     self.routed = routes;
                     if let Some(c) = &mut self.carry {
@@ -1744,27 +1566,16 @@ impl WgInterface {
         Ok(())
     }
 
-    /// Deletes the interface, and with it its addresses and routes. Not
-    /// defguard's `remove_interface`; see `routes::delete_link` for why.
-    #[cfg(not(windows))]
+    /// Removes the interface, and with it its addresses and routes (see
+    /// `platform::wg`).
     pub fn teardown(&mut self) -> Result<(), WireguardInterfaceError> {
         // The carry interface first, and whatever happens to it the mesh
         // interface still goes.
-        let carry = self.carry.take().map(|c| crate::routes::delete_link(&c.ifname));
-        crate::routes::delete_link(&self.ifname)?;
+        let carry = self.carry.take().map(|c| crate::platform::wg::release_carry(c.api, &c.ifname));
+        crate::platform::wg::remove_interface(&mut self.api, &self.ifname)?;
         self.applied.clear();
         self.routed.clear();
         carry.transpose()?;
-        Ok(())
-    }
-
-    /// Closes the adapter, which removes it with its addresses and routes
-    /// (see [`nt`]). There is never a carry interface on Windows.
-    #[cfg(windows)]
-    pub fn teardown(&mut self) -> Result<(), WireguardInterfaceError> {
-        self.api.remove_interface();
-        self.applied.clear();
-        self.routed.clear();
         Ok(())
     }
 }
@@ -2954,7 +2765,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn kernel_finds_an_address_on_other_interfaces_only() {
-        if !crate::firewall::netns::reexec("wg::tests::kernel_finds_an_address_on_other_interfaces_only") {
+        if !crate::platform::linux::netns::reexec("wg::tests::kernel_finds_an_address_on_other_interfaces_only") {
             return;
         }
         let out = std::process::Command::new("sh")
@@ -2978,7 +2789,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn kernel_reconcile_routes_peers_and_never_their_endpoints() {
-        if !crate::firewall::netns::reexec("wg::tests::kernel_reconcile_routes_peers_and_never_their_endpoints") {
+        if !crate::platform::linux::netns::reexec("wg::tests::kernel_reconcile_routes_peers_and_never_their_endpoints") {
             return;
         }
         let sh = |script: &str| {
@@ -3030,7 +2841,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn kernel_reconcile_routes_service_addresses() {
-        if !crate::firewall::netns::reexec("wg::tests::kernel_reconcile_routes_service_addresses") {
+        if !crate::platform::linux::netns::reexec("wg::tests::kernel_reconcile_routes_service_addresses") {
             return;
         }
         let sh = |script: &str| {
@@ -3084,7 +2895,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn kernel_a_relayed_peers_probe_handshakes_and_its_roamed_endpoint_survives_the_relay_ending() {
-        if !crate::firewall::netns::reexec(
+        if !crate::platform::linux::netns::reexec(
             "wg::tests::kernel_a_relayed_peers_probe_handshakes_and_its_roamed_endpoint_survives_the_relay_ending",
         ) {
             return;
@@ -3146,7 +2957,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn kernel_a_relayed_peer_moves_to_the_carry_interface_and_back() {
-        if !crate::firewall::netns::reexec("wg::tests::kernel_a_relayed_peer_moves_to_the_carry_interface_and_back") {
+        if !crate::platform::linux::netns::reexec("wg::tests::kernel_a_relayed_peer_moves_to_the_carry_interface_and_back") {
             return;
         }
         let sh = |script: &str| {
@@ -3195,7 +3006,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn kernel_reconcile_configures_the_lan_endpoint_when_resolved() {
-        if !crate::firewall::netns::reexec("wg::tests::kernel_reconcile_configures_the_lan_endpoint_when_resolved") {
+        if !crate::platform::linux::netns::reexec("wg::tests::kernel_reconcile_configures_the_lan_endpoint_when_resolved") {
             return;
         }
         let sh = |script: &str| {
@@ -3233,7 +3044,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn kernel_reconcile_configures_the_reflexive_endpoint_when_resolved() {
-        if !crate::firewall::netns::reexec("wg::tests::kernel_reconcile_configures_the_reflexive_endpoint_when_resolved") {
+        if !crate::platform::linux::netns::reexec("wg::tests::kernel_reconcile_configures_the_reflexive_endpoint_when_resolved") {
             return;
         }
         let sh = |script: &str| {

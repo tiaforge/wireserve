@@ -5390,3 +5390,27 @@ terminator was stopped, its permit still in place, was not reached.
     name between `wireserve0` and `wireserve1` (the old one is still being
     removed, #336), and a 443 that gives way to a plain mapping warns on
     every poll, as on Linux.
+
+350. **Platform code in one place** (2026-10-18). Everything that differs
+    between operating systems lives under `platform/` in the agent
+    (`platform::unix`, `platform::linux`, `platform::windows`, and
+    `fallback` for what a platform has nothing to do about), and under
+    `platform/` in the TLS crate; `platform/mod.rs` is the one place that
+    chooses, naming each module with what it is on every platform. The
+    shared code calls `platform::*` and has no `cfg` of its own, but in
+    tests that check a platform's result (a Unix file mode, a Linux kernel
+    test). What only some platforms can do is asked, not assumed:
+    `platform::capabilities::{REWRITES_PORTS, CARRIES_TRAFFIC}`. Earlier
+    entries' paths, now: `wg/nt.rs` → `platform/windows/nt.rs`,
+    `firewall/wfp.rs` → `platform/windows/wfp.rs`, `winnet` →
+    `platform::windows::net`, `winsec` → `platform::windows::security`,
+    `winservice` → `platform::windows::service`, `winpath` →
+    `platform::windows::system_path`, `routes_windows.rs` →
+    `platform/windows/routes.rs`; `routes.rs`, `firewall/{nft,nftables}.rs`
+    and `firewall/host_interop/` → `platform/linux/`, `install.rs` →
+    `platform/unix/install.rs`. Behaviour unchanged, but the carry
+    interface on Windows is now closed explicitly at teardown (without
+    waiting for it, as the process ending did). The agent builds for Linux
+    and Windows only, as it did: the other-Unix stand-ins are kept, not
+    claimed to work.
+

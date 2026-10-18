@@ -778,8 +778,7 @@ impl Addresses {
         }
         use socket2::{Domain, Protocol, Socket, Type};
         let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
-        #[cfg(windows)]
-        exclusive_address_use(&socket)?;
+        crate::platform::prepare_address_socket(&socket)?;
         socket.bind(&SocketAddr::new(vip.into(), self.port).into())?;
         socket.listen(1024)?;
         socket.set_nonblocking(true)?;
@@ -819,64 +818,6 @@ impl Drop for Addresses {
     }
 }
 
-/// `SO_EXCLUSIVEADDRUSE`: without it, Windows lets another process bind the
-/// same address and port with `SO_REUSEADDR` and take connections from us.
-#[cfg(windows)]
-fn exclusive_address_use(socket: &socket2::Socket) -> std::io::Result<()> {
-    use std::os::windows::io::AsRawSocket;
-    use windows_sys::Win32::Networking::WinSock::{setsockopt, SOCKET_ERROR, SOL_SOCKET, SO_EXCLUSIVEADDRUSE};
-    let on: i32 = 1;
-    // SAFETY: an open socket, and a value of the size given.
-    let rc = unsafe {
-        setsockopt(
-            socket.as_raw_socket() as usize,
-            SOL_SOCKET,
-            SO_EXCLUSIVEADDRUSE,
-            std::ptr::from_ref(&on).cast(),
-            std::mem::size_of::<i32>() as i32,
-        )
-    };
-    if rc == SOCKET_ERROR {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// The TLS connections, the listening that goes with them, and the port
-/// they arrive on: [`listener`] on Linux; each service address's 443 on
-/// Windows, where nothing rewrites it (PLAN.md M50).
-#[cfg(unix)]
-pub fn open_tls(port: u16) -> std::io::Result<(Incoming, Listening, u16)> {
-    let listener = listener(port)?;
-    let port = listener.local_addr()?.port();
-    Ok((listener.into(), Listening::Every, port))
-}
-
-#[cfg(windows)]
-#[allow(clippy::unnecessary_wraps)]
-pub fn open_tls(_port: u16) -> std::io::Result<(Incoming, Listening, u16)> {
-    let (addresses, incoming) = Addresses::new(wireserve_types::TLS_PUBLIC_PORT);
-    Ok((incoming, Listening::PerAddress(addresses), wireserve_types::TLS_PUBLIC_PORT))
-}
-
-/// [`open_tls`] for plain HTTP (PLAN.md #328): [`http_listener`] on Linux,
-/// each service address's 80 on Windows.
-#[cfg(unix)]
-pub fn open_http(port: u16) -> std::io::Result<Option<(Incoming, Listening, u16)>> {
-    let Some(listener) = http_listener(port)? else {
-        return Ok(None);
-    };
-    let port = listener.local_addr()?.port();
-    Ok(Some((listener.into(), Listening::Every, port)))
-}
-
-#[cfg(windows)]
-#[allow(clippy::unnecessary_wraps)]
-pub fn open_http(_port: u16) -> std::io::Result<Option<(Incoming, Listening, u16)>> {
-    let (addresses, incoming) = Addresses::new(wireserve_types::HTTP_PUBLIC_PORT);
-    Ok(Some((incoming, Listening::PerAddress(addresses), wireserve_types::HTTP_PUBLIC_PORT)))
-}
-
 /// The TLS listening socket (PLAN.md M35): the first one systemd passed us
 /// when `wireserve-tls.socket` started this process — held by systemd
 /// across restarts, so no other local user can take the port in between —
@@ -903,7 +844,7 @@ fn listener_at(index: u32, port: u16) -> std::io::Result<TcpListener> {
     let passed = listen_fd(pid, std::env::var("LISTEN_PID").ok().as_deref(), std::env::var("LISTEN_FDS").ok().as_deref(), index);
     // Left in the environment: the runtime's other threads may read it, and
     // a child could never mistake them for its own, `LISTEN_PID` being ours.
-    let std_listener = match passed.and_then(passed_listener) {
+    let std_listener = match passed.and_then(crate::platform::passed_listener) {
         Some(listener) => listener,
         None => {
             use socket2::{Domain, Protocol, Socket, Type};
@@ -916,21 +857,6 @@ fn listener_at(index: u32, port: u16) -> std::io::Result<TcpListener> {
     };
     std_listener.set_nonblocking(true)?;
     TcpListener::from_std(std_listener)
-}
-
-#[cfg(unix)]
-#[allow(clippy::unnecessary_wraps)]
-fn passed_listener(fd: i32) -> Option<std::net::TcpListener> {
-    use std::os::fd::FromRawFd;
-    // SAFETY: systemd passed this descriptor to this very process
-    // (LISTEN_PID), and nothing else in it has taken ownership of it.
-    Some(unsafe { std::net::TcpListener::from_raw_fd(fd) })
-}
-
-/// No systemd: nothing is ever passed.
-#[cfg(windows)]
-fn passed_listener(_fd: i32) -> Option<std::net::TcpListener> {
-    None
 }
 
 /// The `index`th descriptor systemd's socket activation passed this
