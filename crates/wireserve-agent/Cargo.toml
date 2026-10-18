@@ -28,9 +28,7 @@ rpassword.workspace = true
 libc.workspace = true
 rand.workspace = true
 blake2.workspace = true
-
-# The TLS terminator (`tls-daemon`) runs on Unix hosts only.
-[target.'cfg(unix)'.dependencies]
+# The TLS terminator, `tls-daemon`.
 wireserve-tls.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

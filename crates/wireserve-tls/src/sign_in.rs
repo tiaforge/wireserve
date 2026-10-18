@@ -453,7 +453,9 @@ pub fn plain(status: StatusCode, text: &'static str) -> Response<Body> {
     r
 }
 
-#[cfg(test)]
+// Unix only: the stand-in agent below is a Unix socket, and on Windows the
+// link talks only to a pipe that SYSTEM or Administrators made.
+#[cfg(all(test, unix))]
 pub(crate) mod tests {
     use super::*;
     use wireserve_types::tls::{TlsRequest, TlsResponse};

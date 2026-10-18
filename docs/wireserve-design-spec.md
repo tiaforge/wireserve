@@ -389,8 +389,9 @@ struct ServiceRule {
   shelling out to `nft`"; reversed — see PLAN.md decisions log #69.)
 - **Windows**: `WfpBackend`, the Windows Filtering Platform directly,
   implementing the same trait — backend swap only, no change to the sync
-  logic that calls `apply()`. A Windows node serves nothing, so its
-  ruleset is the default-deny alone (PLAN.md M49).
+  logic that calls `apply()`. A Windows node carries nobody's traffic, so
+  its ruleset is the default-deny and its services' permits; nothing on it
+  rewrites a port (PLAN.md M49, M50).
 - **Startup ordering**: `teardown()`-then-deny-all must run *before* the
   first successful `apply()` — the interface should never come up
   permissive-by-default while waiting on the first poll response.
@@ -756,7 +757,7 @@ What it does, end to end:
 ## Open items intentionally deferred (not v1)
 
 - BSD firewall backend (trait exists; Windows has one since PLAN.md M49,
-  for nodes that serve nothing)
+  serving since M50)
 - Multi-tenant coordinator, web UI
 - OIDC-backed admin auth with per-admin attribution (through the
   coordinator's own identity provider client, revisited later) — v1 uses a
