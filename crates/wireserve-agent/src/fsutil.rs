@@ -6,41 +6,14 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-/// Errno values that mean "this directory will not let me do the
+/// Error codes that mean "this directory will not let me do the
 /// rename-based dance, but the target file itself may still be writable"
-/// — see the fallback note on `atomic_write` below.
-///
-/// `EBUSY`/`EXDEV` come from a bind-mounted target (every container
-/// runtime's `/etc/hosts`). `EROFS`/`EACCES`/`EPERM` come from the
-/// opposite direction: a read-only or non-writable *directory* with a
-/// writable file bind-mounted into it, which is exactly what
-/// `ProtectSystem=strict` plus `ReadWritePaths=/etc/hosts` produces.
-#[cfg(unix)]
-const FALLBACK_ERRNOS: [i32; 5] = [
-    1,  // EPERM
-    13, // EACCES
-    16, // EBUSY
-    18, // EXDEV
-    30, // EROFS
-];
-
-/// The Windows counterparts (these are Win32 error codes, not errnos):
-/// a file another process has open without delete sharing — the DNS
-/// Client reading the hosts file, say — can't be renamed over.
-#[cfg(windows)]
-const FALLBACK_ERRNOS: [i32; 4] = [
-    5,  // ERROR_ACCESS_DENIED
-    17, // ERROR_NOT_SAME_DEVICE
-    19, // ERROR_WRITE_PROTECT
-    32, // ERROR_SHARING_VIOLATION
-];
-
+/// — see the fallback note on `atomic_write` below, and the platform's
+/// list (`platform::fs::RENAME_FALLBACK_ERRORS`).
 fn is_fallback_errno(e: &std::io::Error) -> bool {
-    e.raw_os_error().is_some_and(|n| FALLBACK_ERRNOS.contains(&n))
+    e.raw_os_error().is_some_and(|n| crate::platform::fs::RENAME_FALLBACK_ERRORS.contains(&n))
 }
 
 /// Writes `contents` to `path` atomically, creating the file at exactly
@@ -48,8 +21,7 @@ fn is_fallback_errno(e: &std::io::Error) -> bool {
 /// leave a window where the file exists with default permissions).
 ///
 /// On Windows `mode` means nothing: the file takes the ACL its directory
-/// passes on, which is what protects it (the state directory's own is set
-/// by `crate::winsec`).
+/// passes on, which is what protects it (see `platform::fs`).
 ///
 /// The temp file is created in the same directory as `path` so the final
 /// `rename` is guaranteed to be on the same filesystem (required for
@@ -57,7 +29,7 @@ fn is_fallback_errno(e: &std::io::Error) -> bool {
 /// copy+delete on some platforms, which is not atomic).
 ///
 /// **Falls back to a non-atomic in-place write when the directory will not
-/// support the temp-file dance** — see `FALLBACK_ERRNOS`. The fallback is
+/// support the temp-file dance** — see `platform::fs::RENAME_FALLBACK_ERRORS`. The fallback is
 /// tried at *both* steps, because the two deployments that need it fail at
 /// different points: a bind-mounted target file fails at `rename()`
 /// (`EBUSY`), while a read-only directory holding a writable bind-mounted
@@ -103,10 +75,7 @@ pub fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<
     let _ = std::fs::remove_file(&tmp_path);
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(mode);
-    #[cfg(not(unix))]
-    let _ = mode;
+    crate::platform::fs::create_with_mode(&mut options, mode);
     let opened = options.open(&tmp_path);
 
     let mut f = match opened {

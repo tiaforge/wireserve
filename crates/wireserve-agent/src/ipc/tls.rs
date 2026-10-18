@@ -47,38 +47,20 @@ pub fn tls_group_name() -> Option<String> {
     }
 }
 
-#[cfg(unix)]
-pub async fn serve(ctx: TlsContext, socket_path: &Path) -> std::io::Result<()> {
-    let gid = tls_group_name().and_then(|g| crate::ipc::server::lookup_group(&g));
-    match gid {
-        Some(_) => tracing::info!(socket = %socket_path.display(), "TLS terminator socket shared with its group"),
-        None => tracing::info!(socket = %socket_path.display(), "TLS terminator socket is root-only (no `wireserve-tls` group)"),
+/// Serves the terminator's endpoint at `socket_path`, shared with
+/// `terminator` (see `platform::ipc::terminator`): reading and writing it,
+/// and no more. Nobody else but root (administrators) gets in.
+pub async fn serve(ctx: TlsContext, socket_path: &Path, terminator: Option<crate::platform::ipc::Principal>) -> std::io::Result<()> {
+    use crate::platform::ipc::{Listener, ENDPOINT, PRIVATE};
+    let mut listener = Listener::bind(socket_path, terminator.as_ref())?;
+    match &terminator {
+        Some(_) => tracing::info!(path = %socket_path.display(), "TLS terminator {ENDPOINT} shared with the terminator"),
+        None => tracing::info!(path = %socket_path.display(), "TLS terminator {ENDPOINT} is {PRIVATE} (no terminator account)"),
     }
-    let listener = crate::ipc::server::bind_socket(socket_path, gid)?;
     loop {
-        let (stream, _) = listener.accept().await?;
+        let stream = listener.accept().await?;
         let ctx = ctx.clone();
         tokio::spawn(async move { handle(&ctx, stream).await });
-    }
-}
-
-/// `serve` for Windows: `terminator` is the SID of the terminator's
-/// account, which the pipe is shared with — reading and writing it, and no
-/// more (see `server::GROUP_PIPE_ACCESS`).
-#[cfg(windows)]
-pub async fn serve(ctx: TlsContext, socket_path: &Path, terminator: Option<String>) -> std::io::Result<()> {
-    use crate::ipc::server::{pipe_instance, pipe_sddl};
-    let sd = crate::winsec::SecurityDescriptor::from_sddl(&pipe_sddl(terminator.as_deref()))?;
-    let mut server = pipe_instance(socket_path, &sd, true)?;
-    match &terminator {
-        Some(_) => tracing::info!(pipe = %socket_path.display(), "TLS terminator pipe shared with its account"),
-        None => tracing::info!(pipe = %socket_path.display(), "TLS terminator pipe is administrators-only (no terminator service)"),
-    }
-    loop {
-        server.connect().await?;
-        let connected = std::mem::replace(&mut server, pipe_instance(socket_path, &sd, false)?);
-        let ctx = ctx.clone();
-        tokio::spawn(async move { handle(&ctx, connected).await });
     }
 }
 

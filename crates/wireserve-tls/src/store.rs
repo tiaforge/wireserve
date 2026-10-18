@@ -62,7 +62,7 @@ impl Store {
     pub fn open(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(root.join("certs"))?;
-        set_mode(&root, 0o700)?;
+        crate::platform::set_mode(&root, 0o700)?;
         Ok(Self { root })
     }
 
@@ -110,12 +110,9 @@ impl Store {
         let stored = parse(chain_pem.as_bytes(), key_pem.as_bytes())?;
         let dir = self.dir(directory, fqdn);
         std::fs::create_dir_all(&dir)?;
-        set_mode(&dir, 0o700)?;
+        crate::platform::set_mode(&dir, 0o700)?;
         if let Some(ca) = dir.parent() {
-            set_mode(ca, 0o700)?;
-            // The directories just made, if they were, survive a crash too.
-            sync_dir(ca)?;
-            sync_dir(&self.root.join("certs"))?;
+            crate::platform::set_mode(ca, 0o700)?;
         }
         let written = write_private(&dir.join("key.tmp"), key_pem.as_bytes())
             .and_then(|()| write_private(&dir.join("cert.tmp"), chain_pem.as_bytes()));
@@ -231,25 +228,8 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 pub(crate) fn create_private(path: &Path) -> io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+    crate::platform::owner_only(&mut options);
     options.open(path)
-}
-
-#[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-}
-
-/// See [`create_private`]: the directory's ACL is `install`'s.
-#[cfg(windows)]
-#[allow(clippy::unnecessary_wraps)]
-fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]

@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn kernel_probe_and_choice_against_real_interfaces() {
         use defguard_wireguard_rs::key::Key;
-        if !crate::firewall::netns::reexec("ifname::tests::kernel_probe_and_choice_against_real_interfaces") {
+        if !crate::platform::linux::netns::reexec("ifname::tests::kernel_probe_and_choice_against_real_interfaces") {
             return;
         }
         let ours = crate::wg::clamp_private_key(&Key::generate()).to_string();
