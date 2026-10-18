@@ -39,23 +39,40 @@ It asks for the join token. `install`:
 
 1. copies `wireserve.exe` and `wireguard.dll` to
    `C:\Program Files\wireserve\`;
-2. creates the **`wireserve-agent`** Windows service, which runs as
+2. adds that folder to the system `Path`;
+3. creates the local **`wireserve`** group (see below);
+4. creates the **`wireserve-agent`** Windows service, which runs as
    LocalSystem, starts with Windows and is restarted if it fails;
-3. joins the mesh;
-4. starts the service and waits until it runs.
+5. joins the mesh;
+6. starts the service and waits until it runs.
 
-`install` does not add `C:\Program Files\wireserve` to `PATH`; run the
-commands below with the full path, or add it yourself.
+Terminals opened before `install` don't see the new `Path`; open a new
+one, or use the full path, `& "C:\Program Files\wireserve\wireserve.exe"`.
 
 ## Using it
 
-Every command talks to the running service, and only administrators may:
-run them from an elevated terminal.
+Every command talks to the running service, which only administrators,
+from an elevated terminal, and members of the `wireserve` group may.
 
 ```powershell
-& "C:\Program Files\wireserve\wireserve.exe" status
-& "C:\Program Files\wireserve\wireserve.exe" leave
+wireserve status
+wireserve leave
 ```
+
+To use it without elevating, join the group, from an elevated terminal,
+and sign out and in again (Windows reads your groups at sign-in):
+
+```powershell
+net localgroup wireserve <user> /add
+```
+
+Membership lets someone do anything the commands do, `leave` included,
+as the `wireserve` group does on Linux. The service shares its pipe with
+the group only if the group existed when it started, so a group you
+create yourself takes a restart of the service. Set
+`WIRESERVE_SOCKET_GROUP` system-wide to use another local group, or to
+empty to share with none. Only a group of the computer's own counts, never
+a domain's of the same name.
 
 `status` shows the mesh's services and peers. `leave` takes the node out
 of the mesh, as on Linux, and also removes the `wireserve-agent` service.
@@ -79,6 +96,9 @@ takes the same flag.
   while the agent runs: stopping the service, or the agent crashing,
   removes it. Windows lists it as an unidentified, public network; that
   does not matter to the firewall below.
+- **The system `Path`**: `C:\Program Files\wireserve` added at its end,
+  once. `leave` keeps it, as it keeps the files there.
+- **A local group**, `wireserve`, empty until you add someone.
 - **Firewall rules** in the Windows Filtering Platform: every new inbound
   connection over the mesh is blocked, on the mesh adapter and to the
   node's mesh addresses, while replies to the computer's own connections
@@ -108,4 +128,7 @@ takes the same flag.
 - **`wireguard.dll must be next to wireserve.exe`**: unpack the whole zip
   and run `install` from that folder.
 - **`not permitted to use the wireserve daemon`**: the command was run
-  from an unelevated terminal.
+  from an unelevated terminal by someone not in the `wireserve` group, or
+  who joined it without signing out and in again.
+- **`wireserve` is not recognized**: the terminal was open before
+  `install`; open a new one.

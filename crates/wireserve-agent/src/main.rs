@@ -548,6 +548,24 @@ async fn cmd_install(instance: &Instance, args: InstallArgs) -> Result<(), Box<d
         winservice::stop_and_wait(&winservice::service_name(other))?;
     }
     let exe = install_files()?;
+    // Before the service starts: it looks the group up once, when it
+    // creates its pipe.
+    let group = match wireserve_agent::ipc::server::socket_group_name() {
+        Some(group) => {
+            wireserve_agent::winsec::ensure_local_group(&group, "May use the wireserve agent without elevation")?;
+            Some(group)
+        }
+        None => None,
+    };
+    let dir = exe.parent().ok_or("the installed wireserve.exe has no folder")?;
+    let on_path = match wireserve_agent::winpath::add_to_system_path(dir) {
+        Ok(_) => true,
+        // Only a convenience: the full path still works.
+        Err(e) => {
+            eprintln!("warning: could not add {} to the system Path: {e}", dir.display());
+            false
+        }
+    };
     let name = winservice::service_name(instance);
     winservice::install(&name, instance, &exe)?;
     if !upgrade {
@@ -565,8 +583,21 @@ async fn cmd_install(instance: &Instance, args: InstallArgs) -> Result<(), Box<d
     } else {
         println!("{name} is running");
     }
-    println!("From an elevated terminal, `{}{instance_flag} status` shows its peers.", exe.display());
+    let command = if on_path { "wireserve".to_string() } else { format!("& \"{}\"", exe.display()) };
+    println!("From an elevated terminal, `{command}{instance_flag} status` shows its peers.");
+    if on_path {
+        println!("({} is on the system Path now; a terminal opened before this one does not see it yet.)", dir.display());
+    }
     println!("Its log: {}", instance.log_path().display());
+    if let Some(group) = group {
+        // Who this terminal runs as: the one to add, unless the elevation
+        // prompt took another administrator's password. Every service was
+        // (re)started above, after the group existed: no restart to suggest.
+        let who = std::env::var("USERNAME").ok().filter(|u| !u.is_empty());
+        println!();
+        println!("To use it without an elevated terminal, join the `{group}` group and sign out and in again:");
+        println!("  net localgroup {group} {} /add", who.as_deref().unwrap_or("<user>"));
+    }
     Ok(())
 }
 

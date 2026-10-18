@@ -31,6 +31,8 @@ pub mod wg;
 #[cfg(windows)]
 pub mod winnet;
 #[cfg(windows)]
+pub mod winpath;
+#[cfg(windows)]
 pub mod winsec;
 #[cfg(windows)]
 pub mod winservice;

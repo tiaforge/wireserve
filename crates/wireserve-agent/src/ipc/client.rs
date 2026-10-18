@@ -1,8 +1,9 @@
 //! Thin client used by the `wireserve <service>`/`status`/`leave` CLI
 //! subcommands to talk to a running daemon over the Unix socket (a named
-//! pipe on Windows). The socket is root-only, or shared with the `wireserve`
-//! group when the host has one (see `server::serve`), so a refused
-//! connection is reported as that, not as a daemon that isn't running.
+//! pipe on Windows). The socket is root-only (administrators-only), or
+//! shared with the `wireserve` group when the host has one (see
+//! `server::serve`), so a refused connection is reported as that, not as a
+//! daemon that isn't running.
 
 use std::path::Path;
 
@@ -24,7 +25,12 @@ pub enum IpcClientError {
     )]
     Denied(std::path::PathBuf),
     #[cfg(windows)]
-    #[error("not permitted to use the wireserve daemon at {0}: run this from an elevated (Administrator) terminal")]
+    #[error(
+        "not permitted to use the wireserve daemon at {0}: run this from an elevated (Administrator) terminal, \
+         or join the `wireserve` group (`net localgroup wireserve <user> /add` from an elevated terminal, \
+         then sign out and in again). The daemon shares its pipe with that group only if the group existed \
+         when it started"
+    )]
     Denied(std::path::PathBuf),
     #[error("I/O error talking to daemon: {0}")]
     Io(#[from] std::io::Error),
@@ -61,17 +67,50 @@ async fn connect(socket_path: &Path) -> std::io::Result<UnixStream> {
 /// so a short wait is enough.
 #[cfg(windows)]
 async fn connect(socket_path: &Path) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
-    use tokio::net::windows::named_pipe::ClientOptions;
     use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 
     let mut tries = 0;
     loop {
-        match ClientOptions::new().open(socket_path.as_os_str()) {
+        match open_pipe(socket_path) {
             Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) && tries < 50 => {
                 tries += 1;
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
             result => return result,
         }
+    }
+}
+
+/// `ClientOptions::open`, but asking for reading and writing the pipe only
+/// (`server::GROUP_PIPE_ACCESS`): its `GENERIC_WRITE` asks for more than a
+/// member of the `wireserve` group is given, and would be refused. Still
+/// identification only, as tokio's is: the server may learn who connects,
+/// never act as them.
+#[cfg(windows)]
+fn open_pipe(socket_path: &Path) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use std::os::windows::ffi::OsStrExt;
+    use tokio::net::windows::named_pipe::NamedPipeClient;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+    };
+
+    let name: Vec<u16> = socket_path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: a NUL-terminated name; the handle is handed to tokio, which
+    // owns and closes it from then on.
+    unsafe {
+        let h = CreateFileW(
+            name.as_ptr(),
+            super::server::GROUP_PIPE_ACCESS,
+            0,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+            std::ptr::null_mut(),
+        );
+        if h == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        NamedPipeClient::from_raw_handle(h)
     }
 }

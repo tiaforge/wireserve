@@ -5280,9 +5280,27 @@ name, a Linux peer's connection to the Windows node timed out, restart and
     turning them off is still accepted. Tests call `dispatch` directly and
     keep running on Windows.
 
-342. **Left for later:** adding `C:\Program Files\wireserve` to `PATH`;
-    Authenticode-signing `wireserve.exe` (no certificate yet; SmartScreen
-    warns on an unsigned download); an aarch64 build (wireguard-nt ships
-    an arm64 DLL); sharing the IPC pipe with a group; serving on Windows
+342. **Left for later:** Authenticode-signing `wireserve.exe` (no
+    certificate yet; SmartScreen warns on an unsigned download); an
+    aarch64 build (wireguard-nt ships an arm64 DLL); serving on Windows
     (service rules in WFP, and the address rewrites nftables does, which
     WFP has no plain counterpart for).
+
+343. **`Path` and the `wireserve` group** (2026-10-18). `install` appends
+    `%ProgramFiles%\wireserve` to the system `Path` in the registry
+    (`winpath.rs`), kept unexpanded and of its stored type, last so it
+    shadows nothing, and broadcasts the change; `leave` leaves it, as it
+    leaves the files. A failure to edit it is a warning. `install` also
+    creates a local `wireserve` group (`NetLocalGroupAdd`, the
+    `groupadd --system`), and the daemon shares its pipe with it when it
+    exists, so a member uses the agent from an unelevated terminal. Only
+    a group of this computer's own counts: the name is looked up
+    qualified by the computer's name and must come back as an alias of
+    that domain, since the bare name falls through to a domain group,
+    which anyone the domain lets create groups could make. The group gets
+    `FILE_GENERIC_READ | FILE_WRITE_DATA` on the pipe, not
+    `GENERIC_WRITE`: that includes `FILE_CREATE_PIPE_INSTANCE`, with
+    which a member could serve instances of the pipe and answer clients,
+    administrators included, in the daemon's place. The client asks for
+    exactly those rights (`CreateFileW` itself; tokio's `ClientOptions`
+    asks for `GENERIC_WRITE`), still at identification level.

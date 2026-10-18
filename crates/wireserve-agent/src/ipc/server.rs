@@ -547,7 +547,8 @@ pub async fn serve(ctx: AgentContext, socket_path: &Path) -> std::io::Result<()>
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
     let name = socket_path.as_os_str();
-    let sd = crate::winsec::SecurityDescriptor::from_sddl(PIPE_SDDL)?;
+    let group = pipe_group();
+    let sd = crate::winsec::SecurityDescriptor::from_sddl(&pipe_sddl(group.as_ref().map(|(_, sid)| sid.as_str())))?;
     let create = |first: bool| -> std::io::Result<NamedPipeServer> {
         let mut sa = sd.attributes();
         // SAFETY: `sa` and the descriptor it points to outlive the call.
@@ -559,7 +560,10 @@ pub async fn serve(ctx: AgentContext, socket_path: &Path) -> std::io::Result<()>
         }
     };
     let mut server = create(true)?;
-    tracing::info!(pipe = %socket_path.display(), "IPC pipe is administrators-only");
+    match &group {
+        Some((name, _)) => tracing::info!(group = %name, pipe = %socket_path.display(), "IPC pipe shared with group"),
+        None => tracing::info!(pipe = %socket_path.display(), "IPC pipe is administrators-only (no `wireserve` group)"),
+    }
     loop {
         server.connect().await?;
         let connected = std::mem::replace(&mut server, create(false)?);
@@ -570,9 +574,43 @@ pub async fn serve(ctx: AgentContext, socket_path: &Path) -> std::io::Result<()>
     }
 }
 
+/// The local group to share the pipe with, and its SID: as on Linux, the
+/// configured name (`socket_group_name`) if the group exists, looked up
+/// once, here. A lookup that fails leaves the pipe administrators-only.
+#[cfg(windows)]
+fn pipe_group() -> Option<(String, String)> {
+    let name = socket_group_name()?;
+    match crate::winsec::local_group_sid(&name) {
+        Ok(sid) => sid.map(|sid| (name, sid)),
+        Err(e) => {
+            tracing::warn!(group = %name, error = %e, "could not look up the group; the IPC pipe stays administrators-only");
+            None
+        }
+    }
+}
+
 /// SYSTEM and Administrators, full access; nothing inherited.
 #[cfg(windows)]
 const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)";
+
+/// What the group may do with the pipe: read it and write to it, and no
+/// more. `GENERIC_WRITE` would include `FILE_CREATE_PIPE_INSTANCE` (the
+/// same bit as `FILE_APPEND_DATA`), with which a member could create
+/// instances of the pipe itself and answer clients, administrators
+/// included, in the daemon's place. The client asks for no more than
+/// this (`client::connect`).
+#[cfg(windows)]
+pub(crate) const GROUP_PIPE_ACCESS: u32 = windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ
+    | windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA;
+
+/// [`PIPE_SDDL`], and the group's access when there is one.
+#[cfg(windows)]
+fn pipe_sddl(group_sid: Option<&str>) -> String {
+    match group_sid {
+        Some(sid) => format!("{PIPE_SDDL}(A;;0x{GROUP_PIPE_ACCESS:x};;;{sid})"),
+        None => PIPE_SDDL.to_string(),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -596,6 +634,18 @@ mod tests {
             dir,
             rx,
         )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_pipe_grants_the_group_reading_and_writing_only() {
+        use windows_sys::Win32::Storage::FileSystem::FILE_CREATE_PIPE_INSTANCE;
+        assert_eq!(pipe_sddl(None), PIPE_SDDL);
+        // Users, standing in for a local group's SID.
+        let shared = pipe_sddl(Some("S-1-5-32-545"));
+        assert_eq!(shared, "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12008b;;;S-1-5-32-545)");
+        assert_eq!(GROUP_PIPE_ACCESS & FILE_CREATE_PIPE_INSTANCE, 0);
+        crate::winsec::SecurityDescriptor::from_sddl(&shared).unwrap();
     }
 
     #[cfg(unix)]
