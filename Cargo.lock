@@ -4203,6 +4203,7 @@ dependencies = [
  "tokio-tungstenite",
  "tower",
  "tracing",
+ "windows-sys 0.61.2",
  "wireserve-types",
  "x509-parser",
 ]

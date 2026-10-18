@@ -83,9 +83,8 @@ impl Accounts {
 
 fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension("tmp");
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+    let mut f = crate::store::create_private(&tmp)?;
     f.write_all(text.as_bytes())?;
     f.sync_all()?;
     std::fs::rename(tmp, path)

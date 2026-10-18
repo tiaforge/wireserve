@@ -171,9 +171,14 @@ enum Command {
         check_in_secs: u64,
         // The port to listen on when not started by `wireserve-tls.socket`,
         // which otherwise decides it. Service addresses' 443 is rewritten to
-        // whichever it is.
+        // whichever it is. Not on Windows, which listens on each service
+        // address's 443 and 80 (PLAN.md M50).
         #[arg(long, env = "WIRESERVE_TLS_PORT", default_value_t = wireserve_types::TLS_LISTEN_PORT, hide = true)]
         port: u16,
+        /// Run under the Service Control Manager (`install` sets this up)
+        #[cfg(windows)]
+        #[arg(long, hide = true)]
+        service: bool,
     },
     /// `wireserve <service> ...`: everything that isn't one of the commands
     /// above. See [`ServiceArgs`].
@@ -269,12 +274,14 @@ fn init_logging() {
 
 /// The service's logging: appended to `path`, in the private state
 /// directory. A log past 10 MiB at start is kept as `agent.log.old`, the
-/// one before that dropped.
+/// one before that dropped. `private_dir` makes the directory private
+/// first, as the agent's own; the terminator's is `install`'s to set up,
+/// which the terminator's account could not.
 #[cfg(windows)]
-fn init_file_logging(path: &std::path::Path) -> std::io::Result<()> {
+fn init_file_logging(path: &std::path::Path, private_dir: bool) -> std::io::Result<()> {
     use tracing_subscriber::EnvFilter;
     const KEEP: u64 = 10 * 1024 * 1024;
-    if let Some(dir) = path.parent() {
+    if let Some(dir) = path.parent().filter(|_| private_dir) {
         wireserve_agent::winsec::ensure_private_dir(dir)?;
     }
     if std::fs::metadata(path).is_ok_and(|m| m.len() > KEEP) {
@@ -286,22 +293,25 @@ fn init_file_logging(path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `daemon --service`: the daemon, under the Service Control Manager. The
-/// process's exit code; the service's own, which decides whether it is
-/// restarted, is the daemon's (see `winservice`).
+/// `daemon --service` or `tls-daemon --service`: the agent or its TLS
+/// terminator, under the Service Control Manager. The process's exit code;
+/// the service's own, which decides whether it is restarted, is the
+/// daemon's (see `winservice`).
 #[cfg(windows)]
 fn run_service(cli: Cli) -> i32 {
     use wireserve_agent::winservice;
-    let Command::Daemon { poll_interval_secs, ifname, .. } = cli.command else {
-        unreachable!("only `daemon --service` runs as a service")
-    };
     let instance = cli.instance;
-    let log = instance.log_path();
-    if let Err(e) = init_file_logging(&log) {
+    let tls = matches!(cli.command, Command::TlsDaemon { .. });
+    let (name, log) = if tls {
+        (winservice::tls_service_name(&instance), instance.tls_log_path())
+    } else {
+        (winservice::service_name(&instance), instance.log_path())
+    };
+    if let Err(e) = init_file_logging(&log, !tls) {
         eprintln!("error: could not open the log {}: {e}", log.display());
         return 1;
     }
-    let name = winservice::service_name(&instance);
+    let command = std::sync::Mutex::new(Some(cli.command));
     let dispatched = winservice::dispatch(&name, move || {
         let runtime = match tokio::runtime::Runtime::new() {
             Ok(r) => r,
@@ -310,10 +320,19 @@ fn run_service(cli: Cli) -> i32 {
                 return 1;
             }
         };
-        match runtime.block_on(cmd_daemon(&instance, poll_interval_secs, ifname.clone())) {
+        let result = match command.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+            Some(Command::Daemon { poll_interval_secs, ifname, .. }) => {
+                runtime.block_on(cmd_daemon(&instance, poll_interval_secs, ifname))
+            }
+            Some(Command::TlsDaemon { state_dir, acme_ca_file, check_in_secs, port, .. }) => {
+                runtime.block_on(cmd_tls_daemon(&instance, state_dir, acme_ca_file, check_in_secs, port))
+            }
+            _ => Err("only `daemon --service` and `tls-daemon --service` run as a service".into()),
+        };
+        match result {
             Ok(()) => 0,
             Err(e) => {
-                tracing::error!(error = %e, "the agent stopped");
+                tracing::error!(error = %e, "stopped");
                 1
             }
         }
@@ -346,7 +365,7 @@ fn main() {
     // A service hands the process to the Service Control Manager before
     // anything else, and logs to a file: it has no console.
     #[cfg(windows)]
-    if let Command::Daemon { service: true, .. } = &cli.command {
+    if matches!(&cli.command, Command::Daemon { service: true, .. } | Command::TlsDaemon { service: true, .. }) {
         std::process::exit(run_service(cli));
     }
     init_logging();
@@ -367,24 +386,8 @@ async fn run(cli: Cli) {
         } => {
             cmd_daemon(&instance, poll_interval_secs, ifname).await
         }
-        #[cfg(not(unix))]
-        Command::TlsDaemon { .. } => Err("the TLS terminator is not supported on this platform".into()),
-        #[cfg(unix)]
-        Command::TlsDaemon { state_dir, acme_ca_file, check_in_secs, port } => {
-            // systemd may list several colon-separated state directories;
-            // the unit names exactly one.
-            let state_dir = state_dir
-                .and_then(|d| d.to_str().and_then(|s| s.split(':').next()).map(std::path::PathBuf::from))
-                .unwrap_or_else(|| instance.tls_state_dir());
-            wireserve_tls::run(wireserve_tls::Options {
-                socket: instance.tls_socket_path(),
-                state_dir,
-                ca_file: acme_ca_file,
-                check_in_every: Duration::from_secs(check_in_secs.max(1)),
-                port,
-            })
-            .await
-            .map_err(Into::into)
+        Command::TlsDaemon { state_dir, acme_ca_file, check_in_secs, port, .. } => {
+            cmd_tls_daemon(&instance, state_dir, acme_ca_file, check_in_secs, port).await
         }
         Command::Service(words) => cmd_service(&instance, &words).await,
         Command::Transit { action } => cmd_transit(&instance, action).await,
@@ -397,6 +400,37 @@ async fn run(cli: Cli) {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
+}
+
+/// `tls-daemon`: the TLS terminator (PLAN.md M33), until stopped.
+async fn cmd_tls_daemon(
+    instance: &Instance,
+    state_dir: Option<std::path::PathBuf>,
+    acme_ca_file: Option<std::path::PathBuf>,
+    check_in_secs: u64,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // systemd may list several colon-separated state directories; the unit
+    // names exactly one. A Windows path has a colon of its own.
+    #[cfg(unix)]
+    let state_dir = state_dir.and_then(|d| d.to_str().and_then(|s| s.split(':').next()).map(std::path::PathBuf::from));
+    let state_dir = state_dir.unwrap_or_else(|| instance.tls_state_dir());
+    let run = wireserve_tls::run(wireserve_tls::Options {
+        socket: instance.tls_socket_path(),
+        state_dir,
+        ca_file: acme_ca_file,
+        check_in_every: Duration::from_secs(check_in_secs.max(1)),
+        port,
+    });
+    // The service's stop, as SIGTERM is under systemd.
+    #[cfg(windows)]
+    let run = async {
+        tokio::select! {
+            result = run => result,
+            () = wireserve_agent::winservice::stop_requested() => Ok(()),
+        }
+    };
+    run.await.map_err(Into::into)
 }
 
 async fn cmd_join(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -528,7 +562,7 @@ async fn cmd_install(instance: &Instance, args: InstallArgs) -> Result<(), Box<d
     use wireserve_agent::winservice;
     let InstallArgs { join: args, tls_port } = args;
     if tls_port.is_some() {
-        return Err("--tls-port: Windows nodes serve nothing, so there is no TLS terminator to give a port".into());
+        return Err("--tls-port: on Windows the TLS terminator listens on each service's own 443 and 80".into());
     }
     if let Some(url) = &args.coordinator_url {
         register::check_coordinator_transport(url, args.allow_plaintext_http)?;
@@ -543,39 +577,39 @@ async fn cmd_install(instance: &Instance, args: InstallArgs) -> Result<(), Box<d
         args.coordinator_url.is_some() || args.join_token.is_some() || args.join_token_file.is_some();
     let upgrade = registered && !join_args_given;
 
-    let running = winservice::running_instances(paths::all_instances())?;
+    // Terminators first: each checks in with its agent.
+    let instances = paths::all_instances();
+    let mut running_tls = Vec::new();
+    for other in &instances {
+        if winservice::stop_and_wait(&winservice::tls_service_name(other))? {
+            running_tls.push(other.clone());
+        }
+    }
+    let running = winservice::running_instances(instances)?;
     for other in &running {
         winservice::stop_and_wait(&winservice::service_name(other))?;
     }
-    let exe = install_files()?;
-    // Before the service starts: it looks the group up once, when it
-    // creates its pipe.
-    let group = match wireserve_agent::ipc::server::socket_group_name() {
-        Some(group) => {
-            wireserve_agent::winsec::ensure_local_group(&group, "May use the wireserve agent without elevation")?;
-            Some(group)
+    // Whatever fails from here on, what was running runs again, on whichever
+    // files are in place: a failed upgrade must not leave the node offline.
+    let installed = install_and_start(instance, args, upgrade, &running, &running_tls).await;
+    if let Err(e) = &installed {
+        let mut restarted = Vec::new();
+        for other in &running {
+            if winservice::start(&winservice::service_name(other), &other.log_path()).is_ok() {
+                restarted.push(winservice::service_name(other));
+            }
         }
-        None => None,
-    };
+        for other in &running_tls {
+            if winservice::start(&winservice::tls_service_name(other), &other.tls_log_path()).is_ok() {
+                restarted.push(winservice::tls_service_name(other));
+            }
+        }
+        if !restarted.is_empty() {
+            return Err(format!("{e} (started again what was running: {})", restarted.join(", ")).into());
+        }
+    }
+    let (exe, name, tls_name, group, on_path) = installed?;
     let dir = exe.parent().ok_or("the installed wireserve.exe has no folder")?;
-    let on_path = match wireserve_agent::winpath::add_to_system_path(dir) {
-        Ok(_) => true,
-        // Only a convenience: the full path still works.
-        Err(e) => {
-            eprintln!("warning: could not add {} to the system Path: {e}", dir.display());
-            false
-        }
-    };
-    let name = winservice::service_name(instance);
-    winservice::install(&name, instance, &exe)?;
-    if !upgrade {
-        cmd_join(instance, args).await?;
-    }
-    winservice::start(&name, &instance.log_path())?;
-    for other in running.iter().filter(|i| *i != instance) {
-        winservice::start(&winservice::service_name(other), &other.log_path())?;
-    }
-
     let instance_flag = if instance.is_default() { String::new() } else { format!(" --instance {}", instance.name()) };
     println!();
     if upgrade {
@@ -588,7 +622,7 @@ async fn cmd_install(instance: &Instance, args: InstallArgs) -> Result<(), Box<d
     if on_path {
         println!("({} is on the system Path now; a terminal opened before this one does not see it yet.)", dir.display());
     }
-    println!("Its log: {}", instance.log_path().display());
+    println!("Its log: {}; its TLS terminator's, {tls_name}: {}", instance.log_path().display(), instance.tls_log_path().display());
     if let Some(group) = group {
         // Who this terminal runs as: the one to add, unless the elevation
         // prompt took another administrator's password. Every service was
@@ -599,6 +633,63 @@ async fn cmd_install(instance: &Instance, args: InstallArgs) -> Result<(), Box<d
         println!("  net localgroup {group} {} /add", who.as_deref().unwrap_or("<user>"));
     }
     Ok(())
+}
+
+/// The part of a Windows `install` after every service is stopped: the
+/// files, the group, the `Path`, both services, the join, and starting
+/// what should run. The installed executable, the two services' names,
+/// the group and whether the `Path` has the folder.
+#[cfg(windows)]
+#[allow(clippy::type_complexity)]
+async fn install_and_start(
+    instance: &Instance,
+    args: JoinArgs,
+    upgrade: bool,
+    running: &[Instance],
+    running_tls: &[Instance],
+) -> Result<(std::path::PathBuf, String, String, Option<String>, bool), Box<dyn std::error::Error>> {
+    use wireserve_agent::winservice;
+    let exe = install_files()?;
+    // Before the service starts: it looks the group up once, when it
+    // creates its pipe.
+    let group = match wireserve_agent::ipc::server::socket_group_name() {
+        Some(group) => {
+            wireserve_agent::winsec::ensure_local_group(&group, "May use the wireserve agent without elevation")?;
+            Some(group)
+        }
+        None => None,
+    };
+    let dir = exe.parent().ok_or("the installed wireserve.exe has no folder")?.to_path_buf();
+    let on_path = match wireserve_agent::winpath::add_to_system_path(&dir) {
+        Ok(_) => true,
+        // Only a convenience: the full path still works.
+        Err(e) => {
+            eprintln!("warning: could not add {} to the system Path: {e}", dir.display());
+            false
+        }
+    };
+    let name = winservice::service_name(instance);
+    winservice::install(&name, instance, &exe)?;
+    // The TLS terminator (PLAN.md M50), under an account of its own whose
+    // state directory only it and administrators may read. Before the
+    // agent starts: the agent looks its account up once, at start.
+    let tls_name = winservice::tls_service_name(instance);
+    winservice::install_tls(&tls_name, instance, &exe)?;
+    let tls_account = wireserve_agent::winsec::service_sid(&tls_name)?
+        .ok_or_else(|| format!("the {tls_name} service was created, but Windows knows no account NT SERVICE\\{tls_name}"))?;
+    wireserve_agent::winsec::ensure_private_dir_for(&instance.tls_state_dir(), &tls_account)?;
+    if !upgrade {
+        cmd_join(instance, args).await?;
+    }
+    winservice::start(&name, &instance.log_path())?;
+    winservice::start(&tls_name, &instance.tls_log_path())?;
+    for other in running.iter().filter(|i| *i != instance) {
+        winservice::start(&winservice::service_name(other), &other.log_path())?;
+    }
+    for other in running_tls.iter().filter(|i| *i != instance) {
+        winservice::start(&winservice::tls_service_name(other), &other.tls_log_path())?;
+    }
+    Ok((exe, name, tls_name, group, on_path))
 }
 
 /// Copies this executable and the `wireguard.dll` beside it into
@@ -623,11 +714,26 @@ fn install_files() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
         if to.canonicalize().is_ok_and(|t| t == *from) {
             continue;
         }
+        // The same file already (the DLL, most upgrades): nothing to replace,
+        // and nothing to wait for a process to let go of.
+        if std::fs::read(&to).is_ok_and(|have| std::fs::read(from).is_ok_and(|want| want == have)) {
+            continue;
+        }
         // Copied beside, then renamed over: never a half-written file where
         // the service looks for it.
         let tmp = dir.join(format!(".{file}.tmp"));
         std::fs::copy(from, &tmp).map_err(|e| format!("could not copy {} to {}: {e}", from.display(), dir.display()))?;
-        std::fs::rename(&tmp, &to).map_err(|e| format!("could not replace {}: {e}", to.display()))?;
+        // A stopped service's process may still be exiting, and holding the
+        // file, for a moment after the service reports stopped.
+        let mut tries = 0;
+        while let Err(e) = std::fs::rename(&tmp, &to) {
+            tries += 1;
+            if tries == 20 {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(format!("could not replace {}: {e}", to.display()).into());
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
     Ok(dir.join("wireserve.exe"))
 }
@@ -821,8 +927,12 @@ async fn cmd_daemon(
     let mut fw = firewall::nftables::NftablesBackend::new(ifname.clone())?
         .with_carry(carry.clone())
         .with_own(&[ip4.into(), ip6.into()]);
+    // Who the terminator's holes are for (PLAN.md M50): its service's own
+    // account, which exists once `install` made the service.
     #[cfg(windows)]
-    let mut fw = firewall::wfp::WfpBackend::new(&ifname, &[ip4.into(), ip6.into()])?;
+    let terminator = wireserve_agent::winsec::service_sid(&wireserve_agent::winservice::tls_service_name(instance))?;
+    #[cfg(windows)]
+    let mut fw = firewall::wfp::WfpBackend::new(&ifname, &[ip4.into(), ip6.into()], terminator.as_deref())?;
     #[cfg(not(any(target_os = "linux", windows)))]
     let mut fw = NoopFirewall;
 
@@ -933,17 +1043,22 @@ async fn cmd_daemon(
     let tls_link = Arc::new(wireserve_agent::tls_link::TlsLink::default());
     // Relay port checks (PLAN.md M40).
     let port_checks = Arc::new(wireserve_agent::port_check::PortChecker::default());
-    #[cfg(unix)]
     {
-        let tls_socket_path = instance.tls_socket_path();
         let ctx = wireserve_agent::ipc::tls::TlsContext {
             state: shared_state.clone(),
             link: tls_link.clone(),
             client: client.clone(),
         };
-        let path = tls_socket_path.clone();
+        let path = instance.tls_socket_path();
+        #[cfg(unix)]
+        let serving = async move { wireserve_agent::ipc::tls::serve(ctx, &path).await };
+        #[cfg(windows)]
+        let serving = {
+            let terminator = terminator.clone();
+            async move { wireserve_agent::ipc::tls::serve(ctx, &path, terminator).await }
+        };
         tokio::spawn(async move {
-            if let Err(e) = wireserve_agent::ipc::tls::serve(ctx, &path).await {
+            if let Err(e) = serving.await {
                 tracing::error!(error = %e, "TLS terminator socket exited");
             }
         });
@@ -1509,8 +1624,10 @@ async fn cmd_leave(instance: &Instance) -> Result<(), Box<dyn std::error::Error>
     // run on, it would fail and be restarted over and over.
     #[cfg(windows)]
     if matches!(resp, wireserve_agent::ipc::IpcResponse::Ok) {
-        let name = wireserve_agent::winservice::service_name(instance);
-        wireserve_agent::winservice::delete(&name).map_err(|e| format!("left the mesh, but could not remove the {name} service: {e}"))?;
+        use wireserve_agent::winservice;
+        for name in [winservice::tls_service_name(instance), winservice::service_name(instance)] {
+            winservice::delete(&name).map_err(|e| format!("left the mesh, but could not remove the {name} service: {e}"))?;
+        }
     }
     print_response(resp);
     Ok(())

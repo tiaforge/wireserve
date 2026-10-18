@@ -1,11 +1,12 @@
 //! The Windows IP Helper calls the agent's Windows code shares: finding an
 //! interface by name, listing the host's addresses, and assigning an
-//! adapter its addresses and MTU. What `getifaddrs`, `if_nametoindex` and
+//! adapter its addresses (its services' too, PLAN.md M50) and MTU. What `getifaddrs`, `if_nametoindex` and
 //! netlink do on Linux.
 //!
 //! Interfaces are named by their *alias* — what `Get-NetAdapter` shows
 //! as `Name`, and what wireguard-nt calls the adapter's name.
 
+use std::collections::BTreeSet;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
@@ -275,6 +276,80 @@ pub fn set_addresses(luid: NET_LUID_LH, addrs: &[(IpAddr, u8)]) -> io::Result<()
         }
     }
     first_err.map_or(Ok(()), Err)
+}
+
+/// Moves the interface's service addresses (PLAN.md M50) from `old` to
+/// `new`: each a /32 beside the interface's own addresses, so the host
+/// receives a service's traffic itself, as nothing rewrites it here, and
+/// never the source of the host's own connections (`SkipAsSource`), which
+/// must keep coming from the node's address. An address in neither set is
+/// left alone, whatever it is. Returns which of `old` and `new` the
+/// interface has afterwards; the error is the first failure, which leaves
+/// that address as it was.
+pub fn sync_service_addresses(
+    luid: NET_LUID_LH,
+    old: &BTreeSet<Ipv4Addr>,
+    new: &BTreeSet<Ipv4Addr>,
+) -> (BTreeSet<Ipv4Addr>, io::Result<()>) {
+    let present = match v4_addresses(luid) {
+        Ok(p) => p,
+        Err(e) => return (old.clone(), Err(e)),
+    };
+    let mut first_err = None;
+    for addr in old.difference(new).filter(|a| present.contains(a)) {
+        let row = address_row(luid, *addr);
+        // SAFETY: a row naming the interface and the address.
+        if let Err(e) = check(unsafe { DeleteUnicastIpAddressEntry(&row) }) {
+            first_err.get_or_insert(e);
+        }
+    }
+    for addr in new.difference(&present) {
+        let mut row = address_row(luid, *addr);
+        row.OnLinkPrefixLength = 32;
+        row.SkipAsSource = true;
+        // As for the node's own addresses: no duplicate-address detection
+        // on a point-to-point tunnel.
+        row.DadState = IpDadStatePreferred;
+        // SAFETY: a complete row for this interface.
+        match unsafe { CreateUnicastIpAddressEntry(&row) } {
+            NO_ERROR | ERROR_OBJECT_ALREADY_EXISTS => {}
+            code => {
+                first_err.get_or_insert(io::Error::from_raw_os_error(code as i32));
+            }
+        }
+    }
+    let after = v4_addresses(luid).unwrap_or(present);
+    let kept = after.into_iter().filter(|a| old.contains(a) || new.contains(a)).collect();
+    (kept, first_err.map_or(Ok(()), Err))
+}
+
+/// A row naming `addr` on the interface, ready to create or delete.
+fn address_row(luid: NET_LUID_LH, addr: Ipv4Addr) -> MIB_UNICASTIPADDRESS_ROW {
+    // SAFETY: an all-zero row is valid input to InitializeUnicastIpAddressEntry.
+    let mut row: MIB_UNICASTIPADDRESS_ROW = unsafe { std::mem::zeroed() };
+    unsafe { InitializeUnicastIpAddressEntry(&mut row) };
+    row.InterfaceLuid = luid;
+    row.Address = to_sockaddr_inet(SocketAddr::new(addr.into(), 0));
+    row
+}
+
+/// The interface's IPv4 addresses.
+fn v4_addresses(luid: NET_LUID_LH) -> io::Result<BTreeSet<Ipv4Addr>> {
+    let mut table: *mut MIB_UNICASTIPADDRESS_TABLE = std::ptr::null_mut();
+    // SAFETY: the table is allocated by the call and freed below.
+    check(unsafe { GetUnicastIpAddressTable(AF_INET, &mut table) })?;
+    let rows = unsafe { std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize) };
+    let out = rows
+        .iter()
+        // SAFETY: both are plain integers inside the LUID union.
+        .filter(|row| unsafe { row.InterfaceLuid.Value == luid.Value })
+        .filter_map(|row| match from_sockaddr_inet(&row.Address)?.ip() {
+            IpAddr::V4(a) => Some(a),
+            IpAddr::V6(_) => None,
+        })
+        .collect();
+    unsafe { FreeMibTable(table.cast()) };
+    Ok(out)
 }
 
 #[cfg(test)]

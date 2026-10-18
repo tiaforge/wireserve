@@ -17,6 +17,10 @@
 //! certificate is held and its address is bound; the agent reports that to
 //! the coordinator, which only then points the name at the service's own
 //! address.
+//!
+//! On Windows (PLAN.md M50) it runs as its own service, under a virtual
+//! account of its own, and listens on each service address's 443 and 80
+//! itself: nothing there rewrites them onto one port.
 
 pub mod acme;
 pub mod link;
@@ -47,6 +51,7 @@ pub struct Options {
     pub ca_file: Option<PathBuf>,
     pub check_in_every: Duration,
     /// The port to listen on when systemd passed no socket (PLAN.md M35).
+    /// Unused on Windows, where each service address's 443 is listened on.
     pub port: u16,
 }
 
@@ -72,6 +77,9 @@ struct Served {
     service: TlsService,
     /// In the listener's routes.
     routed: bool,
+    /// Why its address could not be listened on, last time it was tried;
+    /// logged when it changes.
+    unclaimed: Option<String>,
 }
 
 /// An issuance running in the background: the name, the CA's directory,
@@ -98,12 +106,11 @@ pub async fn run(opts: Options) -> Result<(), Error> {
     let certs = Arc::new(Certs::default());
     let tls = serve::server_config(certs.clone());
     let shared = serve::Shared::default();
-    let listener = serve::listener(opts.port).map_err(|e| Error::Listen(opts.port, e))?;
-    let port = listener.local_addr().map_err(|e| Error::Listen(opts.port, e))?.port();
+    let (incoming, mut listening, port) = serve::open_tls(opts.port).map_err(|e| Error::Listen(opts.port, e))?;
     // Plain HTTP on services' port 80 (PLAN.md #328). Without its socket the
     // agent leaves port 80 to the services themselves, as before.
     let http_wanted = wireserve_types::http_listen_port(port);
-    let http_listener = match serve::http_listener(http_wanted) {
+    let http_listener = match serve::open_http(http_wanted) {
         Ok(Some(l)) => Some(l),
         Ok(None) => {
             tracing::warn!("systemd passed no plain-HTTP socket; port 80 is not guarded — `wireserve install` again to add it");
@@ -114,7 +121,11 @@ pub async fn run(opts: Options) -> Result<(), Error> {
             None
         }
     };
-    let http_port = http_listener.as_ref().and_then(|l| l.local_addr().ok()).map_or(0, |a| a.port());
+    let http_port = http_listener.as_ref().map_or(0, |(_, _, port)| *port);
+    let (http_incoming, mut http_listening) = match http_listener {
+        Some((incoming, listening, _)) => (Some(incoming), listening),
+        None => (None, serve::Listening::Every),
+    };
     let mut http_served: BTreeMap<String, wireserve_types::tls::HttpService> = BTreeMap::new();
 
     let mut served: BTreeMap<String, Served> = BTreeMap::new();
@@ -125,8 +136,8 @@ pub async fn run(opts: Options) -> Result<(), Error> {
     let mut last_prune: Option<Instant> = None;
 
     tracing::info!(socket = %link.socket().display(), port, http_port, "TLS terminator starting");
-    let accepting = serve::spawn(listener, tls, shared.clone());
-    let accepting_http = http_listener.map(|l| serve::spawn_http(l, shared.clone()));
+    let accepting = serve::spawn(incoming, tls, shared.clone());
+    let accepting_http = http_incoming.map(|l| serve::spawn_http(l, shared.clone()));
     let mut tick = tokio::time::interval(opts.check_in_every);
     loop {
         tick.tick().await;
@@ -155,9 +166,9 @@ pub async fn run(opts: Options) -> Result<(), Error> {
         *shared.strip.write().unwrap_or_else(std::sync::PoisonError::into_inner) = config.strip_headers.clone();
         *shared.forwarders.write().unwrap_or_else(std::sync::PoisonError::into_inner) = config.forwarding_nodes.clone();
 
-        forget_gone(&mut served, &mut issuance, &certs, &shared, &config);
+        forget_gone(&mut served, &mut issuance, &certs, &shared, &mut listening, &config);
         if http_up {
-            route_http(&shared, &mut http_served, &config.http);
+            route_http(&shared, &mut http_served, &mut http_listening, &config.http);
         }
 
         let Some(settings) = config.acme.clone() else {
@@ -216,12 +227,17 @@ pub async fn run(opts: Options) -> Result<(), Error> {
             }
 
             // Routed to as soon as there is a certificate to answer with.
-            let s = served.entry(service.name.clone()).or_insert_with(|| Served { service: service.clone(), routed: false });
+            let s = served
+                .entry(service.name.clone())
+                .or_insert_with(|| Served { service: service.clone(), routed: false, unclaimed: None });
             // Another address or backend is another route; who may reach
             // it is only its policy, replaced in place below so no request
             // ever finds the service missing in between.
             if (s.service.vip, s.service.upstream) != (service.vip, service.upstream) && s.routed {
                 shared.unroute(s.service.vip);
+                if s.service.vip != service.vip {
+                    listening.release(s.service.vip);
+                }
                 s.routed = false;
             }
             s.service = service.clone();
@@ -234,10 +250,24 @@ pub async fn run(opts: Options) -> Result<(), Error> {
                 });
                 shared.policies.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(service.vip, policy);
                 if !s.routed {
-                    tracing::info!(service = %service.name, addr = %service.vip, upstream = %service.upstream, "serving");
-                    let route = Arc::new(serve::Route::new(service.upstream));
-                    shared.routes.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(service.vip, route);
-                    s.routed = true;
+                    match listening.claim(service.vip) {
+                        Ok(()) => {
+                            tracing::info!(service = %service.name, addr = %service.vip, upstream = %service.upstream, "serving");
+                            let route = Arc::new(serve::Route::new(service.upstream));
+                            shared.routes.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(service.vip, route);
+                            s.routed = true;
+                            s.unclaimed = None;
+                        }
+                        // Tried again at the next check-in: the agent adds
+                        // the address on its next poll.
+                        Err(e) => {
+                            let why = e.to_string();
+                            if s.unclaimed.as_ref() != Some(&why) {
+                                tracing::warn!(service = %service.name, addr = %service.vip, port, error = %why, "cannot listen on the service's address yet; not serving it");
+                                s.unclaimed = Some(why);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -298,6 +328,7 @@ fn forget_gone(
     issuance: &mut BTreeMap<String, Issuance>,
     certs: &Certs,
     shared: &serve::Shared,
+    listening: &mut serve::Listening,
     config: &TlsConfig,
 ) {
     let wanted: BTreeSet<&str> = config.services.iter().map(|s| s.name.as_str()).collect();
@@ -308,6 +339,7 @@ fn forget_gone(
             if s.routed {
                 shared.unroute(s.service.vip);
             }
+            listening.release(s.service.vip);
             certs.remove(&s.service.fqdn);
             issuance.remove(&s.service.fqdn);
         }
@@ -318,13 +350,19 @@ fn forget_gone(
 /// Answers exactly the services in `wanted` in plain HTTP (PLAN.md #328):
 /// each one's policy replaced in place, its route only when its address or
 /// backend changed, and the ones no longer wanted let go.
-fn route_http(shared: &serve::Shared, served: &mut BTreeMap<String, wireserve_types::tls::HttpService>, wanted: &[wireserve_types::tls::HttpService]) {
+fn route_http(
+    shared: &serve::Shared,
+    served: &mut BTreeMap<String, wireserve_types::tls::HttpService>,
+    listening: &mut serve::Listening,
+    wanted: &[wireserve_types::tls::HttpService],
+) {
     let names: BTreeSet<&str> = wanted.iter().map(|s| s.name.as_str()).collect();
     served.retain(|name, s| {
         let keep = names.contains(name.as_str());
         if !keep {
             tracing::info!(service = %name, "no longer answering its port 80");
             shared.unroute_http(s.vip);
+            listening.release(s.vip);
         }
         keep
     });
@@ -333,6 +371,9 @@ fn route_http(shared: &serve::Shared, served: &mut BTreeMap<String, wireserve_ty
         if let Some(old) = served.get(&service.name) {
             if (old.vip, old.upstream) != (service.vip, service.upstream) {
                 shared.unroute_http(old.vip);
+                if old.vip != service.vip {
+                    listening.release(old.vip);
+                }
                 served.remove(&service.name);
             }
         }
@@ -343,6 +384,12 @@ fn route_http(shared: &serve::Shared, served: &mut BTreeMap<String, wireserve_ty
         let policy = Arc::new(serve::Policy { fqdn: fqdn.clone(), aliases: aliases.to_vec(), access, cross_site: service.cross_site });
         shared.http_policies.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(service.vip, policy);
         if !served.contains_key(&service.name) {
+            // Tried again at the next check-in, quietly: the TLS side says
+            // why an address cannot be listened on, and this is the same one.
+            if let Err(e) = listening.claim(service.vip) {
+                tracing::debug!(service = %service.name, addr = %service.vip, error = %e, "cannot listen on the service's port 80 yet");
+                continue;
+            }
             tracing::info!(service = %service.name, addr = %service.vip, upstream = %service.upstream, "answering its port 80");
             let route = Arc::new(serve::Route::new(service.upstream));
             shared.http_routes.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(service.vip, route);
@@ -418,10 +465,10 @@ mod tests {
         let certs = Certs::default();
         certs.set("plex.int.test", stored.key.clone());
         let shared = serve::Shared::default();
-        let mut served = BTreeMap::from([("plex".to_string(), Served { service: service("plex"), routed: false })]);
+        let mut served = BTreeMap::from([("plex".to_string(), Served { service: service("plex"), routed: false, unclaimed: None })]);
         let mut issuance = BTreeMap::from([("plex.int.test".to_string(), Issuance { cert: Some(stored), ..Issuance::default() })]);
 
-        forget_gone(&mut served, &mut issuance, &certs, &shared, &TlsConfig::default());
+        forget_gone(&mut served, &mut issuance, &certs, &shared, &mut serve::Listening::Every, &TlsConfig::default());
 
         assert!(served.is_empty());
         assert!(issuance.is_empty(), "a held certificate the resolver lacks would never be loaded again");
@@ -431,10 +478,10 @@ mod tests {
     fn a_name_still_wanted_keeps_its_state() {
         let (chain, key) = store::tests::self_signed("plex.int.test", 36_500);
         let stored = store::parse(chain.as_bytes(), key.as_bytes()).unwrap();
-        let mut served = BTreeMap::from([("plex".to_string(), Served { service: service("plex"), routed: false })]);
+        let mut served = BTreeMap::from([("plex".to_string(), Served { service: service("plex"), routed: false, unclaimed: None })]);
         let mut issuance = BTreeMap::from([("plex.int.test".to_string(), Issuance { cert: Some(stored), ..Issuance::default() })]);
         let config = TlsConfig { services: vec![service("plex")], ..TlsConfig::default() };
-        forget_gone(&mut served, &mut issuance, &Certs::default(), &serve::Shared::default(), &config);
+        forget_gone(&mut served, &mut issuance, &Certs::default(), &serve::Shared::default(), &mut serve::Listening::Every, &config);
         assert_eq!((served.len(), issuance.len()), (1, 1));
     }
 }

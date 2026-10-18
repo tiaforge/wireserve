@@ -5282,9 +5282,9 @@ name, a Linux peer's connection to the Windows node timed out, restart and
 
 342. **Left for later:** Authenticode-signing `wireserve.exe` (no
     certificate yet; SmartScreen warns on an unsigned download); an
-    aarch64 build (wireguard-nt ships an arm64 DLL); serving on Windows
-    (service rules in WFP, and the address rewrites nftables does, which
-    WFP has no plain counterpart for).
+    aarch64 build (wireguard-nt ships an arm64 DLL). Serving came in M50,
+    but for the address rewrites nftables does, which WFP has no plain
+    counterpart for.
 
 343. **`Path` and the `wireserve` group** (2026-10-18). `install` appends
     `%ProgramFiles%\wireserve` to the system `Path` in the registry
@@ -5304,3 +5304,89 @@ name, a Linux peer's connection to the Windows node timed out, restart and
     administrators included, in the daemon's place. The client asks for
     exactly those rights (`CreateFileW` itself; tokio's `ClientOptions`
     asks for `GENERIC_WRITE`), still at identification level.
+
+## M50 — Windows nodes serve
+
+A Windows node publishes services, with the TLS terminator, as a Linux one
+does, for everything that needs no rewrite: a port published as itself, and
+TCP 80 and 443 onto any port, through the terminator. Decided with the user
+(2026-10-18): the service addresses, the WFP permits and the terminator
+first; how to rewrite a port (a proxy in the agent, or WinDivert) is
+decided later. Remapped ports other than 80 and 443, targets on another
+address, transit and exit stay refused. Tested on Windows 11 (2026-10-18)
+against the real mesh, Windows Defender Firewall on and its network
+profile Public, the backend under an explicit Defender *block* rule: a
+Linux peer reached a published port, and the node's own address and an
+unpublished port timed out; port 80 and 443 through the terminator, with a
+Let's Encrypt certificate it got over DNS-01 as its own account; a second
+process could not bind a held 443, and one that took 443 while the
+terminator was stopped, its permit still in place, was not reached.
+
+344. **No rewrite, so the service address is the host's.** nftables
+    rewrites `vip:PUBLIC` to `node:TARGET` before conntrack; WFP rewrites
+    nothing without a kernel driver of our own (its redirect layers are
+    callout-only). So each own service's address is added to the mesh
+    adapter as a /32 (`winnet::sync_service_addresses`), with `SkipAsSource`
+    so the host's own connections keep coming from the node's address, and
+    a backend listening on every address receives it unrewritten. Every
+    service's address, not only the terminated ones as Linux's local routes
+    are: the terminator binds an address before it says it serves it. Read
+    back from the adapter each cycle; the adapter dies with the agent, so
+    nothing is swept at start. `serve` refuses what would need a rewrite
+    (`unsupported_on_windows`), and the firewall backend skips it again.
+
+345. **Permits in our sublayer, above our blocks.** One hard permit per
+    service port at `ALE_AUTH_RECV_ACCEPT_V4`: the adapter's LUID, the
+    service address, the port, the protocol, and the grants' sources as
+    OR'ed remote-address conditions (an empty list: no permit). Weight
+    ranges make the order explicit: permits 15, blocks 1 (they were
+    `FWP_EMPTY`, left to BFE). Hard (`CLEAR_ACTION_RIGHT`), as the blocks
+    are: no lower sublayer's block overrides it but a veto. Defender's own
+    blocks do not veto: a backend Defender had an explicit block rule for,
+    on a Public network, was reached — so `install` adds no Defender rule.
+
+346. **The terminator answers its ports itself, and only it.** Linux
+    rewrites 443 and 80 onto the terminator's one socket on every address,
+    held by systemd. Here the terminator binds each service address's 443
+    and 80 itself (`serve::Addresses`, fed into one accept loop through
+    `serve::Incoming`, so the connection limits stay per listener): bound
+    to the address, never the wildcard, so the host's own servers keep 443
+    and 80 elsewhere, and `SO_EXCLUSIVEADDRUSE`, so nobody binds them under
+    it. Windows has no privileged ports, so the permits for 443 and 80 also
+    match `ALE_USER_ID` against the terminator's account: a process that
+    got there first, or after a crash, is not let in. The check-in reports
+    port 443 and 80, so the agent's `Terminated` rules need no change.
+
+347. **The terminator as a virtual account.** `wireserve-tls[-<name>]`, a
+    second service running `tls-daemon --service` as `NT SERVICE\<it>`,
+    unrestricted service SID: the separate user it is on Linux, with no
+    password and nothing of the agent's. Its state directory,
+    `%ProgramData%\wireserve-tls`, is the agent's kind of private: owner
+    checked, then SYSTEM, Administrators and that account
+    (`winsec::ensure_private_dir_for`); the TLS crate's `0600` and `0700`
+    are Unix-only, the ACL doing their work. Its log is in that directory,
+    as the agent's is in its own. Its pipe is shared with that account,
+    reading and writing only, as the `wireserve` group's is (#343).
+    `install` makes it before the agent starts — the agent looks the
+    account up once — and `leave` deletes it with the agent's; an upgrade
+    stops terminators before agents and starts them after.
+
+348. **The terminator checks who made its pipe.** Any user may create a
+    pipe of a free name, and one made before the agent (at boot) would be
+    handed every sign-in ticket and session the terminator passes on. So
+    the link reads the pipe's owner and refuses any but SYSTEM or
+    Administrators, which no other user can make the owner of anything.
+    The TLS crate's tests stay Unix-only: their stand-in agent is a Unix
+    socket, and one on Windows would have to be made by an administrator.
+
+349. **A failed upgrade starts again what it stopped.** The first upgrade on
+    the test machine stopped every service, replaced `wireserve.exe`, then
+    failed to replace `wireguard.dll` (a stopped service's process still
+    held it) and returned with nothing running: the node was offline until
+    started by hand. `install` now starts what was running whatever fails
+    after the stop, and says so; a file identical to the installed one is
+    not replaced at all, and a replace is retried for ten seconds.
+    Seen there too and left for later: every restart flips the adapter's
+    name between `wireserve0` and `wireserve1` (the old one is still being
+    removed, #336), and a 443 that gives way to a plain mapping warns on
+    every poll, as on Linux.

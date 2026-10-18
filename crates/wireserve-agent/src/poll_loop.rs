@@ -643,7 +643,7 @@ pub struct PollContext<'a, F: FirewallBackend> {
 /// stays as it was, and the firewall still marks only what the directory
 /// and the terminator agree on.
 #[cfg(target_os = "linux")]
-fn sync_local_routes(old: &BTreeSet<Ipv4Addr>, new: &BTreeSet<Ipv4Addr>, node: Option<Ipv4Addr>) -> BTreeSet<Ipv4Addr> {
+fn sync_local_routes(old: &BTreeSet<Ipv4Addr>, new: &BTreeSet<Ipv4Addr>, node: Option<Ipv4Addr>, _ifname: &str) -> BTreeSet<Ipv4Addr> {
     if old == new {
         return old.clone();
     }
@@ -653,9 +653,57 @@ fn sync_local_routes(old: &BTreeSet<Ipv4Addr>, new: &BTreeSet<Ipv4Addr>, node: O
     crate::routes::sync_local(old, new, node).0
 }
 
-#[cfg(not(target_os = "linux"))]
-fn sync_local_routes(old: &BTreeSet<Ipv4Addr>, _new: &BTreeSet<Ipv4Addr>, _node: Option<Ipv4Addr>) -> BTreeSet<Ipv4Addr> {
+/// Windows (PLAN.md M50): the service addresses, as addresses of the mesh
+/// adapter itself — what the host receives on, nothing rewriting them. Read
+/// back from the adapter every time, not only on a change: one that came
+/// back up has none.
+#[cfg(windows)]
+fn sync_local_routes(old: &BTreeSet<Ipv4Addr>, new: &BTreeSet<Ipv4Addr>, _node: Option<Ipv4Addr>, ifname: &str) -> BTreeSet<Ipv4Addr> {
+    let luid = match crate::winnet::luid_by_alias(ifname) {
+        Ok(Some(luid)) => luid,
+        Ok(None) => return BTreeSet::new(),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not find the mesh adapter to give it its service addresses");
+            return old.clone();
+        }
+    };
+    let (now, result) = crate::winnet::sync_service_addresses(luid, old, new);
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "could not move every service address onto the mesh adapter");
+    }
+    now
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn sync_local_routes(old: &BTreeSet<Ipv4Addr>, _new: &BTreeSet<Ipv4Addr>, _node: Option<Ipv4Addr>, _ifname: &str) -> BTreeSet<Ipv4Addr> {
     old.clone()
+}
+
+/// The service addresses the host must receive on itself (PLAN.md M33): on
+/// Linux those its terminator answers, which a rewrite sends to the host's
+/// own sockets; everything else is rewritten onto the node's address. On
+/// Windows (PLAN.md M50) every one of its services' addresses: nothing
+/// rewrites them, so whatever answers one receives it unchanged — and the
+/// terminator binds an address before it says it serves it.
+fn host_addresses_wanted(
+    rules: &[ServiceRule],
+    declared: &[ServiceDecl],
+    node: Option<Ipv4Addr>,
+    directory: &PollResponse,
+) -> BTreeSet<Ipv4Addr> {
+    if cfg!(windows) {
+        let Some(node) = node else {
+            return BTreeSet::new();
+        };
+        return declared.iter().filter_map(|d| own_vip(&d.name, node, directory)).collect();
+    }
+    rules
+        .iter()
+        .filter_map(|r| match r {
+            ServiceRule::Terminated { vip, .. } => Some(*vip),
+            ServiceRule::Mapped { .. } => None,
+        })
+        .collect()
 }
 
 /// Runs exactly one poll cycle against the daemon's single shared `state`,
@@ -892,16 +940,10 @@ where
     let term = Terminator { tls: terminating_here(node_ip, &directory, &serving), tls_port, http, http_port };
     state.lock().await.http_answered.clone_from(&term.http);
     let rules = service_rules(&declared, node_ip, &directory, &directory.access, mesh_ranges.as_ref(), &term);
-    // The addresses the terminator must receive on (PLAN.md M33): routed to
-    // the host itself, so they arrive at its sockets rather than looping
-    // back into the mesh interface.
-    let local_routes_wanted: BTreeSet<Ipv4Addr> = rules
-        .iter()
-        .filter_map(|r| match r {
-            ServiceRule::Terminated { vip, .. } => Some(*vip),
-            _ => None,
-        })
-        .collect();
+    // The addresses the host must receive on (PLAN.md M33, M50): routed to
+    // it, or on Windows given to the mesh adapter, so they arrive at its
+    // sockets rather than looping back into the mesh interface.
+    let local_routes_wanted = host_addresses_wanted(&rules, &declared, node_ip, &directory);
     // End-to-end relays (PLAN.md M39): which peers this node reaches through
     // a carrier that only forwards their session's ciphertext. Like a
     // transited peer, a relayed one keeps probing its direct candidates.
@@ -1051,6 +1093,7 @@ where
             &local_routes_before,
             &local_routes_before.union(&local_routes_wanted).copied().collect(),
             node_ip,
+            &ifname,
         );
         let owned_now = match ctx.firewall.apply(&rules, &forwarding) {
             Ok(()) => {
@@ -1070,7 +1113,7 @@ where
         // the host's forwarding posture is left completely alone. See
         // `ip_forward` module doc for why this is scoped to `ifname` and
         // never the host's global/`all` forwarding switches.
-        let local_routes = sync_local_routes(&local_routes, &local_routes_wanted, node_ip);
+        let local_routes = sync_local_routes(&local_routes, &local_routes_wanted, node_ip, &ifname);
         let forwards_services = rules.iter().any(|r| r.remote_target().is_some());
         crate::firewall::ip_forward::set_enabled(
             &ifname,
@@ -1337,6 +1380,29 @@ mod tests {
         let mut e = published(name, NODE, Some(VIP));
         e.terminated = true;
         with_services(vec![e])
+    }
+
+    /// Which service addresses the host receives on itself: on Linux the
+    /// terminated ones, the rest being rewritten onto the node's address;
+    /// on Windows (PLAN.md M50) every one, nothing rewriting them.
+    #[test]
+    fn the_host_receives_on_the_terminated_addresses_or_on_windows_on_all() {
+        let other = Ipv4Addr::new(10, 9, 0, 51);
+        let declared = vec![ServiceDecl::new("web", vec![pm("443:8080")]), ServiceDecl::new("ssh", vec![pm("22")])];
+        let dir = with_services(vec![published("web", NODE, Some(VIP)), published("ssh", NODE, Some(other))]);
+        let rules = [
+            ServiceRule::Terminated { vip: VIP, map: pm("443:8080"), port: 443, sources: None },
+            ServiceRule::Mapped { vip: other, node: NODE, map: pm("22"), sources: None },
+        ];
+        let wanted = host_addresses_wanted(&rules, &declared, Some(NODE), &dir);
+        if cfg!(windows) {
+            assert_eq!(wanted, BTreeSet::from([VIP, other]));
+            // Before anything is opened: the terminator binds it first.
+            assert_eq!(host_addresses_wanted(&[], &declared, Some(NODE), &dir), BTreeSet::from([VIP, other]));
+        } else {
+            assert_eq!(wanted, BTreeSet::from([VIP]));
+        }
+        assert!(host_addresses_wanted(&[], &declared, None, &dir).is_empty());
     }
 
     #[test]

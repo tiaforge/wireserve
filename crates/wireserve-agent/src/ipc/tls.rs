@@ -7,7 +7,9 @@
 //! names.
 //!
 //! Shared with the `wireserve-tls` group (0660, in a 0750 directory) when
-//! that group exists; root-only otherwise.
+//! that group exists; root-only otherwise. On Windows (PLAN.md M50) a named
+//! pipe, shared with the terminator's own account, `NT SERVICE\wireserve-tls`,
+//! once its service exists; administrators-only otherwise.
 
 use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -45,6 +47,7 @@ pub fn tls_group_name() -> Option<String> {
     }
 }
 
+#[cfg(unix)]
 pub async fn serve(ctx: TlsContext, socket_path: &Path) -> std::io::Result<()> {
     let gid = tls_group_name().and_then(|g| crate::ipc::server::lookup_group(&g));
     match gid {
@@ -59,7 +62,30 @@ pub async fn serve(ctx: TlsContext, socket_path: &Path) -> std::io::Result<()> {
     }
 }
 
-async fn handle(ctx: &TlsContext, stream: tokio::net::UnixStream) {
+/// `serve` for Windows: `terminator` is the SID of the terminator's
+/// account, which the pipe is shared with — reading and writing it, and no
+/// more (see `server::GROUP_PIPE_ACCESS`).
+#[cfg(windows)]
+pub async fn serve(ctx: TlsContext, socket_path: &Path, terminator: Option<String>) -> std::io::Result<()> {
+    use crate::ipc::server::{pipe_instance, pipe_sddl};
+    let sd = crate::winsec::SecurityDescriptor::from_sddl(&pipe_sddl(terminator.as_deref()))?;
+    let mut server = pipe_instance(socket_path, &sd, true)?;
+    match &terminator {
+        Some(_) => tracing::info!(pipe = %socket_path.display(), "TLS terminator pipe shared with its account"),
+        None => tracing::info!(pipe = %socket_path.display(), "TLS terminator pipe is administrators-only (no terminator service)"),
+    }
+    loop {
+        server.connect().await?;
+        let connected = std::mem::replace(&mut server, pipe_instance(socket_path, &sd, false)?);
+        let ctx = ctx.clone();
+        tokio::spawn(async move { handle(&ctx, connected).await });
+    }
+}
+
+async fn handle<S>(ctx: &TlsContext, stream: S)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half.take(MAX_REQUEST));
     let mut line = String::new();

@@ -9,7 +9,11 @@
 //!
 //! One service per instance: `wireserve-agent`, or `wireserve-agent-<name>`
 //! for a named one, each running `wireserve.exe daemon --service` as
-//! LocalSystem, started at boot and restarted after a failure.
+//! LocalSystem, started at boot and restarted after a failure. Beside each,
+//! its TLS terminator (PLAN.md M50): `wireserve-tls[-<name>]`, running
+//! `wireserve.exe tls-daemon --service` as a virtual account of its own,
+//! `NT SERVICE\wireserve-tls[-<name>]` — what the terminator's own user is
+//! on Linux.
 
 use std::io;
 use std::path::Path;
@@ -26,11 +30,11 @@ use windows_sys::Win32::System::Services::{
     StartServiceCtrlDispatcherW, StartServiceW, SC_ACTION, SC_ACTION_RESTART, SC_HANDLE, SC_MANAGER_ALL_ACCESS,
     SC_MANAGER_CONNECT, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
     SERVICE_CONFIG_DESCRIPTION, SERVICE_CONFIG_FAILURE_ACTIONS, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
-    SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_DESCRIPTIONW,
+    SERVICE_CONFIG_SERVICE_SID_INFO, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_DESCRIPTIONW,
     SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONSW, SERVICE_FAILURE_ACTIONS_FLAG,
-    SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS,
-    SERVICE_STATUS_HANDLE, SERVICE_STOP, SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW,
-    SERVICE_WIN32_OWN_PROCESS,
+    SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_SID_INFO, SERVICE_SID_TYPE_UNRESTRICTED, SERVICE_START,
+    SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOP, SERVICE_STOPPED, SERVICE_STOP_PENDING,
+    SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
 };
 
 use crate::paths::Instance;
@@ -43,6 +47,17 @@ pub fn service_name(instance: &Instance) -> String {
         "wireserve-agent".to_string()
     } else {
         format!("wireserve-agent-{}", instance.name())
+    }
+}
+
+/// The TLS terminator's service for `instance` (PLAN.md M50), and the
+/// name of the account it runs as, `NT SERVICE\<it>`.
+#[must_use]
+pub fn tls_service_name(instance: &Instance) -> String {
+    if instance.is_default() {
+        "wireserve-tls".to_string()
+    } else {
+        format!("wireserve-tls-{}", instance.name())
     }
 }
 
@@ -185,20 +200,70 @@ pub fn is_running(name: &str) -> io::Result<bool> {
     })
 }
 
+/// One service's configuration, for [`install`] and [`install_tls`].
+struct Spec<'a> {
+    name: &'a str,
+    display: String,
+    description: &'a str,
+    /// What follows the executable on its command line.
+    args: &'a str,
+    /// A virtual account (`NT SERVICE\<name>`) rather than LocalSystem.
+    own_account: bool,
+}
+
 /// Creates the service `name` to run `exe daemon --service` for
 /// `instance`, or brings an existing one's configuration up to date.
 pub fn install(name: &str, instance: &Instance, exe: &Path) -> io::Result<()> {
-    let mut command = format!("\"{}\" daemon --service", exe.display());
+    install_spec(
+        &Spec {
+            name,
+            display: display_name("wireserve agent", instance),
+            description: "Keeps this computer in its wireserve mesh: WireGuard peers, firewall and names.",
+            args: "daemon --service",
+            own_account: false,
+        },
+        instance,
+        exe,
+    )
+}
+
+/// The TLS terminator's service `name` for `instance` (PLAN.md M50): `exe
+/// tls-daemon --service`, as `NT SERVICE\<name>`, which holds nothing of
+/// the agent's — it parses TLS and HTTP from the whole mesh.
+pub fn install_tls(name: &str, instance: &Instance, exe: &Path) -> io::Result<()> {
+    install_spec(
+        &Spec {
+            name,
+            display: display_name("wireserve TLS terminator", instance),
+            description: "Answers this computer's wireserve services on HTTPS and plain HTTP, with their certificates.",
+            args: "tls-daemon --service",
+            own_account: true,
+        },
+        instance,
+        exe,
+    )
+}
+
+fn display_name(what: &str, instance: &Instance) -> String {
+    if instance.is_default() {
+        what.to_string()
+    } else {
+        format!("{what} ({})", instance.name())
+    }
+}
+
+fn install_spec(spec: &Spec<'_>, instance: &Instance, exe: &Path) -> io::Result<()> {
+    let name = spec.name;
+    let mut command = format!("\"{}\" {}", exe.display(), spec.args);
     if !instance.is_default() {
         command.push_str(&format!(" --instance {}", instance.name()));
     }
     let wcommand = wide(&command);
     let wname = wide(name);
-    let display = wide(&if instance.is_default() {
-        "wireserve agent".to_string()
-    } else {
-        format!("wireserve agent ({})", instance.name())
-    });
+    let display = wide(&spec.display);
+    // NULL is LocalSystem on creation, and "unchanged" on an update.
+    let account = spec.own_account.then(|| wide(&format!(r"NT SERVICE\{name}")));
+    let account_ptr = account.as_ref().map_or(std::ptr::null(), |a| a.as_ptr());
     let service = match open(name, SERVICE_ALL_ACCESS)? {
         Some(h) => {
             // SAFETY: a handle with SERVICE_CHANGE_CONFIG; NULL leaves a field as it is.
@@ -212,7 +277,7 @@ pub fn install(name: &str, instance: &Instance, exe: &Path) -> io::Result<()> {
                     std::ptr::null(),
                     std::ptr::null_mut(),
                     std::ptr::null(),
-                    std::ptr::null(),
+                    account_ptr,
                     std::ptr::null(),
                     display.as_ptr(),
                 )
@@ -224,7 +289,8 @@ pub fn install(name: &str, instance: &Instance, exe: &Path) -> io::Result<()> {
         }
         None => {
             let scm = manager(SC_MANAGER_ALL_ACCESS)?;
-            // SAFETY: NUL-terminated strings; a NULL account is LocalSystem.
+            // SAFETY: NUL-terminated strings; a NULL account is LocalSystem,
+            // and a virtual account takes no password.
             let h = unsafe {
                 CreateServiceW(
                     scm.0,
@@ -238,7 +304,7 @@ pub fn install(name: &str, instance: &Instance, exe: &Path) -> io::Result<()> {
                     std::ptr::null(),
                     std::ptr::null_mut(),
                     std::ptr::null(),
-                    std::ptr::null(),
+                    account_ptr,
                     std::ptr::null(),
                 )
             };
@@ -255,10 +321,20 @@ pub fn install(name: &str, instance: &Instance, exe: &Path) -> io::Result<()> {
         }
     };
 
-    let mut description = wide("Keeps this computer in its wireserve mesh: WireGuard peers, firewall and names.");
+    let mut description = wide(spec.description);
     let info = SERVICE_DESCRIPTIONW { lpDescription: description.as_mut_ptr() };
     // SAFETY: a description that outlives the call.
     unsafe { ChangeServiceConfig2W(service.0, SERVICE_CONFIG_DESCRIPTION, std::ptr::from_ref(&info).cast()) };
+    if spec.own_account {
+        // Its SID in its token, which the pipe, the state directory and the
+        // firewall's permits match. A virtual account implies it; said
+        // anyway, so nothing depends on that.
+        let sid = SERVICE_SID_INFO { dwServiceSidType: SERVICE_SID_TYPE_UNRESTRICTED };
+        // SAFETY: a structure that outlives the call.
+        if unsafe { ChangeServiceConfig2W(service.0, SERVICE_CONFIG_SERVICE_SID_INFO, std::ptr::from_ref(&sid).cast()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
 
     // Restarted 5 s after a failure, then 30 s, then every minute; the count
     // resets after a day without one. Failures include a nonzero exit, not
@@ -378,6 +454,8 @@ mod tests {
     fn each_instance_has_a_service_of_its_own() {
         assert_eq!(service_name(&Instance::default()), "wireserve-agent");
         assert_eq!(service_name(&Instance::new("work").unwrap()), "wireserve-agent-work");
+        assert_eq!(tls_service_name(&Instance::default()), "wireserve-tls");
+        assert_eq!(tls_service_name(&Instance::new("work").unwrap()), "wireserve-tls-work");
     }
 
     #[test]

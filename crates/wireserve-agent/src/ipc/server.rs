@@ -164,7 +164,10 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
 /// Whether this node publishes `name` on TCP 80 and its terminator did not
 /// answer that on the last cycle (PLAN.md #328).
 fn unguarded(state: &AgentState, name: &str) -> bool {
-    state.declared_services.iter().any(|d| d.name == name && d.ports.iter().any(wireserve_types::is_http_map))
+    // On Windows a remapped 80 the terminator does not answer is closed,
+    // not unguarded: nothing rewrites it onto the backend (PLAN.md M50).
+    let reaches_backend = |m: &wireserve_types::PortMap| wireserve_types::is_http_map(m) && (!cfg!(windows) || m.public == m.target);
+    state.declared_services.iter().any(|d| d.name == name && d.ports.iter().any(reaches_backend))
         && !state.http_answered.contains(name)
 }
 
@@ -379,18 +382,42 @@ where
 }
 
 /// Why this platform's daemon refuses `req`, if it does. A Windows node
-/// uses the mesh's services and serves none of its own (PLAN.md M49, #341): no
-/// service declarations, transit or exit — what turns any of those off
-/// is still accepted, so a state file copied from elsewhere can be undone.
-fn refused_here(req: &IpcRequest) -> Option<&'static str> {
-    let serves = matches!(
-        req,
-        IpcRequest::Serve { .. } | IpcRequest::TransitCapable { enabled: true } | IpcRequest::ExitCapable { enabled: true }
-    );
-    (cfg!(windows) && serves).then_some(
-        "not supported on Windows: a Windows node uses the mesh's services, but declares none, \
-         and carries no one else's traffic",
-    )
+/// carries nobody's traffic (PLAN.md M49, #341): no transit or exit — what
+/// turns either off is still accepted, so a state file copied from
+/// elsewhere can be undone. It serves (PLAN.md M50), but nothing there
+/// rewrites one port to another or forwards elsewhere (see
+/// [`unsupported_on_windows`]).
+fn refused_here(req: &IpcRequest) -> Option<String> {
+    if !cfg!(windows) {
+        return None;
+    }
+    match req {
+        IpcRequest::TransitCapable { enabled: true } | IpcRequest::ExitCapable { enabled: true } => {
+            Some("not supported on Windows: a Windows node carries no one else's traffic".to_string())
+        }
+        IpcRequest::Serve { ports, .. } => unsupported_on_windows(ports),
+        _ => None,
+    }
+}
+
+/// The first of `ports` a Windows node cannot publish, and why: one onto
+/// another address (PLAN.md M26), or one whose public port is not its
+/// target — but for TCP 80 and 443, which its TLS terminator answers on
+/// the public port and passes on to the target itself.
+fn unsupported_on_windows(ports: &[wireserve_types::PortMap]) -> Option<String> {
+    ports.iter().find_map(|m| {
+        if m.addr.is_some() {
+            return Some(format!("{m}: a Windows node serves only what runs on it, not another address"));
+        }
+        let terminated = wireserve_types::is_tls_map(m) || wireserve_types::is_http_map(m);
+        (m.public != m.target && !terminated).then(|| {
+            format!(
+                "{m}: a Windows node publishes a port only as itself (`{}`), but for TCP 80 and 443, \
+                 which its TLS terminator passes on to any port",
+                wireserve_types::PortMap { public: m.target, ..*m }
+            )
+        })
+    })
 }
 
 /// The group the daemon's socket is shared with when it exists on this
@@ -544,21 +571,9 @@ fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
 /// connected to, and a fresh one takes over listening.
 #[cfg(windows)]
 pub async fn serve(ctx: AgentContext, socket_path: &Path) -> std::io::Result<()> {
-    use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
-
-    let name = socket_path.as_os_str();
     let group = pipe_group();
     let sd = crate::winsec::SecurityDescriptor::from_sddl(&pipe_sddl(group.as_ref().map(|(_, sid)| sid.as_str())))?;
-    let create = |first: bool| -> std::io::Result<NamedPipeServer> {
-        let mut sa = sd.attributes();
-        // SAFETY: `sa` and the descriptor it points to outlive the call.
-        unsafe {
-            ServerOptions::new()
-                .first_pipe_instance(first)
-                .reject_remote_clients(true)
-                .create_with_security_attributes_raw(name, std::ptr::from_mut(&mut sa).cast())
-        }
-    };
+    let create = |first: bool| pipe_instance(socket_path, &sd, first);
     let mut server = create(true)?;
     match &group {
         Some((name, _)) => tracing::info!(group = %name, pipe = %socket_path.display(), "IPC pipe shared with group"),
@@ -571,6 +586,25 @@ pub async fn serve(ctx: AgentContext, socket_path: &Path) -> std::io::Result<()>
         tokio::spawn(async move {
             handle_connection(&ctx, connected).await;
         });
+    }
+}
+
+/// One instance of the pipe `name`, local clients only. The first is
+/// created as the first instance of that name, so a pipe someone else made
+/// before the agent started is an error, never one the agent shares.
+#[cfg(windows)]
+pub(crate) fn pipe_instance(
+    name: &Path,
+    sd: &crate::winsec::SecurityDescriptor,
+    first: bool,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    let mut sa = sd.attributes();
+    // SAFETY: `sa` and the descriptor it points to outlive the call.
+    unsafe {
+        tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(first)
+            .reject_remote_clients(true)
+            .create_with_security_attributes_raw(name.as_os_str(), std::ptr::from_mut(&mut sa).cast())
     }
 }
 
@@ -593,8 +627,8 @@ fn pipe_group() -> Option<(String, String)> {
 #[cfg(windows)]
 const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)";
 
-/// What the group may do with the pipe: read it and write to it, and no
-/// more. `GENERIC_WRITE` would include `FILE_CREATE_PIPE_INSTANCE` (the
+/// What the group (or the TLS terminator's account, `ipc::tls`) may do
+/// with the pipe: read it and write to it, and no more. `GENERIC_WRITE` would include `FILE_CREATE_PIPE_INSTANCE` (the
 /// same bit as `FILE_APPEND_DATA`), with which a member could create
 /// instances of the pipe itself and answer clients, administrators
 /// included, in the daemon's place. The client asks for no more than
@@ -605,7 +639,7 @@ pub(crate) const GROUP_PIPE_ACCESS: u32 = windows_sys::Win32::Storage::FileSyste
 
 /// [`PIPE_SDDL`], and the group's access when there is one.
 #[cfg(windows)]
-fn pipe_sddl(group_sid: Option<&str>) -> String {
+pub(crate) fn pipe_sddl(group_sid: Option<&str>) -> String {
     match group_sid {
         Some(sid) => format!("{PIPE_SDDL}(A;;0x{GROUP_PIPE_ACCESS:x};;;{sid})"),
         None => PIPE_SDDL.to_string(),
@@ -694,9 +728,18 @@ mod tests {
     }
 
     #[test]
-    fn a_windows_node_serves_nothing_but_may_turn_things_off() {
-        let serve = IpcRequest::Serve { name: "web".into(), ports: vec![], group: None, always_sign_in: false };
-        assert_eq!(refused_here(&serve).is_some(), cfg!(windows));
+    fn a_windows_node_serves_only_what_needs_no_rewrite_and_carries_nothing() {
+        let serve = |ports: &[&str]| IpcRequest::Serve {
+            name: "web".into(),
+            ports: ports.iter().map(|p| p.parse().unwrap()).collect(),
+            group: None,
+            always_sign_in: false,
+        };
+        assert!(refused_here(&serve(&["22", "53/udp", "80:8080", "443:8443", "80"])).is_none());
+        assert_eq!(refused_here(&serve(&["22", "2222:22"])).is_some(), cfg!(windows));
+        assert_eq!(refused_here(&serve(&["80:8080/udp"])).is_some(), cfg!(windows), "80 over UDP is no web app");
+        assert_eq!(refused_here(&serve(&["8080:192.168.1.1:80"])).is_some(), cfg!(windows));
+        assert!(unsupported_on_windows(&["2222:22".parse().unwrap()]).unwrap().contains("`22/tcp`"));
         assert_eq!(refused_here(&IpcRequest::TransitCapable { enabled: true }).is_some(), cfg!(windows));
         assert_eq!(refused_here(&IpcRequest::ExitCapable { enabled: true }).is_some(), cfg!(windows));
         assert!(refused_here(&IpcRequest::TransitCapable { enabled: false }).is_none());
@@ -847,8 +890,6 @@ mod tests {
         assert!(ctx.state.lock().await.pending_services.is_empty());
     }
 
-    // Over a connection, which a Windows daemon refuses (`refused_here`).
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn serve_then_list_shows_declared_service_as_local() {
         let (ctx, _dir, _rx) = test_ctx();
@@ -1095,8 +1136,6 @@ mod tests {
         assert!(!state.declared_services.iter().any(|d| d.name == "one-too-many"));
     }
 
-    // Over a connection, which a Windows daemon refuses (`refused_here`).
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn serve_can_still_update_an_existing_service_when_at_the_limit() {
         // Re-declaring a name already present replaces it rather than

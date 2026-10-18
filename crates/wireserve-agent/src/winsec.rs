@@ -17,6 +17,10 @@
 //! The daemon's pipe may also be shared with a local group, as its socket
 //! is with the `wireserve` group on Linux; [`local_group_sid`] is the
 //! lookup and [`ensure_local_group`] the `groupadd`.
+//!
+//! The TLS terminator (PLAN.md M50) runs as a virtual account of its own,
+//! `NT SERVICE\<its service>` ([`service_sid`]): its state directory
+//! ([`ensure_private_dir_for`]), its pipe and its firewall permits name it.
 
 use std::io;
 use std::path::Path;
@@ -29,8 +33,8 @@ use windows_sys::Win32::Security::Authorization::{
     SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    CreateWellKnownSid, EqualSid, GetSecurityDescriptorDacl, GetTokenInformation, LookupAccountNameW, SidTypeAlias,
-    TokenElevation, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid, ACL, DACL_SECURITY_INFORMATION,
+    CreateWellKnownSid, EqualSid, GetSecurityDescriptorDacl, GetSecurityDescriptorLength, GetTokenInformation,
+    LookupAccountNameW, SidTypeAlias, TokenElevation, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid, ACL, DACL_SECURITY_INFORMATION,
     OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
     SECURITY_MAX_SID_SIZE, SID_NAME_USE, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, WELL_KNOWN_SID_TYPE,
 };
@@ -68,6 +72,15 @@ impl SecurityDescriptor {
             return Err(io::Error::last_os_error());
         }
         Ok(Self(sd))
+    }
+
+    /// The descriptor as bytes, self-relative: what WFP takes as a
+    /// `FWP_SECURITY_DESCRIPTOR_TYPE` value.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        // SAFETY: a valid self-relative descriptor of that many bytes,
+        // alive as long as `self`.
+        unsafe { std::slice::from_raw_parts(self.0.cast::<u8>(), GetSecurityDescriptorLength(self.0) as usize) }
     }
 
     /// For `CreateNamedPipeW` and friends. Valid while `self` is.
@@ -129,6 +142,33 @@ pub fn restrict_to_admins(path: &Path) -> io::Result<()> {
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
     restrict_to_admins(dir)
+}
+
+/// [`ensure_private_dir`] for a directory another account works in — the
+/// TLS terminator's: SYSTEM, Administrators and that account (`sid`), and
+/// nobody else, after the same check of who owns it.
+pub fn ensure_private_dir_for(dir: &Path, sid: &str) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let name = wide(&dir.to_string_lossy());
+    check_owner(dir, &name)?;
+    let sd = SecurityDescriptor::from_sddl(&format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{sid})"))?;
+    let dacl = sd.dacl()?;
+    // SAFETY: a NUL-terminated path and a DACL inside `sd`, both live for the call.
+    let code = unsafe {
+        SetNamedSecurityInfoW(
+            name.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null(),
+        )
+    };
+    if code != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(code as i32));
+    }
+    Ok(())
 }
 
 /// Refuses a `path` owned by anyone but SYSTEM, Administrators or this
@@ -200,7 +240,24 @@ pub fn local_group_sid(name: &str) -> io::Result<Option<String>> {
         return Ok(None);
     }
     let computer = computer_name()?;
-    let account = wide(&format!("{computer}\\{name}"));
+    Ok(lookup(&format!("{computer}\\{name}"))?
+        .filter(|(_, kind, domain)| *kind == SidTypeAlias && domain.eq_ignore_ascii_case(&computer))
+        .map(|(sid, ..)| sid))
+}
+
+/// The SID of the service `name`'s own account, `NT SERVICE\<name>`, as
+/// SDDL writes it — what its process runs as under a virtual account.
+/// `None` until the service exists.
+pub fn service_sid(name: &str) -> io::Result<Option<String>> {
+    Ok(lookup(&format!(r"NT SERVICE\{name}"))?
+        .filter(|(sid, _, domain)| sid.starts_with("S-1-5-80-") && domain.eq_ignore_ascii_case("NT SERVICE"))
+        .map(|(sid, ..)| sid))
+}
+
+/// `account`'s SID (as SDDL writes it), what kind of account it is, and
+/// the domain it was found in; `None` for no such account.
+fn lookup(account: &str) -> io::Result<Option<(String, SID_NAME_USE, String)>> {
+    let account = wide(account);
     let mut sid = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
     let mut sid_len = SECURITY_MAX_SID_SIZE;
     let mut domain = vec![0u16; 256];
@@ -223,9 +280,6 @@ pub fn local_group_sid(name: &str) -> io::Result<Option<String>> {
         return if err.raw_os_error() == Some(ERROR_NONE_MAPPED as i32) { Ok(None) } else { Err(err) };
     }
     let domain = String::from_utf16_lossy(&domain[..domain_len as usize]);
-    if kind != SidTypeAlias || !domain.eq_ignore_ascii_case(&computer) {
-        return Ok(None);
-    }
     let mut text: PWSTR = std::ptr::null_mut();
     // SAFETY: a valid SID; `text` is allocated by the call and freed below.
     if unsafe { ConvertSidToStringSidW(sid.as_mut_ptr().cast(), &mut text) } == 0 {
@@ -238,7 +292,7 @@ pub fn local_group_sid(name: &str) -> io::Result<Option<String>> {
         LocalFree(text.cast());
         out
     };
-    Ok(Some(out))
+    Ok(Some((out, kind, domain)))
 }
 
 /// Creates the local group `name` unless one exists already: the Windows
@@ -344,6 +398,15 @@ mod tests {
     #[test]
     fn malformed_sddl_is_an_error() {
         assert!(SecurityDescriptor::from_sddl("D:(nonsense)").is_err());
+    }
+
+    /// Every service has a service SID, running or not: the Service
+    /// Control Manager's own `NT SERVICE\EventLog`, say.
+    #[test]
+    fn a_service_has_a_sid_of_its_own_and_a_missing_one_none() {
+        let sid = service_sid("EventLog").unwrap().expect("the event log service");
+        assert!(sid.starts_with("S-1-5-80-"), "{sid}");
+        assert_eq!(service_sid("wireserve-tls-no-such-instance").unwrap(), None);
     }
 
     #[test]

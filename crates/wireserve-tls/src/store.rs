@@ -179,17 +179,38 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
     let tmp = path.with_extension("tmp");
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        let mut f = create_private(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)
 }
 
+/// Creates (or truncates) `path` readable by its owner alone: `0600` on
+/// Unix. On Windows the file takes the state directory's ACL, which
+/// `install` gives the terminator's account and administrators only.
+pub(crate) fn create_private(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+#[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+/// See [`create_private`]: the directory's ACL is `install`'s.
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)]
+fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -218,10 +239,13 @@ pub(crate) mod tests {
         let life = loaded.not_after.duration_since(loaded.not_before).unwrap();
         assert_eq!(life, Duration::from_secs(90 * 86_400));
         assert_eq!(loaded.default_renewal(), loaded.not_before + Duration::from_secs(60 * 86_400));
-        use std::os::unix::fs::PermissionsExt;
-        let key_path = dir.path().join("certs").join(ca_id(CA)).join("plex.int.test/key.pem");
-        let mode = std::fs::metadata(key_path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let key_path = dir.path().join("certs").join(ca_id(CA)).join("plex.int.test/key.pem");
+            let mode = std::fs::metadata(key_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
     }
 
     const CA: &str = "https://acme-staging-v02.api.letsencrypt.org/directory";

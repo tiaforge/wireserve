@@ -2,6 +2,8 @@
 //! port of every address (PLAN.md M35), to which the agent rewrites each
 //! service address's 443; each connection goes to the service whose
 //! address it arrived on, and each request to its backend in plain HTTP.
+//! Where nothing rewrites (Windows, PLAN.md M50), a socket on each service
+//! address's 443 itself instead ([`Incoming`]).
 //!
 //! The proxying itself is hyper's pooled client, with each request's headers
 //! edited in place ([`Route::forward`], PLAN.md #329). What is ours is the
@@ -25,7 +27,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use hyper_util::server::conn::auto;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use wireserve_types::tls::NODE_HEADER;
 
@@ -690,6 +693,190 @@ impl Route {
 /// are closed unanswered.
 pub type Routes = Arc<RwLock<HashMap<Ipv4Addr, Arc<Route>>>>;
 
+/// Where a listener's connections come from.
+pub enum Incoming {
+    /// One socket on every address, to which the agent rewrites each service
+    /// address's public port (PLAN.md M35).
+    One(TcpListener),
+    /// One socket per service address on the public port itself, where
+    /// nothing rewrites (Windows, PLAN.md M50): see [`Addresses`].
+    PerAddress(mpsc::Receiver<(TcpStream, SocketAddr)>),
+}
+
+impl From<TcpListener> for Incoming {
+    fn from(listener: TcpListener) -> Self {
+        Self::One(listener)
+    }
+}
+
+impl Incoming {
+    /// The next connection; `None` once there will be none, its
+    /// [`Addresses`] gone (the terminator stopping).
+    async fn accept(&mut self) -> Option<std::io::Result<(TcpStream, SocketAddr)>> {
+        match self {
+            Self::One(listener) => Some(listener.accept().await),
+            Self::PerAddress(rx) => rx.recv().await.map(Ok),
+        }
+    }
+}
+
+/// What a service address is claimed with before it is routed to: nothing,
+/// where one socket listens on every address, or its own socket.
+pub enum Listening {
+    Every,
+    PerAddress(Addresses),
+}
+
+impl Listening {
+    /// Makes `vip` one this listener receives on.
+    pub fn claim(&mut self, vip: Ipv4Addr) -> std::io::Result<()> {
+        match self {
+            Self::Every => Ok(()),
+            Self::PerAddress(a) => a.bind(vip),
+        }
+    }
+
+    /// Stops receiving on `vip`, if it was claimed.
+    pub fn release(&mut self, vip: Ipv4Addr) {
+        if let Self::PerAddress(a) = self {
+            a.release(vip);
+        }
+    }
+}
+
+/// The sockets of one port on each service address (PLAN.md M50), all
+/// feeding one [`Incoming::PerAddress`]: opened as services are routed to,
+/// closed as they go.
+///
+/// Each is bound to its address alone, never the wildcard: the host's own
+/// servers keep 443 and 80 on its other addresses, and on these too if they
+/// bound the wildcard — a socket bound to the address itself takes that
+/// address's connections. On Windows each is bound for exclusive use, so
+/// no other process can bind the same address and port while it holds it;
+/// one that held it first makes the bind fail, and the service is not
+/// served (the agent only opens what the terminator says it serves).
+pub struct Addresses {
+    port: u16,
+    tx: mpsc::Sender<(TcpStream, SocketAddr)>,
+    bound: HashMap<Ipv4Addr, JoinHandle<()>>,
+}
+
+impl Addresses {
+    /// No address bound yet, and the connections all of them will accept.
+    #[must_use]
+    pub fn new(port: u16) -> (Self, Incoming) {
+        let (tx, rx) = mpsc::channel(64);
+        (Self { port, tx, bound: HashMap::new() }, Incoming::PerAddress(rx))
+    }
+
+    /// Listens on `vip`'s port, unless it already does. Fails while the
+    /// address is not the host's (the agent adds it) or someone else holds
+    /// the port on it.
+    pub fn bind(&mut self, vip: Ipv4Addr) -> std::io::Result<()> {
+        if self.bound.contains_key(&vip) {
+            return Ok(());
+        }
+        use socket2::{Domain, Protocol, Socket, Type};
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+        #[cfg(windows)]
+        exclusive_address_use(&socket)?;
+        socket.bind(&SocketAddr::new(vip.into(), self.port).into())?;
+        socket.listen(1024)?;
+        socket.set_nonblocking(true)?;
+        let listener = TcpListener::from_std(socket.into())?;
+        let tx = self.tx.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok(conn) => {
+                        if tx.send(conn).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(addr = %vip, error = %e, "accept failed");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        });
+        self.bound.insert(vip, task);
+        Ok(())
+    }
+
+    pub fn release(&mut self, vip: Ipv4Addr) {
+        if let Some(task) = self.bound.remove(&vip) {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for Addresses {
+    fn drop(&mut self) {
+        for task in self.bound.values() {
+            task.abort();
+        }
+    }
+}
+
+/// `SO_EXCLUSIVEADDRUSE`: without it, Windows lets another process bind the
+/// same address and port with `SO_REUSEADDR` and take connections from us.
+#[cfg(windows)]
+fn exclusive_address_use(socket: &socket2::Socket) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{setsockopt, SOCKET_ERROR, SOL_SOCKET, SO_EXCLUSIVEADDRUSE};
+    let on: i32 = 1;
+    // SAFETY: an open socket, and a value of the size given.
+    let rc = unsafe {
+        setsockopt(
+            socket.as_raw_socket() as usize,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            std::ptr::from_ref(&on).cast(),
+            std::mem::size_of::<i32>() as i32,
+        )
+    };
+    if rc == SOCKET_ERROR {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The TLS connections, the listening that goes with them, and the port
+/// they arrive on: [`listener`] on Linux; each service address's 443 on
+/// Windows, where nothing rewrites it (PLAN.md M50).
+#[cfg(unix)]
+pub fn open_tls(port: u16) -> std::io::Result<(Incoming, Listening, u16)> {
+    let listener = listener(port)?;
+    let port = listener.local_addr()?.port();
+    Ok((listener.into(), Listening::Every, port))
+}
+
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)]
+pub fn open_tls(_port: u16) -> std::io::Result<(Incoming, Listening, u16)> {
+    let (addresses, incoming) = Addresses::new(wireserve_types::TLS_PUBLIC_PORT);
+    Ok((incoming, Listening::PerAddress(addresses), wireserve_types::TLS_PUBLIC_PORT))
+}
+
+/// [`open_tls`] for plain HTTP (PLAN.md #328): [`http_listener`] on Linux,
+/// each service address's 80 on Windows.
+#[cfg(unix)]
+pub fn open_http(port: u16) -> std::io::Result<Option<(Incoming, Listening, u16)>> {
+    let Some(listener) = http_listener(port)? else {
+        return Ok(None);
+    };
+    let port = listener.local_addr()?.port();
+    Ok(Some((listener.into(), Listening::Every, port)))
+}
+
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)]
+pub fn open_http(_port: u16) -> std::io::Result<Option<(Incoming, Listening, u16)>> {
+    let (addresses, incoming) = Addresses::new(wireserve_types::HTTP_PUBLIC_PORT);
+    Ok(Some((incoming, Listening::PerAddress(addresses), wireserve_types::HTTP_PUBLIC_PORT)))
+}
+
 /// The TLS listening socket (PLAN.md M35): the first one systemd passed us
 /// when `wireserve-tls.socket` started this process — held by systemd
 /// across restarts, so no other local user can take the port in between —
@@ -712,15 +899,12 @@ pub fn http_listener(port: u16) -> std::io::Result<Option<TcpListener>> {
 
 /// The `index`th socket systemd passed, or one bound to `port`.
 fn listener_at(index: u32, port: u16) -> std::io::Result<TcpListener> {
-    use std::os::fd::FromRawFd;
     let pid = std::process::id();
     let passed = listen_fd(pid, std::env::var("LISTEN_PID").ok().as_deref(), std::env::var("LISTEN_FDS").ok().as_deref(), index);
     // Left in the environment: the runtime's other threads may read it, and
     // a child could never mistake them for its own, `LISTEN_PID` being ours.
-    let std_listener = match passed {
-        // SAFETY: systemd passed this descriptor to this very process
-        // (LISTEN_PID), and nothing else in it has taken ownership of it.
-        Some(fd) => unsafe { std::net::TcpListener::from_raw_fd(fd) },
+    let std_listener = match passed.and_then(passed_listener) {
+        Some(listener) => listener,
         None => {
             use socket2::{Domain, Protocol, Socket, Type};
             let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
@@ -734,13 +918,28 @@ fn listener_at(index: u32, port: u16) -> std::io::Result<TcpListener> {
     TcpListener::from_std(std_listener)
 }
 
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)]
+fn passed_listener(fd: i32) -> Option<std::net::TcpListener> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: systemd passed this descriptor to this very process
+    // (LISTEN_PID), and nothing else in it has taken ownership of it.
+    Some(unsafe { std::net::TcpListener::from_raw_fd(fd) })
+}
+
+/// No systemd: nothing is ever passed.
+#[cfg(windows)]
+fn passed_listener(_fd: i32) -> Option<std::net::TcpListener> {
+    None
+}
+
 /// The `index`th descriptor systemd's socket activation passed this
 /// process, if it passed that many: `LISTEN_PID` names us, and they count
 /// up from 3, in the order the socket unit lists them.
-fn listen_fd(pid: u32, listen_pid: Option<&str>, listen_fds: Option<&str>, index: u32) -> Option<std::os::fd::RawFd> {
-    const SD_LISTEN_FDS_START: std::os::fd::RawFd = 3;
+fn listen_fd(pid: u32, listen_pid: Option<&str>, listen_fds: Option<&str>, index: u32) -> Option<i32> {
+    const SD_LISTEN_FDS_START: i32 = 3;
     let count = passed_fds(pid, listen_pid, listen_fds)?;
-    (index < count).then(|| SD_LISTEN_FDS_START + std::os::fd::RawFd::try_from(index).unwrap_or(0))
+    (index < count).then(|| SD_LISTEN_FDS_START + i32::try_from(index).unwrap_or(0))
 }
 
 /// How many descriptors systemd passed this process; `None` when it was
@@ -757,29 +956,29 @@ fn passed_fds(pid: u32, listen_pid: Option<&str>, listen_fds: Option<&str>) -> O
 /// request, not once per connection: a grant taken away, or a node
 /// revoked, reaches a keep-alive or HTTP/2 connection at its next request,
 /// and an upgraded one — a WebSocket — within [`Limits::recheck`].
-pub fn spawn(listener: TcpListener, tls: Arc<rustls::ServerConfig>, shared: Shared) -> JoinHandle<()> {
+pub fn spawn(listener: impl Into<Incoming>, tls: Arc<rustls::ServerConfig>, shared: Shared) -> JoinHandle<()> {
     spawn_with_limits(listener, tls, shared, Limits::default())
 }
 
 /// [`spawn`], with the connection limits given.
-pub fn spawn_with_limits(listener: TcpListener, tls: Arc<rustls::ServerConfig>, shared: Shared, limits: Limits) -> JoinHandle<()> {
-    accept(listener, Some(tokio_rustls::TlsAcceptor::from(tls)), shared, limits)
+pub fn spawn_with_limits(listener: impl Into<Incoming>, tls: Arc<rustls::ServerConfig>, shared: Shared, limits: Limits) -> JoinHandle<()> {
+    accept(listener.into(), Some(tokio_rustls::TlsAcceptor::from(tls)), shared, limits)
 }
 
 /// The plain-HTTP listener (PLAN.md #328): each service's port 80, answered
 /// by the same rules as its 443 but for the sign-in, which needs TLS to keep
 /// a session in.
-pub fn spawn_http(listener: TcpListener, shared: Shared) -> JoinHandle<()> {
+pub fn spawn_http(listener: impl Into<Incoming>, shared: Shared) -> JoinHandle<()> {
     spawn_http_with_limits(listener, shared, Limits::default())
 }
 
 /// [`spawn_http`], with the connection limits given.
-pub fn spawn_http_with_limits(listener: TcpListener, shared: Shared, limits: Limits) -> JoinHandle<()> {
-    accept(listener, None, shared, limits)
+pub fn spawn_http_with_limits(listener: impl Into<Incoming>, shared: Shared, limits: Limits) -> JoinHandle<()> {
+    accept(listener.into(), None, shared, limits)
 }
 
 /// One listener's accept loop: TLS when `tls` is given, plain HTTP without.
-fn accept(listener: TcpListener, tls: Option<tokio_rustls::TlsAcceptor>, shared: Shared, limits: Limits) -> JoinHandle<()> {
+fn accept(mut listener: Incoming, tls: Option<tokio_rustls::TlsAcceptor>, shared: Shared, limits: Limits) -> JoinHandle<()> {
     let http = tls.is_none();
     let conns = Arc::new(Conns::default());
     let upgrade_slots = Arc::new(UpgradeSlots::default());
@@ -787,15 +986,16 @@ fn accept(listener: TcpListener, tls: Option<tokio_rustls::TlsAcceptor>, shared:
         let mut last_refusal_logged: Option<Instant> = None;
         loop {
             let (tcp, peer) = match listener.accept().await {
-                Ok(c) => c,
-                Err(e) => {
+                None => return,
+                Some(Ok(c)) => c,
+                Some(Err(e)) => {
                     tracing::warn!(error = %e, "accept failed");
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
             };
-            // The address the agent rewrote 443 (or 80) to this port on.
-            // Anything else — the host's own addresses, a service no longer
+            // The address the agent rewrote 443 (or 80) to this port on, or
+            // whose own socket accepted it. Anything else — the host's own addresses, a service no longer
             // served — is nobody's to answer.
             let Some(vip) = tcp.local_addr().ok().and_then(|a| local_v4(a.ip())) else {
                 continue;
@@ -1438,7 +1638,8 @@ fn join_cookies(headers: &mut HeaderMap) {
     }
 }
 
-#[cfg(test)]
+// Unix only, like the sign-in's: most of these use its stand-in agent.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -1588,6 +1789,34 @@ mod tests {
         // The plain-HTTP socket is the second (PLAN.md #328).
         assert_eq!(listen_fd(42, Some("42"), Some("2"), 1), Some(4));
         assert_eq!(listen_fd(42, Some("42"), Some("1"), 1), None, "a socket unit from before it");
+    }
+
+    /// Each service address's own socket (PLAN.md M50), all feeding one
+    /// accept loop that knows which address each came in on.
+    #[tokio::test]
+    async fn per_address_sockets_feed_one_incoming_and_close_when_released() {
+        // A free port, then two loopback addresses on it.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let (a, b) = (Ipv4Addr::new(127, 0, 0, 2), Ipv4Addr::new(127, 0, 0, 3));
+        let (mut addresses, mut incoming) = Addresses::new(port);
+        addresses.bind(a).unwrap();
+        addresses.bind(a).unwrap();
+        addresses.bind(b).unwrap();
+        for vip in [a, b] {
+            let _client = TcpStream::connect((vip, port)).await.unwrap();
+            let (tcp, _) = incoming.accept().await.unwrap().unwrap();
+            assert_eq!(tcp.local_addr().unwrap().ip(), std::net::IpAddr::V4(vip));
+        }
+        addresses.release(a);
+        tokio::task::yield_now().await;
+        assert!(TcpStream::connect((a, port)).await.is_err(), "a released address is not listened on");
+        let _client = TcpStream::connect((b, port)).await.unwrap();
+        assert!(incoming.accept().await.unwrap().is_ok());
+        // Not one of the host's: the agent has not added it yet.
+        assert!(addresses.bind(Ipv4Addr::new(192, 0, 2, 1)).is_err());
+        // The terminator stopping: no more connections, and no error either.
+        drop(addresses);
+        assert!(incoming.accept().await.is_none());
     }
 
     #[tokio::test]
