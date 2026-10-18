@@ -6,15 +6,36 @@ and reaches every service it is allowed to by its `<service>.wg` name, the
 same as a Linux node.
 
 It can also publish services, with HTTPS under their names, as a Linux
-node does (see [Serving](#serving) for what differs). What a Windows node
-does **not** do, yet:
+node does. What it does not do yet is listed under
+[Not on Windows yet](#not-on-windows-yet).
 
-- **publish a port as another one** (`2222:22`), except TCP 80 and 443,
-  which its TLS terminator passes on to any port;
-- **forward to another address** (`80:192.168.1.1:80`);
-- **carry traffic** for others: no `transit` and no `exit`.
+## Not on Windows yet
 
-A Windows node refuses those commands.
+What works on Linux and not, or differently, on Windows:
+
+- **Publishing a port as another one** (`wireserve ssh 2222:22`) is
+  refused, but for TCP 80 and 443, which the TLS terminator passes on to any
+  port. Publish the port the service listens on (`wireserve ssh 22`).
+- **Publishing a service on another address** (`80:192.168.1.1:80`, a
+  router or printer on the computer's network) is refused.
+- **Port 80 without the terminator**: while the terminator does not answer
+  a service's 80 (just installed, or stopped), an `80:3000` service is
+  closed on 80, where Linux passes it straight to the service. An `80`
+  published as itself still gets through, marked `(80 unguarded)`.
+- **Where the service listens**: on every address (`0.0.0.0`) or on the
+  service's own address. On the node's mesh address alone it is not
+  reached, as it would be on Linux.
+- **Carrying traffic for others**: no `transit`, no relaying for other
+  nodes, no `exit`. The commands are refused.
+- **`wireserve-admin` and the coordinator** do not run on Windows: manage
+  the mesh from a Linux machine.
+- **`install --tls-port`** is refused: the terminator listens on each
+  service's own 443 and 80.
+- **Downloads**: a zip, for x86_64 only (no ARM64), with an unsigned
+  `wireserve.exe`, which SmartScreen warns about.
+- **The adapter's name** changes between `wireserve0` and `wireserve1` on
+  every restart of the service, while Windows still removes the old one.
+  Nothing depends on the name.
 
 ## Installing
 
@@ -164,7 +185,11 @@ beside it), and every other command takes the same flag.
   known mesh, readable by SYSTEM and Administrators only. The agent refuses
   a `wireserve` folder there that some other user created.
 - **Its log**, `C:\ProgramData\wireserve\agent.log` (an instance's in its
-  own folder under `instances\`), kept to about 10 MiB.
+  own folder under `instances\`), kept to about 10 MiB, and the
+  terminator's, `C:\ProgramData\wireserve-tls\tls.log`. `ProgramData` is
+  a hidden folder, and both are readable by administrators only, so
+  Explorer will not open them from a normal account; from an elevated
+  PowerShell, `Get-Content C:\ProgramData\wireserve\agent.log -Tail 50 -Wait`.
 
 ## Troubleshooting
 
