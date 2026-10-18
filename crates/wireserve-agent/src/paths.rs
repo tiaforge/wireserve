@@ -123,11 +123,20 @@ impl Instance {
     /// unit, which gives it a state directory of its own.
     #[must_use]
     pub fn tls_state_dir(&self) -> PathBuf {
+        let root = tls_state_root();
         if self.is_default() {
-            PathBuf::from("/var/lib/wireserve-tls")
+            root
         } else {
-            PathBuf::from("/var/lib/wireserve-tls").join(&self.name)
+            root.join(&self.name)
         }
+    }
+
+    /// The terminator's log on Windows (PLAN.md M50), in its own state
+    /// directory: the agent's is not its to write.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn tls_log_path(&self) -> PathBuf {
+        self.tls_state_dir().join("tls.log")
     }
 
     /// The service's log on Windows, beside the state: a service has no
@@ -169,6 +178,20 @@ fn state_root() -> PathBuf {
         let data = std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into());
         PathBuf::from(data).join("wireserve")
     })
+}
+
+#[cfg(not(windows))]
+fn tls_state_root() -> PathBuf {
+    PathBuf::from("/var/lib/wireserve-tls")
+}
+
+/// `%ProgramData%\wireserve-tls`, beside the agent's own directory rather
+/// than in it: `install` gives it an ACL of its own, which lets the
+/// terminator's account in (`crate::winsec::ensure_private_dir_for`).
+#[cfg(windows)]
+fn tls_state_root() -> PathBuf {
+    let data = std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into());
+    PathBuf::from(data).join("wireserve-tls")
 }
 
 /// Where the IPC endpoints live. On Windows that is the named-pipe
