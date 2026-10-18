@@ -13,22 +13,28 @@
 //! applied to a directory whose owner is SYSTEM, Administrators, or the
 //! account the agent runs as; one some other user created first is
 //! refused rather than adopted.
+//!
+//! The daemon's pipe may also be shared with a local group, as its socket
+//! is with the `wireserve` group on Linux; [`local_group_sid`] is the
+//! lookup and [`ensure_local_group`] the `groupadd`.
 
 use std::io;
 use std::path::Path;
 
-use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, HANDLE};
+use windows_sys::core::PWSTR;
+use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_ALIAS_EXISTS, ERROR_NONE_MAPPED, ERROR_SUCCESS, HANDLE};
+use windows_sys::Win32::NetworkManagement::NetManagement::{NetLocalGroupAdd, LOCALGROUP_INFO_1};
 use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, SetNamedSecurityInfoW,
-    SDDL_REVISION_1, SE_FILE_OBJECT,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
+    SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    CreateWellKnownSid, EqualSid, GetSecurityDescriptorDacl, GetTokenInformation, TokenElevation, TokenUser,
-    WinBuiltinAdministratorsSid,
-    WinLocalSystemSid, ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
-    WELL_KNOWN_SID_TYPE,
+    CreateWellKnownSid, EqualSid, GetSecurityDescriptorDacl, GetTokenInformation, LookupAccountNameW, SidTypeAlias,
+    TokenElevation, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid, ACL, DACL_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+    SECURITY_MAX_SID_SIZE, SID_NAME_USE, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, WELL_KNOWN_SID_TYPE,
 };
+use windows_sys::Win32::System::SystemInformation::{ComputerNameNetBIOS, GetComputerNameExW};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use crate::winnet::wide;
@@ -184,6 +190,92 @@ fn well_known_sid(kind: WELL_KNOWN_SID_TYPE) -> io::Result<Vec<u8>> {
     Ok(sid)
 }
 
+/// The SID, as SDDL writes it, of `name` if that is a group of this
+/// computer's own (an alias in its local account database), and `None`
+/// otherwise. Not a domain's group of the same name, nor a built-in one:
+/// the plain name would resolve to a domain group when there is no local
+/// one, and anyone the domain lets create groups could make that.
+pub fn local_group_sid(name: &str) -> io::Result<Option<String>> {
+    if name.is_empty() || name.contains(['\\', '@']) {
+        return Ok(None);
+    }
+    let computer = computer_name()?;
+    let account = wide(&format!("{computer}\\{name}"));
+    let mut sid = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut sid_len = SECURITY_MAX_SID_SIZE;
+    let mut domain = vec![0u16; 256];
+    let mut domain_len = domain.len() as u32;
+    let mut kind: SID_NAME_USE = 0;
+    // SAFETY: a NUL-terminated name; `sid` and `domain` are the sizes given.
+    let ok = unsafe {
+        LookupAccountNameW(
+            std::ptr::null(),
+            account.as_ptr(),
+            sid.as_mut_ptr().cast(),
+            &mut sid_len,
+            domain.as_mut_ptr(),
+            &mut domain_len,
+            &mut kind,
+        )
+    };
+    if ok == 0 {
+        let err = io::Error::last_os_error();
+        return if err.raw_os_error() == Some(ERROR_NONE_MAPPED as i32) { Ok(None) } else { Err(err) };
+    }
+    let domain = String::from_utf16_lossy(&domain[..domain_len as usize]);
+    if kind != SidTypeAlias || !domain.eq_ignore_ascii_case(&computer) {
+        return Ok(None);
+    }
+    let mut text: PWSTR = std::ptr::null_mut();
+    // SAFETY: a valid SID; `text` is allocated by the call and freed below.
+    if unsafe { ConvertSidToStringSidW(sid.as_mut_ptr().cast(), &mut text) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a NUL-terminated string from the call above, freed once.
+    let out = unsafe {
+        let len = (0..).take_while(|&i| *text.add(i) != 0).count();
+        let out = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+        LocalFree(text.cast());
+        out
+    };
+    Ok(Some(out))
+}
+
+/// Creates the local group `name` unless one exists already: the Windows
+/// `groupadd --system`. A user or a domain group of that name is an error,
+/// as it would be the account [`local_group_sid`] refuses.
+pub fn ensure_local_group(name: &str, comment: &str) -> io::Result<()> {
+    // Network Management's own codes, which the system's messages don't
+    // cover (`io::Error` would print "unknown error").
+    const NERR_GROUP_EXISTS: u32 = 2223;
+    const NERR_USER_EXISTS: u32 = 2224;
+    let mut wname = wide(name);
+    let mut wcomment = wide(comment);
+    let info = LOCALGROUP_INFO_1 { lgrpi1_name: wname.as_mut_ptr(), lgrpi1_comment: wcomment.as_mut_ptr() };
+    let mut bad_field = 0u32;
+    // SAFETY: level 1 takes a LOCALGROUP_INFO_1, whose strings outlive the call.
+    let code = unsafe { NetLocalGroupAdd(std::ptr::null(), 1, std::ptr::from_ref(&info).cast(), &mut bad_field) };
+    match code {
+        ERROR_SUCCESS | ERROR_ALIAS_EXISTS => Ok(()),
+        NERR_GROUP_EXISTS | NERR_USER_EXISTS => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("could not create the local group `{name}`: a user or a domain group already has that name"),
+        )),
+        code => Err(io::Error::other(format!("could not create the local group `{name}` (error {code})"))),
+    }
+}
+
+/// This computer's NetBIOS name: the name of its local account database.
+fn computer_name() -> io::Result<String> {
+    let mut buf = vec![0u16; 64];
+    let mut len = buf.len() as u32;
+    // SAFETY: `buf` is `len` characters, written by the call.
+    if unsafe { GetComputerNameExW(ComputerNameNetBIOS, buf.as_mut_ptr(), &mut len) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(String::from_utf16_lossy(&buf[..len as usize]))
+}
+
 /// Whether this process runs elevated — as SYSTEM, or an administrator
 /// past the UAC prompt: the Windows counterpart of `euid == 0`.
 pub fn is_elevated() -> io::Result<bool> {
@@ -252,5 +344,37 @@ mod tests {
     #[test]
     fn malformed_sddl_is_an_error() {
         assert!(SecurityDescriptor::from_sddl("D:(nonsense)").is_err());
+    }
+
+    #[test]
+    fn only_a_group_of_this_computer_has_a_local_group_sid() {
+        assert_eq!(local_group_sid("wireserve-test-no-such-group").unwrap(), None);
+        // Built in, so in BUILTIN and not in this computer's own database.
+        assert_eq!(local_group_sid("Administrators").unwrap(), None);
+        // A name with a domain in it is refused before any lookup.
+        assert_eq!(local_group_sid(r"OTHER\wireserve").unwrap(), None);
+        assert_eq!(local_group_sid("").unwrap(), None);
+    }
+
+    /// Creating a local group takes an administrator.
+    #[test]
+    fn a_created_group_is_found_and_creating_it_again_is_fine() {
+        use windows_sys::Win32::NetworkManagement::NetManagement::NetLocalGroupDel;
+
+        if !is_elevated().unwrap_or(false) {
+            assert!(std::env::var_os("WIRESERVE_TEST_STRICT").is_none(), "would skip under WIRESERVE_TEST_STRICT: not elevated");
+            eprintln!("SKIPPED: not elevated: creating a local group takes an administrator");
+            return;
+        }
+        let name = format!("wireserve-test-{}", std::process::id());
+        ensure_local_group(&name, "wireserve test").unwrap();
+        let found = local_group_sid(&name);
+        let again = ensure_local_group(&name, "wireserve test");
+        // SAFETY: a NUL-terminated name.
+        unsafe { NetLocalGroupDel(std::ptr::null(), wide(&name).as_ptr()) };
+        let sid = found.unwrap().expect("the group just created");
+        assert!(sid.starts_with("S-1-5-21-"), "a local account database's SID, not {sid}");
+        again.unwrap();
+        assert_eq!(local_group_sid(&name).unwrap(), None);
     }
 }
