@@ -82,17 +82,17 @@ impl Instance {
 
     fn state_dir(&self) -> PathBuf {
         if self.is_default() {
-            state_root()
+            crate::platform::paths::state_root()
         } else {
-            state_root().join(INSTANCES_DIR).join(&self.name)
+            crate::platform::paths::state_root().join(INSTANCES_DIR).join(&self.name)
         }
     }
 
     fn run_dir(&self) -> PathBuf {
         if self.is_default() {
-            run_root().join("wireserve")
+            crate::platform::paths::run_root().join("wireserve")
         } else {
-            run_root().join(format!("wireserve-{}", self.name))
+            crate::platform::paths::run_root().join(format!("wireserve-{}", self.name))
         }
     }
 
@@ -112,9 +112,9 @@ impl Instance {
     #[must_use]
     pub fn tls_socket_path(&self) -> PathBuf {
         let dir = if self.is_default() {
-            run_root().join("wireserve-tls")
+            crate::platform::paths::run_root().join("wireserve-tls")
         } else {
-            run_root().join(format!("wireserve-tls-{}", self.name))
+            crate::platform::paths::run_root().join(format!("wireserve-tls-{}", self.name))
         };
         dir.join("tls.sock")
     }
@@ -123,7 +123,7 @@ impl Instance {
     /// unit, which gives it a state directory of its own.
     #[must_use]
     pub fn tls_state_dir(&self) -> PathBuf {
-        let root = tls_state_root();
+        let root = crate::platform::paths::tls_state_root();
         if self.is_default() {
             root
         } else {
@@ -133,7 +133,6 @@ impl Instance {
 
     /// The terminator's log on Windows (PLAN.md M50), in its own state
     /// directory: the agent's is not its to write.
-    #[cfg(windows)]
     #[must_use]
     pub fn tls_log_path(&self) -> PathBuf {
         self.tls_state_dir().join("tls.log")
@@ -141,7 +140,6 @@ impl Instance {
 
     /// The service's log on Windows, beside the state: a service has no
     /// console, and the state directory is already private.
-    #[cfg(windows)]
     #[must_use]
     pub fn log_path(&self) -> PathBuf {
         self.state_path().with_file_name("agent.log")
@@ -162,59 +160,10 @@ impl Instance {
     }
 }
 
-#[cfg(not(windows))]
-fn state_root() -> PathBuf {
-    std::env::var("WIRESERVE_STATE_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/var/lib/wireserve"))
-}
-
-/// `%ProgramData%\wireserve`. The directory gets an ACL of its own when
-/// created (`crate::winsec`): what ProgramData's children inherit lets
-/// every local user read them.
-#[cfg(windows)]
-fn state_root() -> PathBuf {
-    std::env::var("WIRESERVE_STATE_ROOT").map(PathBuf::from).unwrap_or_else(|_| {
-        let data = std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into());
-        PathBuf::from(data).join("wireserve")
-    })
-}
-
-#[cfg(not(windows))]
-fn tls_state_root() -> PathBuf {
-    PathBuf::from("/var/lib/wireserve-tls")
-}
-
-/// `%ProgramData%\wireserve-tls`, beside the agent's own directory rather
-/// than in it: `install` gives it an ACL of its own, which lets the
-/// terminator's account in (`crate::winsec::ensure_private_dir_for`).
-#[cfg(windows)]
-fn tls_state_root() -> PathBuf {
-    let data = std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into());
-    PathBuf::from(data).join("wireserve-tls")
-}
-
-/// Where the IPC endpoints live. On Windows that is the named-pipe
-/// namespace, so `socket_path` is a pipe name such as
-/// `\\.\pipe\wireserve\agent.sock`.
-#[cfg(not(windows))]
-fn run_root() -> PathBuf {
-    std::env::var("WIRESERVE_RUN_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/run"))
-}
-
-#[cfg(windows)]
-fn run_root() -> PathBuf {
-    std::env::var("WIRESERVE_RUN_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(r"\\.\pipe"))
-}
-
 /// Every instance that has a state directory, the default one included.
 pub fn all_instances() -> Vec<Instance> {
     let mut out = vec![Instance::default()];
-    if let Ok(entries) = std::fs::read_dir(state_root().join(INSTANCES_DIR)) {
+    if let Ok(entries) = std::fs::read_dir(crate::platform::paths::state_root().join(INSTANCES_DIR)) {
         out.extend(
             entries
                 .flatten()
@@ -251,20 +200,8 @@ pub fn other_instances(own: &Instance) -> Vec<(Instance, AgentState)> {
 
 /// The hosts file (spec §6). Shared by every instance; each one owns only
 /// its own marked block.
-#[cfg(not(windows))]
 pub fn hosts_path() -> PathBuf {
-    std::env::var("WIRESERVE_HOSTS_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/etc/hosts"))
-}
-
-/// `%SystemRoot%\System32\drivers\etc\hosts`.
-#[cfg(windows)]
-pub fn hosts_path() -> PathBuf {
-    std::env::var("WIRESERVE_HOSTS_PATH").map(PathBuf::from).unwrap_or_else(|_| {
-        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-        PathBuf::from(root).join(r"System32\drivers\etc\hosts")
-    })
+    crate::platform::paths::hosts_path()
 }
 
 #[cfg(test)]

@@ -65,7 +65,7 @@ pub trait Divert: Send + Sync {
     fn retain(&self, live: &[u32]);
 }
 
-impl Divert for crate::firewall::nftables::PhoneDivert {
+impl Divert for crate::platform::linux::nftables::PhoneDivert {
     fn add(&self, index: u32) {
         Self::add(self, index);
     }
@@ -676,7 +676,7 @@ mod tests {
         use std::sync::mpsc;
         use wireserve_types::{FirewallBackend, Forwarding, PhoneRelayRules};
 
-        if !crate::firewall::netns::reexec("phone_relay::io::tests::kernel_a_phone_reaches_a_relayed_node_and_the_carrier_on_one_port") {
+        if !crate::platform::linux::netns::reexec("phone_relay::io::tests::kernel_a_phone_reaches_a_relayed_node_and_the_carrier_on_one_port") {
             return;
         }
         let mut spaces = Vec::new();
@@ -698,8 +698,8 @@ mod tests {
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 
         let (phone, minipc, carrier) = (End::new(1), End::new(2), End::new(4));
-        let mut fw = crate::firewall::nftables::NftablesBackend::new("wg0").unwrap();
-        let rules = PhoneRelayRules { listen_port: 51820, divert_port: 42000, mesh_port: 42001, pool: Some(42003..=42066), indexes: Vec::new() };
+        let mut fw = crate::platform::linux::nftables::NftablesBackend::new("wg0").unwrap();
+        let rules = PhoneRelayRules { listen_port: 51820, divert_port: 42000, mesh_port: 42001, indexes: Vec::new() };
         let forwarding = Forwarding {
             relay_self: Some("100.90.0.2".parse().unwrap()),
             relay_ends: vec![51820],
@@ -955,7 +955,7 @@ mod tests {
         use defguard_boringtun::noise::TunnResult;
         use wireserve_types::{FirewallBackend, Forwarding, PhoneRelayRules};
 
-        if !crate::firewall::netns::reexec("phone_relay::io::tests::kernel_wireguard_answers_a_handshake_given_back_to_it") {
+        if !crate::platform::linux::netns::reexec("phone_relay::io::tests::kernel_wireguard_answers_a_handshake_given_back_to_it") {
             return;
         }
         let (phone, carrier) = (End::new(1), End::new(4));
@@ -975,7 +975,7 @@ mod tests {
             let _ = space.kill();
             let _ = space.wait();
             if String::from_utf8_lossy(&out.stderr).contains("type wireguard") || String::from_utf8_lossy(&out.stderr).contains("Unknown device type") {
-                crate::firewall::netns::skip("no wireguard kernel module");
+                crate::platform::linux::netns::skip("no wireguard kernel module");
                 return;
             }
             panic!("{}", String::from_utf8_lossy(&out.stderr));
@@ -990,7 +990,7 @@ mod tests {
         let out = std::process::Command::new("sh").args(["-euc", &wg]).output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 
-        let mut fw = crate::firewall::nftables::NftablesBackend::new("wg0").unwrap();
+        let mut fw = crate::platform::linux::nftables::NftablesBackend::new("wg0").unwrap();
         fw.apply(&[], &Forwarding {
             relay_self: Some("100.90.0.2".parse().unwrap()),
             phone_relay: Some(PhoneRelayRules { listen_port: 51820, divert_port: 42000, mesh_port: 42001, pool: None, indexes: Vec::new() }),
