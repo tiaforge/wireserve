@@ -40,6 +40,19 @@ pub struct TransitState {
     dialable: Mutex<HashMap<String, (bool, DateTime<Utc>)>>,
     /// Port checks under way, by carrier pubkey (PLAN.md M40).
     port_checks: Mutex<HashMap<String, Vec<PendingCheck>>>,
+    /// Where carriers see each node's WireGuard traffic come from, by the
+    /// observed node's pubkey (`PollRequest::transit_observed`).
+    observed: Mutex<HashMap<String, Observed>>,
+}
+
+/// One node's source address as a carrier last saw it.
+#[derive(Debug, Clone)]
+struct Observed {
+    addr: String,
+    /// The carrier that saw it.
+    by: String,
+    /// When a carrier last said so.
+    at: DateTime<Utc>,
 }
 
 /// One port check under way: the carrier listens on `port`, and the
@@ -158,6 +171,8 @@ impl TransitState {
             report.transit_capable = false;
             report.reachable.clear();
         }
+        drop(by_pubkey);
+        self.observed.lock().expect("transit state mutex poisoned").retain(|_, o| o.by != pubkey);
     }
 
     /// Whether this node is *currently* offering to carry traffic, from its
@@ -383,6 +398,55 @@ impl TransitState {
         }
     }
 
+    /// Records where `carrier` sees each of `seen`'s nodes (`(pubkey,
+    /// addr)`), and returns the nodes whose address changed.
+    ///
+    /// Two carriers can disagree: behind a NAT that maps each destination
+    /// apart, each sees a port of its own. The address held stays while any
+    /// carrier still says so within `fresh_secs`, so such a node doesn't
+    /// flap between them on every poll; it moves when the carrier that saw
+    /// it sees another, or when nobody has confirmed it for that long.
+    pub fn report_observed(&self, carrier: &str, seen: &[(String, String)], fresh_secs: i64) -> Vec<String> {
+        let now = Utc::now();
+        let mut observed = self.observed.lock().expect("transit state mutex poisoned");
+        let mut changed = Vec::new();
+        for (pubkey, addr) in seen {
+            match observed.get_mut(pubkey) {
+                Some(o) if o.addr == *addr => {
+                    o.by = carrier.to_string();
+                    o.at = now;
+                }
+                Some(o) if o.by != carrier && (now - o.at).num_seconds() <= fresh_secs => {}
+                _ => {
+                    observed.insert(pubkey.clone(), Observed { addr: addr.clone(), by: carrier.to_string(), at: now });
+                    changed.push(pubkey.clone());
+                }
+            }
+        }
+        changed
+    }
+
+    /// Where a carrier last saw `pubkey`'s traffic come from. Kept however
+    /// old: a node nobody reaches right now was last seen there, which is
+    /// still a better guess than its startup probe.
+    #[must_use]
+    pub fn observed_addr(&self, pubkey: &str) -> Option<String> {
+        self.observed.lock().ok()?.get(pubkey).map(|o| o.addr.clone())
+    }
+
+    /// [`Self::observed_addr`] for every node at once.
+    #[must_use]
+    pub fn observed_addrs(&self) -> HashMap<String, String> {
+        let observed = self.observed.lock().expect("transit state mutex poisoned");
+        observed.iter().map(|(pk, o)| (pk.clone(), o.addr.clone())).collect()
+    }
+
+    /// Drops what carriers saw of `pubkey`, when the node itself has just
+    /// learned something newer: a restarted agent's own probe.
+    pub fn forget_observed(&self, pubkey: &str) {
+        self.observed.lock().expect("transit state mutex poisoned").remove(pubkey);
+    }
+
     /// Drops a node's report — on revoke and rejoin, so it can never be
     /// selected as transit and never shows up as wanting anything
     /// afterward.
@@ -395,6 +459,7 @@ impl TransitState {
         self.carry_ports.lock().expect("transit state mutex poisoned").remove(pubkey);
         self.dialable.lock().expect("transit state mutex poisoned").remove(pubkey);
         self.port_checks.lock().expect("transit state mutex poisoned").remove(pubkey);
+        self.observed.lock().expect("transit state mutex poisoned").retain(|pk, o| pk != pubkey && o.by != pubkey);
     }
 }
 
@@ -498,6 +563,41 @@ mod tests {
         s.report("b", true, &["a".into(), "c".into()], &[]);
         s.report("b", true, &["a".into()], &[]);
         assert_eq!(s.select("a", "c", 30), None);
+    }
+
+    fn seen(pk: &str, addr: &str) -> Vec<(String, String)> {
+        vec![(pk.to_string(), addr.to_string())]
+    }
+
+    #[test]
+    fn an_observed_address_stays_while_any_carrier_confirms_it() {
+        let s = TransitState::default();
+        assert_eq!(s.report_observed("c1", &seen("x", "198.51.100.1:1000"), 60), ["x"]);
+        assert!(s.report_observed("c1", &seen("x", "198.51.100.1:1000"), 60).is_empty(), "no change");
+        // A second carrier, behind which x's NAT maps another port, doesn't
+        // move it while the first still sees it.
+        assert!(s.report_observed("c2", &seen("x", "198.51.100.1:2000"), 60).is_empty());
+        assert_eq!(s.observed_addr("x").as_deref(), Some("198.51.100.1:1000"));
+        // The carrier that saw it sees x somewhere new: it moves.
+        assert_eq!(s.report_observed("c1", &seen("x", "203.0.113.5:3000"), 60), ["x"]);
+        assert_eq!(s.observed_addr("x").as_deref(), Some("203.0.113.5:3000"));
+        // Unconfirmed for longer than `fresh_secs`, anyone may move it.
+        assert_eq!(s.report_observed("c2", &seen("x", "198.51.100.1:2000"), -1), ["x"]);
+    }
+
+    #[test]
+    fn a_carriers_observations_go_with_its_approval_and_a_nodes_with_it() {
+        let s = TransitState::default();
+        s.report_observed("c1", &seen("x", "198.51.100.1:1000"), 60);
+        s.report_observed("c2", &seen("y", "198.51.100.2:1000"), 60);
+        s.report_observed("c2", &seen("z", "198.51.100.3:1000"), 60);
+        s.withdraw_carrier("c1");
+        assert_eq!(s.observed_addr("x"), None);
+        s.forget("y");
+        assert_eq!(s.observed_addr("y"), None);
+        assert!(s.observed_addr("z").is_some());
+        s.forget("c2");
+        assert_eq!(s.observed_addrs().len(), 0);
     }
 
     #[test]

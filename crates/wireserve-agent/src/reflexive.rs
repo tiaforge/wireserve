@@ -17,9 +17,11 @@
 //! guaranteed, and never attempted for symmetric NAT (out of scope —
 //! that needs a relay, NAT-traversal step 3, not yet designed). Runs
 //! once per agent process lifetime (`register::join` and each
-//! `cmd_daemon` startup), not every poll cycle: a NAT remapping later
-//! (e.g. a router reboot) is only recovered by a restart, same class of
-//! limitation `listen_port` itself already has.
+//! `cmd_daemon` startup), not every poll cycle. A NAT remapping later (a
+//! router reboot, a VPN switched on and off) is followed instead by an
+//! approved carrier, which reports where it sees this node's packets come
+//! from (`PollRequest::transit_observed`, PLAN.md decisions log #336); the
+//! coordinator publishes that in place of this probe's answer.
 
 use std::time::Duration;
 

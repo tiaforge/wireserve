@@ -633,6 +633,9 @@ pub struct EndpointTracker {
     /// Every other agent this node reaches directly, by pubkey, with its
     /// mesh address — see [`Self::peers_to_nudge`].
     nudge: HashMap<String, Ipv4Addr>,
+    /// This node's own public address and reflexive address as of the last
+    /// cycle that knew them — see [`Self::note_own_path`].
+    own_path: Option<(String, Option<String>)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -642,6 +645,33 @@ struct RxSeen {
 }
 
 impl EndpointTracker {
+    /// Notes how this node reaches the internet this cycle: its public IPv4
+    /// address as the coordinator sees it (`public`), and the reflexive
+    /// address its peers are told. When either moved since the last cycle
+    /// (a VPN switched on or off, a new address from the ISP, a router that
+    /// remapped), every tier's backoff is lifted: it was measured from where
+    /// this node was. A peer dials this node's new address at once, and a
+    /// hole punch only meets if this node dials back at the same time,
+    /// rather than after up to [`ENDPOINT_RETRY_BACKOFF_MAX`].
+    ///
+    /// Returns whether it moved. A cycle whose probe found no address
+    /// (`public` is `None`) changes nothing: a lost probe is not a move.
+    pub fn note_own_path(&mut self, public: Option<&str>, reflexive: Option<&str>) -> bool {
+        let Some(public) = public else {
+            return false;
+        };
+        let path = (public.to_string(), reflexive.map(str::to_string));
+        let moved = self.own_path.as_ref().is_some_and(|p| *p != path);
+        self.own_path = Some(path);
+        if moved {
+            for t in self.states.values_mut().flat_map(|s| s.per_tier.values_mut()) {
+                t.next_retry_at = None;
+                t.backoff = ENDPOINT_RETRY_BACKOFF_INITIAL;
+            }
+        }
+        moved
+    }
+
     pub fn resolve(
         &mut self,
         pubkey: &str,
@@ -1893,6 +1923,26 @@ mod tests {
         let tier = tracker.resolve(&pubkey, lan_only("192.168.1.50"), None, now + GRACE);
         assert_eq!(tier, EndpointTier::Wan);
         assert_eq!(tracker.peers_on_wan(), vec![pubkey.as_str()]);
+    }
+
+    #[test]
+    fn a_moved_own_path_lifts_every_backoff_and_a_lost_probe_does_not() {
+        let now = std::time::Instant::now();
+        let mut tracker = EndpointTracker::default();
+        let pubkey = key_b64(2).to_string();
+        assert!(!tracker.note_own_path(Some("203.0.113.1:51820"), Some("203.0.113.1:40000")), "the first cycle is no move");
+        tracker.resolve(&pubkey, lan_only("192.168.1.50"), None, now);
+        let later = now + GRACE;
+        assert_eq!(tracker.resolve(&pubkey, lan_only("192.168.1.50"), None, later), EndpointTier::Wan);
+        assert_eq!(tracker.resolve(&pubkey, lan_only("192.168.1.50"), None, later), EndpointTier::Wan, "backed off");
+
+        assert!(!tracker.note_own_path(None, None), "a probe that found nothing");
+        assert!(!tracker.note_own_path(Some("203.0.113.1:51820"), Some("203.0.113.1:40000")));
+        assert_eq!(tracker.resolve(&pubkey, lan_only("192.168.1.50"), None, later), EndpointTier::Wan, "still backed off");
+
+        // A VPN switched on: the coordinator sees this node elsewhere.
+        assert!(tracker.note_own_path(Some("198.51.100.4:51820"), Some("203.0.113.1:40000")));
+        assert_eq!(tracker.resolve(&pubkey, lan_only("192.168.1.50"), None, later), EndpointTier::Lan, "tried again at once");
     }
 
     #[test]

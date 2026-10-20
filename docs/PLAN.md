@@ -5149,3 +5149,35 @@ polls.
     `Host` is the service's, `X-Forwarded-Host` the public name (with a
     port, or the node's own), an invalid one dropped, the public origin's
     POST let in and another site's refused. No e2e.
+
+336. **A carrier says where it sees a node; a node that moved tries
+    again at once.** A node's reflexive address came from one probe at
+    agent startup (it can't run again once the kernel holds the port).
+    A VPN switched on and off, or a router restart, leaves the NAT mapping
+    somewhere else, and peers kept dialling the old one until the agent
+    restarted; the node's own tier backoff, grown to 30 minutes while the
+    VPN was up, kept it from dialling back, and a hole punch needs both.
+    Now an agent offering transit sends `transit_observed`: for each peer
+    it reaches, the kernel's endpoint for it, which WireGuard roamed to
+    from that peer's own packets — its mapping as it is now. Public IPv4
+    only (a carrier on the node's LAN sees an address nobody else can
+    dial, and the probe says better). The coordinator takes it from an
+    approved carrier only, for a peer in that poll's `transit_reachable`,
+    outside the mesh range, keeps it in `TransitState` (not the database:
+    it is re-sent every 20s) and publishes it as the peer's
+    `reflexive_addr` in the directory and `/admin/peers`. It stays while
+    any carrier confirms it, so two carriers seeing two ports (a symmetric
+    NAT) don't make it flap; the carrier that saw it, or anyone after
+    `online_threshold_secs` unconfirmed, moves it. A node's own probe
+    changing (a restarted agent) drops it; withdrawing or forgetting a
+    carrier drops what it saw. On the agent, `EndpointTracker::
+    note_own_path` lifts every tier's backoff when the node's own public
+    IPv4 (the coordinator's view) or published reflexive address moves;
+    a cycle whose probe found nothing is no move. Peers already reset a
+    tier whose candidate changed. IPv6 needed none of this: no NAT, the
+    advertised address is the real one. Unit tests: the agent observes
+    only public IPv4 endpoints of reachable peers; the backoff lifts on a
+    move and not on a lost probe; carriers' observations hold, move and go
+    with approval. Through `/poll`: ignored from an unapproved carrier and
+    for a LAN address, published from an approved one, kept over a
+    resent probe and replaced by a new one. No e2e.

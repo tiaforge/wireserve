@@ -105,6 +105,8 @@ pub struct Loaded {
     pub carry_ports: HashMap<String, u16>,
     /// Pubkeys that reported `CAP_SIGN_IN` fresh.
     pub sign_in_capable: HashSet<String>,
+    /// Where carriers see each node's traffic come from, by pubkey.
+    pub observed: HashMap<String, String>,
 }
 
 impl Loaded {
@@ -118,6 +120,7 @@ impl Loaded {
             static_relays: crate::db::nodes::all_static_relays(conn)?,
             carry_ports: app.transit.carry_ports(fresh),
             sign_in_capable: app.transit.with_capability(wireserve_types::CAP_SIGN_IN, fresh),
+            observed: app.transit.observed_addrs(),
         })
     }
 }
@@ -131,6 +134,8 @@ pub struct LoadedNode {
     pub ready: Vec<String>,
     pub carry_port: Option<u16>,
     pub sign_in_capable: bool,
+    /// Where a carrier sees it.
+    pub observed: Option<String>,
 }
 
 impl LoadedNode {
@@ -149,6 +154,7 @@ impl LoadedNode {
         Ok(Self {
             carry_port: pk.and_then(|pk| app.transit.carry_port(pk, fresh)),
             sign_in_capable: pk.is_some_and(|pk| app.transit.has_capability(pk, wireserve_types::CAP_SIGN_IN, fresh)),
+            observed: pk.and_then(|pk| app.transit.observed_addr(pk)),
             row,
             services,
             ready,
@@ -199,11 +205,16 @@ fn empty_rules() -> Rules {
     Rules { grants: Vec::new(), members: BTreeMap::new(), tags: BTreeMap::new(), owner_groups: BTreeMap::new() }
 }
 
-fn make_peer(env: &Env, n: &NodeRow, carry_port: Option<u16>) -> PeerInfo {
+fn make_peer(env: &Env, n: &NodeRow, carry_port: Option<u16>, observed: Option<&str>) -> PeerInfo {
     let mut p = peer_info(n, env.online_threshold_secs, env.relay_port_base);
     // Moves on every poll of every node, and nobody reads it from here.
     p.last_handshake = None;
     p.relay.carry_port = carry_port;
+    // Where a carrier sees the node now beats its own probe, made once when
+    // its agent started.
+    if let Some(addr) = observed {
+        p.reflexive_addr = Some(addr.to_string());
+    }
     p
 }
 
@@ -455,7 +466,7 @@ impl DirectoryState {
         // mesh is built twice over.
         for n in nodes.values() {
             let Some(pk) = n.pubkey.clone() else { continue };
-            let p = make_peer(env, n, l.carry_ports.get(&pk).copied());
+            let p = make_peer(env, n, l.carry_ports.get(&pk).copied(), l.observed.get(&pk).map(String::as_str));
             if p.relay.port.is_some() && p.relay.carry_port.is_some() {
                 relayable.insert(pk.clone());
             }
@@ -534,7 +545,7 @@ impl DirectoryState {
             self.relayable.remove(&old);
             self.sign_in_capable.remove(&old);
         }
-        let peer = make_peer(env, &node, l.carry_port);
+        let peer = make_peer(env, &node, l.carry_port, l.observed.as_deref());
         if peer.relay.port.is_some() && peer.relay.carry_port.is_some() {
             self.relayable.insert(pk.clone());
         } else {
@@ -739,11 +750,12 @@ mod tests {
             static_relays: Vec::new(),
             carry_ports: HashMap::new(),
             sign_in_capable: HashSet::new(),
+            observed: HashMap::new(),
         }
     }
 
     fn node_load(row: Option<NodeRow>, services: Vec<ServiceRow>) -> LoadedNode {
-        LoadedNode { row, services, ready: Vec::new(), carry_port: None, sign_in_capable: false }
+        LoadedNode { row, services, ready: Vec::new(), carry_port: None, sign_in_capable: false, observed: None }
     }
 
     fn base_of(s: &DirectoryState) -> DirectoryBase {

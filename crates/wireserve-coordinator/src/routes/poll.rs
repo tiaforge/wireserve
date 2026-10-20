@@ -233,6 +233,36 @@ async fn answer(
     let seen: Vec<wireserve_types::PortCheck> =
         req.port_checks_seen.iter().take(wireserve_types::MAX_PORT_CHECKS_PER_POLL).cloned().collect();
     state.transit.record_seen(&self_pubkey, &seen);
+    // Where this carrier sees its peers' traffic come from, which follows a
+    // NAT mapping that changed after a node's startup probe (see
+    // `PollRequest::transit_observed`). Taken from an approved carrier only,
+    // already trusted with who talks to whom, and for a peer it says it
+    // reaches right now. A public IPv4 `ip:port` outside the mesh only: a
+    // carrier on a node's own LAN sees an address only that LAN can dial,
+    // and the node's own probe says better.
+    let observed: Vec<(String, String)> = if transit_capable {
+        let ranges = wireserve_types::MeshRanges::parse(&state.config.mesh_info());
+        req.transit_observed
+            .iter()
+            .take(wireserve_types::MAX_TRANSIT_REACHABLE_PER_POLL)
+            .filter(|o| o.pubkey != self_pubkey && transit_reachable.contains(&o.pubkey))
+            .filter(|o| wireserve_types::is_valid_reflexive_addr(&o.addr) && wireserve_types::is_globally_routable_endpoint(&o.addr))
+            .filter(|o| {
+                let ip = o.addr.rsplit_once(':').and_then(|(ip, _)| ip.parse().ok());
+                ip.is_some_and(|ip| !ranges.is_some_and(|r| r.contains4(ip)))
+            })
+            .map(|o| (o.pubkey.clone(), o.addr.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let observed_changed = state.transit.report_observed(&self_pubkey, &observed, state.config.online_threshold_secs);
+    // A node's own probe changing means its agent just restarted and probed
+    // afresh: newer than anything a carrier saw before, until one sees it
+    // again.
+    if req.reflexive_addr.as_deref().is_some_and(|v| node.reflexive_addr.as_deref() != Some(v)) {
+        state.transit.forget_observed(&self_pubkey);
+    }
 
     // Same observed-source-address fallback as `/register` (spec §4.2),
     // re-applied on every poll rather than frozen at join time — see
@@ -412,6 +442,14 @@ async fn answer(
     }
     if changed {
         state.directory.refresh_node(&conn, &state, node.id)?;
+    }
+    // Each node a carrier now sees somewhere new, so its peers hear of it in
+    // their next poll.
+    for pk in &observed_changed {
+        let id = state.directory.read().id_of(pk);
+        if let Some(id) = id {
+            state.directory.refresh_node(&conn, &state, id)?;
+        }
     }
     let have = req.directory;
     // A whole directory is the expensive answer. Only so many at once: a

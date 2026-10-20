@@ -418,6 +418,16 @@ pub struct PollRequest {
     /// capped at [`MAX_TRANSIT_WANTED_PER_POLL`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transit_wanted: Vec<String>,
+    /// Where this node sees peers of `transit_reachable` sending their
+    /// WireGuard traffic from: the address the kernel learned from their
+    /// own packets, so each one's NAT mapping as it is now. A peer's own
+    /// probe runs once, at its startup, and can't follow a mapping that
+    /// changes after (a VPN switched on and off, a router restarted). The
+    /// coordinator takes it from approved carriers only and publishes it as
+    /// the peer's `reflexive_addr`. Public IPv4 only; capped at
+    /// [`MAX_TRANSIT_REACHABLE_PER_POLL`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transit_observed: Vec<ObservedEndpoint>,
     #[serde(default)]
     pub services: Vec<ServiceDecl>,
     /// The directory this node holds, when it holds one it can apply a delta
@@ -448,6 +458,15 @@ pub struct PollRequest {
     /// nonce each one received from the coordinator.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub port_checks_seen: Vec<PortCheck>,
+}
+
+/// One peer's WireGuard source address, as another node sees it
+/// (`PollRequest::transit_observed`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedEndpoint {
+    pub pubkey: String,
+    /// `ip:port`, IPv4.
+    pub addr: String,
 }
 
 /// A check that one of a carrier's public relay ports is open (PLAN.md

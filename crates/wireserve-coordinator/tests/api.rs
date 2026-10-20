@@ -3138,6 +3138,55 @@ async fn approving_a_node_lets_it_carry_and_denying_it_stops_selection_at_once()
     assert_eq!(b_body["transit_awaiting_approval"], json!(true));
 }
 
+fn reflexive_for(body: &Value, peer_name: &str) -> Option<String> {
+    body["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == peer_name)
+        .and_then(|p| p["reflexive_addr"].as_str())
+        .map(str::to_string)
+}
+
+fn b_observes(addr: &str) -> Value {
+    relay_poll(json!({
+        "services": [],
+        "transit_capable": true,
+        "transit_reachable": [pubkey_for("pk-a"), pubkey_for("pk-c")],
+        "transit_observed": [{ "pubkey": pubkey_for("pk-a"), "addr": addr }],
+    }))
+}
+
+#[tokio::test]
+async fn where_an_approved_carrier_sees_a_node_is_its_reflexive_address_until_the_node_probes_again() {
+    let app = test_app();
+    let (a, b, c) = transit_scenario(&app).await;
+    let poll_c = || async { poll_full(&app.router, &c, relay_poll(json!({ "services": [] }))).await.1 };
+    poll_full(&app.router, &a, relay_poll(json!({ "services": [], "reflexive_addr": "203.0.113.1:40000" }))).await;
+    assert_eq!(reflexive_for(&poll_c().await, "a").as_deref(), Some("203.0.113.1:40000"));
+
+    // Unapproved, B's word counts for nothing.
+    poll_full(&app.router, &b, b_observes("198.51.100.7:51000")).await;
+    assert_eq!(reflexive_for(&poll_c().await, "a").as_deref(), Some("203.0.113.1:40000"));
+
+    assert_eq!(admin_post(&app.router, "/admin/nodes/b/transit/approve").await, StatusCode::OK);
+    // An address on B's own LAN is no use to anyone else.
+    poll_full(&app.router, &b, b_observes("192.168.1.20:51820")).await;
+    assert_eq!(reflexive_for(&poll_c().await, "a").as_deref(), Some("203.0.113.1:40000"));
+    // A's NAT moved after its probe (a VPN came and went): B sees where.
+    poll_full(&app.router, &b, b_observes("198.51.100.7:51000")).await;
+    assert_eq!(reflexive_for(&poll_c().await, "a").as_deref(), Some("198.51.100.7:51000"));
+    let peers = admin_peers(&app.router).await;
+    assert_eq!(reflexive_for(&peers, "a").as_deref(), Some("198.51.100.7:51000"), "node show says what peers dial");
+
+    // A resending the probe it made at startup changes nothing...
+    poll_full(&app.router, &a, relay_poll(json!({ "services": [], "reflexive_addr": "203.0.113.1:40000" }))).await;
+    assert_eq!(reflexive_for(&poll_c().await, "a").as_deref(), Some("198.51.100.7:51000"));
+    // ...but a restarted agent's new probe is newer than anything B saw.
+    poll_full(&app.router, &a, relay_poll(json!({ "services": [], "reflexive_addr": "203.0.113.2:40001" }))).await;
+    assert_eq!(reflexive_for(&poll_c().await, "a").as_deref(), Some("203.0.113.2:40001"));
+}
+
 #[tokio::test]
 async fn transit_approval_is_refused_where_it_cannot_mean_anything() {
     let app = test_app();

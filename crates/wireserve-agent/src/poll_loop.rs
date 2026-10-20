@@ -129,6 +129,28 @@ pub struct TransitSelfReport {
     pub dialable_v4: Option<bool>,
     /// Port checks answered since the last poll (PLAN.md M40).
     pub port_checks_seen: Vec<wireserve_types::PortCheck>,
+    /// Where the peers in `reachable` send from — see
+    /// [`observed_endpoints`].
+    pub observed: Vec<wireserve_types::ObservedEndpoint>,
+}
+
+/// Where each of `reachable` sends its WireGuard traffic from: the kernel's
+/// endpoint for it, which it learned from that peer's own packets
+/// (`PollRequest::transit_observed`). Only a public IPv4 address is any use
+/// to the peer's other peers; one on this node's LAN, an IPv6 one, or a
+/// relayed session's address inside the mesh is left out.
+fn observed_endpoints(
+    reachable: &[String],
+    endpoints: &std::collections::HashMap<String, String>,
+) -> Vec<wireserve_types::ObservedEndpoint> {
+    reachable
+        .iter()
+        .filter_map(|pk| {
+            let addr = endpoints.get(pk)?;
+            (wireserve_types::is_valid_reflexive_addr(addr) && wireserve_types::is_globally_routable_endpoint(addr))
+                .then(|| wireserve_types::ObservedEndpoint { pubkey: pk.clone(), addr: addr.clone() })
+        })
+        .collect()
 }
 
 /// The phones this node relays (PLAN.md M40), from `relay_public`: each
@@ -181,6 +203,7 @@ pub fn build_poll_request(
         exit_capable: transit.exit_capable,
         transit_reachable: transit.reachable,
         transit_wanted: transit.wanted,
+        transit_observed: transit.observed,
         services: declared.to_vec(),
         directory: None,
         capabilities: {
@@ -595,7 +618,8 @@ pub struct PollContext<'a, F: FirewallBackend> {
     /// This node's own reflexive address, learned exactly once at daemon
     /// startup by a one-shot probe run before `wg::WgInterface::bring_up`
     /// claimed `listen_port` (see `crate::reflexive`'s module doc for
-    /// why it can't be re-probed mid-run). Resent verbatim on every poll
+    /// why it can't be re-probed mid-run, and what follows a mapping that
+    /// changes after). Resent verbatim on every poll
     /// even though the value itself never changes cycle to cycle, so the
     /// coordinator's COALESCE contract stays uniform across every
     /// self-reported field.
@@ -696,6 +720,8 @@ where
     let tunnel = crate::wg::tunnel_peers(&ifname).unwrap_or_default();
     let liveness_now = std::time::Instant::now();
     ctx.endpoint_tracker.observe_rx(tunnel.iter().map(|t| (t.pubkey.as_str(), t.rx_bytes)), liveness_now);
+    let endpoints: std::collections::HashMap<String, String> =
+        tunnel.iter().filter_map(|t| Some((t.pubkey.clone(), t.endpoint.clone()?))).collect();
     let handshakes: std::collections::HashMap<String, Option<chrono::DateTime<chrono::Utc>>> =
         tunnel.into_iter().map(|t| (t.pubkey, t.last_handshake)).collect();
     let now_utc = chrono::Utc::now();
@@ -711,6 +737,7 @@ where
     } else {
         Vec::new()
     };
+    let transit_observed = observed_endpoints(&transit_reachable, &endpoints);
     // Sent regardless of `transit_capable` — any node may need transit
     // help even if it can't offer it.
     let mut transit_wanted: Vec<String> = ctx
@@ -745,6 +772,7 @@ where
             carry_port: ctx.wg.carry_port(),
             dialable_v4: ctx.own_dialable_v4,
             port_checks_seen: checks_seen.clone(),
+            observed: transit_observed,
         },
         tls_report,
     );
@@ -935,12 +963,14 @@ where
         // This node's own public addresses — from its own directory entry
         // plus its startup reflexive probe — tell a peer on this LAN apart
         // from one on another LAN that reuses the same private range.
-        let own_public = directory
-            .peers
-            .iter()
-            .find(|p| p.pubkey == self_pubkey)
-            .map(|p| crate::wg::public_v4s(p, ctx.own_reflexive_addr))
-            .unwrap_or_default();
+        let own_entry = directory.peers.iter().find(|p| p.pubkey == self_pubkey);
+        let own_public = own_entry.map(|p| crate::wg::public_v4s(p, ctx.own_reflexive_addr)).unwrap_or_default();
+        // A path that moved under this node (a VPN switched on or off) makes
+        // every tier worth trying again now, rather than after its backoff.
+        let own_reflexive = own_entry.and_then(|p| p.reflexive_addr.as_deref());
+        if ctx.endpoint_tracker.note_own_path(dual.v4.as_deref(), own_reflexive) {
+            tracing::info!(public = ?dual.v4, reflexive = ?own_reflexive, "this node's own path to the internet moved; trying every peer's direct candidates again");
+        }
         let now = std::time::Instant::now();
         let endpoint_tiers: std::collections::HashMap<String, crate::wg::EndpointTier> = directory
             .peers
@@ -1159,6 +1189,7 @@ mod tests {
                 carry_port: None,
                 dialable_v4: None,
                 port_checks_seen: vec![],
+                observed: vec![wireserve_types::ObservedEndpoint { pubkey: "reachable-pk".into(), addr: "198.51.100.9:61000".into() }],
             },
             TlsSelfReport::default(),
         );
@@ -1172,6 +1203,24 @@ mod tests {
         assert!(req.exit_capable);
         assert_eq!(req.transit_reachable, vec!["reachable-pk".to_string()]);
         assert_eq!(req.transit_wanted, vec!["wanted-pk".to_string()]);
+        assert_eq!(req.transit_observed[0].addr, "198.51.100.9:61000");
+    }
+
+    #[test]
+    fn only_a_reachable_peers_public_ipv4_source_is_observed() {
+        let endpoints: std::collections::HashMap<String, String> = [
+            ("public", "198.51.100.9:61000"),
+            ("lan", "192.168.1.20:51820"),
+            ("cgnat", "100.90.0.4:51820"),
+            ("v6", "[2001:db8::1]:51820"),
+            ("unreached", "203.0.113.7:51820"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let reachable: Vec<String> = ["public", "lan", "cgnat", "v6", "no-endpoint"].into_iter().map(String::from).collect();
+        let got = observed_endpoints(&reachable, &endpoints);
+        assert_eq!(got, [wireserve_types::ObservedEndpoint { pubkey: "public".into(), addr: "198.51.100.9:61000".into() }]);
     }
 
     const NODE: Ipv4Addr = Ipv4Addr::new(10, 9, 0, 1);
@@ -1350,7 +1399,7 @@ mod tests {
             &crate::probe::DualProbeResult::default(),
             None,
             None,
-            TransitSelfReport { capable: false, exit_capable: false, reachable: vec![], wanted: vec![], carry_port: None, dialable_v4: None, port_checks_seen: vec![] },
+            TransitSelfReport { capable: false, exit_capable: false, reachable: vec![], wanted: vec![], carry_port: None, dialable_v4: None, port_checks_seen: vec![], observed: vec![] },
             TlsSelfReport::default(),
         );
         assert!(req.capabilities.is_empty(), "no terminator, nothing to claim");
@@ -1362,7 +1411,7 @@ mod tests {
             &crate::probe::DualProbeResult::default(),
             None,
             None,
-            TransitSelfReport { capable: false, exit_capable: false, reachable: vec![], wanted: vec![], carry_port: None, dialable_v4: None, port_checks_seen: vec![] },
+            TransitSelfReport { capable: false, exit_capable: false, reachable: vec![], wanted: vec![], carry_port: None, dialable_v4: None, port_checks_seen: vec![], observed: vec![] },
             TlsSelfReport { capable: true, ready: vec!["plex".into()] },
         );
         assert!(req.capabilities.contains(&wireserve_types::CAP_TLS_TERMINATE.to_string()));

@@ -1232,9 +1232,18 @@ pub async fn list_peers(
 ) -> Result<Json<AdminPeersResponse>, AppError> {
     let conn = state.db.conn.lock().await;
     let rows = nodes::list_all_peers(&conn)?;
+    // The reflexive address as peers are told it: where a carrier sees the
+    // node, when one does.
+    let observed = state.transit.observed_addrs();
     let peers = rows
         .iter()
-        .map(|n| crate::directory::peer_info(n, state.config.online_threshold_secs, state.config.relay_port_base))
+        .map(|n| {
+            let mut p = crate::directory::peer_info(n, state.config.online_threshold_secs, state.config.relay_port_base);
+            if let Some(addr) = n.pubkey.as_ref().and_then(|pk| observed.get(pk)) {
+                p.reflexive_addr = Some(addr.clone());
+            }
+            p
+        })
         .collect();
     let transit_approved = rows
         .iter()
