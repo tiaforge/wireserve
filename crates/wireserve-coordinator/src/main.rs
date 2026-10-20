@@ -177,6 +177,18 @@ async fn serve() {
         );
     }
 
+    if let Some(own) = config::v4_cidr_holding_any(&net_v4_cidr, &wireserve_coordinator::bootstrap::host_v4_networks()) {
+        tracing::warn!(
+            mesh_v4_cidr = %net_v4_cidr,
+            host_address = %own,
+            "mesh IPv4 range contains one of this host's own addresses. A node that reaches \
+             the coordinator at that address routes it into the tunnel once it is up, and \
+             loses every poll after its first (the agent refuses to join such a mesh). Set \
+             WIRESERVE_NET_V4_CIDR to a range clear of this host's networks before the first \
+             node registers"
+        );
+    }
+
     if config::v6_prefix_has_nonrandom_global_id(&net_v6_prefix) {
         tracing::warn!(
             mesh_v6_prefix = %net_v6_prefix,

@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 const ADMIN_TOKEN_KEY: &str = "WIRESERVE_ADMIN_TOKEN";
@@ -125,10 +126,83 @@ fn generate_admin_token() -> String {
 /// A private-use IPv4 /16 that can never overlap `100.64.0.0/10` (the
 /// carrier-grade-NAT range Tailscale and some ISPs allocate from), because
 /// it's drawn from `10.0.0.0/8` by construction rather than checked after
-/// the fact.
+/// the fact — and clear of this host's own networks. See
+/// [`v4_cidr_clear_of`].
 fn generate_v4_cidr() -> String {
-    let second: u8 = rand::random();
+    v4_cidr_clear_of(&host_v4_networks(), |n| rand::random::<u32>() as usize % n)
+}
+
+/// A `10.X.0.0/16` that overlaps none of `host` (network address, prefix
+/// length), with `pick(n)` choosing among the `n` that qualify.
+///
+/// A coordinator on a 10.x network — a cloud VPC, a homelab LAN, a
+/// container network — would otherwise draw its own network one time in
+/// 256. Its nodes are then handed addresses alongside the coordinator's,
+/// route the coordinator into the tunnel, and every poll after the first
+/// is lost. A host whose networks cover all of `10.0.0.0/8` leaves no /16
+/// clear; then only the ranges holding one of its own addresses are
+/// skipped, which is the case that cuts nodes off.
+fn v4_cidr_clear_of(host: &[(Ipv4Addr, u8)], pick: impl FnOnce(usize) -> usize) -> String {
+    let range = |second: u8| u32::from(Ipv4Addr::new(10, second, 0, 0));
+    // Two prefixes overlap when they agree on the shorter of the two masks.
+    let overlaps = |second: u8, &(net, len): &(Ipv4Addr, u8)| {
+        let mask = mask32(len.min(16));
+        range(second) & mask == u32::from(net) & mask
+    };
+    let holds = |second: u8, &(addr, _): &(Ipv4Addr, u8)| u32::from(addr) & mask32(16) == range(second);
+    let mut clear: Vec<u8> = (0..=255).filter(|&s| !host.iter().any(|n| overlaps(s, n))).collect();
+    if clear.is_empty() {
+        clear = (0..=255).filter(|&s| !host.iter().any(|n| holds(s, n))).collect();
+    }
+    if clear.is_empty() {
+        clear = (0..=255).collect();
+    }
+    let second = clear[pick(clear.len()).min(clear.len() - 1)];
     format!("10.{second}.0.0/16")
+}
+
+fn mask32(len: u8) -> u32 {
+    if len == 0 { 0 } else { u32::MAX << (32 - u32::from(len)) }
+}
+
+/// This host's IPv4 addresses with their prefix lengths, every interface
+/// alike: a container bridge reaches the coordinator as surely as a LAN
+/// does. Empty if they can't be listed, which leaves the draw as random
+/// as it always was.
+#[cfg(unix)]
+pub fn host_v4_networks() -> Vec<(Ipv4Addr, u8)> {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `head` with a list we free below.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut cursor = head;
+    while !cursor.is_null() {
+        // SAFETY: every node of the list is valid until freeifaddrs; the
+        // sockaddrs are read as AF_INET only after the family says so.
+        let ifa = unsafe { &*cursor };
+        cursor = ifa.ifa_next;
+        if ifa.ifa_addr.is_null() || ifa.ifa_netmask.is_null() {
+            continue;
+        }
+        if i32::from(unsafe { (*ifa.ifa_addr).sa_family }) != libc::AF_INET {
+            continue;
+        }
+        let sin = unsafe { &*ifa.ifa_addr.cast::<libc::sockaddr_in>() };
+        let mask = unsafe { &*ifa.ifa_netmask.cast::<libc::sockaddr_in>() };
+        let addr = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+        let len = u32::from_be(mask.sin_addr.s_addr).count_ones() as u8;
+        out.push((addr, len));
+    }
+    // SAFETY: `head` came from getifaddrs and is freed exactly once.
+    unsafe { libc::freeifaddrs(head) };
+    out
+}
+
+#[cfg(not(unix))]
+pub fn host_v4_networks() -> Vec<(Ipv4Addr, u8)> {
+    Vec::new()
 }
 
 /// A properly-random RFC 4193 unique local address prefix: `fd` followed
@@ -291,6 +365,33 @@ mod tests {
         for _ in 0..100 {
             let cidr = generate_v4_cidr();
             assert!(!crate::config::v4_cidr_overlaps_cgnat(&cidr), "{cidr}");
+        }
+    }
+
+    #[test]
+    fn v4_cidr_skips_the_hosts_own_networks() {
+        let host: Vec<(Ipv4Addr, u8)> = vec![
+            ("127.0.0.1".parse().unwrap(), 8),
+            ("10.88.0.1".parse().unwrap(), 16),
+            ("10.89.3.7".parse().unwrap(), 24),
+            ("10.0.0.0".parse().unwrap(), 12),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for i in 0..240 {
+            let cidr = v4_cidr_clear_of(&host, |n| i % n);
+            assert!(!["10.88.0.0/16", "10.89.0.0/16"].contains(&cidr.as_str()), "{cidr}");
+            let second: u8 = cidr.split('.').nth(1).unwrap().parse().unwrap();
+            assert!(second >= 16, "{cidr} is inside 10.0.0.0/12");
+            seen.insert(cidr);
+        }
+        assert_eq!(seen.len(), 256 - 16 - 2, "every clear range can be drawn");
+    }
+
+    #[test]
+    fn v4_cidr_under_a_host_covering_all_of_10_still_avoids_its_addresses() {
+        let host: Vec<(Ipv4Addr, u8)> = vec![("10.3.4.5".parse().unwrap(), 8)];
+        for i in 0..256 {
+            assert_ne!(v4_cidr_clear_of(&host, |n| i % n), "10.3.0.0/16");
         }
     }
 

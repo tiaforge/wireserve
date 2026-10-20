@@ -23,6 +23,10 @@ pub enum JoinError {
          refusing to join a mesh whose directory could not be checked"
     )]
     MeshUnverifiable,
+    /// The node is registered by then: the range is only learnt from the
+    /// registration itself.
+    #[error("{0}. The coordinator has already registered this node; delete it there before joining again")]
+    CoordinatorInsideMesh(String),
 }
 
 /// Refuses a plain-`http://` coordinator URL to anything but loopback
@@ -199,6 +203,9 @@ pub async fn join(params: JoinParams<'_>) -> Result<AgentState, JoinError> {
         .mesh
         .filter(|m| crate::mesh::pinnable(m, state.ip4.as_deref(), state.ip6.as_deref()))
         .ok_or(JoinError::MeshUnverifiable)?;
+    crate::mesh::check_coordinator_outside(&offered, params.coordinator_url)
+        .await
+        .map_err(JoinError::CoordinatorInsideMesh)?;
     state.mesh = Some(offered);
     state.save(params.state_path)?;
     Ok(state)

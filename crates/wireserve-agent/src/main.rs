@@ -522,9 +522,13 @@ async fn cmd_daemon(
         state.coordinator_url.as_deref().unwrap_or_default(),
         state.allow_plaintext_http,
     )?;
-    if state.mesh.is_none() {
+    let Some(mesh) = &state.mesh else {
         return Err("this node has no pinned mesh range — run `wireserve join` again".into());
-    }
+    };
+    // Joined before `join` checked this, or the coordinator moved to an
+    // address inside the range since.
+    wireserve_agent::mesh::check_coordinator_outside(mesh, state.coordinator_url.as_deref().unwrap_or_default())
+        .await?;
 
     let ip4: std::net::Ipv4Addr = state.ip4.clone().unwrap_or_default().parse()?;
     let ip6: std::net::Ipv6Addr = state.ip6.clone().unwrap_or_default().parse()?;

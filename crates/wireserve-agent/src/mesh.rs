@@ -14,7 +14,7 @@
 //! but not a compromised coordinator or anyone on a plain-HTTP path, who
 //! would simply report a range to match.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use wireserve_types::{MeshInfo, MeshRanges, PollResponse};
 
@@ -32,6 +32,61 @@ pub fn pinnable(offered: &MeshInfo, own_ip4: Option<&str>, own_ip6: Option<&str>
     let v4_ok = own_ip4.and_then(|a| a.parse::<Ipv4Addr>().ok()).is_some_and(|a| ranges.contains4(a));
     let v6_ok = own_ip6.and_then(|a| a.parse::<Ipv6Addr>().ok()).is_some_and(|a| ranges.contains6(a));
     v4_ok && v6_ok
+}
+
+/// Refuses mesh ranges that contain the address this node reaches the
+/// coordinator at (`coordinator_url`'s host, resolved).
+///
+/// Every mesh address is routed into the tunnel, so a coordinator inside
+/// the range is reached through the tunnel too — where nothing answers.
+/// The first poll goes out before the tunnel is up and succeeds; every one
+/// after it is lost, and the node is cut off with nothing to say why. A
+/// coordinator drawing a range on its own 10.x network causes exactly
+/// that. A host that doesn't resolve is not refused: the next poll would
+/// fail on its own, and say so.
+pub async fn check_coordinator_outside(info: &MeshInfo, coordinator_url: &str) -> Result<(), String> {
+    let Some(ranges) = MeshRanges::parse(info) else {
+        return Ok(());
+    };
+    let addrs = coordinator_addresses(coordinator_url).await;
+    match coordinator_inside(&ranges, &addrs) {
+        None => Ok(()),
+        Some(addr) => Err(format!(
+            "the mesh ranges ({}, {}) contain {addr}, the address this node reaches the \
+             coordinator at ({coordinator_url}): with the tunnel up, every poll to it would be \
+             routed into the tunnel and lost. Give the coordinator a WIRESERVE_NET_V4_CIDR / \
+             WIRESERVE_NET_V6_PREFIX clear of its own networks, then join again",
+            ranges.v4_cidr(),
+            ranges.v6_prefix()
+        )),
+    }
+}
+
+/// The first of `addrs` inside `ranges`.
+#[must_use]
+pub fn coordinator_inside(ranges: &MeshRanges, addrs: &[IpAddr]) -> Option<IpAddr> {
+    addrs.iter().copied().find(|a| match a {
+        IpAddr::V4(a) => ranges.contains4(*a),
+        IpAddr::V6(a) => ranges.contains6(*a),
+    })
+}
+
+async fn coordinator_addresses(url: &str) -> Vec<IpAddr> {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return Vec::new();
+    };
+    let port = url.port_or_known_default().unwrap_or(443);
+    let Some(host) = url.host_str() else {
+        return Vec::new();
+    };
+    // An IPv6 literal keeps its brackets in `host_str`.
+    if let Ok(addr) = host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+        return vec![addr];
+    }
+    tokio::net::lookup_host((host, port))
+        .await
+        .map(|found| found.map(|s| s.ip()).collect())
+        .unwrap_or_default()
 }
 
 /// Drops every peer with an address outside `ranges` and every service
@@ -182,6 +237,25 @@ mod tests {
         let kept: Vec<(&str, Option<&str>)> = d.services.iter().map(|s| (s.name.as_str(), s.vip4.as_deref())).collect();
         assert_eq!(kept, [("ok", Some("10.9.0.50")), ("dns", None)]);
         assert_eq!(d.pending_services[0].vip4, None);
+    }
+
+    #[test]
+    fn a_coordinator_inside_either_range_is_found() {
+        let r = MeshRanges::parse(&info()).unwrap();
+        let at = |a: &str| coordinator_inside(&r, &[a.parse().unwrap()]);
+        assert_eq!(at("10.9.0.200"), Some("10.9.0.200".parse().unwrap()));
+        assert_eq!(at("fdb4:d481:7c21::1"), Some("fdb4:d481:7c21::1".parse().unwrap()));
+        assert_eq!(at("10.9.1.1"), None);
+        assert_eq!(at("203.0.113.7"), None);
+        assert_eq!(coordinator_inside(&r, &[]), None);
+    }
+
+    #[tokio::test]
+    async fn a_mesh_holding_the_coordinators_address_is_refused() {
+        assert!(check_coordinator_outside(&info(), "http://10.9.0.5:47820").await.is_err());
+        assert!(check_coordinator_outside(&info(), "https://[fdb4:d481:7c21::5]").await.is_err());
+        assert!(check_coordinator_outside(&info(), "http://10.88.0.5:47820").await.is_ok());
+        assert!(check_coordinator_outside(&info(), "not a url").await.is_ok());
     }
 
     #[test]

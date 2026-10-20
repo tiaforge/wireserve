@@ -754,6 +754,19 @@ pub fn v4_cidr_overlaps_cgnat(cidr: &str) -> bool {
     (u32::from(addr) & mask) == (cgnat_net & mask)
 }
 
+/// The first of `host`'s addresses inside the configured IPv4 mesh range,
+/// if any (`None` too for a range that doesn't parse).
+#[must_use]
+pub fn v4_cidr_holding_any(cidr: &str, host: &[(std::net::Ipv4Addr, u8)]) -> Option<std::net::Ipv4Addr> {
+    let (addr, len) = cidr.split_once('/')?;
+    let (addr, len): (std::net::Ipv4Addr, u32) = (addr.parse().ok()?, len.parse().ok()?);
+    if len > 32 {
+        return None;
+    }
+    let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+    host.iter().map(|&(a, _)| a).find(|&a| u32::from(a) & mask == u32::from(addr) & mask)
+}
+
 /// Whether a configured IPv6 mesh prefix uses a Unique Local Address
 /// block whose Global ID was obviously not generated the way RFC 4193
 /// requires.
@@ -974,6 +987,14 @@ mod tests {
         assert!(bad("WIRESERVE_ACME_DIRECTORY", "http://acme.test/dir"));
         assert!(bad("WIRESERVE_ACME_EMAIL", "not-an-address"));
         assert!(bad("WIRESERVE_ACME_PROPAGATION_SECS", "3600"));
+    }
+
+    #[test]
+    fn a_range_holding_a_host_address_is_found() {
+        let host = [("127.0.0.1".parse().unwrap(), 8), ("10.89.3.7".parse().unwrap(), 24)];
+        assert_eq!(v4_cidr_holding_any("10.89.0.0/16", &host), Some("10.89.3.7".parse().unwrap()));
+        assert_eq!(v4_cidr_holding_any("10.90.0.0/16", &host), None);
+        assert_eq!(v4_cidr_holding_any("nonsense", &host), None);
     }
 
     #[test]
