@@ -727,9 +727,9 @@ dependencies = [
 
 [[package]]
 name = "defguard_wireguard_rs"
-version = "0.12.2"
+version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed997d9067c268058aa41d9c585beea28366558b8c7ad89c0ead6a9895b1ef58"
+checksum = "7da1b4284df8cd2fb76944124dbd552c2c02f04c1d536c7485b5d71efe7767f7"
 dependencies = [
  "base64 0.23.1",
  "defguard_boringtun",
