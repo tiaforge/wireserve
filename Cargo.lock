@@ -851,12 +851,12 @@ dependencies = [
 
 [[package]]
 name = "dns-update"
-version = "0.5.9"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b55d6bab7e8f88b1ff3079da050676de0fbc0589014bb52bf39975affb8ad19"
+checksum = "3bee8173806ecce181535651e457cac50ced7920d48e2da3920ded2c44bf1246"
 dependencies = [
  "aws-lc-rs",
- "base64 0.23.1",
+ "encodify",
  "hex",
  "hickory-net",
  "hickory-proto",
@@ -967,6 +967,16 @@ dependencies = [
  "sec1",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "encodify"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e95d6e27686e1d6991a3077f4dbec9d33d18903466d234165ad86cd08c3ebc79"
+dependencies = [
+ "memchr",
+ "simdutf8",
 ]
 
 [[package]]
