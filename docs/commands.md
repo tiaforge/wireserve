@@ -31,11 +31,10 @@ anywhere that can reach it):
 | Command | What it does |
 | --- | --- |
 | `wireserve-admin node create <name>` | create a node, print a join token |
-| `wireserve-admin device create <name> [--exit [node]] [--dns <svc\|ip>] [--mesh-dns] [--allow-unverified] [--out <file>] [--qr]` | create a device (an agent-less static peer, such as a phone) and write its `.conf`: every node end to end, directly or through a carrier's relay port; `--exit` adds a full-tunnel profile, `--mesh-dns` names the resolver in the mesh profile too |
+| `wireserve-admin device create <name> [--exit [node]] [--dns <svc\|ip>] [--mesh-dns] [--out <file>] [--qr]` | create a device (an agent-less static peer, such as a phone) and write its `.conf`: every node end to end, through one carrier on its WireGuard port; `--exit` adds a full-tunnel profile, `--mesh-dns` names the resolver in the mesh profile too |
 | `wireserve-admin device refresh <name> [same flags]` | re-issue a device's `.conf` under a new key, same name and address; the old key stops working at once |
 | `wireserve-admin node list` | every node: address, endpoint, when it was last seen, transit, exit, tags, and a note on a device whose config is stale |
 | `wireserve-admin node show <name>` | every field of one node, including whether an agent is dialable and which addresses a device holds |
-| `wireserve-admin transit ports` | every public relay port phones use: where it must be open, which node and devices, whether it was open, which may be closed |
 | `wireserve-admin node revoke <name>` | cut a node off, keep its name reserved |
 | `wireserve-admin node rejoin <name>` | fresh join token, same name and address; the old key stops working at once |
 | `wireserve-admin node delete <name>` | remove the record, free the name |
@@ -48,7 +47,7 @@ anywhere that can reach it):
 | `wireserve-admin tag add\|remove <node> <tag>` | tag a node, for grants to name |
 | `wireserve-admin tag list [<tag>]` | every tag in use and the nodes carrying it (`node list` shows each node's tags too) |
 | `wireserve-admin service access <svc>` / `node access <node>` | who reaches a service and why, or what a node reaches |
-| `--json` on `node list`, `service list`, `group list`, `grant list`, `tag list` and `transit ports` | the coordinator's answer as JSON, for scripts; the tables are for people and may change |
+| `--json` on `node list`, `service list`, `group list`, `grant list` and `tag list` | the coordinator's answer as JSON, for scripts; the tables are for people and may change |
 | `wireserve-admin owner link <node> [--qr]` | a single-use link for whoever the device belongs to |
 | `wireserve-admin owner clear <node>` | the device belongs to nobody again |
 | `wireserve-admin owner sign-out <e-mail or subject>` | signs a person out of every web service, in every browser; their devices stay theirs |

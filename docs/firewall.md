@@ -17,8 +17,7 @@ the admin port is deliberately unreachable from anywhere else.
 
 | Port | Direction | Who connects | Notes |
 | --- | --- | --- | --- |
-| 51820/udp | inbound | other agent nodes, phones | the WireGuard listen port, on the node's real interface |
-| relay ports/udp | inbound | phones | **carriers only, and only the ports `wireserve-admin transit ports` lists** — see below |
+| 51820/udp | inbound | other agent nodes, phones | the WireGuard listen port, on the node's real interface; on a carrier, also how phones reach every other node |
 | 443/tcp | outbound | the coordinator | the poll loop |
 | 443/tcp | outbound | your ACME CA | the TLS terminator, for certificates (Let's Encrypt by default) |
 
@@ -34,19 +33,17 @@ needs nothing opened, since relayed sessions travel inside the carrier's own
 tunnels. `deploy/e2e/run-nat-test.sh` builds this topology and checks all of
 it.
 
-**What a carrier needs open, and when.** Nothing, for relaying between
-agents. For phones: one UDP port per node a phone reaches
-through it — that node's relay port, `41000` plus its number — on its public
-IPv4 address. Its own firewall (ufw, firewalld, nftables) is wireserve's to
-handle; a firewall **outside** the machine is yours: a cloud provider's
-security group, or the router's port forward for a carrier at home.
-`device create` checks each port from outside before writing a config that
-needs it, and stops with the exact port and address if it is closed;
-`wireserve-admin transit ports` lists them all afterwards, including those no
-device uses any more. A port stays the same for the node's life, so it is
-opened once. The whole relay range (`41000`–`42999` by default, moved with
-`WIRESERVE_RELAY_PORT_BASE`) is closed to anything not relayed on a
-carrier's other interfaces, so keep other services off it there.
+**What a carrier needs open, and when.** Nothing beyond its WireGuard
+port. Relaying between agents travels inside the carrier's own tunnels,
+and phones reach every node through the carrier on that same port: the
+carrier tells from the packets themselves which node each one is for,
+and sends it on over the mesh without being able to read it (PLAN.md
+M49). So a phone on a network that lets out UDP to the WireGuard port and
+little else, as hotel and office Wi-Fi often does, still reaches
+everything. The carrier's own firewall (ufw, firewalld, nftables) is
+wireserve's to handle; a firewall **outside** the machine — a cloud
+provider's security group, or the router's port forward for a carrier at
+home — must let in its WireGuard port, as for any dialable node.
 
 **Two machines behind the same router is the case to watch.** They learn
 each other's address as their shared router's external one, so reaching it
@@ -167,17 +164,6 @@ firewall-cmd --get-zone-of-interface=wireserve0
 
 `sudo ufw allow in on wireserve0` or similar manual exceptions are not
 needed and can be removed.
-
-A carrier (`transit on`) also gets one input accept that is not tied to
-the mesh interface: `ct mark & 0x8000000 == 0x8000000` (iptables:
-`-m connmark --mark 0x8000000/0x8000000`). Only the agent's own table sets
-that bit, and only on the public relay port a `wireserve-admin
-device create` is checking at that moment, so the coordinator's probe gets
-through the host's own firewall and the check measures the firewalls
-outside the host — the cloud firewall or router — which are the only ones
-to open by hand. firewalld is not covered: on a firewalld host, open the
-port being checked with `firewall-cmd --add-port=<port>/udp` for the
-duration, or pass `--allow-unverified`.
 
 In a container (Docker/Podman with host networking) the same happens on
 the host, except for firewalld, which the container can't reach; the agent
