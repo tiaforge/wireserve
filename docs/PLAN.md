@@ -8,7 +8,9 @@ this checklist lives in the session that created it — this file is the
 source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
-**Currently working on:** nothing in progress. M39–M41 (end-to-end
+**Currently working on:** M49 (phones relayed on the carrier's own
+WireGuard port, items 337–346) is implemented; its e2e test
+(`run-phone-relay-test.sh`) has not been run yet. Before that: M39–M41 (end-to-end
 relaying: carry interface, phone relays through a carrier's public port, the
 gateway retired; items 234–249) are done; plan
 `~/.claude/plans/wobbly-roaming-karp.md` (not in the repo).
@@ -5181,3 +5183,133 @@ polls.
     with approval. Through `/poll`: ignored from an unapproved carrier and
     for a LAN address, published from an approved one, kept over a
     resent probe and replaced by a new one. No e2e.
+
+## M49 — phones reach every node on the carrier's own WireGuard port
+
+M40 gave every NAT-ed node a public relay port on its carrier
+(`41000 + slot`). On networks that allow outbound UDP to the WireGuard port
+and little else (hotel and corporate Wi-Fi), a phone reached its directly
+dialled nodes and none of its relayed ones. Any port other than the
+WireGuard port is a port some network blocks. M40 put the destination in the
+port because "kernel WireGuard gives nft no way to tell which node a packet
+is for". The packet says so itself, without any key: a handshake
+initiation's `mac1` is keyed on its responder's public key, and every later
+packet carries the receiver's session index. A userspace step on the
+carrier can read both. Decided with the user (2026-10-29, 2026-10-30): one
+public port, the carrier's own listen port; the kernel keeps it; the agent
+sorts out only what is not the carrier's; every one of a phone's nodes goes
+through one carrier; Linux only, like every carrier role.
+
+337. **What the carrier reads** (`phone_relay::packet`). Message types
+    1–4 by their first four bytes (`type`, then three zero bytes), sizes
+    148, 92 and 64 exactly for types 1–3, at least 32 for type 4. The
+    sender index (offset 4 of types 1 and 2), the receiver index (offset 8
+    of type 2, offset 4 of types 3 and 4), and `mac1` of types 1 and 2:
+    `BLAKE2s-128(key = BLAKE2s-256("mac1----" ‖ responder pubkey),
+    msg[..mac1_offset])`. An initiation's `mac1` names the node a phone
+    wants; a response's names the initiator, which is how the carrier
+    learns which device a phone address belongs to — needed when a node
+    starts the handshake. Nothing is decrypted, and the carrier holds no
+    key that could.
+338. **The kernel keeps the port; the agent takes packets by tproxy**
+    (`firewall::nftables::phone_relay_rules`). In `phone-pre` (prerouting,
+    mangle priority), a UDP packet to this host's own address (`fib daddr
+    type local`) at its WireGuard listen port, arriving anywhere but the
+    mesh, IPv4: a type 1 goes to the agent's divert socket (`tproxy ip to
+    :<base + RELAY_SLOTS>`, under `limit 200/s burst 400`); a type 2, 3 or
+    4 whose receiver index a relayed node chose goes there too (`phone-idx`,
+    one rule pair per live index, the index matched byte-swapped: WireGuard
+    writes it little-endian, nft reads raw payload in network order, which
+    the kernel test caught); everything else is left to kernel WireGuard.
+    tproxy rewrites nothing, so the host firewalls see a packet to the
+    WireGuard port they already let in. NFQUEUE was the first design: its
+    verdict hands a packet back to the kernel untouched, where tproxy needs
+    the agent to put it back (#339). tproxy won because it needs no netlink
+    protocol, only sockets, and because `nft_queue` was missing on the
+    kernel this was built and tested on, where `nft_tproxy` was there.
+339. **What is not a relayed node's goes back to the kernel as it came**:
+    sent from a transparent socket bound to the phone's own address and
+    port, to this host's address and listen port. It arrives on `lo` (which
+    `phone-pre` ignores) with its original source, so WireGuard learns the
+    phone's real endpoint. Only handshake initiations ever take this path —
+    one per peer every two minutes, the carrier's own agents included — and
+    a data packet only if its index outlived the agent's memory of it.
+340. **Live indexes, and why not a set.** The rules for a relayed session's
+    index must exist the moment its handshake completes, and the table is
+    replaced on every poll. A dynamic set with a timeout, filled from the
+    packet path, was the obvious fit, but a set keyed by raw payload needs
+    `typeof`, which nft's JSON does not take before 1.1 (1.0.9 refuses
+    `type integer` and the `typeof` object alike). So the agent keeps the
+    indexes (`PhoneDivert`), every apply writes one rule pair per index and
+    the jump to them (always, even with none yet), and a newly learned index
+    is added at once under the same lock as the apply, also into the batch a
+    restore replays. An expired index is
+    dropped at the next apply; until then its packets reach the agent,
+    which hands them back (#339).
+341. **The agent's sorter** (`phone_relay::Sorter`, a pure state machine,
+    and `phone_relay::io`, its thread). A session is one handshake between
+    a phone and a node: the node, the phone's address and the address it
+    dialled, and the two indexes once known. Phone type 1 whose `mac1` is a
+    relayed node's → new session, forwarded; type 2 from a phone (answering
+    a node) and types 3/4 → by the node's index, the phone's address
+    updated (roaming), forwarded. From a node (on the divert socket's twin
+    on the mesh address, `base + RELAY_SLOTS + 1`): type 2 → by the phone's
+    index, learning the node's index (new rules) and, by `mac1`, the
+    device; type 1 → to the device's last address, by `mac1`; types 3/4 →
+    by the phone's index. Replies to a phone leave a raw socket with the
+    address it dialled and the listen port as their source. Sessions expire
+    180 s after their last packet (WireGuard's reject-after-time); at most
+    4096 are kept. A node index already taken by another node's session is
+    refused: that response is dropped and the handshake retries with a new
+    one. An index that one of the carrier's own sessions also uses can't be
+    seen (the kernel does not say), and is accepted: about 2⁻³² per pair,
+    and that one session re-handshakes.
+342. **Who may be relayed to.** Exactly the nodes and devices the exports
+    assigned to this carrier (`relay_public`, and the new `relay_devices`
+    in `PollResponse`), from the mesh addresses and listen ports in the
+    directory. A packet from the mesh is taken only from one of those
+    nodes' own address and port.
+343. **One carrier per device, every node through it** (`relay_plan`). The
+    carrier qualifies as before (approved, offering, `relay`, dialable,
+    public IPv4) and now also says `phone-relay` (`CAP_PHONE_RELAY`): an
+    older agent would not sort. Preferred: the one reaching the most nodes
+    right now, then one already serving devices. It is dialled directly;
+    every other node at `carrier:listen_port`. The `.conf` then says
+    nothing about where a node is, and moves with it. The exit, when it is
+    not the carrier, keeps its own endpoint in the full-tunnel profile: it
+    must be dialable anyway, and it is dialled on its WireGuard port.
+    With no carrier, dialable nodes are direct and the rest unreachable,
+    as before.
+344. **Removed:** the public relay ports and everything that served them —
+    `public_relay_rules`, `PublicRelay`, `relay_ranges` (#242, #274),
+    `RELAY_MARK` and `CHECK_MARK` with their host-firewall openings, the
+    port checks (`port_check.rs`, `PortCheck`, the coordinator's check
+    state, the `relay_ports` table, which migration 0028 drops,
+    `GET /admin/relay-ports`, `wireserve-admin transit ports`,
+    `--allow-unverified`) and the forwarding a carrier turned on for phones.
+    #241, #242, #244's checks and #245 are superseded. Agent-to-agent
+    relaying (M39) is untouched.
+345. **Upgrading.** Carriers first, then re-export every phone that was
+    relayed: its `.conf` points at a relay port nothing serves any more.
+    Migration 0028 clears `exported_at` of every device with a recorded
+    relay, so `node list` marks it stale, as one never exported, and it
+    holds every released address meanwhile (#273). A device reached only
+    directly keeps working. An older carrier is never picked: the plan
+    wants `phone-relay`.
+346. **Verification.** Unit tests for the packet parser and `mac1` against
+    real handshakes (`defguard_boringtun`, already a dependency through
+    `defguard_wireguard_rs`), for the sorter with real phone and node
+    sessions through it, both directions, both initiators, roaming,
+    collision and expiry; for the rules' shape. A kernel test,
+    `kernel_a_phone_reaches_a_relayed_node_and_the_carrier_on_one_port`:
+    three namespaces, a phone, a carrier with these rules and the agent's
+    sorter thread, and a node behind it on a veth standing in for the mesh,
+    WireGuard on both sides in userspace (boringtun) because this kernel
+    has none; the phone handshakes and exchanges data with the node and with
+    the carrier's own WireGuard stand-in at once, from one socket, to one
+    port. It passes as root and in an unprivileged user namespace, the way
+    CI runs it. API tests for the plan, the poll and the migration.
+    `run-phone-relay-test.sh` now lets the phone's network out on UDP 51820
+    only, and checks the carrier's own service and a relayed node's over
+    it; not run (no container runtime and no WireGuard module where this
+    was built).
