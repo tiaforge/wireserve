@@ -54,6 +54,9 @@ rpassword = "7"
 # frozen and the crate is complete, not that it is unmaintained.
 qrcodegen = "1.8"
 libc = "0.2"
+# What a carrier checks a phone's handshake `mac1` with (PLAN.md M49); the
+# version defguard_boringtun (through defguard_wireguard_rs) already uses.
+blake2 = { version = "0.11", default-features = false }
 # The versions defguard_wireguard_rs uses, for our own route handling (see
 # wireserve-agent/src/routes.rs); keep in step with it.
 netlink-packet-core = "0.9"
