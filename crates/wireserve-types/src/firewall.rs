@@ -46,14 +46,22 @@ pub struct RelayEnd {
     pub carry_port: u16,
 }
 
-/// A node this node relays phones to (PLAN.md M40): UDP arriving from the
-/// internet at `port` goes on to `to:to_port`, the node's own WireGuard
-/// port, leaving this node from its mesh address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PublicRelay {
-    pub port: u16,
-    pub to: Ipv4Addr,
-    pub to_port: u16,
+/// Phones this node relays to other nodes on its own WireGuard port
+/// (PLAN.md M49): what the firewall diverts to the agent's sorter, and
+/// where the sorter's mesh side listens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhoneRelayRules {
+    /// This node's WireGuard listen port, which phones dial for every node.
+    pub listen_port: u16,
+    /// Where the diverted packets go: the agent's transparent socket.
+    pub divert_port: u16,
+    /// The sorter's socket on this node's mesh address, which relayed
+    /// nodes answer.
+    pub mesh_port: u16,
+    /// The receiver indexes relayed nodes chose for live sessions: a type
+    /// 2, 3 or 4 packet carrying one of them is a relayed node's, not this
+    /// node's own.
+    pub indexes: Vec<u32>,
 }
 
 /// A pair whose end-to-end session this node relays (PLAN.md M39): UDP
@@ -99,28 +107,14 @@ pub struct Forwarding {
     /// leave from. Without it no relay rule is written.
     pub relay_self: Option<Ipv4Addr>,
     /// UDP ports of this node's own WireGuard interfaces that relayed
-    /// sessions arrive at through the mesh interface (PLAN.md M39, M40):
+    /// sessions arrive at through the mesh interface (PLAN.md M39, M49):
     /// the carry interface's listen port, and the mesh interface's own for
-    /// a phone relayed through a carrier's public port. WireGuard
-    /// authenticates every packet on them, so letting the mesh send there
-    /// opens nothing else.
+    /// a phone relayed through a carrier. WireGuard authenticates every
+    /// packet on them, so letting the mesh send there opens nothing else.
     pub relay_ends: Vec<u16>,
-    /// Nodes this node relays phones to (PLAN.md M40): what arrives on
-    /// `relay_public_iface` at one of their relay ports goes on to them.
-    pub relay_public: Vec<PublicRelay>,
-    /// The interface phones reach this node's public address on — the one
-    /// its default route leaves by. `None` writes no public relay rules.
-    pub relay_public_iface: Option<String>,
-    /// Every relay port, and the ports relayed phone sessions leave this
-    /// node from, as two inclusive ranges. The first is closed to anything
-    /// not relayed on every interface but the mesh's, so a packet that
-    /// arrives before its relay rule is dropped rather than tracked — and
-    /// then kept alive untranslated by its sender's keepalives. Checked
-    /// ports (`relay_checks`) are left open for their check.
-    pub relay_ranges: Option<((u16, u16), (u16, u16))>,
-    /// Relay ports under a port check right now, which a listener of the
-    /// agent's own answers.
-    pub relay_checks: Vec<u16>,
+    /// Phones this node relays on its own WireGuard port (PLAN.md M49).
+    /// Needs `relay_self`.
+    pub phone_relay: Option<PhoneRelayRules>,
     /// Interfaces whose IPv4 forwarding this agent turned on so replies
     /// from a service's target address can reach the mesh (PLAN.md M26).
     /// Nothing else may be forwarded from them: before the agent turned

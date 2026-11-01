@@ -728,8 +728,13 @@ async fn cmd_daemon(
         .build()?;
     // The TLS terminator's own socket (PLAN.md M33).
     let tls_link = Arc::new(wireserve_agent::tls_link::TlsLink::default());
-    // Relay port checks (PLAN.md M40).
-    let port_checks = Arc::new(wireserve_agent::port_check::PortChecker::default());
+    // Phones relayed on this node's WireGuard port (PLAN.md M49), once a
+    // poll says this node carries any.
+    #[cfg(target_os = "linux")]
+    let phone_relay = poll_loop::PhoneRelayHandle {
+        relay: wireserve_agent::phone_relay::io::PhoneRelay::default(),
+        divert: fw.phone_divert(),
+    };
     let tls_socket_path = instance.tls_socket_path();
     {
         let ctx = wireserve_agent::ipc::tls::TlsContext {
@@ -824,8 +829,6 @@ async fn cmd_daemon(
             scheduled = async {
                 tokio::select! {
                     _ = interval.tick() => true,
-                    // A port check answered: the coordinator is waiting on it.
-                    () = port_checks.wake.notified() => false,
                     // A peer's path just went dead: ask for its relay now.
                     () = async {
                         loop {
@@ -860,7 +863,10 @@ async fn cmd_daemon(
                     own_reflexive_addr: own_reflexive_addr.as_deref(),
                     tls: Some(&tls_link),
                     own_dialable_v4,
-                    port_checks: Some(&port_checks),
+                    #[cfg(target_os = "linux")]
+                    phone_relay: Some(&phone_relay),
+                    #[cfg(not(target_os = "linux"))]
+                    phone_relay: None,
                     held: &mut held_directory,
                 };
                 let result = poll_loop::run_once(&mut ctx, &shared_state).await;

@@ -219,10 +219,6 @@ pub fn cmd_node_access(client: &AdminClient, node: &str) -> Result<wireserve_typ
     Ok(client.node_access(node)?)
 }
 
-pub fn cmd_relay_ports(client: &AdminClient) -> Result<wireserve_types::RelayPortsResponse, CliError> {
-    Ok(client.relay_ports()?)
-}
-
 pub fn cmd_export_config(
     admin_client: &AdminClient,
     node_facing_url: &str,

@@ -211,15 +211,6 @@ enum TransitAction {
         /// The node's name
         name: String,
     },
-    /// List the public relay ports devices use, and whether they are open
-    // PLAN.md M40: on which carrier and address each must be open, which
-    // node it leads to and which devices rely on it. A port no device
-    // relies on any more may be closed again.
-    Ports {
-        /// Print the coordinator's response as JSON, for scripts
-        #[arg(long)]
-        json: bool,
-    },
 }
 
 #[derive(Subcommand)]
@@ -255,11 +246,6 @@ struct DeviceArgs {
     // is picked. Needs --dns, and --out or --qr, since there are two files.
     #[arg(long, requires = "dns", value_name = "NODE", num_args = 0..=1, default_missing_value = "")]
     exit: Option<String>,
-    /// Write the config even if a relay port can't be confirmed open
-    // For a port you know is open, or a check that can't reach it from the
-    // coordinator's network.
-    #[arg(long)]
-    allow_unverified: bool,
     /// The DNS server for --exit or --mesh-dns: a service name or an IPv4 address
     // A service by name (a Pi-hole published on 53, say, which then also
     // answers the mesh's own names), or an address such as 9.9.9.9.
@@ -719,17 +705,6 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             wireserve_admin::cmd_deny_transit(&client, &name)?;
             println!("node '{name}' may no longer carry transit traffic");
         }
-        Command::Transit { action: TransitAction::Ports { json } } => {
-            let client = build_client(&coordinator_url, &admin_token)?;
-            let resp = wireserve_admin::cmd_relay_ports(&client)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
-            } else if resp.ports.is_empty() {
-                println!("no public relay ports: no device reaches a node through a carrier");
-            } else {
-                print!("{}", wireserve_admin::listing::relay_ports(&resp));
-            }
-        }
         Command::Node { action: NodeAction::List { json } } => {
             let client = build_client(&coordinator_url, &admin_token)?;
             let resp = wireserve_admin::cmd_list_peers(&client)?;
@@ -749,7 +724,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             print!("{}", wireserve_admin::listing::node(&resp, peer, chrono::Utc::now()));
         }
         Command::Device { action } => {
-            let (refresh, DeviceArgs { name, out, qr, exit, allow_unverified, dns, mesh_dns }) = match action {
+            let (refresh, DeviceArgs { name, out, qr, exit, dns, mesh_dns }) = match action {
                 DeviceAction::Create(args) => (false, args),
                 DeviceAction::Refresh(args) => (true, args),
             };
@@ -773,7 +748,6 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 exit: exit.as_deref(),
                 dns: dns.as_deref(),
                 mesh_dns,
-                allow_unverified,
             };
             let client = build_client(&coordinator_url, &admin_token)?;
             let register_url = config::resolve_register_url_interactive(register_url.as_deref())?;

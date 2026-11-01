@@ -12,7 +12,6 @@ pub mod mesh;
 pub mod paths;
 pub mod poll_loop;
 pub mod phone_relay;
-pub mod port_check;
 pub mod probe;
 pub mod reflexive;
 pub mod register;

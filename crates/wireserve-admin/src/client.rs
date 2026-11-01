@@ -14,7 +14,7 @@ use reqwest::StatusCode;
 use wireserve_types::{
     AdminPeersResponse, AdminServicesResponse, CreateNodeRequest, CreateNodeResponse,
     DenyServiceRequest, ErrorBody, ExportRecord, NodeKind, RegisterRequest, RegisterResponse, RejoinRequest,
-    RejoinResponse, RelayPlan, RelayPlanRequest, RelayPortsResponse,
+    RejoinResponse, RelayPlan, RelayPlanRequest,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -172,23 +172,15 @@ impl AdminClient {
         Ok(())
     }
 
-    /// `POST /admin/relays/plan` (PLAN.md M40) — how a device reaches each
-    /// node, with the relay ports checked. Can take most of a minute: a
-    /// carrier has to poll to learn of a check, and again to report it.
-    pub fn relay_plan(&self, allow_unverified: bool) -> Result<RelayPlan, ClientError> {
+    /// `POST /admin/relays/plan` (PLAN.md M40, M49) — how a device reaches
+    /// each node.
+    pub fn relay_plan(&self) -> Result<RelayPlan, ClientError> {
         let resp = self
             .http
             .post(self.url("/admin/relays/plan"))
             .bearer_auth(&self.admin_token)
-            .timeout(std::time::Duration::from_secs(90))
-            .json(&RelayPlanRequest { allow_unverified })
+            .json(&RelayPlanRequest {})
             .send()?;
-        Ok(Self::check_status(resp)?.json()?)
-    }
-
-    /// `GET /admin/relay-ports` (PLAN.md M40).
-    pub fn relay_ports(&self) -> Result<RelayPortsResponse, ClientError> {
-        let resp = self.http.get(self.url("/admin/relay-ports")).bearer_auth(&self.admin_token).send()?;
         Ok(Self::check_status(resp)?.json()?)
     }
 

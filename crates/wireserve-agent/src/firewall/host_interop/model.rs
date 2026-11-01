@@ -105,31 +105,14 @@ pub enum Opening {
     ExitRequest,
     /// `oifname <if> ct mark & E == E` on `FORWARD`: its reply.
     ExitReply,
-    /// `oifname <if> ct mark & R == R` on `FORWARD`: a phone's session,
-    /// relayed from this node's public address into the mesh (PLAN.md M40).
-    RelayRequest,
-    /// `iifname <if> ct mark & R == R` on `FORWARD`: its reply.
-    RelayReply,
-    /// `ct mark & C == C` on `INPUT`: the coordinator's probe of a relay
-    /// port under a check (PLAN.md M40), which our own table marked — from
-    /// outside, so the one `INPUT` opening not pinned to the mesh interface,
-    /// and pinned instead to a flow only our table marks, on a port only
-    /// while a check runs.
-    RelayCheck,
 }
 
 impl Opening {
     #[must_use]
     pub fn hook(self) -> Hook {
         match self {
-            Self::Input | Self::RelayCheck => Hook::Input,
-            Self::Hairpin
-            | Self::ServiceRequest
-            | Self::ServiceReply
-            | Self::ExitRequest
-            | Self::ExitReply
-            | Self::RelayRequest
-            | Self::RelayReply => Hook::Forward,
+            Self::Input => Hook::Input,
+            Self::Hairpin | Self::ServiceRequest | Self::ServiceReply | Self::ExitRequest | Self::ExitReply => Hook::Forward,
         }
     }
 
@@ -137,13 +120,7 @@ impl Opening {
     #[must_use]
     pub fn wanted(hook: Hook, forward: ForwardWanted) -> Vec<Self> {
         match hook {
-            Hook::Input => {
-                let mut out = vec![Self::Input];
-                if forward.relay_check {
-                    out.push(Self::RelayCheck);
-                }
-                out
-            }
+            Hook::Input => vec![Self::Input],
             Hook::Forward => {
                 let mut out = Vec::new();
                 if forward.transit {
@@ -154,9 +131,6 @@ impl Opening {
                 }
                 if forward.exit {
                     out.extend([Self::ExitRequest, Self::ExitReply]);
-                }
-                if forward.relay {
-                    out.extend([Self::RelayRequest, Self::RelayReply]);
                 }
                 out
             }

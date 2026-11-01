@@ -38,8 +38,6 @@ pub struct TransitState {
     /// Whether each node is dialable from outside (PLAN.md M40), as its
     /// agent last reported.
     dialable: Mutex<HashMap<String, (bool, DateTime<Utc>)>>,
-    /// Port checks under way, by carrier pubkey (PLAN.md M40).
-    port_checks: Mutex<HashMap<String, Vec<PendingCheck>>>,
     /// Where carriers see each node's WireGuard traffic come from, by the
     /// observed node's pubkey (`PollRequest::transit_observed`).
     observed: Mutex<HashMap<String, Observed>>,
@@ -53,28 +51,6 @@ struct Observed {
     by: String,
     /// When a carrier last said so.
     at: DateTime<Utc>,
-}
-
-/// One port check under way: the carrier listens on `port`, and the
-/// coordinator sends `nonce` to it from outside.
-#[derive(Debug, Clone)]
-struct PendingCheck {
-    port: u16,
-    nonce: [u8; 8],
-    /// The carrier has been told, in a poll response.
-    picked_up: bool,
-    seen: bool,
-}
-
-/// How a port check stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CheckState {
-    /// The carrier hasn't polled since the check began.
-    Waiting,
-    /// It has, and is listening; nothing has arrived yet.
-    Listening,
-    /// The nonce arrived: the port is open.
-    Seen,
 }
 
 /// One node's last capability report, and when it came.
@@ -330,74 +306,6 @@ impl TransitState {
         })
     }
 
-    /// Starts a check of `carrier`'s `port`, unless one is under way; the
-    /// nonce to send it.
-    pub fn start_check(&self, carrier: &str, port: u16) -> [u8; 8] {
-        let mut checks = self.port_checks.lock().expect("transit state mutex poisoned");
-        let list = checks.entry(carrier.to_string()).or_default();
-        if let Some(c) = list.iter().find(|c| c.port == port) {
-            return c.nonce;
-        }
-        let nonce: [u8; 8] = rand::random();
-        list.push(PendingCheck { port, nonce, picked_up: false, seen: false });
-        nonce
-    }
-
-    /// The checks `carrier` should run, for its poll response. Marks them
-    /// picked up.
-    pub fn checks_for(&self, carrier: &str) -> Vec<wireserve_types::PortCheck> {
-        let mut checks = self.port_checks.lock().expect("transit state mutex poisoned");
-        let Some(list) = checks.get_mut(carrier) else {
-            return Vec::new();
-        };
-        list.iter_mut()
-            .filter(|c| !c.seen)
-            .map(|c| {
-                c.picked_up = true;
-                wireserve_types::PortCheck { port: c.port, nonce: hex(&c.nonce) }
-            })
-            .collect()
-    }
-
-    /// Records the nonces `carrier` says it received. Only a nonce this
-    /// coordinator sent to that port counts.
-    pub fn record_seen(&self, carrier: &str, seen: &[wireserve_types::PortCheck]) {
-        let mut checks = self.port_checks.lock().expect("transit state mutex poisoned");
-        let Some(list) = checks.get_mut(carrier) else {
-            return;
-        };
-        for c in list.iter_mut() {
-            if seen.iter().any(|s| s.port == c.port && s.nonce == hex(&c.nonce)) {
-                c.seen = true;
-            }
-        }
-    }
-
-    /// How the check of `carrier`'s `port` stands; `None` when there is none.
-    #[must_use]
-    pub fn check_state(&self, carrier: &str, port: u16) -> Option<CheckState> {
-        let checks = self.port_checks.lock().ok()?;
-        let c = checks.get(carrier)?.iter().find(|c| c.port == port)?;
-        Some(if c.seen {
-            CheckState::Seen
-        } else if c.picked_up {
-            CheckState::Listening
-        } else {
-            CheckState::Waiting
-        })
-    }
-
-    /// Ends the check of `carrier`'s `port`.
-    pub fn finish_check(&self, carrier: &str, port: u16) {
-        let mut checks = self.port_checks.lock().expect("transit state mutex poisoned");
-        if let Some(list) = checks.get_mut(carrier) {
-            list.retain(|c| c.port != port);
-            if list.is_empty() {
-                checks.remove(carrier);
-            }
-        }
-    }
-
     /// Records where `carrier` sees each of `seen`'s nodes (`(pubkey,
     /// addr)`), and returns the nodes whose address changed.
     ///
@@ -458,15 +366,8 @@ impl TransitState {
         self.capabilities.lock().expect("transit state mutex poisoned").remove(pubkey);
         self.carry_ports.lock().expect("transit state mutex poisoned").remove(pubkey);
         self.dialable.lock().expect("transit state mutex poisoned").remove(pubkey);
-        self.port_checks.lock().expect("transit state mutex poisoned").remove(pubkey);
         self.observed.lock().expect("transit state mutex poisoned").retain(|pk, o| pk != pubkey && o.by != pubkey);
     }
-}
-
-/// A nonce as the wire carries it: 16 lowercase hex digits.
-#[must_use]
-pub fn hex(nonce: &[u8; 8]) -> String {
-    nonce.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]

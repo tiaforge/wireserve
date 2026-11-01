@@ -126,6 +126,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../../migrations/0025_approved_ports.sql")),
         M::up(include_str!("../../migrations/0026_node_id_indexes.sql")),
         M::up(include_str!("../../migrations/0027_always_sign_in.sql")),
+        M::up(include_str!("../../migrations/0028_one_port_phone_relays.sql")),
     ])
 }
 
@@ -387,6 +388,52 @@ mod tests {
         assert_eq!(approved[0].name, "plex");
         assert!(approved[0].approved_at.is_some());
         assert!(approved[0].denied_at.is_none());
+    }
+
+    /// PLAN.md #345: a device exported with a relay dials a relay port
+    /// nothing serves any more, so it is stale until exported again; one
+    /// reached directly is not.
+    #[test]
+    fn migration_marks_devices_exported_with_a_relay_stale_and_drops_the_port_checks() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        migrations().to_version(&mut conn, 27).unwrap();
+        for (name, kind, n) in [("gw", "agent", 1), ("minipc", "agent", 2), ("phone", "static", 3), ("laptop", "static", 4)] {
+            conn.execute(
+                "INSERT INTO nodes (name, kind, pubkey, ip4, ip6, join_token_used, exported_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+                rusqlite::params![
+                    name,
+                    kind,
+                    format!("pk{n}"),
+                    format!("100.90.0.{n}"),
+                    format!("fd00:90::{n}"),
+                    (kind == "static").then_some("2026-10-01T00:00:00Z"),
+                ],
+            )
+            .unwrap();
+        }
+        let id = |name: &str| -> i64 { conn.query_row("SELECT id FROM nodes WHERE name = ?1", [name], |r| r.get(0)).unwrap() };
+        conn.execute(
+            "INSERT INTO static_relay_peers (static_node_id, peer_node_id, carrier_node_id) VALUES (?1, ?2, ?3)",
+            [id("phone"), id("minipc"), id("gw")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO relay_ports (carrier_node_id, port, address, open, checked_at) VALUES (?1, 41001, '203.0.113.2', 1, '2026-10-01T00:00:00Z')",
+            [id("gw")],
+        )
+        .unwrap();
+        migrations().to_latest(&mut conn).unwrap();
+        let exported = |name: &str| -> Option<String> {
+            conn.query_row("SELECT exported_at FROM nodes WHERE name = ?1", [name], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(exported("phone"), None, "relayed: stale until exported again");
+        assert!(exported("laptop").is_some(), "reached directly: still good");
+        let tables: i64 = conn
+            .query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'relay_ports'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tables, 0);
     }
 
     #[test]

@@ -127,8 +127,9 @@ pub struct TransitSelfReport {
     /// Whether this node is dialable from outside (PLAN.md M40), from the
     /// startup probe.
     pub dialable_v4: Option<bool>,
-    /// Port checks answered since the last poll (PLAN.md M40).
-    pub port_checks_seen: Vec<wireserve_types::PortCheck>,
+    /// Whether this agent can relay phones on its WireGuard port (PLAN.md
+    /// M49): a daemon on Linux, with the sorter to do it.
+    pub phone_relay: bool,
     /// Where the peers in `reachable` send from — see
     /// [`observed_endpoints`].
     pub observed: Vec<wireserve_types::ObservedEndpoint>,
@@ -153,30 +154,58 @@ fn observed_endpoints(
         .collect()
 }
 
-/// The phones this node relays (PLAN.md M40), from `relay_public`: each
-/// node's relay port on this node, going on to that node's own WireGuard
-/// port. A node without a mesh address, relay port or listen port is left
-/// out — never guessed at — and so is this node itself.
-fn public_relays(directory: &PollResponse, self_pubkey: &str) -> Vec<wireserve_types::PublicRelay> {
-    directory
+/// The phone relay's ports (PLAN.md M49): the divert socket on the first
+/// port after the relay ports, the mesh socket on the next.
+fn phone_relay_ports(base: u16) -> Option<(u16, u16)> {
+    let divert = base.checked_add(wireserve_types::RELAY_SLOTS)?;
+    Some((divert, divert.checked_add(1)?))
+}
+
+/// What the phone relay is told this cycle (PLAN.md M49), from
+/// `relay_public` and `relay_devices`: each node by its mesh address and
+/// WireGuard port, from the directory, and its key. A node or device whose
+/// entry or key is missing is left out — never guessed at — and so is this
+/// node itself. `None` when this node relays no phones.
+#[cfg(target_os = "linux")]
+fn phone_relay_config(
+    directory: &PollResponse,
+    self_pubkey: &str,
+    node_ip: Option<Ipv4Addr>,
+    listen_port: u16,
+) -> Option<crate::phone_relay::io::Config> {
+    let key = |pk: &str| defguard_wireguard_rs::key::Key::try_from(pk).ok().map(|k| k.as_array());
+    let nodes: Vec<(std::net::SocketAddrV4, [u8; 32])> = directory
         .relay_public
         .iter()
         .filter(|pk| pk.as_str() != self_pubkey)
         .filter_map(|pk| {
             let p = directory.peers.iter().find(|p| &p.pubkey == pk)?;
-            Some(wireserve_types::PublicRelay { port: p.relay.port?, to: p.ip4.parse().ok()?, to_port: p.relay.listen_port? })
+            Some((std::net::SocketAddrV4::new(p.ip4.parse().ok()?, p.relay.listen_port?), key(pk)?))
         })
-        .collect()
+        .collect();
+    if nodes.is_empty() {
+        return None;
+    }
+    let (divert_port, mesh_port) = phone_relay_ports(directory.relay_port_base?)?;
+    Some(crate::phone_relay::io::Config {
+        listen_port,
+        divert_port,
+        mesh: std::net::SocketAddrV4::new(node_ip?, mesh_port),
+        nodes,
+        devices: directory.relay_devices.iter().filter_map(|pk| key(pk)).collect(),
+    })
 }
 
-/// The relay ports and, after them, the ports relayed phone sessions leave
-/// from (PLAN.md M40), from the coordinator's first relay port.
-fn relay_ranges(base: u16) -> Option<((u16, u16), (u16, u16))> {
-    let n = wireserve_types::RELAY_SLOTS;
-    let relay = (base, base.checked_add(n - 1)?);
-    let phones = (base.checked_add(n)?, base.checked_add(2 * n - 1)?);
-    Some((relay, phones))
+/// The phone relay of a running daemon (PLAN.md M49), and the firewall's
+/// handle it diverts sessions through.
+#[cfg(target_os = "linux")]
+pub struct PhoneRelayHandle {
+    pub relay: crate::phone_relay::io::PhoneRelay,
+    pub divert: std::sync::Arc<dyn crate::phone_relay::io::Divert>,
 }
+
+#[cfg(not(target_os = "linux"))]
+pub struct PhoneRelayHandle;
 
 /// Builds the request body from currently-declared services — this is the
 /// node's own view of what it's serving, independent of anything the
@@ -214,11 +243,13 @@ pub fn build_poll_request(
             if transit.carry_port.is_some() {
                 caps.push(wireserve_types::CAP_RELAY.to_string());
             }
+            if transit.phone_relay {
+                caps.push(wireserve_types::CAP_PHONE_RELAY.to_string());
+            }
             caps
         },
         carry_port: transit.carry_port,
         dialable_v4: transit.dialable_v4,
-        port_checks_seen: transit.port_checks_seen,
         tls_ready: {
             let mut ready = tls.ready;
             ready.truncate(wireserve_types::MAX_TLS_READY_PER_POLL);
@@ -630,8 +661,8 @@ pub struct PollContext<'a, F: FirewallBackend> {
     /// Whether this node is dialable from outside (PLAN.md M40), learned
     /// with the reflexive address at startup.
     pub own_dialable_v4: Option<bool>,
-    /// This node's relay port checks (PLAN.md M40); `None` in tests.
-    pub port_checks: Option<&'a std::sync::Arc<crate::port_check::PortChecker>>,
+    /// This node's phone relay (PLAN.md M49); `None` in tests.
+    pub phone_relay: Option<&'a PhoneRelayHandle>,
     /// The shared directory as of the last poll (fix 6), kept between polls so
     /// that the next can name it and be sent only what changed.
     pub held: &'a mut Option<crate::held::Held>,
@@ -756,8 +787,6 @@ where
     });
 
     // 1. send
-    // Answered port checks go out until a poll gets through with them.
-    let checks_seen = ctx.port_checks.map(|c| c.seen()).unwrap_or_default();
     let mut req = build_poll_request(
         &declared,
         endpoint_addr,
@@ -771,7 +800,7 @@ where
             wanted: transit_wanted,
             carry_port: ctx.wg.carry_port(),
             dialable_v4: ctx.own_dialable_v4,
-            port_checks_seen: checks_seen.clone(),
+            phone_relay: ctx.phone_relay.is_some(),
             observed: transit_observed,
         },
         tls_report,
@@ -810,10 +839,6 @@ where
             status,
             message: body_text,
         });
-    }
-    // Accepted: the coordinator recorded them before answering.
-    if let Some(checker) = ctx.port_checks {
-        checker.delivered(&checks_seen);
     }
     let mut directory: PollResponse = resp.json().await?;
     // The whole directory, whether it came whole or as what changed.
@@ -925,24 +950,27 @@ where
     };
     let carry_port = ctx.wg.carry_port();
     let carry_name = ctx.wg.carry_name().map(str::to_string);
-    // Phones this node relays through its public address (PLAN.md M40), and
-    // the relay ports' ranges — a carrier's alone, like the relays above.
-    let relay_public: Vec<wireserve_types::PublicRelay> = if transit_capable {
-        public_relays(&directory, &self_pubkey)
-    } else {
-        Vec::new()
-    };
-    let relay_ranges = directory.relay_port_base.filter(|_| transit_capable).and_then(relay_ranges);
-    if let Some(checker) = ctx.port_checks {
-        checker.start(&directory.port_checks);
+    // Phones this node relays on its own WireGuard port (PLAN.md M49) — a
+    // carrier's alone, like the relays above.
+    #[cfg(target_os = "linux")]
+    let phone_relay = if transit_capable { phone_relay_config(&directory, &self_pubkey, node_ip, listen_port) } else { None };
+    #[cfg(target_os = "linux")]
+    if let Some(handle) = ctx.phone_relay {
+        if let Err(e) = handle.relay.configure(phone_relay.clone(), &handle.divert) {
+            tracing::warn!(error = %e, "could not open the phone relay's sockets; phones can't reach other nodes through this one");
+        }
     }
-    let relay_checks = ctx.port_checks.map(|c| c.active_ports()).unwrap_or_default();
-    // A port under a check answers the check, not a phone: its relay would
-    // otherwise take the coordinator's probe too, and the check would read
-    // an open port as closed. Sessions already relayed keep their tracked
-    // flow meanwhile; only a new one waits the minute out.
-    let relay_public: Vec<wireserve_types::PublicRelay> =
-        relay_public.into_iter().filter(|r| !relay_checks.contains(&r.port)).collect();
+    #[cfg(target_os = "linux")]
+    let phone_relay = phone_relay.filter(|_| ctx.phone_relay.is_some_and(|h| h.relay.is_running())).map(|c| {
+        wireserve_types::PhoneRelayRules {
+            listen_port: c.listen_port,
+            divert_port: c.divert_port,
+            mesh_port: c.mesh.port(),
+            indexes: Vec::new(),
+        }
+    });
+    #[cfg(not(target_os = "linux"))]
+    let phone_relay: Option<wireserve_types::PhoneRelayRules> = None;
     // The devices this node is the exit for (PLAN.md M27). Only while this
     // node itself opted in — the coordinator's list is the device side of
     // the consent, never the whole of it — and only with a pinned mesh
@@ -1006,7 +1034,7 @@ where
         //    directory and not from whatever `serve` may have queued
         //    since. The one exception is an admin denial, already folded
         //    in above, which can only ever close a hole; see there.
-        //    `relay_forwards` and `relay_public` (PLAN.md M39, M40) are
+        //    `relay_forwards` and `phone_relay` (PLAN.md M39, M49) are
         //    this node's own role as a carrier this cycle — empty whenever
         //    it carries none, whether or not it opted in.
         //
@@ -1020,14 +1048,9 @@ where
         //    An exit (PLAN.md M27) is one more egress: replies from the
         //    internet arrive on the default route's interface, which goes
         //    through the same owned, guarded switch.
-        //
-        //    So is a public relay (PLAN.md M40): IPv4 forwarding is decided on
-        //    the interface a packet arrives on, which for a phone's is the
-        //    default route's.
         let mut egress = egress_interfaces(&rules, &ifname);
-        let public_iface = internet_egress(&ifname);
-        if !exit.is_empty() || !relay_public.is_empty() {
-            egress.extend(public_iface.clone());
+        if !exit.is_empty() {
+            egress.extend(internet_egress(&ifname));
         }
         let plan = crate::firewall::ip_forward::begin_egress(&egress, &owned_egress);
         let forwarding = wireserve_types::Forwarding {
@@ -1035,10 +1058,7 @@ where
             relay_self: node_ip,
             // A phone relayed to this node arrives at its own WireGuard port.
             relay_ends: carry_port.into_iter().chain(std::iter::once(listen_port)).collect(),
-            relay_public: relay_public.clone(),
-            relay_public_iface: public_iface,
-            relay_ranges,
-            relay_checks: relay_checks.clone(),
+            phone_relay,
             guarded: plan.guard.iter().cloned().collect(),
             exit: exit.clone(),
             mesh_v4: mesh_ranges.as_ref().map(wireserve_types::MeshRanges::v4),
@@ -1074,7 +1094,7 @@ where
         let forwards_services = rules.iter().any(|r| r.remote_target().is_some());
         crate::firewall::ip_forward::set_enabled(
             &ifname,
-            !relay_forwards.is_empty() || !relay_public.is_empty() || forwards_services || !exit.is_empty(),
+            !relay_forwards.is_empty() || forwards_services || !exit.is_empty(),
         );
         // A relayed peer's request for such a service arrives on the carry
         // interface, and IPv4 forwards only what arrives on an interface
@@ -1188,7 +1208,7 @@ mod tests {
                 wanted: vec!["wanted-pk".into()],
                 carry_port: None,
                 dialable_v4: None,
-                port_checks_seen: vec![],
+                phone_relay: false,
                 observed: vec![wireserve_types::ObservedEndpoint { pubkey: "reachable-pk".into(), addr: "198.51.100.9:61000".into() }],
             },
             TlsSelfReport::default(),
@@ -1399,7 +1419,7 @@ mod tests {
             &crate::probe::DualProbeResult::default(),
             None,
             None,
-            TransitSelfReport { capable: false, exit_capable: false, reachable: vec![], wanted: vec![], carry_port: None, dialable_v4: None, port_checks_seen: vec![], observed: vec![] },
+            TransitSelfReport { capable: false, exit_capable: false, reachable: vec![], wanted: vec![], carry_port: None, dialable_v4: None, phone_relay: false, observed: vec![] },
             TlsSelfReport::default(),
         );
         assert!(req.capabilities.is_empty(), "no terminator, nothing to claim");
@@ -1411,7 +1431,7 @@ mod tests {
             &crate::probe::DualProbeResult::default(),
             None,
             None,
-            TransitSelfReport { capable: false, exit_capable: false, reachable: vec![], wanted: vec![], carry_port: None, dialable_v4: None, port_checks_seen: vec![], observed: vec![] },
+            TransitSelfReport { capable: false, exit_capable: false, reachable: vec![], wanted: vec![], carry_port: None, dialable_v4: None, phone_relay: false, observed: vec![] },
             TlsSelfReport { capable: true, ready: vec!["plex".into()] },
         );
         assert!(req.capabilities.contains(&wireserve_types::CAP_TLS_TERMINATE.to_string()));
@@ -1597,7 +1617,7 @@ mod tests {
             relay_carrying: vec![],
             relay_public: vec![],
             relay_port_base: None,
-            port_checks: vec![],
+            relay_devices: vec![],
             transit_awaiting_approval: false,
             exit_clients: vec![],
             mesh: None,

@@ -320,10 +320,16 @@ pub const CAP_SIGN_IN: &str = "session-sign-in";
 /// between nodes that all say so.
 pub const CAP_RELAY: &str = "relay";
 
+/// `phone-relay` (PLAN.md M49): this agent, as a carrier, relays phones on
+/// its own WireGuard port, sorting out the packets for other nodes by what
+/// WireGuard sends in the clear. A device is only ever assigned a carrier
+/// that says so: an older one served each node on a port of its own.
+pub const CAP_PHONE_RELAY: &str = "phone-relay";
+
 /// How many relay slots a mesh has (PLAN.md M39): a node's relay port is
 /// the coordinator's base plus its slot, so the ports run from the base to
-/// the base plus this, less one. The same number again after them is where
-/// a carrier's relayed phone sessions leave from (PLAN.md M40).
+/// the base plus this, less one. A carrier's sorter for phones listens on
+/// the two ports right after them (PLAN.md M49).
 pub const RELAY_SLOTS: u16 = 1000;
 
 /// The default first relay port (`WIRESERVE_RELAY_PORT_BASE`).
@@ -454,10 +460,6 @@ pub struct PollRequest {
     /// where inbound traffic is let in. `None` when it could not be tested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialable_v4: Option<bool>,
-    /// The port checks this node was asked to run (PLAN.md M40) and the
-    /// nonce each one received from the coordinator.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub port_checks_seen: Vec<PortCheck>,
 }
 
 /// One peer's WireGuard source address, as another node sees it
@@ -468,19 +470,6 @@ pub struct ObservedEndpoint {
     /// `ip:port`, IPv4.
     pub addr: String,
 }
-
-/// A check that one of a carrier's public relay ports is open (PLAN.md
-/// M40): the carrier listens on `port` for a while, and the coordinator
-/// sends `nonce` to it from outside.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PortCheck {
-    pub port: u16,
-    /// 16 hex digits.
-    pub nonce: String,
-}
-
-/// At most this many port checks are read from one poll.
-pub const MAX_PORT_CHECKS_PER_POLL: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PeerInfo {
@@ -664,19 +653,22 @@ pub struct PollResponse {
     /// addresses and ports come from.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relay_carrying: Vec<TransitPair>,
-    /// The nodes THIS node relays phones to through its public relay port
-    /// (PLAN.md M40), by pubkey: each one's relay port on this node's public
-    /// address goes on to that node's own WireGuard port.
+    /// The nodes THIS node relays phones to on its own WireGuard port
+    /// (PLAN.md M40, M49), by pubkey: a phone's handshake whose `mac1` names
+    /// one of them, and that session's packets, go on to the node's own
+    /// WireGuard port over the mesh.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relay_public: Vec<String>,
+    /// The devices that reach those nodes through THIS node (PLAN.md M49), by
+    /// pubkey: a node's handshake towards one of them is sent on to the
+    /// address that device was last seen at.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_devices: Vec<String>,
     /// The first relay port (`WIRESERVE_RELAY_PORT_BASE`): relay ports run
-    /// from it for [`RELAY_SLOTS`], and the phone sessions a carrier relays
-    /// leave it from the [`RELAY_SLOTS`] after those.
+    /// from it for [`RELAY_SLOTS`], and a carrier's sorter for phones
+    /// listens on the two ports after those (PLAN.md M49).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_port_base: Option<u16>,
-    /// Port checks THIS node should run now (PLAN.md M40).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub port_checks: Vec<PortCheck>,
     /// THIS node asked to carry transit (`transit_capable`) but no admin
     /// has approved it as a carrier, so the coordinator is ignoring the
     /// offer. A self-reported offer is never enough on its own: a carrier
@@ -861,84 +853,39 @@ pub struct RelayAssignment {
     pub carrier: String,
 }
 
-/// `POST /admin/relays/plan` (PLAN.md M40): how a device exported now
-/// reaches each node — directly, or through which carrier's public relay
-/// port — with that port checked from the internet first.
+/// `POST /admin/relays/plan` (PLAN.md M40, M49): how a device exported
+/// now reaches each node — directly, or through which carrier.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RelayPlanRequest {
-    /// Keep a relay whose port could not be confirmed open (`device create
-    /// --allow-unverified`), for an operator who knows better than the
-    /// check, which runs from the coordinator's own network.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub allow_unverified: bool,
-}
+pub struct RelayPlanRequest {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RelayPlan {
-    /// Nodes a device dials directly: they accept inbound WireGuard.
+    /// Nodes a device dials directly: the carrier itself, or, with no
+    /// carrier, the nodes that accept inbound WireGuard.
     #[serde(default)]
     pub direct: Vec<String>,
-    /// Nodes it reaches through a carrier.
+    /// Nodes it reaches through the carrier.
     #[serde(default)]
     pub relayed: Vec<RelayPlanEntry>,
     /// Nodes nothing reaches from outside: not dialable, and no carrier
     /// qualifies. Left out of the `.conf`, with the reason.
     #[serde(default)]
     pub unreachable: Vec<Unreachable>,
-    /// Relay ports that must be opened before the plan can be used — the
-    /// export stops with exactly these unless `allow_unverified`.
-    #[serde(default)]
-    pub closed: Vec<RelayPortStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayPlanEntry {
     pub node: String,
     pub carrier: String,
-    /// `<carrier public IPv4>:<the node's relay port>`, the `Endpoint =`.
+    /// `<carrier public IPv4>:<the carrier's WireGuard port>`, the
+    /// `Endpoint =` — the same for every node the carrier relays.
     pub endpoint: String,
-    /// Whether the port was seen open from outside; `None` when it could
-    /// not be checked.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub open: Option<bool>,
-    /// The carrier is the coordinator's own host, so a check from here
-    /// never leaves the machine and can't see a firewall in front of it:
-    /// not checked, and the operator is told to make sure by hand.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub unverifiable_here: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Unreachable {
     pub node: String,
     pub reason: String,
-}
-
-/// `GET /admin/relay-ports` (PLAN.md M40): every public relay port a
-/// carrier has or had, what it serves and whether it may be closed.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RelayPortsResponse {
-    #[serde(default)]
-    pub ports: Vec<RelayPortStatus>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RelayPortStatus {
-    pub carrier: String,
-    /// The carrier's public IPv4 address, where the port has to be open.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub address: Option<String>,
-    pub port: u16,
-    /// The node the port leads to, when one still has it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node: Option<String>,
-    /// The devices whose `.conf` uses it; empty means it may be closed.
-    #[serde(default)]
-    pub devices: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checked_at: Option<chrono::DateTime<chrono::Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub open: Option<bool>,
 }
 
 // ---- §4.5.1 Admin: list peers ----
@@ -1124,7 +1071,7 @@ mod tests {
             relay_carrying: vec![],
             relay_public: vec![],
             relay_port_base: None,
-            port_checks: vec![],
+            relay_devices: vec![],
             transit_awaiting_approval: false,
             exit_clients: vec![],
             mesh: None,
@@ -1181,7 +1128,7 @@ mod tests {
             relay_carrying: vec![],
             relay_public: vec![],
             relay_port_base: None,
-            port_checks: vec![],
+            relay_devices: vec![],
             transit_awaiting_approval: false,
             exit_clients: vec![],
             mesh: None,

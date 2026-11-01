@@ -7,5 +7,7 @@
 //! one on to its node over the mesh, or back to the kernel as it came.
 //! Nothing is decrypted: the carrier holds no key to any of these sessions.
 
+#[cfg(target_os = "linux")]
+pub mod io;
 pub mod packet;
 pub mod sorter;

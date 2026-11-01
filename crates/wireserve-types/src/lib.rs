@@ -28,7 +28,7 @@ pub use naming::{
     HTTP_PUBLIC_PORT, LETS_ENCRYPT_DIRECTORY, TLS_LISTEN_PORT, TLS_PUBLIC_PORT,
 };
 pub use firewall::{
-    is_internet_v4, FirewallBackend, Forwarding, PublicRelay, RelayEnd, RelayForward, ServiceRule, Sources,
+    is_internet_v4, FirewallBackend, Forwarding, PhoneRelayRules, RelayEnd, RelayForward, ServiceRule, Sources,
     NOT_THE_INTERNET_V4,
 };
 pub use node::{NodeKind, Proto};

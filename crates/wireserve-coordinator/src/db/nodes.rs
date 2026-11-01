@@ -495,43 +495,6 @@ pub fn all_static_relays(conn: &Connection) -> Result<Vec<(i64, i64, i64)>, DbEr
     Ok(rows)
 }
 
-/// What was last seen of a carrier's public relay port.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelayPortRow {
-    pub carrier_node_id: i64,
-    pub port: u16,
-    pub address: String,
-    pub open: bool,
-    pub checked_at: Option<DateTime<Utc>>,
-}
-
-/// Records a port check's outcome, replacing the last one.
-pub fn record_relay_port(conn: &Connection, carrier: i64, port: u16, address: &str, open: bool) -> Result<(), DbError> {
-    conn.execute(
-        "INSERT INTO relay_ports (carrier_node_id, port, address, open, checked_at) VALUES (?1, ?2, ?3, ?4, ?5) \
-         ON CONFLICT (carrier_node_id, port) DO UPDATE SET address = ?3, open = ?4, checked_at = ?5",
-        rusqlite::params![carrier, port, address, open, now_str()],
-    )?;
-    Ok(())
-}
-
-/// Every recorded relay port.
-pub fn relay_ports(conn: &Connection) -> Result<Vec<RelayPortRow>, DbError> {
-    let mut stmt = conn.prepare("SELECT carrier_node_id, port, address, open, checked_at FROM relay_ports ORDER BY carrier_node_id, port")?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok(RelayPortRow {
-                carrier_node_id: r.get(0)?,
-                port: r.get(1)?,
-                address: r.get(2)?,
-                open: r.get(3)?,
-                checked_at: r.get::<_, String>(4).ok().and_then(|s| parse_dt(&s)),
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
-}
-
 /// The static nodes that depend on `node_id` — as their exit, or as the
 /// carrier of one of their relays — by name. Used to warn on lifecycle
 /// operations that would strand them.
@@ -1057,19 +1020,6 @@ mod tests {
         assert_eq!((row.exit_node_id, row.exit_enabled), (None, false));
         assert!(all_static_relays(&conn).unwrap().is_empty());
         assert!(static_nodes_depending_on(&conn, exit).unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_relay_port_check_is_recorded_and_replaced() {
-        let db = test_db();
-        let conn = db.conn.lock().await;
-        let carrier = create_node(&conn, "c", NodeKind::Agent, "h-c", None).unwrap();
-        record_relay_port(&conn, carrier, 41003, "203.0.113.7", false).unwrap();
-        record_relay_port(&conn, carrier, 41003, "203.0.113.7", true).unwrap();
-        let rows = relay_ports(&conn).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].open && rows[0].checked_at.is_some());
-        assert_eq!(rows[0].address, "203.0.113.7");
     }
 
     #[tokio::test]
