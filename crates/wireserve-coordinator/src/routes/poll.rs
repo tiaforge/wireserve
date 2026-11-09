@@ -230,9 +230,6 @@ async fn answer(
     state.transit.report_capabilities(&self_pubkey, &capabilities);
     state.transit.report_carry_port(&self_pubkey, req.carry_port);
     state.transit.report_dialable(&self_pubkey, req.dialable_v4);
-    let seen: Vec<wireserve_types::PortCheck> =
-        req.port_checks_seen.iter().take(wireserve_types::MAX_PORT_CHECKS_PER_POLL).cloned().collect();
-    state.transit.record_seen(&self_pubkey, &seen);
     // Where this carrier sees its peers' traffic come from, which follows a
     // NAT mapping that changed after a node's startup probe (see
     // `PollRequest::transit_observed`). Taken from an approved carrier only,
@@ -560,23 +557,26 @@ async fn answer(
             Vec::new()
         };
 
-        // This requester's public relays (PLAN.md M40): the nodes devices reach
-        // through its public address, from their exports — only while it is
-        // approved to carry, and only nodes still in the directory.
-        let relay_public: Vec<String> = if node.transit_approved {
-            let mut dests: Vec<String> = dir
+        // This requester's phone relays (PLAN.md M40, M49): the nodes devices
+        // reach through it, and those devices, from their exports — only while
+        // it is approved to carry, and only nodes and devices still in the
+        // directory.
+        let (relay_public, relay_devices): (Vec<String>, Vec<String>) = if node.transit_approved {
+            let mine: Vec<&(i64, i64, i64)> = dir
                 .static_relays
                 .iter()
                 .filter(|(device, _, carrier)| *carrier == node.id && dir.nodes.contains_key(device))
-                .filter_map(|(_, peer, _)| dir.nodes.get(peer)?.pubkey.clone())
                 .collect();
-            dests.sort();
-            dests.dedup();
-            dests
+            let pubkeys = |ids: &mut dyn Iterator<Item = i64>| {
+                let mut out: Vec<String> = ids.filter_map(|id| dir.nodes.get(&id)?.pubkey.clone()).collect();
+                out.sort();
+                out.dedup();
+                out
+            };
+            (pubkeys(&mut mine.iter().map(|(_, peer, _)| *peer)), pubkeys(&mut mine.iter().map(|(device, _, _)| *device)))
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
-        let port_checks = state.transit.checks_for(&self_pubkey);
 
         let available = state.config.sign_in().is_some();
         let sign_in_capable = |owner: &nodes::NodeRow| {
@@ -618,8 +618,8 @@ async fn answer(
             denied_services: outcome.denied.iter().map(directory::denied_service).collect(),
             relay_carrying,
             relay_public,
+            relay_devices,
             relay_port_base: Some(state.config.relay_port_base),
-            port_checks,
             transit_awaiting_approval,
             exit_clients,
             mesh: Some(state.config.mesh_info()),

@@ -72,4 +72,5 @@ Each node has a **relay port**, `41000` plus a number the coordinator
 assigns it for life (`WIRESERVE_RELAY_PORT_BASE` moves the range). A
 carrier receives a node's relayed packets on that port of its mesh
 address, inside the tunnel, so for relaying between agents nothing is
-ever opened on the internet.
+ever opened on the internet. Phones are relayed differently, on the
+carrier's own WireGuard port: see [devices](devices.md).

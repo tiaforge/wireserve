@@ -15,53 +15,37 @@ the QR code — it will sit in your scrollback.) Such a peer gets a mesh
 address and reaches every service by its address (in `wireserve-admin
 service list`) and port, but has no `.wg` name resolution.
 
-**Every node, end to end.** The config holds one `[Peer]` per node, and the
-phone talks to each one directly — WireGuard between the two, as between
-agents. How depends on the node:
-
-- **A node that accepts inbound WireGuard** (a VPS, a home server with a port
-  forward) is dialled at its own endpoint. Each agent finds this out itself
-  when it starts: the coordinator answers its startup probe a second time,
-  from a port the node never sent anything to, and that answer only gets in
-  where the node's router or firewall lets unsolicited traffic in.
-  `node show <name>` shows the result (`dialable: yes|no`).
-- **Every other node** — behind a NAT nothing gets through (a home server
-  without a port forward, CGNAT), or one that hasn't said, because it is
-  offline or runs an older agent — is reached through a **carrier**: an
-  approved node with a public IPv4 address, preferably one that reaches it
-  right now. An offline node's relay works once it is back. The phone dials the
-  carrier's public address on that node's **relay port**, and the carrier
-  sends the packets on to the node without being able to read them — the
-  session is the phone's and the node's, the carrier holds no key to it.
-  It still sees that the two talk, when and how much.
+**Every node, end to end, through one carrier.** The config holds one
+`[Peer]` per node, and the phone talks to each one directly — WireGuard
+between the two, as between agents — but sends all of it to one
+**carrier**: an approved node with a public IPv4 address that accepts
+inbound WireGuard, preferably the one reaching the most nodes right now.
+Every `[Peer]` has the same `Endpoint =`, the carrier's address and
+WireGuard port. The carrier is the phone's peer for itself; for every other
+node it reads only what WireGuard sends in the clear (which public key a
+handshake is meant for, and the session it belongs to) and sends the
+packets on to that node over the mesh, without being able to read them —
+the session is the phone's and the node's, the carrier holds no key to it.
+It still sees that the two talk, when and how much.
 
 ```sh
 wireserve-admin transit approve vps1      # and `wireserve transit on` on vps1
 wireserve-admin device create myphone --qr
 ```
 
-Before writing anything the export checks, from outside, that every relay
-port it needs is open, since that is the one thing that may need doing by
-hand (see [Ports and firewalls](firewall.md)), and it lists every port the
-config relies on each time. A port on the coordinator's own host can't be
-checked — the check would never leave the machine — so it is listed as
-`NOT CHECKED`: make sure it is open in any firewall in front of that host
-(a cloud provider's panel, say). A closed one stops the export:
+So a phone needs exactly one port to get out on, the WireGuard port, and
+nothing has to be opened for it beyond what the carrier already needs to
+be dialable (see [Ports and firewalls](firewall.md)). A network that lets
+out only that port, as hotel and office Wi-Fi often does, still reaches
+every node. And the config says nothing about where a node is: one that
+moves behind another NAT, or gets a port forward, needs no new config.
 
-```
-these relay ports must be reachable from the internet first:
-  open UDP 41003 inbound on vps1 (203.0.113.7) in any firewall outside the
-  host — cloud firewall or router port forward — for minipc; it was not reachable
-then run this again (or pass --allow-unverified to write the config regardless)
-```
-
-Each node's relay port is `41000` plus a number it keeps for life, the same
-on every carrier, so a port opened once stays right. The export prefers a
-carrier whose port for that node is already open, then one already serving
-phones, so as few as possible ever need opening. `wireserve-admin
-relay-ports` lists every one: where it must be open, which node it leads to,
-which devices use it, whether it was open when last checked — and which no
-device uses any more and may be closed again.
+Whether a node accepts inbound WireGuard each agent finds out itself when
+it starts: the coordinator answers its startup probe a second time, from a
+port the node never sent anything to, and that answer only gets in where
+the node's router or firewall lets unsolicited traffic in. `node show
+<name>` shows the result (`dialable: yes|no`). With no carrier at all, a
+node that is dialable is dialled directly and the others are left out.
 
 **The config is a snapshot.** A node that joins later isn't in it, nor is
 one no carrier reaches at the time of the export (the export says so).

@@ -3,10 +3,10 @@
 //! in one CLI call, and renders a `.conf` for import into an official
 //! WireGuard client.
 //!
-//! Every node the device reaches, it reaches end to end (PLAN.md M40, M41):
-//! directly when the node accepts inbound WireGuard, and otherwise through a
-//! carrier's public relay port, which forwards the session without being
-//! able to read it. Only an exit, which the device's full-tunnel profile
+//! Every node the device reaches, it reaches end to end (PLAN.md M40, M41,
+//! M49): through one carrier, on the carrier's own WireGuard port, which
+//! forwards each session without being able to read it — the carrier
+//! itself directly. Only an exit, which the device's full-tunnel profile
 //! sends its internet traffic to, sees any of it — that is what an exit is.
 
 use defguard_wireguard_rs::key::Key;
@@ -53,10 +53,6 @@ pub enum ExportConfigError {
     /// for a caller of the library.
     #[error("{0}")]
     DnsUsage(&'static str),
-    /// Relay ports that must be opened first (PLAN.md M40) — each named with
-    /// exactly where.
-    #[error("{0}")]
-    PortsClosed(String),
 }
 
 /// This node's own interface parameters for rendering: the private key
@@ -120,8 +116,10 @@ pub struct RenderedConf {
 /// plus the `/32` of every approved service it owns (`services`, PLAN.md
 /// M20 — the same rule the agent applies), never a shared mesh CIDR block.
 ///
-/// A relayed node's `Endpoint =` is its carrier's public relay port; with
-/// one in the file, the interface's MTU drops to the carry interface's
+/// A relayed node's `Endpoint =` is its carrier's public address and
+/// WireGuard port (PLAN.md M49); the exit's, in the full-tunnel profile,
+/// is its own. With a relayed node in the file, the interface's MTU drops
+/// to the carry interface's
 /// 1340, since the carrier sends those packets on inside its own tunnel.
 ///
 /// Defense in depth (security review S2): the coordinator validates
@@ -166,9 +164,19 @@ pub fn render_conf(
             continue;
         }
         render_peer(&mut mesh, peer, services, endpoint.as_deref(), None);
-        let is_exit = relayed.is_none() && exit.is_some_and(|e| e.node == peer.name);
+        // The full tunnel goes straight to its exit (PLAN.md #343), at its
+        // own endpoint even where the mesh profile reaches it through the
+        // carrier: one without an endpoint of its own is never the exit, or
+        // the internet would go through the carrier.
+        let own = if relayed.is_some() { choose_endpoint(peer) } else { endpoint.clone() };
+        let is_exit = exit.is_some_and(|e| e.node == peer.name) && own.is_some();
         exit_rendered |= is_exit;
-        render_peer(&mut full, peer, services, endpoint.as_deref(), is_exit.then_some("0.0.0.0/0, ::/0"));
+        let full_endpoint = if is_exit { own } else { endpoint.clone() };
+        if full_endpoint.as_deref().is_some_and(contains_newline) {
+            warn_skipped(&peer.name);
+            continue;
+        }
+        render_peer(&mut full, peer, services, full_endpoint.as_deref(), is_exit.then_some("0.0.0.0/0, ::/0"));
         if let Some((node, carrier, _)) = relayed {
             relays.push(RelayAssignment { node: node.clone(), carrier: carrier.clone() });
         }
@@ -393,8 +401,6 @@ pub struct ExportOptions<'a> {
     pub dns: Option<&'a str>,
     /// `--mesh-dns`: put the resolver into the mesh profile too (M28).
     pub mesh_dns: bool,
-    /// `--allow-unverified`: write relays whose port couldn't be seen open.
-    pub allow_unverified: bool,
 }
 
 /// Where each profile sends DNS, resolved from [`ExportOptions`].
@@ -456,69 +462,29 @@ fn resolve_profiles(
     })
 }
 
-/// Asks the coordinator how the device reaches each node (PLAN.md M40), and
-/// stops — before anything is created — if a relay port it needs isn't
-/// open, naming exactly which port to open where.
-fn plan_routes(admin_client: &AdminClient, opts: &ExportOptions<'_>, exit: Option<&PeerInfo>) -> Result<RelayPlan, ExportConfigError> {
-    eprintln!("working out how the device reaches each node (checking a relay port can take up to a minute)…");
-    let plan = admin_client.relay_plan(opts.allow_unverified)?;
+/// Asks the coordinator how the device reaches each node (PLAN.md M40,
+/// M49), and says so: every node but the carrier through the carrier, on
+/// its WireGuard port — the one port the device needs to get out on.
+fn plan_routes(admin_client: &AdminClient, exit: Option<&PeerInfo>) -> Result<RelayPlan, ExportConfigError> {
+    let plan = admin_client.relay_plan()?;
     for u in &plan.unreachable {
         eprintln!("warning: {} is left out of the config: {}", u.node, u.reason);
     }
     if let Some(exit) = exit {
-        if !plan.direct.iter().any(|n| n == &exit.name) {
+        if plan.unreachable.iter().any(|u| u.node == exit.name) {
             return Err(ExportConfigError::ExitNotDialable { name: exit.name.clone() });
         }
     }
-    if !plan.closed.is_empty() {
-        let mut msg = String::from("these relay ports must be reachable from the internet first:\n");
-        for port in &plan.closed {
-            let at = port.address.as_deref().unwrap_or("its public address");
-            let node = port.node.as_deref().unwrap_or("a node");
-            let why = if port.open == Some(false) { "was not reachable" } else { "could not be checked in time" };
-            msg.push_str(&format!(
-                "  open UDP {} inbound on {} ({at}) in any firewall outside the host — cloud firewall or \
-                 router port forward — for {node}; it {why}\n",
-                port.port, port.carrier
-            ));
-        }
-        if opts.allow_unverified {
-            eprint!("warning: writing the config anyway (--allow-unverified); {msg}");
-        } else {
-            msg.push_str("then run this again (or pass --allow-unverified to write the config regardless)");
-            return Err(ExportConfigError::PortsClosed(msg));
-        }
-    }
-    for r in &plan.relayed {
-        eprintln!("{}: relayed by {} at {} (end to end — {} can't read it)", r.node, r.carrier, r.endpoint, r.carrier);
-    }
-    // What the config depends on outside the mesh, said every time: a port
-    // a firewall in front of the carrier must let in. Checked ones are
-    // named too, so the list is complete, not only what went wrong.
-    let mut needed: Vec<String> = plan
-        .relayed
-        .iter()
-        .map(|r| {
-            let (addr, port) = r.endpoint.rsplit_once(':').unwrap_or((&r.endpoint, "?"));
-            let state = match (r.open, r.unverifiable_here) {
-                (_, true) => format!(
-                    "NOT CHECKED: the coordinator runs on {}, so a check from it never leaves the machine — \
-                     make sure it is open in any firewall in front of {}",
-                    r.carrier, r.carrier
-                ),
-                (Some(true), _) => "seen open from outside".to_string(),
-                _ => "not seen open".to_string(),
-            };
-            format!("  UDP {port} inbound on {} ({addr}), for {}: {state}", r.carrier, r.node)
-        })
-        .collect();
-    needed.sort();
-    needed.dedup();
-    if !needed.is_empty() {
-        eprintln!("this config relies on these ports being open from the internet (see `wireserve-admin transit ports`):");
-        for line in &needed {
-            eprintln!("{line}");
-        }
+    if let Some(first) = plan.relayed.first() {
+        let nodes: Vec<&str> = plan.relayed.iter().map(|r| r.node.as_str()).collect();
+        eprintln!(
+            "{} relayed by {} at {} (end to end — {} can't read it); the device needs nothing but UDP {} to get out",
+            nodes.join(", "),
+            first.carrier,
+            first.endpoint,
+            first.carrier,
+            first.endpoint.rsplit_once(':').map_or("?", |(_, port)| port),
+        );
     }
     Ok(plan)
 }
@@ -539,7 +505,7 @@ pub fn run(
     let directory = admin_client.list_peers()?;
     let exit = select_exit(&directory, opts.exit)?;
     let dns = check_dns(admin_client, &directory, exit, opts)?;
-    let plan = plan_routes(admin_client, opts, exit)?;
+    let plan = plan_routes(admin_client, exit)?;
     let created = admin_client.create_node(name, NodeKind::Static, None)?;
     let mut exported = finish(admin_client, node_facing_url, name, &created.join_token, &directory, &plan, exit, dns)?;
     exported.claim = created.claim;
@@ -559,7 +525,7 @@ pub fn run(
 /// anything, so pointing this at an agent node by mistake is refused.
 ///
 /// Everything that can fail on the way in — the directory, the exit, the
-/// relay ports — happens ahead of the rejoin for the same reason.
+/// relay plan — happens ahead of the rejoin for the same reason.
 pub fn run_refresh(
     admin_client: &AdminClient,
     node_facing_url: &str,
@@ -569,7 +535,7 @@ pub fn run_refresh(
     let directory = admin_client.list_peers()?;
     let exit = select_exit(&directory, opts.exit)?;
     let dns = check_dns(admin_client, &directory, exit, opts)?;
-    let plan = plan_routes(admin_client, opts, exit)?;
+    let plan = plan_routes(admin_client, exit)?;
     let rejoined = match admin_client.rejoin(name, None, Some(NodeKind::Static)) {
         Ok(r) => r,
         Err(ClientError::Api { status, message }) if status == reqwest::StatusCode::NOT_FOUND => {
@@ -1010,7 +976,7 @@ mod exit_tests {
         let dns = Ipv4Addr::new(10, 90, 0, 50);
         let routes = Routes {
             direct: vec!["vps".into(), "vps2".into()],
-            relayed: vec![("minipc".into(), "vps2".into(), "203.0.113.9:41004".into())],
+            relayed: vec![("minipc".into(), "vps2".into(), "203.0.113.9:51820".into())],
         };
         let out = render_conf(&iface(), &[exit.clone(), public, natted], &[], &routes, Some(&ExitProfile { node: "vps", dns }));
         let full = out.exit_text.expect("an exit resolver asks for the second profile");
@@ -1026,7 +992,7 @@ mod exit_tests {
         // Every other node stays end to end: its /32s outrank the default
         // route, and a relayed one keeps its relay.
         assert!(full.contains("AllowedIPs = 10.90.0.3/32, fdb4:d481:7c21::3/128\n"), "{full}");
-        assert!(full.contains("Endpoint = 203.0.113.9:41004\n"), "{full}");
+        assert!(full.contains("Endpoint = 203.0.113.9:51820\n"), "{full}");
         assert_eq!(
             out.text.replace("AllowedIPs = 10.90.0.2/32, fdb4:d481:7c21::2/128", "AllowedIPs = 0.0.0.0/0, ::/0"),
             full.replace("DNS = 10.90.0.50\n", ""),
@@ -1043,11 +1009,24 @@ mod exit_tests {
     }
 
     #[test]
-    fn a_relayed_node_is_never_the_exit() {
+    fn a_node_without_an_endpoint_of_its_own_is_never_the_exit() {
         let natted = peer("minipc", 4, None);
-        let routes = Routes { direct: vec![], relayed: vec![("minipc".into(), "vps".into(), "203.0.113.9:41004".into())] };
+        let routes = Routes { direct: vec![], relayed: vec![("minipc".into(), "vps".into(), "203.0.113.9:51820".into())] };
         let out = render_conf(&iface(), &[natted], &[], &routes, Some(&ExitProfile { node: "minipc", dns: Ipv4Addr::new(9, 9, 9, 9) }));
         assert!(out.exit_text.is_none(), "a full tunnel through a relay would send the internet through the carrier");
+    }
+
+    /// PLAN.md #343: every node goes through the carrier in the mesh
+    /// profile, the exit included; the full tunnel dials the exit itself.
+    #[test]
+    fn an_exit_reached_through_the_carrier_is_dialled_directly_in_the_full_tunnel() {
+        let exit = peer("vps2", 2, Some("198.51.100.20:51820"));
+        let routes = Routes { direct: vec![], relayed: vec![("vps2".into(), "vps".into(), "203.0.113.9:51820".into())] };
+        let out = render_conf(&iface(), &[exit], &[], &routes, Some(&ExitProfile { node: "vps2", dns: Ipv4Addr::new(9, 9, 9, 9) }));
+        assert!(out.text.contains("Endpoint = 203.0.113.9:51820\n"), "{}", out.text);
+        let full = out.exit_text.expect("a full-tunnel profile");
+        assert!(full.contains("Endpoint = 198.51.100.20:51820\nAllowedIPs = 0.0.0.0/0, ::/0\n") || full.contains("AllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = 198.51.100.20:51820\n"), "{full}");
+        assert_eq!(out.relays, vec![RelayAssignment { node: "vps2".into(), carrier: "vps".into() }]);
     }
 
     #[test]
@@ -1092,7 +1071,7 @@ mod exit_tests {
     // ---- the mesh profile's resolver (PLAN.md M28) ----
 
     fn opts(exit: bool, mesh_dns: bool) -> ExportOptions<'static> {
-        ExportOptions { exit: exit.then_some(""), dns: None, mesh_dns, allow_unverified: false }
+        ExportOptions { exit: exit.then_some(""), dns: None, mesh_dns }
     }
 
     #[test]

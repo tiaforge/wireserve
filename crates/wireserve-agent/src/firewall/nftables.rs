@@ -8,12 +8,13 @@ use std::sync::{Arc, Mutex};
 use std::net::{IpAddr, Ipv4Addr};
 
 use nftables::expr::{
-    BinaryOperation, CTDir, Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, Prefix, Range, SetItem, CT,
+    BinaryOperation, CTDir, Expression, Fib, FibFlag, FibResult, Meta, MetaKey, NamedExpression, Payload, PayloadBase, PayloadField,
+    PayloadRaw, Prefix, SetItem, CT,
 };
 use nftables::schema::{Chain, NfCmd, NfListObject, NfObject, Nftables, Rule, Table};
-use nftables::stmt::{Accept, Drop, Limit, Mangle, Match, NATFamily, Operator, Reject, RejectType, Statement, NAT};
+use nftables::stmt::{Accept, Drop, JumpTarget, Limit, Mangle, Match, NATFamily, Operator, Reject, RejectType, Statement, TProxy, NAT};
 use nftables::types::{NfChainPolicy, NfChainType, NfFamily, NfHook};
-use wireserve_types::{FirewallBackend, Forwarding, PortMap, Proto, PublicRelay, RelayForward, ServiceRule, Sources};
+use wireserve_types::{FirewallBackend, Forwarding, PhoneRelayRules, PortMap, Proto, RelayForward, ServiceRule, Sources};
 
 use super::nft::{Nft, NftError};
 
@@ -33,6 +34,8 @@ const EXIT_MARK_CHAIN: &str = "exit-mark";
 const EXIT_MASQ_CHAIN: &str = "exit-masq";
 const RELAY_PRE_CHAIN: &str = "relay-pre";
 const RELAY_POST_CHAIN: &str = "relay-post";
+const PHONE_PRE_CHAIN: &str = "phone-pre";
+const PHONE_IDX_CHAIN: &str = "phone-idx";
 
 /// Before conntrack (-200): the rewrite must happen before a connection
 /// is ever tracked, so that the tracked connection is the rewritten one.
@@ -61,22 +64,6 @@ pub const SERVICE_MARK: u32 = 0x0100_0000;
 /// bit, so an exit flow to the same address and port sharing the bit would
 /// have its replies rewritten to look like they came from the service.
 pub const EXIT_MARK: u32 = 0x0200_0000;
-
-/// The conntrack mark bit that says "this flow is a phone's session,
-/// relayed from this node's public address to another node" (PLAN.md M40).
-/// Its own bit, like [`EXIT_MARK`]: the host firewalls are opened for
-/// exactly these flows, and the guard on the public interface lets them in.
-pub const RELAY_MARK: u32 = 0x0400_0000;
-
-/// The conntrack mark bit that says "this is the coordinator's probe of a
-/// relay port under a check" (PLAN.md M40). Set only on a port a check is
-/// running on, from anywhere but the mesh; the host firewalls' input chains
-/// let exactly these flows through to the agent's listener, which is what a
-/// check has to reach — the port's real traffic is forwarded, and never
-/// meets the input hook. Without it the host's own firewall (ufw's default
-/// `deny (incoming)`) dropped the probe, and the check blamed a firewall
-/// outside the host for a port that worked.
-pub const CHECK_MARK: u32 = 0x0800_0000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NftablesError {
@@ -121,6 +108,69 @@ pub fn restore(nft: &Nft, shared: &SharedRuleset) -> Result<bool, NftError> {
     }
 }
 
+/// The receiver indexes of the phone sessions this node relays (PLAN.md
+/// #340), which the firewall diverts to the agent's sorter. Shared by the
+/// sorter's thread, which learns them, and the backend, which writes them
+/// into every ruleset it applies.
+///
+/// A newly learned index is diverted at once, not at the next apply:
+/// the phone's next packet is already on its way. It is added under the
+/// ruleset's own lock, as an apply is made, so an apply never replaces the
+/// table with one built before the index was known; and into the batch a
+/// restore replays.
+pub struct PhoneDivert {
+    nft: Nft,
+    last: SharedRuleset,
+    state: Mutex<DivertState>,
+}
+
+#[derive(Default)]
+struct DivertState {
+    indexes: std::collections::BTreeSet<u32>,
+    /// The table the last apply wrote phone rules into, and their divert
+    /// port; `None` while this node relays no phones.
+    active: Option<(String, u16)>,
+}
+
+impl PhoneDivert {
+    /// Diverts `index` from now on.
+    pub fn add(&self, index: u32) {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.indexes.insert(index) {
+            return;
+        }
+        let Some((table, divert_port)) = state.active.clone() else { return };
+        let objects = phone_index_rules(&table, divert_port, index);
+        let batch = Nftables { objects: objects.to_vec().into() };
+        match self.nft.apply(&batch) {
+            Ok(()) => {
+                if let Some(applied) = last.as_mut() {
+                    let mut all = applied.objects.to_vec();
+                    all.extend(objects);
+                    applied.objects = all.into();
+                }
+            }
+            // The next apply writes it with the rest.
+            Err(e) => tracing::warn!(error = %e, index, "could not divert a relayed phone session at once"),
+        }
+    }
+
+    /// Keeps only `live`: an index no longer listed is left out of the
+    /// next apply. Until then its packets still reach the sorter, which
+    /// hands them back to the kernel.
+    pub fn retain(&self, live: &[u32]) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.indexes.retain(|i| live.contains(i));
+    }
+
+    /// The indexes diverted now.
+    #[must_use]
+    pub fn indexes(&self) -> Vec<u32> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).indexes.iter().copied().collect()
+    }
+}
+
 pub struct NftablesBackend {
     /// The WireGuard interface every rule is scoped to — this backend must
     /// never install a rule that isn't `iifname`-restricted to it, or it
@@ -134,19 +184,17 @@ pub struct NftablesBackend {
     own: Vec<IpAddr>,
     nft: Nft,
     last: SharedRuleset,
+    divert: Arc<PhoneDivert>,
 }
 
 impl NftablesBackend {
     /// Fails if `nft` can't be found: the firewall is not optional, so a
     /// daemon without one must refuse to start rather than run open.
     pub fn new(ifname: impl Into<String>) -> Result<Self, NftablesError> {
-        Ok(Self {
-            ifname: ifname.into(),
-            carry: None,
-            own: Vec::new(),
-            nft: Nft::locate()?,
-            last: SharedRuleset::default(),
-        })
+        let nft = Nft::locate()?;
+        let last = SharedRuleset::default();
+        let divert = Arc::new(PhoneDivert { nft: nft.clone(), last: Arc::clone(&last), state: Mutex::default() });
+        Ok(Self { ifname: ifname.into(), carry: None, own: Vec::new(), nft, last, divert })
     }
 
     /// Also firewalls the carry interface `carry` (PLAN.md M39). Set before
@@ -171,6 +219,13 @@ impl NftablesBackend {
     #[must_use]
     pub fn last_applied(&self) -> SharedRuleset {
         Arc::clone(&self.last)
+    }
+
+    /// The handle the phone relay's sorter diverts sessions through
+    /// (PLAN.md #340).
+    #[must_use]
+    pub fn phone_divert(&self) -> Arc<PhoneDivert> {
+        Arc::clone(&self.divert)
     }
 }
 
@@ -520,82 +575,97 @@ fn relay_rules(t: &str, ifname: &str, me: Ipv4Addr, pairs: &[RelayForward]) -> (
     (nat, fwd)
 }
 
-fn port_range(lo: u16, hi: u16) -> Expression<'static> {
-    Expression::Range(Box::new(Range { range: [Expression::Number(u32::from(lo)), Expression::Number(u32::from(hi))] }))
+/// The first four bytes of a WireGuard message, read in network order:
+/// its type, and three zero bytes (`phone_relay::packet`).
+fn wg_type_word() -> Expression<'static> {
+    raw_th(64, 32)
 }
 
-/// Phones relayed through this node's public address (PLAN.md M40): what
-/// arrives on `public` at a node's relay port goes on to that node's own
-/// WireGuard port, marked with [`RELAY_MARK`] and leaving from this node's
-/// mesh address on a port of `phones` — a range, not one port, because a
-/// phone that roams starts a new flow while its old one is still tracked.
-/// Only new flows are rate-limited (a nat chain sees nothing else): past
-/// the limit a packet isn't translated and meets the input drop for the
-/// relay ports, so a flood from spoofed sources costs this node nothing it
-/// forwards. WireGuard at the other end drops whatever no phone signed.
-///
-/// Returns the nat rules and the forward chain's rules for `public`.
-fn public_relay_rules(
-    t: &str,
-    ifname: &str,
-    public: &str,
-    me: Ipv4Addr,
-    relays: &[PublicRelay],
-    phones: (u16, u16),
-) -> (Vec<NfObject<'static>>, Vec<NfObject<'static>>) {
-    let mut nat = Vec::new();
-    let mut fwd = Vec::new();
-    if relays.is_empty() || public == ifname {
-        return (nat, fwd);
-    }
-    for r in relays {
-        nat.push(rule(t, RELAY_PRE_CHAIN, vec![
-            iifname_is(public),
-            dport_is(Proto::Udp, r.port),
-            Statement::Limit(Limit {
-                rate: 200,
-                rate_unit: None,
-                per: Some("second".into()),
-                burst: Some(400),
-                burst_unit: None,
-                inv: None,
-            }),
-            add_bit(ct("mark", None), RELAY_MARK),
-            Statement::DNAT(Some(NAT {
-                addr: Some(addr(r.to)),
-                family: Some(NATFamily::IP),
-                port: Some(Expression::Number(u32::from(r.to_port))),
-                flags: None,
-            })),
-        ]));
-        fwd.push(rule(t, FORWARD_CHAIN, vec![
-            iifname_is(public),
-            oifname_is(ifname),
-            has_bit(ct("mark", None), RELAY_MARK),
-            is(payload("ip", "daddr"), addr(r.to)),
-            dport_is(Proto::Udp, r.to_port),
+/// `len` bits of the UDP datagram at `offset`, counted from the start of
+/// the UDP header (eight bytes, 64 bits, before WireGuard's message).
+fn raw_th(offset: u32, len: u32) -> Expression<'static> {
+    Expression::Named(NamedExpression::Payload(Payload::PayloadRaw(PayloadRaw { base: PayloadBase::TH, offset, len })))
+}
+
+fn tproxy_to(port: u16) -> Statement<'static> {
+    Statement::TProxy(TProxy { family: Some("ip".into()), port, addr: None })
+}
+
+/// The two rules that divert a relayed node's session (PLAN.md #338,
+/// #340): its index is the receiver of the phone's data and cookie replies
+/// (at byte 4), and of the phone's response when the node started the
+/// handshake (at byte 8).
+fn phone_index_rules(t: &str, divert_port: u16, index: u32) -> [NfObject<'static>; 2] {
+    use crate::phone_relay::packet::{TYPE_WORD_COOKIE_REPLY, TYPE_WORD_DATA, TYPE_WORD_RESPONSE};
+    // Already matched by the jump; tproxy wants to see it in its own rule.
+    let udp = || is(meta(MetaKey::L4proto), Expression::String("udp".into()));
+    // WireGuard writes its indexes little-endian; nft reads raw payload in
+    // network order.
+    let index = Expression::Number(index.swap_bytes());
+    [
+        rule(t, PHONE_IDX_CHAIN, vec![
+            udp(),
+            in_list(wg_type_word(), vec![Expression::Number(TYPE_WORD_COOKIE_REPLY), Expression::Number(TYPE_WORD_DATA)]),
+            is(raw_th(96, 32), index.clone()),
+            tproxy_to(divert_port),
             Statement::Accept(None::<Accept>),
-        ]));
+        ]),
+        rule(t, PHONE_IDX_CHAIN, vec![
+            udp(),
+            is(wg_type_word(), Expression::Number(TYPE_WORD_RESPONSE)),
+            is(raw_th(128, 32), index),
+            tproxy_to(divert_port),
+            Statement::Accept(None::<Accept>),
+        ]),
+    ]
+}
+
+/// Phones relayed on this node's own WireGuard port (PLAN.md #338): what
+/// arrives from anywhere but the mesh at this host's own address and that
+/// port, and may be another node's, goes to the agent's divert socket —
+/// every handshake initiation (rate-limited: past the limit the kernel's
+/// WireGuard gets it, and drops what is not its own), and the packets of
+/// the sessions a relayed node answered. tproxy changes nothing in the
+/// packet, so the host's firewalls see what they already let in: a packet
+/// for the WireGuard port. Everything else is the kernel's, untouched.
+fn phone_relay_rules(t: &str, not_mesh: Vec<Statement<'static>>, rules: &PhoneRelayRules) -> Vec<NfObject<'static>> {
+    use crate::phone_relay::packet::TYPE_WORD_INITIATION;
+    let ours = || {
+        let mut expr = not_mesh.clone();
+        expr.extend([
+            is(meta(MetaKey::Nfproto), Expression::String("ipv4".into())),
+            dport_is(Proto::Udp, rules.listen_port),
+            is(
+                Expression::Named(NamedExpression::Fib(Fib {
+                    result: FibResult::Type,
+                    flags: std::iter::once(FibFlag::Daddr).collect(),
+                })),
+                Expression::String("local".into()),
+            ),
+        ]);
+        expr
+    };
+    let mut objects = vec![
+        chain(t, PHONE_PRE_CHAIN, NfChainType::Filter, NfHook::Prerouting, PRIO_MANGLE),
+        regular_chain(t, PHONE_IDX_CHAIN),
+    ];
+    let mut initiation = ours();
+    initiation.extend([
+        is(wg_type_word(), Expression::Number(TYPE_WORD_INITIATION)),
+        Statement::Limit(Limit { rate: 200, rate_unit: None, per: Some("second".into()), burst: Some(400), burst_unit: None, inv: None }),
+        tproxy_to(rules.divert_port),
+        Statement::Accept(None::<Accept>),
+    ]);
+    objects.push(rule(t, PHONE_PRE_CHAIN, initiation));
+    // Even with no index yet: one learned between applies is added to
+    // `phone-idx` on its own (`PhoneDivert::add`).
+    let mut jump = ours();
+    jump.push(Statement::Jump(JumpTarget { target: PHONE_IDX_CHAIN.into() }));
+    objects.push(rule(t, PHONE_PRE_CHAIN, jump));
+    for index in &rules.indexes {
+        objects.extend(phone_index_rules(t, rules.divert_port, *index));
     }
-    // A flow whose relay has since gone: its phone still sends keepalives,
-    // which would otherwise keep it forwarded for as long as it does.
-    fwd.push(rule(t, FORWARD_CHAIN, vec![
-        iifname_is(public),
-        has_bit(ct("mark", None), RELAY_MARK),
-        Statement::Drop(None::<Drop>),
-    ]));
-    nat.push(rule(t, RELAY_POST_CHAIN, vec![
-        oifname_is(ifname),
-        is(meta(MetaKey::L4proto), Expression::String("udp".into())),
-        has_bit(ct("mark", None), RELAY_MARK),
-        Statement::SNAT(Some(NAT {
-            addr: Some(addr(me)),
-            family: Some(NATFamily::IP),
-            port: Some(port_range(phones.0, phones.1)),
-            flags: None,
-        })),
-    ]));
-    (nat, fwd)
+    objects
 }
 
 /// A mapping onto another address (PLAN.md M26) leaves the node for that
@@ -627,6 +697,16 @@ fn chain(table: &str, name: &'static str, kind: NfChainType, hook: NfHook, prio:
         hook: Some(hook),
         prio: Some(prio),
         policy: Some(NfChainPolicy::Accept),
+        ..Chain::default()
+    })))
+}
+
+/// A chain with no hook, reached only by a `jump`.
+fn regular_chain(table: &str, name: &'static str) -> NfObject<'static> {
+    NfObject::CmdObject(NfCmd::Add(NfListObject::Chain(Chain {
+        family: NfFamily::INet,
+        table: Cow::Owned(table.to_string()),
+        name: name.into(),
         ..Chain::default()
     })))
 }
@@ -742,39 +822,6 @@ pub(crate) fn apply_batch_with(
         out.extend(carry.map(iifname_is_not));
         out
     };
-    // Relay ports (PLAN.md M40) from anywhere but the mesh: a relayed
-    // packet was translated in prerouting and is forwarded, never
-    // delivered here, so what reaches the input hook on one is untranslated
-    // — its relay rule isn't in place yet, or it is over the limit. Dropped
-    // before conntrack confirms it, so no flow is left behind that its
-    // sender's keepalives would keep alive untranslated once the rule comes.
-    // A port under a check is left to the agent's listener.
-    //
-    // Only new flows (PLAN.md #274): the relay ports lie inside Linux's
-    // ephemeral range, so this host's own UDP — a DNS lookup, NTP — goes out
-    // from one of them now and then, and its reply arrives here as part of
-    // an established flow. An untranslated relay packet is never anything
-    // but new: dropped, it leaves no flow to be established by.
-    if let Some(((lo, hi), _)) = forwarding.relay_ranges {
-        let mut expr = not_mesh();
-        expr.push(is(payload("udp", "dport"), port_range(lo, hi)));
-        if !forwarding.relay_checks.is_empty() {
-            expr.push(Statement::Match(Match {
-                left: payload("udp", "dport"),
-                right: Expression::Named(NamedExpression::Set(
-                    forwarding.relay_checks.iter().map(|p| SetItem::Element(Expression::Number(u32::from(*p)))).collect(),
-                )),
-                op: Operator::NEQ,
-            }));
-        }
-        expr.push(Statement::Match(Match {
-            left: ct("state", None),
-            right: Expression::List(vec![Expression::String("new".into())]),
-            op: Operator::IN,
-        }));
-        expr.push(Statement::Drop(None::<Drop>));
-        objects.push(rule(t, CHAIN_NAME, expr));
-    }
     for (vip, ..) in &terminated {
         let mut expr = not_mesh();
         expr.extend([is(payload("ip", "daddr"), addr(*vip)), Statement::Drop(None::<Drop>)]);
@@ -835,6 +882,13 @@ pub(crate) fn apply_batch_with(
             accept(),
         ]));
     }
+    // The relayed nodes' answers to the phones this node relays (PLAN.md
+    // M49), at the sorter's socket on this node's mesh address. The sorter
+    // takes a packet only from a relayed node's own address and port.
+    let phone_relay = forwarding.phone_relay.as_ref().filter(|_| forwarding.relay_self.is_some());
+    if let Some(phones) = phone_relay {
+        objects.push(rule(t, CHAIN_NAME, vec![iifname_is(ifname), dport_is(Proto::Udp, phones.mesh_port), accept()]));
+    }
     // Default-deny, but ONLY for the WireGuard interface — everything else
     // stays governed by the chain's own accept policy above. TCP is refused
     // rather than dropped (see `refuse_tcp`).
@@ -862,7 +916,7 @@ pub(crate) fn apply_batch_with(
         objects.push(rule(t, FORWARD_CHAIN, vec![
             iifname_is(lan),
             is(meta(MetaKey::Nfproto), Expression::String("ipv4".into())),
-            lacks_bits(ct("mark", None), SERVICE_MARK | EXIT_MARK | RELAY_MARK),
+            lacks_bits(ct("mark", None), SERVICE_MARK | EXIT_MARK),
             Statement::Drop(None::<Drop>),
         ]));
     }
@@ -885,28 +939,6 @@ pub(crate) fn apply_batch_with(
         None => (Vec::new(), Vec::new()),
     };
     objects.extend(relay_fwd);
-    if let (Some(me), Some(public), Some((_, phones))) =
-        (forwarding.relay_self, forwarding.relay_public_iface.as_deref(), forwarding.relay_ranges)
-    {
-        let (nat, fwd) = public_relay_rules(t, ifname, public, me, &forwarding.relay_public, phones);
-        relay_nat.extend(nat);
-        objects.extend(fwd);
-    }
-    // The coordinator's probe of a port under a check (PLAN.md M40) is marked
-    // for the host firewalls' input chains (see `CHECK_MARK`). A nat chain
-    // sees a flow's first packet only, and the mark stays with the flow.
-    if forwarding.relay_ranges.is_some() && !forwarding.relay_checks.is_empty() {
-        let mut expr = not_mesh();
-        expr.push(Statement::Match(Match {
-            left: payload("udp", "dport"),
-            right: Expression::Named(NamedExpression::Set(
-                forwarding.relay_checks.iter().map(|p| SetItem::Element(Expression::Number(u32::from(*p)))).collect(),
-            )),
-            op: Operator::EQ,
-        }));
-        expr.push(add_bit(ct("mark", None), CHECK_MARK));
-        relay_nat.push(rule(t, RELAY_PRE_CHAIN, expr));
-    }
     if !relay_nat.is_empty() {
         relay_nat.splice(0..0, [
             chain(t, RELAY_PRE_CHAIN, NfChainType::NAT, NfHook::Prerouting, PRIO_DSTNAT),
@@ -928,6 +960,9 @@ pub(crate) fn apply_batch_with(
     objects.push(rule(t, FORWARD_CHAIN, vec![iifname_is(ifname), Statement::Drop(None::<Drop>)]));
     objects.extend(exit);
     objects.extend(relay_nat);
+    if let Some(phones) = phone_relay {
+        objects.extend(phone_relay_rules(t, not_mesh(), phones));
+    }
     if let Some(carry) = carry {
         objects.extend(carry_table(carry, &mapped, &terminated));
     }
@@ -1120,10 +1155,23 @@ impl FirewallBackend for NftablesBackend {
     /// the same transaction, so a mid-cycle failure can never leave them
     /// disagreeing about which cycle they reflect.
     fn apply(&mut self, rules: &[ServiceRule], forwarding: &Forwarding) -> Result<(), Self::Error> {
-        let batch = apply_batch_with(&self.ifname, self.carry.as_deref(), &self.own, rules, forwarding);
+        // Under the lock from here: a phone session's index learned while
+        // this batch is built is either in it or added after it (see
+        // `PhoneDivert`).
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.divert.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut forwarding = forwarding.clone();
+        if let Some(phones) = forwarding.phone_relay.as_mut().filter(|_| forwarding.relay_self.is_some()) {
+            phones.indexes = state.indexes.iter().copied().collect();
+        }
+        let batch = apply_batch_with(&self.ifname, self.carry.as_deref(), &self.own, rules, &forwarding);
         match self.nft.apply(&batch) {
             Ok(()) => {
+                state.active = forwarding
+                    .phone_relay
+                    .as_ref()
+                    .filter(|_| forwarding.relay_self.is_some())
+                    .map(|p| (table_name(&self.ifname), p.divert_port));
                 *last = Some(batch);
                 Ok(())
             }
@@ -1142,6 +1190,7 @@ impl FirewallBackend for NftablesBackend {
     fn teardown(&mut self) -> Result<(), Self::Error> {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         *last = None;
+        self.divert.state.lock().unwrap_or_else(|e| e.into_inner()).active = None;
         self.nft.apply(&teardown_batch(&table_name(&self.ifname)))?;
         if let Some(carry) = &self.carry {
             self.nft.apply(&teardown_batch(&table_name(carry)))?;
@@ -1441,9 +1490,9 @@ mod tests {
             json!([
                 iif("eth0"),
                 {"match": {"op": "==", "left": {"meta": {"key": "nfproto"}}, "right": "ipv4"}},
-                // Neither ours, an exit's (PLAN.md M27) nor a relayed phone's
-                // (M40): all of them arrive on an interface the agent owns.
-                {"match": {"op": "==", "left": {"&": [{"ct": {"key": "mark"}}, SERVICE_MARK | EXIT_MARK | RELAY_MARK]}, "right": 0}},
+                // Neither ours nor an exit's (PLAN.md M27): both arrive on an
+                // interface the agent owns.
+                {"match": {"op": "==", "left": {"&": [{"ct": {"key": "mark"}}, SERVICE_MARK | EXIT_MARK]}, "right": 0}},
                 {"drop": null},
             ])
         );
@@ -1780,39 +1829,48 @@ mod tests {
 
 
 
-    /// The relays' rules (PLAN.md M39, M40) are accepted by a real kernel —
-    /// NAT included, which an unprivileged namespace allows.
+    fn phones(indexes: Vec<u32>) -> PhoneRelayRules {
+        PhoneRelayRules { listen_port: 51820, divert_port: 42000, mesh_port: 42001, indexes }
+    }
+
+    /// The relays' rules (PLAN.md M39, M49) are accepted by a real kernel —
+    /// NAT and tproxy included, which an unprivileged namespace allows.
     #[test]
     fn kernel_accepts_a_carriers_relay_rules() {
-        let forwarding = Forwarding {
-            relay_public: vec![wireserve_types::PublicRelay { port: 41004, to: "100.90.0.4".parse().unwrap(), to_port: 51820 }],
-            relay_public_iface: Some("eth0".into()),
-            relay_ranges: Some(((41000, 41999), (42000, 42999))),
-            relay_checks: vec![41005],
-            guarded: vec!["eth0".into()],
-            ..fwd(&[pair(0)])
-        };
+        let forwarding = Forwarding { phone_relay: Some(phones(vec![0x0102_0304])), guarded: vec!["eth0".into()], ..fwd(&[pair(0)]) };
         let script = nft_script(&[apply_batch("wg0", &[], &forwarding)]) + "nft list table inet wireserve.wg0";
         let Some(listing) = crate::firewall::netns::run(&script) else {
             return;
         };
         let lines = normalised_lines(&listing);
-        let r = format!("0x{RELAY_MARK:08x}");
+        let ours = "iifname != \"wg0\" iifname != \"lo\" meta nfproto ipv4 udp dport 51820 fib daddr type local";
         for want in [
             "iifname \"wg0\" ip saddr 100.90.0.1 ip daddr 100.90.0.2 udp dport 41003 dnat ip to 100.90.0.3:50003".to_string(),
             "oifname \"wg0\" ip saddr 100.90.0.1 ip daddr 100.90.0.3 udp dport 50003 snat ip to 100.90.0.2:41001".to_string(),
             "iifname \"wg0\" oifname \"wg0\" ip saddr 100.90.0.1 ip daddr 100.90.0.3 udp dport 50003 accept".to_string(),
-            format!("iifname \"eth0\" udp dport 41004 limit rate 200/second burst 400 packets ct mark set ct mark | {r} dnat ip to 100.90.0.4:51820"),
-            format!("oifname \"wg0\" meta l4proto udp ct mark & {r} == {r} snat ip to 100.90.0.2:42000-42999"),
-            format!("iifname \"eth0\" oifname \"wg0\" ct mark & {r} == {r} ip daddr 100.90.0.4 udp dport 51820 accept"),
-            format!("iifname \"eth0\" ct mark & {r} == {r} drop"),
-            "iifname != \"wg0\" iifname != \"lo\" udp dport 41000-41999 udp dport != 41005 ct state new drop".to_string(),
-            format!("iifname != \"wg0\" iifname != \"lo\" udp dport 41005 ct mark set ct mark | 0x{CHECK_MARK:08x}"),
+            format!("{ours} @th,64,32 0x1000000 limit rate 200/second burst 400 packets tproxy ip to :42000 accept"),
+            format!("{ours} jump phone-idx"),
+            // The index as WireGuard sends it: little-endian.
+            "meta l4proto udp @th,64,32 { 0x3000000, 0x4000000 } @th,96,32 0x4030201 tproxy ip to :42000 accept".to_string(),
+            "meta l4proto udp @th,64,32 0x2000000 @th,128,32 0x4030201 tproxy ip to :42000 accept".to_string(),
+            "iifname \"wg0\" udp dport 42001 accept".to_string(),
         ] {
             assert!(lines.contains(&want), "missing `{want}` in:\n{listing}");
         }
-        let guard = format!("iifname \"eth0\" meta nfproto ipv4 ct mark & 0x{:08x} == 0x00000000 drop", SERVICE_MARK | EXIT_MARK | RELAY_MARK);
+        let guard = format!("iifname \"eth0\" meta nfproto ipv4 ct mark & 0x{:08x} == 0x00000000 drop", SERVICE_MARK | EXIT_MARK);
         assert!(lines.contains(&guard), "missing `{guard}` in:\n{listing}");
+    }
+
+    /// No phone rules without this node's mesh address (the sorter's socket
+    /// is on it); with it, the jump to the indexes even before there is one.
+    #[test]
+    fn phone_rules_need_the_mesh_address_and_always_jump_to_the_indexes() {
+        let none = Forwarding { phone_relay: Some(phones(vec![])), ..Forwarding::default() };
+        let batch = serde_json::to_value(apply_batch("wg0", &[], &none)).unwrap().to_string();
+        assert!(!batch.contains("phone-pre") && !batch.contains("tproxy"), "{batch}");
+        let some = Forwarding { relay_self: Some("100.90.0.2".parse().unwrap()), phone_relay: Some(phones(vec![])), ..Forwarding::default() };
+        let batch = serde_json::to_value(apply_batch("wg0", &[], &some)).unwrap().to_string();
+        assert!(batch.contains("tproxy") && batch.contains("\"jump\""), "{batch}");
     }
 
     #[test]
@@ -1852,7 +1910,7 @@ mod tests {
         has(&format!("ct direction reply ct mark & {m} == {m} ip saddr 192.168.178.1 tcp sport 80 ip saddr set 100.90.0.50 tcp sport set 443"));
         has("type nat hook postrouting priority srcnat; policy accept;");
         has(&format!("meta mark & {m} == {m} ip daddr 192.168.178.1 tcp dport 80 oifname != \"wg0\" masquerade"));
-        has(&format!("iifname \"eth0\" meta nfproto ipv4 ct mark & 0x{:08x} == 0x00000000 drop", SERVICE_MARK | EXIT_MARK | RELAY_MARK));
+        has(&format!("iifname \"eth0\" meta nfproto ipv4 ct mark & 0x{:08x} == 0x00000000 drop", SERVICE_MARK | EXIT_MARK));
     }
 
     /// A terminated service's rules (PLAN.md M33, M35). As with the mapped
@@ -1940,7 +1998,7 @@ mod tests {
         for want in [
             "type nat hook postrouting priority srcnat; policy accept;".to_string(),
             format!("meta mark & {m} == {m} ip daddr 192.168.178.1 tcp dport 80 oifname != \"wg0\" masquerade"),
-            format!("iifname \"eth0\" meta nfproto ipv4 ct mark & 0x{:08x} == 0x00000000 drop", SERVICE_MARK | EXIT_MARK | RELAY_MARK),
+            format!("iifname \"eth0\" meta nfproto ipv4 ct mark & 0x{:08x} == 0x00000000 drop", SERVICE_MARK | EXIT_MARK),
         ] {
             assert!(lines.contains(&want), "missing `{want}` in:\n{listing}");
         }
@@ -2019,67 +2077,6 @@ mod tests {
     /// The relay ports' drop (PLAN.md #274) spares this host's own UDP: a
     /// reply to a lookup sent from a relay port arrives, and a packet nobody
     /// asked for on one is still dropped.
-    /// A relay port check (PLAN.md M40) on a host whose own firewall drops
-    /// everything incoming, as ufw's `deny (incoming)` does: the probe from
-    /// outside reaches the listener only once the host firewall holds the
-    /// interop's `RelayCheck` opening, and only on the port under a check.
-    /// Before, the check failed on such a host though the relay itself
-    /// worked: its traffic is forwarded and never meets the input hook.
-    #[test]
-    fn kernel_a_relay_port_check_gets_through_a_host_firewall_that_drops_everything() {
-        use crate::firewall::host_interop::model::{ChainRef, Family, Opening};
-        use crate::firewall::host_interop::nft_ops::insert_accept;
-        if !crate::firewall::netns::reexec(
-            "firewall::nftables::tests::kernel_a_relay_port_check_gets_through_a_host_firewall_that_drops_everything",
-        ) {
-            return;
-        }
-        let mut outside = std::process::Command::new("unshare").args(["-n", "sleep", "60"]).spawn().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let pid = outside.id();
-        let setup = format!(
-            "ip link set lo up
-             ip link add eth0 type veth peer name o0 && ip link set o0 netns {pid}
-             ip addr add 203.0.113.1/24 dev eth0 && ip link set eth0 up
-             nsenter -t {pid} -n sh -euc 'ip link set lo up; ip addr add 203.0.113.2/24 dev o0; ip link set o0 up'
-             nft add table inet ufwlike
-             nft add chain inet ufwlike input '{{ type filter hook input priority 0; policy drop; }}'"
-        );
-        let out = std::process::Command::new("sh").args(["-euc", &setup]).output().unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        let forwarding = Forwarding {
-            relay_ranges: Some(((41000, 41999), (42000, 42999))),
-            relay_checks: vec![41005],
-            ..Forwarding::default()
-        };
-        let apply = |batches: &[Nftables<'_>]| {
-            let out = std::process::Command::new("sh").args(["-euc", &nft_script(batches)]).output().unwrap();
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        };
-        apply(&[apply_batch("wg0", &[], &forwarding)]);
-
-        let probe = |port: u16| -> bool {
-            let listener = std::net::UdpSocket::bind(("203.0.113.1", port)).unwrap();
-            listener.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
-            let _ = std::process::Command::new("nsenter")
-                .args(["-t", &pid.to_string(), "-n", "python3", "-c"])
-                .arg(format!("import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b'nonce', ('203.0.113.1', {port}))"))
-                .status();
-            let mut buf = [0u8; 16];
-            listener.recv_from(&mut buf).is_ok()
-        };
-        let before = probe(41005);
-        let chain = ChainRef { family: Family::Inet, table: "ufwlike".into(), chain: "input".into() };
-        apply(&[insert_accept(&chain, "wg0", Opening::RelayCheck)]);
-        let after = probe(41005);
-        let unchecked = probe(41006);
-        let _ = outside.kill();
-        let _ = outside.wait();
-        assert!(!before, "the host firewall drops the probe without the opening");
-        assert!(after, "the probe of the port under a check reaches the listener");
-        assert!(!unchecked, "a relay port no check runs on stays closed");
-    }
-
     #[test]
     fn kernel_a_lan_neighbour_cannot_reach_the_mesh_address_and_the_host_still_can() {
         if !crate::firewall::netns::reexec(
@@ -2166,64 +2163,6 @@ d, a = s.recvfrom(4); s.sendto(d, a)"
             [false, false, true, true, true, true, true],
             "neighbour v4, v6; host v4, v6; the LAN address itself; answers to the host's own v4, v6"
         );
-    }
-
-    #[test]
-    fn kernel_a_reply_to_this_hosts_own_udp_on_a_relay_port_arrives() {
-        if !crate::firewall::netns::reexec(
-            "firewall::nftables::tests::kernel_a_reply_to_this_hosts_own_udp_on_a_relay_port_arrives",
-        ) {
-            return;
-        }
-        let mut outside = std::process::Command::new("unshare").args(["-n", "sleep", "60"]).spawn().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let pid = outside.id();
-        let setup = format!(
-            "ip link set lo up
-             ip link add eth0 type veth peer name o0 && ip link set o0 netns {pid}
-             ip addr add 203.0.113.1/24 dev eth0 && ip link set eth0 up
-             nsenter -t {pid} -n sh -euc 'ip link set lo up; ip addr add 203.0.113.2/24 dev o0; ip link set o0 up'"
-        );
-        let out = std::process::Command::new("sh").args(["-euc", &setup]).output().unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        let forwarding = Forwarding { relay_ranges: Some(((41000, 41999), (42000, 42999))), ..Forwarding::default() };
-        let script = nft_script(&[apply_batch("wg0", &[], &forwarding)]);
-        let out = std::process::Command::new("sh").args(["-euc", &script]).output().unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-
-        // Outside: a resolver that answers whatever arrives, and later sends
-        // a datagram to a relay port unasked.
-        let mut echo = std::process::Command::new("nsenter")
-            .args(["-t", &pid.to_string(), "-n", "python3", "-c"])
-            .arg(
-                "import socket\n\
-                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n\
-                 s.bind(('203.0.113.2', 53))\n\
-                 while True:\n    d, a = s.recvfrom(64)\n    s.sendto(d, a)\n",
-            )
-            .spawn()
-            .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        // This host: a lookup from relay port 41010.
-        let socket = std::net::UdpSocket::bind("203.0.113.1:41010").unwrap();
-        socket.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
-        socket.send_to(b"lookup", "203.0.113.2:53").unwrap();
-        let mut buf = [0u8; 64];
-        let answered = socket.recv_from(&mut buf).is_ok_and(|(n, _)| &buf[..n] == b"lookup");
-        // Unasked, to another relay port something listens on.
-        let listener = std::net::UdpSocket::bind("203.0.113.1:41011").unwrap();
-        listener.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
-        let _ = std::process::Command::new("nsenter")
-            .args(["-t", &pid.to_string(), "-n", "python3", "-c"])
-            .arg("import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b'unasked', ('203.0.113.1', 41011))")
-            .status();
-        let unasked_arrived = listener.recv_from(&mut buf).is_ok();
-        let _ = echo.kill();
-        let _ = echo.wait();
-        let _ = outside.kill();
-        let _ = outside.wait();
-        assert!(answered, "the reply to this host's own lookup must arrive");
-        assert!(!unasked_arrived, "a new flow to a relay port is still dropped");
     }
 
     /// A service mapped onto another address (PLAN.md M26) is reached from

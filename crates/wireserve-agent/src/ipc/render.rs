@@ -232,7 +232,7 @@ pub fn render(view: &ListView, now: DateTime<Utc>) -> String {
             if !view.relay_public.is_empty() {
                 let names: Vec<String> = view.relay_public.iter().map(|n| clean(n)).collect();
                 out.push_str(&format!(
-                    "  relaying devices to (end to end, on public ports — see `wireserve-admin transit ports`): {}\n",
+                    "  relaying devices to (end to end, on this node's WireGuard port): {}\n",
                     names.join(", ")
                 ));
             }
@@ -468,7 +468,7 @@ Not published:
         };
         let out = render(&view, now());
         assert!(out.contains("relaying (end to end, unreadable here): c <-> x"), "{out}");
-        assert!(out.contains("relaying devices to (end to end, on public ports"), "{out}");
+        assert!(out.contains("relaying devices to (end to end, on this node's WireGuard port)"), "{out}");
         assert!(out.contains("minipc"), "{out}");
     }
 

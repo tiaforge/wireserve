@@ -3392,12 +3392,14 @@ async fn every_node_has_its_own_stable_relay_port_and_its_reported_carry_port() 
     assert_eq!(relay_of(&body, "n3")["port"], json!(base + 2));
 }
 
-// ---- PLAN.md M40, M41: phones reach every node end to end ----
+// ---- PLAN.md M40, M41, M49: phones reach every node end to end ----
 
-/// An agent's poll, as one on this version sends it: the relay capability
-/// and carry port, whether it is dialable, and a public IPv4 endpoint.
+/// An agent's poll, as one on this version sends it: the relay and
+/// phone-relay capabilities and carry port, whether it is dialable, and a
+/// public IPv4 endpoint.
 fn phone_era_poll(dialable: bool, endpoint: &str, extra: Value) -> Value {
     let mut body = relay_poll(json!({ "services": [], "dialable_v4": dialable, "endpoint_addr_v4": endpoint }));
+    body["capabilities"] = json!([wireserve_types::CAP_RELAY, wireserve_types::CAP_PHONE_RELAY]);
     for (k, v) in extra.as_object().unwrap() {
         body[k] = v.clone();
     }
@@ -3439,8 +3441,8 @@ async fn admin_get(router: &Router, path: &str) -> Value {
     body_json(resp).await
 }
 
-async fn relay_plan(router: &Router, allow_unverified: bool) -> Value {
-    let req = json_request("POST", "/admin/relays/plan", Some(ADMIN), json!({ "allow_unverified": allow_unverified }));
+async fn relay_plan(router: &Router) -> Value {
+    let req = json_request("POST", "/admin/relays/plan", Some(ADMIN), json!({}));
     let resp = router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     body_json(resp).await
@@ -3461,50 +3463,42 @@ fn exit_clients(body: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// What the plan says about `node`'s relay, once `gw` has picked up the
-/// port check the plan started and seen its nonce.
-async fn plan_with_the_check_answered(app: &TestApp, gw: &str) -> Value {
-    let router = app.router.clone();
-    let plan = tokio::spawn(async move { relay_plan(&router, false).await });
-    let mut checks = Value::Null;
-    for _ in 0..40 {
-        let (_, body) = poll_full(&app.router, gw, gw_offers()).await;
-        if body.get("port_checks").is_some() {
-            checks = body["port_checks"].clone();
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(checks.is_array(), "the carrier is asked to listen");
-    let mut answer = gw_offers();
-    answer["port_checks_seen"] = checks;
-    poll_full(&app.router, gw, answer).await;
-    plan.await.unwrap()
+#[tokio::test]
+async fn every_node_is_reached_through_one_carrier_on_its_own_wireguard_port() {
+    let app = test_app();
+    let (_gw, _minipc) = phone_scenario(&app).await;
+    // A third node, dialable itself: through the carrier all the same, so
+    // the `.conf` says nothing about where a node is (PLAN.md #343).
+    let t = admin_create_node(&app.router, "vps2").await;
+    let vps2 = register_node(&app.router, &t, "vps2", 51820).await["bearer_token"].as_str().unwrap().to_string();
+    poll_full(&app.router, &vps2, phone_era_poll(true, "203.0.113.9:51820", json!({}))).await;
+
+    let plan = relay_plan(&app.router).await;
+    assert_eq!(plan["direct"], json!(["gw"]), "the carrier itself: {plan}");
+    assert_eq!(
+        plan["relayed"],
+        json!([
+            { "node": "minipc", "carrier": "gw", "endpoint": "203.0.113.2:51820" },
+            { "node": "vps2", "carrier": "gw", "endpoint": "203.0.113.2:51820" },
+        ]),
+        "{plan}"
+    );
+    assert_eq!(plan["unreachable"], json!([]), "{plan}");
+    assert!(plan.get("closed").is_none(), "no port to check: {plan}");
 }
 
 #[tokio::test]
-async fn a_dialable_node_is_dialled_directly_and_one_that_is_not_is_relayed_through_a_checked_port() {
+async fn a_carrier_that_does_not_sort_phones_is_never_picked() {
+    // An older agent served each node on a port of its own.
     let app = test_app();
     let (gw, _minipc) = phone_scenario(&app).await;
-    let port = wireserve_types::DEFAULT_RELAY_PORT_BASE + 1;
-
-    let plan = plan_with_the_check_answered(&app, &gw).await;
-    assert_eq!(plan["direct"], json!(["gw"]), "{plan}");
-    assert_eq!(
-        plan["relayed"],
-        json!([{ "node": "minipc", "carrier": "gw", "endpoint": format!("203.0.113.2:{port}"), "open": true }]),
-        "{plan}"
-    );
-    assert_eq!(plan["closed"], json!([]), "{plan}");
-    assert_eq!(plan["unreachable"], json!([]), "{plan}");
-
-    // Seen open: the next export trusts it without another check.
-    let again = relay_plan(&app.router, false).await;
-    assert_eq!(again["relayed"][0]["open"], json!(true), "{again}");
-    let ports = admin_get(&app.router, "/admin/relay-ports").await;
-    assert_eq!(ports["ports"][0]["port"], json!(port), "{ports}");
-    assert_eq!(ports["ports"][0]["open"], json!(true), "{ports}");
-    assert_eq!(ports["ports"][0]["devices"], json!([]), "no device uses it yet: {ports}");
+    let mut older = gw_offers();
+    older["capabilities"] = json!([wireserve_types::CAP_RELAY]);
+    poll_full(&app.router, &gw, older).await;
+    let plan = relay_plan(&app.router).await;
+    assert_eq!(plan["relayed"], json!([]), "{plan}");
+    assert_eq!(plan["direct"], json!(["gw"]), "dialable, so dialled directly: {plan}");
+    assert_eq!(plan["unreachable"][0]["node"], json!("minipc"), "{plan}");
 }
 
 #[tokio::test]
@@ -3512,11 +3506,11 @@ async fn a_node_that_never_said_whether_it_is_dialable_is_relayed_not_guessed_at
     // Offline, or an older agent: its last recorded endpoint (here a public
     // one) is no evidence a phone gets through — often it is a home NAT's.
     let app = test_app();
-    let (gw, _minipc) = phone_scenario(&app).await;
+    let (_gw, _minipc) = phone_scenario(&app).await;
     let t = admin_create_node(&app.router, "fedora").await;
     let fedora = register_node(&app.router, &t, "fedora", 51820).await["bearer_token"].as_str().unwrap().to_string();
     poll_full(&app.router, &fedora, json!({ "services": [], "endpoint_addr_v4": "198.51.100.3:51820" })).await;
-    let plan = plan_with_the_check_answered(&app, &gw).await;
+    let plan = relay_plan(&app.router).await;
     assert_eq!(plan["direct"], json!(["gw"]), "{plan}");
     let relayed: Vec<&str> = plan["relayed"].as_array().unwrap().iter().map(|r| r["node"].as_str().unwrap()).collect();
     assert!(relayed.contains(&"fedora") && relayed.contains(&"minipc"), "{plan}");
@@ -3527,7 +3521,7 @@ async fn nothing_reaches_a_node_no_carrier_qualifies_for_and_the_plan_says_why()
     let app = test_app();
     let (_gw, _minipc) = phone_scenario(&app).await;
     assert_eq!(admin_post(&app.router, "/admin/nodes/gw/transit/deny").await, StatusCode::OK);
-    let plan = relay_plan(&app.router, false).await;
+    let plan = relay_plan(&app.router).await;
     assert_eq!(plan["relayed"], json!([]), "{plan}");
     assert_eq!(plan["unreachable"][0]["node"], json!("minipc"), "{plan}");
     assert!(plan["unreachable"][0]["reason"].as_str().unwrap().contains("dialable"), "{plan}");
@@ -3547,6 +3541,7 @@ async fn an_export_makes_its_carrier_relay_and_its_exit_send_on_and_nobody_else(
 
     let (_, body) = poll_full(&app.router, &gw, gw_offers()).await;
     assert_eq!(body["relay_public"], json!([pubkey_for("minipc")]), "{body}");
+    assert_eq!(body["relay_devices"], json!([pubkey_for("phone")]), "whose handshakes it may forward: {body}");
     assert_eq!(body["relay_port_base"], json!(wireserve_types::DEFAULT_RELAY_PORT_BASE), "{body}");
     assert_eq!(exit_clients(&body), vec![pubkey_for("phone")], "{body}");
     // The relayed node's own entry says where a phone's session ends.
@@ -3554,13 +3549,11 @@ async fn an_export_makes_its_carrier_relay_and_its_exit_send_on_and_nobody_else(
     assert_eq!(minipc_entry["relay"]["listen_port"], json!(51820), "{body}");
 
     let (_, body) = poll_full(&app.router, &minipc, phone_era_poll(false, "198.51.100.3:51820", json!({}))).await;
-    assert!(body.get("relay_public").is_none() && exit_clients(&body).is_empty(), "{body}");
+    assert!(body.get("relay_public").is_none() && body.get("relay_devices").is_none() && exit_clients(&body).is_empty(), "{body}");
 
     let peers = admin_peers(&app.router).await;
     assert_eq!(peers["exit_devices"], json!(["phone"]), "{peers}");
     assert!(peers.get("stale_devices").is_none(), "{peers}");
-    let ports = admin_get(&app.router, "/admin/relay-ports").await;
-    assert_eq!(ports["ports"][0]["devices"], json!(["phone"]), "{ports}");
 }
 
 #[tokio::test]
@@ -3591,7 +3584,7 @@ async fn withdrawing_approval_ends_the_relay_and_the_exit_and_marks_the_device_s
 
     assert_eq!(admin_post(&app.router, "/admin/nodes/gw/transit/deny").await, StatusCode::OK);
     let (_, body) = poll_full(&app.router, &gw, gw_offers()).await;
-    assert!(body.get("relay_public").is_none() && exit_clients(&body).is_empty(), "{body}");
+    assert!(body.get("relay_public").is_none() && body.get("relay_devices").is_none() && exit_clients(&body).is_empty(), "{body}");
     assert_eq!(admin_peers(&app.router).await["stale_devices"], json!(["phone"]));
 }
 
@@ -3669,7 +3662,7 @@ async fn a_revoked_device_is_no_longer_an_exit_client_nor_relayed() {
     record_export(&app.router, "phone", json!({ "exit": "gw", "relays": [{ "node": "minipc", "carrier": "gw" }] })).await;
     assert_eq!(admin_post(&app.router, "/admin/nodes/phone/revoke").await, StatusCode::OK);
     let (_, body) = poll_full(&app.router, &gw, gw_offers()).await;
-    assert!(exit_clients(&body).is_empty() && body.get("relay_public").is_none(), "{body}");
+    assert!(exit_clients(&body).is_empty() && body.get("relay_public").is_none() && body.get("relay_devices").is_none(), "{body}");
 }
 
 // ---- PLAN.md M36: who can reach what ----

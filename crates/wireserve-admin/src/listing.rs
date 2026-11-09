@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use wireserve_types::term::{ago, clean, fields, table};
 use wireserve_types::{
     AdminPeersResponse, AdminServiceInfo, DnsRecordState, GrantsResponse, GroupsResponse, OwnersStatus, PeerInfo,
-    RelayPortsResponse, ServiceApprovalState,
+    ServiceApprovalState,
 };
 
 /// `-` for nothing, else the cleaned items joined by commas.
@@ -107,37 +107,6 @@ pub fn grants(resp: &GrantsResponse) -> String {
 pub fn tags(by_tag: &std::collections::BTreeMap<String, Vec<String>>) -> String {
     let rows: Vec<Vec<String>> = by_tag.iter().map(|(tag, nodes)| vec![clean(tag), list(nodes)]).collect();
     table(&["TAG", "NODES"], &rows)
-}
-
-/// `transit ports`.
-#[must_use]
-pub fn relay_ports(resp: &RelayPortsResponse) -> String {
-    let rows: Vec<Vec<String>> = resp
-        .ports
-        .iter()
-        .map(|p| {
-            let state = match p.open {
-                Some(true) => "open",
-                Some(false) => "CLOSED",
-                None => "unchecked",
-            };
-            let devices = if p.devices.is_empty() {
-                "none, safe to close".to_string()
-            } else {
-                p.devices.iter().map(|d| clean(d)).collect::<Vec<_>>().join(", ")
-            };
-            vec![
-                clean(&p.carrier),
-                format!("udp/{}", p.port),
-                opt(p.address.as_deref()),
-                opt(p.node.as_deref()),
-                state.into(),
-                p.checked_at.map_or_else(|| "never".to_string(), |t| t.format("%Y-%m-%d").to_string()),
-                devices,
-            ]
-        })
-        .collect();
-    table(&["CARRIER", "PORT", "ADDRESS", "NODE", "STATE", "CHECKED", "USED BY"], &rows)
 }
 
 /// Its relaying (PLAN.md M23): `on` when approved and switched on by the
@@ -355,7 +324,7 @@ pub fn node(resp: &AdminPeersResponse, p: &PeerInfo, now: DateTime<Utc>) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wireserve_types::{GrantInfo, GrantSource, GroupInfo, RelayPortStatus};
+    use wireserve_types::{GrantInfo, GrantSource, GroupInfo};
 
     fn now() -> DateTime<Utc> {
         "2026-10-03T12:00:00Z".parse().unwrap()
@@ -494,22 +463,6 @@ phone   10.1.0.3  -                     never   -         yes       -           
         assert_eq!(grants(&gr), "SOURCE   GROUP\ntag:ops  infra\n");
         let t = [("ops".to_string(), vec!["a".to_string(), "b".to_string()])].into();
         assert_eq!(tags(&t), "TAG  NODES\nops  a,b\n");
-        let p = RelayPortsResponse {
-            ports: vec![RelayPortStatus {
-                carrier: "strato".into(),
-                address: Some("85.215.231.166".into()),
-                port: 51901,
-                node: Some("lego2".into()),
-                devices: vec![],
-                checked_at: None,
-                open: Some(false),
-            }],
-        };
-        assert_eq!(
-            relay_ports(&p),
-            "CARRIER  PORT       ADDRESS         NODE   STATE   CHECKED  USED BY\n\
-             strato   udp/51901  85.215.231.166  lego2  CLOSED  never    none, safe to close\n"
-        );
     }
 
     #[test]

@@ -99,8 +99,7 @@ pub fn names_include_filter(names: &str) -> bool {
 #[must_use]
 pub fn opening_spec(ifname: &str, opening: Opening) -> Vec<String> {
     let mark = |m: u32| ["-m".to_string(), "connmark".into(), "--mark".into(), format!("{m:#x}/{m:#x}")];
-    let (service, exit, relay) =
-        (crate::firewall::nftables::SERVICE_MARK, crate::firewall::nftables::EXIT_MARK, crate::firewall::nftables::RELAY_MARK);
+    let (service, exit) = (crate::firewall::nftables::SERVICE_MARK, crate::firewall::nftables::EXIT_MARK);
     let mut spec: Vec<String> = Vec::new();
     match opening {
         Opening::Input => spec.extend(["-i".into(), ifname.into()]),
@@ -121,15 +120,6 @@ pub fn opening_spec(ifname: &str, opening: Opening) -> Vec<String> {
             spec.extend(["-o".into(), ifname.into()]);
             spec.extend(mark(exit));
         }
-        Opening::RelayRequest => {
-            spec.extend(["-o".into(), ifname.into()]);
-            spec.extend(mark(relay));
-        }
-        Opening::RelayReply => {
-            spec.extend(["-i".into(), ifname.into()]);
-            spec.extend(mark(relay));
-        }
-        Opening::RelayCheck => spec.extend(mark(crate::firewall::nftables::CHECK_MARK)),
     }
     spec
 }

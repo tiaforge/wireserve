@@ -916,13 +916,6 @@ pub async fn record_export(
     Ok(())
 }
 
-/// How long a port found open stays trusted before an export checks it
-/// again (PLAN.md M40).
-const RELAY_PORT_TRUSTED_DAYS: i64 = 30;
-/// How long an export waits for a port check: the carrier has to poll to
-/// learn of it, listen, and poll again to report it.
-const PORT_CHECK_WAIT: std::time::Duration = std::time::Duration::from_secs(50);
-
 /// A node's public IPv4 `ip`, from its endpoint, if it has a globally
 /// routable one — where a device off the mesh can reach it.
 fn public_v4(peer: &wireserve_types::PeerInfo) -> Option<std::net::Ipv4Addr> {
@@ -933,35 +926,27 @@ fn public_v4(peer: &wireserve_types::PeerInfo) -> Option<std::net::Ipv4Addr> {
         .find_map(|e| e.parse::<std::net::SocketAddrV4>().ok().map(|a| *a.ip()))
 }
 
-/// Whether `addr` is one of this host's own addresses: binding to it works
-/// only then.
-fn is_own_address(addr: std::net::Ipv4Addr) -> bool {
-    std::net::UdpSocket::bind((addr, 0)).is_ok()
-}
-
-/// `POST /admin/relays/plan` (PLAN.md M40): how a device exported now
-/// reaches each node, with every relay port it needs checked from outside
-/// first (or recently).
+/// `POST /admin/relays/plan` (PLAN.md M40, M49): how a device exported now
+/// reaches each node.
 ///
-/// A node that reported itself dialable is dialled directly. Every other
-/// one — including one that never said (offline, or an older agent), whose
-/// last recorded endpoint is no evidence a phone gets through — gets a
-/// carrier: approved, offering, able to relay, itself dialable, with a
-/// public IPv4 address. Preferred, in order: one that reaches the node right
-/// now (an offline node gets one anyway, which works once it is back), one
-/// whose port for that node was already seen open, one already serving
-/// devices — so as few ports as possible need opening. A port on the
-/// coordinator's own host isn't checked: the check couldn't see a firewall
-/// in front of it (`RelayPlanEntry::unverifiable_here`).
+/// One carrier for the whole device (#343): approved, offering, able to
+/// relay, sorting phones on its own WireGuard port (`phone-relay`), itself
+/// dialable, with a public IPv4 address. Preferred: the one that reaches
+/// the most nodes right now, then one already serving devices. The
+/// carrier is dialled directly, and every other node through it, at the
+/// carrier's own address and WireGuard port — so the `.conf` says nothing
+/// about where a node is. A node without a known listen port can't be
+/// forwarded to, and is left out. With no carrier, a node that reported
+/// itself dialable is dialled directly and the rest are unreachable.
 pub async fn relay_plan(
     State(state): State<AppState>,
     _admin: AdminAuth,
-    Json(body): Json<wireserve_types::RelayPlanRequest>,
+    Json(_body): Json<wireserve_types::RelayPlanRequest>,
 ) -> Result<Json<wireserve_types::RelayPlan>, AppError> {
     let fresh = state.config.online_threshold_secs;
-    let (rows, relays, ports) = {
+    let (rows, relays) = {
         let conn = state.db.conn.lock().await;
-        (nodes::list_all_peers(&conn)?, nodes::all_static_relays(&conn)?, nodes::relay_ports(&conn)?)
+        (nodes::list_all_peers(&conn)?, nodes::all_static_relays(&conn)?)
     };
     let infos: Vec<wireserve_types::PeerInfo> =
         rows.iter().map(|n| crate::directory::peer_info(n, fresh, state.config.relay_port_base)).collect();
@@ -970,192 +955,60 @@ pub async fn relay_plan(
         .zip(&infos)
         .filter(|(n, _)| n.kind == wireserve_types::NodeKind::Agent)
         .collect();
-    let carriers: Vec<(&nodes::NodeRow, &wireserve_types::PeerInfo, std::net::Ipv4Addr)> = agents
+    let serving: std::collections::HashSet<i64> = relays.iter().map(|(_, _, c)| *c).collect();
+    let mut carriers: Vec<(&nodes::NodeRow, &wireserve_types::PeerInfo, std::net::SocketAddrV4)> = agents
         .iter()
         .filter(|(n, p)| {
             n.transit_approved
                 && state.transit.is_offering(&p.pubkey, fresh)
                 && state.transit.has_capability(&p.pubkey, wireserve_types::CAP_RELAY, fresh)
+                && state.transit.has_capability(&p.pubkey, wireserve_types::CAP_PHONE_RELAY, fresh)
                 && state.transit.dialable(&p.pubkey, fresh) == Some(true)
         })
-        .filter_map(|(n, p)| Some((*n, *p, public_v4(p)?)))
+        .filter_map(|(n, p)| Some((*n, *p, std::net::SocketAddrV4::new(public_v4(p)?, p.relay.listen_port?))))
         .collect();
-    let serving: std::collections::HashSet<i64> = relays.iter().map(|(_, _, c)| *c).collect();
-    let now = chrono::Utc::now();
-    let trusted_open = |carrier: i64, port: u16, address: std::net::Ipv4Addr| {
-        ports.iter().any(|r| {
-            r.carrier_node_id == carrier
-                && r.port == port
-                && r.open
-                && r.address == address.to_string()
-                && r.checked_at.is_some_and(|t| (now - t).num_days() < RELAY_PORT_TRUSTED_DAYS)
-        })
+    let reached = |carrier: &wireserve_types::PeerInfo| {
+        agents.iter().filter(|(_, p)| p.pubkey != carrier.pubkey && state.transit.reaches(&carrier.pubkey, &p.pubkey, fresh)).count()
     };
+    carriers.sort_by_key(|(c, cp, _)| (std::cmp::Reverse(reached(cp)), !serving.contains(&c.id), cp.pubkey.clone()));
 
     let mut plan = wireserve_types::RelayPlan::default();
-    let mut to_check: Vec<(usize, i64, String, u16, std::net::SocketAddrV4)> = Vec::new();
-    for (node, peer) in &agents {
-        let dialable = state.transit.dialable(&peer.pubkey, fresh);
-        // Only a node that said so is dialled directly. One that didn't —
-        // offline, or an older agent — would otherwise get whatever endpoint
-        // was last recorded for it, often a home NAT's address that a phone
-        // can't get through; a relay works for it either way.
-        if dialable == Some(true) {
-            plan.direct.push(node.name.clone());
-            continue;
+    let Some((carrier, _, endpoint)) = carriers.first() else {
+        for (node, peer) in &agents {
+            // Only a node that said so is dialled directly. One that didn't —
+            // offline, or an older agent — would otherwise get whatever
+            // endpoint was last recorded for it, often a home NAT's address
+            // that a phone can't get through.
+            if state.transit.dialable(&peer.pubkey, fresh) == Some(true) {
+                plan.direct.push(node.name.clone());
+            } else {
+                plan.unreachable.push(wireserve_types::Unreachable {
+                    node: node.name.clone(),
+                    reason: "it isn't known to be dialable from outside, and no node qualifies as a carrier \
+                             (approved, `transit on`, relaying phones, itself dialable with a public IPv4)"
+                        .into(),
+                });
+            }
         }
-        let (Some(port), Some(_)) = (peer.relay.port, peer.relay.listen_port) else {
+        return Ok(Json(plan));
+    };
+    for (node, peer) in &agents {
+        if node.id == carrier.id {
+            plan.direct.push(node.name.clone());
+        } else if peer.relay.listen_port.is_none() {
             plan.unreachable.push(wireserve_types::Unreachable {
                 node: node.name.clone(),
-                reason: "it has no relay port or no known listen port".into(),
+                reason: "its WireGuard port isn't known yet, so the carrier can't forward to it".into(),
             });
-            continue;
-        };
-        // Preferably a carrier that reaches the node right now; a node that is
-        // offline gets one anyway, and its relay works once it is back.
-        let mut candidates: Vec<&(&nodes::NodeRow, &wireserve_types::PeerInfo, std::net::Ipv4Addr)> =
-            carriers.iter().filter(|(c, _, _)| c.id != node.id).collect();
-        candidates.sort_by_key(|(c, cp, addr)| {
-            (
-                !state.transit.reaches(&cp.pubkey, &peer.pubkey, fresh),
-                !trusted_open(c.id, port, *addr),
-                !serving.contains(&c.id),
-                cp.pubkey.clone(),
-            )
-        });
-        let Some((carrier, _, addr)) = candidates.first() else {
-            plan.unreachable.push(wireserve_types::Unreachable {
-                node: node.name.clone(),
-                reason: "it isn't known to be dialable from outside, and no node qualifies as a \
-                         carrier (approved, `transit on`, relaying, itself dialable with a public IPv4)"
-                    .into(),
-            });
-            continue;
-        };
-        let endpoint = format!("{addr}:{port}");
-        // A check sent to the coordinator's own address never leaves the
-        // machine, so it would read "open" whatever a firewall in front of
-        // it does. Such a port isn't checked, and the operator is told.
-        if is_own_address(*addr) {
+        } else {
             plan.relayed.push(wireserve_types::RelayPlanEntry {
                 node: node.name.clone(),
                 carrier: carrier.name.clone(),
-                endpoint,
-                open: None,
-                unverifiable_here: true,
-            });
-            continue;
-        }
-        let open = trusted_open(carrier.id, port, *addr).then_some(true);
-        if open.is_none() {
-            to_check.push((plan.relayed.len(), carrier.id, carrier.pubkey.clone().unwrap_or_default(), port, std::net::SocketAddrV4::new(*addr, port)));
-        }
-        plan.relayed.push(wireserve_types::RelayPlanEntry {
-            node: node.name.clone(),
-            carrier: carrier.name.clone(),
-            endpoint,
-            open,
-            unverifiable_here: false,
-        });
-    }
-
-    // Check every port that needs it, together.
-    if !to_check.is_empty() {
-        if let Some(socket) = state.probe_udp.clone() {
-            let nonces: Vec<[u8; 8]> =
-                to_check.iter().map(|(_, _, pk, port, _)| state.transit.start_check(pk, *port)).collect();
-            let deadline = tokio::time::Instant::now() + PORT_CHECK_WAIT;
-            loop {
-                let pending: Vec<usize> = (0..to_check.len())
-                    .filter(|i| state.transit.check_state(&to_check[*i].2, to_check[*i].3) != Some(crate::transit::CheckState::Seen))
-                    .collect();
-                if pending.is_empty() || tokio::time::Instant::now() >= deadline {
-                    break;
-                }
-                for i in &pending {
-                    let (_, _, pk, _, target) = &to_check[*i];
-                    if state.transit.check_state(pk, target.port()) == Some(crate::transit::CheckState::Listening) {
-                        let datagram = wireserve_types::reflexive::build_response(nonces[*i], *target);
-                        let _ = socket.send_to(&datagram, target);
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-            let conn = state.db.conn.lock().await;
-            for (entry, carrier_id, pk, port, target) in &to_check {
-                let open = match state.transit.check_state(pk, *port) {
-                    Some(crate::transit::CheckState::Seen) => Some(true),
-                    Some(crate::transit::CheckState::Listening) => Some(false),
-                    _ => None,
-                };
-                state.transit.finish_check(pk, *port);
-                if let Some(open) = open {
-                    nodes::record_relay_port(&conn, *carrier_id, *port, &target.ip().to_string(), open)?;
-                }
-                plan.relayed[*entry].open = open;
-            }
-        }
-    }
-    for entry in &plan.relayed {
-        if entry.open != Some(true) && !entry.unverifiable_here {
-            let port = entry.endpoint.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(0);
-            plan.closed.push(wireserve_types::RelayPortStatus {
-                carrier: entry.carrier.clone(),
-                address: entry.endpoint.rsplit_once(':').map(|(a, _)| a.to_string()),
-                port,
-                node: Some(entry.node.clone()),
-                devices: Vec::new(),
-                checked_at: None,
-                open: entry.open,
+                endpoint: endpoint.to_string(),
             });
         }
-    }
-    if !plan.closed.is_empty() && !body.allow_unverified {
-        tracing::info!(event = "relay_plan_ports_closed", ports = plan.closed.len());
     }
     Ok(Json(plan))
-}
-
-/// `GET /admin/relay-ports` (PLAN.md M40): every public relay port a
-/// carrier has had checked or has in use, what it leads to, which devices
-/// use it, and whether it was open.
-pub async fn relay_ports(
-    State(state): State<AppState>,
-    _admin: AdminAuth,
-) -> Result<Json<wireserve_types::RelayPortsResponse>, AppError> {
-    let conn = state.db.conn.lock().await;
-    let rows = nodes::list_all_peers(&conn)?;
-    let by_id: std::collections::HashMap<i64, &nodes::NodeRow> = rows.iter().map(|n| (n.id, n)).collect();
-    let port_of = |id: i64| by_id.get(&id).and_then(|n| wireserve_types::relay_port(state.config.relay_port_base, n.relay_slot));
-    let mut out: std::collections::BTreeMap<(String, u16), wireserve_types::RelayPortStatus> = std::collections::BTreeMap::new();
-    for r in nodes::relay_ports(&conn)? {
-        let Some(carrier) = by_id.get(&r.carrier_node_id) else { continue };
-        out.insert((carrier.name.clone(), r.port), wireserve_types::RelayPortStatus {
-            carrier: carrier.name.clone(),
-            address: Some(r.address.clone()),
-            port: r.port,
-            node: rows.iter().find(|n| port_of(n.id) == Some(r.port)).map(|n| n.name.clone()),
-            devices: Vec::new(),
-            checked_at: r.checked_at,
-            open: Some(r.open),
-        });
-    }
-    for (device, peer, carrier) in nodes::all_static_relays(&conn)? {
-        let (Some(d), Some(p), Some(c), Some(port)) = (by_id.get(&device), by_id.get(&peer), by_id.get(&carrier), port_of(peer)) else {
-            continue;
-        };
-        let entry = out.entry((c.name.clone(), port)).or_insert_with(|| wireserve_types::RelayPortStatus {
-            carrier: c.name.clone(),
-            address: None,
-            port,
-            node: Some(p.name.clone()),
-            devices: Vec::new(),
-            checked_at: None,
-            open: None,
-        });
-        entry.devices.push(d.name.clone());
-    }
-    Ok(Json(wireserve_types::RelayPortsResponse { ports: out.into_values().collect() }))
 }
 
 /// `POST /admin/nodes/{name}/transit/approve`.
@@ -1323,13 +1176,4 @@ pub async fn list_peers(
         exit_devices,
         tags,
     }))
-}
-
-#[cfg(test)]
-mod relay_plan_tests {
-    #[test]
-    fn only_this_hosts_own_addresses_count_as_its_own() {
-        assert!(super::is_own_address(std::net::Ipv4Addr::LOCALHOST));
-        assert!(!super::is_own_address("203.0.113.254".parse().unwrap()));
-    }
 }

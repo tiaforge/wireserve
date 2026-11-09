@@ -35,7 +35,7 @@ use super::model::{
     Hook, IpVersion, IptablesObservation, IptablesVariant, NftView, Observed, Opening, RuleInfo,
     FIREWALLD_TABLE, GUARD_CHAIN, IPTABLES_TABLES, TAG_PREFIX,
 };
-use crate::firewall::nftables::{CHECK_MARK, EXIT_MARK, RELAY_MARK, SERVICE_MARK};
+use crate::firewall::nftables::{EXIT_MARK, SERVICE_MARK};
 
 const TRUSTED: &str = "trusted";
 
@@ -65,9 +65,6 @@ pub fn opening_matches(ifname: &str, opening: Opening) -> Vec<Value> {
         Opening::ServiceReply => vec![oifname_match(ifname), mark_match(SERVICE_MARK)],
         Opening::ExitRequest => vec![iifname_match(ifname), mark_match(EXIT_MARK)],
         Opening::ExitReply => vec![oifname_match(ifname), mark_match(EXIT_MARK)],
-        Opening::RelayRequest => vec![oifname_match(ifname), mark_match(RELAY_MARK)],
-        Opening::RelayReply => vec![iifname_match(ifname), mark_match(RELAY_MARK)],
-        Opening::RelayCheck => vec![mark_match(CHECK_MARK)],
     }
 }
 
@@ -130,9 +127,6 @@ pub fn guard_exceptions(ifname: &str, forward: ForwardWanted) -> Vec<Vec<Value>>
     }
     if forward.exit {
         out.push(opening_matches(ifname, Opening::ExitRequest));
-    }
-    if forward.relay {
-        out.push(opening_matches(ifname, Opening::RelayReply));
     }
     out
 }

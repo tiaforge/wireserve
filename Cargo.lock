@@ -4119,8 +4119,10 @@ dependencies = [
 name = "wireserve-agent"
 version = "1.0.0-beta.5"
 dependencies = [
+ "blake2",
  "chrono",
  "clap",
+ "defguard_boringtun",
  "defguard_wireguard_rs",
  "libc",
  "netlink-packet-core",

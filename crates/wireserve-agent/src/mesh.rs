@@ -196,7 +196,7 @@ mod tests {
             relay_carrying: vec![],
             relay_public: vec![],
             relay_port_base: None,
-            port_checks: vec![],
+            relay_devices: vec![],
             transit_awaiting_approval: false,
             exit_clients: vec![],
             mesh: None,

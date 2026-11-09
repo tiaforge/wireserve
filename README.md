@@ -166,9 +166,7 @@ Run any command with `--help` for its options.
 
 ## License
 
-wireserve is free for personal use, hobby projects, research and
-noncommercial organizations under the
-[PolyForm Noncommercial License 1.0.0](LICENSE.md). It is source-available
-rather than open source: commercial use needs a separate license.
+wireserve is open source under the [Apache License 2.0](LICENSE), for any
+use, commercial included.
 
 Contributions are welcome. See [Contributing](CONTRIBUTING.md).
