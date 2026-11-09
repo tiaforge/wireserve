@@ -13,7 +13,7 @@ members = [
 version = "1.0.0-beta.5"
 edition = "2021"
 rust-version = "1.91"
-license = "PolyForm-Noncommercial-1.0.0"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 wireserve-types = { path = "crates/wireserve-types" }

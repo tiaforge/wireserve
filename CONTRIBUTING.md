@@ -28,21 +28,12 @@ choose "Report a vulnerability".
    rewrites dozens of unrelated files. Match the style around your change.
 4. Open the pull request against `main`.
 
-### The contributor agreement
+### Licensing of contributions
 
-The first time you open a pull request, a bot asks you to sign the
-[Contributor License Agreement](CLA.md). You sign by posting one sentence as
-a comment. You only do this once.
-
-Why it is needed: wireserve is free for noncommercial use, and businesses
-buy a commercial license. That is only possible if we can license every
-part of wireserve commercially, including your contribution. You keep the
-copyright in your work, and every published version that contains it stays
-available under wireserve's free license. Read [CLA.md](CLA.md) for the
-details. It is short.
-
-If you contribute as part of your job, check with your employer first. See
-section 8 of the agreement.
+wireserve is licensed under the [Apache License 2.0](LICENSE), and so is
+what you contribute: section 5 of the license says a contribution you
+submit is under its terms unless you say otherwise. There is no agreement
+to sign and nothing to add to your commits.
 
 ## How pull requests are merged
 

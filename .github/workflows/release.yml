@@ -204,12 +204,12 @@ jobs:
 
             agent=wireserve-$VERSION-$arch-linux
             mkdir -p "$agent"
-            cp "bins/bin-$arch/wireserve" LICENSE.md README.md "$agent/"
+            cp "bins/bin-$arch/wireserve" LICENSE README.md "$agent/"
             tar -czf "upload/$agent.tar.gz" --owner=0 --group=0 "$agent"
 
             coord=wireserve-coordinator-$VERSION-$arch-linux
             mkdir -p "$coord"
-            cp "bins/bin-$arch/wireserve-coordinator" "bins/bin-$arch/wireserve-admin" LICENSE.md README.md "$coord/"
+            cp "bins/bin-$arch/wireserve-coordinator" "bins/bin-$arch/wireserve-admin" LICENSE README.md "$coord/"
             tar -czf "upload/$coord.tar.gz" --owner=0 --group=0 "$coord"
           done
           (cd upload && sha256sum -- *.tar.gz > SHA256SUMS)
@@ -246,7 +246,7 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0
+            org.opencontainers.image.licenses=Apache-2.0
             org.opencontainers.image.title=wireserve-coordinator
 
       - name: GitHub release
