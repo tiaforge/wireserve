@@ -5891,7 +5891,7 @@ name, a Linux peer's connection to the Windows node timed out, restart and
 
 353. **Left for later:** Authenticode-signing `wireserve.exe` (no
     certificate yet; SmartScreen warns on an unsigned download); an
-    aarch64 build (wireguard-nt ships an arm64 DLL). Serving came in M50,
+    aarch64 build (wireguard-nt ships an arm64 DLL). Serving came in M51,
     but for the address rewrites nftables does, which WFP has no plain
     counterpart for.
 
@@ -5914,7 +5914,7 @@ name, a Linux peer's connection to the Windows node timed out, restart and
     exactly those rights (`CreateFileW` itself; tokio's `ClientOptions`
     asks for `GENERIC_WRITE`), still at identification level.
 
-## M50 — Windows nodes serve
+## M51 — Windows nodes serve
 
 A Windows node publishes services, with the TLS terminator, as a Linux one
 does, for everything that needs no rewrite: a port published as itself, and
@@ -5931,7 +5931,7 @@ Let's Encrypt certificate it got over DNS-01 as its own account; a second
 process could not bind a held 443, and one that took 443 while the
 terminator was stopped, its permit still in place, was not reached.
 
-344. **No rewrite, so the service address is the host's.** nftables
+355. **No rewrite, so the service address is the host's.** nftables
     rewrites `vip:PUBLIC` to `node:TARGET` before conntrack; WFP rewrites
     nothing without a kernel driver of our own (its redirect layers are
     callout-only). So each own service's address is added to the mesh
@@ -5944,7 +5944,7 @@ terminator was stopped, its permit still in place, was not reached.
     nothing is swept at start. `serve` refuses what would need a rewrite
     (`unsupported_on_windows`), and the firewall backend skips it again.
 
-345. **Permits in our sublayer, above our blocks.** One hard permit per
+356. **Permits in our sublayer, above our blocks.** One hard permit per
     service port at `ALE_AUTH_RECV_ACCEPT_V4`: the adapter's LUID, the
     service address, the port, the protocol, and the grants' sources as
     OR'ed remote-address conditions (an empty list: no permit). Weight
@@ -5954,7 +5954,7 @@ terminator was stopped, its permit still in place, was not reached.
     blocks do not veto: a backend Defender had an explicit block rule for,
     on a Public network, was reached — so `install` adds no Defender rule.
 
-346. **The terminator answers its ports itself, and only it.** Linux
+357. **The terminator answers its ports itself, and only it.** Linux
     rewrites 443 and 80 onto the terminator's one socket on every address,
     held by systemd. Here the terminator binds each service address's 443
     and 80 itself (`serve::Addresses`, fed into one accept loop through
@@ -5966,7 +5966,7 @@ terminator was stopped, its permit still in place, was not reached.
     got there first, or after a crash, is not let in. The check-in reports
     port 443 and 80, so the agent's `Terminated` rules need no change.
 
-347. **The terminator as a virtual account.** `wireserve-tls[-<name>]`, a
+358. **The terminator as a virtual account.** `wireserve-tls[-<name>]`, a
     second service running `tls-daemon --service` as `NT SERVICE\<it>`,
     unrestricted service SID: the separate user it is on Linux, with no
     password and nothing of the agent's. Its state directory,
@@ -5975,12 +5975,12 @@ terminator was stopped, its permit still in place, was not reached.
     (`winsec::ensure_private_dir_for`); the TLS crate's `0600` and `0700`
     are Unix-only, the ACL doing their work. Its log is in that directory,
     as the agent's is in its own. Its pipe is shared with that account,
-    reading and writing only, as the `wireserve` group's is (#343).
+    reading and writing only, as the `wireserve` group's is (#354).
     `install` makes it before the agent starts — the agent looks the
     account up once — and `leave` deletes it with the agent's; an upgrade
     stops terminators before agents and starts them after.
 
-348. **The terminator checks who made its pipe.** Any user may create a
+359. **The terminator checks who made its pipe.** Any user may create a
     pipe of a free name, and one made before the agent (at boot) would be
     handed every sign-in ticket and session the terminator passes on. So
     the link reads the pipe's owner and refuses any but SYSTEM or
@@ -5988,7 +5988,7 @@ terminator was stopped, its permit still in place, was not reached.
     The TLS crate's tests stay Unix-only: their stand-in agent is a Unix
     socket, and one on Windows would have to be made by an administrator.
 
-349. **A failed upgrade starts again what it stopped.** The first upgrade on
+360. **A failed upgrade starts again what it stopped.** The first upgrade on
     the test machine stopped every service, replaced `wireserve.exe`, then
     failed to replace `wireguard.dll` (a stopped service's process still
     held it) and returned with nothing running: the node was offline until
@@ -5997,10 +5997,10 @@ terminator was stopped, its permit still in place, was not reached.
     not replaced at all, and a replace is retried for ten seconds.
     Seen there too and left for later: every restart flips the adapter's
     name between `wireserve0` and `wireserve1` (the old one is still being
-    removed, #336), and a 443 that gives way to a plain mapping warns on
+    removed, #347), and a 443 that gives way to a plain mapping warns on
     every poll, as on Linux.
 
-350. **Platform code in one place** (2026-10-18). Everything that differs
+361. **Platform code in one place** (2026-10-18). Everything that differs
     between operating systems lives under `platform/` in the agent
     (`platform::unix`, `platform::linux`, `platform::windows`, and
     `fallback` for what a platform has nothing to do about), and under

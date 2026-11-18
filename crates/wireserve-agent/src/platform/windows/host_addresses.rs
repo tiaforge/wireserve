@@ -1,5 +1,5 @@
 //! The service addresses the host receives on itself, on Windows (PLAN.md
-//! M50): every one of its services', as addresses of the mesh adapter.
+//! M51): every one of its services', as addresses of the mesh adapter.
 
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
@@ -9,7 +9,7 @@ use std::net::Ipv4Addr;
 /// serves it.
 pub const EVERY_SERVICE: bool = true;
 
-/// Windows (PLAN.md M50): the service addresses, as addresses of the mesh
+/// Windows (PLAN.md M51): the service addresses, as addresses of the mesh
 /// adapter itself — what the host receives on, nothing rewriting them. Read
 /// back from the adapter every time, not only on a change: one that came
 /// back up has none.

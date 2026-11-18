@@ -18,7 +18,7 @@
 //! the coordinator, which only then points the name at the service's own
 //! address.
 //!
-//! On Windows (PLAN.md M50) it runs as its own service, under a virtual
+//! On Windows (PLAN.md M51) it runs as its own service, under a virtual
 //! account of its own, and listens on each service address's 443 and 80
 //! itself: nothing there rewrites them onto one port.
 

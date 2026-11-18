@@ -15,7 +15,7 @@ pub struct OwnTable;
 pub type Interop = NoopInterop;
 
 /// The filters for the mesh adapter `ifname` and this node's own addresses
-/// `own`. The terminator's holes (PLAN.md M50) are for its service's own
+/// `own`. The terminator's holes (PLAN.md M51) are for its service's own
 /// account, which exists once `install` made the service. No carry
 /// interface's: the adapter blocks cover it.
 pub fn backend(ifname: &str, _carry: Option<String>, own: &[IpAddr], instance: &Instance) -> Result<Backend, Box<dyn std::error::Error>> {

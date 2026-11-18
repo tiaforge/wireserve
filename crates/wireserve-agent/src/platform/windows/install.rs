@@ -1,4 +1,4 @@
-//! `install` on Windows (PLAN.md M49, M50): the files, the services, the
+//! `install` on Windows (PLAN.md M50, M51): the files, the services, the
 //! group and the `Path`.
 
 use std::time::Duration;
@@ -130,7 +130,7 @@ where
     };
     let name = winservice::service_name(instance);
     winservice::install(&name, instance, &exe)?;
-    // The TLS terminator (PLAN.md M50), under an account of its own whose
+    // The TLS terminator (PLAN.md M51), under an account of its own whose
     // state directory only it and administrators may read. Before the
     // agent starts: the agent looks its account up once, at start.
     let tls_name = winservice::tls_service_name(instance);

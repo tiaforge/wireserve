@@ -18,7 +18,7 @@
 //! is with the `wireserve` group on Linux; [`local_group_sid`] is the
 //! lookup and [`ensure_local_group`] the `groupadd`.
 //!
-//! The TLS terminator (PLAN.md M50) runs as a virtual account of its own,
+//! The TLS terminator (PLAN.md M51) runs as a virtual account of its own,
 //! `NT SERVICE\<its service>` ([`service_sid`]): its state directory
 //! ([`ensure_private_dir_for`]), its pipe and its firewall permits name it.
 

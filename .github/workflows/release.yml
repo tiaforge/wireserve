@@ -254,7 +254,7 @@ jobs:
           # from its own directory, and docs/windows.md for how to install.
           win=wireserve-$VERSION-x86_64-windows
           mkdir -p "$win"
-          cp bins/bin-windows-x86_64/wireserve.exe bins/bin-windows-x86_64/wireguard.dll LICENSE.md README.md "$win/"
+          cp bins/bin-windows-x86_64/wireserve.exe bins/bin-windows-x86_64/wireguard.dll LICENSE README.md "$win/"
           cp docs/windows.md "$win/WINDOWS.md"
           zip -qr "upload/$win.zip" "$win"
 
