@@ -4097,7 +4097,7 @@ dependencies = [
 
 [[package]]
 name = "wireserve-admin"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 dependencies = [
  "axum",
  "chrono",
@@ -4117,7 +4117,7 @@ dependencies = [
 
 [[package]]
 name = "wireserve-agent"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 dependencies = [
  "blake2",
  "chrono",
@@ -4145,7 +4145,7 @@ dependencies = [
 
 [[package]]
 name = "wireserve-coordinator"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -4179,7 +4179,7 @@ dependencies = [
 
 [[package]]
 name = "wireserve-tls"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -4210,7 +4210,7 @@ dependencies = [
 
 [[package]]
 name = "wireserve-types"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 dependencies = [
  "base64 0.23.1",
  "chrono",
