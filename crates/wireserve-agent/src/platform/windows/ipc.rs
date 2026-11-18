@@ -37,7 +37,7 @@ pub fn group(name: &str) -> Option<Principal> {
 }
 
 /// Who the TLS terminator's pipe is shared with: its service's own
-/// account (PLAN.md M50), once `install` made the service.
+/// account (PLAN.md M51), once `install` made the service.
 #[must_use]
 pub fn terminator(instance: &crate::paths::Instance) -> Option<Principal> {
     let name = super::service::tls_service_name(instance);

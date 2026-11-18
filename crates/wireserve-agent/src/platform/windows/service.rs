@@ -10,7 +10,7 @@
 //! One service per instance: `wireserve-agent`, or `wireserve-agent-<name>`
 //! for a named one, each running `wireserve.exe daemon --service` as
 //! LocalSystem, started at boot and restarted after a failure. Beside each,
-//! its TLS terminator (PLAN.md M50): `wireserve-tls[-<name>]`, running
+//! its TLS terminator (PLAN.md M51): `wireserve-tls[-<name>]`, running
 //! `wireserve.exe tls-daemon --service` as a virtual account of its own,
 //! `NT SERVICE\wireserve-tls[-<name>]` — what the terminator's own user is
 //! on Linux.
@@ -50,7 +50,7 @@ pub fn service_name(instance: &Instance) -> String {
     }
 }
 
-/// The TLS terminator's service for `instance` (PLAN.md M50), and the
+/// The TLS terminator's service for `instance` (PLAN.md M51), and the
 /// name of the account it runs as, `NT SERVICE\<it>`.
 #[must_use]
 pub fn tls_service_name(instance: &Instance) -> String {
@@ -227,7 +227,7 @@ pub fn install(name: &str, instance: &Instance, exe: &Path) -> io::Result<()> {
     )
 }
 
-/// The TLS terminator's service `name` for `instance` (PLAN.md M50): `exe
+/// The TLS terminator's service `name` for `instance` (PLAN.md M51): `exe
 /// tls-daemon --service`, as `NT SERVICE\<name>`, which holds nothing of
 /// the agent's — it parses TLS and HTTP from the whole mesh.
 pub fn install_tls(name: &str, instance: &Instance, exe: &Path) -> io::Result<()> {

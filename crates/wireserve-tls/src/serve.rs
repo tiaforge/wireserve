@@ -2,7 +2,7 @@
 //! port of every address (PLAN.md M35), to which the agent rewrites each
 //! service address's 443; each connection goes to the service whose
 //! address it arrived on, and each request to its backend in plain HTTP.
-//! Where nothing rewrites (Windows, PLAN.md M50), a socket on each service
+//! Where nothing rewrites (Windows, PLAN.md M51), a socket on each service
 //! address's 443 itself instead ([`Incoming`]).
 //!
 //! The proxying itself is hyper's pooled client, with each request's headers
@@ -788,7 +788,7 @@ pub enum Incoming {
     /// address's public port (PLAN.md M35).
     One(TcpListener),
     /// One socket per service address on the public port itself, where
-    /// nothing rewrites (Windows, PLAN.md M50): see [`Addresses`].
+    /// nothing rewrites (Windows, PLAN.md M51): see [`Addresses`].
     PerAddress(mpsc::Receiver<(TcpStream, SocketAddr)>),
 }
 
@@ -833,7 +833,7 @@ impl Listening {
     }
 }
 
-/// The sockets of one port on each service address (PLAN.md M50), all
+/// The sockets of one port on each service address (PLAN.md M51), all
 /// feeding one [`Incoming::PerAddress`]: opened as services are routed to,
 /// closed as they go.
 ///
@@ -1901,7 +1901,7 @@ mod tests {
         assert_eq!(listen_fd(42, Some("42"), Some("1"), 1), None, "a socket unit from before it");
     }
 
-    /// Each service address's own socket (PLAN.md M50), all feeding one
+    /// Each service address's own socket (PLAN.md M51), all feeding one
     /// accept loop that knows which address each came in on.
     #[tokio::test]
     async fn per_address_sockets_feed_one_incoming_and_close_when_released() {

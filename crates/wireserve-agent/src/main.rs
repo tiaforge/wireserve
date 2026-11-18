@@ -171,7 +171,7 @@ enum Command {
         // The port to listen on when not started by `wireserve-tls.socket`,
         // which otherwise decides it. Service addresses' 443 is rewritten to
         // whichever it is. Not on Windows, which listens on each service
-        // address's 443 and 80 (PLAN.md M50).
+        // address's 443 and 80 (PLAN.md M51).
         #[arg(long, env = "WIRESERVE_TLS_PORT", default_value_t = wireserve_types::TLS_LISTEN_PORT, hide = true)]
         port: u16,
         /// Run under the service manager: the Service Control Manager on Windows (`install` sets this up)
@@ -986,7 +986,7 @@ async fn cmd_daemon(
     Ok(())
 }
 
-/// Removes the service addresses (PLAN.md M33, M50) a previous run left
+/// Removes the service addresses (PLAN.md M33, M51) a previous run left
 /// the host holding (see `platform::host_addresses::left_behind`).
 fn sweep_local_routes(state: &mut AgentState, state_path: &std::path::Path) {
     let range = state.mesh.as_ref().and_then(wireserve_types::MeshRanges::parse);
@@ -1069,7 +1069,7 @@ async fn teardown_everything<F: FirewallBackend>(
     if let Err(e) = fw.teardown() {
         tracing::warn!(error = %e, "failed to tear down firewall rules during teardown");
     }
-    // The service addresses stop being this host's own (PLAN.md M33, M50)
+    // The service addresses stop being this host's own (PLAN.md M33, M51)
     // — after the firewall, which marked traffic for them.
     {
         let mut state = state.lock().await;

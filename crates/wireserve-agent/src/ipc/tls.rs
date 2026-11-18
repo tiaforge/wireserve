@@ -7,7 +7,7 @@
 //! names.
 //!
 //! Shared with the `wireserve-tls` group (0660, in a 0750 directory) when
-//! that group exists; root-only otherwise. On Windows (PLAN.md M50) a named
+//! that group exists; root-only otherwise. On Windows (PLAN.md M51) a named
 //! pipe, shared with the terminator's own account, `NT SERVICE\wireserve-tls`,
 //! once its service exists; administrators-only otherwise.
 

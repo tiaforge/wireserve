@@ -1,14 +1,14 @@
 //! The Windows firewall backend: the Windows Filtering Platform, directly.
 //!
 //! A Windows node is a mesh member whose ruleset is the default-deny with
-//! holes for its services (PLAN.md M50) and nothing else: no transit, no
+//! holes for its services (PLAN.md M51) and nothing else: no transit, no
 //! exit. Every new inbound connection over the mesh is refused but those,
 //! and replies to the node's own connections come back as they belong to
 //! flows it opened — WFP's ALE layers only ever see the first packet of a
 //! flow, which is what nftables' `ct state established` amounts to on
 //! Linux.
 //!
-//! Why WFP and not Windows Defender Firewall rules (PLAN.md #338): the blocks
+//! Why WFP and not Windows Defender Firewall rules (PLAN.md #349): the blocks
 //! sit in a sublayer of our own at the highest weight and clear the
 //! action right, so no other firewall on the host — Defender, or whatever
 //! replaced it, all of them WFP clients — can permit what they refuse;
@@ -83,7 +83,7 @@ const SUBLAYER_WEIGHT: u16 = u16::MAX;
 const BLOCK_WEIGHT: u8 = 1;
 const PERMIT_WEIGHT: u8 = 15;
 
-/// One service's hole in the default-deny (PLAN.md M50): new connections
+/// One service's hole in the default-deny (PLAN.md M51): new connections
 /// to `vip:port` over `proto` on the mesh adapter, from `sources` (anyone
 /// when `None`), and with `terminator` only those its account accepts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,11 +416,11 @@ impl FirewallBackend for WfpBackend {
     type Error = io::Error;
 
     /// The default-deny and the services' holes. `forwarding` is always
-    /// empty here: a Windows node carries nobody's traffic (PLAN.md M49).
+    /// empty here: a Windows node carries nobody's traffic (PLAN.md M50).
     fn apply(&mut self, rules: &[ServiceRule], forwarding: &Forwarding) -> Result<(), Self::Error> {
         // What the agent always fills in (its own address and ports, the
         // mesh's range) asks for nothing to be forwarded; these would.
-        let forwards = !forwarding.relay.is_empty() || !forwarding.relay_public.is_empty() || !forwarding.exit.is_empty();
+        let forwards = !forwarding.relay.is_empty() || forwarding.phone_relay.is_some() || !forwarding.exit.is_empty();
         if forwards && self.warned.insert("forwarding".into()) {
             tracing::warn!("forwarding is not supported on Windows; nothing is forwarded");
         }

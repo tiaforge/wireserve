@@ -177,6 +177,7 @@ fn observed_endpoints(
 
 /// The phone relay's ports (PLAN.md M49): the divert socket on the first
 /// port after the relay ports, the mesh socket on the next.
+#[cfg(target_os = "linux")]
 fn phone_relay_ports(base: u16) -> Option<(u16, u16)> {
     let divert = base.checked_add(wireserve_types::RELAY_SLOTS)?;
     Some((divert, divert.checked_add(1)?))
@@ -760,7 +761,7 @@ pub struct PollContext<'a, F: FirewallBackend> {
 /// The service addresses the host must receive on itself (PLAN.md M33): on
 /// Linux those its terminator answers, which a rewrite sends to the host's
 /// own sockets; everything else is rewritten onto the node's address. On
-/// Windows (PLAN.md M50) every one of its services' addresses: nothing
+/// Windows (PLAN.md M51) every one of its services' addresses: nothing
 /// rewrites them, so whatever answers one receives it unchanged — and the
 /// terminator binds an address before it says it serves it.
 fn host_addresses_wanted(
@@ -1203,7 +1204,7 @@ where
     let term = Terminator { tls: terminating_here(node_ip, &directory, &serving), tls_port, http, http_port };
     state.lock().await.http_answered.clone_from(&term.http);
     let rules = service_rules(&declared, node_ip, &directory, &directory.access, mesh_ranges.as_ref(), &term);
-    // The addresses the host must receive on (PLAN.md M33, M50): routed to
+    // The addresses the host must receive on (PLAN.md M33, M51): routed to
     // it, or on Windows given to the mesh adapter, so they arrive at its
     // sockets rather than looping back into the mesh interface.
     let local_routes_wanted = host_addresses_wanted(&rules, &declared, node_ip, &directory);
@@ -1704,7 +1705,7 @@ mod tests {
 
     /// Which service addresses the host receives on itself: on Linux the
     /// terminated ones, the rest being rewritten onto the node's address;
-    /// on Windows (PLAN.md M50) every one, nothing rewriting them.
+    /// on Windows (PLAN.md M51) every one, nothing rewriting them.
     #[test]
     fn the_host_receives_on_the_terminated_addresses_or_on_windows_on_all() {
         let other = Ipv4Addr::new(10, 9, 0, 51);

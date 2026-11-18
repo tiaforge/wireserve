@@ -1,4 +1,4 @@
-//! The terminator on Windows (see [`super`]; PLAN.md M50): the agent's
+//! The terminator on Windows (see [`super`]; PLAN.md M51): the agent's
 //! named pipe, each service address's own socket on 443 and 80, and files
 //! protected by their directory's ACL.
 

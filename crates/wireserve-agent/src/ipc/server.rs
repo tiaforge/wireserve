@@ -164,7 +164,7 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
 /// (PLAN.md #326): its 80 is closed then, not passed on (`service_rules`).
 fn unguarded(state: &AgentState, name: &str) -> bool {
     // Where nothing rewrites ports (Windows), a remapped 80 the terminator
-    // does not answer is closed, not unguarded (PLAN.md M50).
+    // does not answer is closed, not unguarded (PLAN.md M51).
     let reaches_backend = |m: &wireserve_types::PortMap| {
         wireserve_types::is_http_map(m) && (crate::platform::capabilities::REWRITES_PORTS || m.public == m.target)
     };
@@ -384,10 +384,10 @@ where
 
 /// Why this platform's daemon refuses `req`, if it does (see
 /// `platform::capabilities`). Where nodes carry nobody's traffic (Windows,
-/// PLAN.md M49, #341): no transit or exit — what turns either off is still
+/// PLAN.md M50, #352): no transit or exit — what turns either off is still
 /// accepted, so a state file copied from elsewhere can be undone. Where
 /// nothing rewrites one port to another or forwards elsewhere (Windows,
-/// PLAN.md M50), what would need it (see [`unsupported_on_windows`]).
+/// PLAN.md M51), what would need it (see [`unsupported_on_windows`]).
 fn refused_here(req: &IpcRequest) -> Option<String> {
     use crate::platform::capabilities::{CARRIES_TRAFFIC, REWRITES_PORTS};
     match req {

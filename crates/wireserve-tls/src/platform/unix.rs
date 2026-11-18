@@ -15,7 +15,7 @@ pub(crate) async fn connect(socket: &Path) -> std::io::Result<tokio::net::UnixSt
 
 /// The TLS connections, the listening that goes with them, and the port
 /// they arrive on: [`crate::serve::listener`] on Linux; each service address's 443 on
-/// Windows, where nothing rewrites it (PLAN.md M50).
+/// Windows, where nothing rewrites it (PLAN.md M51).
 pub(crate) fn open_tls(port: u16) -> std::io::Result<(Incoming, Listening, u16)> {
     let listener = crate::serve::listener(port)?;
     let port = listener.local_addr()?.port();
