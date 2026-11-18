@@ -161,7 +161,7 @@ log "starting the gateway (inet + its own LAN) and a node behind it"
 # Global IPv4 forwarding off, as on a VPS: the agent has to own and guard the
 # egress switch itself, which is what makes check 6 mean something.
 podman run -d --name "$GW" --network "$INET" --network "$GW_LAN" \
-    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --security-opt apparmor=unconfined --device /dev/net/tun --sysctl net.ipv4.ip_forward=0 \
+    --cap-add=NET_ADMIN --cap-add=NET_RAW --security-opt unmask=/proc/sys --security-opt apparmor=unconfined --device /dev/net/tun --sysctl net.ipv4.ip_forward=0 \
     --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
 sleep 1
 GW_IP=$(ip_on "$GW" "$INET")
@@ -177,7 +177,7 @@ in_netns "$GW" iptables -P FORWARD DROP
 echo "gw: $GW_IP (egress $GW_INET_IF), lan $GW_LAN_IP"
 
 podman run -d --name "$HOME_AGENT" --network "$INET" \
-    --cap-add=NET_ADMIN --security-opt unmask=/proc/sys --security-opt apparmor=unconfined --device /dev/net/tun \
+    --cap-add=NET_ADMIN --cap-add=NET_RAW --security-opt unmask=/proc/sys --security-opt apparmor=unconfined --device /dev/net/tun \
     --entrypoint sleep wireserve-agent:e2e infinity >/dev/null
 sleep 1
 
