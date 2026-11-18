@@ -195,8 +195,9 @@ podman exec "$GW" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http
     --listen-port "$WG_PORT" --endpoint "$GW_IP:$WG_PORT" 2>/dev/null
 podman exec "$HOME_AGENT" wireserve join "http://$COORD_IP:47820" --allow-plaintext-http "$JT_HOME" \
     --listen-port "$WG_PORT" 2>/dev/null
+# Each daemon's output is kept in its container, for a failure to show.
 for a in "$GW" "$HOME_AGENT"; do
-    podman exec -d "$a" wireserve daemon --poll-interval-secs "$POLL"
+    podman exec -d "$a" sh -c "exec wireserve daemon --poll-interval-secs $POLL >/tmp/daemon.log 2>&1"
 done
 wait_for 30 sees "$GW" node-home || fail "node-gw never got node-home into its peers"
 wait_for 30 sees "$HOME_AGENT" node-gw || fail "node-home never got node-gw into its peers"
@@ -322,11 +323,45 @@ SEEN=$(tcp_line "$PHONE" "$WEB_IP" 8080) \
 [ "$SEEN" = "$GW_IP" ] || fail "the internet host saw '$SEEN', not the gateway's $GW_IP"
 pass "the internet host saw the gateway's address ($SEEN), not the phone's $PHONE_IP4"
 
+# Where a relayed session (PLAN.md M49) stops, for check 4: node-home's peer
+# in the phone's file is dialled at node-gw's WireGuard port, and node-gw's
+# sorter carries it over the mesh. One retry is captured at each hop: the
+# phone's handshakes arriving on node-gw's egress, going on to node-home over
+# the mesh, node-home's answers, and those answers leaving towards the phone.
+relay_diagnostics() {
+    note "the relay plan for a device exported now:"
+    admin node show node-gw || true
+    note "phone wg (node-home's entry is the one without 0.0.0.0/0):"
+    podman exec "$PHONE" wg show wg0 || true
+    note "node-gw wg:"; in_netns "$GW" wg show wireserve0 || true
+    note "node-home wg:"; in_netns "$HOME_AGENT" wg show wireserve0 || true
+    note "node-gw's phone diversion (phone-pre, phone-idx) and its input chain:"
+    in_netns "$GW" nft list table inet wireserve.wireserve0 \
+        | awk '/chain (phone-pre|phone-idx|wireserve-in) /,/^\t}/' || true
+    note "node-gw's sockets on its WireGuard port and above:"
+    in_netns "$GW" ss -uanp || true
+    note "node-gw daemon (phone, relay, warnings):"
+    podman exec "$GW" grep -iE 'phone|relay|sorter|divert|WARN|ERROR' /tmp/daemon.log | tail -40 || true
+    note "node-home daemon (warnings):"
+    podman exec "$HOME_AGENT" grep -E 'WARN|ERROR' /tmp/daemon.log | tail -20 || true
+    note "one retry, captured on node-gw's egress and mesh, and node-home's mesh:"
+    in_netns_bg "$GW" "$DEBUG_IMG" sh -c "timeout 14 tcpdump -lni $GW_INET_IF -c 30 'udp port $WG_PORT' > /tmp/c.txt 2>&1; echo '-- node-gw $GW_INET_IF'; cat /tmp/c.txt"
+    in_netns_bg "$GW" "$DEBUG_IMG" sh -c "timeout 14 tcpdump -lni wireserve0 -c 30 'udp and not port 53' > /tmp/c.txt 2>&1; echo '-- node-gw wireserve0'; cat /tmp/c.txt"
+    in_netns_bg "$HOME_AGENT" "$DEBUG_IMG" sh -c "timeout 14 tcpdump -lni wireserve0 -c 30 'udp or tcp port 12345' > /tmp/c.txt 2>&1; echo '-- node-home wireserve0'; cat /tmp/c.txt"
+    sleep 2
+    podman exec "$PHONE" timeout 10 bash -c "exec 3<>/dev/tcp/$SVC_HOME/12345" || true
+    sleep 4
+    for c in $(podman ps -aq --filter "name=wireserve-exit-helper" 2>/dev/null); do
+        podman logs "$c" 2>/dev/null | sed 's/^/  /'
+    done
+}
+
 log "4/9: the mesh still works in the full tunnel"
 podman exec "$PHONE" timeout 15 bash -c "exec 3<>/dev/tcp/$SVC_HOME/12345" \
-    || fail "the phone lost the mesh in the full tunnel"
-# Directly, not through the exit: every peer in the file has handshaken with
-# the phone itself. (The exit forwards to public addresses, so a home node on
+    || { relay_diagnostics; fail "the phone lost the mesh in the full tunnel"; }
+# Every peer in the file has handshaken with the phone itself: node-gw
+# directly, node-home through node-gw's WireGuard port (PLAN.md M49), not
+# through the exit. (The exit forwards to public addresses, so a home node on
 # one would also be reachable the long way round — and stop being so the
 # moment the exit went away.)
 if podman exec "$PHONE" wg show wg0 latest-handshakes | awk '$2 == 0 {bad=1} END {exit !bad}'; then
