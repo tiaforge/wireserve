@@ -226,7 +226,7 @@ log "2/9: the phone's network lets out UDP $WG_PORT and nothing else"
 ROUTER_P_INET=$(if_on "$ROUTER_P" "$INET")
 podman exec -i "$ROUTER_P" nft -f - <<NFT
 table inet strictwifi {
-    chain fwd {
+    chain forward {
         type filter hook forward priority -10; policy accept;
         oifname "$ROUTER_P_INET" meta l4proto udp udp dport != $WG_PORT drop
     }
