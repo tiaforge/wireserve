@@ -23,7 +23,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 /// cookie, so a real STUN client or server can never mistake this for
 /// standard STUN traffic (which would otherwise be misleading, since the
 /// framing is entirely different despite the superficial resemblance).
-const MAGIC: [u8; 4] = *b"WSR1";
+pub const MAGIC: [u8; 4] = *b"WSR1";
 
 /// The request is fixed-size and checked by exact equality — no
 /// variable-length parsing at all, and the fixed size is what bounds the

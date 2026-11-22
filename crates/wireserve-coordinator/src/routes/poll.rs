@@ -230,6 +230,16 @@ async fn answer(
     state.transit.report_capabilities(&self_pubkey, &capabilities);
     state.transit.report_carry_port(&self_pubkey, req.carry_port);
     state.transit.report_dialable(&self_pubkey, req.dialable_v4);
+    // The reflexive answer on this node's WireGuard port (PLAN.md M50): asked
+    // of the one node an admin named, and only while it says it can. Its
+    // port goes into `/probe` only once its own poll confirms the answer is
+    // in place, and leaves again with the first poll that doesn't.
+    let answer_reflexive =
+        node.reflexive_responder && capabilities.iter().any(|c| c == wireserve_types::CAP_REFLEXIVE);
+    let reflexive_port = node.listen_port.and_then(|p| u16::try_from(p).ok());
+    state
+        .transit
+        .report_reflexive_answering(&self_pubkey, reflexive_port.filter(|_| answer_reflexive && req.reflexive_answering));
     // Where this carrier sees its peers' traffic come from, which follows a
     // NAT mapping that changed after a node's startup probe (see
     // `PollRequest::transit_observed`). Taken from an approved carrier only,
@@ -619,6 +629,7 @@ async fn answer(
             relay_carrying,
             relay_public,
             relay_devices,
+            answer_reflexive,
             relay_port_base: Some(state.config.relay_port_base),
             transit_awaiting_approval,
             exit_clients,

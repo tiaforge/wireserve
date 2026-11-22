@@ -129,6 +129,18 @@ pub fn cmd_deny_transit(client: &AdminClient, name: &str) -> Result<(), CliError
     Ok(client.deny_transit(name)?)
 }
 
+/// Names the node that answers reflexive probes on its WireGuard port
+/// (PLAN.md M50).
+pub fn cmd_set_reflexive_responder(client: &AdminClient, name: &str) -> Result<(), CliError> {
+    validate_name(name)?;
+    Ok(client.set_reflexive_responder(name)?)
+}
+
+/// Leaves no node answering reflexive probes on its WireGuard port.
+pub fn cmd_clear_reflexive_responder(client: &AdminClient) -> Result<(), CliError> {
+    Ok(client.clear_reflexive_responder()?)
+}
+
 /// A grant source as the command line writes it: `everyone`,
 /// `oidc:<group>` or `tag:<tag>`.
 pub fn parse_source(raw: &str) -> Result<wireserve_types::GrantSource, CliError> {

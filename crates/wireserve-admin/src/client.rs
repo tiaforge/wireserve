@@ -331,6 +331,24 @@ impl AdminClient {
         Ok(())
     }
 
+    /// `PUT /admin/reflexive-responder/{name}` (PLAN.md M50).
+    pub fn set_reflexive_responder(&self, name: &str) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .put(self.url(&format!("/admin/reflexive-responder/{name}")))
+            .bearer_auth(&self.admin_token)
+            .send()?;
+        Self::check_status(resp)?;
+        Ok(())
+    }
+
+    /// `DELETE /admin/reflexive-responder` (PLAN.md M50).
+    pub fn clear_reflexive_responder(&self) -> Result<(), ClientError> {
+        let resp = self.http.delete(self.url("/admin/reflexive-responder")).bearer_auth(&self.admin_token).send()?;
+        Self::check_status(resp)?;
+        Ok(())
+    }
+
     /// `POST /admin/nodes/{name}/transit/deny`.
     pub fn deny_transit(&self, name: &str) -> Result<(), ClientError> {
         let resp = self

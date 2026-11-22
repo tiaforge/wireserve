@@ -230,7 +230,7 @@ fn carry_out(io: &Sockets, action: Action, packet: &[u8], from_phone: Option<(So
     }
 }
 
-fn udp_socket() -> io::Result<OwnedFd> {
+pub(crate) fn udp_socket() -> io::Result<OwnedFd> {
     // SAFETY: plain socket(2); the result is checked before use.
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
@@ -240,7 +240,7 @@ fn udp_socket() -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-fn set_int(fd: &OwnedFd, level: libc::c_int, name: libc::c_int, value: libc::c_int) -> io::Result<()> {
+pub(crate) fn set_int(fd: &OwnedFd, level: libc::c_int, name: libc::c_int, value: libc::c_int) -> io::Result<()> {
     // SAFETY: `value` outlives the call, and its size is passed with it.
     let rc = unsafe {
         libc::setsockopt(
@@ -269,7 +269,7 @@ fn sockaddr(addr: SocketAddrV4) -> libc::sockaddr_in {
 
 const SOCKADDR_IN_LEN: libc::socklen_t = size_of::<libc::sockaddr_in>() as libc::socklen_t;
 
-fn bind(fd: &OwnedFd, addr: SocketAddrV4) -> io::Result<()> {
+pub(crate) fn bind(fd: &OwnedFd, addr: SocketAddrV4) -> io::Result<()> {
     let sa = sockaddr(addr);
     // SAFETY: `sa` is a valid sockaddr_in of the length passed.
     let rc = unsafe { libc::bind(fd.as_raw_fd(), std::ptr::from_ref(&sa).cast(), SOCKADDR_IN_LEN) };
@@ -294,7 +294,7 @@ fn from_sockaddr(sa: &libc::sockaddr_in) -> SocketAddrV4 {
 }
 
 /// One diverted packet: its length in `buf`, who sent it, and where to.
-fn recv_diverted(fd: &OwnedFd, buf: &mut [u8]) -> io::Result<(usize, SocketAddrV4, SocketAddrV4)> {
+pub(crate) fn recv_diverted(fd: &OwnedFd, buf: &mut [u8]) -> io::Result<(usize, SocketAddrV4, SocketAddrV4)> {
     // SAFETY: all-zero is a valid value for each of these C structs; every
     // pointer set below outlives the call.
     let mut from: libc::sockaddr_in = unsafe { zeroed() };
@@ -341,7 +341,7 @@ fn reinject(phone: SocketAddrV4, local: SocketAddrV4, packet: &[u8]) -> io::Resu
 }
 
 /// Sends `payload` to `to` in a UDP datagram from `from`, headers and all.
-fn send_raw(raw: &OwnedFd, from: SocketAddrV4, to: SocketAddrV4, payload: &[u8]) -> io::Result<()> {
+pub(crate) fn send_raw(raw: &OwnedFd, from: SocketAddrV4, to: SocketAddrV4, payload: &[u8]) -> io::Result<()> {
     let datagram = udp_datagram(from, to, payload)?;
     send_to(raw.as_raw_fd(), &datagram, to)
 }

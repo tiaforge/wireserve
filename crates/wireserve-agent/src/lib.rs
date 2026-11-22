@@ -14,6 +14,8 @@ pub mod poll_loop;
 pub mod phone_relay;
 pub mod probe;
 pub mod reflexive;
+#[cfg(target_os = "linux")]
+pub mod reflexive_responder;
 pub mod register;
 #[cfg(target_os = "linux")]
 pub mod routes;

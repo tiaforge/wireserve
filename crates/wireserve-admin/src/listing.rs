@@ -123,6 +123,17 @@ fn transit(resp: &AdminPeersResponse, name: &str) -> &'static str {
     }
 }
 
+/// Whether this node answers reflexive probes on its WireGuard port
+/// (PLAN.md M50): `answering` once its poll confirms it, `waiting` while
+/// named but not yet confirmed.
+fn responder(resp: &AdminPeersResponse, name: &str) -> &'static str {
+    match (resp.reflexive_responder.as_deref() == Some(name), resp.reflexive_answering) {
+        (true, true) => "answering",
+        (true, false) => "waiting for its agent",
+        (false, _) => "-",
+    }
+}
+
 /// `offering` for a node that runs `exit on`, `yes` for a device whose
 /// last export has the full-tunnel profile (PLAN.md M27).
 fn exit(resp: &AdminPeersResponse, name: &str) -> &'static str {
@@ -315,6 +326,7 @@ pub fn node(resp: &AdminPeersResponse, p: &PeerInfo, now: DateTime<Utc>) -> Stri
         ("dialable", dialable.into()),
         ("transit", transit(resp, &p.name).into()),
         ("exit", exit(resp, &p.name).into()),
+        ("probe responder", responder(resp, &p.name).into()),
         ("tags", node_tags(resp, &p.name)),
         ("config", if stale(resp, &p.name) { "stale, run `device refresh`".into() } else { "-".into() }),
         ("holds", holds),

@@ -7,9 +7,26 @@
 | 443/tcp | inbound | every agent | your reverse proxy, terminating TLS |
 | 47820/tcp | none | the proxy only | plain HTTP, must not be reachable from an untrusted network |
 | 47821/tcp | none | nobody | admin listener, loopback only; the coordinator refuses to start if it is not |
+| 47820/udp | inbound, optional | every agent, once per start | the reflexive responder: tells a node its NAT-mapped address; forwarded directly, not through the proxy |
 
-The coordinator is not a WireGuard peer and needs no UDP port, no
-`NET_ADMIN`, and no access to `/dev/net/tun`. Admin commands run inside the
+The coordinator is not a WireGuard peer and needs no `NET_ADMIN` and no
+access to `/dev/net/tun`.
+
+**Networks that let UDP out only to the WireGuard port.** Hotel and office
+Wi-Fi often block 47820/udp, so a node there never hears the responder. If
+the coordinator's host is also a mesh node, let that node answer the probe
+on its own WireGuard port instead:
+
+```sh
+wireserve-admin node responder <node-on-the-coordinator-host>
+```
+
+Its agent takes the probe off the WireGuard port with the same tproxy rule
+the phone relay uses, and nodes are told to probe it as soon as its agent
+confirms (`node show` says `answering`). The coordinator's own 47820/udp
+keeps answering too, as a fallback. Name only the node at the address the
+coordinator's name resolves to: anywhere else, the probes never reach it.
+`node responder --clear` stops it. Admin commands run inside the
 host or container (`podman exec <container> wireserve-admin ...`), because
 the admin port is deliberately unreachable from anywhere else.
 

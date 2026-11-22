@@ -24,6 +24,10 @@ use crate::state::AppState;
 /// comment for why no separate port exists). This is how an agent learns
 /// where to send its one-shot reflexive-address probe without a new CLI
 /// flag or config value of its own.
+///
+/// `reflexive_ports` (PLAN.md M50) lists first the WireGuard port of the node
+/// an admin named to answer there, while its own polls confirm it does, then
+/// this responder's. Nothing is listed but this responder's port otherwise.
 pub async fn probe(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -35,9 +39,24 @@ pub async fn probe(
         peer_addr.ip(),
         state.config.trusts_forwarded_from(peer_addr.ip()),
     );
+    let own = state.config.listen_addr.port();
     Json(wireserve_types::ProbeResponse {
         addr: client.ip.to_string(),
-        reflexive_port: state.config.listen_addr.port(),
+        reflexive_port: own,
         answers_twice: state.probe_udp.is_some(),
+        reflexive_ports: reflexive_ports(&state, own),
     })
+}
+
+/// The ports `/probe` lists (PLAN.md M50): a confirmed WireGuard port first,
+/// then `own`. Just `own` while none is confirmed — the list is then the same
+/// as `reflexive_port`, and left out.
+fn reflexive_ports(state: &AppState, own: u16) -> Vec<u16> {
+    let mut ports = state.transit.reflexive_answering_ports(state.config.online_threshold_secs);
+    if ports.is_empty() {
+        return Vec::new();
+    }
+    ports.retain(|p| *p != own);
+    ports.push(own);
+    ports
 }

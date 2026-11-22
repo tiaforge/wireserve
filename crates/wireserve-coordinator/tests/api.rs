@@ -4796,3 +4796,95 @@ async fn reach_answers_what_the_asking_node_gets_at_each_service_and_only_to_a_n
     let resp = app.router.clone().oneshot(json_request("GET", "/reach", None, json!({}))).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ---- PLAN.md M50: the reflexive probe answered on a node's WireGuard port ----
+
+async fn probe_json(router: &Router) -> Value {
+    let resp = router.clone().oneshot(raw_request("GET", "/probe", None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
+}
+
+async fn admin_send(router: &Router, method: &str, uri: &str) -> StatusCode {
+    let req = raw_request(method, uri, Some(&format!("Bearer {ADMIN}")));
+    router.clone().oneshot(req).await.unwrap().status()
+}
+
+fn reflexive_poll(caps: &[&str], answering: bool) -> Value {
+    json!({ "services": [], "capabilities": caps, "reflexive_answering": answering })
+}
+
+#[tokio::test]
+async fn the_named_node_is_asked_to_answer_and_listed_only_once_it_confirms() {
+    let app = test_app();
+    let t = admin_create_node(&app.router, "coord").await;
+    let coord = register_node(&app.router, &t, "coord", 51820).await["bearer_token"].as_str().unwrap().to_string();
+    let t = admin_create_node(&app.router, "other").await;
+    let other = register_node(&app.router, &t, "other", 51821).await["bearer_token"].as_str().unwrap().to_string();
+    let cap = [wireserve_types::CAP_REFLEXIVE];
+
+    // Nobody named: nobody asked, nothing listed.
+    let (_, body) = poll_raw(&app.router, &coord, reflexive_poll(&cap, false)).await;
+    assert!(body.get("answer_reflexive").is_none());
+    assert!(probe_json(&app.router).await.get("reflexive_ports").is_none());
+
+    assert_eq!(admin_send(&app.router, "PUT", "/admin/reflexive-responder/coord").await, StatusCode::OK);
+    // Asked, but not listed before its own poll says the answer is in place.
+    let (_, body) = poll_raw(&app.router, &coord, reflexive_poll(&cap, false)).await;
+    assert_eq!(body["answer_reflexive"], json!(true));
+    assert!(probe_json(&app.router).await.get("reflexive_ports").is_none());
+    // Another node is not asked, and its claim counts for nothing.
+    let (_, body) = poll_raw(&app.router, &other, reflexive_poll(&cap, true)).await;
+    assert!(body.get("answer_reflexive").is_none());
+    assert!(probe_json(&app.router).await.get("reflexive_ports").is_none());
+
+    // Confirmed: its WireGuard port first, then the coordinator's own.
+    poll_raw(&app.router, &coord, reflexive_poll(&cap, true)).await;
+    let probe = probe_json(&app.router).await;
+    assert_eq!(probe["reflexive_ports"][0], json!(51820));
+    assert_eq!(probe["reflexive_ports"].as_array().unwrap().last(), Some(&probe["reflexive_port"]));
+    let resp = app.router.clone().oneshot(raw_request("GET", "/admin/peers", Some(&format!("Bearer {ADMIN}")))).await.unwrap();
+    let peers = body_json(resp).await;
+    assert_eq!(peers["reflexive_responder"], json!("coord"));
+    assert_eq!(peers["reflexive_answering"], json!(true));
+
+    // The first poll that doesn't confirm takes it out again.
+    poll_raw(&app.router, &coord, reflexive_poll(&cap, false)).await;
+    assert!(probe_json(&app.router).await.get("reflexive_ports").is_none());
+
+    // Without the capability it is never asked, nor listed.
+    let (_, body) = poll_raw(&app.router, &coord, reflexive_poll(&[], true)).await;
+    assert!(body.get("answer_reflexive").is_none());
+    assert!(probe_json(&app.router).await.get("reflexive_ports").is_none());
+
+    // Naming another node, or none, stops advertising the first at once.
+    poll_raw(&app.router, &coord, reflexive_poll(&cap, true)).await;
+    assert!(probe_json(&app.router).await.get("reflexive_ports").is_some());
+    assert_eq!(admin_send(&app.router, "PUT", "/admin/reflexive-responder/other").await, StatusCode::OK);
+    assert!(probe_json(&app.router).await.get("reflexive_ports").is_none());
+    let (_, body) = poll_raw(&app.router, &coord, reflexive_poll(&cap, true)).await;
+    assert!(body.get("answer_reflexive").is_none(), "one node at a time");
+    assert!(probe_json(&app.router).await.get("reflexive_ports").is_none());
+    poll_raw(&app.router, &other, reflexive_poll(&cap, true)).await;
+    assert_eq!(probe_json(&app.router).await["reflexive_ports"][0], json!(51821));
+    assert_eq!(admin_send(&app.router, "DELETE", "/admin/reflexive-responder").await, StatusCode::OK);
+    assert!(probe_json(&app.router).await.get("reflexive_ports").is_none());
+    let (_, body) = poll_raw(&app.router, &other, reflexive_poll(&cap, true)).await;
+    assert!(body.get("answer_reflexive").is_none());
+}
+
+#[tokio::test]
+async fn a_responder_is_never_a_static_node_and_rejoin_withdraws_it() {
+    let app = test_app();
+    assert_eq!(admin_send(&app.router, "PUT", "/admin/reflexive-responder/nobody").await, StatusCode::NOT_FOUND);
+    let req = json_request("POST", "/admin/nodes", Some(ADMIN), json!({ "name": "phone", "kind": "static" }));
+    assert!(app.router.clone().oneshot(req).await.unwrap().status().is_success());
+    assert_eq!(admin_send(&app.router, "PUT", "/admin/reflexive-responder/phone").await, StatusCode::BAD_REQUEST);
+
+    let t = admin_create_node(&app.router, "coord").await;
+    register_node(&app.router, &t, "coord", 51820).await;
+    assert_eq!(admin_send(&app.router, "PUT", "/admin/reflexive-responder/coord").await, StatusCode::OK);
+    assert!(admin_post(&app.router, "/admin/nodes/coord/rejoin").await.is_success());
+    let resp = app.router.clone().oneshot(raw_request("GET", "/admin/peers", Some(&format!("Bearer {ADMIN}")))).await.unwrap();
+    assert!(body_json(resp).await.get("reflexive_responder").is_none(), "granted to the identity rejoin replaced");
+}

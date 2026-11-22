@@ -54,6 +54,10 @@ pub struct NodeRow {
     /// Its relay slot (PLAN.md M39): its relay port is the configured base
     /// plus this. `None` once every slot is taken.
     pub relay_slot: Option<u16>,
+    /// An admin named this node the one that answers reflexive probes on
+    /// its own WireGuard port (PLAN.md M50): the node on the coordinator's
+    /// host. At most one node has it; revoke and rejoin withdraw it.
+    pub reflexive_responder: bool,
 }
 
 #[cfg(test)]
@@ -83,6 +87,7 @@ impl NodeRow {
             created_at: None,
             exit_enabled: false,
             relay_slot: None,
+            reflexive_responder: false,
         }
     }
 }
@@ -113,6 +118,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
         created_at: row.get::<_, Option<String>>("created_at")?.and_then(|s| parse_sqlite_dt(&s)),
         exit_enabled: row.get("exit_enabled")?,
         relay_slot: row.get("relay_slot")?,
+        reflexive_responder: row.get("reflexive_responder")?,
     })
 }
 
@@ -387,7 +393,8 @@ pub fn revoke(conn: &Connection, node_id: i64) -> Result<(), DbError> {
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "UPDATE nodes SET revoked = 1, revoked_at = ?1, bearer_token_hash = NULL, \
-         join_token_hash = NULL, join_token_used = 1, transit_approved_at = NULL \
+         join_token_hash = NULL, join_token_used = 1, transit_approved_at = NULL, \
+         reflexive_responder = 0 \
          WHERE id = ?2",
         rusqlite::params![now_str(), node_id],
     )?;
@@ -435,7 +442,7 @@ pub fn reissue_join_token(
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "UPDATE nodes SET join_token_hash = ?1, join_token_used = 0, join_token_expires_at = ?2, \
-         bearer_token_hash = NULL, pubkey = NULL, transit_approved_at = NULL \
+         bearer_token_hash = NULL, pubkey = NULL, transit_approved_at = NULL, reflexive_responder = 0 \
          WHERE id = ?3",
         rusqlite::params![join_token_hash, join_token_expires_at, node_id],
     )
@@ -443,6 +450,25 @@ pub fn reissue_join_token(
     super::owners::forget(&tx, node_id)?;
     tx.commit()?;
     Ok(())
+}
+
+/// Makes `node_id` the one node that answers reflexive probes on its own
+/// WireGuard port (PLAN.md M50), taking it from any other in the same
+/// statement, or — with `None` — leaves no node doing it.
+pub fn set_reflexive_responder(conn: &Connection, node_id: Option<i64>) -> Result<(), DbError> {
+    conn.execute(
+        "UPDATE nodes SET reflexive_responder = (id IS ?1) WHERE reflexive_responder != (id IS ?1)",
+        [node_id],
+    )?;
+    Ok(())
+}
+
+/// The node that answers reflexive probes on its WireGuard port (PLAN.md
+/// M50), if an admin named one.
+pub fn reflexive_responder(conn: &Connection) -> Result<Option<NodeRow>, DbError> {
+    Ok(conn
+        .query_row("SELECT * FROM nodes WHERE reflexive_responder = 1 ORDER BY id LIMIT 1", [], map_row)
+        .optional()?)
 }
 
 /// Grants (`true`) or withdraws (`false`) a node's approval to carry

@@ -130,6 +130,12 @@ pub struct TransitSelfReport {
     /// Whether this agent can relay phones on its WireGuard port (PLAN.md
     /// M49): a daemon on Linux, with the sorter to do it.
     pub phone_relay: bool,
+    /// Whether this agent can answer reflexive probes on its WireGuard port
+    /// (PLAN.md M50): a daemon on Linux, like the phone relay.
+    pub reflexive: bool,
+    /// Whether it does right now: asked to, running, and the firewall rule
+    /// in place as of the last apply (PLAN.md #351).
+    pub reflexive_answering: bool,
     /// Where the peers in `reachable` send from — see
     /// [`observed_endpoints`].
     pub observed: Vec<wireserve_types::ObservedEndpoint>,
@@ -159,6 +165,12 @@ fn observed_endpoints(
 fn phone_relay_ports(base: u16) -> Option<(u16, u16)> {
     let divert = base.checked_add(wireserve_types::RELAY_SLOTS)?;
     Some((divert, divert.checked_add(1)?))
+}
+
+/// The reflexive responder's transparent socket (PLAN.md M50): the port
+/// after the phone relay's two.
+fn reflexive_divert_port(base: u16) -> Option<u16> {
+    base.checked_add(wireserve_types::RELAY_SLOTS)?.checked_add(2)
 }
 
 /// What the phone relay is told this cycle (PLAN.md M49), from
@@ -202,10 +214,47 @@ fn phone_relay_config(
 pub struct PhoneRelayHandle {
     pub relay: crate::phone_relay::io::PhoneRelay,
     pub divert: std::sync::Arc<dyn crate::phone_relay::io::Divert>,
+    /// The reflexive probe answered on the same WireGuard port (PLAN.md
+    /// M50), which the same tproxy machinery hands over.
+    pub reflexive: crate::reflexive_responder::Responder,
 }
 
 #[cfg(not(target_os = "linux"))]
 pub struct PhoneRelayHandle;
+
+/// Whether this agent can answer reflexive probes on its WireGuard port
+/// (PLAN.md M50): a daemon on Linux, which has the tproxy machinery.
+#[cfg(target_os = "linux")]
+fn reflexive_capable(handle: Option<&PhoneRelayHandle>) -> bool {
+    handle.is_some()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reflexive_capable(_handle: Option<&PhoneRelayHandle>) -> bool {
+    false
+}
+
+/// Whether it answers them right now, as of the last firewall apply.
+#[cfg(target_os = "linux")]
+fn reflexive_answering(handle: Option<&PhoneRelayHandle>) -> bool {
+    handle.is_some_and(|h| h.reflexive.confirmed())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reflexive_answering(_handle: Option<&PhoneRelayHandle>) -> bool {
+    false
+}
+
+/// Records whether the ruleset just applied hands probes to the responder.
+#[cfg(target_os = "linux")]
+fn note_reflexive_applied(handle: Option<&PhoneRelayHandle>, applied: bool) {
+    if let Some(h) = handle {
+        h.reflexive.set_confirmed(applied);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn note_reflexive_applied(_handle: Option<&PhoneRelayHandle>, _applied: bool) {}
 
 /// Builds the request body from currently-declared services — this is the
 /// node's own view of what it's serving, independent of anything the
@@ -246,10 +295,14 @@ pub fn build_poll_request(
             if transit.phone_relay {
                 caps.push(wireserve_types::CAP_PHONE_RELAY.to_string());
             }
+            if transit.reflexive {
+                caps.push(wireserve_types::CAP_REFLEXIVE.to_string());
+            }
             caps
         },
         carry_port: transit.carry_port,
         dialable_v4: transit.dialable_v4,
+        reflexive_answering: transit.reflexive_answering,
         tls_ready: {
             let mut ready = tls.ready;
             ready.truncate(wireserve_types::MAX_TLS_READY_PER_POLL);
@@ -801,6 +854,8 @@ where
             carry_port: ctx.wg.carry_port(),
             dialable_v4: ctx.own_dialable_v4,
             phone_relay: ctx.phone_relay.is_some(),
+            reflexive: reflexive_capable(ctx.phone_relay),
+            reflexive_answering: reflexive_answering(ctx.phone_relay),
             observed: transit_observed,
         },
         tls_report,
@@ -971,6 +1026,26 @@ where
     });
     #[cfg(not(target_os = "linux"))]
     let phone_relay: Option<wireserve_types::PhoneRelayRules> = None;
+    // Reflexive probes answered on this node's WireGuard port (PLAN.md M50):
+    // only while the coordinator asks, which it does of the one node an
+    // admin named.
+    #[cfg(target_os = "linux")]
+    let reflexive = ctx.phone_relay.and_then(|handle| {
+        let config = directory
+            .answer_reflexive
+            .then(|| directory.relay_port_base.and_then(reflexive_divert_port))
+            .flatten()
+            .map(|divert_port| crate::reflexive_responder::Config { listen_port, divert_port });
+        if let Err(e) = handle.reflexive.configure(config) {
+            tracing::warn!(error = %e, "could not open the reflexive responder's sockets; probes on the WireGuard port go unanswered");
+        }
+        config.filter(|_| handle.reflexive.is_running()).map(|c| wireserve_types::ReflexiveRules {
+            listen_port: c.listen_port,
+            divert_port: c.divert_port,
+        })
+    });
+    #[cfg(not(target_os = "linux"))]
+    let reflexive: Option<wireserve_types::ReflexiveRules> = None;
     // The devices this node is the exit for (PLAN.md M27). Only while this
     // node itself opted in — the coordinator's list is the device side of
     // the consent, never the whole of it — and only with a pinned mesh
@@ -1059,6 +1134,7 @@ where
             // A phone relayed to this node arrives at its own WireGuard port.
             relay_ends: carry_port.into_iter().chain(std::iter::once(listen_port)).collect(),
             phone_relay,
+            reflexive,
             guarded: plan.guard.iter().cloned().collect(),
             exit: exit.clone(),
             mesh_v4: mesh_ranges.as_ref().map(wireserve_types::MeshRanges::v4),
@@ -1075,9 +1151,13 @@ where
         let owned_now = match ctx.firewall.apply(&rules, &forwarding) {
             Ok(()) => {
                 crate::firewall::ip_forward::take_egress(&plan.take);
+                note_reflexive_applied(ctx.phone_relay, forwarding.reflexive.is_some());
                 plan.guard
             }
             Err(e) => {
+                // Whatever the previous ruleset held, this cycle can't
+                // vouch for it.
+                note_reflexive_applied(ctx.phone_relay, false);
                 failures.push(PollError::Firewall(e.to_string()));
                 // The previous ruleset is still in place, guarding what
                 // was owned; nothing new was turned on.
@@ -1209,6 +1289,8 @@ mod tests {
                 carry_port: None,
                 dialable_v4: None,
                 phone_relay: false,
+                reflexive: false,
+                reflexive_answering: false,
                 observed: vec![wireserve_types::ObservedEndpoint { pubkey: "reachable-pk".into(), addr: "198.51.100.9:61000".into() }],
             },
             TlsSelfReport::default(),
@@ -1419,7 +1501,7 @@ mod tests {
             &crate::probe::DualProbeResult::default(),
             None,
             None,
-            TransitSelfReport { capable: false, exit_capable: false, reachable: vec![], wanted: vec![], carry_port: None, dialable_v4: None, phone_relay: false, observed: vec![] },
+            TransitSelfReport { capable: false, exit_capable: false, reachable: vec![], wanted: vec![], carry_port: None, dialable_v4: None, phone_relay: false, reflexive: false, reflexive_answering: false, observed: vec![] },
             TlsSelfReport::default(),
         );
         assert!(req.capabilities.is_empty(), "no terminator, nothing to claim");
@@ -1431,7 +1513,7 @@ mod tests {
             &crate::probe::DualProbeResult::default(),
             None,
             None,
-            TransitSelfReport { capable: false, exit_capable: false, reachable: vec![], wanted: vec![], carry_port: None, dialable_v4: None, phone_relay: false, observed: vec![] },
+            TransitSelfReport { capable: false, exit_capable: false, reachable: vec![], wanted: vec![], carry_port: None, dialable_v4: None, phone_relay: false, reflexive: false, reflexive_answering: false, observed: vec![] },
             TlsSelfReport { capable: true, ready: vec!["plex".into()] },
         );
         assert!(req.capabilities.contains(&wireserve_types::CAP_TLS_TERMINATE.to_string()));
@@ -1618,6 +1700,7 @@ mod tests {
             relay_public: vec![],
             relay_port_base: None,
             relay_devices: vec![],
+            answer_reflexive: false,
             transit_awaiting_approval: false,
             exit_clients: vec![],
             mesh: None,

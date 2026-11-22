@@ -6,6 +6,7 @@ pub mod mesh;
 pub mod naming;
 pub mod node;
 pub mod ports;
+pub mod rate_limit;
 pub mod reflexive;
 pub mod session;
 pub mod term;
@@ -28,7 +29,7 @@ pub use naming::{
     HTTP_PUBLIC_PORT, LETS_ENCRYPT_DIRECTORY, TLS_LISTEN_PORT, TLS_PUBLIC_PORT,
 };
 pub use firewall::{
-    is_internet_v4, FirewallBackend, Forwarding, PhoneRelayRules, RelayEnd, RelayForward, ServiceRule, Sources,
+    is_internet_v4, FirewallBackend, Forwarding, PhoneRelayRules, ReflexiveRules, RelayEnd, RelayForward, ServiceRule, Sources,
     NOT_THE_INTERNET_V4,
 };
 pub use node::{NodeKind, Proto};
