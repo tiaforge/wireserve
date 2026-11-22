@@ -199,6 +199,7 @@ mod tests {
             created_at: None,
             exit_enabled: false,
             relay_slot: None,
+            reflexive_responder: false,
         }
     }
 

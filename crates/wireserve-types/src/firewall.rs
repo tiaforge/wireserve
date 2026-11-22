@@ -64,6 +64,16 @@ pub struct PhoneRelayRules {
     pub indexes: Vec<u32>,
 }
 
+/// Reflexive probes this node answers on its own WireGuard port (PLAN.md
+/// M50): what the firewall hands the agent's responder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReflexiveRules {
+    /// This node's WireGuard listen port, which the probes are sent to.
+    pub listen_port: u16,
+    /// Where they go: the responder's transparent socket.
+    pub divert_port: u16,
+}
+
 /// A pair whose end-to-end session this node relays (PLAN.md M39): UDP
 /// arriving on this node's mesh address at one side's relay port goes on
 /// to that side's carry interface, appearing to come from the other
@@ -115,6 +125,9 @@ pub struct Forwarding {
     /// Phones this node relays on its own WireGuard port (PLAN.md M49).
     /// Needs `relay_self`.
     pub phone_relay: Option<PhoneRelayRules>,
+    /// Reflexive probes this node answers on its WireGuard port (PLAN.md
+    /// M50).
+    pub reflexive: Option<ReflexiveRules>,
     /// Interfaces whose IPv4 forwarding this agent turned on so replies
     /// from a service's target address can reach the mesh (PLAN.md M26).
     /// Nothing else may be forwarded from them: before the agent turned

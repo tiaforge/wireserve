@@ -182,6 +182,29 @@ pub struct ProbeResponse {
     /// reaches it. Absent from an older coordinator, which never does.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub answers_twice: bool,
+    /// Every UDP port a reflexive probe may go to on this address, most
+    /// preferred first (PLAN.md M50): the WireGuard port of the node on the
+    /// coordinator's host while it confirms it answers there, then
+    /// `reflexive_port`. A node probes them all at once from one socket.
+    /// Absent from an older coordinator: `reflexive_port` alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reflexive_ports: Vec<u16>,
+}
+
+impl ProbeResponse {
+    /// The ports to probe, most preferred first: `reflexive_ports`, or
+    /// `reflexive_port` alone from a coordinator that sends no list. Each
+    /// port once, and never port 0.
+    #[must_use]
+    pub fn probe_ports(&self) -> Vec<u16> {
+        let mut out: Vec<u16> = Vec::new();
+        for p in self.reflexive_ports.iter().copied().chain(std::iter::once(self.reflexive_port)) {
+            if p != 0 && !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        out
+    }
 }
 
 // ---- §4.2 Node: register ----
@@ -326,10 +349,16 @@ pub const CAP_RELAY: &str = "relay";
 /// that says so: an older one served each node on a port of its own.
 pub const CAP_PHONE_RELAY: &str = "phone-relay";
 
+/// `reflexive` (PLAN.md M50): this agent can answer reflexive probes on its
+/// own WireGuard port, taking them off the port by tproxy as the phone
+/// relay does. Only a node that says so is ever asked to.
+pub const CAP_REFLEXIVE: &str = "reflexive";
+
 /// How many relay slots a mesh has (PLAN.md M39): a node's relay port is
 /// the coordinator's base plus its slot, so the ports run from the base to
 /// the base plus this, less one. A carrier's sorter for phones listens on
-/// the two ports right after them (PLAN.md M49).
+/// the two ports right after them (PLAN.md M49), and the reflexive
+/// responder on the one after those (PLAN.md M50).
 pub const RELAY_SLOTS: u16 = 1000;
 
 /// The default first relay port (`WIRESERVE_RELAY_PORT_BASE`).
@@ -460,6 +489,13 @@ pub struct PollRequest {
     /// where inbound traffic is let in. `None` when it could not be tested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialable_v4: Option<bool>,
+    /// This node answers reflexive probes on its own WireGuard port right
+    /// now (PLAN.md M50): it was asked to (`PollResponse::answer_reflexive`),
+    /// its responder is running and the firewall rule that hands it the
+    /// probes was applied. The coordinator lists that port in `/probe` only
+    /// while this is fresh. Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reflexive_answering: bool,
 }
 
 /// One peer's WireGuard source address, as another node sees it
@@ -664,6 +700,11 @@ pub struct PollResponse {
     /// address that device was last seen at.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relay_devices: Vec<String>,
+    /// THIS node answers reflexive probes on its own WireGuard port (PLAN.md
+    /// M50): an admin named it the one on the coordinator's host, and it
+    /// said `reflexive`. Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub answer_reflexive: bool,
     /// The first relay port (`WIRESERVE_RELAY_PORT_BASE`): relay ports run
     /// from it for [`RELAY_SLOTS`], and a carrier's sorter for phones
     /// listens on the two ports after those (PLAN.md M49).
@@ -910,6 +951,14 @@ pub struct AdminPeersResponse {
     /// anything is created rather than after.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transit_offering: Vec<String>,
+    /// The node an admin named to answer reflexive probes on its own
+    /// WireGuard port (PLAN.md M50), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflexive_responder: Option<String>,
+    /// Whether that node's last poll confirmed it answers there, so `/probe`
+    /// lists its port.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reflexive_answering: bool,
     /// Whether each agent found itself dialable from outside at its last
     /// start (PLAN.md M40), by name; agents that couldn't tell are left out.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -1072,6 +1121,7 @@ mod tests {
             relay_public: vec![],
             relay_port_base: None,
             relay_devices: vec![],
+            answer_reflexive: false,
             transit_awaiting_approval: false,
             exit_clients: vec![],
             mesh: None,
@@ -1129,6 +1179,7 @@ mod tests {
             relay_public: vec![],
             relay_port_base: None,
             relay_devices: vec![],
+            answer_reflexive: false,
             transit_awaiting_approval: false,
             exit_clients: vec![],
             mesh: None,

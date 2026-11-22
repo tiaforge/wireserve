@@ -149,6 +149,18 @@ enum NodeAction {
         #[arg(long, value_parser = ["v4", "v6"])]
         family: Option<String>,
     },
+    /// Answer reflexive probes on this node's WireGuard port
+    // PLAN.md M50: for the node on the coordinator's own host, so nodes on
+    // networks that let UDP out only to the WireGuard port still learn their
+    // NAT-mapped address. One node at a time; naming one replaces the last.
+    Responder {
+        /// The node's name: the one on the coordinator's host
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        name: Option<String>,
+        /// No node answers any more; the coordinator's own port still does
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -714,6 +726,24 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 println!("no nodes yet: add one with `node create <name>`");
             } else {
                 print!("{}", wireserve_admin::listing::nodes(&resp, chrono::Utc::now()));
+            }
+        }
+        Command::Node { action: NodeAction::Responder { name, clear } } => {
+            let client = build_client(&coordinator_url, &admin_token)?;
+            match name.filter(|_| !clear) {
+                Some(name) => {
+                    check_name(&name)?;
+                    wireserve_admin::cmd_set_reflexive_responder(&client, &name)?;
+                    println!("node '{name}' answers reflexive probes on its WireGuard port");
+                    println!(
+                        "  from its next poll, if its agent can; nodes are told to probe it once it confirms. \
+                         It must be on the host the coordinator's address points at"
+                    );
+                }
+                None => {
+                    wireserve_admin::cmd_clear_reflexive_responder(&client)?;
+                    println!("no node answers reflexive probes on its WireGuard port any more");
+                }
             }
         }
         Command::Node { action: NodeAction::Show { name } } => {

@@ -121,18 +121,83 @@ pub async fn learn_waiting(coordinator_url: &str, listen_port: u16, timeout: Dur
     }
 }
 
-/// How long to wait for the coordinator's second answer once the first came:
-/// both are sent together, so anything later is lost, not late.
+/// How long to wait for the coordinator's second answer, and for the other
+/// ports' answers, once the first came: all are sent together, so anything
+/// later is lost, not late.
 const SECOND_ANSWER_WAIT: Duration = Duration::from_millis(800);
+
+/// One valid answer, matched to the request by its nonce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// From the port probed at this index of the list (most preferred
+    /// first), with the address it saw.
+    Probed(usize, std::net::SocketAddrV4),
+    /// From the coordinator's address on a port this node never probed: its
+    /// second answer (PLAN.md M40), which only arrives where unsolicited
+    /// traffic is let in.
+    Second(std::net::SocketAddrV4),
+}
+
+/// What an answer from `src` is, given the `targets` probed (PLAN.md M50,
+/// #353). Only the coordinator's own address on an unprobed port counts as
+/// its second answer: the node that answers on its WireGuard port is at the
+/// same address, but on a port this node sent to.
+fn classify(src: std::net::SocketAddr, targets: &[std::net::SocketAddr], observed: std::net::SocketAddrV4) -> Option<Answer> {
+    if let Some(i) = targets.iter().position(|t| *t == src) {
+        return Some(Answer::Probed(i, observed));
+    }
+    targets.iter().any(|t| t.ip() == src.ip()).then_some(Answer::Second(observed))
+}
+
+/// What a set of answers says (PLAN.md M50). The address: the most preferred
+/// port's answer, else the second answer's. `dialable`: unknown from a
+/// coordinator that answers once, or when its own port (`own`, the index of
+/// `reflexive_port` in the list) never answered — then it never got the
+/// request and so sent no second answer; otherwise whether the second came.
+fn conclude(answers: &[Answer], answers_twice: bool, own: Option<usize>) -> Learned {
+    let probed = answers.iter().filter_map(|a| match a {
+        Answer::Probed(i, o) => Some((*i, *o)),
+        Answer::Second(_) => None,
+    });
+    let best = probed.clone().min_by_key(|(i, _)| *i).map(|(_, o)| o);
+    if let Some(best) = best {
+        if let Some(other) = probed.clone().map(|(_, o)| o).find(|o| *o != best) {
+            tracing::debug!(%best, %other, "the reflexive probe's answers disagree: a NAT that maps each destination port apart");
+        }
+    }
+    let second = answers.iter().find_map(|a| match a {
+        Answer::Second(o) => Some(*o),
+        Answer::Probed(..) => None,
+    });
+    let own_answered = own.is_some_and(|own| probed.clone().any(|(i, _)| i == own));
+    let dialable = if !answers_twice {
+        None
+    } else if second.is_some() {
+        Some(true)
+    } else if own_answered {
+        Some(false)
+    } else {
+        None
+    };
+    Learned { addr: best.or(second).map(|o| o.to_string()), dialable }
+}
 
 async fn try_learn(coordinator_url: &str, listen_port: u16, timeout: Duration) -> Result<Learned, ReflexiveProbeError> {
     // IPv4 only (PLAN.md decisions log #90+) — the wire protocol itself
     // is IPv4-only. A node with working IPv6 calls in too (#207).
     let probe_resp = crate::probe::fetch_probe_response(coordinator_url, crate::probe::Family::V4, timeout).await?;
-    let reflexive_port = probe_resp.reflexive_port;
     let answers_twice = probe_resp.answers_twice;
+    // Every port the coordinator lists, most preferred first (PLAN.md M50):
+    // the WireGuard port of the node on its host, while that node answers
+    // there, then its own.
+    let ports = probe_resp.probe_ports();
+    let own = ports.iter().position(|p| *p == probe_resp.reflexive_port);
     let (_, coordinator_addr) = crate::probe::resolve_family(coordinator_url, crate::probe::Family::V4).await?;
-    let target = std::net::SocketAddr::new(coordinator_addr.ip(), reflexive_port);
+    let targets: Vec<std::net::SocketAddr> =
+        ports.iter().map(|p| std::net::SocketAddr::new(coordinator_addr.ip(), *p)).collect();
+    if targets.is_empty() {
+        return Err(ReflexiveProbeError::NoResponse);
+    }
 
     // The exact port `bring_up` is about to claim — see module doc.
     let socket = tokio::net::UdpSocket::bind(("0.0.0.0", listen_port))
@@ -143,9 +208,13 @@ async fn try_learn(coordinator_url: &str, listen_port: u16, timeout: Duration) -
     let request = build_request(nonce);
     let mut buf = [0u8; RESPONSE_LEN];
     let per_attempt_timeout = timeout / PROBE_ATTEMPTS;
+    let mut answers: Vec<Answer> = Vec::new();
 
     for _ in 0..PROBE_ATTEMPTS {
-        socket.send_to(&request, target).await.map_err(ReflexiveProbeError::Io)?;
+        // The same request, one nonce, to every port at once.
+        for target in &targets {
+            socket.send_to(&request, target).await.map_err(ReflexiveProbeError::Io)?;
+        }
         let Ok(recv) = tokio::time::timeout(per_attempt_timeout, socket.recv_from(&mut buf)).await else {
             continue; // this attempt timed out — retry
         };
@@ -153,32 +222,34 @@ async fn try_learn(coordinator_url: &str, listen_port: u16, timeout: Duration) -
         // Anything malformed, or a stray reply answering a different
         // request than the one just sent, is ignored rather than
         // trusted — retry instead.
-        let Some((echoed_nonce, observed)) = parse_response(&buf[..n]) else {
+        let Some(answer) = parse_response(&buf[..n])
+            .filter(|(echoed, _)| *echoed == nonce)
+            .and_then(|(_, observed)| classify(src, &targets, observed))
+        else {
             continue;
         };
-        if echoed_nonce != nonce {
-            continue;
-        }
-        // The answer from the port this node sent to came first, or the
-        // second one did (its own NAT or firewall passed it before the
-        // first arrived). Either way: whether the one from the other port
-        // arrives is the question.
-        let mut from_other_port = src != target;
-        let dialable = if !answers_twice {
-            None
-        } else {
-            let deadline = tokio::time::Instant::now() + SECOND_ANSWER_WAIT;
-            while !from_other_port {
-                let Ok(Ok((n, src))) = tokio::time::timeout_at(deadline, socket.recv_from(&mut buf)).await else {
-                    break;
-                };
-                if src.ip() == target.ip() && src != target && parse_response(&buf[..n]).is_some_and(|(e, _)| e == nonce) {
-                    from_other_port = true;
+        answers.push(answer);
+        // The first came: whatever else is coming comes within moments.
+        let deadline = tokio::time::Instant::now() + SECOND_ANSWER_WAIT;
+        let done = |answers: &[Answer]| {
+            let all_probed = (0..targets.len()).all(|i| answers.iter().any(|a| matches!(a, Answer::Probed(j, _) if *j == i)));
+            let second = !answers_twice || answers.iter().any(|a| matches!(a, Answer::Second(_)));
+            all_probed && second
+        };
+        while !done(&answers) {
+            let Ok(Ok((n, src))) = tokio::time::timeout_at(deadline, socket.recv_from(&mut buf)).await else {
+                break;
+            };
+            if let Some(answer) = parse_response(&buf[..n])
+                .filter(|(echoed, _)| *echoed == nonce)
+                .and_then(|(_, observed)| classify(src, &targets, observed))
+            {
+                if !answers.contains(&answer) {
+                    answers.push(answer);
                 }
             }
-            Some(from_other_port)
-        };
-        return Ok(Learned { addr: Some(observed.to_string()), dialable });
+        }
+        return Ok(conclude(&answers, answers_twice, own));
     }
     Err(ReflexiveProbeError::NoResponse)
 }
@@ -276,5 +347,90 @@ mod tests {
         let coordinator_url = format!("http://{http_addr}");
         let addr = learn_reflexive_addr(&coordinator_url, 0, Duration::from_millis(300)).await;
         assert!(addr.is_none());
+    }
+
+    fn v4(s: &str) -> std::net::SocketAddrV4 {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn only_the_coordinators_unprobed_port_is_its_second_answer() {
+        let targets: Vec<std::net::SocketAddr> = vec!["192.0.2.1:51820".parse().unwrap(), "192.0.2.1:47820".parse().unwrap()];
+        let o = v4("198.51.100.7:40000");
+        assert_eq!(classify("192.0.2.1:51820".parse().unwrap(), &targets, o), Some(Answer::Probed(0, o)));
+        assert_eq!(classify("192.0.2.1:47820".parse().unwrap(), &targets, o), Some(Answer::Probed(1, o)));
+        assert_eq!(classify("192.0.2.1:33333".parse().unwrap(), &targets, o), Some(Answer::Second(o)));
+        assert_eq!(classify("203.0.113.9:51820".parse().unwrap(), &targets, o), None, "someone else's answer");
+    }
+
+    #[test]
+    fn the_wireguard_ports_answer_alone_never_makes_a_node_dialable() {
+        let wg = Answer::Probed(0, v4("198.51.100.7:40000"));
+        let own = Answer::Probed(1, v4("198.51.100.7:40000"));
+        // The coordinator's own port blocked: it never got the request, so
+        // its silence says nothing.
+        assert_eq!(conclude(&[wg], true, Some(1)), Learned { addr: Some("198.51.100.7:40000".into()), dialable: None });
+        // Its own port answered and the second never came: not dialable.
+        assert_eq!(conclude(&[wg, own], true, Some(1)).dialable, Some(false));
+        let second = Answer::Second(v4("198.51.100.7:40000"));
+        assert_eq!(conclude(&[own, second], true, Some(1)).dialable, Some(true));
+        assert_eq!(conclude(&[own], false, Some(1)).dialable, None, "a coordinator that answers once");
+    }
+
+    #[test]
+    fn the_most_preferred_ports_answer_is_the_address() {
+        let wg = Answer::Probed(0, v4("198.51.100.7:40000"));
+        let own = Answer::Probed(1, v4("198.51.100.7:40001"));
+        assert_eq!(conclude(&[own, wg], true, Some(1)).addr.as_deref(), Some("198.51.100.7:40000"));
+        let second = Answer::Second(v4("198.51.100.7:40002"));
+        assert_eq!(conclude(&[second], true, Some(1)).addr.as_deref(), Some("198.51.100.7:40002"), "the second alone still says where");
+        assert_eq!(conclude(&[], true, Some(1)), Learned::default());
+    }
+
+    /// A fake coordinator listing two ports, of which only `answering` answers.
+    async fn fake_two_port_coordinator(answering: usize) -> String {
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ports = [a.local_addr().unwrap().port(), b.local_addr().unwrap().port()];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_addr = listener.local_addr().unwrap();
+        let body = format!(r#"{{"addr":"127.0.0.1","reflexive_port":{},"reflexive_ports":[{},{}]}}"#, ports[1], ports[0], ports[1]);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        let udp = if answering == 0 { a } else { b };
+        tokio::spawn(async move {
+            let mut buf = [0u8; REQUEST_LEN];
+            loop {
+                let Ok((n, src)) = udp.recv_from(&mut buf).await else { return };
+                let Some(nonce) = parse_request(&buf[..n]) else { continue };
+                let std::net::SocketAddr::V4(src_v4) = src else { continue };
+                let _ = udp.send_to(&wireserve_types::reflexive::build_response(nonce, src_v4), src).await;
+            }
+        });
+        format!("http://{http_addr}")
+    }
+
+    #[tokio::test]
+    async fn learns_the_address_from_whichever_listed_port_answers() {
+        for answering in [0, 1] {
+            let url = fake_two_port_coordinator(answering).await;
+            let learned = learn(&url, 0, Duration::from_secs(2)).await;
+            assert!(learned.addr.is_some_and(|a| a.starts_with("127.0.0.1:")), "port {answering}");
+        }
     }
 }

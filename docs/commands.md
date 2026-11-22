@@ -39,6 +39,7 @@ anywhere that can reach it):
 | `wireserve-admin node rejoin <name>` | fresh join token, same name and address; the old key stops working at once |
 | `wireserve-admin node delete <name>` | remove the record, free the name |
 | `wireserve-admin node clear-endpoint <name>` | drop a stale advertised endpoint |
+| `wireserve-admin node responder <name>\|--clear` | let the node on the coordinator's host answer reflexive probes on its WireGuard port, for nodes on networks that allow only that port |
 | `wireserve-admin service list [--pending]` | declared services and their approval state |
 | `wireserve-admin service approve <svc> --node <node>` | let a declaration reach the mesh |
 | `wireserve-admin group create\|delete\|list` | service groups; a service in none is in `default` |

@@ -14,7 +14,7 @@ use nftables::expr::{
 use nftables::schema::{Chain, NfCmd, NfListObject, NfObject, Nftables, Rule, Table};
 use nftables::stmt::{Accept, Drop, JumpTarget, Limit, Mangle, Match, NATFamily, Operator, Reject, RejectType, Statement, TProxy, NAT};
 use nftables::types::{NfChainPolicy, NfChainType, NfFamily, NfHook};
-use wireserve_types::{FirewallBackend, Forwarding, PhoneRelayRules, PortMap, Proto, RelayForward, ServiceRule, Sources};
+use wireserve_types::{FirewallBackend, Forwarding, PhoneRelayRules, PortMap, ReflexiveRules, Proto, RelayForward, ServiceRule, Sources};
 
 use super::nft::{Nft, NftError};
 
@@ -36,6 +36,7 @@ const RELAY_PRE_CHAIN: &str = "relay-pre";
 const RELAY_POST_CHAIN: &str = "relay-post";
 const PHONE_PRE_CHAIN: &str = "phone-pre";
 const PHONE_IDX_CHAIN: &str = "phone-idx";
+const REFLEXIVE_PRE_CHAIN: &str = "reflexive-pre";
 
 /// Before conntrack (-200): the rewrite must happen before a connection
 /// is ever tracked, so that the tracked connection is the rewritten one.
@@ -668,6 +669,41 @@ fn phone_relay_rules(t: &str, not_mesh: Vec<Statement<'static>>, rules: &PhoneRe
     objects
 }
 
+/// Reflexive probes answered on this node's own WireGuard port (PLAN.md
+/// #347, #348): a UDP datagram of exactly a probe's size (`udp length`, the
+/// eight-byte header included) to this host's own address at that port,
+/// from anywhere but the mesh, whose payload starts with the probe's magic,
+/// goes to the agent's responder. A WireGuard message starts with its type
+/// (1 to 4) and three zero bytes, so none is ever taken. tproxy decides per
+/// packet and rewrites nothing; NAT (`redirect`) would have bound the whole
+/// flow — the prober's WireGuard packets from the same port among it — to
+/// the responder for as long as WireGuard kept retrying. Rate-limited
+/// overall: past the limit the kernel's WireGuard gets the probe, and drops
+/// it.
+fn reflexive_rules(t: &str, not_mesh: Vec<Statement<'static>>, rules: &ReflexiveRules) -> Vec<NfObject<'static>> {
+    let mut expr = not_mesh;
+    expr.extend([
+        is(meta(MetaKey::Nfproto), Expression::String("ipv4".into())),
+        dport_is(Proto::Udp, rules.listen_port),
+        is(
+            Expression::Named(NamedExpression::Fib(Fib {
+                result: FibResult::Type,
+                flags: std::iter::once(FibFlag::Daddr).collect(),
+            })),
+            Expression::String("local".into()),
+        ),
+        is(
+            payload("udp", "length"),
+            Expression::Number(u32::try_from(8 + wireserve_types::reflexive::REQUEST_LEN).expect("a probe's size fits")),
+        ),
+        is(raw_th(64, 32), Expression::Number(u32::from_be_bytes(wireserve_types::reflexive::MAGIC))),
+        Statement::Limit(Limit { rate: 200, rate_unit: None, per: Some("second".into()), burst: Some(400), burst_unit: None, inv: None }),
+        tproxy_to(rules.divert_port),
+        Statement::Accept(None::<Accept>),
+    ]);
+    vec![chain(t, REFLEXIVE_PRE_CHAIN, NfChainType::Filter, NfHook::Prerouting, PRIO_MANGLE), rule(t, REFLEXIVE_PRE_CHAIN, expr)]
+}
+
 /// A mapping onto another address (PLAN.md M26) leaves the node for that
 /// address with the node's own address as its source: whatever answers
 /// there — a router, a printer — has no route back into the mesh, and would
@@ -962,6 +998,9 @@ pub(crate) fn apply_batch_with(
     objects.extend(relay_nat);
     if let Some(phones) = phone_relay {
         objects.extend(phone_relay_rules(t, not_mesh(), phones));
+    }
+    if let Some(reflexive) = &forwarding.reflexive {
+        objects.extend(reflexive_rules(t, not_mesh(), reflexive));
     }
     if let Some(carry) = carry {
         objects.extend(carry_table(carry, &mapped, &terminated));
@@ -1859,6 +1898,40 @@ mod tests {
         }
         let guard = format!("iifname \"eth0\" meta nfproto ipv4 ct mark & 0x{:08x} == 0x00000000 drop", SERVICE_MARK | EXIT_MARK);
         assert!(lines.contains(&guard), "missing `{guard}` in:\n{listing}");
+    }
+
+    /// The reflexive probe's rule (PLAN.md M50) is accepted by a real
+    /// kernel, and takes exactly a probe's size and magic off the WireGuard
+    /// port.
+    #[test]
+    fn kernel_accepts_the_reflexive_probes_rule() {
+        let forwarding =
+            Forwarding { reflexive: Some(ReflexiveRules { listen_port: 51820, divert_port: 42002 }), ..Forwarding::default() };
+        let script = nft_script(&[apply_batch("wg0", &[], &forwarding)]) + "nft list table inet wireserve.wg0";
+        let Some(listing) = crate::firewall::netns::run(&script) else {
+            return;
+        };
+        let lines = normalised_lines(&listing);
+        let want = "iifname != \"wg0\" iifname != \"lo\" meta nfproto ipv4 udp dport 51820 udp length 72 \
+                    fib daddr type local @th,64,32 0x57535231 limit rate 200/second burst 400 packets tproxy ip to :42002 accept";
+        assert!(lines.iter().any(|l| l == want), "missing `{want}` in:\n{listing}");
+    }
+
+    #[test]
+    fn the_reflexive_chain_is_there_only_while_this_node_answers() {
+        let chains = |forwarding: &Forwarding| -> Vec<String> {
+            let batch = serde_json::to_value(apply_batch("wg0", &[], forwarding)).unwrap();
+            let mut out = Vec::new();
+            for item in batch["nftables"].as_array().unwrap() {
+                if let Some(name) = item.pointer("/add/chain/name").and_then(|n| n.as_str()) {
+                    out.push(name.to_string());
+                }
+            }
+            out
+        };
+        assert!(!chains(&Forwarding::default()).iter().any(|c| c == REFLEXIVE_PRE_CHAIN));
+        let on = Forwarding { reflexive: Some(ReflexiveRules { listen_port: 51820, divert_port: 42002 }), ..Forwarding::default() };
+        assert!(chains(&on).iter().any(|c| c == REFLEXIVE_PRE_CHAIN));
     }
 
     /// No phone rules without this node's mesh address (the sorter's socket

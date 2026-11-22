@@ -116,6 +116,8 @@ pub fn admin_router(state: AppState) -> Router {
             post(admin::approve_transit),
         )
         .route("/admin/nodes/{name}/transit/deny", post(admin::deny_transit))
+        .route("/admin/reflexive-responder", delete(admin::clear_reflexive_responder))
+        .route("/admin/reflexive-responder/{name}", axum::routing::put(admin::set_reflexive_responder))
         .route("/admin/nodes/{name}/export", axum::routing::put(admin::record_export))
         .route("/admin/relays/plan", post(admin::relay_plan))
         .route("/admin/peers", get(admin::list_peers))

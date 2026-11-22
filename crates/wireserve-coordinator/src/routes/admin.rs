@@ -1073,6 +1073,44 @@ pub async fn deny_transit(
     Ok(())
 }
 
+/// `PUT /admin/reflexive-responder/{name}` (PLAN.md M50) — makes this node
+/// the one that answers reflexive probes on its own WireGuard port, in place
+/// of any other. Meant for the node on the coordinator's host: the probes go
+/// to the address the coordinator's name resolves to, so a node anywhere
+/// else is never sent one (and the coordinator's own port still answers).
+/// The node starts answering on its next poll, if its agent can, and is
+/// listed in `/probe` once a poll after that confirms it.
+pub async fn set_reflexive_responder(
+    State(state): State<AppState>,
+    _admin: AdminAuth,
+    Path(name): Path<String>,
+) -> Result<(), AppError> {
+    let conn = state.db.conn.lock().await;
+    let node = nodes::find_by_name(&conn, &name)?.ok_or(AppError::NotFound)?;
+    if node.kind == wireserve_types::NodeKind::Static {
+        return Err(AppError::BadRequest("a kind=static node has no agent to answer probes".into()));
+    }
+    if node.revoked {
+        return Err(AppError::Conflict("node is revoked — rejoin and re-register it first".into()));
+    }
+    nodes::set_reflexive_responder(&conn, Some(node.id))?;
+    // A node that answered before is no longer asked: not advertised from now.
+    state.transit.clear_reflexive_answering();
+    tracing::info!(event = "reflexive_responder_set", node_name = %name);
+    Ok(())
+}
+
+/// `DELETE /admin/reflexive-responder` (PLAN.md M50) — no node answers
+/// reflexive probes on its WireGuard port any more; the coordinator's own
+/// port still does.
+pub async fn clear_reflexive_responder(State(state): State<AppState>, _admin: AdminAuth) -> Result<(), AppError> {
+    let conn = state.db.conn.lock().await;
+    nodes::set_reflexive_responder(&conn, None)?;
+    state.transit.clear_reflexive_answering();
+    tracing::info!(event = "reflexive_responder_cleared");
+    Ok(())
+}
+
 /// `GET /admin/peers` (spec §4.5.1).
 ///
 /// Every entry's `relay.via` (PLAN.md M39) is always `None` here —
@@ -1165,8 +1203,15 @@ pub async fn list_peers(
         .iter()
         .filter_map(|n| Some((n.name.clone(), state.transit.dialable(n.pubkey.as_deref()?, state.config.online_threshold_secs)?)))
         .collect();
+    let responder = rows.iter().find(|n| n.reflexive_responder);
+    let reflexive_answering = responder
+        .and_then(|n| n.pubkey.as_deref())
+        .is_some_and(|pk| state.transit.reflexive_answering_port(pk, state.config.online_threshold_secs).is_some());
+    let reflexive_responder = responder.map(|n| n.name.clone());
     Ok(Json(AdminPeersResponse {
         dialable,
+        reflexive_responder,
+        reflexive_answering,
         peers,
         transit_approved,
         transit_offering,

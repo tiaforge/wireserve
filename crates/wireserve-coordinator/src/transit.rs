@@ -41,6 +41,10 @@ pub struct TransitState {
     /// Where carriers see each node's WireGuard traffic come from, by the
     /// observed node's pubkey (`PollRequest::transit_observed`).
     observed: Mutex<HashMap<String, Observed>>,
+    /// The WireGuard port each node last confirmed it answers reflexive
+    /// probes on (PLAN.md M50), by pubkey, and when. Only ever recorded for
+    /// the node an admin named; cleared when the admin names another.
+    reflexive_answering: Mutex<HashMap<String, (u16, DateTime<Utc>)>>,
 }
 
 /// One node's source address as a carrier last saw it.
@@ -351,6 +355,52 @@ impl TransitState {
 
     /// Drops what carriers saw of `pubkey`, when the node itself has just
     /// learned something newer: a restarted agent's own probe.
+    /// Records whether this node answers reflexive probes on `port` right
+    /// now (PLAN.md M50): `Some` once its poll confirms it, `None` otherwise.
+    pub fn report_reflexive_answering(&self, pubkey: &str, port: Option<u16>) {
+        let mut map = self.reflexive_answering.lock().expect("transit state mutex poisoned");
+        match port.filter(|p| *p != 0) {
+            Some(p) => map.insert(pubkey.to_string(), (p, Utc::now())),
+            None => map.remove(pubkey),
+        };
+    }
+
+    /// Forgets every node's confirmation — when an admin names another
+    /// node, or none, so a node no longer asked is not advertised while
+    /// its last report is still fresh.
+    pub fn clear_reflexive_answering(&self) {
+        self.reflexive_answering.lock().expect("transit state mutex poisoned").clear();
+    }
+
+    /// The WireGuard port this node confirmed it answers reflexive probes
+    /// on, by a poll no older than `fresh_secs`.
+    #[must_use]
+    pub fn reflexive_answering_port(&self, pubkey: &str, fresh_secs: i64) -> Option<u16> {
+        let now = Utc::now();
+        self.reflexive_answering
+            .lock()
+            .ok()?
+            .get(pubkey)
+            .filter(|(_, at)| (now - *at).num_seconds() <= fresh_secs)
+            .map(|(p, _)| *p)
+    }
+
+    /// The WireGuard ports confirmed to answer reflexive probes, by a poll
+    /// no older than `fresh_secs`, lowest first. At most one node is ever
+    /// asked, so this is one port or none.
+    #[must_use]
+    pub fn reflexive_answering_ports(&self, fresh_secs: i64) -> Vec<u16> {
+        let now = Utc::now();
+        let mut ports: Vec<u16> = self
+            .reflexive_answering
+            .lock()
+            .map(|m| m.values().filter(|(_, at)| (now - *at).num_seconds() <= fresh_secs).map(|(p, _)| *p).collect())
+            .unwrap_or_default();
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+    }
+
     pub fn forget_observed(&self, pubkey: &str) {
         self.observed.lock().expect("transit state mutex poisoned").remove(pubkey);
     }
@@ -366,6 +416,7 @@ impl TransitState {
         self.capabilities.lock().expect("transit state mutex poisoned").remove(pubkey);
         self.carry_ports.lock().expect("transit state mutex poisoned").remove(pubkey);
         self.dialable.lock().expect("transit state mutex poisoned").remove(pubkey);
+        self.reflexive_answering.lock().expect("transit state mutex poisoned").remove(pubkey);
         self.observed.lock().expect("transit state mutex poisoned").retain(|pk, o| pk != pubkey && o.by != pubkey);
     }
 }

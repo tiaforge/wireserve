@@ -17,8 +17,8 @@ gateway retired; items 234–249) are done; plan
 `run-phone-relay-test.sh`, `run-transit-test.sh`, `run-exit-test.sh` and
 `run-nat-test.sh` all pass (2026-09-30).
 
-**Next:** M50 (the reflexive probe answered on the WireGuard port, items
-347–355) is planned, not started.
+**Latest:** M50 (the reflexive probe answered on the WireGuard port, items
+347–356) is implemented; its e2e check is not written yet (#355).
 
 Everything that can be verified here now is. What remains unverified is
 scale (three nodes, not thirty), real WAN paths, and long-running
@@ -5330,7 +5330,7 @@ coordinator host is itself a node, kernel WireGuard holds that port.
 Decided with the user (2026-11-22): the node on the coordinator's host
 answers probes on its own WireGuard port, taken by tproxy as in M49; the
 admin names that node; `/probe` lists that port and the coordinator's own.
-Planned, not implemented.
+Implemented; where it differs from the plan, #356 says so.
 
 347. **Not `redirect`.** Matching the request on the WireGuard port is
     easy (fixed size, `WSR1` magic), and `redirect to :47820` would hand
@@ -5414,3 +5414,44 @@ Planned, not implemented.
     node's port while WireGuard on that port keeps handshaking.
     `run-nat-test.sh` gains a node whose network lets UDP out to 51820
     only, and checks its `reflexive=` in `list-peers`.
+
+    Done: all of the unit and API tests above, and a kernel test of its
+    own rather than an extension of M49's
+    (`kernel_a_probe_on_the_wireguard_port_is_answered_and_wireguard_keeps_the_rest`):
+    a prober in another namespace sends a probe to the host's port 51820,
+    held by a plain UDP socket standing in for kernel WireGuard, gets its
+    own address back from 51820, and the 148-byte handshake it then sends
+    from the same socket reaches the stand-in, which never sees the probe.
+    It passes in an unprivileged user namespace. Not done: the
+    `run-nat-test.sh` case (no container runtime where this was built).
+356. **As built, where it differs from the plan.**
+    - **Its own chain and thread, not `phone-pre`'s** (#348). `phone-pre`,
+      its divert socket and the sorter thread live and die with the
+      phone relay's own configuration (its mesh socket, its nodes), so
+      sharing them would have tied the two roles' lifecycles together.
+      The probe has `reflexive-pre` (prerouting, mangle priority, the
+      same guards) and `reflexive_responder`: a transparent socket on
+      `relay_port_base + RELAY_SLOTS + 2`, right after the phone relay's
+      two, and a raw socket, reusing `phone_relay::io`'s socket helpers.
+      It travels in `PhoneRelayHandle`, which is what a Linux daemon has
+      and tests don't.
+    - **The admin command** (#350) is `wireserve-admin node responder
+      <name>` and `node responder --clear`, over `PUT
+      /admin/reflexive-responder/{name}` and `DELETE
+      /admin/reflexive-responder`. Stored as `nodes.reflexive_responder`
+      (migration 0029), set for one node and cleared for every other in
+      one statement; revoke and rejoin clear it, as they do transit
+      approval. Naming another node, or none, drops every confirmation at
+      once, so the last one is not advertised while its report is fresh.
+      `node show` says `answering` or `waiting for its agent`;
+      `/admin/peers` carries `reflexive_responder` and
+      `reflexive_answering`.
+    - **Confirmation** (#351): the agent's `Responder` records whether the
+      last firewall apply included the rule while it ran; a failed apply
+      counts as no. The next poll's `reflexive_answering` reports it. The
+      coordinator records it only for the named node with the capability,
+      at its registered `listen_port`.
+    - **`dialable`** (#353) is unknown, not "no", when the coordinator's
+      own port never answered: it then never got the request, so its
+      silence about the second answer says nothing. On a network that
+      blocks 47820/udp the node so reports nothing, as before M50.

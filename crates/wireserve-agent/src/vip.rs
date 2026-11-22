@@ -134,6 +134,7 @@ mod tests {
             relay_public: vec![],
             relay_port_base: None,
             relay_devices: vec![],
+            answer_reflexive: false,
             transit_awaiting_approval: false,
             exit_clients: vec![],
             mesh: None,

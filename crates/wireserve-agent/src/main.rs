@@ -734,6 +734,7 @@ async fn cmd_daemon(
     let phone_relay = poll_loop::PhoneRelayHandle {
         relay: wireserve_agent::phone_relay::io::PhoneRelay::default(),
         divert: fw.phone_divert(),
+        reflexive: wireserve_agent::reflexive_responder::Responder::default(),
     };
     let tls_socket_path = instance.tls_socket_path();
     {
