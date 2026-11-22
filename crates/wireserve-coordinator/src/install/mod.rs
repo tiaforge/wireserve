@@ -573,6 +573,16 @@ Later, if more than one person uses this mesh:
                                               through a login server you run
 ";
 
+/// For a coordinator whose host joins the mesh too (PLAN.md M50): that node
+/// can answer the NAT check on its WireGuard port, for machines on networks
+/// that let UDP out to that port and little else.
+pub const RESPONDER_HINT: &str = "\
+   If this machine joins the mesh as well, let its node answer the NAT check
+   on its WireGuard port too, for machines on hotel or office Wi-Fi that only
+   lets that port out:
+     wireserve-admin node responder <its node name>
+";
+
 /// The Caddy site block for these answers.
 #[must_use]
 pub fn caddy_block(answers: &Answers) -> String {
@@ -623,6 +633,8 @@ fn print_next_steps(answers: &Answers, service_user: &str, state_dir: &Path) {
         }
     }
     println!();
+    print!("{RESPONDER_HINT}");
+    println!();
     print!("{}", SETUP_HINTS);
     println!();
     println!("Settings: /etc/wireserve/coordinator.env. `sudo wireserve-coordinator install --reconfigure`");
@@ -634,6 +646,12 @@ fn print_next_steps(answers: &Answers, service_user: &str, state_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_install_output_names_the_responder_command() {
+        assert!(RESPONDER_HINT.contains("wireserve-admin node responder <its node name>"));
+        assert!(RESPONDER_HINT.lines().all(|l| l.len() <= 80), "fits a terminal");
+    }
 
     #[test]
     fn an_installed_unit_means_upgrade_unless_reconfiguring() {
