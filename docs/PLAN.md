@@ -17,6 +17,9 @@ gateway retired; items 234–249) are done; plan
 `run-phone-relay-test.sh`, `run-transit-test.sh`, `run-exit-test.sh` and
 `run-nat-test.sh` all pass (2026-09-30).
 
+**Next:** M50 (the reflexive probe answered on the WireGuard port, items
+347–355) is planned, not started.
+
 Everything that can be verified here now is. What remains unverified is
 scale (three nodes, not thirty), real WAN paths, and long-running
 behaviour.
@@ -5313,3 +5316,101 @@ through one carrier; Linux only, like every carrier role.
     only, and checks the carrier's own service and a relayed node's over
     it; not run (no container runtime and no WireGuard module where this
     was built).
+
+## M50 — the reflexive probe on the WireGuard port
+
+M22's probe goes to the coordinator's UDP responder, on the port number of
+`WIRESERVE_LISTEN_ADDR` (47820 by default). On networks that let UDP out to
+the WireGuard port and little else (M49's hotel and corporate Wi-Fi) it
+never arrives: the node starts without its reflexive address and without
+`dialable` (M40), so it is never picked as a carrier. #336 recovers the
+address later through an approved carrier, but not `dialable`. The
+coordinator can't simply listen on 51820 instead: on a mesh whose
+coordinator host is itself a node, kernel WireGuard holds that port.
+Decided with the user (2026-11-22): the node on the coordinator's host
+answers probes on its own WireGuard port, taken by tproxy as in M49; the
+admin names that node; `/probe` lists that port and the coordinator's own.
+Planned, not implemented.
+
+347. **Not `redirect`.** Matching the request on the WireGuard port is
+    easy (fixed size, `WSR1` magic), and `redirect to :47820` would hand
+    it to the coordinator's existing responder. But NAT is decided per
+    conntrack entry, not per packet, and the probe is sent from the
+    node's own `listen_port`: the same 5-tuple its WireGuard uses towards
+    the coordinator host moments later. Every WireGuard packet of that
+    flow would follow the probe's mapping to the responder and be dropped,
+    and the handshake retry every 5 s keeps the entry alive for good.
+    tproxy rewrites nothing and decides per packet (#338).
+348. **What the node takes.** One more rule in `phone-pre`, with the same
+    guards as its others (IPv4, not from the mesh, `fib daddr type
+    local`, UDP to the listen port): `udp length 72` (8 + `REQUEST_LEN`),
+    the magic at the start of the payload (`@th,64,32`), a `limit`, then
+    `tproxy` to the divert socket. A WireGuard message never starts with
+    `WSR1` (its first byte is a type 1–4, then three zeros), so nothing of
+    WireGuard's is taken. `phone-pre`, the divert socket, the raw socket
+    and the `phone_relay::io` thread exist today only while the node
+    relays phones; they now exist while it does either, and the
+    reflexive rule only while it answers probes.
+349. **What it answers.** In the io thread, before the sorter:
+    `wireserve_types::reflexive::parse_request`, then `build_response`
+    with the source the divert socket reports, sent once from the raw
+    socket with the original destination (the address dialled, the
+    listen port) as its source. The second answer (M40) stays the
+    coordinator's alone. Anything malformed or over budget is dropped
+    silently, as in #91. The budget is per source: `SlidingWindowLimiter`
+    moves from the coordinator to `wireserve-types` so both use the same
+    one; the nft `limit` is only the outer bound, since on its own one
+    sender could spend everyone's. 19 bytes out for 64 in, so still under
+    1x.
+350. **Who answers: one node, named by the admin.** Something like
+    `wireserve-admin node set <name> --reflexive-responder` (the exact
+    form follows M44's conventions when built), stored on the node (a
+    migration), at most one at a time: `/probe` advertises one address,
+    the coordinator's. Not found by matching a node's public IP to the
+    coordinator's: behind a NAT or a reverse proxy on another host, that
+    guesses wrong. The node's `PollResponse` says to answer, and only if
+    the agent sent the new capability `reflexive` (`CAP_REFLEXIVE`), as
+    with `phone-relay`: an older agent is never asked. The admin's choice
+    asserts that the node is at the address the coordinator's name
+    resolves to; if it is not, its answers never come and the fallback
+    (#352) covers it. The docs (coordinator, firewall) say so.
+351. **Advertised only while confirmed.** The agent says in its poll that
+    the rule is in place, after the nft apply succeeded (and after a host
+    firewall reload restored it). The coordinator lists the node's port
+    in `/probe` only while that report is no older than
+    `online_threshold_secs`. The port is the node's own `listen_port`, not
+    an assumed 51820.
+352. **`/probe` lists ports.** New `reflexive_ports`: the responder node's
+    port first while confirmed, then the coordinator's own.
+    `reflexive_port` stays, the coordinator's own, for older agents. The
+    agent sends the same request, one nonce, to every listed port from
+    its one `listen_port` socket, and prefers the answer from the
+    WireGuard port: that is the path WireGuard's own packets take. Two
+    answers that disagree mean a symmetric NAT, which the reflexive tier
+    can't help anyway; logged at debug, the preferred one used. The
+    fallback is what keeps this from ever being worse than today: while
+    the responder node's agent restarts, or before it is confirmed.
+353. **`dialable` counts only the coordinator's second socket.**
+    `try_learn` counts an answer as "from another port" when its source
+    differs from the one target (`src != target`). With several targets
+    the responder node's answer would count, and a node would think
+    itself dialable when it is not. "Another port" becomes: the
+    coordinator's address, from a port not in the list probed. The wait
+    for the second answer stays as it is (`SECOND_ANSWER_WAIT`), whatever
+    order the answers arrive in.
+354. **The coordinator host probing itself.** Its own probe runs before
+    its WireGuard and its rule exist, and its own packets go out through
+    output, never through `phone-pre`'s prerouting. It is answered on the
+    coordinator's own port, locally, so its `dialable` comes over
+    loopback and says nothing about the outside firewall. That is how it
+    is today; noted so it isn't rediscovered.
+355. **Verification (planned).** Unit tests: the rule's shape; the answer
+    path (request in, one answer from the address dialled, a malformed or
+    over-budget request answered by nothing); the `dialable` count with
+    several targets; `/probe`'s list advertised only while confirmed and
+    never to an agent without the capability; the admin command and the
+    migration. The M49 kernel test gains a prober in a namespace allowed
+    UDP out to the WireGuard port only: it learns its address through the
+    node's port while WireGuard on that port keeps handshaking.
+    `run-nat-test.sh` gains a node whose network lets UDP out to 51820
+    only, and checks its `reflexive=` in `list-peers`.
