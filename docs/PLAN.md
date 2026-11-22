@@ -18,7 +18,8 @@ gateway retired; items 234–249) are done; plan
 `run-nat-test.sh` all pass (2026-09-30).
 
 **Latest:** M50 (the reflexive probe answered on the WireGuard port, items
-347–356) is implemented; its e2e check is not written yet (#355).
+347–356) is implemented; its e2e suite (`run-reflexive-port-test.sh`, #355)
+is written and has not run yet.
 
 Everything that can be verified here now is. What remains unverified is
 scale (three nodes, not thirty), real WAN paths, and long-running
@@ -5422,8 +5423,19 @@ Implemented; where it differs from the plan, #356 says so.
     held by a plain UDP socket standing in for kernel WireGuard, gets its
     own address back from 51820, and the 148-byte handshake it then sends
     from the same socket reaches the stand-in, which never sees the probe.
-    It passes in an unprivileged user namespace. Not done: the
-    `run-nat-test.sh` case (no container runtime where this was built).
+    It passes in an unprivileged user namespace. The e2e check became a
+    suite of its own, `run-reflexive-port-test.sh`, rather than a case in
+    `run-nat-test.sh`, which has no node on the coordinator's host: the
+    coordinator and node-coord share one network namespace, node-wifi sits
+    behind a router that lets UDP out to 51820 only and maps node-wifi's
+    51820 to 40404. It checks that node-wifi's `join` learns nothing before
+    a responder is named, that node-coord confirms and `/probe` lists 51820
+    first, that node-wifi's daemon then learns `router:40404`, that its
+    `dialable` stays unknown, that it reaches node-coord's service over the
+    tunnel on the very flow the probe used, and that `--clear` takes the
+    port out of `/probe` and the rule off node-coord. Not run (no container
+    runtime where this was built): the release workflow runs it nightly and
+    on a tag.
 356. **As built, where it differs from the plan.**
     - **Its own chain and thread, not `phone-pre`'s** (#348). `phone-pre`,
       its divert socket and the sorter thread live and die with the
