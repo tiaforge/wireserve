@@ -599,13 +599,23 @@ pub struct SessionAnswer {
 pub async fn redeem(
     State(state): State<AppState>,
     BearerNode { node }: BearerNode,
+    headers: HeaderMap,
     Json(body): Json<RedeemBody>,
-) -> Result<Json<SessionAnswer>, AppError> {
+) -> Result<Response, AppError> {
     let oidc = enabled(&state)?;
     limit(&state.redeem_limiter, &node)?;
     let fqdn = body.fqdn.to_ascii_lowercase();
     own_service(&state, &node, &fqdn).await?;
-    let taken = sessions::take_ticket(&*state.db.conn.lock().await, &wireserve_types::hash_token(&body.ticket), &fqdn)?;
+    let taken = {
+        // The node as it stands now, under the lock the ticket is taken
+        // under: the row `BearerNode` read is from before the body came,
+        // and a rejoin in between keeps the services `own_service` checks.
+        let conn = state.db.conn.lock().await;
+        if BearerNode::recheck(&conn, &headers, &node)?.is_none() {
+            return Ok(outlived(&node));
+        }
+        sessions::take_ticket(&conn, &wireserve_types::hash_token(&body.ticket), &fqdn)?
+    };
     let Some(sessions::Ticket { session_id: id, to, bind }) = taken else {
         return Err(AppError::Gone("this sign-in link was used already, or is too old".into()));
     };
@@ -623,7 +633,14 @@ pub async fn redeem(
     };
     tracing::info!(event = "session_redeemed", node_name = %node.name, service = %fqdn, sub = %s.sub);
     let granted = sign_in_service(&state, &fqdn).await?.map(|(_, g)| g);
-    Ok(Json(SessionAnswer { token: token(&state, &oidc, &s, &fqdn, granted.as_deref()).await?, to: Some(to) }))
+    Ok(Json(SessionAnswer { token: token(&state, &oidc, &s, &fqdn, granted.as_deref()).await?, to: Some(to) }).into_response())
+}
+
+/// The answer to a request whose node token was revoked or replaced while
+/// its body was on the way, as `routes::poll` gives it.
+fn outlived(node: &crate::db::nodes::NodeRow) -> Response {
+    tracing::info!(event = "sign_in_outlived_its_token", node_name = %node.name, "a sign-in request's token was revoked or replaced while its body was on the way");
+    crate::auth::AuthError::Unauthorized.into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -651,18 +668,23 @@ async fn held_session(state: &AppState, oidc: &Oidc, node: &crate::db::nodes::No
 pub async fn renew(
     State(state): State<AppState>,
     BearerNode { node }: BearerNode,
+    headers: HeaderMap,
     Json(body): Json<TokenBody>,
-) -> Result<Json<SessionAnswer>, AppError> {
+) -> Result<Response, AppError> {
     let oidc = enabled(&state)?;
     limit(&state.sign_in_limiter, &node)?;
     let (fqdn, id) = held_session(&state, &oidc, &node, &body).await?;
+    // As in `redeem`, before the session is touched or refreshed for it.
+    if BearerNode::recheck(&*state.db.conn.lock().await, &headers, &node)?.is_none() {
+        return Ok(outlived(&node));
+    }
     let s = match freshen(&state, &oidc, &id).await? {
         Fresh::Live(s) => s,
         Fresh::Ended => return Err(AppError::Gone("signed out".into())),
         Fresh::Unavailable => return Err(AppError::Unavailable("the identity provider cannot be reached".into())),
     };
     let granted = sign_in_service(&state, &fqdn).await?.map(|(_, g)| g);
-    Ok(Json(SessionAnswer { token: token(&state, &oidc, &s, &fqdn, granted.as_deref()).await?, to: None }))
+    Ok(Json(SessionAnswer { token: token(&state, &oidc, &s, &fqdn, granted.as_deref()).await?, to: None }).into_response())
 }
 
 /// `POST /sign-in/end`: a service's sign-out ends the whole session.
