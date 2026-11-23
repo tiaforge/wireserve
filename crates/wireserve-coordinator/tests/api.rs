@@ -3293,6 +3293,68 @@ async fn malformed_transit_pubkeys_are_dropped_not_rejected() {
 }
 
 #[tokio::test]
+async fn transit_reports_are_kept_only_for_nodes_in_the_mesh() {
+    let app = test_app();
+    let (a, b, _c) = transit_scenario(&app).await;
+    let (pk_a, pk_b, pk_c, nobody) = (pubkey_for("pk-a"), pubkey_for("pk-b"), pubkey_for("pk-c"), pubkey_for("nobody"));
+    assert_eq!(admin_post(&app.router, "/admin/nodes/b/transit/approve").await, StatusCode::OK);
+    let (status, _) = poll_full(
+        &app.router,
+        &b,
+        relay_poll(json!({
+            "services": [],
+            "transit_capable": true,
+            "transit_reachable": [nobody, pk_a, pk_c],
+            "transit_observed": [
+                { "pubkey": nobody, "addr": "198.51.100.7:51000" },
+                { "pubkey": pk_a, "addr": "198.51.100.8:51000" },
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let transit = &app.state.transit;
+    assert!(transit.reaches(&pk_b, &pk_a, 180) && transit.reaches(&pk_b, &pk_c, 180));
+    assert!(!transit.reaches(&pk_b, &nobody, 180), "a pubkey that is no node is not kept");
+    assert_eq!(transit.observed_addr(&nobody), None);
+    assert_eq!(transit.observed_addr(&pk_a).as_deref(), Some("198.51.100.8:51000"));
+
+    poll_full(&app.router, &a, relay_poll(json!({ "services": [], "transit_wanted": [nobody, pk_c] }))).await;
+    assert!(transit.either_wants(&pk_a, &pk_c));
+    assert!(!transit.either_wants(&pk_a, &nobody));
+
+    // A node that leaves takes its place in everyone else's reports with it.
+    assert_eq!(admin_post(&app.router, "/admin/nodes/c/revoke").await, StatusCode::OK);
+    assert!(!transit.reaches(&pk_b, &pk_c, 180));
+    assert!(!transit.either_wants(&pk_a, &pk_c));
+    assert!(transit.wanted_pairs().is_empty(), "{:?}", transit.wanted_pairs());
+}
+
+#[tokio::test]
+async fn the_coordinator_keeps_no_more_transit_entries_per_poll_than_the_agent_sends() {
+    let app = test_app();
+    let (a, b, _c) = transit_scenario(&app).await;
+    let (pk_a, pk_b, pk_c) = (pubkey_for("pk-a"), pubkey_for("pk-b"), pubkey_for("pk-c"));
+    assert_eq!(admin_post(&app.router, "/admin/nodes/b/transit/approve").await, StatusCode::OK);
+    // As many entries as the cap ahead of the real ones: the real ones are
+    // past it, and not kept.
+    let filler = |n: usize| (0..n).map(|i| pubkey_for(&format!("filler-{i}"))).collect::<Vec<_>>();
+    let mut reachable = filler(wireserve_types::MAX_TRANSIT_REACHABLE_PER_POLL);
+    reachable.extend([pk_a.clone(), pk_c.clone()]);
+    poll_full(&app.router, &b, relay_poll(json!({ "services": [], "transit_capable": true, "transit_reachable": reachable }))).await;
+    assert!(!app.state.transit.reaches(&pk_b, &pk_a, 180));
+
+    let mut wanted = filler(wireserve_types::MAX_TRANSIT_WANTED_PER_POLL);
+    wanted.push(pk_c.clone());
+    poll_full(&app.router, &a, relay_poll(json!({ "services": [], "transit_wanted": wanted }))).await;
+    assert!(!app.state.transit.either_wants(&pk_a, &pk_c));
+
+    // Within the cap, they are.
+    poll_full(&app.router, &b, b_offers_transit()).await;
+    assert!(app.state.transit.reaches(&pk_b, &pk_a, 180));
+}
+
+#[tokio::test]
 async fn revoke_removes_a_node_from_transit_consideration() {
     let app = test_app();
     let ta = admin_create_node(&app.router, "a").await;
