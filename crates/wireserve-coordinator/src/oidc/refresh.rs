@@ -26,6 +26,12 @@ pub async fn run(state: AppState, oidc: Arc<Oidc>) {
 /// One refresh of every owner. The database is locked per owner, never
 /// across a call to the provider.
 pub async fn pass(state: &AppState, oidc: &Oidc) {
+    // Sign-in sessions and tickets are swept on this timer too: otherwise
+    // only a new session sweeps them, and tickets — which anyone signed in
+    // can have made, many a minute — pile up while nobody signs in afresh.
+    if let Err(e) = crate::db::sessions::sweep(&*state.db.conn.lock().await, chrono::Utc::now()) {
+        tracing::error!(error = %e, "could not sweep idle sign-in sessions and spent tickets");
+    }
     let all = match owners::all(&*state.db.conn.lock().await) {
         Ok(v) => v,
         Err(e) => {

@@ -922,6 +922,40 @@ async fn a_session_whose_token_does_not_open_goes_stale_and_its_browser_can_sign
     assert!(resp.headers()[header::LOCATION].to_str().unwrap().starts_with(&issuer), "to the provider, not stuck on it");
 }
 
+#[tokio::test]
+async fn idle_sessions_and_spent_tickets_go_without_anyone_signing_in_afresh() {
+    // Only a new session swept them, so an idle session stayed renewable
+    // and tickets piled up for as long as nobody new signed in.
+    let idp = start_idp().await;
+    let issuer = idp.lock().unwrap().issuer.clone();
+    let app = signing_app(&issuer);
+    let (home, _, _) = grafana(&app).await;
+    let (resp, _) = sign_in_as(&app, &idp, "alice", &["family"]).await;
+    ticket_of(&resp);
+    let (resp, _) = sign_in_as(&app, &idp, "bob", &["family"]).await;
+    let redeem = serde_json::json!({"fqdn": "grafana.int.test", "ticket": ticket_of(&resp), "bind": BIND});
+    let (_, answer) = json(&app.router, "POST", "/sign-in/redeem", &home, redeem).await;
+    let db = &app.state.db;
+    let count = |table: &'static str| async move {
+        db.conn.lock().await.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get::<_, i64>(0)).unwrap()
+    };
+    assert_eq!(count("sign_in_tickets").await, 1, "alice's, never redeemed");
+
+    {
+        let conn = app.state.db.conn.lock().await;
+        conn.execute("UPDATE sign_in_tickets SET expires_at = '2020-01-01T00:00:00+00:00'", []).unwrap();
+        conn.execute("UPDATE sign_in_sessions SET last_used_at = '2020-01-01T00:00:00+00:00' WHERE sub = 'bob'", []).unwrap();
+    }
+    // Idle past the limit: not renewable, swept or not.
+    let renew = serde_json::json!({"fqdn": "grafana.int.test", "token": answer["token"]});
+    assert_eq!(json(&app.router, "POST", "/sign-in/renew", &home, renew).await.0, StatusCode::GONE);
+
+    wireserve_coordinator::oidc::refresh::pass(&app.state, app.state.oidc.as_ref().unwrap()).await;
+    assert_eq!(count("sign_in_tickets").await, 0);
+    let left = wireserve_coordinator::db::sessions::all(&*app.state.db.conn.lock().await).unwrap();
+    assert_eq!(left.iter().map(|s| s.sub.as_str()).collect::<Vec<_>>(), ["alice"]);
+}
+
 fn token_hits(idp: &Shared) -> usize {
     idp.lock().unwrap().token_hits
 }
