@@ -203,20 +203,7 @@ impl Config {
         // Rejected loudly rather than ignored: a typo here would silently
         // rename nothing and leave the operator hunting for why their
         // services still answer to `.wg`.
-        let service_domain = match std::env::var("WIRESERVE_SERVICE_DOMAIN") {
-            Ok(d) if d.trim().is_empty() => None,
-            Ok(d) => {
-                let d = d.trim().to_string();
-                if !wireserve_types::is_valid_hostname(&d) {
-                    return Err(ConfigError::Invalid(
-                        "WIRESERVE_SERVICE_DOMAIN",
-                        format!("{d:?} is not a valid domain (needs at least two labels)"),
-                    ));
-                }
-                Some(d)
-            }
-            Err(_) => None,
-        };
+        let service_domain = service_domain_from(std::env::var("WIRESERVE_SERVICE_DOMAIN").ok().as_deref())?;
         let dns = crate::dns::config::from_lookup(|k| std::env::var(k).ok(), service_domain.as_deref())?;
         let acme = acme_from_lookup(|k| std::env::var(k).ok())?;
         warn_forward_auth_keys(|k| std::env::var(k).ok());
@@ -344,6 +331,24 @@ pub fn cross_site_services_from(raw: Option<&str>) -> Result<Vec<String>, Config
         }
     }
     Ok(out)
+}
+
+/// `WIRESERVE_SERVICE_DOMAIN`, in its one canonical form: lower case, with
+/// no trailing dot. A hostname may be typed either way, but every consumer
+/// compares names it has lowercased and trimmed against this value as is,
+/// so `Int.Example.com` refused every certificate and every sign-in. Agents
+/// take either form, so they are told this one without harm.
+pub fn service_domain_from(raw: Option<&str>) -> Result<Option<String>, ConfigError> {
+    let Some(d) = raw.map(str::trim).filter(|d| !d.is_empty()) else {
+        return Ok(None);
+    };
+    if !wireserve_types::is_valid_hostname(d) {
+        return Err(ConfigError::Invalid(
+            "WIRESERVE_SERVICE_DOMAIN",
+            format!("{d:?} is not a valid domain (needs at least two labels)"),
+        ));
+    }
+    Ok(Some(d.trim_end_matches('.').to_ascii_lowercase()))
 }
 
 /// `WIRESERVE_RESERVED_SERVICE_NAMES`: service names, comma-separated.
@@ -818,6 +823,17 @@ pub fn is_loopback_or_private(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_service_domain_is_kept_in_one_form_however_it_was_typed() {
+        for typed in ["int.example.com", "Int.Example.com", "int.example.com.", " INT.example.COM. "] {
+            assert_eq!(service_domain_from(Some(typed)).unwrap().as_deref(), Some("int.example.com"), "{typed:?}");
+        }
+        assert_eq!(service_domain_from(Some("  ")).unwrap(), None);
+        assert_eq!(service_domain_from(None).unwrap(), None);
+        assert!(service_domain_from(Some("localhost")).is_err());
+        assert!(service_domain_from(Some("int..example.com")).is_err());
+    }
 
     fn sample() -> Config {
         Config {
