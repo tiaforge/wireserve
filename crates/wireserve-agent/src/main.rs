@@ -780,6 +780,10 @@ async fn cmd_daemon(
     let mut coordinator_failures: u32 = 0;
     // What the last poll left this node holding of the shared directory.
     let mut held_directory: Option<wireserve_agent::held::Held> = None;
+    // What the last poll's firewall apply put in place, which a poll the
+    // coordinator does not answer still narrows to what this node offers.
+    // Empty at start: the startup deny-all has nothing to narrow.
+    let mut last_applied: Option<poll_loop::LastApplied> = None;
     let mut not_before = tokio::time::Instant::now();
     // Between polls, the kernel's receive counters: a peer whose path goes
     // quiet is noticed within seconds, not at the next poll.
@@ -872,6 +876,7 @@ async fn cmd_daemon(
                     #[cfg(not(target_os = "linux"))]
                     phone_relay: None,
                     held: &mut held_directory,
+                    applied: &mut last_applied,
                 };
                 let result = poll_loop::run_once(&mut ctx, &shared_state).await;
                 // Safety net for host-firewall changes the interop's own
@@ -1222,7 +1227,7 @@ async fn cmd_declare(
     // that coordinator requires approval it will sit pending until an
     // admin acts. The agent cannot know which until it polls, so say what
     // is actually true and point at where the answer shows up.
-    println!("ok — queued; takes effect on the next poll");
+    println!("ok — queued; takes effect on the next poll the coordinator answers");
     if let Some(m) = unguarded {
         println!(
             "  {} is a usual web app's port: publish it as 80:{} instead (`wireserve <name> 80:{} ...`). On 80 the \
@@ -1240,7 +1245,9 @@ async fn cmd_declare(
 
 async fn cmd_withdraw(instance: &Instance, name: String) -> Result<(), Box<dyn std::error::Error>> {
     into_result(client::call(&instance.socket_path(), &IpcRequest::Unserve { name: name.clone() }).await?)?;
-    println!("ok — {name} is withdrawn on the next poll, and its name is free for other nodes");
+    // Closed on the next poll whether or not the coordinator answers it; the
+    // name is freed only once one does.
+    println!("ok — {name} is withdrawn on the next poll, and its name is free for other nodes once the coordinator hears of it");
     println!("  `wireserve {name} <port>...` publishes it again");
     Ok(())
 }
@@ -1296,7 +1303,8 @@ async fn cmd_exit(instance: &Instance, action: Toggle) -> Result<(), Box<dyn std
             println!(
                 "ok — exit enabled; devices exported with `wireserve-admin device create --exit` \
                  through this node will send their internet traffic out from here, under this \
-                 host's own address, from the next poll. IPv4 only: their IPv6 is dropped here."
+                 host's own address, from the next poll the coordinator answers. IPv4 only: their \
+                 IPv6 is dropped here."
             );
         } else {
             println!("ok — exit disabled; takes effect on the next poll");

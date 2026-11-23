@@ -763,6 +763,9 @@ pub struct PollContext<'a, F: FirewallBackend> {
     /// The shared directory as of the last poll (fix 6), kept between polls so
     /// that the next can name it and be sent only what changed.
     pub held: &'a mut Option<crate::held::Held>,
+    /// What the last firewall apply of this run put in place, which a cycle
+    /// the coordinator does not answer narrows ([`narrow_to_local`]).
+    pub applied: &'a mut Option<LastApplied>,
 }
 
 /// Moves the terminator's local routes from `old` to `new` (see
@@ -797,6 +800,10 @@ fn sync_local_routes(old: &BTreeSet<Ipv4Addr>, _new: &BTreeSet<Ipv4Addr>, _node:
 /// neither blocked nor lost. Only the fields this cycle actually
 /// produces (`last_directory`, a quarantined declaration) are written
 /// back; `declared_services` is never overwritten wholesale.
+///
+/// A cycle that ends before its local steps — the coordinator unreachable,
+/// a 5xx, a refusal, a response this node will not act on — still closes
+/// what this node itself stopped offering since: see [`narrow_to_local`].
 pub async fn run_once<F: FirewallBackend>(
     ctx: &mut PollContext<'_, F>,
     state: &Mutex<AgentState>,
@@ -808,6 +815,179 @@ where
     // whatever the coordinator then says, or doesn't.
     ctx.wg.check()?;
 
+    let mut reached_local_steps = false;
+    let result = poll_and_apply(ctx, state, &mut reached_local_steps).await;
+    if result.is_err() && !reached_local_steps {
+        narrow_to_local(ctx, state).await;
+    }
+    result
+}
+
+/// What the last full apply put in place (see [`narrow_to_local`]): each
+/// service rule with the name of the declaration it came from, and the
+/// forwarding beside them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LastApplied {
+    pub rules: Vec<(String, ServiceRule)>,
+    pub forwarding: wireserve_types::Forwarding,
+}
+
+/// What of `last` this node's own state still asks for: its rules for
+/// mappings still declared under the same name, and its forwarding less
+/// what `transit off` and `exit off` withdrew. Everything returned is taken
+/// from `last` — nothing is computed afresh — so it can only ever be the
+/// same or less: no service, mapping, source, relay or exit client that the
+/// last apply did not already hold.
+///
+/// A service declared for people only since (PLAN.md #326) loses its 443
+/// and 80 rewrites, as `service_rules` closes them; its terminated ones
+/// stay.
+#[must_use]
+pub fn narrowed(last: &LastApplied, declared: &[ServiceDecl], transit_capable: bool, exit_capable: bool) -> LastApplied {
+    let still_declared = |name: &str, rule: &ServiceRule| {
+        let (ServiceRule::Mapped { map, .. } | ServiceRule::Terminated { map, .. }) = rule;
+        let web = wireserve_types::is_tls_map(map) || wireserve_types::is_http_map(map);
+        declared.iter().any(|d| {
+            d.name == name && d.ports.contains(map) && !(d.always_sign_in && web && matches!(rule, ServiceRule::Mapped { .. }))
+        })
+    };
+    let rules: Vec<(String, ServiceRule)> = last.rules.iter().filter(|(name, rule)| still_declared(name, rule)).cloned().collect();
+    let mut forwarding = last.forwarding.clone();
+    if !transit_capable {
+        forwarding.relay.clear();
+        forwarding.phone_relay = None;
+    }
+    if !exit_capable {
+        forwarding.exit.clear();
+    }
+    // Nothing left that replies arrive from elsewhere for: the switches
+    // this agent turned on for them go off.
+    if forwarding.exit.is_empty() && !rules.iter().any(|(_, r)| r.remote_target().is_some()) {
+        forwarding.guarded.clear();
+    }
+    LastApplied { rules, forwarding }
+}
+
+/// Re-applies the last full apply, narrowed to what this node's own state
+/// still asks for ([`narrowed`]), when a cycle could not get a directory to
+/// apply. Without it, `wireserve <name> off`, `transit off` and `exit off`
+/// did nothing for as long as the coordinator was unreachable — hours, or
+/// days — though each says it takes effect on the next poll.
+///
+/// It only ever narrows, and this is why it is safe without a coordinator:
+/// a newly declared service, a wider grant, `transit on` or `exit on` all
+/// wait for a coordinator that answers (spec §5: the agent opens nothing
+/// until one says so). Nothing is turned on here — no forwarding switch,
+/// no relay socket — only off. A cycle with nothing to narrow applies
+/// nothing.
+///
+/// "The last full apply" is this run's: after a restart with the
+/// coordinator still down it is the startup deny-all, which has nothing to
+/// narrow, so the node stays closed until the coordinator answers, as it
+/// always did.
+async fn narrow_to_local<F: FirewallBackend>(ctx: &mut PollContext<'_, F>, state: &Mutex<AgentState>)
+where
+    F::Error: std::fmt::Display,
+{
+    let Some(last) = ctx.applied.as_ref() else {
+        return;
+    };
+    let (declared, transit_capable, exit_capable, owned, routes_before, node_ip) = {
+        let s = state.lock().await;
+        (
+            s.declared_services.clone(),
+            s.transit_capable,
+            s.exit_capable,
+            s.forwarding_owned.iter().cloned().collect::<BTreeSet<String>>(),
+            s.local_routes.iter().copied().collect::<BTreeSet<Ipv4Addr>>(),
+            s.ip4.as_deref().and_then(|ip| ip.parse::<Ipv4Addr>().ok()),
+        )
+    };
+    let mut now = narrowed(last, &declared, transit_capable, exit_capable);
+    if now == *last {
+        return;
+    }
+    tracing::info!("the coordinator did not answer; closing what this node no longer offers");
+    let ifname = ctx.wg.ifname().to_string();
+    let carry_name = ctx.wg.carry_name().map(str::to_string);
+    let (applied, owned_now, routes_now) = tokio::task::block_in_place(|| {
+        #[cfg(target_os = "linux")]
+        if now.forwarding.phone_relay.is_none() && last.forwarding.phone_relay.is_some() {
+            if let Some(handle) = ctx.phone_relay {
+                if let Err(e) = handle.relay.configure(None, &handle.divert) {
+                    tracing::warn!(error = %e, "could not close the phone relay's sockets");
+                }
+            }
+        }
+        // Only switches this agent already owns, and none turned back on:
+        // what is no longer guarded is released before the ruleset that
+        // guarded it goes, as in `run_once`.
+        let wanted: BTreeSet<String> = now.forwarding.guarded.iter().filter(|g| owned.contains(*g)).cloned().collect();
+        let plan = crate::firewall::ip_forward::begin_egress(&wanted, &owned);
+        let guard: BTreeSet<String> = plan.guard.difference(&plan.take).cloned().collect();
+        now.forwarding.guarded = guard.iter().cloned().collect();
+        let rules: Vec<ServiceRule> = now.rules.iter().map(|(_, r)| r.clone()).collect();
+        let applied = match ctx.firewall.apply(&rules, &now.forwarding) {
+            Ok(()) => {
+                note_reflexive_applied(ctx.phone_relay, now.forwarding.reflexive.is_some());
+                true
+            }
+            Err(e) => {
+                note_reflexive_applied(ctx.phone_relay, false);
+                tracing::warn!(error = %e, "could not close what this node no longer offers; trying again next poll");
+                false
+            }
+        };
+        // Off only, and only once the ruleset that sent traffic there is gone.
+        let forwards_services = now.rules.iter().any(|(_, r)| r.remote_target().is_some());
+        let routes = if applied {
+            let wanted: BTreeSet<Ipv4Addr> = now
+                .rules
+                .iter()
+                .filter_map(|(_, r)| match r {
+                    ServiceRule::Terminated { vip, .. } => Some(*vip),
+                    ServiceRule::Mapped { .. } => None,
+                })
+                .collect();
+            if now.forwarding.relay.is_empty() && !forwards_services && now.forwarding.exit.is_empty() {
+                crate::firewall::ip_forward::set_enabled(&ifname, false);
+            }
+            if let (Some(carry), false) = (&carry_name, forwards_services) {
+                crate::firewall::ip_forward::set_enabled(carry, false);
+            }
+            sync_local_routes(&routes_before, &routes_before.intersection(&wanted).copied().collect(), node_ip)
+        } else {
+            routes_before.clone()
+        };
+        (applied, guard, routes)
+    });
+    {
+        let owned: Vec<String> = owned_now.into_iter().collect();
+        let routed: Vec<Ipv4Addr> = routes_now.into_iter().collect();
+        let mut s = state.lock().await;
+        if s.forwarding_owned != owned || s.local_routes != routed {
+            s.forwarding_owned = owned;
+            s.local_routes = routed;
+            if let Err(e) = s.save(ctx.state_path) {
+                tracing::warn!(error = %e, "could not record what was closed");
+            }
+        }
+    }
+    if applied {
+        *ctx.applied = Some(now);
+    }
+}
+
+/// The body of [`run_once`]. `reached_local_steps` is set once it has a
+/// directory to apply, after which it has done all it can whatever fails.
+async fn poll_and_apply<F: FirewallBackend>(
+    ctx: &mut PollContext<'_, F>,
+    state: &Mutex<AgentState>,
+    reached_local_steps: &mut bool,
+) -> Result<(), PollError>
+where
+    F::Error: std::fmt::Display,
+{
     // Snapshot exactly what this cycle sends, then release the lock.
     let (bearer, self_pubkey, declared, endpoint_addr, listen_port, node_ip, transit_capable, exit_capable) = {
         let s = state.lock().await;
@@ -1111,6 +1291,22 @@ where
     } else {
         Vec::new()
     };
+    // Each rule by the declaration it came from, for `narrow_to_local`. A
+    // service address belongs to one service alone (`vip::sanitize`); a
+    // rule that matched none would be left out, and so closed there.
+    let named_rules: Vec<(String, ServiceRule)> = {
+        let names: Vec<(Ipv4Addr, &str)> = node_ip
+            .map(|node| declared.iter().filter_map(|d| Some((own_vip(&d.name, node, &directory)?, d.name.as_str()))).collect())
+            .unwrap_or_default();
+        rules
+            .iter()
+            .filter_map(|r| {
+                let (ServiceRule::Mapped { vip, .. } | ServiceRule::Terminated { vip, .. }) = r;
+                names.iter().find(|(v, _)| v == vip).map(|(_, name)| ((*name).to_string(), r.clone()))
+            })
+            .collect()
+    };
+    *reached_local_steps = true;
     let (failures, owned_egress_now, local_routes_now) = tokio::task::block_in_place(|| {
         let mut failures = Vec::new();
 
@@ -1208,6 +1404,7 @@ where
             Ok(()) => {
                 crate::firewall::ip_forward::take_egress(&plan.take);
                 note_reflexive_applied(ctx.phone_relay, forwarding.reflexive.is_some());
+                *ctx.applied = Some(LastApplied { rules: named_rules, forwarding: forwarding.clone() });
                 plan.guard
             }
             Err(e) => {
@@ -1999,6 +2196,284 @@ mod tests {
         assert!(!PollError::NotRegistered.is_coordinator_trouble());
         // It answered; asking again sooner or later gets the same answer.
         assert!(!PollError::Malformed(String::new()).is_coordinator_trouble());
+    }
+
+    // ---- while the coordinator does not answer: only ever narrows ----
+
+    const VIP2: Ipv4Addr = Ipv4Addr::new(10, 9, 0, 51);
+    const EXIT_CLIENT: Ipv4Addr = Ipv4Addr::new(10, 9, 0, 9);
+
+    /// What a full apply left in place: two services, a relayed pair, a
+    /// phone relay, an exit client and the guarded egress interface it uses.
+    fn last_applied() -> LastApplied {
+        let end = |last: u8, port: u16| wireserve_types::RelayEnd { ip4: Ipv4Addr::new(10, 9, 0, last), relay_port: port, carry_port: port + 1 };
+        LastApplied {
+            rules: vec![
+                ("db".into(), ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("5432"), sources: Some(vec![GRANTED].into()) }),
+                ("web".into(), ServiceRule::Mapped { vip: VIP2, node: NODE, map: pm("80:8080"), sources: None }),
+                ("web".into(), ServiceRule::Mapped { vip: VIP2, node: NODE, map: pm("8443"), sources: None }),
+            ],
+            forwarding: wireserve_types::Forwarding {
+                relay: vec![wireserve_types::RelayForward { a: end(3, 41000), c: end(4, 41002) }],
+                relay_self: Some(NODE),
+                relay_ends: vec![51820],
+                phone_relay: Some(wireserve_types::PhoneRelayRules { listen_port: 51820, divert_port: 41064, mesh_port: 41065, indexes: vec![] }),
+                reflexive: None,
+                guarded: vec!["eth0".into()],
+                exit: vec![EXIT_CLIENT],
+                mesh_v4: Some((Ipv4Addr::new(10, 9, 0, 0), 24)),
+            },
+        }
+    }
+
+    fn declared_then() -> Vec<ServiceDecl> {
+        vec![ServiceDecl::new("db", vec![pm("5432")]), ServiceDecl::new("web", vec![pm("80:8080"), pm("8443")])]
+    }
+
+    #[test]
+    fn nothing_changed_locally_narrows_nothing() {
+        assert_eq!(narrowed(&last_applied(), &declared_then(), true, true), last_applied());
+    }
+
+    #[test]
+    fn a_withdrawn_service_and_a_mapping_dropped_from_a_declaration_are_closed() {
+        let declared = vec![ServiceDecl::new("web", vec![pm("8443")])];
+        let now = narrowed(&last_applied(), &declared, true, true);
+        assert_eq!(now.rules, vec![last_applied().rules[2].clone()]);
+        assert_eq!(now.forwarding, last_applied().forwarding);
+    }
+
+    #[test]
+    fn a_service_declared_for_people_only_since_loses_its_web_rewrite() {
+        let declared = vec![ServiceDecl::new("db", vec![pm("5432")]), for_people("web", vec![pm("80:8080"), pm("8443")])];
+        let now = narrowed(&last_applied(), &declared, true, true);
+        assert!(!reaches(&now.rules.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>(), 8080), "{now:?}");
+        assert_eq!(now.rules.len(), 2);
+    }
+
+    #[test]
+    fn transit_off_stops_relaying_and_exit_off_stops_the_exit() {
+        let now = narrowed(&last_applied(), &declared_then(), false, true);
+        assert!(now.forwarding.relay.is_empty() && now.forwarding.phone_relay.is_none());
+        assert_eq!(now.forwarding.exit, [EXIT_CLIENT]);
+        assert_eq!(now.rules, last_applied().rules);
+
+        let now = narrowed(&last_applied(), &declared_then(), true, false);
+        assert!(now.forwarding.exit.is_empty());
+        assert!(now.forwarding.guarded.is_empty(), "nothing left forwards replies from elsewhere");
+        assert_eq!(now.forwarding.relay, last_applied().forwarding.relay);
+    }
+
+    #[test]
+    fn a_new_declaration_or_a_wider_one_opens_nothing() {
+        // Declared since, the coordinator never answered: no address, no
+        // grant, nothing to open. A broader mapping set for an existing name
+        // keeps exactly the rules it already had.
+        let mut declared = declared_then();
+        declared.push(ServiceDecl::new("ssh", vec![pm("22")]));
+        declared[1].ports.push(pm("9000"));
+        assert_eq!(narrowed(&last_applied(), &declared, true, true), last_applied());
+        // Transit and exit switched on since: nothing the last apply lacked.
+        let mut last = last_applied();
+        last.forwarding.relay.clear();
+        last.forwarding.exit.clear();
+        last.forwarding.guarded.clear();
+        assert_eq!(narrowed(&last, &declared, true, true), last);
+    }
+
+    /// The daemon's state, one poll cycle at a time, against a coordinator
+    /// at `url` and the fake firewall.
+    struct Daemon {
+        dir: tempfile::TempDir,
+        state: Mutex<AgentState>,
+        fw: crate::firewall::fake::FakeFirewallBackend,
+        wg: WgInterface,
+        tracker: crate::wg::EndpointTracker,
+        held: Option<crate::held::Held>,
+        applied: Option<LastApplied>,
+        client: reqwest::Client,
+        url: String,
+    }
+
+    impl Daemon {
+        fn new(url: String) -> Self {
+            let state = AgentState {
+                bearer_token: Some("token".into()),
+                ip4: Some(NODE.to_string()),
+                declared_services: declared_then(),
+                transit_capable: true,
+                exit_capable: true,
+                ..AgentState::default()
+            };
+            Self {
+                dir: tempfile::tempdir().unwrap(),
+                state: Mutex::new(state),
+                fw: crate::firewall::fake::FakeFirewallBackend::default(),
+                // Never brought up: `check` has nothing to look at.
+                wg: WgInterface::new("wsnarrow0").unwrap(),
+                tracker: crate::wg::EndpointTracker::default(),
+                held: None,
+                applied: Some(last_applied()),
+                client: reqwest::Client::new(),
+                url,
+            }
+        }
+
+        async fn cycle(&mut self) -> Result<(), PollError> {
+            let hosts_path = self.dir.path().join("hosts");
+            let state_path = self.dir.path().join("state.json");
+            let mut ctx = PollContext {
+                client: &self.client,
+                coordinator_url: &self.url,
+                hosts_path: &hosts_path,
+                hosts_label: None,
+                state_path: &state_path,
+                wg: &mut self.wg,
+                firewall: &mut self.fw,
+                endpoint_tracker: &mut self.tracker,
+                own_reflexive_addr: None,
+                tls: None,
+                own_dialable_v4: None,
+                phone_relay: None,
+                held: &mut self.held,
+                applied: &mut self.applied,
+            };
+            run_once(&mut ctx, &self.state).await
+        }
+
+        fn applies(&self) -> Vec<(Vec<ServiceRule>, wireserve_types::Forwarding)> {
+            self.fw
+                .calls
+                .iter()
+                .filter_map(|c| match c {
+                    crate::firewall::fake::Call::Apply(rules, fwd) => Some((rules.clone(), fwd.clone())),
+                    crate::firewall::fake::Call::Teardown => None,
+                })
+                .collect()
+        }
+    }
+
+    /// A port nothing listens on: every request is refused at once.
+    fn unreachable() -> String {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// A coordinator that answers every request with a 503.
+    async fn failing() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut conn, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = conn.read(&mut buf).await;
+                let _ = conn.write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn while_the_coordinator_is_unreachable_a_withdrawn_service_is_closed_on_the_next_cycle() {
+        let mut d = Daemon::new(unreachable());
+        d.state.lock().await.declared_services.retain(|s| s.name != "db");
+        let e = d.cycle().await.unwrap_err();
+        assert!(e.is_coordinator_trouble(), "{e}");
+        let applies = d.applies();
+        assert_eq!(applies.len(), 1, "{applies:?}");
+        assert!(!reaches(&applies[0].0, 5432), "{applies:?}");
+        assert!(reaches(&applies[0].0, 8080) && reaches(&applies[0].0, 8443));
+        assert_eq!(applies[0].1.exit, [EXIT_CLIENT], "nothing else changed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn while_the_coordinator_fails_transit_off_and_exit_off_stop_their_forwarding() {
+        let mut d = Daemon::new(failing().await);
+        {
+            let mut s = d.state.lock().await;
+            s.transit_capable = false;
+            s.exit_capable = false;
+        }
+        let e = d.cycle().await.unwrap_err();
+        assert!(matches!(e, PollError::Rejected { status, .. } if status.is_server_error()), "{e}");
+        let applies = d.applies();
+        assert_eq!(applies.len(), 1, "{applies:?}");
+        let fwd = &applies[0].1;
+        assert!(fwd.relay.is_empty() && fwd.phone_relay.is_none() && fwd.exit.is_empty(), "{fwd:?}");
+        assert_eq!(applies[0].0.len(), 3, "the services stay as they were");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn while_the_coordinator_is_unreachable_a_new_declaration_opens_nothing() {
+        let mut d = Daemon::new(unreachable());
+        d.state.lock().await.declared_services.push(ServiceDecl::new("ssh", vec![pm("22")]));
+        d.cycle().await.unwrap_err();
+        assert!(d.applies().is_empty(), "{:?}", d.fw.calls);
+        assert_eq!(d.applied, Some(last_applied()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_cycle_with_nothing_changed_locally_applies_nothing() {
+        let mut d = Daemon::new(unreachable());
+        d.cycle().await.unwrap_err();
+        assert!(d.fw.calls.is_empty());
+
+        // Narrowed once, and then not again for as long as nothing changes.
+        d.state.lock().await.exit_capable = false;
+        d.cycle().await.unwrap_err();
+        d.cycle().await.unwrap_err();
+        assert_eq!(d.applies().len(), 1, "{:?}", d.fw.calls);
+    }
+
+    /// A coordinator that answers `/poll` with `directory`, and anything
+    /// else with a 503.
+    async fn answering(directory: &PollResponse) -> String {
+        let body = serde_json::to_string(directory).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut conn, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 65536];
+                let n = conn.read(&mut buf).await.unwrap_or(0);
+                let reply = if buf[..n].starts_with(b"POST /poll ") {
+                    format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len())
+                } else {
+                    "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+                };
+                let _ = conn.write_all(reply.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn what_an_answered_poll_applied_is_what_an_unanswered_one_narrows() {
+        let mut directory = with_services(vec![published("db", NODE, Some(VIP)), published("web", NODE, Some(VIP2))]);
+        directory.access = open_all(&declared_then());
+        let mut d = Daemon::new(answering(&directory).await);
+        d.applied = None;
+        let _ = d.cycle().await;
+        let applied = d.applied.clone().expect("the firewall step ran");
+        assert_eq!(applied.rules.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["db", "web", "web"]);
+
+        d.url = unreachable();
+        d.state.lock().await.declared_services.retain(|s| s.name != "web");
+        d.cycle().await.unwrap_err();
+        let applies = d.applies();
+        assert_eq!(applies.len(), 2, "{applies:?}");
+        assert_eq!(applies[1].0, [applied.rules[0].1.clone()], "only db is left open");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn after_a_restart_with_the_coordinator_still_down_nothing_is_applied() {
+        // The startup deny-all is all this run has applied: nothing to narrow.
+        let mut d = Daemon::new(unreachable());
+        d.applied = None;
+        d.state.lock().await.declared_services.clear();
+        d.cycle().await.unwrap_err();
+        assert!(d.fw.calls.is_empty());
     }
 
     #[test]
