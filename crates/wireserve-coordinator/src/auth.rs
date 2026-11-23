@@ -166,16 +166,35 @@ impl FromRequestParts<AppState> for AdminAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        // The admin surface keeps the strict early rejection, because the
-        // reasoning in `over_budget` does not apply to it: it binds to
-        // loopback or an internal address (§4.0), there is exactly one
-        // credential and normally one operator, so there is no population
-        // of innocent callers sharing the key to be collateral damage.
-        if over_budget(state, parts) {
-            return Err(AuthError::RateLimited);
-        }
+        // A correct admin token is honoured even when the source is over
+        // budget, as a node's is in `BearerNode`; being over budget only
+        // stops a source from going on failing. The admin surface once
+        // rejected on the budget alone, on the grounds that it binds to
+        // loopback or an internal address (§4.0) with one credential and one
+        // operator, so nobody innocent shared its key. That does not hold:
+        // the limiter is shared with the node listener, and the operator's
+        // source key is shared with every other process on loopback — and,
+        // without trusted proxy headers, with everyone the reverse proxy
+        // forwards, all seen as 127.0.0.1. Ten bad requests a minute to
+        // either listener then locked `wireserve-admin` out with 429, `node
+        // revoke` included, at the moment it is most likely to be needed.
+        //
+        // So the token is compared before the budget is consulted. That
+        // costs an over-budget source the two SHA-256s below, which S3's
+        // check-first order spared it; that is a bounded, small price
+        // against the lockout. A missing or wrong token is treated exactly
+        // as before: counted, delayed, and 429 rather than 401 once over.
+        let blocked = over_budget(state, parts);
+        let reject = |reason: &str| {
+            record_failed_auth(state, parts, "admin", reason);
+            if blocked {
+                AuthError::RateLimited
+            } else {
+                AuthError::Unauthorized
+            }
+        };
         let Some(candidate) = extract_bearer(parts) else {
-            let err = record_failed_auth(state, parts, "admin", "missing_header");
+            let err = reject("missing_header");
             state.rate_limiter.apply_failure_delay().await;
             return Err(err);
         };
@@ -185,7 +204,7 @@ impl FromRequestParts<AppState> for AdminAuth {
         if matches {
             Ok(AdminAuth)
         } else {
-            let err = record_failed_auth(state, parts, "admin", "bad_admin_token");
+            let err = reject("bad_admin_token");
             state.rate_limiter.apply_failure_delay().await;
             Err(err)
         }

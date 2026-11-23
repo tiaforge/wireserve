@@ -527,6 +527,39 @@ async fn rate_limiter_trips_after_threshold_and_is_per_ip() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+#[tokio::test]
+async fn the_admin_token_still_works_when_its_source_is_over_budget() {
+    // The operator shares its source key with every process on loopback,
+    // and the limiter with the node listener: bad requests from any of them
+    // must not lock `wireserve-admin` out, `node revoke` included.
+    let mut config = test_config("");
+    config.rate_limit_max = 2;
+    config.global_auth_failure_max = 3;
+    let app = app_with_config(config);
+    let wrong = || async { app.router.clone().oneshot(raw_request("POST", "/admin/nodes", Some("Bearer wrong"))).await.unwrap().status() };
+    let ip: std::net::IpAddr = PEER_IP.parse().unwrap();
+
+    // Two failures, one of them on the node listener, and the source is over.
+    assert_eq!(wrong().await, StatusCode::UNAUTHORIZED);
+    assert_eq!(poll_full(&app.router, "brt_garbage", json!({ "services": [] })).await.0, StatusCode::UNAUTHORIZED);
+    assert!(app.state.rate_limiter.is_blocked(ip));
+    // Over budget, a wrong token is refused with 429 and still counted: the
+    // third failure is still within the global budget, so not delayed yet.
+    assert_eq!(wrong().await, StatusCode::TOO_MANY_REQUESTS);
+    assert!(app.state.rate_limiter.failure_delay().is_none());
+
+    // The right one is served, a write and a revoke alike...
+    let join = admin_create_node(&app.router, "homeserver").await;
+    register_node(&app.router, &join, "pk-homeserver", 51820).await;
+    assert_eq!(admin_post(&app.router, "/admin/nodes/homeserver/revoke").await, StatusCode::OK);
+    // ...without spending the failure budget or restoring it.
+    assert!(app.state.rate_limiter.failure_delay().is_none(), "a valid request is no failure");
+    assert!(app.state.rate_limiter.is_blocked(ip), "nor does it clear the source's failures");
+    let resp = app.router.clone().oneshot(raw_request("POST", "/admin/nodes", None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "a missing token is refused as before");
+    assert!(app.state.rate_limiter.failure_delay().is_some(), "and counted: the global budget is now spent");
+}
+
 // ---- 13. online / last_handshake threshold ----
 
 #[tokio::test]
