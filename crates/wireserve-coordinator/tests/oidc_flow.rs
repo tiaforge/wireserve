@@ -20,6 +20,7 @@ use openidconnect::core::{
 use openidconnect::{
     AdditionalClaims, Audience, AuthUrl, EmptyAdditionalProviderMetadata, EndUserEmail, IdToken, IdTokenClaims,
     IssuerUrl, JsonWebKeySetUrl, Nonce, PrivateSigningKey, ResponseTypes, StandardClaims, SubjectIdentifier, TokenUrl,
+    UserInfoUrl,
 };
 use serde::{Deserialize, Serialize};
 use tower::ServiceExt;
@@ -29,7 +30,8 @@ const KEY: &str = include_str!("fixtures/oidc-test-key.pem");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Groups {
-    groups: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    groups: Option<Vec<String>>,
 }
 impl AdditionalClaims for Groups {}
 
@@ -46,11 +48,19 @@ struct Idp {
     unverified_email: bool,
     /// How many requests reached the token endpoint.
     token_hits: usize,
+    /// Each refresh token presented, in order; each refresh hands out a new
+    /// one.
+    presented: Vec<String>,
+    /// The userinfo endpoint fails, and a refreshed ID token carries no
+    /// groups, so a refresh must ask it.
+    userinfo_down: bool,
+    /// Whom a refreshed ID token names, if not alice.
+    refresh_sub: Option<String>,
 }
 
 type Shared = Arc<Mutex<Idp>>;
 
-fn id_token(issuer: &str, sub: &str, groups: &[String], nonce: Option<&str>, verified: bool) -> String {
+fn id_token(issuer: &str, sub: &str, groups: Option<&[String]>, nonce: Option<&str>, verified: bool) -> String {
     let key = CoreRsaPrivateSigningKey::from_pem(KEY, None).unwrap();
     let now = chrono::Utc::now();
     let mut claims = IdTokenClaims::<Groups, CoreGenderClaim>::new(
@@ -61,7 +71,7 @@ fn id_token(issuer: &str, sub: &str, groups: &[String], nonce: Option<&str>, ver
         StandardClaims::new(SubjectIdentifier::new(sub.into()))
             .set_email(Some(EndUserEmail::new(format!("{sub}@example.com"))))
             .set_email_verified(Some(verified)),
-        Groups { groups: groups.to_vec() },
+        Groups { groups: groups.map(<[String]>::to_vec) },
     );
     if let Some(n) = nonce {
         claims = claims.set_nonce(Some(Nonce::new(n.into())));
@@ -88,8 +98,15 @@ async fn discovery(State(idp): State<Shared>) -> impl IntoResponse {
         vec![CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256],
         EmptyAdditionalProviderMetadata {},
     )
-    .set_token_endpoint(Some(TokenUrl::new(format!("{issuer}/token")).unwrap()));
+    .set_token_endpoint(Some(TokenUrl::new(format!("{issuer}/token")).unwrap()))
+    .set_userinfo_endpoint(Some(UserInfoUrl::new(format!("{issuer}/userinfo")).unwrap()));
     axum::Json(serde_json::to_value(metadata).unwrap())
+}
+
+/// Asked only when a refreshed ID token carries no groups, which it does
+/// only while `userinfo_down`: it times out, as far as the caller can tell.
+async fn userinfo() -> StatusCode {
+    StatusCode::SERVICE_UNAVAILABLE
 }
 
 async fn jwks() -> impl IntoResponse {
@@ -120,12 +137,18 @@ async fn token(State(idp): State<Shared>, Form(form): Form<HashMap<String, Strin
             if digest != challenge {
                 return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "invalid_grant"}))).into_response();
             }
-            tokens(id_token(&issuer, &sub, &groups, Some(&nonce), !idp.unverified_email), "rt-1")
+            tokens(id_token(&issuer, &sub, Some(&groups), Some(&nonce), !idp.unverified_email), "rt-1")
         }
         Some("refresh_token") if idp.refuse_refresh => {
             (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "invalid_grant"}))).into_response()
         }
-        Some("refresh_token") => tokens(id_token(&issuer, "alice", &idp.groups_now, None, !idp.unverified_email), "rt-2"),
+        Some("refresh_token") => {
+            idp.presented.push(form.get("refresh_token").cloned().unwrap_or_default());
+            let rotated = format!("rt-{}", idp.presented.len() + 1);
+            let sub = idp.refresh_sub.clone().unwrap_or_else(|| "alice".into());
+            let groups = (!idp.userinfo_down).then(|| idp.groups_now.clone());
+            tokens(id_token(&issuer, &sub, groups.as_deref(), None, !idp.unverified_email), &rotated)
+        }
         _ => StatusCode::BAD_REQUEST.into_response(),
     }
 }
@@ -138,6 +161,7 @@ async fn start_idp() -> Shared {
         .route("/.well-known/openid-configuration", axum::routing::get(discovery))
         .route("/jwks", axum::routing::get(jwks))
         .route("/token", axum::routing::post(token))
+        .route("/userinfo", axum::routing::get(userinfo))
         .with_state(idp.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     idp
@@ -762,6 +786,85 @@ async fn a_claim_and_a_sign_in_run_side_by_side_in_one_browser() {
     let resp = call(&app.router, "GET", &claim_callback, Some(&both), None).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(text(resp).await.contains("Yes, this is my device"));
+}
+
+/// laptop claimed by alice in the family group, and its owner as stored.
+async fn claimed(app: &App, idp: &Shared) -> wireserve_coordinator::db::owners::Owner {
+    call(&app.router, "POST", "/admin/nodes", None, None).await;
+    let (cookie, callback) = signed_in(app, idp, "alice", &["family"]).await;
+    let page = text(call(&app.router, "GET", &callback, Some(&cookie), None).await).await;
+    let token = page.split("name=\"token\" value=\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+    let resp = call(&app.router, "POST", "/claim/confirm", Some(&cookie), Some(&format!("token={token}"))).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let conn = app.state.db.conn.lock().await;
+    let node = wireserve_coordinator::db::nodes::find_by_name(&conn, "laptop").unwrap().unwrap();
+    wireserve_coordinator::db::owners::of(&conn, node.id).unwrap().unwrap()
+}
+
+#[tokio::test]
+async fn a_token_rotated_before_a_later_step_failed_is_the_one_used_next() {
+    // A provider that rotates refresh tokens has spent the old one by the
+    // time it answers, and many revoke the whole family when a spent one
+    // comes back: keeping the old one after a userinfo timeout lost the
+    // owner at the next refresh.
+    let idp = start_idp().await;
+    let issuer = idp.lock().unwrap().issuer.clone();
+    let app = app(&issuer);
+    let oidc = app.state.oidc.clone().unwrap();
+    let owner = claimed(&app, &idp).await;
+    let stored = || async {
+        wireserve_coordinator::db::owners::of(&*app.state.db.conn.lock().await, owner.node_id).unwrap().unwrap()
+    };
+
+    idp.lock().unwrap().groups_now = vec!["family".into()];
+    idp.lock().unwrap().userinfo_down = true;
+    wireserve_coordinator::oidc::refresh::pass(&app.state, &oidc).await;
+    let o = stored().await;
+    assert!(o.stale_since.is_some(), "the groups could not be read: stale");
+    assert_eq!(oidc.open(o.node_id, &o.refresh_token_enc).as_deref(), Some("rt-2"), "the rotated token is kept");
+
+    idp.lock().unwrap().userinfo_down = false;
+    wireserve_coordinator::oidc::refresh::pass(&app.state, &oidc).await;
+    assert_eq!(idp.lock().unwrap().presented, ["rt-1", "rt-2"], "the next refresh presents the new token");
+    let o = stored().await;
+    assert!(o.stale_since.is_none());
+    assert_eq!(oidc.open(o.node_id, &o.refresh_token_enc).as_deref(), Some("rt-3"));
+
+    // An answer for someone else is not believed, but the token it came
+    // with is the one the provider will take next: the old one is spent.
+    idp.lock().unwrap().refresh_sub = Some("mallory".into());
+    idp.lock().unwrap().groups_now = vec!["admins".into()];
+    wireserve_coordinator::oidc::refresh::pass(&app.state, &oidc).await;
+    let o = stored().await;
+    assert_eq!((o.groups.as_slice(), o.stale_since.is_some()), (&["family".to_string()][..], true), "nobody else's groups");
+    assert_eq!(oidc.open(o.node_id, &o.refresh_token_enc).as_deref(), Some("rt-4"));
+}
+
+#[tokio::test]
+async fn a_sessions_token_rotated_before_a_later_step_failed_is_the_one_used_next() {
+    let idp = start_idp().await;
+    let issuer = idp.lock().unwrap().issuer.clone();
+    let app = signing_app(&issuer);
+    let (home, _, _) = grafana(&app).await;
+    let (resp, _) = sign_in_as(&app, &idp, "alice", &["family"]).await;
+    let redeem = serde_json::json!({"fqdn": "grafana.int.test", "ticket": ticket_of(&resp), "bind": BIND});
+    let (_, answer) = json(&app.router, "POST", "/sign-in/redeem", &home, redeem).await;
+    let renew = serde_json::json!({"fqdn": "grafana.int.test", "token": answer["token"]});
+    let backdate = || async {
+        app.state.db.conn.lock().await
+            .execute("UPDATE sign_in_sessions SET refreshed_at = '2020-01-01T00:00:00+00:00'", [])
+            .unwrap();
+    };
+
+    backdate().await;
+    idp.lock().unwrap().userinfo_down = true;
+    let (status, _) = json(&app.router, "POST", "/sign-in/renew", &home, renew.clone()).await;
+    assert_eq!(status, StatusCode::OK, "stale, and still counting for now");
+    idp.lock().unwrap().userinfo_down = false;
+    backdate().await;
+    let (status, _) = json(&app.router, "POST", "/sign-in/renew", &home, renew).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(idp.lock().unwrap().presented, ["rt-1", "rt-2"], "the next refresh presents the new token");
 }
 
 fn token_hits(idp: &Shared) -> usize {

@@ -469,9 +469,10 @@ async fn freshen(state: &AppState, oidc: &Oidc, id: &str) -> Result<Fresh, DbErr
             sessions::remove(&conn, id)?;
             return Ok(Fresh::Ended);
         }
-        Err(RefreshError::Failed(e)) => {
-            tracing::warn!(sub = %s.sub, error = %e, "session refresh failed; its groups go stale");
-            sessions::refresh_failed(&conn, id)?;
+        Err(RefreshError::Failed { error, rotated }) => {
+            tracing::warn!(sub = %s.sub, error = %error, "session refresh failed; its groups go stale");
+            let sealed = rotated.map(|t| oidc.seal_for(&aad(id), &t));
+            sessions::refresh_failed(&conn, id, sealed.as_deref())?;
             sessions::touch(&conn, id)?;
         }
     }

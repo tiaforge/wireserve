@@ -125,11 +125,14 @@ pub fn refreshed(
 }
 
 /// A refresh that failed for a reason other than the provider refusing
-/// the token: marks the owner stale, from the first failure on.
-pub fn refresh_failed(conn: &Connection, node_id: i64, sub: &str) -> Result<(), DbError> {
+/// the token: marks the owner stale, from the first failure on. `token_enc`
+/// is the rotated token, when the provider handed one out before the
+/// failure: the one stored is spent then.
+pub fn refresh_failed(conn: &Connection, node_id: i64, sub: &str, token_enc: Option<&str>) -> Result<(), DbError> {
     conn.execute(
-        "UPDATE node_owners SET stale_since = COALESCE(stale_since, ?1) WHERE node_id = ?2 AND sub = ?3",
-        rusqlite::params![super::nodes::now_str(), node_id, sub],
+        "UPDATE node_owners SET stale_since = COALESCE(stale_since, ?1), \
+           refresh_token_enc = COALESCE(?4, refresh_token_enc) WHERE node_id = ?2 AND sub = ?3",
+        rusqlite::params![super::nodes::now_str(), node_id, sub, token_enc],
     )?;
     Ok(())
 }
@@ -243,8 +246,12 @@ mod tests {
         let o = of(&conn, a).unwrap().unwrap();
         assert_eq!((o.groups.as_slice(), o.refresh_token_enc.as_str()), (&["family".to_string()][..], "rotated"));
 
-        refresh_failed(&conn, a, "bob").unwrap();
+        refresh_failed(&conn, a, "bob", None).unwrap();
         let o = of(&conn, a).unwrap().unwrap();
+        assert_eq!(o.refresh_token_enc, "rotated", "kept when nothing new came");
+        refresh_failed(&conn, a, "bob", Some("rotated-again")).unwrap();
+        let o = of(&conn, a).unwrap().unwrap();
+        assert_eq!(o.refresh_token_enc, "rotated-again", "a token rotated before the failure is kept");
         assert!(o.groups_count(Utc::now()), "stale, but not for long yet");
         assert!(!o.groups_count(Utc::now() + Duration::hours(2)));
         assert!(groups_by_node(&conn, Utc::now() + Duration::hours(2)).unwrap().is_empty());
