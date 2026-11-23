@@ -39,6 +39,8 @@ libc.workspace = true
 rand.workspace = true
 
 [dev-dependencies]
+# Paused time: a CA that never answers times out without the test waiting.
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 rcgen = "0.14"
 time = "0.3"
