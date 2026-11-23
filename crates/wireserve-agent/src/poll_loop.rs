@@ -50,6 +50,10 @@ pub enum PollError {
     /// while the others were still applied — see `run_once`.
     #[error("reconciliation incomplete: {}", join_failures(.0))]
     Incomplete(Vec<PollError>),
+    /// The WireGuard interface this daemon made is gone, or another holds
+    /// its name: see `WgInterface::check`. The daemon exits on it.
+    #[error(transparent)]
+    InterfaceLost(#[from] crate::wg::InterfaceLost),
 }
 
 fn join_failures(failures: &[PollError]) -> String {
@@ -83,6 +87,13 @@ impl PollError {
             PollError::Rejected { status, .. } => *status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error(),
             _ => false,
         }
+    }
+
+    /// Whether this is [`PollError::InterfaceLost`]: no later cycle can
+    /// recover from it, only a restart.
+    #[must_use]
+    pub fn is_interface_lost(&self) -> bool {
+        matches!(self, PollError::InterfaceLost(_))
     }
 
     /// The hosts-file step failed with `EROFS`. Under the shipped systemd
@@ -793,6 +804,10 @@ pub async fn run_once<F: FirewallBackend>(
 where
     F::Error: std::fmt::Display,
 {
+    // First, whether there is still an interface to reconcile at all — and
+    // whatever the coordinator then says, or doesn't.
+    ctx.wg.check()?;
+
     // Snapshot exactly what this cycle sends, then release the lock.
     let (bearer, self_pubkey, declared, endpoint_addr, listen_port, node_ip, transit_capable, exit_capable) = {
         let s = state.lock().await;
@@ -1984,6 +1999,15 @@ mod tests {
         assert!(!PollError::NotRegistered.is_coordinator_trouble());
         // It answered; asking again sooner or later gets the same answer.
         assert!(!PollError::Malformed(String::new()).is_coordinator_trouble());
+    }
+
+    #[test]
+    fn only_a_lost_interface_is_one_and_it_is_not_the_coordinators_trouble() {
+        let lost = PollError::from(crate::wg::InterfaceLost { ifname: "wireserve0".into(), reason: "no longer exists".into() });
+        assert!(lost.is_interface_lost());
+        assert!(!lost.is_coordinator_trouble() && !lost.is_unauthorized());
+        assert!(!PollError::Rejected { status: reqwest::StatusCode::BAD_GATEWAY, message: String::new() }.is_interface_lost());
+        assert!(!PollError::Incomplete(vec![PollError::Firewall("x".into())]).is_interface_lost());
     }
 
     fn naming(domain: &str) -> wireserve_types::ServiceNaming {

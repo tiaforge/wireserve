@@ -201,7 +201,10 @@ unprivileged namespace — no root and no containers needed.
 
 The agent adds one route per peer address on its interface and nothing
 else — no routes to peers' endpoints, so hosts without a default route
-work too. Versions before this let the WireGuard library pin a route to
+work too. Every poll it checks the interface is still its own: one set
+down is set up again with its routes, and one deleted (or replaced by
+another under the same name) makes the daemon exit, so the service
+manager restarts it. Versions before this let the WireGuard library pin a route to
 every peer endpoint via the default gateway; those stay until the link
 goes down or the host reboots, and are harmless while the gateway doesn't
 change (`ip route` lists them as `<endpoint-ip> via <gateway>`).

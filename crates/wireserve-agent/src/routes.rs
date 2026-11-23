@@ -24,7 +24,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use netlink_packet_core::{
     NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST,
 };
-use netlink_packet_route::link::LinkMessage;
+use netlink_packet_route::link::{LinkFlags, LinkMessage};
 use netlink_packet_route::route::{
     RouteAddress, RouteAttribute, RouteHeader, RouteMessage, RouteProtocol, RouteScope, RouteType,
 };
@@ -92,7 +92,9 @@ pub fn sync_all(sets: &[RouteSet<'_>]) -> io::Result<()> {
     first_err.map_or(Ok(()), Err)
 }
 
-fn interface_index(ifname: &str) -> io::Result<u32> {
+/// The kernel's index for `ifname`; `ENODEV` when there is no such
+/// interface.
+pub fn interface_index(ifname: &str) -> io::Result<u32> {
     let name = std::ffi::CString::new(ifname).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     // SAFETY: `name` is a valid NUL-terminated string for the call.
     match unsafe { libc::if_nametoindex(name.as_ptr()) } {
@@ -140,6 +142,51 @@ fn request(message: RouteMessage, add: bool) -> io::Result<()> {
     } else {
         send(RouteNetlinkMessage::DelRoute(message), NLM_F_REQUEST | NLM_F_ACK, &[libc::ESRCH, libc::ENOENT])
     }
+}
+
+/// Every address the main table has a host route to, through any
+/// interface: what [`sync`] would find already there. An interface set down
+/// loses its routes — the kernel removes every route through an interface
+/// when it goes down, and setting it up again does not bring them back.
+/// Through any interface, because `sync` counts an address another
+/// interface already routes as added, and that one is not missing either.
+pub fn host_routes() -> io::Result<BTreeSet<IpAddr>> {
+    let mut out = BTreeSet::new();
+    for family in [AddressFamily::Inet, AddressFamily::Inet6] {
+        let mut message = RouteMessage::default();
+        message.header.address_family = family;
+        message.header.table = RouteHeader::RT_TABLE_MAIN;
+        for route in dump(RouteNetlinkMessage::GetRoute(message))? {
+            if route.header.table != RouteHeader::RT_TABLE_MAIN || !matches!(route.header.destination_prefix_length, 32 | 128) {
+                continue;
+            }
+            out.extend(route.attributes.iter().find_map(|a| match a {
+                RouteAttribute::Destination(RouteAddress::Inet(v)) => Some(IpAddr::V4(*v)),
+                RouteAttribute::Destination(RouteAddress::Inet6(v)) => Some(IpAddr::V6(*v)),
+                _ => None,
+            }));
+        }
+    }
+    Ok(out)
+}
+
+/// Whether the interface with this index is set up (`IFF_UP`).
+pub fn link_is_up(index: u32) -> io::Result<bool> {
+    let mut message = LinkMessage::default();
+    message.header.index = index;
+    match roundtrip(RouteNetlinkMessage::GetLink(message), NLM_F_REQUEST, &[])? {
+        Some(RouteNetlinkMessage::NewLink(link)) => Ok(link.header.flags.contains(LinkFlags::Up)),
+        _ => Err(io::Error::other(format!("the kernel did not describe interface {index}"))),
+    }
+}
+
+/// Sets the interface with this index up, as `ip link set up` does.
+pub fn set_link_up(index: u32) -> io::Result<()> {
+    let mut message = LinkMessage::default();
+    message.header.index = index;
+    message.header.flags = LinkFlags::Up;
+    message.header.change_mask = LinkFlags::Up;
+    send(RouteNetlinkMessage::SetLink(message), NLM_F_REQUEST | NLM_F_ACK, &[])
 }
 
 /// The kernel's `local` table, where the host's own addresses live.
@@ -342,6 +389,14 @@ fn send(payload: RouteNetlinkMessage, flags: u16, done: &[i32]) -> io::Result<()
 
 /// [`send`], returning the route the kernel answered with, if it did.
 fn exchange(payload: RouteNetlinkMessage, flags: u16, done: &[i32]) -> io::Result<Option<RouteMessage>> {
+    Ok(match roundtrip(payload, flags, done)? {
+        Some(RouteNetlinkMessage::NewRoute(route)) => Some(route),
+        _ => None,
+    })
+}
+
+/// [`send`], returning the message the kernel answered with, if it did.
+fn roundtrip(payload: RouteNetlinkMessage, flags: u16, done: &[i32]) -> io::Result<Option<RouteNetlinkMessage>> {
     let mut req = NetlinkMessage::from(payload);
     req.header.flags = flags;
     req.finalize();
@@ -368,7 +423,9 @@ fn exchange(payload: RouteNetlinkMessage, flags: u16, done: &[i32]) -> io::Resul
                     return if ok { Ok(None) } else { Err(err) };
                 }
                 NetlinkPayload::Done(_) => return Ok(None),
-                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(route)) => return Ok(Some(route)),
+                NetlinkPayload::InnerMessage(message @ (RouteNetlinkMessage::NewRoute(_) | RouteNetlinkMessage::NewLink(_))) => {
+                    return Ok(Some(message));
+                }
                 _ => {}
             }
             let len = response.header.length as usize;
