@@ -24,9 +24,11 @@ RestartSec=2s
 # A dead agent leaves the last-applied nftables state exactly as
 # restricted as it was (spec §5) — restarting quickly is the mitigation
 # for stale-but-safe state, not a defense against it. It's still safe to
-# restart aggressively, since teardown()-then-deny-all runs again before
-# the first real apply() on every startup (spec §5's ordering
-# requirement), so a crash loop never leaves the interface permissive.
+# restart aggressively: every startup replaces the dead run's table with
+# deny-all in one atomic nft transaction before the first real apply()
+# (spec §5's ordering requirement), so an interface a crash left up keeps
+# a default-deny at every instant, and a clean stop removes the interface
+# before its table. A crash loop never leaves the interface permissive.
 
 RuntimeDirectory=wireserve wireserve-tls
 RuntimeDirectoryMode=0700
