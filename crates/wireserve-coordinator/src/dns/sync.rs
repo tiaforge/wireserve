@@ -139,6 +139,26 @@ pub fn plan(
     out
 }
 
+/// What the loop carries from one pass to the next.
+#[derive(Debug, Default)]
+pub struct Memory {
+    /// Each name whose address changed, and since when (see [`plan`]).
+    moving: BTreeMap<String, (Ipv4Addr, Instant)>,
+    /// Each name found held by somebody else, for what it was wanted for.
+    held: BTreeMap<String, Held>,
+}
+
+/// A name the zone was found to hold for somebody else.
+#[derive(Debug)]
+struct Held {
+    wanted: Wanted,
+    message: String,
+    /// Not asked about again before this, unless what it is wanted for
+    /// changes.
+    next: Instant,
+    wait: Duration,
+}
+
 /// What a pass reports back to the loop.
 #[derive(Debug, Default)]
 pub struct PassOutcome {
@@ -147,8 +167,14 @@ pub struct PassOutcome {
 }
 
 /// One pass: read the directory, write the difference, record the outcome.
-/// Public so the integration tests can drive passes one at a time.
-pub async fn pass(state: &AppState, dns: &Dns, moving: &mut BTreeMap<String, (Ipv4Addr, Instant)>) -> PassOutcome {
+/// Public so the integration tests can drive passes one at a time; each
+/// with a fresh [`Memory`] is a pass right after a start.
+pub async fn pass(state: &AppState, dns: &Dns, memory: &mut Memory) -> PassOutcome {
+    pass_at(state, dns, memory, Instant::now()).await
+}
+
+/// [`pass`] as of `now`, for tests that need time to have gone by.
+pub async fn pass_at(state: &AppState, dns: &Dns, memory: &mut Memory, now: Instant) -> PassOutcome {
     let read = async {
         let conn = state.db.conn.lock().await;
         let peers = nodes::list_all_peers(&conn)?;
@@ -167,7 +193,15 @@ pub async fn pass(state: &AppState, dns: &Dns, moving: &mut BTreeMap<String, (Ip
         }
     };
 
-    let todo = plan(&want, &written, moving, Instant::now());
+    let todo = plan(&want, &written, &mut memory.moving, now);
+    // A held name is asked about again only for something new, or after a
+    // wait that grows to the failure backoff's: the documented steady state
+    // of a name somebody else holds is to stay so until the admin frees it,
+    // and asking on every pass — every few seconds, as polls poke the loop —
+    // cost several provider requests a minute per name, for as long as it
+    // lasted; enough of them, under a foreign wildcard, met the provider's
+    // rate limit and failed the sync and the challenges for the whole mesh.
+    memory.held.retain(|fqdn, h| want.get(fqdn) == Some(&h.wanted));
     let mut errors: BTreeMap<String, String> = BTreeMap::new();
     // Names left alone because something else already holds them: shown to the
     // admin like an error, but not a provider failure, which would slow every
@@ -181,16 +215,25 @@ pub async fn pass(state: &AppState, dns: &Dns, moving: &mut BTreeMap<String, (Ip
         // later deletes what was written, so an existing record would be
         // lost the moment a node declared a service by that name.
         if !written.contains_key(fqdn) {
+            if let Some(h) = memory.held.get(fqdn).filter(|h| now < h.next) {
+                conflicts.insert(fqdn.clone(), h.message.clone());
+                continue;
+            }
             match held_elsewhere(dns.writer.as_ref(), fqdn, mesh.as_ref()).await {
-                Ok(None) => {}
+                Ok(None) => {
+                    memory.held.remove(fqdn);
+                }
                 Ok(Some(record)) => {
-                    conflicts.insert(
-                        fqdn.clone(),
-                        format!("the zone already has a record here ({record}) that this coordinator did not write; not overwriting it"),
-                    );
+                    let message =
+                        format!("the zone already has a record here ({record}) that this coordinator did not write; not overwriting it");
+                    let wait = memory.held.get(fqdn).map_or(INTERVAL, |h| (h.wait * 2).min(MAX_BACKOFF));
+                    let wanted = want[fqdn].clone();
+                    memory.held.insert(fqdn.clone(), Held { wanted, message: message.clone(), next: now + wait, wait });
+                    conflicts.insert(fqdn.clone(), message);
                     continue;
                 }
                 Err(e) => {
+                    memory.held.remove(fqdn);
                     tracing::warn!(fqdn = %fqdn, error = %e, "could not check what a name already holds; not writing it yet");
                     errors.insert(fqdn.clone(), format!("could not check whether the name is already in use: {e}"));
                     continue;
@@ -325,10 +368,10 @@ async fn reap_challenges(state: &AppState, dns: &Dns) -> bool {
 
 /// Runs forever. Spawned once at startup when a provider is configured.
 pub async fn run(state: AppState, dns: Arc<Dns>) {
-    let mut moving = BTreeMap::new();
+    let mut memory = Memory::default();
     let mut failures: u32 = 0;
     loop {
-        let outcome = pass(&state, &dns, &mut moving).await;
+        let outcome = pass(&state, &dns, &mut memory).await;
         failures = if outcome.failed { failures.saturating_add(1) } else { 0 };
         let wait = if failures > 0 {
             // 60s, 120s, 240s … capped: a provider that is down, or a token

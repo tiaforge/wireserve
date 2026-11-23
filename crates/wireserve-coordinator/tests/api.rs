@@ -4597,6 +4597,63 @@ mod dns_records {
     }
 
     #[tokio::test]
+    async fn a_name_somebody_else_holds_is_asked_about_less_and_less_often_and_at_once_when_it_changes() {
+        // Every pass asked again, and polls run a pass every few seconds:
+        // several provider requests a minute per name, for as long as it
+        // stayed taken.
+        let fake = Arc::new(FakeDns::default());
+        let app = app(&fake);
+        let dns = app.state.dns.clone().unwrap();
+        let home = node(&app, "home").await;
+        fake.zone.lock().unwrap().insert("mail.int.example.com".into(), vec!["A 203.0.113.5".into()]);
+        poll_with(&app.router, &home, json!([svc("mail", 80, 8080)])).await;
+        let mut memory = sync::Memory::default();
+        let t0 = std::time::Instant::now();
+        let s = std::time::Duration::from_secs;
+        let asked = || std::mem::take(&mut *fake.looked_up.lock().unwrap()).iter().filter(|n| n.as_str() == "mail.int.example.com").count();
+
+        sync::pass_at(&app.state, &dns, &mut memory, t0).await;
+        assert_eq!(asked(), 1);
+        for at in [5, 30, 59] {
+            sync::pass_at(&app.state, &dns, &mut memory, t0 + s(at)).await;
+            assert_eq!(asked(), 0, "not again at {at}s");
+            assert!(admin_dns(&app, "mail").await["error"].as_str().unwrap().contains("not overwriting"), "still shown");
+        }
+        sync::pass_at(&app.state, &dns, &mut memory, t0 + s(60)).await;
+        assert_eq!(asked(), 1, "after a minute");
+        sync::pass_at(&app.state, &dns, &mut memory, t0 + s(170)).await;
+        assert_eq!(asked(), 0, "then after two");
+        sync::pass_at(&app.state, &dns, &mut memory, t0 + s(180)).await;
+        assert_eq!(asked(), 1);
+        // Never longer than the failure backoff's cap: a freed name is
+        // picked up within it, without a restart.
+        let mut at = s(180);
+        for _ in 0..10 {
+            at += s(900);
+            sync::pass_at(&app.state, &dns, &mut memory, t0 + at).await;
+            assert_eq!(asked(), 1, "at {at:?}");
+        }
+        fake.zone.lock().unwrap().remove("mail.int.example.com");
+        fake.take();
+        sync::pass_at(&app.state, &dns, &mut memory, t0 + at + s(900)).await;
+        assert!(fake.take().iter().any(|c| c.starts_with("set mail.int.example.com")));
+        assert_eq!(admin_dns(&app, "mail").await, json!({"state": "published"}));
+
+        // What it is wanted for changing is asked about at once.
+        fake.zone.lock().unwrap().insert("wiki.int.example.com".into(), vec!["CNAME wiki.example.net".into()]);
+        poll_with(&app.router, &home, json!([svc("mail", 80, 8080), svc("wiki", 80, 8081)])).await;
+        let t1 = t0 + at + s(1000);
+        sync::pass_at(&app.state, &dns, &mut memory, t1).await;
+        assert_eq!(fake.looked_up.lock().unwrap().iter().filter(|n| n.as_str() == "wiki.int.example.com").count(), 1);
+        fake.looked_up.lock().unwrap().clear();
+        poll_with(&app.router, &home, json!([svc("mail", 80, 8080)])).await;
+        sync::pass_at(&app.state, &dns, &mut memory, t1 + s(5)).await;
+        poll_with(&app.router, &home, json!([svc("mail", 80, 8080), svc("wiki", 80, 8081)])).await;
+        sync::pass_at(&app.state, &dns, &mut memory, t1 + s(10)).await;
+        assert_eq!(fake.looked_up.lock().unwrap().iter().filter(|n| n.as_str() == "wiki.int.example.com").count(), 1, "withdrawn and back");
+    }
+
+    #[tokio::test]
     async fn without_a_provider_there_are_no_challenges() {
         let app = named_app();
         let home = node(&app, "home").await;
