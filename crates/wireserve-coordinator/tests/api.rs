@@ -3364,6 +3364,36 @@ async fn transit_reports_are_kept_only_for_nodes_in_the_mesh() {
 }
 
 #[tokio::test]
+async fn a_poll_right_after_a_revoke_or_rejoin_finds_the_node_gone_from_the_directory() {
+    // The handlers alone, without the admin router's middleware: what a poll
+    // sees when it takes the lock after the handler and before the
+    // middleware has run.
+    let app = test_app();
+    let bare = Router::new()
+        .route("/admin/nodes/{name}/revoke", axum::routing::post(routes::admin::revoke_node))
+        .route("/admin/nodes/{name}/rejoin", axum::routing::post(routes::admin::rejoin_node))
+        .with_state(app.state.clone());
+    let (a, b, _c) = transit_scenario(&app).await;
+    let td = admin_create_node(&app.router, "d").await;
+    register_node(&app.router, &td, "pk-d", 51823).await;
+    let (pk_a, pk_b, pk_c, pk_d) = (pubkey_for("pk-a"), pubkey_for("pk-b"), pubkey_for("pk-c"), pubkey_for("pk-d"));
+    assert_eq!(admin_post(&app.router, "/admin/nodes/b/transit/approve").await, StatusCode::OK);
+    let offer = || relay_poll(json!({ "services": [], "transit_capable": true, "transit_reachable": [pk_a, pk_c, pk_d] }));
+    // The directory has just been read in full, and is not due again.
+    poll_full(&app.router, &a, json!({ "services": [] })).await;
+    poll_full(&app.router, &b, offer()).await;
+    assert!(app.state.transit.reaches(&pk_b, &pk_c, 180) && app.state.transit.reaches(&pk_b, &pk_d, 180));
+
+    assert_eq!(admin_post(&bare, "/admin/nodes/c/revoke").await, StatusCode::OK);
+    let req = json_request("POST", "/admin/nodes/d/rejoin", Some(ADMIN), json!({}));
+    assert_eq!(bare.clone().oneshot(req).await.unwrap().status(), StatusCode::CREATED);
+    poll_full(&app.router, &b, offer()).await;
+    assert!(!app.state.transit.reaches(&pk_b, &pk_c, 180), "a revoked node taken back into a carrier's report");
+    assert!(!app.state.transit.reaches(&pk_b, &pk_d, 180), "a rejoined node's old key taken back");
+    assert!(app.state.transit.reaches(&pk_b, &pk_a, 180));
+}
+
+#[tokio::test]
 async fn the_coordinator_keeps_no_more_transit_entries_per_poll_than_the_agent_sends() {
     let app = test_app();
     let (a, b, _c) = transit_scenario(&app).await;

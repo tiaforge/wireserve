@@ -217,6 +217,10 @@ pub async fn revoke_node(
     if let Some(pubkey) = &node.pubkey {
         state.transit.forget(pubkey);
     }
+    // Marked here, under the lock, and not only by the admin middleware once
+    // this returns: a poll that took the lock in between would still find
+    // the node in the directory, and take it back into its transit report.
+    state.directory_changed();
     // Nor its word that it serves anything with TLS (PLAN.md M33).
     crate::db::tls::clear_node(&conn, node.id)?;
     // Warn, never refuse. Revoking is how a compromised node is cut off, so
@@ -380,6 +384,8 @@ pub async fn rejoin_node(
     if let Some(pubkey) = &node.pubkey {
         state.transit.forget(pubkey);
     }
+    // Under the lock, as in `revoke_node`.
+    state.directory_changed();
 
     tracing::info!(event = "node_rejoined", node_name = %name, join_token_ttl_secs = ttl);
     state.poke_dns();
@@ -1069,6 +1075,8 @@ pub async fn deny_transit(
     if let Some(pubkey) = &node.pubkey {
         state.transit.withdraw_carrier(pubkey);
     }
+    // Under the lock, as in `revoke_node`.
+    state.directory_changed();
     tracing::info!(event = "transit_denied", node_name = %name);
     Ok(())
 }
