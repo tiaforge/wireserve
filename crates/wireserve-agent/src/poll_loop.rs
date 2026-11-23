@@ -42,6 +42,10 @@ pub enum PollError {
     /// the next poll asks for all of it.
     #[error("{0}")]
     OutOfStep(#[from] crate::held::OutOfStep),
+    /// A response that parsed but names something this node refuses to act
+    /// on, so none of it is acted on: see [`naming_is_valid`].
+    #[error("coordinator sent a malformed poll response: {0}")]
+    Malformed(String),
     /// One or more of the local steps (peers, firewall, hosts file) failed
     /// while the others were still applied — see `run_once`.
     #[error("reconciliation incomplete: {}", join_failures(.0))]
@@ -491,6 +495,20 @@ pub fn service_rules(
     rules
 }
 
+/// Whether the service domain a directory names is one this node will use.
+///
+/// The domain is written as root into `/etc/hosts`, handed to the terminator
+/// in every service's name, and shown by `status`, and nothing else on the
+/// way checks it. The rule is the one the coordinator applies to its own
+/// `WIRESERVE_SERVICE_DOMAIN`, on purpose: a stricter one here would leave a
+/// correctly configured coordinator with agents that refuse every poll (upper
+/// case and a trailing dot pass both), and that rule already keeps
+/// whitespace, `#` and control characters out.
+#[must_use]
+pub fn naming_is_valid(naming: Option<&wireserve_types::ServiceNaming>) -> bool {
+    naming.is_none_or(|n| wireserve_types::is_valid_hostname(&n.domain))
+}
+
 /// Keeps the access list to what this node can act on: sources inside the
 /// mesh range it pinned, at most [`wireserve_types::MAX_SOURCES_PER_SERVICE`]
 /// of them, and group names a grant could have named. Anything dropped
@@ -896,6 +914,14 @@ where
         });
     }
     let mut directory: PollResponse = resp.json().await?;
+    // Refused before any of it is held or applied, as a body that does not
+    // parse is, so what was last applied stays. Dropping only the naming
+    // would rename every service on this node back to `.wg` for as long as
+    // the coordinator kept sending it.
+    if !naming_is_valid(directory.naming.as_ref()) {
+        let domain = directory.naming.as_ref().map(|n| n.domain.as_str()).unwrap_or_default();
+        return Err(PollError::Malformed(format!("{domain:?} is not a valid service domain")));
+    }
     // The whole directory, whether it came whole or as what changed.
     crate::held::absorb(ctx.held, &mut directory)?;
     // Before anything acts on an address: peers, firewall, hosts file and
@@ -1866,6 +1892,38 @@ mod tests {
         assert!(!rejected(reqwest::StatusCode::BAD_REQUEST).is_coordinator_trouble());
         assert!(!rejected(reqwest::StatusCode::UNAUTHORIZED).is_coordinator_trouble());
         assert!(!PollError::NotRegistered.is_coordinator_trouble());
+        // It answered; asking again sooner or later gets the same answer.
+        assert!(!PollError::Malformed(String::new()).is_coordinator_trouble());
+    }
+
+    fn naming(domain: &str) -> wireserve_types::ServiceNaming {
+        serde_json::from_value(serde_json::json!({ "domain": domain })).unwrap()
+    }
+
+    #[test]
+    fn a_service_domain_carrying_hosts_file_syntax_is_refused() {
+        for domain in [
+            "wg\n203.0.113.66 deb.debian.org\n# END WIRESERVE\n198.51.100.7 github.com",
+            "int.example.com 198.51.100.7.github.com",
+            "int.example.com\t#",
+            "int.example.com#",
+            "int.example.com\r",
+            "int.exa\u{0}mple.com",
+            "",
+            "wg",
+        ] {
+            assert!(!naming_is_valid(Some(&naming(domain))), "expected {domain:?} refused");
+        }
+    }
+
+    #[test]
+    fn every_form_the_coordinator_takes_for_its_domain_is_used() {
+        // The forms `WIRESERVE_SERVICE_DOMAIN` accepts: refusing one of them
+        // would leave every agent of that coordinator failing every poll.
+        for domain in ["int.example.com", "Int.Example.COM", "int.example.com.", "example.com"] {
+            assert!(naming_is_valid(Some(&naming(domain))), "expected {domain:?} used");
+        }
+        assert!(naming_is_valid(None), "no domain is `.wg`, as before");
     }
 
     // ---- F9: PollError::is_unauthorized ----

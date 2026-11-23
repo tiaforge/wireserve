@@ -195,7 +195,16 @@ impl AgentState {
             return Ok(Self::default());
         }
         let raw = std::fs::read(path)?;
-        Ok(serde_json::from_slice(&raw)?)
+        let mut state: Self = serde_json::from_slice(&raw)?;
+        // An agent from before the poll loop checked the service domain may
+        // have saved one it would now refuse, and `status` and the terminator
+        // read this directory before any poll has replaced it. Dropped whole,
+        // as the poll loop drops such a response; the next poll fills it in.
+        if state.last_directory.as_ref().is_some_and(|d| !crate::poll_loop::naming_is_valid(d.naming.as_ref())) {
+            tracing::warn!(path = %path.display(), "dropping a saved directory whose service domain is not valid");
+            state.last_directory = None;
+        }
+        Ok(state)
     }
 
     /// Persists state at mode 600, atomically (see `fsutil::atomic_write`).
@@ -263,6 +272,28 @@ mod tests {
         let state = AgentState::load(&path).unwrap();
         assert_eq!(state.declared_services[0].group, None);
         assert!(state.own_access.is_empty() && state.service_notices.is_empty());
+    }
+
+    #[test]
+    fn a_saved_directory_with_a_service_domain_this_agent_refuses_is_dropped_on_load() {
+        // Written by an agent from before the check, from a poisoned poll.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-state.json");
+        let saved = |domain: &str| {
+            let directory: PollResponse = serde_json::from_value(serde_json::json!({
+                "peers": [], "services": [], "naming": { "domain": domain },
+            }))
+            .unwrap();
+            let state = AgentState { bearer_token: Some("b".into()), last_directory: Some(directory), ..Default::default() };
+            state.save(&path).unwrap();
+            AgentState::load(&path).unwrap()
+        };
+        let poisoned = saved("wg\n203.0.113.66 deb.debian.org\n# END WIRESERVE");
+        assert!(poisoned.last_directory.is_none());
+        assert_eq!(poisoned.bearer_token.as_deref(), Some("b"), "nothing else is lost");
+
+        let kept = saved("Int.Example.COM.");
+        assert_eq!(kept.last_directory.unwrap().naming.unwrap().domain, "Int.Example.COM.");
     }
 
     #[test]
