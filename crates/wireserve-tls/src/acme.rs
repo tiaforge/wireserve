@@ -110,7 +110,16 @@ pub async fn issue(
     let mut order = match account.new_order(&new_order).await {
         Ok(order) => order,
         // A CA without ARI refuses `replaces`; ask again without it.
-        Err(instant_acme::Error::Unsupported(_)) if replaced_id.is_some() => {
+        Err(instant_acme::Error::Unsupported(what)) if replaced_id.is_some() => {
+            tracing::info!(fqdn, "the CA offers no {what}; ordering without naming the certificate replaced");
+            account.new_order(&NewOrder::new(&identifiers)).await?
+        }
+        // A CA with ARI refuses `replaces` too, for a certificate that
+        // already has a replacement order (RFC 9773 `alreadyReplaced`): one
+        // finalized whose certificate never reached the disk. Asking with
+        // it again would be refused forever while the old one expires.
+        Err(e) if replaced_id.is_some() && order_without_replaces(&e) => {
+            tracing::warn!(fqdn, error = %e, "the CA refused the order naming the certificate replaced; ordering without it");
             account.new_order(&NewOrder::new(&identifiers)).await?
         }
         Err(e) => return Err(e.into()),
@@ -157,6 +166,34 @@ pub async fn issue(
     result
 }
 
+/// Whether an order the CA refused while it named the certificate replaced
+/// is asked for again without naming it: for anything the CA answered,
+/// whatever it said, but not when it was never reached or did not answer —
+/// that says nothing about `replaces`, and the next attempt sends it again.
+fn order_without_replaces(e: &instant_acme::Error) -> bool {
+    !unreachable(e)
+}
+
+/// Whether `e` means the CA was not reached or did not finish answering:
+/// the connection failed, or broke on the way. instant-acme's client
+/// reports both as `Other`, with an I/O or hyper error somewhere beneath.
+fn unreachable(e: &instant_acme::Error) -> bool {
+    match e {
+        instant_acme::Error::Hyper(_) | instant_acme::Error::Timeout(_) => true,
+        instant_acme::Error::Other(inner) => {
+            let mut source: Option<&(dyn std::error::Error + 'static)> = Some(inner.as_ref());
+            while let Some(e) = source {
+                if e.is::<std::io::Error>() || e.is::<hyper::Error>() {
+                    return true;
+                }
+                source = e.source();
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 /// When to renew `stored`: inside the CA's suggested window when it gives
 /// one (ARI), two thirds through its life otherwise.
 pub async fn renewal_time(account: &Account, stored: &Stored) -> SystemTime {
@@ -174,5 +211,50 @@ pub async fn renewal_time(account: &Account, stored: &Stored) -> SystemTime {
             start + span.mul_f64(rand::random::<f64>())
         }
         Err(_) => fallback,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn problem(json: serde_json::Value) -> instant_acme::Error {
+        instant_acme::Error::Api(serde_json::from_value(json).unwrap())
+    }
+
+    #[test]
+    fn a_certificate_already_replaced_is_ordered_again_without_replaces() {
+        // What a CA with ARI answers for a certificate whose replacement
+        // order was finalized but never stored (RFC 9773 §5).
+        let refused = problem(serde_json::json!({
+            "type": "urn:ietf:params:acme:error:alreadyReplaced",
+            "detail": "certificate already has a replacement order",
+            "status": 409,
+        }));
+        assert!(order_without_replaces(&refused));
+        assert!(order_without_replaces(&problem(serde_json::json!({ "type": "urn:ietf:params:acme:error:malformed", "status": 400 }))));
+        assert!(order_without_replaces(&instant_acme::Error::Unsupported("ACME renewal information (ARI)")));
+        // A CA that ignored `replaces` in its answer.
+        assert!(order_without_replaces(&instant_acme::Error::Other("replaces field mismatch".into())));
+    }
+
+    #[test]
+    fn a_broken_connection_is_not_a_reason_to_drop_replaces() {
+        let io = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+        assert!(!order_without_replaces(&instant_acme::Error::Other(Box::new(io))));
+        assert!(!order_without_replaces(&instant_acme::Error::Timeout(None)));
+    }
+
+    #[tokio::test]
+    async fn a_ca_that_cannot_be_reached_is_not_a_reason_to_drop_replaces() {
+        // The error instant-acme's own client gives for a refused
+        // connection, which it buries in `Other`.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let new = NewAccount { contact: &[], terms_of_service_agreed: true, only_return_existing: false };
+        let Err(e) = Account::builder().unwrap().create(&new, format!("https://127.0.0.1:{port}/dir"), None).await else {
+            panic!("nothing listens there");
+        };
+        assert!(matches!(e, instant_acme::Error::Other(_)), "{e:?}");
+        assert!(!order_without_replaces(&e), "{e:?}");
     }
 }
