@@ -1,12 +1,22 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended"],
+  "lockFileMaintenance": {
+    "description": "Transitive crates only move with the lockfile: an advisory fixed in a patch release of one is not picked up otherwise",
+    "enabled": true
+  },
   "packageRules": [
     {
       "description": "netlink-packet-route depends on a specific netlink-packet-core, so bump them together",
       "matchManagers": ["cargo"],
       "matchPackageNames": ["netlink-*"],
       "groupName": "netlink"
+    },
+    {
+      "description": "each rusqlite_migration minor pins one rusqlite minor, so neither builds without the other",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["rusqlite", "rusqlite_migration"],
+      "groupName": "rusqlite"
     }
   ]
 }

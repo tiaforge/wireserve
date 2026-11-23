@@ -8,7 +8,9 @@ GitHub Actions there run the checks and publish releases.
 - **Every branch push and pull request**
   (`.github/workflows/ci.yml`): unit tests on x86_64 and aarch64, in
   strict mode, so a firewall test that would quietly skip fails instead;
-  then `cargo clippy -D warnings`.
+  then `cargo clippy -D warnings`; and `cargo audit`, which fails on any
+  advisory against `Cargo.lock` that `.cargo/audit.toml` does not list
+  with its reason.
 - **The Release workflow** (`.github/workflows/release.yml`):
   1. Builds the release binaries on Debian bookworm for both
      architectures.

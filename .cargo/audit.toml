@@ -1,0 +1,13 @@
+# What `cargo audit` (the audit job in .github/workflows/ci.yml) lets pass.
+# Every entry says why it is not reachable here and what would remove it.
+# An advisory not listed fails the job: fix it, or add it here with a reason.
+
+[advisories]
+ignore = [
+    # rsa: timing side channel in private-key operations (Marvin), no fixed
+    # release in the 0.9 line that openidconnect 4 requires. The coordinator
+    # only verifies an identity provider's RS256 signatures, with public keys;
+    # it holds no RSA private key and openidconnect refuses encrypted ID
+    # tokens. Goes when openidconnect moves to rsa 0.10.
+    "RUSTSEC-2023-0071",
+]
