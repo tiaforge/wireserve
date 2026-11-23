@@ -13,7 +13,8 @@
 #      node reaches it, while web stays open;
 #   3. `grant add tag:ops infra` lets the tagged node in, and only it,
 #      and each node's `wireserve status` says what it reaches;
-#   4. taking the grant away cuts a connection already open;
+#   4. taking the grant away cuts a connection already open, even one the
+#      client sends to home's own address instead of the service address;
 #   5. a declaration naming a group lands in it — once: naming another
 #      later changes nothing and says so in `wireserve status`, and naming a
 #      group that does not exist publishes nothing;
@@ -185,7 +186,7 @@ access_says "$CLIENT_B" db no || fail "b's status does not say db is closed to i
 access_says "$CLIENT_B" web yes || fail "b's status does not say it reaches web"
 pass "node-a (tag ops) reaches db; node-b does not, and both statuses say so"
 
-log "4/6: taking the grant away cuts an open connection"
+log "4/6: taking the grant away cuts an open connection, however it is addressed"
 # The second line goes 8s after the first: long enough for home to have
 # polled and dropped the grant in between.
 in_netns_bg "$CLIENT_A" sh -c "(echo one; sleep 8; echo two) | socat -t10 - TCP:$(vip_of db):5432 > /work/flow.out 2>&1"
@@ -196,6 +197,28 @@ cat "$WORK/flow.out"
 grep -q two "$WORK/flow.out" && fail "the open connection outlived the grant"
 refused "$CLIENT_A" db 5432 || fail "a still reaches db"
 pass "the open connection was cut at the next packet"
+# The same, from a client that stops using the service address once it is
+# connected: conntrack knows the flow as a → home:5432, after home's
+# rewrite, so a rewrite of a's own sending the flow there directly kept it
+# going while home still rewrote the replies (PLAN.md #217). Only once the
+# first line is through: a connection opened that way is never admitted.
+admin grant add tag:ops infra
+wait_until "a to reach db again" 30 reaches "$CLIENT_A" db 5432
+home_mesh=$(in_netns "$HOME_AGENT" ip -4 -o addr show wireserve0 | awk '{ split($4, a, "/"); print a[1]; exit }')
+db_vip=$(vip_of db)
+in_netns_bg "$CLIENT_A" sh -c "(echo one; sleep 8; echo two) | socat -t10 - TCP:$db_vip:5432 > /work/moved.out 2>&1"
+wait_until "the connection to carry its first line" 10 grep -q one "$WORK/moved.out"
+in_netns "$CLIENT_A" sh -c "nft add table ip readdress
+    nft add chain ip readdress out '{ type route hook output priority -300; }'
+    nft add rule ip readdress out ip daddr $db_vip tcp dport 5432 counter ip daddr set $home_mesh"
+admin grant remove tag:ops infra
+sleep 11
+cat "$WORK/moved.out"
+sent=$(in_netns "$CLIENT_A" nft list chain ip readdress out | grep -oE 'packets [0-9]+' | awk '{ print $2 }')
+in_netns "$CLIENT_A" nft delete table ip readdress
+[ "${sent:-0}" -gt 0 ] || fail "a never sent the connection to $home_mesh:5432: the check checked nothing"
+grep -q two "$WORK/moved.out" && fail "the open connection outlived the grant, addressed to home's own $home_mesh:5432"
+pass "the open connection was cut at the next packet, addressed to home's own address too"
 
 log "5/6: a declaration names a group once, and never an unknown one"
 admin grant add tag:ops infra
