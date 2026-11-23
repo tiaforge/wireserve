@@ -81,10 +81,13 @@ agents, 25 for a phone) is found.
 Set `--endpoint` on nodes that have a stable reachable address rather
 than relying on the guess.
 
-The agent needs `CAP_NET_ADMIN` and `/dev/net/tun`, and in a container it
-needs host networking, or the mesh exists only inside that container. The
-systemd unit also grants `CAP_CHOWN`, which it uses for one thing: handing
-its socket to the `wireserve` group.
+The agent needs `CAP_NET_ADMIN`, `CAP_NET_RAW` and `/dev/net/tun`. A
+carrier sends phones their packets from a raw socket, and legacy iptables
+on the host wants `NET_RAW` too; Docker grants it by default, Podman does
+not, and a carrier without it does not offer to relay phones. In a
+container the agent needs host networking, or the mesh exists only inside
+that container. The systemd unit also grants `CAP_CHOWN`, which it uses
+for one thing: handing its socket to the `wireserve` group.
 
 ## Two conflicts worth checking before the first start
 
