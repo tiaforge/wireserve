@@ -102,13 +102,28 @@ pub fn create(conn: &Connection, session: &Session, login_hash: &str) -> Result<
     Ok(())
 }
 
+/// When a session last used before is idle: the idle limit holds at lookup,
+/// not only once [`sweep`] has run — a session past it is not found, so it
+/// cannot be renewed while it waits to be swept.
+fn idle_before() -> String {
+    (Utc::now() - IDLE_TTL).to_rfc3339()
+}
+
 pub fn find(conn: &Connection, id: &str) -> Result<Option<Session>, DbError> {
-    Ok(conn.query_row("SELECT * FROM sign_in_sessions WHERE id = ?1", [id], map_row).optional()?)
+    Ok(conn
+        .query_row("SELECT * FROM sign_in_sessions WHERE id = ?1 AND last_used_at >= ?2", rusqlite::params![id, idle_before()], map_row)
+        .optional()?)
 }
 
 /// The session a browser's login cookie stands for.
 pub fn find_by_login(conn: &Connection, login_hash: &str) -> Result<Option<Session>, DbError> {
-    Ok(conn.query_row("SELECT * FROM sign_in_sessions WHERE login_hash = ?1", [login_hash], map_row).optional()?)
+    Ok(conn
+        .query_row(
+            "SELECT * FROM sign_in_sessions WHERE login_hash = ?1 AND last_used_at >= ?2",
+            rusqlite::params![login_hash, idle_before()],
+            map_row,
+        )
+        .optional()?)
 }
 
 pub fn all(conn: &Connection) -> Result<Vec<Session>, DbError> {
@@ -164,7 +179,9 @@ pub fn remove_person(conn: &Connection, who: &str) -> Result<usize, DbError> {
     Ok(conn.execute("DELETE FROM sign_in_sessions WHERE sub = ?1 OR email = ?1", [who])?)
 }
 
-/// Forgets idle sessions and spent tickets.
+/// Forgets idle sessions and spent tickets: on each new session, and on
+/// each pass of the owners' refresh (`oidc::refresh`), so neither waits for
+/// somebody to sign in afresh.
 pub fn sweep(conn: &Connection, now: DateTime<Utc>) -> Result<(), DbError> {
     conn.execute("DELETE FROM sign_in_tickets WHERE expires_at < ?1", [now.to_rfc3339()])?;
     let idle = (now - IDLE_TTL).to_rfc3339();
@@ -289,6 +306,21 @@ mod tests {
         assert!(find(&conn, "s1").unwrap().is_some());
         sweep(&conn, Utc::now() + IDLE_TTL + Duration::minutes(1)).unwrap();
         assert!(find(&conn, "s1").unwrap().is_none());
+    }
+
+    #[test]
+    fn an_idle_session_is_not_found_even_before_it_is_swept() {
+        let db = crate::db::Db::open_in_memory_for_test();
+        let conn = db.conn.blocking_lock();
+        // Made last: making a session sweeps the idle ones.
+        create(&conn, &session("s2", "ben"), "l2").unwrap();
+        let mut s = session("s1", "anna");
+        s.last_used_at = Utc::now() - IDLE_TTL - Duration::minutes(1);
+        create(&conn, &s, "l1").unwrap();
+        assert_eq!(all(&conn).unwrap().len(), 2, "still stored");
+        assert!(find(&conn, "s1").unwrap().is_none());
+        assert!(find_by_login(&conn, "l1").unwrap().is_none());
+        assert!(find(&conn, "s2").unwrap().is_some() && find_by_login(&conn, "l2").unwrap().is_some());
     }
 
     #[test]
