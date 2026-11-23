@@ -673,11 +673,9 @@ impl Route {
         if req.method() == axum::http::Method::CONNECT {
             return crate::sign_in::plain(axum::http::StatusCode::NOT_IMPLEMENTED, "CONNECT is not supported");
         }
-        let host = match req.headers().get(HOST) {
-            Some(h) => Some(h.clone()),
-            // HTTP/2 names it in its authority alone.
-            None => req.uri().authority().and_then(|a| HeaderValue::from_str(a.as_str()).ok()),
-        };
+        // The name the request was checked by, set as `Host` for HTTP/2's
+        // authority too (`checked_name`).
+        let host = req.headers().get(HOST).cloned();
         // The origin form: the backend is the connection's other end.
         let path = req.uri().path_and_query().cloned().unwrap_or_else(|| axum::http::uri::PathAndQuery::from_static("/"));
         let Ok(uri) = axum::http::Uri::builder().path_and_query(path).build() else {
@@ -966,10 +964,18 @@ impl Conn {
             if held.is_none() && shared.requests.log_refusal() {
                 tracing::warn!(peer = %peer.ip(), forwarder, "too many requests being served; refusing new ones (logged once a minute)");
             }
+            let ambiguous = named_ambiguously(&req);
             let misdirected = match &policy {
-                Some(p) if !for_this_service(&req, &p.hosts()) => !(forwarder && take_public_name(&mut req, &p.fqdn)),
+                Some(p) if !ambiguous && !for_this_service(&req, &p.hosts()) => !(forwarder && take_public_name(&mut req, &p.fqdn)),
                 _ => false,
             };
+            // The backend is told the name that was checked, and nothing
+            // else the client wrote there.
+            if !ambiguous && !misdirected {
+                if let Some(name) = checked_name(&req) {
+                    req.headers_mut().insert(axum::http::header::HOST, name);
+                }
+            }
             if misdirected {
                 tracing::info!(
                     service = policy.as_ref().map(|p| p.fqdn.as_str()).unwrap_or_default(),
@@ -1007,6 +1013,15 @@ impl Conn {
                         "this service is no longer served here",
                     ));
                 };
+                if ambiguous {
+                    tracing::info!(
+                        service = %policy.fqdn,
+                        peer = %peer.ip(),
+                        authority = req.uri().authority().map(|a| a.as_str()).unwrap_or_default(),
+                        "refused a request naming its host ambiguously"
+                    );
+                    return Ok(crate::sign_in::plain(axum::http::StatusCode::BAD_REQUEST, "the request names its host ambiguously"));
+                }
                 if misdirected {
                     return Ok(crate::sign_in::plain(
                         axum::http::StatusCode::MISDIRECTED_REQUEST,
@@ -1180,6 +1195,32 @@ fn for_this_service<B>(req: &Request<B>, hosts: &[&str]) -> bool {
         return false;
     }
     authority.is_none_or(same) && header.is_none_or(same)
+}
+
+/// Whether `req` names its host in a way [`for_this_service`] cannot check
+/// whole: userinfo in its authority, which `host()` leaves out with the `@`
+/// — `evil.example,x@svc.test` passed as `svc.test`, and a backend taking
+/// the first of a list read `evil.example` — or more than one `Host`, of
+/// which only the first is checked (RFC 9112 §3.2 has both refused). hyper
+/// takes either, and h2 userinfo in `:authority`.
+fn named_ambiguously<B>(req: &Request<B>) -> bool {
+    req.uri().authority().is_some_and(|a| a.as_str().contains('@'))
+        || req.headers().get_all(axum::http::header::HOST).iter().nth(1).is_some()
+}
+
+/// The name a request was checked by, as its backend is told it: its
+/// `Host`, which [`for_this_service`] found to be a name of the service
+/// with at most a trailing dot and a port; or else its authority's host and
+/// port, rebuilt rather than copied.
+fn checked_name<B>(req: &Request<B>) -> Option<HeaderValue> {
+    if let Some(host) = req.headers().get(axum::http::header::HOST) {
+        return Some(host.clone());
+    }
+    let authority = req.uri().authority()?;
+    match authority.port() {
+        Some(port) => HeaderValue::from_str(&format!("{}:{port}", authority.host())).ok(),
+        None => HeaderValue::from_str(authority.host()).ok(),
+    }
 }
 
 /// A forwarding node's request naming the public name its proxy was asked
@@ -3537,6 +3578,60 @@ mod tests {
         next_text(&mut ws).await;
         let elsewhere = tokio_tungstenite::client_async(open("https://evil.example"), tls(port, &client).await).await;
         assert!(elsewhere.is_err(), "anyone else's page still is not");
+    }
+
+    // ---- what a request names ----
+
+    #[tokio::test]
+    async fn a_name_with_userinfo_is_refused_and_the_backend_hears_only_the_name_checked() {
+        use tokio::io::AsyncWriteExt;
+        let echo = header_echo().await;
+        let (port, client, _) = in_front_of(echo, quick());
+        // `host()` is what follows the `@`, and was all that was checked;
+        // a backend taking the first of a list saw `evil.example`.
+        for head in [
+            "GET https://evil.example,x@svc.test/ HTTP/1.1\r\nconnection: close\r\n\r\n",
+            "GET https://x@svc.test/ HTTP/1.1\r\nhost: svc.test\r\nconnection: close\r\n\r\n",
+        ] {
+            let mut c = tls(port, &client).await;
+            c.write_all(head.as_bytes()).await.unwrap();
+            let answer = read_all(&mut c).await;
+            assert!(answer.starts_with("HTTP/1.1 400"), "{head:?}: {answer}");
+        }
+        // Two names: the first was checked, and the second could go on.
+        let mut c = tls(port, &client).await;
+        c.write_all(b"GET / HTTP/1.1\r\nhost: svc.test\r\nhost: evil.example\r\nconnection: close\r\n\r\n").await.unwrap();
+        let answer = read_all(&mut c).await;
+        assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+
+        // HTTP/2, naming it in its authority alone.
+        let (port, client, _) = in_front_of_h2(echo, quick());
+        let mut send = h2(port, &client).await;
+        let (status, body) = h2_ask(&mut send, Request::get("https://evil.example,x@svc.test/").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, 400, "{body}");
+        let (status, body) = h2_ask(&mut send, Request::get("https://svc.test:443/").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, 200, "{body}");
+        for line in ["host=svc.test:443", "x-forwarded-host=svc.test:443", "forwarded=for=127.0.0.1;host=\"svc.test:443\";proto=https"] {
+            assert!(body.contains(&format!("\n{line}\n")), "{line}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_websocket_reaches_its_backend_with_one_host_the_one_checked() {
+        use tokio::io::AsyncWriteExt;
+        let (port, client, _) = in_front_of(ws_backend().await, quick());
+        let mut s = tls(port, &client).await;
+        s.write_all(
+            b"GET / HTTP/1.1\r\nhost: svc.test\r\nhost: evil.example\r\nupgrade: websocket\r\nconnection: upgrade\r\n\
+              sec-websocket-version: 13\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let answer = read_until(&mut s, |t| t.contains("\r\n\r\n")).await;
+        assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+        let (mut ws, _) = ws(port, &client, "/").await.expect("upgraded");
+        let seen = next_text(&mut ws).await;
+        assert!(seen.contains("\nhost=svc.test\n"), "{seen}");
     }
 
     // ---- requests in flight ----
