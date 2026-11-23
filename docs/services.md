@@ -119,6 +119,8 @@ firewall rewrites `address:PUBLIC` to `node:TARGET` in the kernel:
   sign-in on 80: anything for people goes on 443. On a node without a
   terminator (the container images), or while it is stopped, port 80 goes
   straight to the service, and `wireserve status` marks it `(80 unguarded)`.
+  A service declared `--always-sign-in` is closed on 80 and 443 instead,
+  until the terminator serves it.
   **A web app on any other port is not guarded**: any page a mesh user
   opens can act on it as their device. Publish it as `80:<port>`;
   `wireserve <name>` says so when a port looks like a web app's.

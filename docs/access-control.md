@@ -180,7 +180,10 @@ Without `--always-sign-in` no request names anyone, signed in or not: a
 backend that reads no names is sent none. It needs a granted `oidc:` group:
 `everyone` is no group anyone signs in with, and would let in every account
 the login server has. Until there is one, and the sign-in is on, nobody gets
-into its 443, and `wireserve status` on its node says why. Its other ports
+into its 443, and `wireserve status` on its node says why. Nor while its
+node's terminator is not serving it — just started, still waiting for its
+certificate, stopped, or not installed: its 443 and 80 are closed then,
+never passed straight to the backend. Its other ports
 stay with the grants. Each declaration says it afresh; leave it out and the
 service is back to letting devices in.
 
@@ -303,7 +306,8 @@ Worth knowing:
   affected. Any other port is passed on raw, unchecked: a web app there can
   be driven by any page a mesh user opens. Publish it as `80:<port>`
   instead; `wireserve status` marks a port 80 that no terminator answers
-  `(80 unguarded)`.
+  `(80 unguarded)` — but on a service declared `--always-sign-in` that port
+  is closed instead.
 - **A device names nobody.** Its grants let it in; they never tell a backend
   who is using it, and no node is told who owns a device. Until PLAN.md #326
   a node was told the owners of the devices it said had called — on its word

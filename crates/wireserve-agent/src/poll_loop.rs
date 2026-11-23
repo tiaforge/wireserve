@@ -431,6 +431,11 @@ async fn pinned_mesh_ranges(
 /// sources alone: there is no sign-in without TLS. One it does not answer —
 /// no terminator on this node, or one that stopped — is a rewrite like any
 /// other, straight to the service.
+///
+/// Except for a service declared for people only (`always_sign_in`, PLAN.md
+/// #326), by this node or in its access entry: its 443 and 80 mappings get
+/// no rule at all while the terminator does not serve them, and reserve no
+/// target. Its other mappings stay with the grants.
 pub fn service_rules(
     declared: &[ServiceDecl],
     node_ip: Option<Ipv4Addr>,
@@ -476,6 +481,16 @@ pub fn service_rules(
             }
             if wireserve_types::is_http_map(&map) && term.http_port != 0 && term.http.contains(&d.name) {
                 rules.push(ServiceRule::Terminated { vip, map, port: term.http_port, sources: sources.clone() });
+                continue;
+            }
+            // A service for people only (PLAN.md #326) has its backend trust
+            // the identity headers, which only the terminator sets and strips:
+            // a rewrite straight to it would let a caller name themselves.
+            // Closed instead, and its target left free, as when terminated.
+            // The node's own declaration is enough, whatever the coordinator
+            // sends.
+            if (tls || wireserve_types::is_http_map(&map)) && (d.always_sign_in || grants.always_sign_in) {
+                tracing::debug!(service = %d.name, port = %map, "for people only, and the terminator does not serve it; closed");
                 continue;
             }
             let taken = targets.iter().any(|t| wireserve_types::same_target(t, &map))
@@ -1506,6 +1521,81 @@ mod tests {
         // A terminator not serving it: nothing in front of the 443 either.
         let rules = service_rules(&declared, Some(NODE), &terminated_here("jellyfin"), &access, None, &Terminator::default());
         assert!(rules.iter().all(|r| matches!(r, ServiceRule::Mapped { sources: Some(_), .. })), "{rules:?}");
+    }
+
+    fn for_people(name: &str, ports: Vec<PortMap>) -> ServiceDecl {
+        ServiceDecl { always_sign_in: true, ..ServiceDecl::new(name, ports) }
+    }
+
+    /// The terminator answering `name`'s 443 and 80.
+    fn serving(name: &str) -> Terminator {
+        let names = BTreeSet::from([name.to_string()]);
+        Terminator { tls: names.clone(), tls_port: TLS_PORT, http: names, http_port: 11080 }
+    }
+
+    #[test]
+    fn a_service_for_people_only_is_closed_on_443_and_80_while_the_terminator_does_not_serve_them() {
+        // PLAN.md #326: a rewrite straight to the backend would let anyone
+        // the grants name send it an identity of their choosing.
+        let declared = vec![for_people("grafana", vec![pm("443:3000"), pm("80:3001"), pm("8920")])];
+        let mut access = restricted("grafana", true);
+        access.always_sign_in = true;
+        for term in [Terminator::default(), Terminator { tls_port: TLS_PORT, http_port: 11080, ..Terminator::default() }] {
+            let rules = service_rules(&declared, Some(NODE), &terminated_here("grafana"), &[access.clone()], None, &term);
+            assert_eq!(rules.len(), 1, "{rules:?}");
+            assert!(!reaches(&rules, 3000) && !reaches(&rules, 3001), "{rules:?}");
+            // Its other ports stay with the grants.
+            assert!(
+                matches!(&rules[0], ServiceRule::Mapped { map, sources: Some(s), .. } if map.public == 8920 && **s == [NODE, GRANTED]),
+                "{rules:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_service_for_people_only_is_terminated_as_ever_while_the_terminator_serves_it() {
+        let declared = vec![for_people("grafana", vec![pm("443:3000"), pm("80:3001"), pm("8920")])];
+        let mut access = restricted("grafana", true);
+        access.always_sign_in = true;
+        let rules = service_rules(&declared, Some(NODE), &terminated_here("grafana"), &[access], None, &serving("grafana"));
+        assert_eq!(rules.len(), 3, "{rules:?}");
+        assert!(matches!(&rules[0], ServiceRule::Terminated { map, port, sources: None, .. } if map.public == 443 && *port == TLS_PORT), "{rules:?}");
+        assert!(matches!(&rules[1], ServiceRule::Terminated { map, port: 11080, sources: Some(_), .. } if map.public == 80), "{rules:?}");
+        assert!(matches!(&rules[2], ServiceRule::Mapped { map, sources: Some(_), .. } if map.public == 8920), "{rules:?}");
+    }
+
+    #[test]
+    fn a_service_for_people_only_granted_to_everyone_is_closed_to_everyone_without_the_terminator() {
+        let declared = vec![for_people("grafana", vec![pm("443:3000"), pm("80:3000"), pm("9090")])];
+        let access = wireserve_types::ServiceAccess { name: "grafana".into(), open: true, always_sign_in: true, ..Default::default() };
+        let rules = service_rules(&declared, Some(NODE), &terminated_here("grafana"), &[access], None, &Terminator::default());
+        assert_eq!(rules, vec![ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("9090"), sources: None }]);
+    }
+
+    #[test]
+    fn either_the_declaration_or_the_access_entry_makes_a_service_for_people_only() {
+        // The node's own word holds against a coordinator that leaves the
+        // flag out, and the coordinator's alone closes it too.
+        let dir = terminated_here("grafana");
+        let rules = service_rules(&[for_people("grafana", vec![pm("443:3000")])], Some(NODE), &dir, &[restricted("grafana", true)], None, &Terminator::default());
+        assert!(rules.is_empty(), "{rules:?}");
+        let mut access = restricted("grafana", true);
+        access.always_sign_in = true;
+        let rules = service_rules(&[ServiceDecl::new("grafana", vec![pm("443:3000")])], Some(NODE), &dir, &[access], None, &Terminator::default());
+        assert!(rules.is_empty(), "{rules:?}");
+    }
+
+    #[test]
+    fn a_service_not_for_people_only_still_falls_back_to_a_rewrite() {
+        let declared = vec![ServiceDecl::new("grafana", vec![pm("443:3000"), pm("80:3001")])];
+        let rules = service_rules(&declared, Some(NODE), &terminated_here("grafana"), &open_all(&declared), None, &Terminator::default());
+        assert_eq!(
+            rules,
+            vec![
+                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("443:3000"), sources: None },
+                ServiceRule::Mapped { vip: VIP, node: NODE, map: pm("80:3001"), sources: None },
+            ]
+        );
     }
 
     #[test]
