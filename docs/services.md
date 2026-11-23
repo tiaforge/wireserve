@@ -74,6 +74,10 @@ Each `PORT` is `[PUBLIC:][ADDRESS:]TARGET[/tcp|/udp]` (TCP unless given;
 without an address, the target is on this node). Names are unique across the
 whole mesh, first come first served.
 
+`wireserve <name> off`, or a port dropped from a declaration, closes on the
+node's next poll even while the coordinator can't be reached; anything that
+opens a port waits for a coordinator that answers.
+
 `status` reads the daemon's cache of the last poll, no network call:
 
 ```

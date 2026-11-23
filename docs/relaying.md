@@ -32,7 +32,7 @@ never used; and the mesh admin approves it as a carrier:
 
 ```sh
 wireserve transit on   # on the node: willing to carry traffic for others
-wireserve transit off  # stop — takes effect on the next poll, no rejoin
+wireserve transit off  # stop — on the next poll, coordinator reachable or not
 
 wireserve-admin transit approve homeserver   # on the admin side: trusted to
 wireserve-admin transit deny homeserver      # withdraw it again
