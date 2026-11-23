@@ -235,6 +235,10 @@ pub async fn start(
         Some(hash) => sessions::find_by_login(&*state.db.conn.lock().await, &hash).ok().flatten(),
         None => None,
     };
+    // A session whose token does not open (the token key changed) is kept,
+    // but signing in through it would only ever find it stale: the person
+    // signs in at the provider again, into a session of their own.
+    let known = known.filter(|k| oidc.open_for(&aad(&k.id), &k.refresh_token_enc).is_some());
     if let Some(known) = known {
         match freshen(&state, &oidc, &known.id).await {
             Ok(Fresh::Live(s)) => return go_back(&state, &s, &fqdn, &service, &to, &bind, None).await,
@@ -450,9 +454,22 @@ async fn freshen(state: &AppState, oidc: &Oidc, id: &str) -> Result<Fresh, DbErr
         return Ok(if s.groups_count(now) { Fresh::Live(s) } else { Fresh::Unavailable });
     }
     let Some(token) = oidc.open_for(&aad(id), &s.refresh_token_enc) else {
-        tracing::warn!(event = "session_ended", sub = %s.sub, reason = "unreadable_token");
-        sessions::remove(&*state.db.conn.lock().await, id)?;
-        return Ok(Fresh::Ended);
+        // As for an owner (`refresh::pass`): most likely the token key
+        // changed, which may yet be undone, so the session goes stale
+        // rather than being ended.
+        tracing::warn!(
+            event = "session_token_unreadable",
+            sub = %s.sub,
+            "a session's refresh token does not open with this token key, so its groups go stale; \
+             WIRESERVE_OIDC_TOKEN_KEY has most likely changed (is coordinator-secrets.env mounted?)"
+        );
+        let conn = state.db.conn.lock().await;
+        sessions::refresh_failed(&conn, id, None)?;
+        sessions::touch(&conn, id)?;
+        let Some(s) = sessions::find(&conn, id)? else {
+            return Ok(Fresh::Ended);
+        };
+        return Ok(if s.groups_count(now) { Fresh::Live(s) } else { Fresh::Unavailable });
     };
     let outcome = oidc.refresh(&token, &s.sub).await;
     let conn = state.db.conn.lock().await;

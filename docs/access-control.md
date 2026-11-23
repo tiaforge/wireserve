@@ -120,6 +120,10 @@ fetches their groups again every `WIRESERVE_OIDC_REFRESH_SECS`: someone
 removed from a group loses what it gave them within that. If the provider
 refuses the token, the device belongs to nobody again; if the provider cannot
 be reached, the groups keep counting for an hour, then not until it answers.
+The same goes when the token key changed — the coordinator started without
+the `coordinator-secrets.env` it sealed them with, say: nobody is dropped,
+the log says so on every refresh, and the right key brings everyone back.
+If that key is gone for good, `owner clear` each device and claim it again.
 Revoking or rejoining a node clears its owner — the new identity may be
 another device. An owner's groups only let the device in: no backend is
 told who owns it (see "A device names nobody" below).
