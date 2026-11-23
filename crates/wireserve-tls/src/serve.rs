@@ -459,8 +459,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
     }
 }
 
-/// One service's backend, as the listener finds it by the address a
-/// connection arrived on.
+/// One service's backend, as the listener finds it, for each request, by
+/// the address its connection arrived on. Its idle connections are its
+/// own: once it is replaced, nothing takes them again.
 #[derive(Clone)]
 pub struct Route {
     upstream: SocketAddr,
@@ -834,10 +835,11 @@ fn passed_fds(pid: u32, listen_pid: Option<&str>, listen_fds: Option<&str>) -> O
 /// Accepts on `listener` until aborted, handing each connection to the
 /// service whose address it arrived on.
 ///
-/// The service's policy and the caller's name are looked up for every
-/// request, not once per connection: a grant taken away, or a node
-/// revoked, reaches a keep-alive or HTTP/2 connection at its next request,
-/// and an upgraded one — a WebSocket — within [`Limits::recheck`].
+/// The service's backend, its policy and the caller's name are looked up
+/// for every request, not once per connection: a grant taken away, a node
+/// revoked or a service re-pointed reaches a keep-alive or HTTP/2
+/// connection at its next request, and an upgraded one — a WebSocket —
+/// within [`Limits::recheck`].
 pub fn spawn(listener: TcpListener, tls: Arc<rustls::ServerConfig>, shared: Shared) -> JoinHandle<()> {
     spawn_with_limits(listener, tls, shared, Limits::default())
 }
@@ -881,10 +883,9 @@ fn accept(listener: TcpListener, tls: Option<tokio_rustls::TlsAcceptor>, shared:
             let Some(vip) = tcp.local_addr().ok().and_then(|a| local_v4(a.ip())) else {
                 continue;
             };
-            let route = read(shared.of(http).0).get(&vip).cloned();
-            let Some(route) = route else {
+            if !read(shared.of(http).0).contains_key(&vip) {
                 continue;
-            };
+            }
             // Only what would be answered counts against the limits, and
             // what is over them is closed unanswered, before any TLS work.
             let forwarding_node = shared.forwarding_node(peer.ip());
@@ -913,7 +914,7 @@ fn accept(listener: TcpListener, tls: Option<tokio_rustls::TlsAcceptor>, shared:
                 .with_interval(Duration::from_secs(15))
                 .with_retries(4);
             let _ = socket2::SockRef::from(&tcp).set_tcp_keepalive(&keepalive);
-            let conn = Conn { shared: shared.clone(), limits: limits.clone(), upgrade_slots: Arc::clone(&upgrade_slots), vip, peer, route, http };
+            let conn = Conn { shared: shared.clone(), limits: limits.clone(), upgrade_slots: Arc::clone(&upgrade_slots), vip, peer, http };
             let tls = tls.clone();
             tokio::spawn(async move {
                 match tls {
@@ -937,14 +938,13 @@ struct Conn {
     upgrade_slots: Arc<UpgradeSlots>,
     vip: Ipv4Addr,
     peer: SocketAddr,
-    route: Arc<Route>,
     /// The plain-HTTP listener's (PLAN.md #328): no sign-in.
     http: bool,
 }
 
 impl Conn {
     async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(self, io: S, permit: Permit) {
-        let Conn { shared, limits, upgrade_slots, vip, peer, route, http } = self;
+        let Conn { shared, limits, upgrade_slots, vip, peer, http } = self;
         let stats = Arc::new(ConnStats::default());
         let watched = Watched::new(io, Arc::clone(&stats), permit, &limits);
         let caller_addr = local_v4(peer.ip());
@@ -952,6 +952,9 @@ impl Conn {
         let service = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
             let in_flight = InFlight::begin(&stats);
             let stats = Arc::clone(&stats);
+            // The backend too, as the policy: a service re-pointed, or its
+            // address given to another, is the next request's to find.
+            let route = read(shared.of(http).0).get(&vip).cloned();
             let policy = read(shared.of(http).1).get(&vip).cloned();
             let caller = caller_addr.and_then(|a| read(&shared.callers).get(&a).cloned());
             // No sign-in without TLS: no session can be kept safe there.
@@ -985,8 +988,7 @@ impl Conn {
                     "misdirected request: it names another host"
                 );
             }
-            let route = Arc::clone(&route);
-            let (upstream, recheck) = (route.upstream, limits.recheck);
+            let recheck = limits.recheck;
             let max_upgrades = limits.max_upgrades_per_forwarded_client;
             let upgrade_slots = Arc::clone(&upgrade_slots);
             let upgrade = crate::upgrade::wanted(&req);
@@ -1007,7 +1009,7 @@ impl Conn {
                     busy.headers_mut().insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("1"));
                     return Ok(busy);
                 };
-                let Some(policy) = policy else {
+                let (Some(route), Some(policy)) = (route, policy) else {
                     return Ok(crate::sign_in::plain(
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
                         "this service is no longer served here",
@@ -1082,9 +1084,10 @@ impl Conn {
                         } else {
                             None
                         };
+                        let upstream = route.upstream;
                         let again = move || {
                             let (shared, asked) = (shared.clone(), Arc::clone(&asked));
-                            async move { still_admitted(&shared, http, vip, caller_addr, &asked).await }
+                            async move { still_admitted(&shared, http, vip, upstream, caller_addr, &asked).await }
                         };
                         let answer = crate::upgrade::proxy(req, upstream, peer, scheme, recheck, again, (slot, held)).await;
                         if answer.status() == axum::http::StatusCode::SWITCHING_PROTOCOLS {
@@ -1138,13 +1141,21 @@ fn as_asked<B>(req: &Request<B>) -> Request<()> {
 }
 
 /// Whether the caller of an upgraded connection would still be let in,
-/// asked as its request was (PLAN.md M42): its service still served here
-/// under the name it asked for, and `guard` still letting it through. A
-/// sign-in that cannot be renewed right now closes nothing — its trouble is
-/// not the caller's; a refusal does.
-async fn still_admitted(shared: &Shared, http: bool, vip: Ipv4Addr, caller_addr: Option<Ipv4Addr>, asked: &Request<()>) -> bool {
+/// asked as its request was (PLAN.md M42): its service still served here,
+/// by the backend `upstream` it is open to, under the name it asked for,
+/// and `guard` still letting it through. A sign-in that cannot be renewed
+/// right now closes nothing — its trouble is not the caller's; a refusal
+/// does.
+async fn still_admitted(
+    shared: &Shared,
+    http: bool,
+    vip: Ipv4Addr,
+    upstream: SocketAddr,
+    caller_addr: Option<Ipv4Addr>,
+    asked: &Request<()>,
+) -> bool {
     let (routes, policies) = shared.of(http);
-    if read(routes).get(&vip).is_none() {
+    if !read(routes).get(&vip).is_some_and(|r| r.upstream == upstream) {
         return false;
     }
     let Some(policy) = read(policies).get(&vip).cloned() else {
@@ -3236,11 +3247,21 @@ mod tests {
         assert!(ws_closed_within(&mut ws1, Duration::from_secs(3)).await, "the grant is gone");
 
         // The service no longer served here.
-        shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(granted));
+        shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(granted.clone()));
         let (mut ws2, _) = ws(port, &client, "/").await.expect("granted again");
         next_text(&mut ws2).await;
         shared.unroute(Ipv4Addr::LOCALHOST);
         assert!(ws_closed_within(&mut ws2, Duration::from_secs(3)).await, "unrouted");
+
+        // Or served by another backend now: requests go there, and this
+        // one's bytes would go on to the old.
+        let (first, second) = (ws_backend().await, ws_backend().await);
+        shared.routes.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(Route::new(first)));
+        shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(granted));
+        let (mut ws3, _) = ws(port, &client, "/").await.expect("served again");
+        next_text(&mut ws3).await;
+        shared.routes.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(Route::new(second)));
+        assert!(ws_closed_within(&mut ws3, Duration::from_secs(3)).await, "re-pointed");
     }
 
     fn forwarding(shared: &Shared) {
@@ -3632,6 +3653,54 @@ mod tests {
         let (mut ws, _) = ws(port, &client, "/").await.expect("upgraded");
         let seen = next_text(&mut ws).await;
         assert!(seen.contains("\nhost=svc.test\n"), "{seen}");
+    }
+
+    // ---- a backend that changes ----
+
+    async fn ask_as(send: &mut hyper::client::conn::http1::SendRequest<Body>, host: &str) -> u16 {
+        send.ready().await.unwrap();
+        let req = Request::get("/").header("host", host).body(Body::empty()).unwrap();
+        let res = send.send_request(req).await.unwrap();
+        let status = res.status().as_u16();
+        let _ = axum::body::to_bytes(Body::new(res.into_body()), 1 << 16).await;
+        status
+    }
+
+    #[tokio::test]
+    async fn a_connection_open_when_its_backend_changes_goes_to_the_new_one() {
+        let (old, old_accepted) = counting_backend(true).await;
+        let (new, new_accepted) = counting_backend(true).await;
+        let (port, client, shared) = in_front_of(old, Limits { idle: Duration::from_secs(30), ..quick() });
+        let mut send = kept_open(port, &client).await;
+        assert_eq!(ask_as(&mut send, "svc.test").await, 200);
+        assert_eq!(old_accepted.load(Ordering::SeqCst), 1);
+
+        // Re-pointed, as `lib.rs` does it: unrouted, and routed again. The
+        // old backend's idle connection is not used again.
+        let reroute = |upstream: SocketAddr, fqdn: &str| {
+            shared.unroute(Ipv4Addr::LOCALHOST);
+            shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(open(fqdn)));
+            shared.routes.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(Route::new(upstream)));
+        };
+        reroute(new, "svc.test");
+        for _ in 0..2 {
+            assert_eq!(ask_as(&mut send, "svc.test").await, 200);
+        }
+        assert_eq!((old_accepted.load(Ordering::SeqCst), new_accepted.load(Ordering::SeqCst)), (1, 1));
+
+        // The address given to another service: the connection opened for
+        // the first reaches the second's backend only, under its policy.
+        let (other, other_accepted) = counting_backend(true).await;
+        reroute(other, "other.test");
+        assert_eq!(ask_as(&mut send, "svc.test").await, 421);
+        assert_eq!(ask_as(&mut send, "other.test").await, 200);
+        assert_eq!(other_accepted.load(Ordering::SeqCst), 1);
+        assert_eq!((old_accepted.load(Ordering::SeqCst), new_accepted.load(Ordering::SeqCst)), (1, 1));
+
+        // And no longer served: refused, on the connection still open.
+        shared.unroute(Ipv4Addr::LOCALHOST);
+        shared.policies.write().unwrap().insert(Ipv4Addr::LOCALHOST, Arc::new(open("other.test")));
+        assert_eq!(ask_as(&mut send, "other.test").await, 503);
     }
 
     // ---- requests in flight ----
