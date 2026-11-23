@@ -968,6 +968,7 @@ impl Conn {
                 tracing::warn!(peer = %peer.ip(), forwarder, "too many requests being served; refusing new ones (logged once a minute)");
             }
             let ambiguous = named_ambiguously(&req);
+            let framed_once = one_length(req.headers_mut());
             let misdirected = match &policy {
                 Some(p) if !ambiguous && !for_this_service(&req, &p.hosts()) => !(forwarder && take_public_name(&mut req, &p.fqdn)),
                 _ => false,
@@ -1023,6 +1024,9 @@ impl Conn {
                         "refused a request naming its host ambiguously"
                     );
                     return Ok(crate::sign_in::plain(axum::http::StatusCode::BAD_REQUEST, "the request names its host ambiguously"));
+                }
+                if !framed_once {
+                    return Ok(crate::sign_in::plain(axum::http::StatusCode::BAD_REQUEST, "the request gives lengths that disagree"));
                 }
                 if misdirected {
                     return Ok(crate::sign_in::plain(
@@ -1217,6 +1221,26 @@ fn for_this_service<B>(req: &Request<B>, hosts: &[&str]) -> bool {
 fn named_ambiguously<B>(req: &Request<B>) -> bool {
     req.uri().authority().is_some_and(|a| a.as_str().contains('@'))
         || req.headers().get_all(axum::http::header::HOST).iter().nth(1).is_some()
+}
+
+/// Whether `headers` give one `Content-Length` at most, once the same one
+/// given again is left as one; false for lengths that disagree, which are
+/// refused. hyper refuses those in HTTP/1, but h2 reads only the first:
+/// `0` and `40` with no body reached the backend as both lines, and one
+/// taking the second would read the next request on its connection as
+/// this one's body.
+fn one_length(headers: &mut HeaderMap) -> bool {
+    use axum::http::header::CONTENT_LENGTH;
+    let mut lengths = headers.get_all(CONTENT_LENGTH).iter();
+    let (Some(first), Some(_)) = (lengths.next(), lengths.next()) else {
+        return true;
+    };
+    let first = first.clone();
+    if headers.get_all(CONTENT_LENGTH).iter().any(|v| *v != first) {
+        return false;
+    }
+    headers.insert(CONTENT_LENGTH, first);
+    true
 }
 
 /// The name a request was checked by, as its backend is told it: its
@@ -2644,6 +2668,50 @@ mod tests {
             assert!(answer.is_empty() || status.starts_with('4') || status.starts_with('5'), "refused: {head:?} -> {answer}");
         }
         assert_eq!(rec.seen.lock().unwrap().len(), before, "none reached the backend: {:?}", rec.seen.lock().unwrap());
+
+        // Over HTTP/2 too, where h2 reads only the first length: two that
+        // disagree and no body reached the backend as both lines, and one
+        // that takes the first would read the next request on the
+        // connection as the body. hyper's own backend refuses them, so it
+        // is no witness: this one takes each head as it comes.
+        let heads = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let lenient = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let lenient_addr = lenient.local_addr().unwrap();
+        let log = Arc::clone(&heads);
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = lenient.accept().await.unwrap();
+                let log = Arc::clone(&log);
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n @ 1..) = s.read(&mut buf).await {
+                        log.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase());
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok").await;
+                    }
+                });
+            }
+        });
+        let (port, client, _) = in_front_of_h2(lenient_addr, quick());
+        let mut send = h2(port, &client).await;
+        for lengths in [["0", "40"], ["4", "40"]] {
+            let mut req = Request::post("https://svc.test/dup").body(Body::empty()).unwrap();
+            for length in lengths {
+                req.headers_mut().append("content-length", HeaderValue::from_static(length));
+            }
+            // h2 resets the stream itself when the first is not the body's.
+            let status = send.send_request(req).await.map(|res| res.status().as_u16());
+            assert!(matches!(status, Ok(400) | Err(_)), "refused: {lengths:?} -> {status:?}");
+        }
+        assert!(heads.lock().unwrap().is_empty(), "none reached the backend: {:?}", heads.lock().unwrap());
+        // The same length twice is one length.
+        let mut req = Request::post("https://svc.test/same").body(Body::empty()).unwrap();
+        for _ in 0..2 {
+            req.headers_mut().append("content-length", HeaderValue::from_static("0"));
+        }
+        assert_eq!(h2_ask(&mut send, req).await, (200, "ok".into()));
+        let heads = heads.lock().unwrap().clone();
+        assert_eq!(heads.iter().map(|h| h.matches("content-length:").count()).collect::<Vec<_>>(), [1], "{heads:?}");
     }
 
     #[tokio::test]
