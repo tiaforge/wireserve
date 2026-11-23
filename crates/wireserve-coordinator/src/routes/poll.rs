@@ -208,19 +208,31 @@ async fn answer(
     // rejecting the whole poll the way an invalid endpoint_addr does —
     // the same posture `transit_wanted`/`transit_reachable`'s own doc
     // comments describe.
+    //
+    // No longer than the agent sends them (`MAX_TRANSIT_REACHABLE_PER_POLL`,
+    // `MAX_TRANSIT_WANTED_PER_POLL`): the cap must not rest on the agent
+    // alone. And only pubkeys of nodes in the directory: anything else is
+    // nobody to carry for, and would be kept in `TransitState` for as long
+    // as the node that named it. An honest agent names only peers it was
+    // given from the directory. Read in full first if it is due, so that a
+    // node just revoked is not still taken for one.
     let self_pubkey = node.pubkey.clone().unwrap_or_default();
-    let transit_reachable: Vec<String> = req
-        .transit_reachable
-        .iter()
-        .filter(|pk| wireserve_types::is_valid_wg_pubkey(pk))
-        .cloned()
-        .collect();
-    let transit_wanted: Vec<String> = req
-        .transit_wanted
-        .iter()
-        .filter(|pk| wireserve_types::is_valid_wg_pubkey(pk))
-        .cloned()
-        .collect();
+    state.directory.ensure(&conn, &state)?;
+    let (transit_reachable, transit_wanted) = {
+        let dir = state.directory.read();
+        let keep = |list: &[String], cap: usize| -> Vec<String> {
+            list.iter()
+                .filter(|pk| wireserve_types::is_valid_wg_pubkey(pk))
+                .take(cap)
+                .filter(|pk| dir.id_of(pk).is_some())
+                .cloned()
+                .collect()
+        };
+        (
+            keep(&req.transit_reachable, wireserve_types::MAX_TRANSIT_REACHABLE_PER_POLL),
+            keep(&req.transit_wanted, wireserve_types::MAX_TRANSIT_WANTED_PER_POLL),
+        )
+    };
     // Only an admin makes a node a carrier (security review finding #1).
     // A carrier sees what it relays in the clear, and the two ends put
     // the other end's addresses in its `AllowedIPs`, so it can also send
@@ -259,7 +271,8 @@ async fn answer(
     // NAT mapping that changed after a node's startup probe (see
     // `PollRequest::transit_observed`). Taken from an approved carrier only,
     // already trusted with who talks to whom, and for a peer it says it
-    // reaches right now. A public IPv4 `ip:port` outside the mesh only: a
+    // reaches right now, which makes it a node in the directory (see
+    // `transit_reachable` above). A public IPv4 `ip:port` outside the mesh only: a
     // carrier on a node's own LAN sees an address only that LAN can dial,
     // and the node's own probe says better.
     let observed: Vec<(String, String)> = if transit_capable {

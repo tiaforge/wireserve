@@ -407,10 +407,16 @@ impl TransitState {
 
     /// Drops a node's report — on revoke and rejoin, so it can never be
     /// selected as transit and never shows up as wanting anything
-    /// afterward.
+    /// afterward — and its place in every other node's: it is no longer
+    /// anyone to reach or to want, and a node that stopped polling would
+    /// otherwise keep naming it.
     pub fn forget(&self, pubkey: &str) {
         let mut by_pubkey = self.by_pubkey.lock().expect("transit state mutex poisoned");
         by_pubkey.remove(pubkey);
+        for report in by_pubkey.values_mut() {
+            report.reachable.remove(pubkey);
+            report.wanted.remove(pubkey);
+        }
         drop(by_pubkey);
         self.exit_offered_at.lock().expect("transit state mutex poisoned").remove(pubkey);
         self.capabilities.lock().expect("transit state mutex poisoned").remove(pubkey);
@@ -568,6 +574,17 @@ mod tests {
         s.forget("b");
         assert_eq!(s.select("a", "c", 30), None);
         assert!(!s.either_wants("b", "x"));
+    }
+
+    #[test]
+    fn a_forgotten_node_goes_from_what_every_other_node_reported_too() {
+        let s = TransitState::default();
+        s.report("b", true, &["a".into(), "c".into()], &[]);
+        s.report("d", false, &[], &["c".into(), "e".into()]);
+        s.forget("c");
+        assert!(!s.reaches("b", "c", 30) && s.reaches("b", "a", 30));
+        assert!(!s.either_wants("d", "c") && s.either_wants("d", "e"));
+        assert_eq!(s.wanted_pairs(), [("d".to_string(), "e".to_string())]);
     }
 
     #[test]
