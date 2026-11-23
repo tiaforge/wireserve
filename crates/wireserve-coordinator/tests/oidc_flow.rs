@@ -956,6 +956,68 @@ async fn idle_sessions_and_spent_tickets_go_without_anyone_signing_in_afresh() {
     assert_eq!(left.iter().map(|s| s.sub.as_str()).collect::<Vec<_>>(), ["alice"]);
 }
 
+/// `bearer`'s JSON request whose body goes out only once the test sends it;
+/// `read` fires when the handler starts reading it, its token found good.
+fn held_request(uri: &str, bearer: &str) -> (Request<Body>, tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Sender<serde_json::Value>) {
+    let (reading, read) = tokio::sync::oneshot::channel::<()>();
+    let (send, body) = tokio::sync::oneshot::channel::<serde_json::Value>();
+    let body = Body::from_stream(futures_util::stream::once(async move {
+        let _ = reading.send(());
+        Ok::<_, std::io::Error>(axum::body::Bytes::from(body.await.unwrap_or_default().to_string()))
+    }));
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .unwrap();
+    req.extensions_mut().insert(ConnectInfo("203.0.113.10:1234".parse::<SocketAddr>().unwrap()));
+    (req, read, send)
+}
+
+/// `uri` from `bearer`, with its node rejoined while the body is on the way:
+/// what it was answered.
+async fn sent_across_a_rejoin(app: &App, uri: &str, bearer: &str, body: serde_json::Value) -> StatusCode {
+    let (req, read, send) = held_request(uri, bearer);
+    let router = app.router.clone();
+    let asked = tokio::spawn(async move { router.oneshot(req).await.unwrap() });
+    read.await.unwrap();
+    let (status, _) = json(&app.router, "POST", "/admin/nodes/home/rejoin", "admin", serde_json::json!({})).await;
+    assert!(status.is_success(), "{status}");
+    send.send(body).unwrap();
+    asked.await.unwrap().status()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_ticket_is_redeemed_for_a_node_that_rejoined_while_the_request_was_on_the_way() {
+    // A rejoin keeps the node's services, so the service check alone let
+    // the old token's request through.
+    let idp = start_idp().await;
+    let issuer = idp.lock().unwrap().issuer.clone();
+    let app = signing_app(&issuer);
+    let (home, _, _) = grafana(&app).await;
+    let (resp, _) = sign_in_as(&app, &idp, "alice", &["family"]).await;
+    let ticket = ticket_of(&resp);
+    let redeem = serde_json::json!({"fqdn": "grafana.int.test", "ticket": ticket, "bind": BIND});
+    assert_eq!(sent_across_a_rejoin(&app, "/sign-in/redeem", &home, redeem).await, StatusCode::UNAUTHORIZED);
+    let left: i64 = app.state.db.conn.lock().await.query_row("SELECT COUNT(*) FROM sign_in_tickets", [], |r| r.get(0)).unwrap();
+    assert_eq!(left, 1, "nor is it spent");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_session_is_renewed_for_a_node_that_rejoined_while_the_request_was_on_the_way() {
+    let idp = start_idp().await;
+    let issuer = idp.lock().unwrap().issuer.clone();
+    let app = signing_app(&issuer);
+    let (home, _, _) = grafana(&app).await;
+    let (resp, _) = sign_in_as(&app, &idp, "alice", &["family"]).await;
+    let redeem = serde_json::json!({"fqdn": "grafana.int.test", "ticket": ticket_of(&resp), "bind": BIND});
+    let (_, answer) = json(&app.router, "POST", "/sign-in/redeem", &home, redeem).await;
+    let renew = serde_json::json!({"fqdn": "grafana.int.test", "token": answer["token"]});
+    assert_eq!(sent_across_a_rejoin(&app, "/sign-in/renew", &home, renew).await, StatusCode::UNAUTHORIZED);
+}
+
 fn token_hits(idp: &Shared) -> usize {
     idp.lock().unwrap().token_hits
 }
