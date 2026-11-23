@@ -68,13 +68,15 @@ jobs:
         run: cargo test --workspace --locked
 
       # The service addresses' payload rewrites are refused in a user
-      # namespace, so this one test only does its work as real root.
+      # namespace, so these tests only do their work as real root.
       - name: cargo test (as root, the address rewrites)
         run: |
           bin=$(cargo test -p wireserve-agent --lib --locked --no-run --message-format=json \
             | jq -r 'select(.profile.test == true and .executable != null) | .executable')
           sudo WIRESERVE_TEST_STRICT=1 "$bin" --exact \
-            firewall::nftables::tests::kernel_a_mapped_service_is_reached_through_the_carry_interface_too --nocapture
+            firewall::nftables::tests::kernel_a_mapped_service_is_reached_through_the_carry_interface_too \
+            firewall::nftables::tests::kernel_a_flow_whose_grant_was_taken_away_is_cut_however_the_client_addresses_it \
+            --nocapture
 
   # Known advisories against Cargo.lock. .cargo/audit.toml lists the ones
   # accepted, each with its reason; any other fails here, on whatever push

@@ -39,9 +39,11 @@ waiting to join it — its services would fall back into `default`.
 
 Each service's own node enforces it, for every protocol: its firewall lets
 only the granted nodes' addresses in, and cuts a connection whose grant was
-taken away at its next packet. Changes reach it within a poll and a
-terminator check-in (seconds). Removing the `everyone → default` grant
-turns the whole mesh deny-by-default; `access` says when it is gone.
+taken away at the next packet the client sends on it, whether to the service
+address or straight to the address and port behind it. Changes reach it
+within a poll and a terminator check-in (seconds). Removing the `everyone →
+default` grant turns the whole mesh deny-by-default; `access` says when it
+is gone.
 
 Every node still sees every published service, so a name you aren't granted
 is something to ask for, not a mystery. The ACCESS column of `wireserve

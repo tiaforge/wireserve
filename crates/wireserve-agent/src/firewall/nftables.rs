@@ -401,6 +401,69 @@ fn refuse_tcp() -> [Statement<'static>; 2] {
     ]
 }
 
+/// The refusal, ahead of the established-accept in `chain`, of a flow a
+/// service address admitted that the rules in place now no longer admit.
+///
+/// Conntrack tracks a service's flow as it is after the rewrite, `client →
+/// node:target` (or the LAN target), so a client whose grant was taken away
+/// could address that same flow to `node:target` itself and have every
+/// packet accepted as established, its replies still rewritten back. What
+/// tells the two apart is the packet mark: `svc-pre` sets it, per packet,
+/// only on what the current grants rewrite, while the flow's mark stays from
+/// whichever ruleset first admitted it. So a packet the client sends on a
+/// marked flow without the packet mark is refused, however it is addressed:
+/// TCP with a reset, as the service address refuses what nobody granted, the
+/// rest dropped. `new` as well as `established`, since a UDP flow stays new
+/// until it has seen a reply; not `related`, the ICMP errors about a flow,
+/// which the rewrite never marks. A flow still granted is marked again by the
+/// new rules at its next packet, so a ruleset replace leaves it working.
+///
+/// Always written, services or not: the flows an earlier ruleset marked
+/// outlive it, and a service withdrawn last leaves no rewrite chains at all.
+fn ungranted_service_packets(t: &str, chain: &'static str, ifname: &str) -> [NfObject<'static>; 2] {
+    let ungranted = || {
+        vec![
+            iifname_is(ifname),
+            is(ct("direction", None), Expression::String("original".into())),
+            Statement::Match(Match {
+                left: ct("state", None),
+                right: Expression::List(["new", "established"].map(|s| Expression::String(s.into())).to_vec()),
+                op: Operator::IN,
+            }),
+            has_mark(ct("mark", None)),
+            lacks_mark(meta(MetaKey::Mark)),
+        ]
+    };
+    let mut refuse = ungranted();
+    refuse.extend(refuse_tcp());
+    let mut drop = ungranted();
+    drop.push(Statement::Drop(None::<Drop>));
+    [rule(t, chain, refuse), rule(t, chain, drop)]
+}
+
+/// The same for an exit's flows (PLAN.md M27), which carry [`EXIT_MARK`]
+/// from their first packet: what a device sends on one once it is no longer
+/// among `clients` is dropped, as anything else from it is. Its source
+/// address decides, the same test `exit-mark` admits a new flow by, and a
+/// flow's source never changes, so no packet mark is needed. `None`: no exit
+/// rules, so every exit flow left from before is cut.
+fn ungranted_exit_packets(t: &str, ifname: &str, clients: Option<&[Ipv4Addr]>) -> NfObject<'static> {
+    let mut expr = vec![
+        iifname_is(ifname),
+        is(ct("direction", None), Expression::String("original".into())),
+        has_bit(ct("mark", None), EXIT_MARK),
+    ];
+    if let Some(clients) = clients {
+        expr.push(Statement::Match(Match {
+            left: payload("ip", "saddr"),
+            right: Expression::Named(NamedExpression::Set(clients.iter().map(|a| SetItem::Element(addr(*a))).collect())),
+            op: Operator::NEQ,
+        }));
+    }
+    expr.push(Statement::Drop(None::<Drop>));
+    rule(t, FORWARD_CHAIN, expr)
+}
+
 fn iifname_is_not(ifname: &str) -> Statement<'static> {
     Statement::Match(Match {
         left: meta(MetaKey::Iifname),
@@ -904,6 +967,8 @@ pub(crate) fn apply_batch_with(
     // peer's declared service) — without this, a WG-interface-scoped
     // default-deny would break outbound connectivity through the tunnel
     // just as badly as the bug above broke it on every other interface.
+    // Not a service's flow the grants no longer admit, though.
+    objects.extend(ungranted_service_packets(t, CHAIN_NAME, ifname));
     objects.push(rule(t, CHAIN_NAME, vec![iifname_is(ifname), established_or_related(), accept()]));
     if has_service_addresses {
         objects.push(rule(t, CHAIN_NAME, vec![iifname_is(ifname), has_mark(ct("mark", None)), accept()]));
@@ -956,6 +1021,12 @@ pub(crate) fn apply_batch_with(
             Statement::Drop(None::<Drop>),
         ]));
     }
+    // A service mapped onto a container's published port or a LAN address
+    // is forwarded, so its flows are refused here too once ungranted, and so
+    // are an exit's once the device is no longer its client.
+    let exit = exit_chains(t, ifname, forwarding);
+    objects.extend(ungranted_service_packets(t, FORWARD_CHAIN, ifname));
+    objects.push(ungranted_exit_packets(t, ifname, (!exit.is_empty()).then_some(forwarding.exit.as_slice())));
     objects.push(rule(t, FORWARD_CHAIN, vec![iifname_is(ifname), established_or_related(), accept()]));
     if !mapped.is_empty() {
         objects.push(rule(t, FORWARD_CHAIN, vec![iifname_is(ifname), has_mark(ct("mark", None)), accept()]));
@@ -984,7 +1055,6 @@ pub(crate) fn apply_batch_with(
     // An exit client's new flow to the internet (PLAN.md M27), marked in
     // `exit-mark`. Anything else from it — its gateway's LAN, IPv6 on a host
     // that forwards it — meets the drop below.
-    let exit = exit_chains(t, ifname, forwarding);
     if !exit.is_empty() {
         objects.push(rule(t, FORWARD_CHAIN, vec![
             iifname_is(ifname),
@@ -1020,7 +1090,10 @@ pub(crate) fn apply_batch_with(
     // Who may (PLAN.md M36): a source the grants leave out is never
     // rewritten or marked, and meets the refusal below like a port the
     // address does not publish. Matched per packet, before conntrack, so
-    // taking a source away cuts its open connections too.
+    // taking a source away cuts its open connections too: at the service
+    // address here, and addressed to where it was rewritten to in the input
+    // and forward chains, which refuse a marked flow's packet that these
+    // rules did not mark (`ungranted_service_packets`).
     objects.push(chain(t, PRE_CHAIN, NfChainType::Filter, NfHook::Prerouting, PRIO_RAW));
     let mesh_rewrites = mapped
         .iter()
@@ -1128,6 +1201,7 @@ fn carry_table(
     let has_service_addresses = !mapped.is_empty() || !terminated.is_empty();
 
     objects.push(chain(t, CHAIN_NAME, NfChainType::Filter, NfHook::Input, 0));
+    objects.extend(ungranted_service_packets(t, CHAIN_NAME, carry));
     objects.push(rule(t, CHAIN_NAME, vec![iifname_is(carry), established_or_related(), accept()]));
     if has_service_addresses {
         objects.push(rule(t, CHAIN_NAME, vec![iifname_is(carry), has_mark(ct("mark", None)), accept()]));
@@ -1138,6 +1212,7 @@ fn carry_table(
     objects.push(rule(t, CHAIN_NAME, vec![iifname_is(carry), Statement::Drop(None::<Drop>)]));
 
     objects.push(chain(t, FORWARD_CHAIN, NfChainType::Filter, NfHook::Forward, 0));
+    objects.extend(ungranted_service_packets(t, FORWARD_CHAIN, carry));
     if !mapped.is_empty() {
         objects.push(rule(t, FORWARD_CHAIN, vec![iifname_is(carry), has_mark(ct("mark", None)), accept()]));
     }
@@ -1306,21 +1381,55 @@ mod tests {
         ]
     }
 
-    fn prelude() -> Vec<Value> {
+    /// The matches of `ungranted_service_packets` on `ifname`: a packet its
+    /// client sends on a flow a service address admitted, unmarked now.
+    fn ungranted(ifname: &str) -> Vec<Value> {
         vec![
+            iif(ifname),
+            json!({"match": {"op": "==", "left": {"ct": {"key": "direction"}}, "right": "original"}}),
+            json!({"match": {"op": "in", "left": {"ct": {"key": "state"}}, "right": ["new", "established"]}}),
+            has_mark(json!({"ct": {"key": "mark"}})),
+            json!({"match": {"op": "!=", "left": {"&": [{"meta": {"key": "mark"}}, SERVICE_MARK]}, "right": SERVICE_MARK}}),
+        ]
+    }
+
+    /// Its two rules: TCP refused, the rest dropped.
+    fn ungranted_rules(ifname: &str) -> [Value; 2] {
+        let mut refuse = ungranted(ifname);
+        refuse.extend(refuse_tcp_json());
+        let mut drop = ungranted(ifname);
+        drop.push(json!({"drop": null}));
+        [Value::Array(refuse), Value::Array(drop)]
+    }
+
+    /// `ungranted_exit_packets` with no exit rules: every exit flow left
+    /// from an earlier ruleset is cut.
+    fn no_exit_left() -> Value {
+        json!([
+            iif("wg0"),
+            {"match": {"op": "==", "left": {"ct": {"key": "direction"}}, "right": "original"}},
+            {"match": {"op": "==", "left": {"&": [{"ct": {"key": "mark"}}, EXIT_MARK]}, "right": EXIT_MARK}},
+            {"drop": null},
+        ])
+    }
+
+    fn prelude() -> Vec<Value> {
+        let mut out = vec![
             json!({"add": {"table": table_json()}}),
             json!({"delete": {"table": table_json()}}),
             json!({"add": {"table": table_json()}}),
             chain_json("wireserve-in", "filter", "input", 0),
-            rule_json(json!([iif("wg0"), established(), {"accept": null}])),
-        ]
+        ];
+        out.extend(ungranted_rules("wg0").map(rule_json));
+        out.push(rule_json(json!([iif("wg0"), established(), {"accept": null}])));
+        out
     }
 
     fn forward(extra: Vec<Value>) -> Vec<Value> {
-        let mut out = vec![
-            chain_json("wireserve-fwd", "filter", "forward", 0),
-            rule_in("wireserve-fwd", json!([iif("wg0"), established(), {"accept": null}])),
-        ];
+        let mut out = vec![chain_json("wireserve-fwd", "filter", "forward", 0)];
+        out.extend(ungranted_rules("wg0").map(|r| rule_in("wireserve-fwd", r)));
+        out.push(rule_in("wireserve-fwd", no_exit_left()));
+        out.push(rule_in("wireserve-fwd", json!([iif("wg0"), established(), {"accept": null}])));
         out.extend(extra);
         out.push(rule_in("wireserve-fwd", json!([iif("wg0"), {"drop": null}])));
         out
@@ -1449,13 +1558,16 @@ mod tests {
         assert_eq!(rules_of("svc-rev-post"), std::slice::from_ref(&back));
         assert_eq!(rules_of("svc-rev-in"), [back]);
 
-        // Only a marked flow gets through, never the target port itself.
+        // Only a marked flow gets through, never the target port itself, and
+        // only while the rewrite above still marks what its client sends.
         let accept_marked = json!([iif("wg0"), has_mark(json!({"ct": {"key": "mark"}})), {"accept": null}]);
         let input = rules_of("wireserve-in");
-        assert_eq!(input[1], accept_marked);
+        assert_eq!(input[..2], ungranted_rules("wg0"));
+        assert_eq!(input[3], accept_marked);
         assert!(!input.iter().any(|r| r.to_string().contains("5080")), "{input:?}");
         let fwd = rules_of("wireserve-fwd");
-        assert_eq!(fwd[1], accept_marked);
+        assert_eq!(fwd[..2], ungranted_rules("wg0"));
+        assert_eq!(fwd[4], accept_marked);
         assert!(!fwd.iter().any(|r| r.to_string().contains("5080")), "{fwd:?}");
     }
 
@@ -1535,9 +1647,16 @@ mod tests {
                 {"drop": null},
             ])
         );
-        // Never the mesh interface: that would drop every transit flow.
-        assert_eq!(fwd_rules[1], json!([iif("wg0"), established(), {"accept": null}]));
-        assert!(!fwd_rules.iter().any(|r| r[0] == iif("wg0") && r.to_string().contains(r#""op":"!=""#)));
+        // Never the mesh interface: that would drop every transit flow. What
+        // the mesh interface refuses by the mark is a flow that carries one.
+        assert_eq!(fwd_rules[4], json!([iif("wg0"), established(), {"accept": null}]));
+        for r in fwd_rules.iter().filter(|r| r[0] == iif("wg0")) {
+            for stmt in r.as_array().unwrap() {
+                if stmt.pointer("/match/left/&/0/ct/key") == Some(&json!("mark")) {
+                    assert!(stmt["match"]["op"] == "==" && stmt["match"]["right"] != 0, "{r}");
+                }
+            }
+        }
     }
 
     // ---- PLAN.md M33: terminated on this node ----
@@ -1587,7 +1706,7 @@ mod tests {
             "{port_drop}"
         );
         // Nothing forwarded for it.
-        assert!(!rules_in(&batch, "wireserve-fwd").iter().any(|r| r.to_string().contains("mark")));
+        assert!(!rules_in(&batch, "wireserve-fwd").iter().any(|r| r.to_string().contains("mark") && r.to_string().contains("accept")));
     }
 
     #[test]
@@ -1828,7 +1947,9 @@ mod tests {
         ] {
             let batch = as_json(&apply_batch("wg0", &[mapped("80:5080")], &forwarding));
             let text = batch.to_string();
-            assert!(!text.contains("exit-") && !text.contains(&EXIT_MARK.to_string()), "{text}");
+            // Only the rule that cuts what an earlier exit admitted.
+            assert!(!text.contains("exit-") && text.matches(&EXIT_MARK.to_string()).count() == 2, "{text}");
+            assert!(rules_in(&batch, "wireserve-fwd").contains(&no_exit_left()), "{text}");
             assert_eq!(batch, as_json(&apply_batch("wg0", &[mapped("80:5080")], &Forwarding::default())));
         }
     }
@@ -2363,6 +2484,308 @@ d, a = s.recvfrom(4); s.sendto(d, a)"
         assert_eq!(through_carry, "hello", "a relayed peer reaches it the same way");
     }
 
+    #[test]
+    fn a_flow_the_grants_no_longer_admit_is_refused_ahead_of_every_accept() {
+        // Services or not, on both interfaces, input and forward alike: a
+        // flow an earlier ruleset marked outlives it.
+        for rules in [vec![], vec![only(mapped("5432"), &["100.90.0.7"])], vec![terminated("443:32400")]] {
+            let batch = as_json(&apply_batch_with("wg0", Some("wg0-t"), &[], &rules, &fwd(&[])));
+            for (table, ifname) in [("wireserve.wg0", "wg0"), ("wireserve.wg0-t", "wg0-t")] {
+                for chain in ["wireserve-in", "wireserve-fwd"] {
+                    let expr: Vec<Value> = batch["nftables"].as_array().unwrap().iter()
+                        .filter_map(|o| o.pointer("/add/rule"))
+                        .filter(|r| r["table"] == table && r["chain"] == chain)
+                        .map(|r| r["expr"].clone())
+                        .collect();
+                    let mine: Vec<&Value> = expr.iter().filter(|r| r[0] == iif(ifname)).collect();
+                    assert_eq!(mine[..2], ungranted_rules(ifname).iter().collect::<Vec<_>>(), "{table} {chain}: {expr:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_exit_cuts_the_flows_of_a_device_that_is_no_longer_its_client() {
+        let batch = as_json(&apply_batch("wg0", &[], &exit_fwd(&[CLIENT])));
+        let fwd_rules = rules_in(&batch, "wireserve-fwd");
+        let established_at = fwd_rules.iter().position(|r| *r == json!([iif("wg0"), established(), {"accept": null}])).unwrap();
+        assert_eq!(
+            fwd_rules[established_at - 1],
+            json!([
+                iif("wg0"),
+                {"match": {"op": "==", "left": {"ct": {"key": "direction"}}, "right": "original"}},
+                {"match": {"op": "==", "left": {"&": [{"ct": {"key": "mark"}}, EXIT_MARK]}, "right": EXIT_MARK}},
+                {"match": {"op": "!=", "left": field("ip", "saddr"), "right": {"set": ["100.90.0.9"]}}},
+                {"drop": null},
+            ])
+        );
+        // `exit off`, or the device moved to another exit: all of them.
+        let off = rules_in(&as_json(&apply_batch("wg0", &[], &exit_fwd(&[]))), "wireserve-fwd");
+        assert_eq!(off[established_at - 1], no_exit_left());
+    }
+
+    /// The node's own address and port, and a LAN target's, alongside the
+    /// service addresses that lead there (PLAN.md #217, M26), against real
+    /// packets. This namespace is the node, on a veth named `wg0` in place of
+    /// the mesh interface; around it a client and a LAN host. The client holds
+    /// four connections open, all granted; then the node's rules are replaced
+    /// with two of the three services' grants narrowed to another device,
+    /// and the client sends one of those flows to the node's own address and
+    /// the target port, the other to the LAN host, as an uncooperative client
+    /// that read both off the directory would:
+    ///
+    /// - the flow that keeps sending to the service address is refused;
+    /// - so are both that skip it, although conntrack knows them as
+    ///   established;
+    /// - the flow whose grant stands keeps working across the replace, and a
+    ///   fresh connection to it is made.
+    ///
+    /// Needs real root, like the carry interface's test above.
+    #[test]
+    fn kernel_a_flow_whose_grant_was_taken_away_is_cut_however_the_client_addresses_it() {
+        if !crate::firewall::netns::reexec(
+            "firewall::nftables::tests::kernel_a_flow_whose_grant_was_taken_away_is_cut_however_the_client_addresses_it",
+        ) {
+            return;
+        }
+        let mut hosts = Vec::new();
+        for _ in 0..2 {
+            hosts.push(std::process::Command::new("unshare").args(["-n", "sleep", "60"]).spawn().unwrap());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (client, lan) = (hosts[0].id(), hosts[1].id());
+        let sh = |script: &str| std::process::Command::new("sh").args(["-euc", script]).output().unwrap();
+        let setup = format!(
+            "ip link set lo up
+             ip link add wg0 type veth peer name c0 && ip link set c0 netns {client}
+             ip link add lan0 type veth peer name l0 && ip link set l0 netns {lan}
+             ip addr add 100.90.0.2/32 dev wg0 && ip link set wg0 up && ip route add 100.90.0.7/32 dev wg0
+             ip addr add 192.168.1.1/24 dev lan0 && ip link set lan0 up
+             nsenter -t {client} -n sh -euc 'ip link set lo up; ip addr add 100.90.0.7/32 dev c0; ip link set c0 up
+               ip route add 100.90.0.0/24 via 100.90.0.2 dev c0 onlink; ip route add 192.168.1.0/24 via 100.90.0.2 dev c0 onlink'
+             nsenter -t {lan} -n sh -euc 'ip link set lo up; ip addr add 192.168.1.2/24 dev l0; ip link set l0 up'
+             echo 0 > /proc/sys/net/ipv4/conf/all/forwarding
+             for i in wg0 lan0; do echo 1 > /proc/sys/net/ipv4/conf/$i/forwarding; done"
+        );
+        let out = sh(&setup);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        // db: 100.90.0.50:5432 to the node's own 5432; web: .51:80 to its
+        // 8080; lan: .52:80 to 192.168.1.2:9000. All granted to the client
+        // at first; then db and lan only to another device.
+        let rules = |db_and_lan: &[&str]| {
+            let at = |vip: Ipv4Addr, map: &str| ServiceRule::Mapped { vip, node: NODE, map: map.parse().unwrap(), sources: None };
+            vec![
+                only(at(VIP, "5432"), db_and_lan),
+                only(at(Ipv4Addr::new(100, 90, 0, 51), "80:8080"), &["100.90.0.7"]),
+                only(at(Ipv4Addr::new(100, 90, 0, 52), "80:192.168.1.2:9000"), db_and_lan),
+            ]
+        };
+        let forwarding = Forwarding { guarded: vec!["lan0".into()], ..Forwarding::default() };
+        let stop = |hosts: Vec<std::process::Child>| {
+            for mut h in hosts {
+                let _ = h.kill();
+                let _ = h.wait();
+            }
+        };
+        let out = sh(&nft_script(&[apply_batch("wg0", &rules(&["100.90.0.7"]), &forwarding)]));
+        if !crate::firewall::netns::real_root() && String::from_utf8_lossy(&out.stderr).contains("Operation not permitted") {
+            eprintln!("SKIPPED: the address rewrites need real root (run the test binary under sudo)");
+            stop(hosts);
+            return;
+        }
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        let echo_server = |addr: &str, ports: &[u16]| {
+            format!(
+                "import socket, threading\n\
+                 def serve(port):\n    \
+                     l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); l.bind(('{addr}', port)); l.listen()\n    \
+                     while True:\n        \
+                         c, _ = l.accept()\n        \
+                         threading.Thread(target=lambda c=c: [c.sendall(d) for d in iter(lambda: c.recv(64), b'')], daemon=True).start()\n\
+                 for p in {ports:?}: threading.Thread(target=serve, args=(p,), daemon=True).start()\n\
+                 threading.Event().wait()\n"
+            )
+        };
+        let mut servers = vec![
+            std::process::Command::new("python3").args(["-c", &echo_server("0.0.0.0", &[5432, 8080])]).spawn().unwrap(),
+            std::process::Command::new("nsenter")
+                .args(["-t", &lan.to_string(), "-n", "python3", "-c", &echo_server("192.168.1.2", &[9000])])
+                .spawn()
+                .unwrap(),
+        ];
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        // Each flow echoes one message before the replace and one after.
+        let mut session = std::process::Command::new("nsenter")
+            .args(["-t", &client.to_string(), "-n", "python3", "-c"])
+            .arg(
+                "import json, socket, sys\n\
+                 def echo(s, msg):\n    \
+                     try:\n        \
+                         s.sendall(msg); return s.recv(64) == msg\n    \
+                     except OSError:\n        \
+                         return False\n\
+                 def connect(addr, port):\n    \
+                     return socket.create_connection((addr, port), timeout=2)\n\
+                 flows = {'db': connect('100.90.0.50', 5432), 'db_readdressed': connect('100.90.0.50', 5432),\n         \
+                          'web': connect('100.90.0.51', 80), 'lan_readdressed': connect('100.90.0.52', 80)}\n\
+                 before = {k: echo(s, b'one') for k, s in flows.items()}\n\
+                 print(json.dumps({'before': before, 'ports': {k: s.getsockname()[1] for k, s in flows.items()}}), flush=True)\n\
+                 sys.stdin.readline()\n\
+                 after = {k: echo(s, b'two') for k, s in flows.items()}\n\
+                 try:\n    \
+                     after['web_fresh'] = echo(connect('100.90.0.51', 80), b'three')\n\
+                 except OSError:\n    \
+                     after['web_fresh'] = False\n\
+                 print(json.dumps(after), flush=True)\n",
+            )
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = std::io::BufRead::lines(std::io::BufReader::new(session.stdout.take().unwrap()));
+        let before: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        let port = |flow: &str| before["ports"][flow].as_u64().unwrap();
+
+        let out = sh(&nft_script(&[apply_batch("wg0", &rules(&["100.90.0.8"]), &forwarding)]));
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        // The client's own rewrite, from its next packet on: the same flow,
+        // addressed past the service address. Stateless, as the node's is;
+        // the replies still come from the service address.
+        let readdress = format!(
+            "nft add table ip readdress
+             nft add chain ip readdress out '{{ type route hook output priority -300; }}'
+             nft add rule ip readdress out tcp sport {} ip daddr 100.90.0.50 counter ip daddr set 100.90.0.2
+             nft add rule ip readdress out tcp sport {} ip daddr 100.90.0.52 counter ip daddr set 192.168.1.2 tcp dport set 9000",
+            port("db_readdressed"),
+            port("lan_readdressed"),
+        );
+        let out = sh(&format!("nsenter -t {client} -n sh -euc \"{readdress}\""));
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        std::io::Write::write_all(session.stdin.as_mut().unwrap(), b"\n").unwrap();
+        let after: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        let counters = sh(&format!("nsenter -t {client} -n nft list chain ip readdress out"));
+        let counters = String::from_utf8_lossy(&counters.stdout).to_string();
+        let _ = session.kill();
+        let _ = session.wait();
+        for mut s in servers.drain(..) {
+            let _ = s.kill();
+            let _ = s.wait();
+        }
+        stop(hosts);
+
+        assert_eq!(
+            before["before"],
+            json!({"db": true, "db_readdressed": true, "web": true, "lan_readdressed": true}),
+            "every flow works while granted"
+        );
+        let sent: Vec<u64> = counters
+            .lines()
+            .filter_map(|l| l.split("counter packets ").nth(1))
+            .map(|n| n.split(' ').next().unwrap().parse().unwrap())
+            .collect();
+        assert!(sent.len() == 2 && sent.iter().all(|n| *n > 0), "the client did send both flows past the service address: {counters}");
+        assert_eq!(
+            after,
+            json!({"db": false, "db_readdressed": false, "web": true, "lan_readdressed": false, "web_fresh": true}),
+            "db at its service address, db at the node's own address, web across the replace, the LAN target \
+             at its own address, a fresh connection to web"
+        );
+    }
+
+    /// `exit off` for one device (PLAN.md M27) cuts the connections it has
+    /// open through the exit, and leaves another device's alone. This
+    /// namespace is the exit, as in the test above; both devices are one
+    /// namespace with two mesh addresses, each connection bound to one.
+    #[test]
+    fn kernel_an_exit_cuts_a_flow_once_the_device_is_no_longer_its_client() {
+        if !crate::firewall::netns::reexec("firewall::nftables::tests::kernel_an_exit_cuts_a_flow_once_the_device_is_no_longer_its_client") {
+            return;
+        }
+        let mut hosts = Vec::new();
+        for _ in 0..2 {
+            hosts.push(std::process::Command::new("unshare").args(["-n", "sleep", "60"]).spawn().unwrap());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (devices, internet) = (hosts[0].id(), hosts[1].id());
+        let setup = format!(
+            "ip link set lo up
+             ip link add wg0 type veth peer name c0 && ip link set c0 netns {devices}
+             ip link add eth0 type veth peer name i0 && ip link set i0 netns {internet}
+             ip addr add 100.90.0.1/24 dev wg0 && ip link set wg0 up
+             ip addr add 203.0.113.1/24 dev eth0 && ip link set eth0 up
+             nsenter -t {devices} -n sh -euc 'ip link set lo up; ip addr add 100.90.0.9/24 dev c0; ip addr add 100.90.0.10/24 dev c0
+               ip link set c0 up; ip route add default via 100.90.0.1'
+             nsenter -t {internet} -n sh -euc 'ip link set lo up; ip addr add 203.0.113.2/24 dev i0; ip link set i0 up'
+             echo 0 > /proc/sys/net/ipv4/conf/all/forwarding
+             for i in wg0 eth0; do echo 1 > /proc/sys/net/ipv4/conf/$i/forwarding; done"
+        );
+        let sh = |script: &str| std::process::Command::new("sh").args(["-euc", script]).output().unwrap();
+        let out = sh(&setup);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let other = Ipv4Addr::new(100, 90, 0, 10);
+        let exit_for = |clients: &[Ipv4Addr]| Forwarding { guarded: vec!["eth0".into()], ..exit_fwd(clients) };
+        let out = sh(&nft_script(&[apply_batch("wg0", &[], &exit_for(&[CLIENT, other]))]));
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        let server = std::process::Command::new("nsenter")
+            .args(["-t", &internet.to_string(), "-n", "python3", "-c"])
+            .arg(
+                "import socket, threading\n\
+                 l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); l.bind(('203.0.113.2', 7000)); l.listen()\n\
+                 while True:\n    \
+                     c, _ = l.accept()\n    \
+                     threading.Thread(target=lambda c=c: [c.sendall(d) for d in iter(lambda: c.recv(64), b'')], daemon=True).start()\n",
+            )
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let mut session = std::process::Command::new("nsenter")
+            .args(["-t", &devices.to_string(), "-n", "python3", "-c"])
+            .arg(
+                "import json, socket, sys\n\
+                 def echo(s, msg):\n    \
+                     try:\n        \
+                         s.sendall(msg); return s.recv(64) == msg\n    \
+                     except OSError:\n        \
+                         return False\n\
+                 def connect(src):\n    \
+                     return socket.create_connection(('203.0.113.2', 7000), timeout=2, source_address=(src, 0))\n\
+                 def fresh(src):\n    \
+                     try:\n        \
+                         return echo(connect(src), b'three')\n    \
+                     except OSError:\n        \
+                         return False\n\
+                 flows = {'off': connect('100.90.0.9'), 'on': connect('100.90.0.10')}\n\
+                 print(json.dumps({k: echo(s, b'one') for k, s in flows.items()}), flush=True)\n\
+                 sys.stdin.readline()\n\
+                 after = {k: echo(s, b'two') for k, s in flows.items()}\n\
+                 after.update({'off_fresh': fresh('100.90.0.9'), 'on_fresh': fresh('100.90.0.10')})\n\
+                 print(json.dumps(after), flush=True)\n",
+            )
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = std::io::BufRead::lines(std::io::BufReader::new(session.stdout.take().unwrap()));
+        let before: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        let out = sh(&nft_script(&[apply_batch("wg0", &[], &exit_for(&[other]))]));
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        std::io::Write::write_all(session.stdin.as_mut().unwrap(), b"\n").unwrap();
+        let after: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        for mut p in [session, server].into_iter().chain(hosts) {
+            let _ = p.kill();
+            let _ = p.wait();
+        }
+        assert_eq!(before, json!({"off": true, "on": true}), "both devices reach the internet through the exit");
+        assert_eq!(
+            after,
+            json!({"off": false, "on": true, "off_fresh": false, "on_fresh": true}),
+            "the open connection and a fresh one of the device that left; the other's, across the replace and fresh"
+        );
+    }
+
     // ---- end-to-end relay (PLAN.md M39) ----
 
     fn relay_pair() -> RelayForward {
@@ -2428,13 +2851,19 @@ d, a = s.recvfrom(4); s.sendto(d, a)"
                 .collect()
         };
         let input = in_table("wireserve.wg0-t", "wireserve-in");
-        assert_eq!(input.first().unwrap(), &json!([iif("wg0-t"), established(), {"accept": null}]));
+        // A relayed client loses an ungranted flow the same way (see
+        // `ungranted_service_packets`).
+        assert_eq!(input[..2], ungranted_rules("wg0-t"));
+        assert_eq!(input[2], json!([iif("wg0-t"), established(), {"accept": null}]));
         assert_eq!(input.last().unwrap(), &json!([iif("wg0-t"), {"drop": null}]));
         // A mapped service's own flows go on to its target (PLAN.md #278),
         // and nothing else.
+        let [refuse, drop] = ungranted_rules("wg0-t");
         assert_eq!(
             in_table("wireserve.wg0-t", "wireserve-fwd"),
             [
+                refuse,
+                drop,
                 json!([iif("wg0-t"), has_mark(json!({"ct": {"key": "mark"}})), {"accept": null}]),
                 json!([iif("wg0-t"), {"drop": null}]),
             ]
@@ -2443,8 +2872,9 @@ d, a = s.recvfrom(4); s.sendto(d, a)"
         let forwards: Vec<&Value> = none["nftables"].as_array().unwrap().iter()
             .filter_map(|o| o.pointer("/add/rule"))
             .filter(|r| r["table"] == "wireserve.wg0-t" && r["chain"] == "wireserve-fwd")
+            .filter(|r| r["expr"].to_string().contains("accept"))
             .collect();
-        assert_eq!(forwards.len(), 1, "without a mapped service it forwards nothing: {forwards:?}");
+        assert!(forwards.is_empty(), "without a mapped service it forwards nothing: {forwards:?}");
         let pre = serde_json::to_string(&in_table("wireserve.wg0-t", "svc-pre")).unwrap();
         assert!(pre.contains("100.90.0.7") && pre.contains("wg0-t"), "the same grant: {pre}");
         // The mesh interface's own table is unchanged by it.
