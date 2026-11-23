@@ -1,5 +1,6 @@
-# Unit tests and clippy on every branch push and pull request. Tags are
-# left to release.yml, which builds and runs the e2e suites instead.
+# Unit tests, clippy and an advisory check on every branch push and pull
+# request. Tags are left to release.yml, which builds and runs the e2e
+# suites instead.
 #
 # Actions are pinned to commit hashes: this repository is public, and a
 # moved tag in someone else's repository should not change what runs here.
@@ -74,6 +75,25 @@ jobs:
             | jq -r 'select(.profile.test == true and .executable != null) | .executable')
           sudo WIRESERVE_TEST_STRICT=1 "$bin" --exact \
             firewall::nftables::tests::kernel_a_mapped_service_is_reached_through_the_carry_interface_too --nocapture
+
+  # Known advisories against Cargo.lock. .cargo/audit.toml lists the ones
+  # accepted, each with its reason; any other fails here, on whatever push
+  # comes first after it is published. rust-cache keeps the installed
+  # cargo-audit between runs.
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --locked --version 0.23.0
+          cargo audit --deny unsound --deny yanked
 
   clippy:
     runs-on: ubuntu-24.04

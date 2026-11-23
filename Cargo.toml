@@ -12,7 +12,9 @@ members = [
 # Every crate takes this one version; deploy/release.sh sets it.
 version = "1.0.0-beta.6"
 edition = "2021"
-rust-version = "1.91"
+# The highest a dependency asks for (defguard_wireguard_rs); the release
+# builds with the current stable.
+rust-version = "1.95"
 license = "Apache-2.0"
 
 [workspace.dependencies]
