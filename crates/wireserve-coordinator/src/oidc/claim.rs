@@ -185,15 +185,33 @@ pub struct CallbackQuery {
 
 /// `GET /oidc/callback`: back from the identity provider, for a claim or a
 /// sign-in to a service — whichever the state it returned belongs to.
-pub async fn callback(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<CallbackQuery>) -> Response {
+pub async fn callback(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<CallbackQuery>,
+) -> Response {
     let Some(oidc) = state.oidc.clone() else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // Every return can cost a request to the provider's token endpoint, so
+    // it is counted per source as starts are.
+    let client_ip =
+        crate::client_ip::resolve_client(&headers, peer.ip(), state.config.trusts_forwarded_from(peer.ip())).ip;
+    if oidc.callback_limiter.is_blocked(client_ip) || !oidc.callback_limiter.record(client_ip) {
+        tracing::warn!(event = "sign_in_rate_limited", client_ip = %client_ip, "coming back from the identity provider faster than the per-address limit");
+        return pages::problem(StatusCode::TOO_MANY_REQUESTS, "Too many sign-ins from here just now. Try again in a minute.");
+    }
     // A sign-in to a service (PLAN.md M48): its flow is the browser's own
-    // cookie, gone whatever happens next — a sign-in answers once, and the
-    // provider would not take its code twice anyway.
+    // cookie, cleared whatever happens next — but a cookie someone kept
+    // still opens, so the coordinator also remembers which flows came back:
+    // a sign-in answers once.
     if let Some(flow) = super::sign_in::returning(&state, &oidc, &headers, q.state.as_deref()) {
         let cleared = [super::sign_in::clear_flow(&state)];
+        if !oidc.first_answer(flow.pending.csrf.secret(), flow.until) {
+            tracing::warn!(event = "sign_in_replayed", client_ip = %client_ip, "a sign-in came back from the identity provider a second time");
+            return super::sign_in::with_cookies(expired_flow(), &cleared);
+        }
         if let Some(error) = q.error {
             let page = pages::problem(StatusCode::BAD_REQUEST, &format!("The sign-in did not finish ({error}). Start again to retry."));
             return super::sign_in::with_cookies(page, &cleared);

@@ -44,6 +44,8 @@ struct Idp {
     refuse_refresh: bool,
     /// The email in its tokens is not marked verified (PLAN.md #275).
     unverified_email: bool,
+    /// How many requests reached the token endpoint.
+    token_hits: usize,
 }
 
 type Shared = Arc<Mutex<Idp>>;
@@ -99,6 +101,7 @@ async fn token(State(idp): State<Shared>, Form(form): Form<HashMap<String, Strin
     use base64::Engine as _;
     use sha2::Digest as _;
     let mut idp = idp.lock().unwrap();
+    idp.token_hits += 1;
     let issuer = idp.issuer.clone();
     let tokens = |id: String, refresh: &str| {
         axum::Json(serde_json::json!({
@@ -759,4 +762,68 @@ async fn a_claim_and_a_sign_in_run_side_by_side_in_one_browser() {
     let resp = call(&app.router, "GET", &claim_callback, Some(&both), None).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(text(resp).await.contains("Yes, this is my device"));
+}
+
+fn token_hits(idp: &Shared) -> usize {
+    idp.lock().unwrap().token_hits
+}
+
+#[tokio::test]
+async fn a_sign_in_comes_back_once_and_a_kept_cookie_cannot_make_the_coordinator_ask_again() {
+    // Whoever kept a flow cookie and its state could send the callback at
+    // any rate, and each one had the coordinator post to the provider's
+    // token endpoint with the client secret.
+    let idp = start_idp().await;
+    let issuer = idp.lock().unwrap().issuer.clone();
+    let app = signing_app(&issuer);
+    grafana(&app).await;
+
+    let (flow, callback) = start_sign_in(&app, &idp, "alice", &["family"]).await;
+    let state = callback.split("&state=").nth(1).unwrap().to_string();
+    let made_up = format!("/oidc/callback?code=x&state={state}");
+    let before = token_hits(&idp);
+    assert_eq!(call(&app.router, "GET", &made_up, Some(&flow), None).await.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(token_hits(&idp), before + 1, "the first return is taken to the provider");
+    for _ in 0..5 {
+        assert_eq!(call(&app.router, "GET", &made_up, Some(&flow), None).await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(call(&app.router, "GET", &callback, Some(&flow), None).await.status(), StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(token_hits(&idp), before + 1, "the same flow again never is");
+
+    // A sign-in that finished does not come back either.
+    let (flow, callback) = start_sign_in(&app, &idp, "alice", &["family"]).await;
+    ticket_of(&call(&app.router, "GET", &callback, Some(&flow), None).await);
+    let before = token_hits(&idp);
+    assert_eq!(call(&app.router, "GET", &callback, Some(&flow), None).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(token_hits(&idp), before);
+}
+
+#[tokio::test]
+async fn a_claim_comes_back_once() {
+    let idp = start_idp().await;
+    let issuer = idp.lock().unwrap().issuer.clone();
+    let app = app(&issuer);
+    call(&app.router, "POST", "/admin/nodes", None, None).await;
+    let (cookie, callback) = signed_in(&app, &idp, "alice", &["family"]).await;
+    assert_eq!(call(&app.router, "GET", &callback, Some(&cookie), None).await.status(), StatusCode::OK);
+    let before = token_hits(&idp);
+    for _ in 0..5 {
+        assert_eq!(call(&app.router, "GET", &callback, Some(&cookie), None).await.status(), StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(token_hits(&idp), before, "the provider is not asked again");
+}
+
+#[tokio::test]
+async fn one_address_comes_back_from_the_provider_only_so_often() {
+    let idp = start_idp().await;
+    let issuer = idp.lock().unwrap().issuer.clone();
+    let app = signing_app(&issuer);
+    let uri = "/oidc/callback?code=x&state=y";
+    for i in 0..wireserve_coordinator::oidc::sign_in::CALLBACKS_PER_MIN {
+        assert_eq!(call(&app.router, "GET", uri, None, None).await.status(), StatusCode::BAD_REQUEST, "{i}");
+    }
+    assert_eq!(call(&app.router, "GET", uri, None, None).await.status(), StatusCode::TOO_MANY_REQUESTS);
+    let mut req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    req.extensions_mut().insert(ConnectInfo("[2001:db8:1::1]:1234".parse::<SocketAddr>().unwrap()));
+    assert_eq!(app.router.clone().oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST, "another address is not held up");
 }
