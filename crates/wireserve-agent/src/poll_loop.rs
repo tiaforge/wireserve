@@ -143,7 +143,7 @@ pub struct TransitSelfReport {
     /// startup probe.
     pub dialable_v4: Option<bool>,
     /// Whether this agent can relay phones on its WireGuard port (PLAN.md
-    /// M49): a daemon on Linux, with the sorter to do it.
+    /// M49): a daemon on Linux whose sorter can open its sockets.
     pub phone_relay: bool,
     /// Whether this agent can answer reflexive probes on its WireGuard port
     /// (PLAN.md M50): a daemon on Linux, like the phone relay.
@@ -236,6 +236,20 @@ pub struct PhoneRelayHandle {
 
 #[cfg(not(target_os = "linux"))]
 pub struct PhoneRelayHandle;
+
+/// Whether this agent can relay phones (PLAN.md M49): a daemon on Linux
+/// whose relay is running, or opened its sockets the last time it tried.
+/// A carrier without `CAP_NET_RAW`, or whose ports another program holds,
+/// is not offered to phones until it can.
+#[cfg(target_os = "linux")]
+fn phone_relay_capable(handle: Option<&PhoneRelayHandle>) -> bool {
+    handle.is_some_and(|h| h.relay.capable())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn phone_relay_capable(_handle: Option<&PhoneRelayHandle>) -> bool {
+    false
+}
 
 /// Whether this agent can answer reflexive probes on its WireGuard port
 /// (PLAN.md M50): a daemon on Linux, which has the tproxy machinery.
@@ -1081,7 +1095,7 @@ where
             wanted: transit_wanted,
             carry_port: ctx.wg.carry_port(),
             dialable_v4: ctx.own_dialable_v4,
-            phone_relay: ctx.phone_relay.is_some(),
+            phone_relay: phone_relay_capable(ctx.phone_relay),
             reflexive: reflexive_capable(ctx.phone_relay),
             reflexive_answering: reflexive_answering(ctx.phone_relay),
             observed: transit_observed,

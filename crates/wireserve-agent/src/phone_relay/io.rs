@@ -91,6 +91,16 @@ impl Drop for Running {
 #[derive(Default)]
 pub struct PhoneRelay {
     running: Mutex<Option<Running>>,
+    tried: Mutex<Tried>,
+}
+
+/// Whether the relay could open what it needs, the last time it tried.
+#[derive(Default)]
+struct Tried {
+    /// `None` before the first try.
+    opened: Option<bool>,
+    /// The divert port and mesh address last tried, once a poll named them.
+    at: Option<(u16, SocketAddrV4)>,
 }
 
 impl PhoneRelay {
@@ -104,6 +114,17 @@ impl PhoneRelay {
                 tracing::info!("no longer relaying phones");
             }
             divert.retain(&[]);
+            // Not asked to relay, and could not the last time: tried again
+            // as that time, so the capability comes back once whatever held
+            // a port lets go of it, or the raw socket is allowed.
+            let mut tried = self.tried.lock().unwrap_or_else(|e| e.into_inner());
+            if tried.opened == Some(false) {
+                let opened = match tried.at {
+                    Some((divert_port, mesh)) => Sockets::open(divert_port, mesh).map(drop),
+                    None => Sockets::probe(),
+                };
+                tried.opened = Some(opened.is_ok());
+            }
             return Ok(());
         };
         let sockets = (config.listen_port, config.divert_port, config.mesh);
@@ -113,7 +134,12 @@ impl PhoneRelay {
         }
         // Closed before the new ones open: they may want the same ports.
         running.take();
-        let io = Sockets::open(&config)?;
+        let opened = Sockets::open(config.divert_port, config.mesh);
+        {
+            let mut tried = self.tried.lock().unwrap_or_else(|e| e.into_inner());
+            *tried = Tried { opened: Some(opened.is_ok()), at: Some((config.divert_port, config.mesh)) };
+        }
+        let io = opened?;
         let mut sorter = Sorter::default();
         sorter.set_peers(&config.nodes, &config.devices);
         let sorter = Arc::new(Mutex::new(sorter));
@@ -122,8 +148,9 @@ impl PhoneRelay {
             let (sorter, stop, divert) = (Arc::clone(&sorter), Arc::clone(&stop), Arc::clone(divert));
             std::thread::Builder::new()
                 .name("phone-relay".into())
-                .spawn(move || run(&io, config.listen_port, &sorter, &stop, divert.as_ref()))?
+                .spawn(move || run(&io, config.listen_port, &sorter, &stop, divert.as_ref()))
         };
+        let thread = thread.inspect_err(|_| self.tried.lock().unwrap_or_else(|e| e.into_inner()).opened = Some(false))?;
         tracing::info!(divert_port = sockets.1, mesh = %sockets.2, "relaying phones on this node's WireGuard port");
         *running = Some(Running { sockets, sorter, stop, thread: Some(thread) });
         Ok(())
@@ -132,6 +159,26 @@ impl PhoneRelay {
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.running.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    /// Whether this agent can relay phones (PLAN.md M49): running, or its
+    /// sockets opened the last time they were tried — at the first call, a
+    /// raw socket and a transparent one opened and closed again, which a
+    /// daemon without `CAP_NET_RAW` cannot do. What the coordinator is told,
+    /// so it never sends phones to a carrier that would drop them.
+    #[must_use]
+    pub fn capable(&self) -> bool {
+        if self.is_running() {
+            return true;
+        }
+        let mut tried = self.tried.lock().unwrap_or_else(|e| e.into_inner());
+        *tried.opened.get_or_insert_with(|| match Sockets::probe() {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot open the phone relay's raw and transparent sockets (CAP_NET_RAW?); not offering to relay phones");
+                false
+            }
+        })
     }
 }
 
@@ -142,21 +189,32 @@ struct Sockets {
 }
 
 impl Sockets {
-    fn open(config: &Config) -> io::Result<Self> {
+    fn open(divert_port: u16, mesh: SocketAddrV4) -> io::Result<Self> {
         let divert = udp_socket()?;
         set_int(&divert, libc::SOL_IP, libc::IP_TRANSPARENT, 1)?;
         set_int(&divert, libc::SOL_IP, libc::IP_RECVORIGDSTADDR, 1)?;
-        bind(&divert, SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, config.divert_port))?;
-        let mesh = UdpSocket::bind(config.mesh)?;
-        // SAFETY: plain socket(2); the result is checked before use.
-        let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::IPPROTO_RAW) };
-        if raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `raw` is a socket this function just opened and owns.
-        let raw = unsafe { OwnedFd::from_raw_fd(raw) };
+        bind(&divert, SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, divert_port))?;
+        let mesh = UdpSocket::bind(mesh)?;
+        let raw = raw_socket()?;
         Ok(Self { divert, mesh, raw })
     }
+
+    /// What [`Sockets::open`] needs of this daemon's privileges, before any
+    /// poll has named the ports: a transparent socket and a raw one.
+    fn probe() -> io::Result<()> {
+        set_int(&udp_socket()?, libc::SOL_IP, libc::IP_TRANSPARENT, 1)?;
+        raw_socket().map(drop)
+    }
+}
+
+fn raw_socket() -> io::Result<OwnedFd> {
+    // SAFETY: plain socket(2); the result is checked before use.
+    let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::IPPROTO_RAW) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a socket this function just opened and owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
 fn run(io: &Sockets, listen_port: u16, sorter: &Mutex<Sorter>, stop: &AtomicBool, divert: &dyn Divert) {
@@ -419,6 +477,46 @@ mod tests {
             assert_eq!(&d[20..22], &51820u16.to_be_bytes());
             assert_eq!(&d[28..], payload);
         }
+    }
+
+    struct NoDivert;
+
+    impl Divert for NoDivert {
+        fn add(&self, _index: u32) {}
+        fn retain(&self, _live: &[u32]) {}
+    }
+
+    #[test]
+    fn a_relay_that_cannot_open_its_sockets_is_not_offered_until_it_can() {
+        let relay = PhoneRelay::default();
+        if Sockets::probe().is_err() {
+            assert!(!relay.capable(), "without the raw socket, never");
+            return;
+        }
+        assert!(relay.capable(), "probed before any poll names the ports");
+        let divert: Arc<dyn Divert> = Arc::new(NoDivert);
+        // Another program on the mesh port.
+        let holder = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let std::net::SocketAddr::V4(mesh) = holder.local_addr().unwrap() else { panic!() };
+        let divert_port = UdpSocket::bind("0.0.0.0:0").unwrap().local_addr().unwrap().port();
+        let config = Config { listen_port: 51820, divert_port, mesh, nodes: vec![], devices: vec![] };
+        assert!(relay.configure(Some(config.clone()), &divert).is_err());
+        assert!(!relay.capable(), "stops being offered at once");
+        relay.configure(None, &divert).unwrap();
+        assert!(!relay.capable(), "tried again, the port still held");
+        drop(holder);
+        // Tried a few times, as polls would: a test elsewhere in this process
+        // that starts a program holds a copy of every socket here for the
+        // moment between its fork and its exec.
+        let tries = || (0..40).map(|_| std::thread::sleep(Duration::from_millis(50)));
+        assert!(
+            tries().any(|()| relay.configure(None, &divert).is_ok() && relay.capable()),
+            "and offered again once it is free"
+        );
+        assert!(tries().any(|()| relay.configure(Some(config.clone()), &divert).is_ok()));
+        assert!(relay.is_running() && relay.capable());
+        relay.configure(None, &divert).unwrap();
+        assert!(!relay.is_running() && relay.capable());
     }
 
     /// The whole path against a real kernel (PLAN.md #346): a phone on the
