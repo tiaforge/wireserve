@@ -185,7 +185,11 @@ pub struct DirectoryState {
     /// besides the service itself: the rules, and which nodes there are at
     /// which addresses.
     access_generation: u64,
-    access_memo: Mutex<HashMap<String, MemoEntry>>,
+    /// By owner, then by service name. Kept by owner so that it is bounded
+    /// by the nodes there are: a node has at most
+    /// [`wireserve_types::MAX_SERVICES_PER_NODE`] services at once, and its
+    /// entries go when it leaves the directory.
+    access_memo: Mutex<HashMap<i64, HashMap<String, MemoEntry>>>,
 }
 
 /// A service's access as last worked out, and what it was worked out from.
@@ -253,6 +257,7 @@ impl DirectoryState {
     pub fn access_for(&self, service: &ServiceRow, owner: &NodeRow, facts: &SignInFacts) -> ServiceAccess {
         let mut memo = self.access_memo.lock().unwrap_or_else(PoisonError::into_inner);
         let owner_key = (owner.id, owner.ip4.clone());
+        let memo = memo.entry(owner.id).or_default();
         if let Some(m) = memo.get(&service.name) {
             if m.generation == self.access_generation
                 && m.owner == owner_key
@@ -264,6 +269,14 @@ impl DirectoryState {
         }
         let access = crate::access::service_access(service, owner, self.nodes.values(), &self.rules, facts);
         if access.sources.len() <= MEMO_MAX_SOURCES {
+            // More names than a node may have at once means names it has let
+            // go of, which nothing else removes: a node declaring new ones
+            // poll after poll would otherwise grow this for as long as the
+            // coordinator runs. Forgetting all of its entries costs that node
+            // alone one working-out per service, once.
+            if memo.len() >= wireserve_types::MAX_SERVICES_PER_NODE && !memo.contains_key(&service.name) {
+                memo.clear();
+            }
             memo.insert(
                 service.name.clone(),
                 MemoEntry {
@@ -501,6 +514,7 @@ impl DirectoryState {
         if self.rules != l.rules || !same_addresses {
             self.access_generation += 1;
         }
+        self.access_memo.get_mut().unwrap_or_else(PoisonError::into_inner).retain(|id, _| nodes.contains_key(id));
         self.nodes = nodes;
         self.by_pubkey = by_pubkey;
         self.node_services = node_services;
@@ -533,6 +547,7 @@ impl DirectoryState {
                 self.sign_in_capable.remove(&pk);
             }
             self.nodes.remove(&id);
+            self.access_memo.get_mut().unwrap_or_else(PoisonError::into_inner).remove(&id);
             for name in old_names {
                 self.remove_service(&name);
             }
@@ -930,5 +945,45 @@ mod tests {
         assert!(s.access_generation > generation);
         let after = s.access_for(&svc, &owner, &facts);
         assert_eq!(after.sources.len(), 2, "{after:?}");
+    }
+
+    fn memo_len(s: &DirectoryState) -> usize {
+        s.access_memo.lock().unwrap().values().map(HashMap::len).sum()
+    }
+
+    #[test]
+    fn a_node_declaring_new_names_poll_after_poll_does_not_grow_what_is_remembered_of_access() {
+        let facts = SignInFacts { available: false, owner_capable: false, terminated: false };
+        let mut s = DirectoryState::new();
+        s.adopt(loaded(vec![node(1, None), node(2, None)], vec![service(2, "db", 5432)]), &ENV);
+        let (one, two) = (s.nodes[&1].clone(), s.nodes[&2].clone());
+        let _ = s.access_for(&service(2, "db", 5432), &two, &facts);
+        // Sixteen new names a poll, for a long while, with nothing changing
+        // in between that would make the entries stale.
+        for round in 0..200 {
+            for i in 0..16 {
+                let _ = s.access_for(&service(1, &format!("r{round}x{i}"), 80), &one, &facts);
+            }
+            assert!(memo_len(&s) <= wireserve_types::MAX_SERVICES_PER_NODE + 1, "round {round}: {}", memo_len(&s));
+        }
+        assert!(s.access_memo.lock().unwrap()[&2].contains_key("db"), "another node's entries are left alone");
+
+        // A node's own services, however many it may have, are all kept.
+        let own: Vec<ServiceRow> = (0..wireserve_types::MAX_SERVICES_PER_NODE).map(|i| service(1, &format!("own{i}"), 80)).collect();
+        for svc in &own {
+            let _ = s.access_for(svc, &one, &facts);
+        }
+        let held = s.access_memo.lock().unwrap()[&1].len();
+        assert_eq!(held, own.len());
+        for svc in &own {
+            let _ = s.access_for(svc, &one, &facts);
+        }
+        assert!(own.iter().all(|svc| s.access_memo.lock().unwrap()[&1].contains_key(&svc.name)), "a poll again finds every one");
+
+        // A node that leaves takes its entries with it, one node read or all.
+        s.apply_node(1, node_load(None, vec![]), &ENV);
+        assert!(!s.access_memo.lock().unwrap().contains_key(&1));
+        s.adopt(loaded(vec![node(1, None)], vec![]), &ENV);
+        assert_eq!(memo_len(&s), 0);
     }
 }
