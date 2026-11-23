@@ -79,7 +79,11 @@ async fn polls_at_once(
     response
 }
 
-/// Every write through the admin surface may move it too.
+/// Every write through the admin surface may move it too: one carried out,
+/// or one that failed on the coordinator's side, which may have written part
+/// of what it set out to. Not one turned away (401, 429, 404, 409, 400):
+/// those wrote nothing, and anyone who can reach the admin listener can send
+/// them, each costing the next poll a full read (see above).
 async fn directory_changed_by_admin(
     axum::extract::State(state): axum::extract::State<AppState>,
     req: axum::extract::Request,
@@ -87,7 +91,7 @@ async fn directory_changed_by_admin(
 ) -> axum::response::Response {
     let writes = !matches!(*req.method(), axum::http::Method::GET | axum::http::Method::HEAD);
     let response = next.run(req).await;
-    if writes {
+    if writes && !response.status().is_client_error() {
         state.directory_changed();
     }
     response
