@@ -156,16 +156,13 @@ pub fn build_config(state: &AgentState) -> TlsConfig {
     let Some(acme) = naming.acme.clone() else {
         return TlsConfig { callers, http, ..TlsConfig::default() };
     };
-    // Who may reach each one (PLAN.md M36), from the list saved before the
-    // rest of the poll cycle ran — never older than the firewall's.
-    let access = |name: &str| state.own_access.iter().find(|a| a.name == name).cloned();
     let services = state
         .declared_services
         .iter()
         .filter_map(|d| {
             let vip = crate::poll_loop::own_vip(&d.name, node, directory)?;
             // No entry: not served at all, as the firewall opens nothing.
-            let access = access(&d.name)?;
+            let access = access_of(state, d)?;
             let map = d.ports.clone().into_iter().find(wireserve_types::is_tls_map)?;
             Some(TlsService {
                 name: d.name.clone(),
@@ -189,6 +186,24 @@ pub fn build_config(state: &AgentState) -> TlsConfig {
     }
 }
 
+/// Who may reach this node's service `d` (PLAN.md M36), from the list saved
+/// before the rest of the poll cycle ran — never older than the firewall's.
+/// `None`: the coordinator named nobody, and it is not served at all.
+///
+/// For people only (PLAN.md #326) when the node's own declaration says so,
+/// whatever the coordinator sent, as the firewall's `service_rules` has it:
+/// a coordinator that left the flag out — older than it, or mistaken —
+/// would otherwise have the terminator let granted devices in without a
+/// session. The node's side only ever narrows: the flag is turned on here,
+/// never off, and nothing else of the entry changes. Turned on for an entry
+/// that offers no sign-in, the terminator refuses everyone ("no sign-in is
+/// offered for it").
+fn access_of(state: &AgentState, d: &wireserve_types::ServiceDecl) -> Option<wireserve_types::ServiceAccess> {
+    let mut access = state.own_access.iter().find(|a| a.name == d.name).cloned()?;
+    access.always_sign_in |= d.always_sign_in;
+    Some(access)
+}
+
 /// This node's services on TCP 80 (PLAN.md #328), for the terminator to
 /// answer in plain HTTP: under the one name every hosts file and DNS record
 /// gives them, or their address — domain or not, certificate or not.
@@ -200,7 +215,7 @@ fn http_services(state: &AgentState, node: Ipv4Addr, directory: &wireserve_types
         .filter_map(|d| {
             let vip = crate::poll_loop::own_vip(&d.name, node, directory)?;
             // No entry: not served at all, as the firewall opens nothing.
-            let access = state.own_access.iter().find(|a| a.name == d.name).cloned()?;
+            let access = access_of(state, d)?;
             let map = d.ports.iter().copied().find(wireserve_types::is_http_map)?;
             Some(wireserve_types::tls::HttpService {
                 name: d.name.clone(),
@@ -398,6 +413,51 @@ mod tests {
         assert_eq!(cfg.services[0].access.sign_in_groups, ["family"]);
         let si = cfg.sign_in.expect("as the coordinator sent it");
         assert_eq!((si.public_key.as_str(), si.login_url.as_str()), ("pk", "https://mesh.test"));
+    }
+
+    /// `plex` declared `--always-sign-in`, on 443 and 80.
+    fn for_people(mut st: AgentState) -> AgentState {
+        let plex = &mut st.declared_services[0];
+        plex.ports.push("80:8080".parse().unwrap());
+        plex.always_sign_in = true;
+        st
+    }
+
+    #[test]
+    fn a_service_this_node_declared_for_people_only_is_served_so_whatever_the_coordinator_sent() {
+        let st = for_people(state(true, true));
+        assert!(st.own_access.iter().all(|a| !a.always_sign_in), "a coordinator that leaves the flag out");
+        let cfg = build_config(&st);
+        assert!(cfg.services[0].access.always_sign_in, "no granted device gets in without a session (PLAN.md #326)");
+        assert_eq!(cfg.http[0].name, "plex");
+        assert!(cfg.http[0].access.always_sign_in, "nor on its port 80");
+        assert!(!cfg.http[1].access.always_sign_in, "a service declared without it is left as the coordinator sent it");
+        // Narrowed, and nothing else changed.
+        let sent = st.own_access.iter().find(|a| a.name == "plex").unwrap();
+        assert_eq!(cfg.services[0].access, wireserve_types::ServiceAccess { always_sign_in: true, ..sent.clone() });
+    }
+
+    #[test]
+    fn the_nodes_declaration_never_turns_the_coordinators_for_people_only_off() {
+        let mut st = state(true, true);
+        for a in &mut st.own_access {
+            a.always_sign_in = true;
+        }
+        let cfg = build_config(&st);
+        assert!(cfg.services[0].access.always_sign_in, "the coordinator's say is kept");
+        assert!(cfg.http[0].access.always_sign_in);
+        let cfg = build_config(&state(true, true));
+        assert!(!cfg.services[0].access.always_sign_in, "neither side says so");
+    }
+
+    #[test]
+    fn a_service_for_people_only_whose_entry_offers_no_sign_in_lets_nobody_in() {
+        // Open to every device by the coordinator's entry, and no sign-in:
+        // the terminator's guard then refuses every request with "no
+        // sign-in is offered for it", since no device gets in by itself.
+        let cfg = build_config(&for_people(state(true, false)));
+        let access = &cfg.services[0].access;
+        assert!(access.always_sign_in && access.open && !access.sign_in && access.sign_in_groups.is_empty(), "{access:?}");
     }
 
     #[tokio::test]
