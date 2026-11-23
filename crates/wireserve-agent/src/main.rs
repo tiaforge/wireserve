@@ -882,6 +882,19 @@ async fn cmd_daemon(
                 // hook has to follow them.
                 interop.tick(firewall::ForwardWanted::of(&*shared_state.lock().await));
 
+                // The interface this daemon made is gone or someone else's
+                // (`WgInterface::check`). As for a lost hosts-file mount
+                // below, exiting non-zero is the recovery: `Restart=on-failure`
+                // brings the agent up again through its deny-first startup.
+                // Teardown leaves an interface it did not make alone.
+                if let Err(e) = &result {
+                    if e.is_interface_lost() {
+                        tracing::error!(error = %e, "the WireGuard interface is gone; tearing down and exiting");
+                        teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, instance.hosts_label(), &socket_path, &shared_state, &state_path, false).await;
+                        return Err(e.to_string().into());
+                    }
+                }
+
                 match &result {
                     Err(e) if e.is_coordinator_trouble() => {
                         coordinator_failures = coordinator_failures.saturating_add(1);

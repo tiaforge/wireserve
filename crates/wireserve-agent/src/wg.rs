@@ -1277,6 +1277,41 @@ pub fn peers_to_configure(applied: &HashMap<Key, Peer>, desired: &HashMap<Key, P
         .collect()
 }
 
+/// Removes each applied peer `desired` no longer has, through `remove`, and
+/// forgets each one as soon as it is gone. `applied` is what the kernel
+/// holds, and a later step failing must not leave a removed peer in it:
+/// were it to come back unchanged, `peers_to_configure` would find it
+/// already there and never add it again.
+fn remove_departed<E>(
+    applied: &mut HashMap<Key, Peer>,
+    desired: &HashMap<Key, Peer>,
+    mut remove: impl FnMut(&Key) -> Result<(), E>,
+) -> Result<(), E> {
+    for key in peers_to_remove(applied.keys(), desired) {
+        remove(&key)?;
+        applied.remove(&key);
+    }
+    Ok(())
+}
+
+/// Configures each peer `peers_to_configure` picks, through `configure`,
+/// and records each one in `applied` as soon as it is in place — as
+/// desired, endpoint included, whatever `peers_to_configure` left out of
+/// what it sent.
+fn configure_changed<E>(
+    applied: &mut HashMap<Key, Peer>,
+    desired: &HashMap<Key, Peer>,
+    mut configure: impl FnMut(&Peer) -> Result<(), E>,
+) -> Result<(), E> {
+    for peer in peers_to_configure(applied, desired) {
+        configure(&peer)?;
+        if let Some(wanted) = desired.get(&peer.public_key) {
+            applied.insert(peer.public_key.clone(), wanted.clone());
+        }
+    }
+    Ok(())
+}
+
 /// What the kernel reports for each peer on `ifname`, for `list`. Reads
 /// through its own handle rather than the daemon's `WgInterface`, which
 /// the poll loop owns; reading is harmless alongside it.
@@ -1306,9 +1341,71 @@ pub enum Slot {
     Foreign(String),
 }
 
+/// The interface `bring_up` made, as the kernel described it right after:
+/// what each poll checks the name still leads to (see
+/// [`WgInterface::check`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Created {
+    index: u32,
+    private_key: Key,
+    listen_port: u16,
+}
+
+/// The interface this daemon made is gone, or something else holds its
+/// name now. Nothing the daemon does from here would reach the mesh, so it
+/// stops and the service manager starts it again, through the same
+/// deny-first startup as any other start.
+#[derive(Debug, thiserror::Error)]
+#[error("the WireGuard interface '{ifname}' {reason}; exiting so the service manager starts the agent again")]
+pub struct InterfaceLost {
+    pub ifname: String,
+    pub reason: String,
+}
+
+/// What one look at the interface found; see [`index_verdict`].
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Still the one this daemon made.
+    Same,
+    /// Gone, or replaced: fatal.
+    Lost(String),
+    /// The look itself failed. Never taken for a lost interface: the next
+    /// poll looks again.
+    Unknown(String),
+}
+
+/// What the kernel's answer for the interface's name says about the one
+/// this daemon made as `created`. Only "no such device" means it is gone; a
+/// different index means it was deleted and something made another under
+/// the same name.
+fn index_verdict(found: std::io::Result<u32>, created: u32) -> Verdict {
+    match found {
+        Ok(index) if index == created => Verdict::Same,
+        Ok(index) => Verdict::Lost(format!("was deleted and another interface (index {index}, not {created}) now has its name")),
+        Err(e) if e.raw_os_error() == Some(libc::ENODEV) => Verdict::Lost("no longer exists".into()),
+        Err(e) => Verdict::Unknown(e.to_string()),
+    }
+}
+
+/// What the interface's WireGuard configuration says: still this daemon's
+/// key and port, or someone reconfigured it.
+fn identity_verdict(read: Result<(Option<Key>, u16), String>, created: &Created) -> Verdict {
+    match read {
+        Ok((Some(key), port)) if key == created.private_key && port == created.listen_port => Verdict::Same,
+        Ok((_, port)) => Verdict::Lost(format!(
+            "was reconfigured behind this agent's back (another private key, or listen port {port} instead of {})",
+            created.listen_port
+        )),
+        Err(e) => Verdict::Unknown(e),
+    }
+}
+
 pub struct WgInterface {
     api: WGApi<Kernel>,
     ifname: String,
+    /// Set by `bring_up`; `None` for a handle that only inspects or removes
+    /// an interface.
+    created: Option<Created>,
     applied: HashMap<Key, Peer>,
     /// What `routes::sync` last installed, so it only runs on a change.
     routed: BTreeSet<IpAddr>,
@@ -1337,6 +1434,7 @@ impl WgInterface {
         Ok(Self {
             api,
             ifname,
+            created: None,
             applied: HashMap::new(),
             routed: BTreeSet::new(),
             resolver: crate::endpoint_dns::EndpointResolver::default(),
@@ -1545,7 +1643,103 @@ impl WgInterface {
             fwmark: None,
         };
         self.api.configure_interface(&config)?;
+        // What `check` compares against from now on: the kernel's own
+        // account, whose key comes back clamped (see `clamp_private_key`).
+        let host = self.api.read_interface_data()?;
+        self.created = match (crate::routes::interface_index(&self.ifname), host.private_key) {
+            (Ok(index), Some(private_key)) => Some(Created { index, private_key, listen_port: host.listen_port }),
+            (found, _) => {
+                tracing::warn!(ifname = %self.ifname, error = ?found.err(), "could not record the interface just brought up; it will not be checked");
+                None
+            }
+        };
         Ok(())
+    }
+
+    /// Run at the start of every poll, whether or not the coordinator then
+    /// answers: is the name still the interface `bring_up` made, with the
+    /// key and port it set, and up? Cheap — an index lookup, one WireGuard
+    /// read and one link read — and nothing else in a cycle looks at the
+    /// kernel's interface itself: `reconcile` diffs against what it last
+    /// did, so without this a deleted interface went unnoticed until the
+    /// directory changed, and then every cycle failed on it for as long as
+    /// the daemon ran.
+    ///
+    /// Gone or replaced is an [`InterfaceLost`]: the daemon exits, and its
+    /// restart builds everything again in the safe order (deny-all first).
+    /// Rebuilding it here instead would have to redo all of that startup in
+    /// the middle of a running daemon. A look that fails for any other
+    /// reason than "no such device" is logged and left for the next poll.
+    ///
+    /// Set down, it is set up again, and the routes the kernel removed with
+    /// it put back. They are put back whenever any are missing, which also
+    /// covers an interface set down and up between two polls.
+    pub fn check(&self) -> Result<(), InterfaceLost> {
+        let Some(created) = &self.created else {
+            return Ok(());
+        };
+        let lost = |reason| InterfaceLost { ifname: self.ifname.clone(), reason };
+        match index_verdict(crate::routes::interface_index(&self.ifname), created.index) {
+            Verdict::Same => {}
+            Verdict::Lost(reason) => return Err(lost(reason)),
+            Verdict::Unknown(e) => {
+                tracing::warn!(ifname = %self.ifname, error = %e, "could not look up the WireGuard interface; checking again next poll");
+                return Ok(());
+            }
+        }
+        let read = self.api.read_interface_data().map(|h| (h.private_key, h.listen_port)).map_err(|e| e.to_string());
+        match identity_verdict(read, created) {
+            Verdict::Same => {}
+            Verdict::Lost(reason) => return Err(lost(reason)),
+            Verdict::Unknown(e) => {
+                tracing::warn!(ifname = %self.ifname, error = %e, "could not read the WireGuard interface; checking again next poll");
+                return Ok(());
+            }
+        }
+        match crate::routes::link_is_up(created.index) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(ifname = %self.ifname, "the WireGuard interface was set down; setting it up again");
+                if let Err(e) = crate::routes::set_link_up(created.index) {
+                    tracing::warn!(ifname = %self.ifname, error = %e, "could not set the WireGuard interface up");
+                }
+            }
+            Err(e) => tracing::warn!(ifname = %self.ifname, error = %e, "could not tell whether the WireGuard interface is up"),
+        }
+        self.restore_routes();
+        Ok(())
+    }
+
+    /// Adds back the peer routes `reconcile` installed and the kernel no
+    /// longer has. Only those: what is routed stays what the last directory
+    /// asked for.
+    fn restore_routes(&self) {
+        if self.routed.is_empty() && self.carry.as_ref().is_none_or(|c| c.routed.is_empty()) {
+            return;
+        }
+        let present = match crate::routes::host_routes() {
+            Ok(present) => present,
+            Err(e) => {
+                tracing::debug!(ifname = %self.ifname, error = %e, "could not list the host's routes");
+                return;
+            }
+        };
+        let carry = self.carry.as_ref().filter(|c| !c.routed.is_subset(&present));
+        let main = !self.routed.is_subset(&present);
+        if !main && carry.is_none() {
+            return;
+        }
+        tracing::warn!(ifname = %self.ifname, "peer routes went missing from the kernel; adding them back");
+        let mut sets = Vec::new();
+        if main {
+            sets.push(crate::routes::RouteSet { ifname: &self.ifname, old: &self.routed, new: &self.routed, prefsrc: None });
+        }
+        if let Some(c) = carry {
+            sets.push(crate::routes::RouteSet { ifname: &c.ifname, old: &c.routed, new: &c.routed, prefsrc: Some(c.src) });
+        }
+        if let Err(e) = crate::routes::sync_all(&sets) {
+            tracing::warn!(ifname = %self.ifname, error = %e, "peer routes are incomplete");
+        }
     }
 
     /// Reconciles the kernel peer set to exactly `peers` (minus `self`).
@@ -1594,10 +1788,7 @@ impl WgInterface {
         // one moving back leaves the carry interface first: the same address
         // in two peers' `AllowedIPs` on one host would do no harm, but
         // there is no reason to have it even for a moment.
-        let to_remove = peers_to_remove(self.applied.keys(), &desired);
-        for key in &to_remove {
-            self.api.remove_peer(key)?;
-        }
+        remove_departed(&mut self.applied, &desired, |key| self.api.remove_peer(key))?;
         let carry_desired = self
             .carry
             .as_ref()
@@ -1609,10 +1800,7 @@ impl WgInterface {
                 carry.applied.remove(&key);
             }
         }
-        let to_configure = peers_to_configure(&self.applied, &desired);
-        for peer in &to_configure {
-            self.api.configure_peer(peer)?;
-        }
+        configure_changed(&mut self.applied, &desired, |peer| self.api.configure_peer(peer))?;
         if let Some(carry) = &mut self.carry {
             for peer in peers_to_configure(&carry.applied, &carry_desired) {
                 carry.api.configure_peer(&peer)?;
@@ -1682,7 +1870,17 @@ impl WgInterface {
         // The carry interface first, and whatever happens to it the mesh
         // interface still goes.
         let carry = self.carry.take().map(|c| crate::routes::delete_link(&c.ifname));
-        crate::routes::delete_link(&self.ifname)?;
+        // Never an interface this daemon did not make: once its own is gone
+        // (see `check`), the name may already belong to someone else's.
+        let replaced = self
+            .created
+            .take()
+            .is_some_and(|c| crate::routes::interface_index(&self.ifname).is_ok_and(|index| index != c.index));
+        if replaced {
+            tracing::warn!(ifname = %self.ifname, "not removing the interface now under this name: it is not the one this agent made");
+        } else {
+            crate::routes::delete_link(&self.ifname)?;
+        }
         self.applied.clear();
         self.routed.clear();
         carry.transpose()?;
@@ -2346,6 +2544,111 @@ mod tests {
         assert_eq!(to_remove, vec![b]);
     }
 
+    #[test]
+    fn a_peer_removed_before_a_later_step_failed_is_added_back_when_it_returns_unchanged() {
+        // The kernel's peers, as `remove_departed` and `configure_changed`
+        // drive them: X goes, then configuring Z fails.
+        let key = |b: u8| Key::new([b; 32]);
+        let (x, y, z) = (key(1), key(2), key(3));
+        let mut kernel: HashMap<Key, Peer> = [(x.clone(), Peer::new(x.clone())), (y.clone(), Peer::new(y.clone()))].into();
+        let mut applied = kernel.clone();
+        let desired: HashMap<Key, Peer> = [(y.clone(), Peer::new(y.clone())), (z.clone(), Peer::new(z.clone()))].into();
+        remove_departed(&mut applied, &desired, |k| {
+            kernel.remove(k);
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        assert!(configure_changed(&mut applied, &desired, |_| Err(())).is_err());
+        assert!(!applied.contains_key(&x), "X is no longer in the kernel, so not in what was applied");
+        assert_eq!(applied.keys().collect::<std::collections::HashSet<_>>(), kernel.keys().collect());
+
+        // Next cycle X is back, exactly as before: it is configured again.
+        let desired: HashMap<Key, Peer> = [x.clone(), y.clone(), z.clone()].into_iter().map(|k| (k.clone(), Peer::new(k))).collect();
+        let mut configured = Vec::new();
+        configure_changed(&mut applied, &desired, |p| {
+            configured.push(p.public_key.clone());
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        configured.sort_by_key(|k| k.as_array());
+        assert_eq!(configured, [x, z]);
+        assert_eq!(applied, desired);
+    }
+
+    #[test]
+    fn a_peer_configured_before_a_later_one_failed_is_recorded_with_its_endpoint() {
+        // So the next cycle finds it unchanged and leaves the kernel's
+        // roaming alone (F6), rather than configuring it all over again.
+        let key = |b: u8| Key::new([b; 32]);
+        let mut desired = HashMap::new();
+        for b in [1, 2] {
+            let mut p = Peer::new(key(b));
+            p.set_endpoint("10.0.0.1:51820").unwrap();
+            desired.insert(key(b), p);
+        }
+        let mut applied = HashMap::new();
+        let mut calls = 0;
+        let _ = configure_changed(&mut applied, &desired, |_| {
+            calls += 1;
+            if calls == 1 { Ok(()) } else { Err(()) }
+        });
+        assert_eq!(applied.len(), 1);
+        let (done, recorded) = applied.iter().next().unwrap();
+        assert_eq!(Some(recorded), desired.get(done));
+        assert!(peers_to_configure(&applied, &desired).iter().all(|p| &p.public_key != done));
+
+        // A changed peer whose endpoint did not change is sent without one,
+        // and recorded with it.
+        let a = key(1);
+        let mut applied: HashMap<Key, Peer> = [(a.clone(), desired[&a].clone())].into();
+        let mut changed = desired[&a].clone();
+        changed.persistent_keepalive_interval = Some(25);
+        let desired: HashMap<Key, Peer> = [(a.clone(), changed.clone())].into();
+        let mut sent = Vec::new();
+        configure_changed(&mut applied, &desired, |p| {
+            sent.push(p.clone());
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        assert_eq!(sent[0].endpoint, None);
+        assert_eq!(applied[&a], changed);
+    }
+
+    // ---- the interface under the daemon ----
+
+    fn created() -> Created {
+        Created { index: 7, private_key: Key::new([5; 32]), listen_port: 51820 }
+    }
+
+    #[test]
+    fn only_no_such_device_means_the_interface_is_gone() {
+        assert_eq!(index_verdict(Ok(7), 7), Verdict::Same);
+        assert!(matches!(index_verdict(Err(std::io::Error::from_raw_os_error(libc::ENODEV)), 7), Verdict::Lost(_)));
+        assert!(matches!(index_verdict(Ok(8), 7), Verdict::Lost(_)), "deleted and made again by someone else");
+        for errno in [libc::ENOMEM, libc::EPERM, libc::ENOBUFS, libc::EINVAL] {
+            assert!(
+                matches!(index_verdict(Err(std::io::Error::from_raw_os_error(errno)), 7), Verdict::Unknown(_)),
+                "errno {errno} must not read as a vanished interface"
+            );
+        }
+    }
+
+    #[test]
+    fn another_key_or_port_on_the_interface_is_fatal_and_an_unreadable_one_is_not() {
+        let c = created();
+        assert_eq!(identity_verdict(Ok((Some(c.private_key.clone()), 51820)), &c), Verdict::Same);
+        assert!(matches!(identity_verdict(Ok((Some(Key::new([6; 32])), 51820)), &c), Verdict::Lost(_)));
+        assert!(matches!(identity_verdict(Ok((None, 51820)), &c), Verdict::Lost(_)));
+        assert!(matches!(identity_verdict(Ok((Some(c.private_key.clone()), 51821)), &c), Verdict::Lost(_)));
+        assert!(matches!(identity_verdict(Err("netlink: no buffer space".into()), &c), Verdict::Unknown(_)));
+    }
+
+    #[test]
+    fn a_handle_that_never_brought_an_interface_up_checks_nothing() {
+        // What tests and the leftover cleanup hold: nothing of theirs to lose.
+        assert!(WgInterface::new("wsnotthere0").unwrap().check().is_ok());
+    }
+
     // ---- F6: peers_to_configure must skip unchanged peers ----
 
     #[test]
@@ -2993,6 +3296,57 @@ mod tests {
         wg.teardown().unwrap();
         assert!(!sh("ip -o link show").contains("wgtest"), "interface still there after teardown");
         wg.teardown().unwrap();
+    }
+
+    /// An interface set down loses its peer routes in the kernel, and
+    /// setting it up again does not bring them back: `check` does, and sets
+    /// it up itself when it finds it down. One deleted, or replaced by
+    /// another under the same name, is fatal — and teardown leaves the
+    /// replacement alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_check_restores_a_downed_interface_and_finds_a_deleted_or_replaced_one_lost() {
+        if !crate::firewall::netns::reexec(
+            "wg::tests::kernel_check_restores_a_downed_interface_and_finds_a_deleted_or_replaced_one_lost",
+        ) {
+            return;
+        }
+        let sh = |script: &str| {
+            let out = std::process::Command::new("sh").args(["-euc", script]).output().unwrap();
+            assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let routes = || sh("ip -4 route show dev wgtest; ip -6 route show dev wgtest");
+        sh("ip link set lo up");
+        let own = clamp_private_key(&Key::generate());
+        let mut wg = WgInterface::new("wgtest").unwrap();
+        wg.bring_up(&own.to_string(), "100.90.0.2".parse().unwrap(), "fd00:90::2".parse().unwrap(), 51820)
+            .unwrap();
+        wg.reconcile(&[peer("peer", &key_b64(9))], &[], &own.public_key().to_string(), false, &HashMap::new(), &HashMap::new())
+            .unwrap();
+        assert!(routes().contains("100.90.0.5") && routes().contains("fd00:90::5"), "{}", routes());
+        wg.check().unwrap();
+
+        // What the kernel does on its own.
+        sh("ip link set wgtest down && ip link set wgtest up");
+        let r = routes();
+        assert!(!r.contains("100.90.0.5") && !r.contains("fd00:90::5"), "the kernel kept the routes after all: {r}");
+        wg.check().unwrap();
+        assert!(routes().contains("100.90.0.5") && routes().contains("fd00:90::5"), "{}", routes());
+
+        sh("ip link set wgtest down");
+        wg.check().unwrap();
+        assert!(sh("ip -o link show wgtest").contains(",UP"), "set up again");
+        assert!(routes().contains("100.90.0.5") && routes().contains("fd00:90::5"), "{}", routes());
+
+        sh("ip link del wgtest");
+        let lost = wg.check().unwrap_err();
+        assert!(lost.reason.contains("no longer exists"), "{lost}");
+
+        sh("ip link add wgtest type wireguard");
+        assert!(wg.check().is_err(), "another interface under the same name is not ours");
+        wg.teardown().unwrap();
+        assert!(sh("ip -o link show").contains("wgtest"), "teardown removed an interface it did not make");
     }
 
     /// The relay's exit path, end to end on two real interfaces. A relayed
