@@ -484,10 +484,17 @@ struct IdlePlace(());
 
 impl IdlePlace {
     fn acquire() -> Option<Self> {
-        POOL_IDLE_TOTAL
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < POOL_MAX_IDLE_TOTAL).then_some(n + 1))
-            .ok()
-            .map(|_| Self(()))
+        // Spelled out rather than `fetch_update`: newer compilers deprecate
+        // that name for `try_update`, which the oldest compiler this builds
+        // with may not have.
+        let mut n = POOL_IDLE_TOTAL.load(Ordering::Relaxed);
+        while n < POOL_MAX_IDLE_TOTAL {
+            match POOL_IDLE_TOTAL.compare_exchange_weak(n, n + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Some(Self(())),
+                Err(now) => n = now,
+            }
+        }
+        None
     }
 }
 
