@@ -4,12 +4,22 @@
 //!
 //! A session is one handshake between a phone and a node, as seen from the
 //! carrier: the node, the phone's address and the address it dialled, and
-//! each end's index once it has been seen. The node's index is what tells
-//! the phone's later packets apart from the carrier's own sessions on the
-//! same port; the phone's index is what tells the node's packets which
-//! phone they are for.
+//! each end's index. The node's index is what tells the phone's later
+//! packets apart from the carrier's own sessions on the same port; the
+//! phone's index is what tells the node's packets which phone they are for.
+//!
+//! Only the node's side is authenticated here: its packets come over the
+//! mesh. A phone's come from the open internet, their indexes in the clear,
+//! and anyone who has seen one can send another like it from anywhere. So
+//! nothing a phone sends sets where a session's packets go. A handshake is
+//! only pending until the node shows it accepted it — its response to a
+//! phone's initiation, or its first packet to the phone's index after the
+//! phone answered the node's own — and only then becomes a session, with
+//! the address the handshake came from. A phone that moves is answered at
+//! its new address from its next handshake on: WireGuard starts one when
+//! what it sends goes unanswered.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddrV4;
 use std::time::{Duration, Instant};
 
@@ -20,9 +30,26 @@ use super::packet::{mac1_key, mac1_matches, Message};
 pub const SESSION_LIFETIME: Duration = Duration::from_secs(180);
 
 /// The most sessions kept at once. Past it the one quiet the longest makes
-/// room: a flood of handshakes with a valid `mac1` (a node's public key is
-/// enough to make one) can only push out idle sessions, never stop new ones.
+/// room. Only a handshake the node answered becomes a session, so a flood
+/// of handshakes with a valid `mac1` (a node's public key is enough to make
+/// one) never gets this far.
 pub const MAX_SESSIONS: usize = 4096;
+
+/// How long a handshake waits for the node to accept it: WireGuard's
+/// rekey-timeout, after which the initiator gives up on it and sends a new
+/// one, with a new index.
+pub const PENDING_LIFETIME: Duration = Duration::from_secs(5);
+
+/// The most handshakes pending at once. Past it the oldest makes room. The
+/// firewall lets initiations through at 200 a second, 400 at once (PLAN.md
+/// #338), so at most 1400 arrive within [`PENDING_LIFETIME`]: a flood at
+/// that rate ages out before it can push out a handshake still waiting.
+pub const MAX_PENDING: usize = 2048;
+
+/// The most handshakes pending from one address to one node. A phone sends
+/// a new one every [`PENDING_LIFETIME`] until one is answered, so it has one
+/// or two at a time; past this the oldest of them makes room.
+pub const MAX_PENDING_PER_PHONE: usize = 4;
 
 /// What to do with a packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,14 +65,32 @@ pub enum Action {
     Drop,
 }
 
+/// A session, or a node's own handshake the phone has not yet answered
+/// (`phone_index` still `None`).
 #[derive(Debug, Clone)]
 struct Session {
     node: SocketAddrV4,
     phone: SocketAddrV4,
     local: SocketAddrV4,
-    node_index: Option<u32>,
+    node_index: u32,
     phone_index: Option<u32>,
+    /// The device a node's own handshake is for, by its `mac1`.
+    device: Option<[u8; 32]>,
     seen: Instant,
+}
+
+/// A handshake from a phone's side the node has not accepted yet: the
+/// phone's initiation, or its response to a node's own (`answers`, that
+/// session). Keyed by the node and the phone's index, which no session of
+/// that node has.
+#[derive(Debug, Clone)]
+struct Pending {
+    phone: SocketAddrV4,
+    local: SocketAddrV4,
+    answers: Option<u64>,
+    since: Instant,
+    /// Its place in [`Sorter::pending_order`].
+    seq: u64,
 }
 
 /// A node phones are relayed to: where its WireGuard listens on the mesh,
@@ -65,6 +110,12 @@ pub struct Sorter {
     next_id: u64,
     by_node_index: HashMap<u32, u64>,
     by_phone_index: HashMap<(SocketAddrV4, u32), u64>,
+    pending: HashMap<(SocketAddrV4, u32), Pending>,
+    /// The pending handshakes, oldest first.
+    pending_order: BTreeMap<u64, (SocketAddrV4, u32)>,
+    /// The pending handshakes from each address to each node, by the
+    /// phone's index, oldest first.
+    pending_by_phone: HashMap<(SocketAddrV4, SocketAddrV4), Vec<u32>>,
     /// Where each device was last seen, and the address it dialled: where
     /// a node's own handshake towards it goes.
     devices_seen: HashMap<[u8; 32], (SocketAddrV4, SocketAddrV4, Instant)>,
@@ -85,6 +136,10 @@ impl Sorter {
             for id in gone {
                 self.remove(id);
             }
+            let gone: Vec<(SocketAddrV4, u32)> = self.pending.keys().filter(|(node, _)| !kept.contains(node)).copied().collect();
+            for key in gone {
+                self.remove_pending(key);
+            }
         }
         self.devices = devices.iter().map(|pk| (*pk, mac1_key(pk))).collect();
         let known: Vec<[u8; 32]> = devices.to_vec();
@@ -92,37 +147,48 @@ impl Sorter {
     }
 
     /// A packet from a phone, arriving at `local`, the address it dialled.
+    /// Nothing here is authenticated, so nothing here changes a session:
+    /// a handshake is only noted, for the node to accept or not.
     pub fn from_phone(&mut self, now: Instant, phone: SocketAddrV4, local: SocketAddrV4, packet: &[u8]) -> Action {
         match Message::parse(packet) {
             Some(Message::Initiation { sender }) => {
                 let Some(node) = self.nodes.iter().find(|n| mac1_matches(packet, &n.mac1)).map(|n| n.addr) else {
                     return Action::ToKernel;
                 };
-                if let Some(old) = self.by_phone_index.get(&(node, sender)).copied() {
-                    self.remove(old);
+                // The same initiation again — from the phone, or replayed
+                // from anywhere: the node has it already, and answers a
+                // replay with nothing. It changes nothing here either.
+                if self.index_taken(node, sender) {
+                    return Action::Drop;
                 }
-                let id = self.insert(Session { node, phone, local, node_index: None, phone_index: Some(sender), seen: now });
-                self.by_phone_index.insert((node, sender), id);
+                self.add_pending((node, sender), Pending { phone, local, answers: None, since: now, seq: 0 });
                 Action::ToNode(node)
             }
-            // The phone answering a node's own handshake.
+            // The phone answering a node's own handshake, which only that
+            // node's next packet to the phone's index settles.
             Some(Message::Response { sender, receiver }) => {
                 let Some(id) = self.by_node_index.get(&receiver).copied() else { return Action::ToKernel };
-                let s = self.sessions.get_mut(&id).expect("indexed sessions exist");
-                (s.phone, s.local, s.seen) = (phone, local, now);
+                let s = self.sessions.get(&id).expect("indexed sessions exist");
                 let node = s.node;
-                if let Some(old) = s.phone_index.replace(sender) {
-                    self.by_phone_index.remove(&(node, old));
+                // Answered already, or not made for that node: no phone's.
+                let made_for_node = self.nodes.iter().any(|n| n.addr == node && mac1_matches(packet, &n.mac1));
+                if s.phone_index.is_some() || !made_for_node || self.index_taken(node, sender) {
+                    return Action::Drop;
                 }
-                self.by_phone_index.insert((node, sender), id);
+                self.add_pending((node, sender), Pending { phone, local, answers: Some(id), since: now, seq: 0 });
                 Action::ToNode(node)
             }
             Some(Message::CookieReply { receiver } | Message::Data { receiver }) => {
                 let Some(id) = self.by_node_index.get(&receiver).copied() else { return Action::ToKernel };
                 let s = self.sessions.get_mut(&id).expect("indexed sessions exist");
-                // A phone that moved: its answers follow it, as WireGuard's
-                // own endpoint would.
-                (s.phone, s.local, s.seen) = (phone, local, now);
+                // From anywhere but where the session is, it still goes on:
+                // the node authenticates it and drops what is forged or
+                // replayed, and a phone that moved keeps reaching it. It
+                // neither moves the session nor keeps it alive — the index
+                // is in the clear, and anyone can send one like it.
+                if (s.phone, s.local) == (phone, local) {
+                    s.seen = now;
+                }
                 Action::ToNode(s.node)
             }
             None => Action::ToKernel,
@@ -135,29 +201,37 @@ impl Sorter {
             return Action::Drop;
         }
         match Message::parse(packet) {
-            // The node answering a phone's handshake: its index is what the
+            // The node answering a phone's handshake: it becomes a session,
+            // at the address it came from, and the node's index is what the
             // phone's packets will carry from now on.
             Some(Message::Response { sender, receiver }) => {
-                let Some(id) = self.by_phone_index.get(&(node, receiver)).copied() else { return Action::Drop };
-                if self.by_node_index.get(&sender).is_some_and(|other| *other != id) {
+                let key = (node, receiver);
+                if !self.pending.get(&key).is_some_and(|p| p.answers.is_none()) {
+                    return Action::Drop;
+                }
+                if self.by_node_index.contains_key(&sender) {
                     // Another session's already: this handshake fails, and
                     // the next one picks another index.
                     return Action::Drop;
                 }
-                let s = self.sessions.get_mut(&id).expect("indexed sessions exist");
-                s.seen = now;
-                let (phone, local) = (s.phone, s.local);
-                if let Some(old) = s.node_index.replace(sender).filter(|old| *old != sender) {
-                    self.by_node_index.remove(&old);
-                }
-                if self.by_node_index.insert(sender, id).is_none() {
-                    self.new_indexes.push(sender);
-                }
+                let p = self.remove_pending(key).expect("pending just seen");
+                let id = self.insert(Session {
+                    node,
+                    phone: p.phone,
+                    local: p.local,
+                    node_index: sender,
+                    phone_index: Some(receiver),
+                    device: None,
+                    seen: now,
+                });
+                self.by_node_index.insert(sender, id);
+                self.by_phone_index.insert(key, id);
+                self.new_indexes.push(sender);
                 // Its `mac1` names the device that started it.
-                if let Some((pk, _)) = self.devices.iter().find(|(_, key)| mac1_matches(packet, key)) {
-                    self.devices_seen.insert(*pk, (phone, local, now));
+                if let Some((pk, _)) = self.devices.iter().find(|(_, k)| mac1_matches(packet, k)) {
+                    self.devices_seen.insert(*pk, (p.phone, p.local, now));
                 }
-                Action::ToPhone { phone, from: local }
+                Action::ToPhone { phone: p.phone, from: p.local }
             }
             // The node starting a handshake with a device, by its key.
             Some(Message::Initiation { sender }) => {
@@ -171,23 +245,52 @@ impl Sorter {
                     }
                     self.remove(old);
                 }
-                let id = self.insert(Session { node, phone, local, node_index: Some(sender), phone_index: None, seen: now });
+                let id = self.insert(Session { node, phone, local, node_index: sender, phone_index: None, device: Some(pk), seen: now });
                 self.by_node_index.insert(sender, id);
                 self.new_indexes.push(sender);
                 Action::ToPhone { phone, from: local }
             }
-            Some(Message::CookieReply { receiver } | Message::Data { receiver }) => {
-                let Some(id) = self.by_phone_index.get(&(node, receiver)).copied() else { return Action::Drop };
-                let s = self.sessions.get_mut(&id).expect("indexed sessions exist");
-                s.seen = now;
-                Action::ToPhone { phone: s.phone, from: s.local }
+            Some(message @ (Message::CookieReply { receiver } | Message::Data { receiver })) => {
+                let key = (node, receiver);
+                if let Some(id) = self.by_phone_index.get(&key).copied() {
+                    let s = self.sessions.get_mut(&id).expect("indexed sessions exist");
+                    s.seen = now;
+                    return Action::ToPhone { phone: s.phone, from: s.local };
+                }
+                let Some(p) = self.pending.get(&key) else { return Action::Drop };
+                let (phone, local, answers) = (p.phone, p.local, p.answers);
+                match (message, answers) {
+                    // The node too busy to take the handshake, asking for it
+                    // again: back to where it came from, settling nothing.
+                    (Message::CookieReply { .. }, _) => Action::ToPhone { phone, from: local },
+                    // The node's first packet to a phone that answered its
+                    // handshake: the node took that answer, and the session
+                    // is now the phone's at the address it came from.
+                    (_, Some(id)) => {
+                        self.remove_pending(key);
+                        let Some(s) = self.sessions.get_mut(&id).filter(|s| s.phone_index.is_none()) else {
+                            return Action::Drop;
+                        };
+                        (s.phone, s.local, s.phone_index, s.seen) = (phone, local, Some(receiver), now);
+                        let device = s.device;
+                        self.by_phone_index.insert(key, id);
+                        if let Some(pk) = device {
+                            self.devices_seen.insert(pk, (phone, local, now));
+                        }
+                        Action::ToPhone { phone, from: local }
+                    }
+                    // Data before the node answered the phone's handshake is
+                    // nothing WireGuard sends.
+                    (_, None) => Action::Drop,
+                }
             }
             None => Action::Drop,
         }
     }
 
-    /// Forgets the sessions quiet for longer than [`SESSION_LIFETIME`], and
-    /// where devices were seen as long ago.
+    /// Forgets the sessions quiet for longer than [`SESSION_LIFETIME`],
+    /// where devices were seen as long ago, and the handshakes pending for
+    /// longer than [`PENDING_LIFETIME`].
     pub fn expire(&mut self, now: Instant) {
         let old: Vec<u64> = self
             .sessions
@@ -199,6 +302,15 @@ impl Sorter {
             self.remove(id);
         }
         self.devices_seen.retain(|_, (_, _, seen)| now.saturating_duration_since(*seen) <= SESSION_LIFETIME);
+        let old: Vec<(SocketAddrV4, u32)> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| now.saturating_duration_since(p.since) > PENDING_LIFETIME)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in old {
+            self.remove_pending(key);
+        }
     }
 
     /// Every node index of a live session: what the firewall diverts.
@@ -227,6 +339,18 @@ impl Sorter {
         self.sessions.is_empty()
     }
 
+    /// How many handshakes wait for their node.
+    #[must_use]
+    pub fn pending(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Whether `node` already has a session or a pending handshake with
+    /// this phone index.
+    fn index_taken(&self, node: SocketAddrV4, phone_index: u32) -> bool {
+        self.by_phone_index.contains_key(&(node, phone_index)) || self.pending.contains_key(&(node, phone_index))
+    }
+
     fn insert(&mut self, session: Session) -> u64 {
         if self.sessions.len() >= MAX_SESSIONS {
             if let Some(quietest) = self.sessions.iter().min_by_key(|(_, s)| s.seen).map(|(id, _)| *id) {
@@ -241,31 +365,105 @@ impl Sorter {
 
     fn remove(&mut self, id: u64) {
         if let Some(s) = self.sessions.remove(&id) {
-            if let Some(i) = s.node_index {
-                self.by_node_index.remove(&i);
-            }
+            self.by_node_index.remove(&s.node_index);
             if let Some(i) = s.phone_index {
                 self.by_phone_index.remove(&(s.node, i));
             }
         }
+    }
+
+    /// Notes a pending handshake, making room first: among that phone's
+    /// own to that node, then among all. Only pending handshakes ever make
+    /// room for one, never a session.
+    fn add_pending(&mut self, key: (SocketAddrV4, u32), mut pending: Pending) {
+        let (node, index) = key;
+        let oldest_of_phone = self
+            .pending_by_phone
+            .get(&(node, pending.phone))
+            .filter(|indexes| indexes.len() >= MAX_PENDING_PER_PHONE)
+            .and_then(|indexes| indexes.first().copied());
+        if let Some(oldest) = oldest_of_phone {
+            self.remove_pending((node, oldest));
+        }
+        if self.pending.len() >= MAX_PENDING {
+            if let Some(oldest) = self.pending_order.values().next().copied() {
+                self.remove_pending(oldest);
+            }
+        }
+        pending.seq = self.next_id;
+        self.next_id += 1;
+        self.pending_order.insert(pending.seq, key);
+        self.pending_by_phone.entry((node, pending.phone)).or_default().push(index);
+        self.pending.insert(key, pending);
+    }
+
+    fn remove_pending(&mut self, key: (SocketAddrV4, u32)) -> Option<Pending> {
+        let p = self.pending.remove(&key)?;
+        self.pending_order.remove(&p.seq);
+        let by_phone = (key.0, p.phone);
+        if let Some(indexes) = self.pending_by_phone.get_mut(&by_phone) {
+            indexes.retain(|i| *i != key.1);
+            if indexes.is_empty() {
+                self.pending_by_phone.remove(&by_phone);
+            }
+        }
+        Some(p)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::phone_relay::packet::tests::{answer, data, initiation, End};
-    use crate::phone_relay::packet::Message;
+    use crate::phone_relay::packet::tests::{answer, data, initiation, seal_mac1, End};
+    use crate::phone_relay::packet::{Message, COOKIE_REPLY_LEN, DATA_MIN_LEN, INITIATION_LEN, RESPONSE_LEN};
     use defguard_boringtun::noise::Tunn;
+    use std::net::Ipv4Addr;
 
     const PHONE: &str = "198.51.100.7:40000";
     const ROAMED: &str = "203.0.113.9:51000";
+    /// Someone who saw the phone's packets go by, sending from elsewhere.
+    const SPOOFED: &str = "192.0.2.66:6666";
     const LOCAL: &str = "192.0.2.1:51820";
     const MINIPC: &str = "10.1.0.5:51820";
     const NAS: &str = "10.1.0.6:51820";
 
     fn a(s: &str) -> SocketAddrV4 {
         s.parse().unwrap()
+    }
+
+    /// An initiation for the node with public key `node`, as anyone who
+    /// knows that key can make one: a valid `mac1`, nothing else real.
+    fn forged_initiation(sender: u32, node: &[u8; 32]) -> Vec<u8> {
+        let mut p = vec![0u8; INITIATION_LEN];
+        p[0] = 1;
+        p[4..8].copy_from_slice(&sender.to_le_bytes());
+        seal_mac1(&mut p, &mac1_key(node));
+        p
+    }
+
+    /// A response to `initiator`'s handshake, made the same way.
+    fn forged_response(sender: u32, receiver: u32, initiator: &[u8; 32]) -> Vec<u8> {
+        let mut p = vec![0u8; RESPONSE_LEN];
+        p[0] = 2;
+        p[4..8].copy_from_slice(&sender.to_le_bytes());
+        p[8..12].copy_from_slice(&receiver.to_le_bytes());
+        seal_mac1(&mut p, &mac1_key(initiator));
+        p
+    }
+
+    /// A data packet (or with `kind` 3, a cookie reply) for `receiver`.
+    fn forged(kind: u8, receiver: u32) -> Vec<u8> {
+        let mut p = vec![0u8; if kind == 3 { COOKIE_REPLY_LEN } else { DATA_MIN_LEN }];
+        p[0] = kind;
+        p[4..8].copy_from_slice(&receiver.to_le_bytes());
+        p
+    }
+
+    fn sender(packet: &[u8]) -> u32 {
+        match Message::parse(packet) {
+            Some(Message::Initiation { sender } | Message::Response { sender, .. }) => sender,
+            other => panic!("no sender: {other:?}"),
+        }
     }
 
     /// The phone (key 1), and a carrier relaying it to minipc (key 2) and
@@ -288,6 +486,14 @@ mod tests {
             self.sorter.from_phone(self.now, a(PHONE), a(LOCAL), packet)
         }
 
+        fn sent_from(&mut self, from: &str, packet: &[u8]) -> Action {
+            self.sorter.from_phone(self.now, a(from), a(LOCAL), packet)
+        }
+
+        fn node_sends(&mut self, node: &str, packet: &[u8]) -> Action {
+            self.sorter.from_node(self.now, a(node), packet)
+        }
+
         /// The phone and `node` handshake through the sorter, the phone
         /// starting; returns both tunnels, the session up.
         fn handshake(&mut self, node: &str, peer: &End, phone_index: u32) -> (Tunn, Tunn) {
@@ -296,13 +502,16 @@ mod tests {
             let init = initiation(&mut p);
             assert_eq!(self.phone_sends(&init), Action::ToNode(a(node)));
             let resp = answer(&mut n, &init).unwrap();
-            assert_eq!(self.sorter.from_node(self.now, a(node), &resp), Action::ToPhone { phone: a(PHONE), from: a(LOCAL) });
+            assert_eq!(self.node_sends(node, &resp), Action::ToPhone { phone: a(PHONE), from: a(LOCAL) });
             let keepalive = answer(&mut p, &resp).unwrap();
             assert_eq!(self.phone_sends(&keepalive), Action::ToNode(a(node)));
             assert!(answer(&mut n, &keepalive).is_none());
             (p, n)
         }
     }
+
+    const AT_PHONE: Action = Action::ToPhone { phone: SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 7), 40000), from: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 51820) };
+    const AT_ROAMED: Action = Action::ToPhone { phone: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 51000), from: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 51820) };
 
     #[test]
     fn a_phone_reaches_each_node_by_its_handshake_and_its_index() {
@@ -311,6 +520,7 @@ mod tests {
         let (mut p1, mut n1) = w.handshake(MINIPC, &minipc, 1);
         let (mut p2, mut n2) = w.handshake(NAS, &nas, 2);
         assert_eq!(w.sorter.len(), 2);
+        assert_eq!(w.sorter.pending(), 0);
         assert_eq!(w.phone_sends(&data(&mut p1)), Action::ToNode(a(MINIPC)));
         assert_eq!(w.phone_sends(&data(&mut p2)), Action::ToNode(a(NAS)));
         assert_eq!(w.sorter.from_node(w.now, a(MINIPC), &data(&mut n1)), Action::ToPhone { phone: a(PHONE), from: a(LOCAL) });
@@ -335,6 +545,7 @@ mod tests {
         assert_eq!(w.phone_sends(&keepalive), Action::ToKernel, "an index no relayed node chose");
         assert_eq!(w.phone_sends(b"not wireguard"), Action::ToKernel);
         assert!(w.sorter.is_empty());
+        assert_eq!(w.sorter.pending(), 0);
     }
 
     #[test]
@@ -349,9 +560,12 @@ mod tests {
         assert_eq!(w.sorter.from_node(w.now, a(MINIPC), &init), Action::ToPhone { phone: a(PHONE), from: a(LOCAL) });
         let resp = answer(&mut p, &init).unwrap();
         assert_eq!(w.phone_sends(&resp), Action::ToNode(a(MINIPC)), "the response carries the node's index");
+        assert_eq!(w.sorter.pending(), 1, "until the node takes it");
         let keepalive = answer(&mut n, &resp).unwrap();
         assert_eq!(w.sorter.from_node(w.now, a(MINIPC), &keepalive), Action::ToPhone { phone: a(PHONE), from: a(LOCAL) });
+        assert_eq!(w.sorter.pending(), 0);
         assert_eq!(w.phone_sends(&data(&mut p)), Action::ToNode(a(MINIPC)));
+        assert_eq!(w.node_sends(MINIPC, &data(&mut n)), AT_PHONE);
     }
 
     #[test]
@@ -369,13 +583,141 @@ mod tests {
     }
 
     #[test]
-    fn a_phone_that_moves_is_answered_where_it_is_now() {
+    fn a_phone_that_moves_is_answered_where_it_is_now_once_the_node_answers_its_next_handshake() {
         let mut w = World::new();
         let minipc = End::new(2);
         let (mut p, mut n) = w.handshake(MINIPC, &minipc, 1);
-        let moved = w.sorter.from_phone(w.now, a(ROAMED), a(LOCAL), &data(&mut p));
-        assert_eq!(moved, Action::ToNode(a(MINIPC)));
-        assert_eq!(w.sorter.from_node(w.now, a(MINIPC), &data(&mut n)), Action::ToPhone { phone: a(ROAMED), from: a(LOCAL) });
+        // Its data still reaches the node from the new address, but the
+        // node's answers go where the session is until a handshake says
+        // otherwise.
+        assert_eq!(w.sent_from(ROAMED, &data(&mut p)), Action::ToNode(a(MINIPC)));
+        assert_eq!(w.node_sends(MINIPC, &data(&mut n)), AT_PHONE);
+        // The phone's next handshake, from where it is now.
+        let init = initiation(&mut p);
+        assert_eq!(w.sent_from(ROAMED, &init), Action::ToNode(a(MINIPC)));
+        assert_eq!(w.node_sends(MINIPC, &data(&mut n)), AT_PHONE, "pending: the session stays where it was");
+        let resp = answer(&mut n, &init).unwrap();
+        assert_eq!(w.node_sends(MINIPC, &resp), AT_ROAMED, "the node answered: the new session is at the new address");
+        let keepalive = answer(&mut p, &resp).unwrap();
+        assert_eq!(w.sent_from(ROAMED, &keepalive), Action::ToNode(a(MINIPC)));
+        assert!(answer(&mut n, &keepalive).is_none());
+        assert_eq!(w.node_sends(MINIPC, &data(&mut n)), AT_ROAMED);
+        assert_eq!(w.sent_from(ROAMED, &data(&mut p)), Action::ToNode(a(MINIPC)));
+        // And a node's own handshake now looks for it there.
+        let mut rekey = minipc.tunnel_to(&w.phone, 500);
+        assert_eq!(w.node_sends(MINIPC, &initiation(&mut rekey)), AT_ROAMED);
+    }
+
+    #[test]
+    fn a_spoofed_data_packet_neither_moves_a_session_nor_keeps_it_alive() {
+        let mut w = World::new();
+        let minipc = End::new(2);
+        let (mut p, mut n) = w.handshake(MINIPC, &minipc, 1);
+        let node_index = w.sorter.node_indexes()[0];
+        let captured = data(&mut p);
+        assert_eq!(w.phone_sends(&captured), Action::ToNode(a(MINIPC)));
+        let last = w.now;
+        w.now += SESSION_LIFETIME / 2;
+        // The same packet again, and ones made up, from elsewhere: on to
+        // the node, which drops them all.
+        assert_eq!(w.sent_from(SPOOFED, &captured), Action::ToNode(a(MINIPC)));
+        assert_eq!(w.sent_from(SPOOFED, &forged(4, node_index)), Action::ToNode(a(MINIPC)));
+        assert_eq!(w.sent_from(SPOOFED, &forged(3, node_index)), Action::ToNode(a(MINIPC)));
+        assert_eq!(w.sorter.node_indexes(), vec![node_index]);
+        assert_eq!(w.sorter.from_node(last, a(MINIPC), &data(&mut n)), AT_PHONE, "the downlink stays with the phone");
+        // The real packets were the session's last: the spoofed ones, later,
+        // count for nothing.
+        w.sorter.expire(last + SESSION_LIFETIME + Duration::from_secs(1));
+        assert!(w.sorter.is_empty());
+    }
+
+    #[test]
+    fn a_spoofed_response_re_indexes_nothing() {
+        let mut w = World::new();
+        let minipc = End::new(2);
+        let (mut p, mut n) = w.handshake(MINIPC, &minipc, 1);
+        let node_index = w.sorter.node_indexes()[0];
+        // Made for minipc, with a fresh index of its own, at a session the
+        // phone started: no node's handshake waits for it.
+        assert_eq!(w.sent_from(SPOOFED, &forged_response(0xdead, node_index, &minipc.public)), Action::Drop);
+        assert_eq!(w.sorter.pending(), 0);
+        assert_eq!(w.node_sends(MINIPC, &data(&mut n)), AT_PHONE);
+        assert_eq!(w.phone_sends(&data(&mut p)), Action::ToNode(a(MINIPC)));
+
+        // At a node's own handshake, ahead of the phone's real answer.
+        let mut n2 = minipc.tunnel_to(&w.phone, 300);
+        let mut p2 = w.phone.tunnel_to(&minipc, 400);
+        let init = initiation(&mut n2);
+        assert_eq!(w.node_sends(MINIPC, &init), AT_PHONE);
+        let theirs = sender(&init);
+        assert_eq!(w.sent_from(SPOOFED, &forged_response(0xbeef, theirs, &w.phone.public)), Action::Drop, "not made for the node");
+        assert_eq!(w.sent_from(SPOOFED, &forged_response(0xbeef, theirs, &minipc.public)), Action::ToNode(a(MINIPC)));
+        let resp = answer(&mut p2, &init).unwrap();
+        assert_eq!(w.phone_sends(&resp), Action::ToNode(a(MINIPC)), "the phone's own answer is not shut out");
+        assert_eq!(w.sorter.pending(), 2);
+        // The node takes only the real one, and its first packet says which.
+        let keepalive = answer(&mut n2, &resp).unwrap();
+        assert_eq!(w.node_sends(MINIPC, &keepalive), AT_PHONE);
+        assert_eq!(w.node_sends(MINIPC, &forged(4, 0xbeef)), Action::Drop, "the forged answer's index is nobody's");
+        assert_eq!(w.sent_from(SPOOFED, &forged_response(0xf00d, theirs, &minipc.public)), Action::Drop, "answered already");
+        assert_eq!(w.phone_sends(&data(&mut p2)), Action::ToNode(a(MINIPC)));
+        assert_eq!(w.node_sends(MINIPC, &data(&mut n2)), AT_PHONE);
+    }
+
+    #[test]
+    fn a_replayed_initiation_leaves_the_session_it_started_alone() {
+        let mut w = World::new();
+        let minipc = End::new(2);
+        let mut p = w.phone.tunnel_to(&minipc, 1);
+        let mut n = minipc.tunnel_to(&w.phone, 101);
+        let init = initiation(&mut p);
+        assert_eq!(w.phone_sends(&init), Action::ToNode(a(MINIPC)));
+        assert_eq!(w.sent_from(SPOOFED, &init), Action::Drop, "while it is pending");
+        let resp = answer(&mut n, &init).unwrap();
+        assert_eq!(w.node_sends(MINIPC, &resp), AT_PHONE, "the node's answer goes to the phone, not the replay");
+        let keepalive = answer(&mut p, &resp).unwrap();
+        assert_eq!(w.phone_sends(&keepalive), Action::ToNode(a(MINIPC)));
+        assert!(answer(&mut n, &keepalive).is_none());
+        let held = w.sorter.node_indexes();
+        assert_eq!(w.sent_from(SPOOFED, &init), Action::Drop, "once it is a session");
+        assert_eq!(w.sent_from(PHONE, &init), Action::Drop, "even from the phone's own address");
+        assert_eq!((w.sorter.len(), w.sorter.pending()), (1, 0));
+        assert_eq!(w.sorter.node_indexes(), held);
+        assert_eq!(w.node_sends(MINIPC, &data(&mut n)), AT_PHONE);
+        assert_eq!(w.phone_sends(&data(&mut p)), Action::ToNode(a(MINIPC)));
+    }
+
+    #[test]
+    fn a_node_that_rekeys_finds_a_phone_at_a_new_address_once_it_takes_the_phones_answer() {
+        let mut w = World::new();
+        let minipc = End::new(2);
+        let (_p, mut n) = w.handshake(MINIPC, &minipc, 1);
+        let mut n2 = minipc.tunnel_to(&w.phone, 300);
+        let mut p2 = w.phone.tunnel_to(&minipc, 400);
+        let init = initiation(&mut n2);
+        assert_eq!(w.node_sends(MINIPC, &init), AT_PHONE, "where the phone was last");
+        // The phone's answer leaves from a new address (its NAT moved it).
+        let resp = answer(&mut p2, &init).unwrap();
+        assert_eq!(w.sent_from(ROAMED, &resp), Action::ToNode(a(MINIPC)));
+        assert_eq!(w.node_sends(MINIPC, &data(&mut n)), AT_PHONE, "the older session is untouched");
+        let keepalive = answer(&mut n2, &resp).unwrap();
+        assert_eq!(w.node_sends(MINIPC, &keepalive), AT_ROAMED, "the node took the answer from there");
+        assert_eq!(w.sent_from(ROAMED, &data(&mut p2)), Action::ToNode(a(MINIPC)));
+        assert_eq!(w.node_sends(MINIPC, &data(&mut n2)), AT_ROAMED);
+        let mut n3 = minipc.tunnel_to(&w.phone, 301);
+        assert_eq!(w.node_sends(MINIPC, &initiation(&mut n3)), AT_ROAMED, "the next one looks there");
+    }
+
+    #[test]
+    fn a_cookie_reply_goes_where_the_pending_handshake_came_from_and_settles_nothing() {
+        let mut w = World::new();
+        let minipc = End::new(2);
+        let (_p, mut n) = w.handshake(MINIPC, &minipc, 1);
+        assert_eq!(w.sent_from(ROAMED, &forged_initiation(77, &minipc.public)), Action::ToNode(a(MINIPC)));
+        assert_eq!(w.node_sends(MINIPC, &forged(3, 77)), AT_ROAMED);
+        assert_eq!(w.node_sends(MINIPC, &forged(4, 77)), Action::Drop, "no data before a response");
+        assert_eq!((w.sorter.len(), w.sorter.pending()), (1, 1));
+        assert_eq!(w.node_sends(MINIPC, &data(&mut n)), AT_PHONE);
     }
 
     #[test]
@@ -411,28 +753,89 @@ mod tests {
     }
 
     #[test]
+    fn a_handshake_the_node_does_not_answer_in_time_is_forgotten() {
+        let mut w = World::new();
+        let minipc = End::new(2);
+        assert_eq!(w.phone_sends(&forged_initiation(77, &minipc.public)), Action::ToNode(a(MINIPC)));
+        w.sorter.expire(w.now + PENDING_LIFETIME);
+        assert_eq!(w.sorter.pending(), 1);
+        w.now += PENDING_LIFETIME + Duration::from_secs(1);
+        w.sorter.expire(w.now);
+        assert_eq!(w.sorter.pending(), 0);
+        assert_eq!(w.node_sends(MINIPC, &forged_response(5, 77, &w.phone.public)), Action::Drop);
+        assert!(w.sorter.is_empty());
+    }
+
+    #[test]
     fn a_node_taken_off_the_list_loses_its_sessions() {
         let mut w = World::new();
         let (minipc, nas) = (End::new(2), End::new(3));
         let (mut p, _n) = w.handshake(MINIPC, &minipc, 1);
         let _ = w.handshake(NAS, &nas, 2);
+        assert_eq!(w.phone_sends(&forged_initiation(77, &minipc.public)), Action::ToNode(a(MINIPC)));
         w.sorter.set_peers(&[(a(NAS), nas.public)], &[w.phone.public]);
-        assert_eq!(w.sorter.len(), 1);
+        assert_eq!((w.sorter.len(), w.sorter.pending()), (1, 0));
         assert_eq!(w.phone_sends(&data(&mut p)), Action::ToKernel);
     }
 
     #[test]
-    fn a_flood_of_handshakes_pushes_out_only_the_quietest_session() {
+    fn pending_handshakes_are_bounded_from_each_address_and_overall() {
+        let mut w = World::new();
+        let minipc = End::new(2);
+        for i in 0..=u32::try_from(MAX_PENDING_PER_PHONE).unwrap() {
+            w.now += Duration::from_millis(1);
+            assert_eq!(w.phone_sends(&forged_initiation(i, &minipc.public)), Action::ToNode(a(MINIPC)));
+        }
+        assert_eq!(w.sorter.pending(), MAX_PENDING_PER_PHONE);
+        assert_eq!(w.node_sends(MINIPC, &forged_response(9000, 0, &w.phone.public)), Action::Drop, "the oldest made room");
+        assert_eq!(w.node_sends(MINIPC, &forged_response(9001, 1, &w.phone.public)), AT_PHONE);
+        // The same index to another node is another handshake.
+        assert_eq!(w.phone_sends(&forged_initiation(2, &End::new(3).public)), Action::ToNode(a(NAS)));
+
+        let mut w = World::new();
+        for i in 0..=u32::try_from(MAX_PENDING).unwrap() {
+            w.now += Duration::from_millis(1);
+            let from = SocketAddrV4::new(Ipv4Addr::from(0x0a00_0000 + i), 40000);
+            assert_eq!(w.sorter.from_phone(w.now, from, a(LOCAL), &forged_initiation(i, &minipc.public)), Action::ToNode(a(MINIPC)));
+        }
+        assert_eq!(w.sorter.pending(), MAX_PENDING);
+        assert_eq!(w.node_sends(MINIPC, &forged_response(9000, 0, &w.phone.public)), Action::Drop, "the oldest made room");
+        assert_eq!(w.node_sends(MINIPC, &forged_response(9001, 1, &w.phone.public)), Action::ToPhone { phone: SocketAddrV4::new(Ipv4Addr::from(0x0a00_0001), 40000), from: a(LOCAL) });
+        assert_eq!(w.sorter.pending(), MAX_PENDING - 1);
+    }
+
+    #[test]
+    fn a_flood_of_handshakes_the_node_never_answers_pushes_out_no_session() {
+        let mut w = World::new();
+        let minipc = End::new(2);
+        let (mut p, mut n) = w.handshake(MINIPC, &minipc, 1);
+        // Idle, and older than every one of them.
+        for i in 0..MAX_SESSIONS + MAX_PENDING {
+            w.now += Duration::from_millis(1);
+            let i = u32::try_from(i).unwrap();
+            let from = SocketAddrV4::new(Ipv4Addr::from(0x0a00_0000 + i), 40000);
+            assert_eq!(w.sorter.from_phone(w.now, from, a(LOCAL), &forged_initiation(1000 + i, &minipc.public)), Action::ToNode(a(MINIPC)));
+        }
+        assert_eq!((w.sorter.len(), w.sorter.pending()), (1, MAX_PENDING));
+        assert_eq!(w.phone_sends(&data(&mut p)), Action::ToNode(a(MINIPC)));
+        assert_eq!(w.node_sends(MINIPC, &data(&mut n)), AT_PHONE);
+    }
+
+    #[test]
+    fn a_flood_of_answered_handshakes_pushes_out_only_the_quietest_session() {
         let mut w = World::new();
         let minipc = End::new(2);
         let (mut p, _n) = w.handshake(MINIPC, &minipc, 1);
-        // A first session, then MAX_SESSIONS more, each one newer.
+        // A first session, then MAX_SESSIONS more the node answered, each
+        // one newer.
         for i in 0..MAX_SESSIONS {
             w.now += Duration::from_millis(1);
-            let mut flood = w.phone.tunnel_to(&minipc, 1000 + u32::try_from(i).unwrap());
-            assert_eq!(w.phone_sends(&initiation(&mut flood)), Action::ToNode(a(MINIPC)));
+            let i = u32::try_from(i).unwrap();
+            assert_eq!(w.phone_sends(&forged_initiation(1000 + i, &minipc.public)), Action::ToNode(a(MINIPC)));
+            assert_eq!(w.node_sends(MINIPC, &forged_response(1_000_000 + i, 1000 + i, &w.phone.public)), AT_PHONE);
         }
         assert_eq!(w.sorter.len(), MAX_SESSIONS);
         assert_eq!(w.phone_sends(&data(&mut p)), Action::ToKernel, "the oldest made room");
+        assert_eq!(w.sorter.node_indexes().len(), MAX_SESSIONS, "and took its index with it");
     }
 }

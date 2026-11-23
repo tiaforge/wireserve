@@ -22,7 +22,8 @@
 #      never saw inside;
 #   6. the phone reaches a service on the carrier itself too, over the same
 #      port, its session there the kernel's own;
-#   7. the phone roams (a new source port) and reaches the node again;
+#   7. the phone roams (a new source port) and reaches the node again,
+#      once its next handshake from there has gone through;
 #   8. default-deny still holds through the relay;
 #   9. a refresh keeps the phone's address and its carrier.
 #
@@ -331,10 +332,13 @@ pass "the carrier's own service and homeserver's, both through UDP $WG_PORT"
 
 log "7/9: the phone roams and gets back"
 podman exec "$PHONE" wg set wg0 listen-port 51999
-sleep 3
-podman exec "$PHONE" timeout 40 bash -c "until exec 3<>/dev/tcp/$SVC_HOME/12345; do sleep 2; done" 2>/dev/null \
+# The carrier answers the phone at its new address only once the node has
+# answered a handshake from there (PLAN.md M49): the phone starts one 15 s
+# after what it sends goes unanswered. Short attempts, so the one after
+# that handshake is not left waiting on a SYN retransmit of an older one.
+podman exec "$PHONE" timeout 60 bash -c "until timeout 5 bash -c 'exec 3<>/dev/tcp/$SVC_HOME/12345'; do sleep 1; done" 2>/dev/null \
     || fail "after a new source port the phone never reached svc-home again"
-pass "reached again from a new source port"
+pass "reached again from a new source port, after its next handshake"
 
 log "8/9: default-deny holds through the relay"
 in_netns_bg "$HOME_AGENT" nc -l -k -p 12346
