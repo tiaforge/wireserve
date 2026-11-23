@@ -45,9 +45,11 @@ pub struct ChallengeBody {
 
 pub async fn add(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     BearerNode { node }: BearerNode,
     Json(body): Json<ChallengeBody>,
-) -> Result<StatusCode, AppError> {
+) -> Result<axum::response::Response, AppError> {
+    use axum::response::IntoResponse;
     let (dns, record) = authorize(&state, &node, &body).await?;
     if let crate::rate_limit::Take::Refused { log } = state.challenge_limiter.take(node.id) {
         if log {
@@ -62,9 +64,19 @@ pub async fn add(
     let expires = Utc::now() + chrono::Duration::minutes(CHALLENGE_TTL_MINUTES);
     {
         let conn = state.db.conn.lock().await;
+        // The node as it stands now: its row was read before the body came
+        // and before the provider was asked about the name, both of which
+        // wait. A node revoked or rejoined in between gets nothing published
+        // (see `BearerNode::recheck`); its services may well still be there
+        // after a rejoin, so `authorize` alone does not catch it.
+        if BearerNode::recheck(&conn, &headers, &node)?.is_none() {
+            drop(conn);
+            tracing::info!(event = "challenge_outlived_its_token", node_name = %node.name, fqdn = %record, "a challenge's token was revoked or replaced while it was being checked");
+            return Ok(crate::auth::AuthError::Unauthorized.into_response());
+        }
         match tls::add_challenge(&conn, &record, &body.value, node.id, expires)? {
             tls::AddOutcome::TooMany => return Err(AppError::TooManyRequests),
-            tls::AddOutcome::Refreshed => return Ok(StatusCode::OK),
+            tls::AddOutcome::Refreshed => return Ok(StatusCode::OK.into_response()),
             tls::AddOutcome::Added => {}
         }
     }
@@ -75,7 +87,7 @@ pub async fn add(
         Ok(()) => {
             tls::mark_written(&*state.db.conn.lock().await, &record, &body.value)?;
             tracing::info!(event = "acme_challenge_published", node_name = %node.name, fqdn = %record);
-            Ok(StatusCode::CREATED)
+            Ok(StatusCode::CREATED.into_response())
         }
         Err(e) => {
             tls::delete_challenge(&*state.db.conn.lock().await, &record, &body.value)?;

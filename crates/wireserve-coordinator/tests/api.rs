@@ -4071,6 +4071,8 @@ mod dns_records {
         /// The names it was asked about.
         looked_up: Mutex<Vec<String>>,
         lookup_fails: AtomicBool,
+        /// When set, the next lookup waits for it.
+        lookup_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     }
 
     impl FakeDns {
@@ -4089,7 +4091,13 @@ mod dns_records {
             self.looked_up.lock().unwrap().push(fqdn.to_string());
             let fails = self.lookup_fails.load(Ordering::SeqCst);
             let found = self.zone.lock().unwrap().get(fqdn).cloned().unwrap_or_default();
-            Box::pin(async move { if fails { Err("provider unreachable".to_string()) } else { Ok(found) } })
+            let gate = self.lookup_gate.lock().unwrap().take();
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    let _ = gate.await;
+                }
+                if fails { Err("provider unreachable".to_string()) } else { Ok(found) }
+            })
         }
         fn set_a<'a>(&'a self, fqdn: &'a str, addr: std::net::Ipv4Addr) -> WriteFuture<'a> {
             self.call(format!("set {fqdn} {addr}"))
@@ -4521,6 +4529,41 @@ mod dns_records {
         pass(&app).await;
         assert!(fake.take().iter().any(|c| c.starts_with("set grafana.int.example.com")));
         assert_eq!(challenge(&app, &home, "POST", "grafana.int.example.com", DIGEST).await, StatusCode::CREATED);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_challenge_asked_for_just_before_a_rejoin_is_not_published() {
+        let fake = Arc::new(FakeDns::default());
+        let app = app(&fake);
+        let home = node(&app, "home").await;
+        poll_with(&app.router, &home, json!([svc("plex", 443, 32400)])).await;
+        fake.take();
+
+        // The request is past its token check, waiting on the provider to say
+        // whether the name is held elsewhere, when the admin rejoins the node.
+        let (release, gate) = tokio::sync::oneshot::channel();
+        *fake.lookup_gate.lock().unwrap() = Some(gate);
+        let asked = {
+            let (app_router, home) = (app.router.clone(), home.clone());
+            tokio::spawn(async move {
+                let req = json_request("POST", "/tls/challenge", Some(&home), json!({ "fqdn": "plex.int.example.com", "value": DIGEST }));
+                app_router.oneshot(req).await.unwrap().status()
+            })
+        };
+        while fake.looked_up.lock().unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let req = json_request("POST", "/admin/nodes/home/rejoin", Some(ADMIN), json!({}));
+        assert_eq!(app.router.clone().oneshot(req).await.unwrap().status(), StatusCode::CREATED);
+        release.send(()).unwrap();
+
+        assert_eq!(asked.await.unwrap(), StatusCode::UNAUTHORIZED);
+        assert!(fake.take().is_empty(), "nothing published for the identity being replaced");
+        let held: i64 = app.state.db.conn.lock().await
+            .query_row("SELECT COUNT(*) FROM acme_challenges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(held, 0);
+        assert_eq!(app.state.rate_limiter.tracked_sources(), 0, "the token was good when presented");
     }
 
     #[tokio::test]
