@@ -4900,6 +4900,42 @@ async fn pages_anyone_can_open_do_not_make_the_next_poll_read_the_whole_mesh() {
     assert_eq!(b_endpoint(&after), json!("198.51.100.7:51821"));
 }
 
+#[tokio::test]
+async fn admin_writes_that_are_refused_do_not_make_the_next_poll_read_the_whole_mesh() {
+    let app = test_app();
+    let (ta, tb) = (admin_create_node(&app.router, "a").await, admin_create_node(&app.router, "b").await);
+    let a = register_node(&app.router, &ta, "pk-a", 51820).await["bearer_token"].as_str().unwrap().to_string();
+    register_node(&app.router, &tb, "pk-b", 51821).await;
+    let b_endpoint = |body: &Value| {
+        body["peers"].as_array().unwrap().iter().find(|p| p["name"] == "b").unwrap()["endpoint_addr"].clone()
+    };
+    let (_, first) = poll_full(&app.router, &a, json!({ "services": [] })).await;
+    let before = b_endpoint(&first);
+
+    // A write the directory is not told of: only a full read would see it.
+    app.state
+        .db
+        .conn
+        .lock()
+        .await
+        .execute("UPDATE nodes SET endpoint_addr = '198.51.100.7:51821' WHERE name = 'b'", [])
+        .unwrap();
+    // Without the admin token, with a wrong one, and with a good one for a
+    // node that is not there.
+    for auth in [None, Some("Bearer wrong-token")] {
+        let resp = app.router.clone().oneshot(raw_request("POST", "/admin/nodes/b/revoke", auth)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(admin_post(&app.router, "/admin/nodes/ghost/revoke").await, StatusCode::NOT_FOUND);
+    let (_, after) = poll_full(&app.router, &a, json!({ "services": [] })).await;
+    assert_eq!(b_endpoint(&after), before, "not read again for any of them");
+
+    // One that is carried out is read.
+    assert_eq!(admin_post(&app.router, "/admin/nodes/b/transit/approve").await, StatusCode::OK);
+    let (_, after) = poll_full(&app.router, &a, json!({ "services": [] })).await;
+    assert_eq!(b_endpoint(&after), json!("198.51.100.7:51821"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn only_so_many_responses_are_built_at_once_and_the_rest_wait_their_turn() {
     let app = test_app();
