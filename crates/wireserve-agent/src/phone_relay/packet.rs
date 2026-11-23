@@ -136,6 +136,17 @@ pub(crate) mod tests {
         }
     }
 
+    /// Gives a handshake `packet` (type 1 or 2) the `mac1` made with `key`
+    /// ([`mac1_key`]): what anyone who knows the recipient's public key can
+    /// do, with nothing else of the handshake real.
+    pub(crate) fn seal_mac1(packet: &mut [u8], key: &[u8; 32]) {
+        let covered = if packet[0] == 1 { INITIATION_MAC1 } else { RESPONSE_MAC1 };
+        let mut mac: Blake2sMac<blake2::digest::consts::U16> = Blake2sMac::new_from_slice(key).unwrap();
+        Update::update(&mut mac, &packet[..covered]);
+        let tag: [u8; 16] = mac.finalize_fixed().into();
+        packet[covered..covered + 16].copy_from_slice(&tag);
+    }
+
     /// A small IPv4 packet carried through a session, as data.
     pub(crate) fn data(tunn: &mut Tunn) -> Vec<u8> {
         let mut inner = vec![0u8; 28];
@@ -192,6 +203,10 @@ pub(crate) mod tests {
         assert!(!mac1_matches(&init, &key));
         assert!(!mac1_matches(&[1u8; INITIATION_LEN - 1], &key));
         assert!(!mac1_matches(&[2u8; INITIATION_LEN], &key), "a response's length, not its type");
+        let mut forged = [0u8; INITIATION_LEN];
+        forged[0] = 1;
+        seal_mac1(&mut forged, &key);
+        assert!(mac1_matches(&forged, &key), "the public key is all a valid `mac1` takes");
     }
 
     #[test]

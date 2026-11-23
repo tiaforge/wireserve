@@ -40,6 +40,15 @@ out only that port, as hotel and office Wi-Fi often does, still reaches
 every node. And the config says nothing about where a node is: one that
 moves behind another NAT, or gets a port forward, needs no new config.
 
+A phone that changes network reaches its other nodes again only after its
+next handshake: the carrier can't tell a packet from the phone from a copy
+someone else sent, so it moves a session only once the node has answered
+a handshake from the new address. WireGuard starts one when what it sends
+goes unanswered for 15 seconds, so a phone in use is back within about 15
+seconds, and one only sending its keepalives within three and a half
+minutes, when its keys run out. Its session with the carrier itself
+follows it at once, as anywhere else.
+
 Whether a node accepts inbound WireGuard each agent finds out itself when
 it starts: the coordinator answers its startup probe a second time, from a
 port the node never sent anything to, and that answer only gets in where
