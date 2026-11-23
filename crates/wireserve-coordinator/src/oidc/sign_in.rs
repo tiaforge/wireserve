@@ -65,6 +65,12 @@ pub const STARTS_PER_MIN: u32 = 20;
 /// (security audit 2026-10-11).
 pub const STARTS_V6_PREFIX: u8 = 48;
 
+/// Returns from the identity provider one address may bring a minute,
+/// counted as starts are. Each can have this process post to the
+/// provider's token endpoint with the client secret, and a provider that
+/// throttles the client for it fails every real sign-in and refresh.
+pub const CALLBACKS_PER_MIN: u32 = 20;
+
 /// The cookie that carries a sign-in through the identity provider and
 /// back: what the return must match and where it goes on to, sealed. It is
 /// kept in the browser, not here, so no number of sign-ins started
@@ -108,6 +114,8 @@ pub(super) struct Returning {
     pub to: String,
     pub bind: String,
     pub pending: Pending,
+    /// Unix seconds after which its cookie is not taken back.
+    pub until: i64,
 }
 
 /// The sign-in this browser's flow cookie holds, if it opens, is not too
@@ -129,6 +137,7 @@ pub(super) fn returning(state: &AppState, oidc: &Oidc, headers: &HeaderMap, retu
             nonce: openidconnect::Nonce::new(flow.nonce),
             pkce: openidconnect::PkceCodeVerifier::new(flow.pkce),
         },
+        until: flow.until,
     })
 }
 

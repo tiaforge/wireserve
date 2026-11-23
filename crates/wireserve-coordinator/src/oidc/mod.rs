@@ -139,7 +139,21 @@ pub struct Oidc {
     pub(crate) signing_key: ed25519_dalek::SigningKey,
     /// The provider's discovery document, and when it was fetched.
     discovered: Mutex<Option<(std::time::Instant, CoreProviderMetadata)>>,
+    /// Returns from the provider, per source, as `/sign-in` counts starts.
+    pub(crate) callback_limiter: crate::rate_limit::SlidingWindowLimiter,
+    /// The state of each sign-in that came back, and until when its flow
+    /// cookie would be taken (Unix seconds): a flow answers once. The cookie
+    /// is the browser's to keep, and without this whoever kept one could
+    /// have this process post to the token endpoint at any rate.
+    answered: Mutex<HashMap<String, i64>>,
 }
+
+/// At most this many returned sign-ins remembered. A full set pushes out
+/// the one whose cookie runs out first rather than turning anyone away
+/// (PLAN.md #324: anyone can start a sign-in, and filling a set that
+/// refuses would stop everyone's); a flow pushed out could come back once
+/// more, which the callback limiter still counts.
+const MAX_ANSWERED: usize = 8192;
 
 async fn send(http: reqwest::Client, req: openidconnect::HttpRequest) -> Result<openidconnect::HttpResponse, HttpError> {
     let (parts, body) = req.into_parts();
@@ -162,7 +176,38 @@ impl Oidc {
             .build()
             .expect("a client with a timeout and no redirects builds");
         let signing_key = config.signing_key();
-        Self { config, http, flows: Mutex::default(), renewing: Mutex::default(), signing_key, discovered: Mutex::default() }
+        let callback_limiter = crate::rate_limit::SlidingWindowLimiter::new(sign_in::CALLBACKS_PER_MIN, 60)
+            .with_v6_prefix(sign_in::STARTS_V6_PREFIX);
+        Self {
+            config,
+            http,
+            flows: Mutex::default(),
+            renewing: Mutex::default(),
+            signing_key,
+            discovered: Mutex::default(),
+            callback_limiter,
+            answered: Mutex::default(),
+        }
+    }
+
+    /// Whether this is the first return of the sign-in whose state is
+    /// `state` and whose cookie is taken until `until`; remembers it.
+    pub(crate) fn first_answer(&self, state: &str, until: i64) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        let mut answered = self.answered.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if answered.contains_key(state) {
+            return false;
+        }
+        if answered.len() >= MAX_ANSWERED {
+            answered.retain(|_, u| *u >= now);
+        }
+        if answered.len() >= MAX_ANSWERED {
+            if let Some(soonest) = answered.iter().min_by_key(|(_, u)| **u).map(|(s, _)| s.clone()) {
+                answered.remove(&soonest);
+            }
+        }
+        answered.insert(state.to_string(), until);
+        true
     }
 
     fn caller(&self) -> impl Fn(openidconnect::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<openidconnect::HttpResponse, HttpError>> + Send>> {
