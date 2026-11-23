@@ -5,7 +5,7 @@
 #
 # Run with:
 #
-#   docker run -d --name wireserve-agent \
+#   docker run -d --name wireserve-agent --restart on-failure \
 #     --network host \
 #     --cap-add=NET_ADMIN --cap-add=NET_RAW --device /dev/net/tun \
 #     -v /etc/hosts:/etc/hosts \
@@ -13,6 +13,11 @@
 #     -v wireserve-agent-run:/run/wireserve \
 #     --env-file agent.env \
 #     wireserve daemon
+#
+# --restart on-failure, as the systemd and Quadlet units have it: the
+# daemon exits non-zero when it finds its interface deleted or replaced
+# under it, or the hosts file read-only, and comes back through the
+# deny-first startup.
 #
 # Never --privileged (spec §8) — CAP_NET_ADMIN + /dev/net/tun is the
 # whole capability set this needs for WireGuard and nftables
