@@ -4684,6 +4684,122 @@ async fn a_poll_whose_body_does_not_arrive_in_time_is_given_up_on() {
     assert!(app.state.polls_in_hand.lock().unwrap().is_empty());
 }
 
+/// A poll with a good token whose body is sent only once the test says so,
+/// and the test's way of saying so.
+fn held_poll(bearer: &str) -> (Request<Body>, tokio::sync::oneshot::Sender<Value>) {
+    let (send, body) = tokio::sync::oneshot::channel::<Value>();
+    let body = Body::from_stream(futures_util::stream::once(async move {
+        Ok::<_, std::io::Error>(axum::body::Bytes::from(body.await.unwrap_or_default().to_string()))
+    }));
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/poll")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {bearer}"))
+        .body(body)
+        .unwrap();
+    let peer: SocketAddr = format!("{PEER_IP}:12345").parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(peer));
+    (req, send)
+}
+
+/// Starts `bearer`'s poll with its body held back, and waits until its token
+/// has been looked up and found good.
+async fn poll_held_past_its_auth(app: &TestApp, bearer: &str) -> (tokio::task::JoinHandle<axum::response::Response>, tokio::sync::oneshot::Sender<Value>) {
+    let (req, send) = held_poll(bearer);
+    let router = app.router.clone();
+    let poll = tokio::spawn(async move { router.oneshot(req).await.unwrap() });
+    while app.state.polls_in_hand.lock().unwrap().is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    (poll, send)
+}
+
+/// What b's slow poll says once its body arrives: services, a carrier's
+/// offer, and an address of its own.
+fn b_slow_body() -> Value {
+    relay_poll(json!({
+        "services": [{ "name": "plex", "ports": [{ "public": 32400, "target": 32400, "proto": "tcp" }] }],
+        "endpoint_addr": "198.51.100.9:51822",
+        "transit_capable": true,
+        "transit_reachable": [pubkey_for("pk-a"), pubkey_for("pk-c")],
+    }))
+}
+
+async fn service_rows(app: &TestApp) -> i64 {
+    app.state.db.conn.lock().await.query_row("SELECT COUNT(*) FROM services", [], |r| r.get(0)).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_poll_whose_token_was_revoked_while_its_body_was_on_the_way_writes_nothing() {
+    let app = test_app();
+    let (_a, b, _c) = transit_scenario(&app).await;
+    let pk_b = pubkey_for("pk-b");
+    assert_eq!(admin_post(&app.router, "/admin/nodes/b/transit/approve").await, StatusCode::OK);
+
+    let (poll, send) = poll_held_past_its_auth(&app, &b).await;
+    assert_eq!(admin_post(&app.router, "/admin/nodes/b/revoke").await, StatusCode::OK);
+    send.send(b_slow_body()).unwrap();
+    let resp = poll.await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let refused = body_json(resp).await;
+
+    assert_eq!(service_rows(&app).await, 0, "no service brought back for a revoked node");
+    assert!(!app.state.transit.is_offering(&pk_b, 180), "no carrier's offer for a revoked key");
+    assert_eq!(app.state.transit.select(&pubkey_for("pk-a"), &pubkey_for("pk-c"), 180), None);
+    assert!(!app.state.transit.has_capability(&pk_b, "relay", 180));
+    let endpoint: Option<String> = app.state.db.conn.lock().await
+        .query_row("SELECT endpoint_addr FROM nodes WHERE name = 'b'", [], |r| r.get(0))
+        .unwrap();
+    assert_ne!(endpoint.as_deref(), Some("198.51.100.9:51822"));
+    assert_eq!(app.state.rate_limiter.tracked_sources(), 0, "a token good when presented is no failed attempt");
+    let (status, unknown) = poll_full(&app.router, "brt_bogus", json!({ "services": [] })).await;
+    assert_eq!((status, unknown), (StatusCode::UNAUTHORIZED, refused), "the answer an unknown token gets");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_poll_whose_node_rejoined_while_its_body_was_on_the_way_writes_nothing() {
+    let app = test_app();
+    let (_a, b, _c) = transit_scenario(&app).await;
+    assert_eq!(admin_post(&app.router, "/admin/nodes/b/transit/approve").await, StatusCode::OK);
+
+    let (poll, send) = poll_held_past_its_auth(&app, &b).await;
+    let req = json_request("POST", "/admin/nodes/b/rejoin", Some(ADMIN), json!({}));
+    let rejoin = body_json(app.router.clone().oneshot(req).await.unwrap()).await;
+    // And the machine registers again under its new key before the old
+    // poll's body is in.
+    register_node(&app.router, rejoin["join_token"].as_str().unwrap(), "pk-b-new", 51822).await;
+    send.send(b_slow_body()).unwrap();
+    let resp = poll.await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    assert_eq!(service_rows(&app).await, 0);
+    for pk in [pubkey_for("pk-b"), pubkey_for("pk-b-new")] {
+        assert!(!app.state.transit.is_offering(&pk, 180));
+        assert!(!app.state.transit.has_capability(&pk, "relay", 180));
+    }
+    assert_eq!(app.state.rate_limiter.tracked_sources(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_poll_under_way_when_transit_is_denied_does_not_make_its_node_a_carrier_again() {
+    let app = test_app();
+    let (_a, b, c) = transit_scenario(&app).await;
+    assert_eq!(admin_post(&app.router, "/admin/nodes/b/transit/approve").await, StatusCode::OK);
+
+    let (poll, send) = poll_held_past_its_auth(&app, &b).await;
+    assert_eq!(admin_post(&app.router, "/admin/nodes/b/transit/deny").await, StatusCode::OK);
+    send.send(b_slow_body()).unwrap();
+    let resp = poll.await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "the token is still good");
+    let b_body = body_json(resp).await;
+    assert_eq!(b_body["transit_awaiting_approval"], json!(true), "{b_body}");
+    assert!(b_body.get("relay_carrying").is_none());
+    assert!(!app.state.transit.is_offering(&pubkey_for("pk-b"), 180));
+    let (_, c_body) = poll_full(&app.router, &c, relay_poll(json!({ "services": [] }))).await;
+    assert!(carrier_for(&c_body, "a").is_none());
+}
+
 #[tokio::test]
 async fn pages_anyone_can_open_do_not_make_the_next_poll_read_the_whole_mesh() {
     let app = test_app();

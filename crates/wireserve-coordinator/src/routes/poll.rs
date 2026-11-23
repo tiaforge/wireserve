@@ -188,6 +188,21 @@ async fn answer(
             ));
         }
     }
+
+    // Everything from here on is written under the database lock, and only
+    // for the node as it stands now. The row `BearerNode` read is from before
+    // the body arrived, which can be seconds: a revoke, rejoin or transit
+    // deny in between would otherwise be undone by this very poll (its
+    // services back, its carrier's offer back, its token in effect not
+    // stopped). The in-memory transit reports are written under this lock
+    // too, as revoke and rejoin forget them under it.
+    let mut conn = state.db.conn.lock().await;
+    let Some(node) = BearerNode::recheck(&conn, &headers, &node)? else {
+        drop(conn);
+        tracing::info!(event = "poll_outlived_its_token", node_name = %node.name, "a poll's token was revoked or replaced while its body was on the way");
+        return Ok(axum::response::IntoResponse::into_response(crate::auth::AuthError::Unauthorized));
+    };
+
     // Transit self-report (PLAN.md M23): hints, not identity/addressing
     // facts, so a malformed entry is dropped silently rather than
     // rejecting the whole poll the way an invalid endpoint_addr does —
@@ -308,8 +323,6 @@ async fn answer(
             state.config.trusts_forwarded_from(peer_addr.ip()),
         )
     };
-
-    let mut conn = state.db.conn.lock().await;
 
     // Whether anything this poll writes shows in the directory every node
     // shares (`DirectorySnapshot`); `last_seen` does not, the snapshot's TTL

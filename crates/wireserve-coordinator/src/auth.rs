@@ -53,7 +53,11 @@ impl IntoResponse for AuthError {
 }
 
 fn extract_bearer(parts: &Parts) -> Option<&str> {
-    let header = parts.headers.get(axum::http::header::AUTHORIZATION)?;
+    bearer_of(&parts.headers)
+}
+
+fn bearer_of(headers: &axum::http::HeaderMap) -> Option<&str> {
+    let header = headers.get(axum::http::header::AUTHORIZATION)?;
     let value = header.to_str().ok()?;
     value.strip_prefix("Bearer ").filter(|t| !t.is_empty())
 }
@@ -197,6 +201,34 @@ impl FromRequestParts<AppState> for AdminAuth {
 /// whether it matches).
 pub struct BearerNode {
     pub node: crate::db::nodes::NodeRow,
+}
+
+impl BearerNode {
+    /// `node` as it stands now, if the token this request presented (in
+    /// `headers`) still belongs to it, under the same key; `None` if it was
+    /// revoked or rejoined since.
+    ///
+    /// The row [`BearerNode`] hands over was read when the request came in,
+    /// and the database lock was let go of then: a handler that waits for
+    /// anything after that (a poll waits up to `poll::BODY_WITHIN` for its
+    /// body) must call this under the lock it writes under, before it
+    /// writes, and use the row it returns. Otherwise a revoke in between is
+    /// undone by the write, and the token did not stop working when the
+    /// admin was told it did.
+    ///
+    /// Not a failed attempt for the rate limiter: the token was good when
+    /// it was presented.
+    pub fn recheck(
+        conn: &rusqlite::Connection,
+        headers: &axum::http::HeaderMap,
+        node: &crate::db::nodes::NodeRow,
+    ) -> Result<Option<crate::db::nodes::NodeRow>, crate::db::DbError> {
+        let Some(candidate) = bearer_of(headers) else { return Ok(None) };
+        // `find_by_bearer_hash` matches unrevoked rows only, and revoke and
+        // rejoin both clear the hash, as a new registration replaces it.
+        Ok(crate::db::nodes::find_by_bearer_hash(conn, &hash_token(candidate))?
+            .filter(|now| now.id == node.id && now.pubkey == node.pubkey))
+    }
 }
 
 /// A request's place among those in hand at once (`routes::polls_at_once`),
