@@ -7,7 +7,9 @@
 //! `cert.pem` and `key.pem` for the other proxy to use.
 //!
 //! Load comes from one address, so `BENCH_MAX_PER_SOURCE` raises the
-//! per-source connection limit past what the load generator opens.
+//! per-source connection limit past what the load generator opens, and the
+//! limits on requests in flight with it: every stream of every one of
+//! those connections may be busy at once.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -69,6 +71,9 @@ async fn main() {
         .and_then(|n| n.parse().ok())
     {
         limits.max_per_source = n;
+        let requests = n.saturating_mul(limits.max_streams as usize);
+        limits.max_requests_per_source = limits.max_requests_per_source.max(requests);
+        limits.max_requests_total = limits.max_requests_total.max(requests);
     }
     serve::spawn_with_limits(listener, serve::server_config(certs), shared, limits)
         .await
