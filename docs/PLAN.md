@@ -8,34 +8,21 @@ this checklist lives in the session that created it — this file is the
 source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
-**Currently working on:** M49 (phones relayed on the carrier's own
-WireGuard port, items 337–346) is implemented; its e2e test
-(`run-phone-relay-test.sh`) has not been run yet. Before that: M39–M41 (end-to-end
-relaying: carry interface, phone relays through a carrier's public port, the
-gateway retired; items 234–249) are done; plan
-`~/.claude/plans/wobbly-roaming-karp.md` (not in the repo).
-`run-phone-relay-test.sh`, `run-transit-test.sh`, `run-exit-test.sh` and
-`run-nat-test.sh` all pass (2026-09-30).
+**Currently working on:** the release review of 2026-11-23 (items 357–373,
+at the end of this file): what a review of the whole tree found in the way
+of 1.0, fixed on a branch of its own. Its unit tests and the kernel tests
+that need no WireGuard module ran where it was made; CI runs the rest, and
+the e2e suites run with the release workflow. #373 lists what was found and
+left.
 
-**Latest:** M50 (the reflexive probe answered on the WireGuard port, items
-347–356) is implemented; its e2e suite (`run-reflexive-port-test.sh`, #355)
-is written and has not run yet.
+**Before that:** M50 (the reflexive probe answered on the WireGuard port,
+items 347–356) and M49 (phones relayed on the carrier's own WireGuard port,
+items 337–346). Their e2e suites (`run-reflexive-port-test.sh`,
+`run-phone-relay-test.sh`) pass in the nightly run on both architectures,
+with every other suite (2026-11-23).
 
-Everything that can be verified here now is. What remains unverified is
-scale (three nodes, not thirty), real WAN paths, and long-running
-behaviour.
-
-**The next E2E run matters more than usual.** M11 fixed a bug that meant
-the mesh never carried traffic at all (R1 below), and the reason it
-survived three review rounds is that `deploy/e2e/run-e2e-test.sh` only
-ever checked control-plane state — `wg show` output, `/etc/hosts`
-contents, `wireserve list` — and never once sent a packet between the two
-agents. The script now has a data-plane check and a default-deny check,
-but neither has been run yet. Everything from M8 onward is still awaiting
-its first live exercise: the F1 shared-state refactor, `Network=host`,
-the RELATED conntrack rule, `block_in_place` around reconciliation, the
-SIGTERM handler, and now M11's peer routing, interface-adoption guard and
-firewall ordering.
+What remains unverified is scale (three nodes, not thirty), real WAN paths,
+and long-running behaviour.
 
 ## Milestones
 
@@ -5467,3 +5454,274 @@ Implemented; where it differs from the plan, #356 says so.
       own port never answered: it then never got the request, so its
       silence about the second answer says nothing. On a network that
       blocks 47820/udp the node so reports nothing, as before M50.
+
+## Release review, 2026-11-23 — before 1.0
+
+A review of the whole tree at 6b89cbf (1.0.0-beta.6 plus M50) for what
+would stand in the way of calling it 1.0: one reader per area (the
+coordinator's core; sign-in, DNS and certificates; the terminator; the
+agent; its firewall and the deployment files; upgrades and mixed versions),
+their findings checked against the code before anything was changed, and
+each fix made with a test that failed first. What was decided with the
+user is marked so. What was found and left is #373.
+
+357. **The service domain went into `/etc/hosts` unchecked.** `is_safe_entry`
+    checked a service's name and address, but the name written is
+    `<name>.<domain>`, and the domain came off the wire as it was: one with a
+    newline put any host at any address into the managed block of every
+    node, and one with a forged end marker left a tail outside the block
+    that every sync appended again and `leave` did not remove. A poll
+    response whose domain is not a hostname is now refused whole, as a body
+    that does not parse is, so the last applied state stays (dropping only
+    the naming would rename every service back to `.wg`). The rule is the
+    coordinator's own for `WIRESERVE_SERVICE_DOMAIN` (`is_valid_hostname`),
+    so no coordinator that starts can wedge its agents. The hosts writer
+    also checks every name it writes, whatever naming it is handed, and a
+    saved directory with such a domain is dropped on load. A file poisoned
+    before the fix keeps its tail: outside the block is the operator's.
+    Tests: the three forms of the injection across repeated syncs; every
+    form the coordinator accepts still used.
+
+358. **A service for people only was open raw while the terminator was not
+    serving it.** #326 has every request to an `--always-sign-in` service's
+    443 need a session, and its backend trusts the identity headers. But a
+    443 or 80 mapping the terminator does not serve fell back to a plain
+    rewrite for the granted devices, whatever the service: for some 20 s
+    after every agent start, before a certificate, with the terminator
+    stopped, and for good on a node without one, a granted device reached
+    the backend with headers of its own choosing. Such a mapping now gets no
+    rule and takes no target until the terminator serves it; the service's
+    other ports and every other service's fallback are as they were. The
+    node's own declaration is enough: the firewall closes on either it or
+    the coordinator's access entry, and the terminator is now told the
+    declaration too (`ipc/tls.rs` `access_of`), so a coordinator that leaves
+    the flag out cannot let devices in. `status` no longer calls such a port
+    80 unguarded.
+
+359. **Advisories against the lockfile, and something that looks for them.**
+    `cargo audit` found ten, most in transitive crates, which Renovate as
+    configured never moves. Cleared by targeted updates: rustls-webpki
+    0.103.17, url 2.5.9, ctutils 0.4.8, rustix, yoke-derive, the quinn and
+    webpki-root-certs entries that are not compiled in; rusqlite 0.41 with
+    rusqlite_migration 2.7 (each of its minors pins one rusqlite minor) for
+    the bundled SQLite, 3.53.2 to 3.54.1, all 29 migrations still applying
+    from every earlier version the tests start at; and openidconnect 4.1,
+    which takes crypto-bigint to a fixed line. Left: rsa 0.9 (Marvin), which
+    openidconnect 4.1 still asks for — the coordinator only verifies an
+    identity provider's signatures and holds no RSA key, so
+    `.cargo/audit.toml` lists it with that reason — and chrono's
+    unmaintained notice. Decided with the user: CI runs `cargo audit` on
+    every push and fails on anything not listed; chrono stays, since
+    openidconnect and oauth2 need it whatever our own crates use, so
+    replacing it in ours would not take it out of the tree. Renovate gets
+    lock file maintenance and a rusqlite group. `rust-version` says 1.95,
+    which defguard_wireguard_rs already required.
+
+360. **A poll that had authenticated outlived its token.** `BearerNode` read
+    the node, let the lock go and handed the row on; the poll then waited
+    up to `BODY_WITHIN` for its body and wrote from that row. A node holding
+    one slow poll open at the moment it was revoked had its services put
+    back (holding their names, and unseen by `service list`, which shows
+    live nodes' rows), its transit offer registered again after
+    `transit.forget`, and what it claimed to observe of others recorded.
+    The same after `rejoin` and `transit deny`. `answer()` now reads the
+    node again under the lock before anything is written, in the database or
+    in memory, and answers 401 if the token it came with is no longer the
+    node's (`BearerNode::recheck`); everything after uses the fresh row.
+    `/tls/challenge` and the sign-in's `redeem` and `renew` do the same
+    before their writes, and revoke, rejoin and transit deny mark the
+    directory changed under their own lock, so the next poll cannot filter
+    against the directory from before.
+
+361. **What one node could make the coordinator keep.** The memo of each
+    service's access (`access_memo`) was keyed by name and never emptied: a
+    node declaring new names poll after poll grew it for as long as the
+    process ran. It is now kept per owner and bounded by
+    `MAX_SERVICES_PER_NODE`, and goes with its node. The caps on a poll's
+    transit lists were applied by the agent alone, and reports were kept for
+    keys that are no node's; both lists are now cut on the coordinator and
+    kept only for nodes in the directory, and a forgotten node goes from
+    every other node's report too. An admin request that is turned away
+    (4xx) no longer marks the directory changed.
+
+362. **A valid admin token is honoured over budget** (decided with the user;
+    replaces M15/R10's strict rejection). The admin API turned a source
+    over its failure budget away before looking at the token, on a limiter
+    it shares with the node listener: ten bad requests a minute from
+    127.0.0.1 — any local process, or without trusted proxy headers anyone
+    the reverse proxy forwards — locked `wireserve-admin` out, `node revoke`
+    included. R10's "no population of innocent callers" did not hold: the
+    operator shares that key with all of them. A correct token is now
+    served whatever the budget, as a node's is; a wrong or missing one is
+    counted, delayed and answered 429 as before.
+
+363. **The terminator bounds requests in flight, not only connections.**
+    #228's caps counted connections, and one HTTP/2 connection carried 200
+    requests at once, each with a backend socket of its own: one address
+    could hold 128 × 200 against `LimitNOFILE=16384`, after which nothing
+    on the node was accepted and the check-ins to the agent stopped. Now
+    100 streams a connection, 256 requests in flight an address (2048 for a
+    forwarding node) and 8192 for the node, 503 with `Retry-After` past
+    them, a 64 KiB send buffer a stream, at most 1024 idle backend
+    connections, and one count of connections across 443 and 80 (each
+    listener had its own, so the documented 128 and 4096 were really
+    twice that). The unit's comment has the arithmetic: 4096 + 8192 + 1024
+    of 16,384.
+
+364. **The name checked is the name forwarded.** The Host check read
+    `uri.host()`, which drops userinfo, and the whole authority was
+    forwarded: `evil.example,x@svc.example.com` passed and reached the
+    backend in `Host`, `X-Forwarded-Host` and `Forwarded`, where a framework
+    taking the first of a list reads `evil.example`. A WebSocket's second
+    `Host` header went through unchecked. Userinfo in the authority and a
+    second `Host` are now refused with 400, and every path forwards the one
+    name that was checked. #335's forwarding node is unchanged.
+
+365. **A request finds its backend when it comes.** The route was taken at
+    accept and the policy per request, so a connection kept open across a
+    re-point went on to the old backend, and one opened for a service whose
+    address was then given to another could pass the new one's policy and
+    reach the old one's backend. Both are now read together for each
+    request, and a replaced route's idle connections are never taken again.
+    Over HTTP/2, `content-length` fields that disagree are refused as they
+    already were over HTTP/1.1.
+
+366. **Certificates: a refused `replaces`, a silent CA, a half-written
+    pair.** A renewal sent ARI's `replaces` and fell back to a plain order
+    only where the CA has no ARI; a CA that refuses it (the certificate
+    already has a replacement order, RFC 9773) would be asked the same
+    again until the certificate expired. Any refusal the CA answers is now
+    followed by one order without it. The check-in loop waited on the CA
+    (the account, the renewal time) with a client that has no timeouts, so a
+    CA that takes the connection and says nothing stopped the check-ins and
+    the agent took 443 away from every service on the node; nothing in the
+    loop waits on the network now, every call has 30 s, and an issuance a
+    deadline. A certificate that cannot be stored is served from memory and
+    stored again later, where it used to be ordered again every few seconds
+    up to the CA's duplicate limit. The pair is written and flushed whole
+    before either file is renamed, and a key that is not the certificate's
+    counts as no certificate at load. The files and their places are
+    unchanged. Not seen against a CA: the e2e suite never renews.
+
+367. **The interface is never up without its table.** On a stop the table
+    went before the interface, in two `nft` runs; on a start `teardown()`
+    ran before the apply, which is itself one delete-and-add transaction;
+    and a bring-up that failed over an interface left by a crash deleted the
+    table and kept the interface, every 2 s under `Restart=on-failure`. On
+    a host with no firewall of its own that is the mesh interface open to
+    its peers. Now: on a stop the interfaces go first and the tables only
+    once they are gone (if they will not go, the tables stay); on a start
+    the one atomic replace, with nothing deleted before it; after a failed
+    bring-up the table stays while the interface is still this agent's.
+    This narrows #70's "undoes interop and our table if bring-up fails".
+
+368. **An interface deleted, replaced or set down under the daemon.**
+    `reconcile` compared with what it remembered, never the kernel: with the
+    interface deleted, cycles went on succeeding with the node off the
+    mesh, and the process never exited for systemd to restart. Each poll now
+    starts by checking that the interface is the one this daemon made
+    (index, key, port); gone or foreign is one error and a non-zero exit,
+    through the usual teardown, which no longer deletes a link under our
+    name that is not ours. A link set down is set up again and the peer
+    routes the kernel dropped with it are put back. Any other read error is
+    not taken for a vanished interface. `applied` is kept in step as each
+    peer is removed or configured, as the carry path already did.
+
+369. **What a node stops offering closes without the coordinator.** The
+    firewall, relay and exit steps ran only on a parsed response, so with
+    the coordinator unreachable `off`, `transit off` and `exit off` did
+    nothing, though each says it takes effect on the next poll. A failed
+    cycle now applies the last ruleset this run applied, narrowed to what
+    the node's own state still asks for. It is taken from the last apply and
+    only filtered, so it can stay the same or close and nothing else: a new
+    declaration, a wider grant, transit or exit on still wait for a
+    coordinator that answers. After a restart the last apply is the
+    deny-all.
+
+370. **A phone's session moves only once its node has answered** (decided
+    with the user; replaces #341's roaming on any packet). The carrier
+    cannot authenticate what a phone sends, and it moved a session to
+    wherever any packet with a live index came from, re-indexed it on any
+    response and dropped it on a replayed initiation: whoever saw one
+    packet could send a phone's downlink elsewhere. Only the node, which
+    reaches the carrier over the mesh, now settles where a session goes: a
+    handshake is pending — bounded (4 a phone address, 2048 in all, 5 s),
+    never touching a session — until the node answers it (its response) or
+    uses it (its first packet to the phone's new index). Data from
+    elsewhere is still forwarded, since the node checks it and a source
+    check proves nothing, but moves nothing. The cost: a phone that roams
+    is answered at its new address after its next handshake — about 15 s
+    while it sends data, up to about 145 s or 205 s (who began the keypair)
+    when it only sends keepalives. And `phone-relay` (#343) is now said
+    only while the relay can open its sockets, as `reflexive_answering` is:
+    a carrier without `CAP_NET_RAW`, or whose ports are taken, is no longer
+    given phones it would drop.
+
+371. **Sign-in and DNS, the slower failures.** `/oidc/callback` answers a
+    flow once and each address only so often (a kept cookie made the
+    coordinator ask the provider's token endpoint without limit). A refresh
+    token the provider rotated is kept when a later step of the refresh
+    fails, where the spent one used to be presented again. A sealed token
+    that does not open — a start with the wrong
+    `WIRESERVE_OIDC_TOKEN_KEY` — makes its owner or session stale instead of
+    deleting every owner 30 s after the start. A session idle for 30 days is
+    not found, as the docs say, and sessions and tickets are swept on the
+    refresh timer. A name somebody else holds at the DNS provider is asked
+    about after 60 s, then twice as long, up to 15 min, instead of every
+    5 s for good. `WIRESERVE_SERVICE_DOMAIN` is kept lower case and without
+    a trailing dot, which the handlers already assumed.
+
+372. **A flow its grant no longer admits is refused however it is
+    addressed** (decided with the user: fixed in the rules, not by weakening
+    the docs). #217 has a removed grant cut open connections "since the
+    rewrite runs before conntrack". That is exactly what makes conntrack
+    track the flow by its rewritten tuple, `client → node:target`: the
+    grant was checked only on packets addressed to the service address, the
+    filter accepted `established` before any mark, and a client sending the
+    same tuple straight to the node's address and port — both in the
+    directory — kept its connection for good. The grant is now checked on
+    every packet after conntrack, by flow: ahead of the established-accept
+    in input and forward, on the mesh and carry tables, a packet in the
+    original direction of a flow carrying the service bit in its conntrack
+    mark, without the packet mark that only the current `svc-pre` sets, is
+    reset (TCP) or dropped. The rules are written even with no services,
+    since marked flows outlive the ruleset. An exit cuts the flows of a
+    device that is no longer its client the same way, by source. Two kernel
+    tests, on veth, show a revoked flow refused at the service address and
+    re-addressed, through input and through forward, and a still-granted
+    one surviving the replace. Known and left: a relayed pair's open
+    session outlives `transit deny` (unmarked NAT flows; it needs a bit of
+    its own); and on a host where other software copies the conntrack mark
+    into the packet mark between raw and filter — wg-quick's full-tunnel
+    rule does, for UDP — the check passes such packets, as before this fix.
+
+373. **Found and left**, for the release notes or after 1.0:
+    - *The directory digest freezes its entries.* An agent hashes its own
+      re-serialisation of `PeerInfo` and `ServiceInfo` and refuses a
+      directory whose digest differs, so a field added to either by a later
+      coordinator fails every older agent's poll. A later coordinator can
+      still answer agents without a new capability the unstamped way, at a
+      whole directory a poll; the rule (frozen entries, new data beside
+      them, or a format number) should be written down before 1.0.
+    - *No versions on the state file or the CLI's socket*, and an older
+      daemon or coordinator silently drops a flag it does not know —
+      `always_sign_in` among them, which only narrows. Nodes do not report
+      their version, so `node list` cannot say which still need upgrading.
+    - *Upgrades:* nothing copies the database before migrating and the docs
+      do not say to; a multi-instance host first installed at beta.3 or
+      earlier needs `install` once per instance for the other instances'
+      plain-HTTP sockets; a beta.1/2 agent loses relayed peers under a
+      coordinator from beta.3 on. Migrations from every beta's schema apply
+      cleanly.
+    - *The container's first admin command* (`podman exec … wireserve-admin
+      node list`, docs/coordinator.md) finds no admin token unless one was
+      passed in: nothing reads `coordinator-secrets.env` for it.
+    - *Terminator:* an HTTP/1.1 response quiet for 300 s is cut as idle;
+      nothing drains on SIGTERM, so a restart drops what is in flight.
+    - *Phone relay:* every initiation shares one nft limit (200/s) ahead of
+      any `mac1` check, so a small flood of junk starves phones' handshakes.
+    - *Admin:* `service approve` approves what is declared at that instant,
+      not what the admin was shown; `node list` shows neither revoked nor
+      never-joined nodes.
+    - *Not tried:* the oldest distributions the README names (Ubuntu 22.04's
+      nft 1.0.2, RHEL 9); a renewal against a real CA.
