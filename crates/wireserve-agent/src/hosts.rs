@@ -40,7 +40,7 @@ pub type Naming<'a> = ServiceNames<'a>;
 fn render_block(services: &[ServiceInfo], naming: Naming<'_>) -> String {
     let mut lines: Vec<String> = services
         .iter()
-        .filter(|s| is_safe_entry(s))
+        .filter(|s| is_safe_entry(s, naming))
         .filter_map(|s| Some(format!("{} {}", naming.address(s)?, naming.host_name(s))))
         .collect();
     lines.sort();
@@ -51,16 +51,25 @@ fn render_block(services: &[ServiceInfo], naming: Naming<'_>) -> String {
 /// allocates the addresses itself, so a bad entry here means either a
 /// coordinator bug or a compromised coordinator. Either way this writer
 /// is the last thing standing between that and a line of attacker-chosen
-/// text in every node's `/etc/hosts`, so it re-checks both fields (a
-/// strict DNS label, a literal IPv4 address) and drops anything else with
-/// a loud warning rather than trusting the wire.
-fn is_safe_entry(s: &ServiceInfo) -> bool {
+/// text in every node's `/etc/hosts`, so it re-checks what it writes (a
+/// strict DNS label for the service, a literal IPv4 address, and a
+/// hostname for the name it gives the service) and drops anything else
+/// with a loud warning rather than trusting the wire.
+///
+/// The name is checked as written, not just the service's part of it: the
+/// rest is the service domain, which the poll loop checks too, but a domain
+/// that got past it would otherwise be free to carry a newline and a forged
+/// end marker into the file.
+fn is_safe_entry(s: &ServiceInfo, naming: Naming<'_>) -> bool {
+    let host = naming.host_name(s);
     let ok = wireserve_types::is_valid_dns_label(&s.name)
-        && own_address(s).parse::<Ipv4Addr>().is_ok();
+        && own_address(s).parse::<Ipv4Addr>().is_ok()
+        && wireserve_types::is_valid_hostname(&host);
     if !ok {
         tracing::warn!(
             service = %s.name.escape_debug(),
             ip4 = %s.ip4.escape_debug(),
+            host = %host.escape_debug(),
             "refusing to write malformed directory entry to the hosts file"
         );
     }
@@ -597,5 +606,55 @@ mod naming_tests {
         let cfg = cfg_for("int.example.com");
         let out = render_block(&services, Naming::new(Some(&cfg)));
         assert_eq!(out, "100.90.0.2 web.int.example.com\n100.90.0.50 plex.int.example.com\n100.90.0.51 prom.int.example.com");
+    }
+
+    #[test]
+    fn a_domain_carrying_hosts_file_syntax_writes_nothing_outside_the_block() {
+        // The poll loop refuses these before they get here; this writer
+        // still refuses to be the one that puts them in /etc/hosts. The
+        // forged end marker used to end the block early on the next read,
+        // leaving a tail outside it that every sync appended once more.
+        let original = "127.0.0.1 localhost\n# the operator's own\n192.168.1.1 router\n";
+        for json in [
+            r##"{"domain":"wg\n203.0.113.66 deb.debian.org\n# END WIRESERVE\n198.51.100.7 github.com"}"##,
+            r##"{"domain":"int.example.com 198.51.100.7.github.com"}"##,
+            r##"{"domain":"int.example.com # END WIRESERVE"}"##,
+        ] {
+            let cfg: ServiceNaming = serde_json::from_str(json).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("hosts");
+            std::fs::write(&path, original).unwrap();
+            let services = [svc("prom", "100.90.0.51", 80)];
+
+            let mut after = Vec::new();
+            for _ in 0..3 {
+                sync(&path, None, &services, Naming::new(Some(&cfg))).unwrap();
+                after.push(std::fs::read_to_string(&path).unwrap());
+            }
+            let out = &after[0];
+            assert!(after.iter().all(|a| a == out), "the file must not grow across syncs: {after:?}");
+            assert!(!out.contains("deb.debian.org") && !out.contains("github.com"), "{out}");
+            assert_eq!(out.matches(END_MARKER).count(), 1, "{out}");
+            assert_eq!(out.matches(BEGIN_MARKER).count(), 1, "{out}");
+            assert_eq!(strip_managed_block(out, None).unwrap(), original, "outside the block untouched");
+
+            remove_block(&path, None).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn a_custom_domain_is_written_as_the_coordinator_sent_it() {
+        // Upper case and a trailing dot are both hostnames the coordinator
+        // accepts for its domain, and both harmless in a hosts file.
+        let services = [svc("prom", "100.90.0.51", 80)];
+        for (domain, line) in [
+            ("int.example.com", "100.90.0.51 prom.int.example.com"),
+            ("Int.Example.COM", "100.90.0.51 prom.Int.Example.COM"),
+            ("int.example.com.", "100.90.0.51 prom.int.example.com."),
+        ] {
+            let cfg = cfg_for(domain);
+            assert_eq!(render_block(&services, Naming::new(Some(&cfg))), line);
+        }
     }
 }
