@@ -90,6 +90,9 @@ struct Issuance {
     /// answer would stop the check-ins and the agent would take 443 from
     /// every service on the node.
     lookup: Option<JoinHandle<SystemTime>>,
+    /// `cert` as issued (its CA's directory, chain and key) while it could
+    /// not be stored.
+    unsaved: Option<(String, String, String)>,
     failures: u32,
     not_before: Option<Instant>,
 }
@@ -100,6 +103,7 @@ impl Issuance {
         self.cert = Some(stored);
         self.ca = Some(ca);
         self.renew_at = None;
+        self.unsaved = None;
         if let Some(lookup) = self.lookup.take() {
             lookup.abort();
         }
@@ -191,24 +195,16 @@ pub async fn run(opts: Options) -> Result<(), Error> {
             let (fqdn, directory, handle) = in_flight.take().expect("checked above");
             let entry = issuance.entry(fqdn.clone()).or_default();
             match handle.await {
-                Ok(Ok((chain, key))) => match store.save(&directory, &fqdn, &chain, &key) {
-                    Ok(stored) => {
-                        tracing::info!(fqdn = %fqdn, ca = %directory, "certificate issued");
-                        certs.set(&fqdn, stored.key.clone());
-                        entry.hold(stored, directory);
-                        entry.failures = 0;
-                        entry.not_before = None;
-                    }
-                    Err(e) => tracing::error!(fqdn = %fqdn, error = %e, "could not store the issued certificate"),
-                },
+                Ok(Ok((chain, key))) => issued(&store, &certs, entry, &fqdn, directory, chain, key),
                 Ok(Err(e)) => {
-                    entry.failures += 1;
-                    let wait = (FIRST_BACKOFF * 2u32.saturating_pow(entry.failures - 1)).min(MAX_BACKOFF);
-                    entry.not_before = Some(Instant::now() + wait);
+                    let wait = back_off(entry);
                     tracing::warn!(fqdn = %fqdn, error = %e, retry_in = ?wait, "certificate issuance failed");
                 }
                 Err(e) => tracing::error!(fqdn = %fqdn, error = %e, "issuance task failed"),
             }
+        }
+        for (fqdn, entry) in &mut issuance {
+            save_again(&store, entry, fqdn);
         }
 
         for service in &config.services {
@@ -303,6 +299,64 @@ pub async fn run(opts: Options) -> Result<(), Error> {
                     }),
                 ));
             }
+        }
+    }
+}
+
+/// Waits longer after each failure, up to [`MAX_BACKOFF`]; returns how long.
+fn back_off(entry: &mut Issuance) -> Duration {
+    entry.failures += 1;
+    let wait = (FIRST_BACKOFF * 2u32.saturating_pow(entry.failures - 1)).min(MAX_BACKOFF);
+    entry.not_before = Some(Instant::now() + wait);
+    wait
+}
+
+/// Serves a certificate just issued, and stores it. One that cannot be
+/// stored is served all the same from memory — it is valid, and only a
+/// restart would lose it — and its storing is tried again with the usual
+/// backoff: ordering again instead would obtain a new certificate every
+/// few seconds on a full disk, until the CA's limit on duplicates locked
+/// the name out for a week.
+fn issued(store: &Store, certs: &Certs, entry: &mut Issuance, fqdn: &str, directory: String, chain: String, key: String) {
+    let stored = match store::parse(chain.as_bytes(), key.as_bytes()) {
+        Ok(stored) => stored,
+        Err(e) => {
+            let wait = back_off(entry);
+            tracing::warn!(fqdn, error = %e, retry_in = ?wait, "the CA's certificate cannot be used");
+            return;
+        }
+    };
+    certs.set(fqdn, stored.key.clone());
+    entry.hold(stored, directory.clone());
+    entry.failures = 0;
+    entry.not_before = None;
+    match store.save(&directory, fqdn, &chain, &key) {
+        Ok(_) => tracing::info!(fqdn, ca = %directory, "certificate issued"),
+        Err(e) => {
+            let wait = back_off(entry);
+            tracing::error!(fqdn, error = %e, retry_in = ?wait, "certificate issued and served, but it could not be stored");
+            entry.unsaved = Some((directory, chain, key));
+        }
+    }
+}
+
+/// Tries again to store the certificate `issued` could not, once its
+/// backoff is over.
+fn save_again(store: &Store, entry: &mut Issuance, fqdn: &str) {
+    if entry.not_before.is_some_and(|t| Instant::now() < t) {
+        return;
+    }
+    let Some((directory, chain, key)) = entry.unsaved.take() else { return };
+    match store.save(&directory, fqdn, &chain, &key) {
+        Ok(_) => {
+            tracing::info!(fqdn, ca = %directory, "stored the certificate served since it was issued");
+            entry.failures = 0;
+            entry.not_before = None;
+        }
+        Err(e) => {
+            let wait = back_off(entry);
+            tracing::error!(fqdn, error = %e, retry_in = ?wait, "the certificate served still cannot be stored");
+            entry.unsaved = Some((directory, chain, key));
         }
     }
 }
@@ -454,6 +508,36 @@ mod tests {
         let config = TlsConfig { services: vec![service("plex")], ..TlsConfig::default() };
         forget_gone(&mut served, &mut issuance, &Certs::default(), &serve::Shared::default(), &config);
         assert_eq!((served.len(), issuance.len()), (1, 1));
+    }
+
+    #[test]
+    fn a_certificate_that_cannot_be_stored_is_served_and_stored_later_without_ordering_again() {
+        const CA: &str = "https://ca.test/dir";
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        // A file where the name's directory goes: no save can succeed.
+        let ca_dir = dir.path().join("certs").join(store::ca_id(CA));
+        std::fs::create_dir_all(&ca_dir).unwrap();
+        std::fs::write(ca_dir.join("plex.int.test"), "").unwrap();
+        let (chain, key) = store::tests::self_signed("plex.int.test", 36_500);
+        let mut entry = Issuance::default();
+
+        issued(&store, &Certs::default(), &mut entry, "plex.int.test", CA.into(), chain.clone(), key.clone());
+        assert!(entry.cert.is_some(), "served from memory");
+        assert!(entry.unsaved.is_some());
+        assert!(entry.not_before.is_some_and(|t| t > Instant::now() + FIRST_BACKOFF / 2), "nothing is tried again at once");
+
+        // Still backing off: not tried.
+        save_again(&store, &mut entry, "plex.int.test");
+        assert_eq!(entry.failures, 1);
+
+        std::fs::remove_file(ca_dir.join("plex.int.test")).unwrap();
+        entry.not_before = Some(Instant::now());
+        save_again(&store, &mut entry, "plex.int.test");
+        assert!(entry.unsaved.is_none());
+        assert_eq!((entry.failures, entry.not_before), (0, None));
+        let loaded = store.load(CA, "plex.int.test").unwrap().expect("stored at last");
+        assert_eq!(Some(loaded.leaf), entry.cert.map(|c| c.leaf));
     }
 
     /// An agent on `socket` that answers every check-in with `config` and

@@ -76,17 +76,36 @@ impl Store {
     }
 
     /// The certificate for `fqdn` from the CA at `directory`, if one is
-    /// stored and readable.
+    /// stored and readable. A key that is not the certificate's is none:
+    /// served, every handshake would fail while the name is reported ready.
     pub fn load(&self, directory: &str, fqdn: &str) -> io::Result<Option<Stored>> {
         let dir = self.dir(directory, fqdn);
         let (Ok(chain), Ok(key)) = (std::fs::read(dir.join("cert.pem")), std::fs::read(dir.join("key.pem"))) else {
             return Ok(None);
         };
-        parse(&chain, &key).map(Some)
+        match parse(&chain, &key) {
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {}
+            other => return other.map(Some),
+        }
+        // A save stopped between its two renames: the new key in place,
+        // its certificate still written beside it. Finishing it costs
+        // nothing; otherwise the pair is issued again.
+        if let Ok(new_chain) = std::fs::read(dir.join("cert.tmp")) {
+            if let Ok(stored) = parse(&new_chain, &key) {
+                std::fs::rename(dir.join("cert.tmp"), dir.join("cert.pem"))?;
+                sync_dir(&dir)?;
+                return Ok(Some(stored));
+            }
+        }
+        tracing::warn!(fqdn, path = %dir.display(), "the stored key is not the certificate's; getting a new certificate");
+        Ok(None)
     }
 
     /// Stores a freshly issued certificate, replacing the old one only once
-    /// both files are fully written.
+    /// both files are fully written: both are written and flushed to disk
+    /// beside the old ones before either is renamed into place, so a full
+    /// disk or a crash while writing leaves the old pair whole. A crash
+    /// between the two renames is finished by `load`.
     pub fn save(&self, directory: &str, fqdn: &str, chain_pem: &str, key_pem: &str) -> io::Result<Stored> {
         let stored = parse(chain_pem.as_bytes(), key_pem.as_bytes())?;
         let dir = self.dir(directory, fqdn);
@@ -94,9 +113,20 @@ impl Store {
         set_mode(&dir, 0o700)?;
         if let Some(ca) = dir.parent() {
             set_mode(ca, 0o700)?;
+            // The directories just made, if they were, survive a crash too.
+            sync_dir(ca)?;
+            sync_dir(&self.root.join("certs"))?;
         }
-        write_atomic(&dir.join("key.pem"), key_pem.as_bytes())?;
-        write_atomic(&dir.join("cert.pem"), chain_pem.as_bytes())?;
+        let written = write_private(&dir.join("key.tmp"), key_pem.as_bytes())
+            .and_then(|()| write_private(&dir.join("cert.tmp"), chain_pem.as_bytes()));
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(dir.join("key.tmp"));
+            let _ = std::fs::remove_file(dir.join("cert.tmp"));
+            return Err(e);
+        }
+        std::fs::rename(dir.join("key.tmp"), dir.join("key.pem"))?;
+        std::fs::rename(dir.join("cert.tmp"), dir.join("cert.pem"))?;
+        sync_dir(&dir)?;
         Ok(stored)
     }
 }
@@ -154,7 +184,8 @@ fn leaf_not_after(chain_pem: &[u8]) -> Option<SystemTime> {
 }
 
 /// Parses a PEM chain and key into something rustls serves, with the
-/// leaf's validity period.
+/// leaf's validity period. A key that is not the leaf's is refused with
+/// `InvalidInput`, which tells it from one that cannot be read at all.
 pub fn parse(chain_pem: &[u8], key_pem: &[u8]) -> io::Result<Stored> {
     let bad = |what: &str, e: &dyn std::fmt::Display| io::Error::new(io::ErrorKind::InvalidData, format!("{what}: {e}"));
     let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(chain_pem)
@@ -167,24 +198,33 @@ pub fn parse(chain_pem: &[u8], key_pem: &[u8]) -> io::Result<Stored> {
     let to_time = |t: x509_parser::time::ASN1Time| {
         SystemTime::UNIX_EPOCH + Duration::from_secs(u64::try_from(t.timestamp()).unwrap_or(0))
     };
+    let key = CertifiedKey::new(chain, signing);
+    // `Unknown`: a key type that cannot name its public key, which rustls's
+    // own `from_der` lets through too. Every key aws-lc-rs loads can.
+    match key.keys_match() {
+        Ok(()) | Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::Unknown)) => {}
+        Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("private key: {e}"))),
+    }
     Ok(Stored {
         not_before: to_time(cert.validity().not_before),
         not_after: to_time(cert.validity().not_after),
-        key: Arc::new(CertifiedKey::new(chain, signing)),
+        key: Arc::new(key),
         leaf,
     })
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// Writes `path`, readable by this user alone, and flushes it to disk.
+fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
-    let tmp = path.with_extension("tmp");
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
+/// Flushes `dir`'s entries to disk, so a rename into it outlives a crash.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }
 
 fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
@@ -274,6 +314,52 @@ pub(crate) mod tests {
         store.save(CA, "old.int.test", &chain, &key).unwrap();
         store.prune_expired(SystemTime::now(), |_, _| false).unwrap();
         assert!(!dir.path().join("certs").join(ca_id(CA)).exists());
+    }
+
+    #[test]
+    fn a_key_that_is_not_the_certificates_is_not_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let (chain, key) = self_signed("plex.int.test", 36_500);
+        store.save(CA, "plex.int.test", &chain, &key).unwrap();
+        let (_, other_key) = self_signed("plex.int.test", 36_500);
+        let pair = dir.path().join("certs").join(ca_id(CA)).join("plex.int.test");
+        std::fs::write(pair.join("key.pem"), &other_key).unwrap();
+        assert!(store.load(CA, "plex.int.test").unwrap().is_none(), "every handshake would fail");
+        assert!(store.save(CA, "plex.int.test", &chain, &other_key).is_err());
+    }
+
+    #[test]
+    fn a_save_that_fails_halfway_leaves_the_previous_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let (chain, key) = self_signed("plex.int.test", 36_500);
+        store.save(CA, "plex.int.test", &chain, &key).unwrap();
+        let before = store.load(CA, "plex.int.test").unwrap().unwrap();
+        // The certificate's file cannot be written, the key's can.
+        let pair = dir.path().join("certs").join(ca_id(CA)).join("plex.int.test");
+        std::fs::create_dir(pair.join("cert.tmp")).unwrap();
+        let (new_chain, new_key) = self_signed("plex.int.test", 90);
+        assert!(store.save(CA, "plex.int.test", &new_chain, &new_key).is_err());
+        let after = store.load(CA, "plex.int.test").unwrap().expect("the previous pair still loads");
+        assert_eq!(after.leaf, before.leaf);
+        assert_eq!(std::fs::read_to_string(pair.join("key.pem")).unwrap(), key, "the new key left beside the old certificate");
+    }
+
+    #[test]
+    fn a_save_stopped_between_its_two_renames_is_finished_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let (chain, key) = self_signed("plex.int.test", 36_500);
+        store.save(CA, "plex.int.test", &chain, &key).unwrap();
+        // The new key in place, the new certificate still beside it.
+        let pair = dir.path().join("certs").join(ca_id(CA)).join("plex.int.test");
+        let (new_chain, new_key) = self_signed("plex.int.test", 90);
+        std::fs::write(pair.join("key.pem"), &new_key).unwrap();
+        std::fs::write(pair.join("cert.tmp"), &new_chain).unwrap();
+        let loaded = store.load(CA, "plex.int.test").unwrap().expect("the new pair is whole");
+        assert_eq!(loaded.leaf, parse(new_chain.as_bytes(), new_key.as_bytes()).unwrap().leaf);
+        assert_eq!(std::fs::read_to_string(pair.join("cert.pem")).unwrap(), new_chain);
     }
 
     #[test]
