@@ -35,10 +35,16 @@ RestartSec=5s
 StateDirectory=wireserve-tls
 StateDirectoryMode=0700
 
-# Sockets: up to 4096 open connections (`serve::Limits`), each holding one
-# here and, while a request runs, one to its backend — well inside this, and
-# above systemd's default 1024, which the connection cap would otherwise
-# never get to.
+# Sockets (`serve::Limits`): up to 4096 open connections, on 443 and 80
+# together; up to 8192 requests being served at once, each holding at most
+# one connection to its backend until its answer is sent — a WebSocket for
+# as long as it is open — whatever the client does, since over HTTP/2 one
+# connection carries up to 100 of them; and up to 1024 idle backend
+# connections kept for the next request. 4096 + 8192 + 1024 = 13312, which
+# leaves 3072 for the listeners, the link to the agent, the sign-in's and
+# ACME's own connections and the runtime. One address gets 128 connections
+# and 256 requests of those, a forwarding node 1024 and 2048. Above
+# systemd's default 1024, which the caps would otherwise never get to.
 LimitNOFILE=16384
 
 CapabilityBoundingSet=

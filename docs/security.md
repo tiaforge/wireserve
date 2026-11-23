@@ -35,9 +35,10 @@ what a node does inside its allowance (`WIRESERVE_POLL_RATE_*`, the pending
 limit, the challenge limit) still queues behind everyone else's. Rate-limit by
 address at the reverse proxy too, and put `WIRESERVE_TRUSTED_PROXY` on it so the
 address the limiter and the log see is the client's. A terminator closes
-connections that say nothing, and caps each address at 128 and the node at
-4096, but a client dripping a request body slowly holds one of its own 128 for
-as long as the backend allows.
+connections that say nothing, and caps each address at 128 connections and 256
+requests in progress and the node at 4096 and 8192, but a client dripping a
+request body slowly holds one of each of its own for as long as the backend
+allows.
 
 ## When a machine is lost or compromised
 

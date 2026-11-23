@@ -289,8 +289,8 @@ fn bad_gateway(text: &'static str) -> Response<Body> {
 
 /// Proxies the upgrade `req` to `upstream`, and once both sides have
 /// switched, keeps the bytes flowing while `still_admitted`, asked every
-/// `recheck`, says yes. `hold` is kept for as long as the bytes flow — a
-/// place in a limit, given back when they stop.
+/// `recheck`, says yes. `hold` is kept for as long as the bytes flow —
+/// places in the limits, given back when they stop.
 pub(crate) async fn proxy<F, Fut, H>(
     mut req: Request<Body>,
     upstream: SocketAddr,
