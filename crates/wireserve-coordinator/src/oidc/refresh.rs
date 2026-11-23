@@ -33,12 +33,19 @@ pub async fn pass(state: &AppState, oidc: &Oidc) {
             return;
         }
     };
+    let mut unreadable = 0usize;
     for owner in all {
         let Some(token) = oidc.open(owner.node_id, &owner.refresh_token_enc) else {
-            // Sealed under another key (WIRESERVE_OIDC_TOKEN_KEY changed), or
-            // damaged: it can never be used again.
-            tracing::warn!(event = "owner_dropped", node_id = owner.node_id, sub = %owner.sub, reason = "unreadable_token");
-            let _ = owners::remove(&*state.db.conn.lock().await, owner.node_id, Some(&owner.sub));
+            // Sealed under another key, most likely: WIRESERVE_OIDC_TOKEN_KEY
+            // changed. That is not necessarily for good — a secrets file not
+            // mounted has the key generated afresh, a restore test or a typo
+            // starts with the wrong one — so the owner only goes stale, as
+            // if the provider could not be asked, and is back as soon as the
+            // right key is. An admin clearing the owner removes it for good.
+            unreadable += 1;
+            if let Err(e) = owners::refresh_failed(&*state.db.conn.lock().await, owner.node_id, &owner.sub, None) {
+                tracing::error!(error = %e, "owner refresh: could not store the outcome");
+            }
             continue;
         };
         let outcome = oidc.refresh(&token, &owner.sub).await;
@@ -72,5 +79,15 @@ pub async fn pass(state: &AppState, oidc: &Oidc) {
         if let Err(e) = result {
             tracing::error!(error = %e, "owner refresh: could not store the outcome");
         }
+    }
+    if unreadable > 0 {
+        tracing::warn!(
+            event = "owner_tokens_unreadable",
+            owners = unreadable,
+            "device owners' refresh tokens do not open with this token key, so their groups go stale; \
+             WIRESERVE_OIDC_TOKEN_KEY has most likely changed (is coordinator-secrets.env mounted?). \
+             Start with the key they were sealed with and they recover; if it is gone for good, \
+             clear those owners (wireserve-admin owner clear) and make new claim links"
+        );
     }
 }

@@ -867,6 +867,61 @@ async fn a_sessions_token_rotated_before_a_later_step_failed_is_the_one_used_nex
     assert_eq!(idp.lock().unwrap().presented, ["rt-1", "rt-2"], "the next refresh presents the new token");
 }
 
+#[tokio::test]
+async fn a_wrong_token_key_makes_owners_stale_and_the_right_one_brings_them_back() {
+    // A secrets file not mounted has the key generated afresh: deleting
+    // every owner whose token did not open took each device's ownership
+    // for good, though the right key would have opened them all again.
+    let idp = start_idp().await;
+    let issuer = idp.lock().unwrap().issuer.clone();
+    let app = app(&issuer);
+    let oidc = app.state.oidc.clone().unwrap();
+    let owner = claimed(&app, &idp).await;
+    idp.lock().unwrap().groups_now = vec!["family".into()];
+    let mut other = app.state.config.oidc.clone().unwrap();
+    other.token_key = [8; 32];
+    let wrong = wireserve_coordinator::oidc::Oidc::new(other).seal(owner.node_id, "rt-1");
+    let db = &app.state.db;
+    let set_token = |sealed: String| async move {
+        db.conn.lock().await
+            .execute("UPDATE node_owners SET refresh_token_enc = ?1", [sealed])
+            .unwrap();
+    };
+    set_token(wrong).await;
+    wireserve_coordinator::oidc::refresh::pass(&app.state, &oidc).await;
+    let o = wireserve_coordinator::db::owners::of(&*app.state.db.conn.lock().await, owner.node_id).unwrap();
+    let o = o.expect("kept");
+    assert!(o.stale_since.is_some(), "stale, as when the provider cannot be asked");
+    assert!(idp.lock().unwrap().presented.is_empty(), "nothing to present");
+
+    set_token(owner.refresh_token_enc.clone()).await;
+    wireserve_coordinator::oidc::refresh::pass(&app.state, &oidc).await;
+    let o = wireserve_coordinator::db::owners::of(&*app.state.db.conn.lock().await, owner.node_id).unwrap().unwrap();
+    assert!(o.stale_since.is_none(), "back with the right key");
+}
+
+#[tokio::test]
+async fn a_session_whose_token_does_not_open_goes_stale_and_its_browser_can_sign_in_again() {
+    let idp = start_idp().await;
+    let issuer = idp.lock().unwrap().issuer.clone();
+    let app = signing_app(&issuer);
+    let (home, _, _) = grafana(&app).await;
+    let (resp, cookies) = sign_in_as(&app, &idp, "alice", &["family"]).await;
+    let login = cookies.iter().find(|c| c.starts_with("wireserve-login=")).unwrap().clone();
+    let redeem = serde_json::json!({"fqdn": "grafana.int.test", "ticket": ticket_of(&resp), "bind": BIND});
+    let (_, answer) = json(&app.router, "POST", "/sign-in/redeem", &home, redeem).await;
+    app.state.db.conn.lock().await
+        .execute("UPDATE sign_in_sessions SET refresh_token_enc = 'sealed-with-another-key', refreshed_at = '2020-01-01T00:00:00+00:00'", [])
+        .unwrap();
+    let renew = serde_json::json!({"fqdn": "grafana.int.test", "token": answer["token"]});
+    assert_eq!(json(&app.router, "POST", "/sign-in/renew", &home, renew).await.0, StatusCode::OK, "stale, still counting for now");
+    let kept = wireserve_coordinator::db::sessions::all(&*app.state.db.conn.lock().await).unwrap();
+    assert!(kept.len() == 1 && kept[0].stale_since.is_some(), "kept, stale: {kept:?}");
+
+    let resp = call(&app.router, "GET", &format!("/sign-in?service=grafana.int.test&bind={BIND}"), Some(&login), None).await;
+    assert!(resp.headers()[header::LOCATION].to_str().unwrap().starts_with(&issuer), "to the provider, not stuck on it");
+}
+
 fn token_hits(idp: &Shared) -> usize {
     idp.lock().unwrap().token_hits
 }
