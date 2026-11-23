@@ -63,9 +63,10 @@ pub async fn pass(state: &AppState, oidc: &Oidc) {
                 tracing::warn!(event = "owner_dropped", node_id = owner.node_id, sub = %owner.sub, reason = "refused");
                 owners::remove(&conn, owner.node_id, Some(&owner.sub)).map(|_| ())
             }
-            Err(RefreshError::Failed(e)) => {
-                tracing::warn!(node_id = owner.node_id, sub = %owner.sub, error = %e, "owner refresh failed; its groups go stale");
-                owners::refresh_failed(&conn, owner.node_id, &owner.sub)
+            Err(RefreshError::Failed { error, rotated }) => {
+                tracing::warn!(node_id = owner.node_id, sub = %owner.sub, error = %error, "owner refresh failed; its groups go stale");
+                let sealed = rotated.map(|t| oidc.seal(owner.node_id, &t));
+                owners::refresh_failed(&conn, owner.node_id, &owner.sub, sealed.as_deref())
             }
         };
         if let Err(e) = result {

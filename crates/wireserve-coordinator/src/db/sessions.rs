@@ -131,11 +131,13 @@ pub fn refreshed(conn: &Connection, id: &str, groups: &[String], token_enc: &str
 }
 
 /// A refresh that failed for a reason other than the provider refusing
-/// the token: stale from the first failure on.
-pub fn refresh_failed(conn: &Connection, id: &str) -> Result<(), DbError> {
+/// the token: stale from the first failure on. `token_enc` as in
+/// `owners::refresh_failed`.
+pub fn refresh_failed(conn: &Connection, id: &str, token_enc: Option<&str>) -> Result<(), DbError> {
     conn.execute(
-        "UPDATE sign_in_sessions SET stale_since = COALESCE(stale_since, ?1) WHERE id = ?2",
-        rusqlite::params![Utc::now().to_rfc3339(), id],
+        "UPDATE sign_in_sessions SET stale_since = COALESCE(stale_since, ?1), \
+           refresh_token_enc = COALESCE(?3, refresh_token_enc) WHERE id = ?2",
+        rusqlite::params![Utc::now().to_rfc3339(), id, token_enc],
     )?;
     Ok(())
 }
@@ -294,10 +296,11 @@ mod tests {
         let db = crate::db::Db::open_in_memory_for_test();
         let conn = db.conn.blocking_lock();
         create(&conn, &session("s1", "anna"), "l1").unwrap();
-        refresh_failed(&conn, "s1").unwrap();
+        refresh_failed(&conn, "s1", None).unwrap();
         let first = find(&conn, "s1").unwrap().unwrap().stale_since.unwrap();
-        refresh_failed(&conn, "s1").unwrap();
-        assert_eq!(find(&conn, "s1").unwrap().unwrap().stale_since, Some(first));
+        refresh_failed(&conn, "s1", Some("rotated")).unwrap();
+        let s = find(&conn, "s1").unwrap().unwrap();
+        assert_eq!((s.stale_since, s.refresh_token_enc.as_str()), (Some(first), "rotated"));
         refreshed(&conn, "s1", &["admins".into()], "sealed2", Some("")).unwrap();
         let s = find(&conn, "s1").unwrap().unwrap();
         assert_eq!((s.groups, s.stale_since, s.email), (vec!["admins".to_string()], None, None));

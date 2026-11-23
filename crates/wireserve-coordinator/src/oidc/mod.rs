@@ -104,9 +104,18 @@ pub enum RefreshError {
     #[error("the identity provider refused the refresh token")]
     Refused,
     /// Anything else — the provider down, a network error. The owner goes
-    /// stale.
-    #[error("{0}")]
-    Failed(String),
+    /// stale. `rotated` is the new refresh token, when the exchange itself
+    /// went through and the failure came after it: a provider that rotates
+    /// tokens has spent the old one, and many revoke the whole family when
+    /// a spent one comes back, so it must be kept whatever failed later.
+    #[error("{error}")]
+    Failed { error: String, rotated: Option<String> },
+}
+
+impl RefreshError {
+    fn failed(error: impl Into<String>) -> Self {
+        Self::Failed { error: error.into(), rotated: None }
+    }
 }
 
 /// The sign-in half-done: what the callback must match.
@@ -318,36 +327,44 @@ impl Oidc {
     /// who the token belongs to; a provider answering for anyone else is
     /// not believed.
     pub async fn refresh(&self, refresh_token: &str, sub: &str) -> Result<Refreshed, RefreshError> {
-        let client = self.client().await.map_err(|e| RefreshError::Failed(e.to_string()))?;
+        let client = self.client().await.map_err(|e| RefreshError::failed(e.to_string()))?;
         let caller = self.caller();
         let token = RefreshToken::new(refresh_token.to_string());
         let request = client
             .exchange_refresh_token(&token)
-            .map_err(|e| RefreshError::Failed(e.to_string()))?;
+            .map_err(|e| RefreshError::failed(e.to_string()))?;
         let tokens = match request.request_async(&caller).await {
             Ok(t) => t,
             Err(RequestTokenError::ServerResponse(r)) if *r.error() == CoreErrorResponseType::InvalidGrant => {
                 return Err(RefreshError::Refused);
             }
-            Err(e) => return Err(RefreshError::Failed(describe(&e))),
+            Err(e) => return Err(RefreshError::failed(describe(&e))),
         };
-        let rotated = tokens.refresh_token().map_or_else(|| refresh_token.to_string(), |t| t.secret().clone());
+        // From here on the exchange has happened: any failure carries the
+        // rotated token back with it. That includes an ID token naming
+        // someone else. The old token is spent either way, and the new one
+        // came from the token endpoint in exchange for this row's own; it is
+        // only ever used for this row's `sub`, and every refresh checks
+        // again whom the answer is for, so keeping it gives nobody's groups
+        // to anyone — the row just stays stale while the answers disagree.
+        let rotated = tokens.refresh_token().map(|t| t.secret().clone());
+        let failed = |error: String| RefreshError::Failed { error, rotated: rotated.clone() };
         let (jwt, email) = match tokens.id_token() {
             Some(id_token) => {
                 // A refreshed ID token carries no nonce of ours to check.
                 let claims = id_token
                     .claims(&client.id_token_verifier(), |_: Option<&Nonce>| Ok(()))
-                    .map_err(|e| RefreshError::Failed(format!("ID token: {e}")))?;
+                    .map_err(|e| failed(format!("ID token: {e}")))?;
                 if claims.subject().as_str() != sub {
-                    return Err(RefreshError::Failed("the refreshed ID token names someone else".into()));
+                    return Err(failed("the refreshed ID token names someone else".into()));
                 }
                 (id_token.to_string(), Some(verified_email(claims)))
             }
             None => (String::new(), None),
         };
-        let groups =
-            self.groups(&client, &jwt, tokens.access_token(), sub).await.map_err(|e| RefreshError::Failed(e.to_string()))?;
-        Ok(Refreshed { groups, refresh_token: rotated, email })
+        let groups = self.groups(&client, &jwt, tokens.access_token(), sub).await.map_err(|e| failed(e.to_string()))?;
+        let refresh_token = rotated.unwrap_or_else(|| refresh_token.to_string());
+        Ok(Refreshed { groups, refresh_token, email })
     }
 
     /// The groups claim, from the ID token already checked (`jwt`) when it
