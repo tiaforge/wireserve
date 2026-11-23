@@ -19,9 +19,53 @@ use wireserve_types::FirewallBackend;
 /// come up permissive-by-default while waiting on the first poll
 /// response." Calling this before the poll loop's first real `apply(...)`
 /// satisfies that regardless of backend.
+///
+/// One `apply` and no `teardown` before it: `apply` replaces whatever the
+/// backend's tables hold, a previous run's included, in one atomic
+/// transaction (the nftables backend deletes and re-adds its mesh and
+/// carry tables in a single `nft` run), so it is both of spec §5's steps at
+/// once. A separate teardown first would delete the previous run's table a
+/// process spawn before the deny-all arrived — and after a crash the
+/// previous run's interface is still up with all its peers (preflight
+/// reuses it), with nothing of ours default-denying it in between.
 pub fn startup_sequence<B: FirewallBackend>(backend: &mut B) -> Result<(), B::Error> {
-    backend.teardown()?;
     backend.apply(&[], &wireserve_types::Forwarding::default())
+}
+
+/// The daemon's stop, the mirror of [`guarded_bring_up`], in the only
+/// order that is closed at every step:
+///
+/// 1. the host-firewall interop: the host's other firewalls close back
+///    over the interfaces, while our own table still default-denies them;
+/// 2. `tear_down_interfaces` — the mesh and carry interfaces themselves.
+///    Once they are gone nothing arrives on them for a table to filter;
+/// 3. our own tables, last.
+///
+/// The other way round, the interfaces stay up with all their peers and
+/// no rules of ours for at least one process spawn. On a host whose own
+/// firewall does not default-deny (a plain Debian box, a Docker host)
+/// nothing else filters them then, and a SYN a peer sends to an
+/// unpublished port in that gap can open a connection that conntrack keeps.
+///
+/// If `tear_down_interfaces` fails, an interface may still be up, so our
+/// tables stay where they are — closed, and replaced atomically by the
+/// next start — and the error is returned.
+pub fn guarded_tear_down<B, I, E>(
+    backend: &mut B,
+    interop: &mut I,
+    tear_down_interfaces: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E>
+where
+    B: FirewallBackend,
+    B::Error: std::fmt::Display,
+    I: InteropHandle,
+{
+    interop.stop();
+    tear_down_interfaces()?;
+    if let Err(e) = backend.teardown() {
+        tracing::warn!(error = %e, "failed to tear down firewall rules during teardown");
+    }
+    Ok(())
 }
 
 /// Which forwarded traffic from and to the mesh interface the host's other
@@ -113,19 +157,25 @@ impl InteropHandle for NoopInterop {
 ///    so running them for a name someone else owns (a wg-quick `wg0`, a
 ///    typo such as `eth0`) would default-deny that interface — cutting off
 ///    the other tunnel, or SSH — and open it through ufw/firewalld.
-/// 2. our own table: teardown, then deny-all (spec §5);
+/// 2. our own table: deny-all, replacing a previous run's in the same
+///    transaction (spec §5, see [`startup_sequence`]);
 /// 3. the host-firewall interop, now that our default-deny is in place;
 /// 4. `bring_up` — the interface itself, last.
 ///
 /// If `bring_up` fails, steps 3 and 2 are undone (in that order) before
 /// the error is returned, so a daemon that never came up leaves nothing
-/// behind for an interface nobody manages.
+/// behind for an interface nobody manages. Our table stays, though, while
+/// `still_ours` says the interface is still there and this agent's: after
+/// a crash it is the previous run's, still up with its peers, and a
+/// bring-up that failed on it must not leave it without a default-deny.
+/// The next start replaces the table atomically.
 pub fn guarded_bring_up<B, W, I, E>(
     backend: &mut B,
     wg: &mut W,
     preflight: impl FnOnce(&W) -> Result<(), E>,
     start_interop: impl FnOnce() -> I,
     bring_up: impl FnOnce(&mut W) -> Result<(), E>,
+    still_ours: impl FnOnce(&W) -> bool,
 ) -> Result<I, E>
 where
     B: FirewallBackend,
@@ -138,7 +188,9 @@ where
     let mut interop = start_interop();
     if let Err(e) = bring_up(wg) {
         interop.stop();
-        if let Err(te) = backend.teardown() {
+        if still_ours(wg) {
+            tracing::warn!("bring-up failed on this agent's own interface: keeping its firewall table");
+        } else if let Err(te) = backend.teardown() {
             tracing::warn!(error = %te, "failed to remove firewall rules after a failed bring-up");
         }
         return Err(e);
@@ -217,10 +269,14 @@ mod tests {
     }
 
     #[test]
-    fn startup_sequence_tears_down_then_applies_empty_ruleset() {
+    fn startup_sequence_replaces_the_ruleset_with_an_empty_one_and_deletes_nothing_first() {
         let mut backend = FakeFirewallBackend::default();
         startup_sequence(&mut backend).unwrap();
-        assert_eq!(backend.calls, vec![Call::Teardown, Call::Apply(vec![], Forwarding::default())]);
+        assert_eq!(
+            backend.calls,
+            vec![Call::Apply(vec![], Forwarding::default())],
+            "a bare teardown first would leave a crashed run's interface without a table until the apply"
+        );
     }
 
     const NODE: std::net::Ipv4Addr = std::net::Ipv4Addr::new(100, 90, 0, 2);
@@ -240,7 +296,6 @@ mod tests {
         assert_eq!(
             backend.calls,
             vec![
-                Call::Teardown,
                 Call::Apply(vec![], Forwarding::default()),
                 Call::Apply(
                     vec![ServiceRule::Mapped { vip: VIP, node: NODE, map: wireserve_types::PortMap::identity(32400, Proto::Tcp), sources: None }],
@@ -288,6 +343,10 @@ mod tests {
     }
 
     fn run(preflight_ok: bool, bring_up_ok: bool) -> (Result<(), ()>, Vec<&'static str>) {
+        run_with(preflight_ok, bring_up_ok, false)
+    }
+
+    fn run_with(preflight_ok: bool, bring_up_ok: bool, still_ours: bool) -> (Result<(), ()>, Vec<&'static str>) {
         let log: Log = Rc::default();
         let mut fw = LoggingBackend(log.clone());
         let result = guarded_bring_up(
@@ -305,6 +364,7 @@ mod tests {
                 log.borrow_mut().push("bring_up");
                 if bring_up_ok { Ok(()) } else { Err(Failed) }
             },
+            |()| still_ours,
         );
         let result = result.map(|_| ()).map_err(|_| ());
         let entries = log.borrow().clone();
@@ -315,7 +375,7 @@ mod tests {
     fn bring_up_runs_in_the_safe_order() {
         assert_eq!(
             run(true, true),
-            (Ok(()), vec!["preflight", "fw.teardown", "fw.apply", "interop.start", "bring_up"])
+            (Ok(()), vec!["preflight", "fw.apply", "interop.start", "bring_up"])
         );
     }
 
@@ -330,17 +390,43 @@ mod tests {
             run(true, false),
             (
                 Err(()),
-                vec![
-                    "preflight",
-                    "fw.teardown",
-                    "fw.apply",
-                    "interop.start",
-                    "bring_up",
-                    "interop.stop",
-                    "fw.teardown"
-                ]
+                vec!["preflight", "fw.apply", "interop.start", "bring_up", "interop.stop", "fw.teardown"]
             )
         );
+    }
+
+    #[test]
+    fn a_failed_bring_up_on_our_own_surviving_interface_keeps_its_table() {
+        assert_eq!(
+            run_with(true, false, true),
+            (Err(()), vec!["preflight", "fw.apply", "interop.start", "bring_up", "interop.stop"])
+        );
+    }
+
+    // ---- guarded_tear_down ----
+
+    use super::guarded_tear_down;
+
+    fn tear_down(interfaces_ok: bool) -> (Result<(), ()>, Vec<&'static str>) {
+        let log: Log = Rc::default();
+        let mut fw = LoggingBackend(log.clone());
+        let mut interop = LoggingInterop(log.clone());
+        let result = guarded_tear_down(&mut fw, &mut interop, || {
+            log.borrow_mut().push("wg.teardown");
+            if interfaces_ok { Ok(()) } else { Err(Failed) }
+        });
+        let entries = log.borrow().clone();
+        (result.map_err(|_| ()), entries)
+    }
+
+    #[test]
+    fn a_stop_removes_the_interfaces_before_their_table() {
+        assert_eq!(tear_down(true), (Ok(()), vec!["interop.stop", "wg.teardown", "fw.teardown"]));
+    }
+
+    #[test]
+    fn a_stop_that_cannot_remove_the_interfaces_keeps_their_table() {
+        assert_eq!(tear_down(false), (Err(()), vec!["interop.stop", "wg.teardown"]));
     }
 }
 

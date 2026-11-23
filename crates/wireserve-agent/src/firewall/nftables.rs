@@ -1872,6 +1872,37 @@ mod tests {
         PhoneRelayRules { listen_port: 51820, divert_port: 42000, mesh_port: 42001, indexes }
     }
 
+    /// What startup's single replace (`firewall::startup_sequence`) leaves
+    /// over a previous run's tables — relay, phone and reflexive chains,
+    /// and a set and chain no batch of ours knows — is exactly what it
+    /// leaves on a host that never ran us: nothing of the old run is left
+    /// over, in the mesh table or the carry table, although no teardown
+    /// ran before it.
+    #[test]
+    fn kernel_the_startup_replace_leaves_nothing_of_a_previous_run() {
+        let own = [IpAddr::V4(NODE)];
+        let busy = Forwarding {
+            relay_self: Some(NODE),
+            phone_relay: Some(phones(vec![0x0102_0304])),
+            reflexive: Some(ReflexiveRules { listen_port: 51820, divert_port: 42002 }),
+            ..fwd(&[pair(0)])
+        };
+        let previous = apply_batch_with("wg0", Some("wg0c"), &own, &[], &busy);
+        let startup = apply_batch_with("wg0", Some("wg0c"), &own, &[], &Forwarding::default());
+        let leftovers = "nft add set inet wireserve.wg0 stale '{ type ipv4_addr; }'\n\
+                         nft add chain inet wireserve.wg0 stale\n\
+                         nft add set inet wireserve.wg0c stale '{ type ipv4_addr; }'\n";
+        let replaced = nft_script(&[previous]) + leftovers + &nft_script(std::slice::from_ref(&startup)) + "nft list ruleset";
+        let Some(replaced) = crate::firewall::netns::run(&replaced) else {
+            return;
+        };
+        let Some(fresh) = crate::firewall::netns::run(&(nft_script(&[startup]) + "nft list ruleset")) else {
+            return;
+        };
+        assert!(fresh.contains("table inet wireserve.wg0c"), "{fresh}");
+        assert_eq!(normalised_lines(&replaced), normalised_lines(&fresh));
+    }
+
     /// The relays' rules (PLAN.md M39, M49) are accepted by a real kernel —
     /// NAT and tproxy included, which an unprivileged namespace allows.
     #[test]

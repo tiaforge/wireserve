@@ -630,7 +630,9 @@ async fn cmd_daemon(
 
     // Spec §5: teardown-then-deny-all must run before the first successful
     // apply() from a poll response — the interface must never come up
-    // permissive-by-default.
+    // permissive-by-default. Both in one atomic replace, so an interface a
+    // crashed run left up is never without a table either (see
+    // `firewall::startup_sequence`).
     //
     // Ordered strictly before `bring_up`, not merely before the first
     // poll. The rules are matched on the interface *name*
@@ -692,6 +694,7 @@ async fn cmd_daemon(
             wg.bring_up(&private_key, ip4, ip6, listen_port)
                 .map_err(Into::<Box<dyn std::error::Error>>::into)
         },
+        |wg| wg.classify(&private_key) == wireserve_agent::wg::Slot::Ours,
     )?;
     if carry.is_some() {
         match wg.bring_up_carry(&private_key, ip4, ip6, state.carry_port) {
@@ -1003,22 +1006,26 @@ fn remove_leftover_interfaces(chosen: &str, previous: Option<&str>, private_key:
             continue;
         };
         tracing::info!(ifname = %name, "removing this node's own interface left behind under another name");
+        // In the order a stop uses (`firewall::guarded_tear_down`): the
+        // interface, still up with its peers, goes before its table does,
+        // and keeps the table if it can't be removed.
         #[cfg(target_os = "linux")]
-        {
-            firewall::host_interop::remove_for(&name);
-            match firewall::nftables::NftablesBackend::new(name.clone()) {
-                Ok(mut fw) => {
-                    if let Err(e) = fw.teardown() {
-                        tracing::warn!(ifname = %name, error = %e, "could not remove its firewall table");
-                    }
-                }
-                Err(e) => tracing::warn!(ifname = %name, error = %e, "could not remove its firewall table"),
+        firewall::host_interop::remove_for(&name);
+        let removed = match WgInterface::new(&name).map(|mut wg| wg.teardown()) {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) | Err(e) => {
+                tracing::warn!(ifname = %name, error = %e, "could not remove it; keeping its firewall table");
+                false
+            }
+        };
+        #[cfg(target_os = "linux")]
+        if removed {
+            if let Err(e) = firewall::nftables::NftablesBackend::new(name.clone()).and_then(|mut fw| fw.teardown()) {
+                tracing::warn!(ifname = %name, error = %e, "could not remove its firewall table");
             }
         }
-        match WgInterface::new(&name).map(|mut wg| wg.teardown()) {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) | Err(e) => tracing::warn!(ifname = %name, error = %e, "could not remove it"),
-        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = removed;
         remove_leftover_carry(&name, private_key);
         drop(claim);
     }
@@ -1034,28 +1041,25 @@ fn remove_leftover_carry(main: &str, private_key: &str) {
     if carry.classify(private_key) != wireserve_agent::wg::Slot::Ours {
         return;
     }
+    // The interface before its table, as for the mesh interface's.
     #[cfg(target_os = "linux")]
-    {
-        firewall::host_interop::remove_for(&name);
-        // The mesh interface's table is gone already; removing it again is
-        // a no-op, and this is the one call that knows both.
-        if let Ok(fw) = firewall::nftables::NftablesBackend::new(main.to_string()) {
-            let mut fw = fw.with_carry(Some(name.clone()));
-            if let Err(e) = fw.teardown() {
-                tracing::warn!(ifname = %name, error = %e, "could not remove its firewall table");
-            }
-        }
-    }
+    firewall::host_interop::remove_for(&name);
     if let Err(e) = wireserve_agent::routes::delete_link(&name) {
-        tracing::warn!(ifname = %name, error = %e, "could not remove a leftover carry interface");
+        tracing::warn!(ifname = %name, error = %e, "could not remove a leftover carry interface; keeping its firewall table");
+        return;
+    }
+    // Only the carry's own table: the mesh interface's is gone already, or
+    // was kept because the mesh interface could not be removed.
+    #[cfg(target_os = "linux")]
+    if let Err(e) = firewall::nftables::NftablesBackend::new(name.clone()).and_then(|mut fw| fw.teardown()) {
+        tracing::warn!(ifname = %name, error = %e, "could not remove its firewall table");
     }
 }
 
 /// Shared by both the `leave` IPC path and F9's revoked-node auto-teardown:
 /// removes the managed hosts-file block, the host-firewall interop, the
-/// firewall table, the
-/// WireGuard interface, the IPC socket, and resets local state to a clean
-/// default (security review F2 — spec §4.6 says `leave` "tears down
+/// WireGuard interface, the firewall table, the IPC socket, and resets
+/// local state to a clean default (security review F2 — spec §4.6 says `leave` "tears down
 /// interface, firewall, hosts block," but the original implementation did
 /// only the last two; the socket and lingering secrets in state were also
 /// flagged). Every step best-effort: a failure partway through (e.g. the
@@ -1090,17 +1094,28 @@ async fn teardown_everything<F: FirewallBackend>(
             }
         }
     }
-    // The host firewall closes back first, then our own table goes: the
-    // interface is never left open to the host firewalls' view while
-    // nothing of ours default-denies it.
-    interop.stop();
-    if let Err(e) = fw.teardown() {
-        tracing::warn!(error = %e, "failed to tear down firewall rules during teardown");
-    }
+    // The host firewall closes back first, then the interfaces go, and only
+    // then our own table: neither interface is ever up, with its peers,
+    // while nothing of ours default-denies it (see
+    // `firewall::guarded_tear_down`). If the interfaces can't be removed,
+    // the table stays.
+    let interfaces_gone = match firewall::guarded_tear_down(fw, interop, || wg.teardown()) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "failed to remove the WireGuard interface during teardown — keeping its firewall \
+                 table and local routes, so it stays default-denied"
+            );
+            false
+        }
+    };
     // The terminator's service addresses stop being this host's own
-    // (PLAN.md M33) — after the firewall, which marked traffic for them.
+    // (PLAN.md M33) — after the firewall, which marked traffic for them, and
+    // so kept with it while an interface may still be up. The next start
+    // sweeps them.
     #[cfg(target_os = "linux")]
-    {
+    if interfaces_gone {
         let mut state = state.lock().await;
         if !state.local_routes.is_empty() {
             let _ = wireserve_agent::routes::remove_local(&state.local_routes);
@@ -1110,9 +1125,8 @@ async fn teardown_everything<F: FirewallBackend>(
             }
         }
     }
-    if let Err(e) = wg.teardown() {
-        tracing::warn!(error = %e, "failed to remove WireGuard interface during teardown");
-    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = interfaces_gone;
     if socket_path.exists() {
         if let Err(e) = std::fs::remove_file(socket_path) {
             tracing::warn!(error = %e, "failed to remove IPC socket during teardown");
