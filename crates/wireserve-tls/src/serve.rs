@@ -84,6 +84,10 @@ pub struct Shared {
     /// by address, as `routes` and `policies` are for 443.
     pub http_routes: Routes,
     pub http_policies: Policies,
+    /// The open connections and the requests being served, on both
+    /// listeners together: they share the process's descriptors.
+    conns: Arc<Conns>,
+    requests: Arc<Conns>,
 }
 
 impl Shared {
@@ -179,8 +183,9 @@ pub struct Limits {
     pub idle: Duration,
     /// A whole request's headers, once they have started (HTTP/1).
     pub header_read: Duration,
-    /// Connections open at once, all clients together. Each holds a socket
-    /// here and, while a request runs, one to its backend.
+    /// Connections open at once, all clients together, on both listeners.
+    /// Each holds a socket here; what they hold at their backends is
+    /// `max_requests_total`'s.
     pub max_total: usize,
     /// Connections open at once from one address. A browser needs a
     /// handful; this is far above that.
@@ -193,6 +198,27 @@ pub struct Limits {
     /// node, by the address it vouched for: its share of the node's
     /// connections. A person with a few tabs needs a handful.
     pub max_upgrades_per_forwarded_client: usize,
+    /// Requests being served at once, all clients together. Each may hold a
+    /// connection to its backend until its answer has been sent — an
+    /// upgraded one for as long as it is open — so this, not the number of
+    /// connections, is what bounds the sockets to backends: over HTTP/2 one
+    /// connection carries up to `max_streams` requests. One over it is
+    /// answered 503 at once. `deploy/systemd/wireserve-tls.service` adds
+    /// it all up.
+    pub max_requests_total: usize,
+    /// The same from one address: twice `max_per_source`, so a browser
+    /// loading a few pages at once over HTTP/2, or one waiting on each of
+    /// its 128 connections, never meets it.
+    pub max_requests_per_source: usize,
+    /// The same for a forwarding node (PLAN.md M43): a quarter of
+    /// `max_requests_total`, as for its connections.
+    pub max_requests_per_forwarder: usize,
+    /// Requests one HTTP/2 connection may have open at once
+    /// (`SETTINGS_MAX_CONCURRENT_STREAMS`): the least RFC 9113 §6.5.2
+    /// recommends, and HAProxy's default (nginx's is 128). A browser queues the
+    /// rest of a page's requests itself; hyper's own 200 let one connection
+    /// take most of an address's share.
+    pub max_streams: u32,
     /// How often an upgraded connection's caller is asked about again
     /// (PLAN.md M42): what a grant taken away waits at most to close it.
     pub recheck: Duration,
@@ -209,15 +235,29 @@ impl Default for Limits {
             max_per_source: 128,
             max_per_forwarder: 1024,
             max_upgrades_per_forwarded_client: 32,
+            max_requests_total: 8192,
+            max_requests_per_source: 256,
+            max_requests_per_forwarder: 2048,
+            max_streams: 100,
             recheck: Duration::from_secs(30),
         }
     }
 }
 
-/// The open connections, in all and per source address.
+/// What a response streams ahead to an HTTP/2 client at most, per request:
+/// h2 keeps it in memory for as long as the client does not read, and
+/// hyper's own 400 KiB came to 3 GiB with every request a node serves at
+/// once held up so. Its kernel buffers and the backend's hold more, and a
+/// stream's throughput is the client's window's to set, not this.
+const H2_SEND_BUFFER: usize = 64 * 1024;
+
+/// The open connections, or the requests being served, in all and per
+/// source address.
 #[derive(Default)]
 struct Conns {
     counts: Mutex<(usize, HashMap<IpAddr, usize>)>,
+    /// When a refusal was last logged.
+    logged: Mutex<Option<Instant>>,
 }
 
 /// One open connection's place in [`Conns`], given back on drop.
@@ -227,18 +267,28 @@ struct Permit {
 }
 
 impl Conns {
-    /// A place for one more connection from `source`, if it has fewer than
-    /// `per_source` open and all together fewer than `limits.max_total`.
-    fn acquire(self: &Arc<Self>, source: IpAddr, per_source: usize, limits: &Limits) -> Option<Permit> {
+    /// A place for one more from `source`, if it has fewer than
+    /// `per_source` and all together are fewer than `total`.
+    fn acquire(self: &Arc<Self>, source: IpAddr, per_source: usize, total: usize) -> Option<Permit> {
         let source = source.to_canonical();
         let mut counts = self.counts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mine = counts.1.get(&source).copied().unwrap_or(0);
-        if counts.0 >= limits.max_total || mine >= per_source {
+        if counts.0 >= total || mine >= per_source {
             return None;
         }
         counts.0 += 1;
         counts.1.insert(source, mine + 1);
         Some(Permit { conns: Arc::clone(self), source })
+    }
+
+    /// Whether a refusal is to be logged now: once a minute.
+    fn log_refusal(&self) -> bool {
+        let mut logged = self.logged.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = logged.is_none_or(|t| t.elapsed() >= Duration::from_secs(60));
+        if now {
+            *logged = Some(Instant::now());
+        }
+        now
     }
 }
 
@@ -422,6 +472,29 @@ pub struct Route {
 /// How long a backend connection may wait unused, and how many may.
 const POOL_IDLE: Duration = Duration::from_secs(60);
 const POOL_MAX_IDLE: usize = 32;
+/// And how many may in all, every route's together: as many routes as
+/// there are services, on two ports each, and no request holds these.
+const POOL_MAX_IDLE_TOTAL: usize = 1024;
+static POOL_IDLE_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+/// One idle backend connection's place in [`POOL_IDLE_TOTAL`], given back
+/// on drop.
+struct IdlePlace(());
+
+impl IdlePlace {
+    fn acquire() -> Option<Self> {
+        POOL_IDLE_TOTAL
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < POOL_MAX_IDLE_TOTAL).then_some(n + 1))
+            .ok()
+            .map(|_| Self(()))
+    }
+}
+
+impl Drop for IdlePlace {
+    fn drop(&mut self) {
+        POOL_IDLE_TOTAL.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 /// A backend on another machine (PLAN.md M26) that is off answers nothing
 /// at all; without a limit a request waits out the kernel.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -456,19 +529,19 @@ impl Lease {
 /// A backend's idle connections, the most recently used on top.
 #[derive(Default)]
 struct Pool {
-    idle: std::sync::Mutex<Vec<(Lease, Instant)>>,
+    idle: std::sync::Mutex<Vec<(Lease, Instant, IdlePlace)>>,
     reaping: std::sync::atomic::AtomicBool,
 }
 
 impl Pool {
-    fn idle(&self) -> std::sync::MutexGuard<'_, Vec<(Lease, Instant)>> {
+    fn idle(&self) -> std::sync::MutexGuard<'_, Vec<(Lease, Instant, IdlePlace)>> {
         self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// An idle connection a request can go in by now, if there is one.
     fn take(&self, cx: &mut Context<'_>) -> Option<Lease> {
         loop {
-            let (mut lease, since) = self.idle().pop()?;
+            let (mut lease, since, _place) = self.idle().pop()?;
             // One the backend closed meanwhile is seen closed here.
             if since.elapsed() < POOL_IDLE && lease.reusable(cx) {
                 return Some(lease);
@@ -486,7 +559,10 @@ impl Pool {
             if idle.len() >= POOL_MAX_IDLE {
                 return;
             }
-            idle.push((lease, Instant::now()));
+            let Some(place) = IdlePlace::acquire() else {
+                return;
+            };
+            idle.push((lease, Instant::now(), place));
         }
         self.reap_idle();
     }
@@ -506,7 +582,7 @@ impl Pool {
                 let Some(pool) = pool.upgrade() else { return };
                 let mut idle = std::mem::take(&mut *pool.idle());
                 std::future::poll_fn(|cx| {
-                    idle.retain_mut(|(lease, since)| since.elapsed() < POOL_IDLE && lease.drive(cx));
+                    idle.retain_mut(|(lease, since, _)| since.elapsed() < POOL_IDLE && lease.drive(cx));
                     Poll::Ready(())
                 })
                 .await;
@@ -525,6 +601,9 @@ struct Driven {
     body: hyper::body::Incoming,
     lease: Option<Lease>,
     pool: Arc<Pool>,
+    /// The request's place in `Limits::max_requests_total`, given back
+    /// with the connection it holds.
+    held: Option<Permit>,
 }
 
 impl Driven {
@@ -532,6 +611,7 @@ impl Driven {
         if let Some(lease) = self.lease.take() {
             self.pool.give_back(lease, cx);
         }
+        self.held = None;
     }
 }
 
@@ -550,7 +630,7 @@ impl hyper::body::Body for Driven {
             None => this.done(cx),
             Some(Ok(_)) if this.body.is_end_stream() => this.done(cx),
             // Cut short: the connection is in no state for another.
-            Some(Err(_)) => this.lease = None,
+            Some(Err(_)) => (this.lease, this.held) = (None, None),
             Some(Ok(_)) => {}
         }
         Poll::Ready(frame)
@@ -586,7 +666,8 @@ impl Route {
     /// headers gone, the backend told where it came from, and the name it
     /// asked for kept. It goes by a connection of the route's own, driven
     /// by this very request rather than a task of its own (PLAN.md #331).
-    async fn forward(&self, mut req: Request<Body>, peer: SocketAddr, scheme: &'static str) -> axum::response::Response {
+    /// `held` is its place in the limits, kept until the answer is done.
+    async fn forward(&self, mut req: Request<Body>, peer: SocketAddr, scheme: &'static str, held: Permit) -> axum::response::Response {
         use axum::http::header::{HOST, TE};
         // A tunnel has no meaning to one fixed backend.
         if req.method() == axum::http::Method::CONNECT {
@@ -614,6 +695,7 @@ impl Route {
         headers.insert(HOST, host.unwrap_or_else(|| self.authority.clone()));
         crate::upgrade::set_forwarded(headers, peer, scheme);
 
+        let mut held = Some(held);
         let mut pooled = true;
         loop {
             let lease = match pooled.then(|| std::future::poll_fn(|cx| Poll::Ready(self.pool.take(cx)))) {
@@ -628,7 +710,7 @@ impl Route {
                     Err(e) => return self.unreachable(&*e),
                 },
             };
-            match self.exchange(lease, req).await {
+            match self.exchange(lease, req, &mut held).await {
                 Ok(answer) => return answer,
                 Err(mut e) => match e.take_message() {
                     // Closed before the request went out: one a backend
@@ -649,6 +731,7 @@ impl Route {
         &self,
         mut lease: Lease,
         req: Request<Body>,
+        held: &mut Option<Permit>,
     ) -> Result<axum::response::Response, Box<hyper::client::conn::TrySendError<Request<Body>>>> {
         let mut answer = std::pin::pin!(lease.send.try_send_request(req));
         let res = std::future::poll_fn(|cx| {
@@ -659,7 +742,7 @@ impl Route {
         .map_err(Box::new)?;
         let (mut parts, body) = res.into_parts();
         crate::upgrade::strip_hop_by_hop(&mut parts.headers, false);
-        let mut body = Driven { body, lease: Some(lease), pool: Arc::clone(&self.pool) };
+        let mut body = Driven { body, lease: Some(lease), pool: Arc::clone(&self.pool), held: held.take() };
         // Nothing to read (HEAD, 204, 304): the connection is free now.
         if hyper::body::Body::is_end_stream(&body.body) {
             std::future::poll_fn(|cx| {
@@ -781,7 +864,7 @@ pub fn spawn_http_with_limits(listener: TcpListener, shared: Shared, limits: Lim
 /// One listener's accept loop: TLS when `tls` is given, plain HTTP without.
 fn accept(listener: TcpListener, tls: Option<tokio_rustls::TlsAcceptor>, shared: Shared, limits: Limits) -> JoinHandle<()> {
     let http = tls.is_none();
-    let conns = Arc::new(Conns::default());
+    let conns = Arc::clone(&shared.conns);
     let upgrade_slots = Arc::new(UpgradeSlots::default());
     tokio::spawn(async move {
         let mut last_refusal_logged: Option<Instant> = None;
@@ -808,7 +891,7 @@ fn accept(listener: TcpListener, tls: Option<tokio_rustls::TlsAcceptor>, shared:
             // what is over them is closed unanswered, before any TLS work.
             let forwarding_node = shared.forwarding_node(peer.ip());
             let per_source = if forwarding_node.is_some() { limits.max_per_forwarder } else { limits.max_per_source };
-            let Some(permit) = conns.acquire(peer.ip(), per_source, &limits) else {
+            let Some(permit) = conns.acquire(peer.ip(), per_source, limits.max_total) else {
                 if last_refusal_logged.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
                     last_refusal_logged = Some(Instant::now());
                     tracing::warn!(
@@ -878,6 +961,11 @@ impl Conn {
             let identity = read(&shared.identity).clone();
             let strip = read(&shared.strip).clone();
             let forwarder = shared.forwarding_node(peer.ip()).is_some();
+            let per_source = if forwarder { limits.max_requests_per_forwarder } else { limits.max_requests_per_source };
+            let held = shared.requests.acquire(peer.ip(), per_source, limits.max_requests_total);
+            if held.is_none() && shared.requests.log_refusal() {
+                tracing::warn!(peer = %peer.ip(), forwarder, "too many requests being served; refusing new ones (logged once a minute)");
+            }
             let misdirected = match &policy {
                 Some(p) if !for_this_service(&req, &p.hosts()) => !(forwarder && take_public_name(&mut req, &p.fqdn)),
                 _ => false,
@@ -905,6 +993,14 @@ impl Conn {
             let shared = shared.clone();
             async move {
                 let _in_flight = in_flight;
+                // Refused at once rather than kept waiting: only a client
+                // with hundreds of requests unanswered gets here, and a
+                // wait would keep each of them open all the same.
+                let Some(held) = held else {
+                    let mut busy = crate::sign_in::plain(axum::http::StatusCode::SERVICE_UNAVAILABLE, "too many requests in progress; try again");
+                    busy.headers_mut().insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+                    return Ok(busy);
+                };
                 let Some(policy) = policy else {
                     return Ok(crate::sign_in::plain(
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -975,13 +1071,13 @@ impl Conn {
                             let (shared, asked) = (shared.clone(), Arc::clone(&asked));
                             async move { still_admitted(&shared, http, vip, caller_addr, &asked).await }
                         };
-                        let answer = crate::upgrade::proxy(req, upstream, peer, scheme, recheck, again, slot).await;
+                        let answer = crate::upgrade::proxy(req, upstream, peer, scheme, recheck, again, (slot, held)).await;
                         if answer.status() == axum::http::StatusCode::SWITCHING_PROTOCOLS {
                             stats.upgraded.store(true, Ordering::Relaxed);
                         }
                         Ok(answer)
                     }
-                    None => Ok(route.forward(req, peer, scheme).await),
+                    None => Ok(route.forward(req, peer, scheme, held).await),
                 };
                 // A renewed session goes back to the browser with
                 // whatever the backend answered.
@@ -995,7 +1091,13 @@ impl Conn {
         });
         let mut builder = auto::Builder::new(TokioExecutor::new());
         builder.http1().timer(TokioTimer::new()).header_read_timeout(limits.header_read);
-        builder.http2().timer(TokioTimer::new()).keep_alive_interval(Some(Duration::from_secs(30))).keep_alive_timeout(Duration::from_secs(20));
+        builder
+            .http2()
+            .timer(TokioTimer::new())
+            .keep_alive_interval(Some(Duration::from_secs(30)))
+            .keep_alive_timeout(Duration::from_secs(20))
+            .max_concurrent_streams(limits.max_streams)
+            .max_send_buf_size(H2_SEND_BUFFER);
         // Plain HTTP is HTTP/1 — browsers speak HTTP/2 only over TLS — and
         // what tries cleartext HTTP/2 here is not one.
         let builder = if http { builder.http1_only() } else { builder };
@@ -2584,6 +2686,35 @@ mod tests {
     /// A terminator for `svc.test` on 127.0.0.1 with these limits, in front
     /// of `upstream`.
     fn in_front_of(upstream: SocketAddr, limits: Limits) -> (u16, tokio_rustls::TlsConnector, Shared) {
+        in_front_of_speaking(upstream, limits, &[])
+    }
+
+    /// [`in_front_of`], with a client that offers HTTP/2.
+    fn in_front_of_h2(upstream: SocketAddr, limits: Limits) -> (u16, tokio_rustls::TlsConnector, Shared) {
+        in_front_of_speaking(upstream, limits, &[b"h2"])
+    }
+
+    /// One HTTP/2 connection to the terminator.
+    async fn h2(port: u16, client: &tokio_rustls::TlsConnector) -> hyper::client::conn::http2::SendRequest<Body> {
+        h2_on(tls(port, client).await).await
+    }
+
+    async fn h2_on(c: Tls) -> hyper::client::conn::http2::SendRequest<Body> {
+        assert_eq!(c.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+        let (send, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(c)).await.unwrap();
+        tokio::spawn(conn);
+        send
+    }
+
+    /// The status and body of `req`, sent on `send`.
+    async fn h2_ask(send: &mut hyper::client::conn::http2::SendRequest<Body>, req: Request<Body>) -> (u16, String) {
+        let res = send.send_request(req).await.unwrap();
+        let status = res.status().as_u16();
+        let body = axum::body::to_bytes(Body::new(res.into_body()), 1 << 16).await.unwrap_or_default();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn in_front_of_speaking(upstream: SocketAddr, limits: Limits, alpn: &[&[u8]]) -> (u16, tokio_rustls::TlsConnector, Shared) {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let key = rcgen::generate_simple_self_signed(vec!["svc.test".into()]).unwrap();
         let der = key.cert.der().clone();
@@ -2598,7 +2729,9 @@ mod tests {
         spawn_with_limits(listener, server_config(certs), shared.clone(), limits);
         let mut roots = rustls::RootCertStore::empty();
         roots.add(der).unwrap();
-        let client = tokio_rustls::TlsConnector::from(Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth()));
+        let mut config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        let client = tokio_rustls::TlsConnector::from(Arc::new(config));
         (port, client, shared)
     }
 
@@ -2747,6 +2880,10 @@ mod tests {
             max_per_source: 100,
             max_per_forwarder: 100,
             max_upgrades_per_forwarded_client: 100,
+            max_requests_total: 1000,
+            max_requests_per_source: 1000,
+            max_requests_per_forwarder: 1000,
+            max_streams: 100,
             recheck: Duration::from_millis(300),
         }
     }
@@ -2755,6 +2892,14 @@ mod tests {
 
     async fn tls(port: u16, client: &tokio_rustls::TlsConnector) -> Tls {
         let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client.connect(rustls_pki_types::ServerName::try_from("svc.test").unwrap(), tcp).await.unwrap()
+    }
+
+    /// [`tls`], from another address of the loopback.
+    async fn tls_from(source: Ipv4Addr, port: u16, client: &tokio_rustls::TlsConnector) -> Tls {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind(SocketAddr::new(source.into(), 0)).unwrap();
+        let tcp = socket.connect(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)).await.unwrap();
         client.connect(rustls_pki_types::ServerName::try_from("svc.test").unwrap(), tcp).await.unwrap()
     }
 
@@ -3392,5 +3537,141 @@ mod tests {
         next_text(&mut ws).await;
         let elsewhere = tokio_tungstenite::client_async(open("https://evil.example"), tls(port, &client).await).await;
         assert!(elsewhere.is_err(), "anyone else's page still is not");
+    }
+
+    // ---- requests in flight ----
+
+    /// A backend that holds every request `hold` before answering `held`:
+    /// how many it holds now, and the most it held at once.
+    async fn holding_backend(hold: Duration) -> (SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = backend.local_addr().unwrap();
+        let (now, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (holding, seen) = (Arc::clone(&now), Arc::clone(&most));
+        tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move || {
+                let (now, most) = (Arc::clone(&holding), Arc::clone(&seen));
+                async move {
+                    most.fetch_max(now.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                    tokio::time::sleep(hold).await;
+                    now.fetch_sub(1, Ordering::SeqCst);
+                    "held"
+                }
+            });
+            axum::serve(backend, app).await.unwrap();
+        });
+        (upstream, now, most)
+    }
+
+    /// `n` requests at once on `send`; their statuses, sorted.
+    async fn at_once(send: &hyper::client::conn::http2::SendRequest<Body>, n: usize) -> Vec<u16> {
+        let mut all = Vec::new();
+        for _ in 0..n {
+            let mut send = send.clone();
+            all.push(tokio::spawn(async move { h2_ask(&mut send, Request::get("https://svc.test/").body(Body::empty()).unwrap()).await.0 }));
+        }
+        let mut statuses = Vec::new();
+        for one in all {
+            statuses.push(one.await.unwrap());
+        }
+        statuses.sort_unstable();
+        statuses
+    }
+
+    #[tokio::test]
+    async fn one_http2_connection_serves_at_most_max_streams_requests_at_once() {
+        // hyper's own limit was 200 a connection, and 150 reached the backend at once.
+        assert_eq!(Limits::default().max_streams, 100);
+        let (upstream, _, most) = holding_backend(Duration::from_millis(300)).await;
+        let (port, client, _) = in_front_of_h2(upstream, Limits { max_streams: 4, idle: Duration::from_secs(30), ..quick() });
+        let mut send = h2(port, &client).await;
+        // Once the client has the server's settings, as a browser waits for them.
+        assert_eq!(h2_ask(&mut send, Request::get("https://svc.test/").body(Body::empty()).unwrap()).await.0, 200);
+        assert_eq!(at_once(&send, 10).await, [200; 10], "the rest wait their turn at the client");
+        assert_eq!(most.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn one_address_cannot_have_more_than_its_share_of_requests_in_flight_and_others_are_not_affected() {
+        let (upstream, now, most) = holding_backend(Duration::from_millis(500)).await;
+        let (port, client, _) = in_front_of_h2(upstream, Limits { max_requests_per_source: 3, idle: Duration::from_secs(30), ..quick() });
+        let send = h2(port, &client).await;
+        assert_eq!(at_once(&send, 5).await, [200, 200, 200, 503, 503]);
+        assert_eq!(most.load(Ordering::SeqCst), 3);
+
+        // On connections of their own, HTTP/1.1 or HTTP/2, they count the same.
+        let busy = tokio::spawn({
+            let send = send.clone();
+            async move { at_once(&send, 3).await }
+        });
+        assert!(eventually(|| now.load(Ordering::SeqCst) == 3).await);
+        let plain = tokio_rustls::TlsConnector::from(Arc::new(plain_config(&client)));
+        assert!(get_once(port, &plain, "/").await.starts_with("HTTP/1.1 503"));
+        let mut other = h2_on(tls_from(Ipv4Addr::new(127, 0, 0, 2), port, &client).await).await;
+        assert_eq!(h2_ask(&mut other, Request::get("https://svc.test/").body(Body::empty()).unwrap()).await, (200, "held".into()));
+        assert_eq!(busy.await.unwrap(), [200; 3]);
+        // Given back with the answers.
+        assert_eq!(at_once(&send, 3).await, [200; 3]);
+    }
+
+    /// `path`, asked on a connection of its own; the whole answer.
+    async fn get_once(port: u16, client: &tokio_rustls::TlsConnector, path: &str) -> String {
+        use tokio::io::AsyncWriteExt;
+        let mut c = tls(port, client).await;
+        c.write_all(format!("GET {path} HTTP/1.1\r\nhost: svc.test\r\nconnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        read_all(&mut c).await
+    }
+
+    /// A client config like `client`'s, offering HTTP/1.1 alone.
+    fn plain_config(client: &tokio_rustls::TlsConnector) -> rustls::ClientConfig {
+        let mut config = (**client.config()).clone();
+        config.alpn_protocols.clear();
+        config
+    }
+
+    #[tokio::test]
+    async fn every_request_in_flight_together_is_capped_too_and_a_forwarding_node_has_a_larger_share() {
+        let (upstream, now, _) = holding_backend(Duration::from_millis(500)).await;
+        let limits = Limits { max_requests_total: 4, max_requests_per_source: 2, max_requests_per_forwarder: 3, idle: Duration::from_secs(30), ..quick() };
+        let (port, client, shared) = in_front_of_h2(upstream, limits);
+        forwarding(&shared);
+        let send = h2(port, &client).await;
+        assert_eq!(at_once(&send, 4).await, [200, 200, 200, 503], "a forwarding node's share");
+        let busy = tokio::spawn({
+            let send = send.clone();
+            async move { at_once(&send, 3).await }
+        });
+        assert!(eventually(|| now.load(Ordering::SeqCst) == 3).await);
+        let other = h2_on(tls_from(Ipv4Addr::new(127, 0, 0, 2), port, &client).await).await;
+        assert_eq!(at_once(&other, 2).await, [200, 503], "all four taken");
+        assert_eq!(busy.await.unwrap(), [200; 3]);
+    }
+
+    #[tokio::test]
+    async fn an_answer_still_streaming_and_an_open_websocket_hold_their_place() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (port, client) = limited(Limits { max_requests_per_source: 1, ..quick() }).await;
+        let mut dripping = tls(port, &client).await;
+        dripping.write_all(b"GET /drip HTTP/1.1\r\nhost: svc.test\r\n\r\n").await.unwrap();
+        let mut buf = [0u8; 256];
+        let n = dripping.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+        let answer = get_once(port, &client, "/").await;
+        assert!(answer.starts_with("HTTP/1.1 503") && answer.contains("retry-after: 1"), "its backend connection is still in use: {answer}");
+        let answer = read_until(&mut dripping, |t| t.ends_with("0\r\n\r\n")).await;
+        assert!(answer.ends_with("0\r\n\r\n"), "{answer}");
+        assert!(get_once(port, &client, "/").await.ends_with("ok"), "given back with the answer's end");
+
+        let (port, client, _) = in_front_of(ws_backend().await, Limits { max_requests_per_source: 1, ..quick() });
+        let (mut socket, _) = ws(port, &client, "/").await.expect("upgraded");
+        next_text(&mut socket).await;
+        match ws(port, &client, "/").await {
+            Err(tungstenite::Error::Http(resp)) => assert_eq!(resp.status(), 503),
+            other => panic!("expected 503, got {:?}", other.map(|(_, r)| r.status())),
+        }
+        socket.close(None).await.unwrap();
+        drop(socket);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        ws(port, &client, "/").await.expect("room again");
     }
 }
