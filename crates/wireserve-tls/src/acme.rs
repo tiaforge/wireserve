@@ -30,18 +30,47 @@ pub enum AcmeError {
     Invalid(String),
     #[error("account: {0}")]
     Account(String),
+    #[error("the CA did not answer in time: {0}")]
+    TimedOut(&'static str),
+}
+
+/// How long one request to the CA may take. instant-acme's own client has
+/// no timeout at all, and a CA that takes the connection and never answers
+/// would hold the one issuance at a time for good. Let's Encrypt answers
+/// in well under a second; finalizing can take a few.
+const CA_CALL: Duration = Duration::from_secs(30);
+
+/// How long polling the order may go on: the CA validates the challenge,
+/// then signs the certificate.
+const POLL: Duration = Duration::from_secs(120);
+
+/// How long a whole issuance may take before it counts as failed: the wait
+/// for the record to propagate, plus ample time for every request, the
+/// coordinator's call to the DNS provider and both polls.
+#[must_use]
+pub fn deadline(settings: &AcmeSettings) -> Duration {
+    Duration::from_secs(u64::from(settings.propagation_secs)) + Duration::from_secs(10 * 60)
+}
+
+/// One call to the CA, given at most `limit`.
+async fn call<T>(what: &'static str, limit: Duration, fut: impl std::future::Future<Output = T>) -> Result<T, AcmeError> {
+    tokio::time::timeout(limit, fut).await.map_err(|_| AcmeError::TimedOut(what))
 }
 
 /// The ACME account, loaded or created once per CA.
 pub struct Accounts {
     dir: PathBuf,
     ca_file: Option<PathBuf>,
+    /// Held while the account is loaded or created: renewal times and the
+    /// issuance ask for it from tasks of their own, and two creating it at
+    /// once would make two accounts.
+    lock: tokio::sync::Mutex<()>,
 }
 
 impl Accounts {
     #[must_use]
     pub fn new(dir: &Path, ca_file: Option<PathBuf>) -> Self {
-        Self { dir: dir.to_path_buf(), ca_file }
+        Self { dir: dir.to_path_buf(), ca_file, lock: tokio::sync::Mutex::new(()) }
     }
 
     /// One account file per directory URL, so moving between staging and
@@ -58,22 +87,18 @@ impl Accounts {
     }
 
     pub async fn get(&self, settings: &AcmeSettings) -> Result<Account, AcmeError> {
+        let _held = self.lock.lock().await;
         let path = self.path(&settings.directory);
         if let Ok(text) = std::fs::read_to_string(&path) {
             let creds: AccountCredentials =
                 serde_json::from_str(&text).map_err(|e| AcmeError::Account(format!("{}: {e}", path.display())))?;
-            return Ok(self.builder()?.from_credentials(creds).await?);
+            return Ok(call("the directory", CA_CALL, self.builder()?.from_credentials(creds)).await??);
         }
         let contact = settings.email.as_ref().map(|e| format!("mailto:{e}"));
         let contacts: Vec<&str> = contact.iter().map(String::as_str).collect();
-        let (account, creds) = self
-            .builder()?
-            .create(
-                &NewAccount { contact: &contacts, terms_of_service_agreed: true, only_return_existing: false },
-                settings.directory.clone(),
-                None,
-            )
-            .await?;
+        let new = NewAccount { contact: &contacts, terms_of_service_agreed: true, only_return_existing: false };
+        let (account, creds) =
+            call("creating the account", CA_CALL, self.builder()?.create(&new, settings.directory.clone(), None)).await??;
         let text = serde_json::to_string(&creds).map_err(|e| AcmeError::Account(e.to_string()))?;
         write_private(&path, &text).map_err(|e| AcmeError::Account(format!("{}: {e}", path.display())))?;
         tracing::info!(directory = %settings.directory, "created an ACME account");
@@ -99,6 +124,7 @@ pub async fn issue(
     settings: &AcmeSettings,
     replaces: Option<&Stored>,
 ) -> Result<(String, String), AcmeError> {
+    let deadline = tokio::time::Instant::now() + deadline(settings);
     let identifiers = [Identifier::Dns(fqdn.to_string())];
     let mut new_order = NewOrder::new(&identifiers);
     // Tells the CA which certificate this one replaces (ARI), which it may
@@ -107,12 +133,12 @@ pub async fn issue(
     if let Some(id) = &replaced_id {
         new_order = new_order.replaces(id.clone());
     }
-    let mut order = match account.new_order(&new_order).await {
+    let mut order = match call("the new order", CA_CALL, account.new_order(&new_order)).await? {
         Ok(order) => order,
         // A CA without ARI refuses `replaces`; ask again without it.
         Err(instant_acme::Error::Unsupported(what)) if replaced_id.is_some() => {
             tracing::info!(fqdn, "the CA offers no {what}; ordering without naming the certificate replaced");
-            account.new_order(&NewOrder::new(&identifiers)).await?
+            call("the new order", CA_CALL, account.new_order(&NewOrder::new(&identifiers))).await??
         }
         // A CA with ARI refuses `replaces` too, for a certificate that
         // already has a replacement order (RFC 9773 `alreadyReplaced`): one
@@ -120,7 +146,7 @@ pub async fn issue(
         // it again would be refused forever while the old one expires.
         Err(e) if replaced_id.is_some() && order_without_replaces(&e) => {
             tracing::warn!(fqdn, error = %e, "the CA refused the order naming the certificate replaced; ordering without it");
-            account.new_order(&NewOrder::new(&identifiers)).await?
+            call("the new order", CA_CALL, account.new_order(&NewOrder::new(&identifiers))).await??
         }
         Err(e) => return Err(e.into()),
     };
@@ -128,7 +154,7 @@ pub async fn issue(
     let mut published: Vec<String> = Vec::new();
     let result = async {
         let mut authorizations = order.authorizations();
-        while let Some(authz) = authorizations.next().await {
+        while let Some(authz) = call("an authorization", CA_CALL, authorizations.next()).await? {
             let mut authz = authz?;
             match authz.status {
                 AuthorizationStatus::Valid => continue,
@@ -143,18 +169,22 @@ pub async fn issue(
             // The coordinator wrote the record to the provider; give it time
             // to reach every one of the zone's nameservers before the CA looks.
             tokio::time::sleep(Duration::from_secs(u64::from(settings.propagation_secs))).await;
-            challenge.set_ready().await?;
+            call("the challenge", CA_CALL, challenge.set_ready()).await??;
         }
-        let retries = RetryPolicy::new().timeout(Duration::from_secs(120));
-        match order.poll_ready(&retries).await? {
+        // The policy's timeout is checked between polls only; a poll that
+        // never returns is bounded here.
+        let retries = RetryPolicy::new().timeout(POLL);
+        match call("the order", POLL + CA_CALL, order.poll_ready(&retries)).await?? {
             OrderStatus::Ready => {}
             other => return Err(AcmeError::Order(other)),
         }
-        let key_pem = order.finalize().await?;
-        let chain_pem = order.poll_certificate(&retries).await?;
+        let key_pem = call("finalizing", CA_CALL, order.finalize()).await??;
+        let chain_pem = call("the certificate", POLL + CA_CALL, order.poll_certificate(&retries)).await??;
         Ok((chain_pem, key_pem))
-    }
-    .await;
+    };
+    // Past it the attempt is a failure like any other: the backoff applies,
+    // and the next name on the node gets its turn.
+    let result = tokio::time::timeout_at(deadline, result).await.unwrap_or(Err(AcmeError::TimedOut("the whole issuance")));
 
     // Withdrawn whatever happened, so no record outlives the order; the
     // coordinator would also expire it on its own.
@@ -201,8 +231,8 @@ pub async fn renewal_time(account: &Account, stored: &Stored) -> SystemTime {
     let Ok(id) = CertificateIdentifier::try_from(&stored.leaf) else {
         return fallback;
     };
-    match account.renewal_info(&id).await {
-        Ok((info, _)) => {
+    match call("renewal information", CA_CALL, account.renewal_info(&id)).await {
+        Ok(Ok((info, _))) => {
             let start: SystemTime = info.suggested_window.start.into();
             let end: SystemTime = info.suggested_window.end.into();
             // Somewhere in the window, so a fleet of terminators does not
@@ -210,7 +240,7 @@ pub async fn renewal_time(account: &Account, stored: &Stored) -> SystemTime {
             let span = end.duration_since(start).unwrap_or(Duration::ZERO);
             start + span.mul_f64(rand::random::<f64>())
         }
-        Err(_) => fallback,
+        Ok(Err(_)) | Err(_) => fallback,
     }
 }
 
@@ -256,5 +286,28 @@ mod tests {
         };
         assert!(matches!(e, instant_acme::Error::Other(_)), "{e:?}");
         assert!(!order_without_replaces(&e), "{e:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_ca_that_takes_the_connection_and_never_answers_times_out() {
+        // Bound and never accepted from: the TLS handshake waits for ever.
+        let ca = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let accounts = Accounts::new(dir.path(), None);
+        let settings = AcmeSettings { directory: format!("https://{}/dir", ca.local_addr().unwrap()), email: None, propagation_secs: 0 };
+        let started = tokio::time::Instant::now();
+        let e = accounts.get(&settings).await.err().expect("nothing answers");
+        assert!(matches!(e, AcmeError::TimedOut(_)), "{e:?}");
+        assert_eq!(started.elapsed(), CA_CALL);
+        drop(ca);
+    }
+
+    #[test]
+    fn an_issuance_has_a_deadline_past_the_propagation_wait() {
+        let settings = AcmeSettings { directory: String::new(), email: None, propagation_secs: 120 };
+        let deadline = deadline(&settings);
+        // The wait, both polls, the other requests, and the agent's minute
+        // for publishing the record.
+        assert!(deadline > Duration::from_secs(120) + POLL * 2 + CA_CALL * 4 + Duration::from_secs(60), "{deadline:?}");
     }
 }

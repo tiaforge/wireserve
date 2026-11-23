@@ -85,15 +85,32 @@ struct Issuance {
     /// The directory of the CA `cert` came from.
     ca: Option<String>,
     renew_at: Option<SystemTime>,
+    /// `renew_at` being asked of the CA, in a task of its own: the check-in
+    /// loop waits on nothing across the network, since a CA that does not
+    /// answer would stop the check-ins and the agent would take 443 from
+    /// every service on the node.
+    lookup: Option<JoinHandle<SystemTime>>,
     failures: u32,
     not_before: Option<Instant>,
+}
+
+impl Issuance {
+    /// Holds `stored`, from the CA at `ca`, in place of what was held.
+    fn hold(&mut self, stored: Stored, ca: String) {
+        self.cert = Some(stored);
+        self.ca = Some(ca);
+        self.renew_at = None;
+        if let Some(lookup) = self.lookup.take() {
+            lookup.abort();
+        }
+    }
 }
 
 /// Runs until the process is stopped.
 pub async fn run(opts: Options) -> Result<(), Error> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let store = Store::open(&opts.state_dir).map_err(Error::State)?;
-    let accounts = acme::Accounts::new(store.root(), opts.ca_file.clone());
+    let accounts = Arc::new(acme::Accounts::new(store.root(), opts.ca_file.clone()));
     let link = Link::new(&opts.socket);
     let certs = Arc::new(Certs::default());
     let tls = serve::server_config(certs.clone());
@@ -178,9 +195,7 @@ pub async fn run(opts: Options) -> Result<(), Error> {
                     Ok(stored) => {
                         tracing::info!(fqdn = %fqdn, ca = %directory, "certificate issued");
                         certs.set(&fqdn, stored.key.clone());
-                        entry.renew_at = None;
-                        entry.cert = Some(stored);
-                        entry.ca = Some(directory);
+                        entry.hold(stored, directory);
                         entry.failures = 0;
                         entry.not_before = None;
                     }
@@ -206,9 +221,7 @@ pub async fn run(opts: Options) -> Result<(), Error> {
                 match store.load(&settings.directory, &service.fqdn) {
                     Ok(Some(stored)) if stored.valid_at(SystemTime::now()) => {
                         certs.set(&service.fqdn, stored.key.clone());
-                        entry.cert = Some(stored);
-                        entry.ca = Some(settings.directory.clone());
-                        entry.renew_at = None;
+                        entry.hold(stored, settings.directory.clone());
                     }
                     Ok(_) => {}
                     Err(e) => tracing::warn!(fqdn = %service.fqdn, error = %e, "stored certificate unreadable; getting a new one"),
@@ -251,24 +264,26 @@ pub async fn run(opts: Options) -> Result<(), Error> {
                 Some(_) if replacing => true,
                 Some(cert) => {
                     if entry.renew_at.is_none() {
-                        entry.renew_at = Some(match accounts.get(&settings).await {
-                            Ok(account) => acme::renewal_time(&account, cert).await,
-                            Err(_) => cert.default_renewal(),
-                        });
+                        match entry.lookup.take() {
+                            Some(lookup) if lookup.is_finished() => {
+                                entry.renew_at = Some(lookup.await.unwrap_or_else(|_| cert.default_renewal()));
+                            }
+                            Some(lookup) => entry.lookup = Some(lookup),
+                            None => {
+                                let (accounts, settings, cert) = (accounts.clone(), settings.clone(), cert.clone());
+                                entry.lookup = Some(tokio::spawn(async move {
+                                    match accounts.get(&settings).await {
+                                        Ok(account) => acme::renewal_time(&account, &cert).await,
+                                        Err(_) => cert.default_renewal(),
+                                    }
+                                }));
+                            }
+                        }
                     }
                     entry.renew_at.is_some_and(|t| SystemTime::now() >= t)
                 }
             };
             if due {
-                let account = match accounts.get(&settings).await {
-                    Ok(a) => a,
-                    Err(e) => {
-                        entry.failures += 1;
-                        entry.not_before = Some(Instant::now() + FIRST_BACKOFF);
-                        tracing::warn!(error = %e, "no ACME account");
-                        continue;
-                    }
-                };
                 tracing::info!(
                     fqdn = %service.fqdn,
                     renewal = entry.cert.is_some() && !replacing,
@@ -277,12 +292,15 @@ pub async fn run(opts: Options) -> Result<(), Error> {
                 );
                 // Renewal information only names a certificate of the same CA.
                 let replaces = if replacing { None } else { entry.cert.clone() };
-                let (fqdn, link, settings) = (service.fqdn.clone(), link.clone(), settings.clone());
+                let (fqdn, link, settings, accounts) = (service.fqdn.clone(), link.clone(), settings.clone(), accounts.clone());
                 let name = fqdn.clone();
                 in_flight = Some((
                     name,
                     settings.directory.clone(),
-                    tokio::spawn(async move { acme::issue(&account, &fqdn, &link, &settings, replaces.as_ref()).await }),
+                    tokio::spawn(async move {
+                        let account = accounts.get(&settings).await?;
+                        acme::issue(&account, &fqdn, &link, &settings, replaces.as_ref()).await
+                    }),
                 ));
             }
         }
@@ -436,5 +454,73 @@ mod tests {
         let config = TlsConfig { services: vec![service("plex")], ..TlsConfig::default() };
         forget_gone(&mut served, &mut issuance, &Certs::default(), &serve::Shared::default(), &config);
         assert_eq!((served.len(), issuance.len()), (1, 1));
+    }
+
+    /// An agent on `socket` that answers every check-in with `config` and
+    /// sends what the terminator said it serves to the returned channel.
+    fn fake_agent(socket: &std::path::Path, config: TlsConfig) -> tokio::sync::mpsc::UnboundedReceiver<Vec<String>> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use wireserve_types::tls::{TlsRequest, TlsResponse};
+        let agent = tokio::net::UnixListener::bind(socket).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = agent.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(read).read_line(&mut line).await.unwrap();
+                let answer = match serde_json::from_str::<TlsRequest>(line.trim_end()).unwrap() {
+                    TlsRequest::CheckIn { serving, .. } => {
+                        let _ = tx.send(serving);
+                        TlsResponse::Config(Box::new(config.clone()))
+                    }
+                    _ => TlsResponse::Error { message: "not in this test".into() },
+                };
+                let mut answer = serde_json::to_string(&answer).unwrap();
+                answer.push('\n');
+                let _ = write.write_all(answer.as_bytes()).await;
+            }
+        });
+        rx
+    }
+
+    #[tokio::test]
+    async fn check_ins_go_on_while_the_ca_takes_connections_and_never_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        // Bound and never accepted from: the kernel completes the TCP
+        // handshake, and the TLS one then waits for ever.
+        let ca = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let directory = format!("https://{}/dir", ca.local_addr().unwrap());
+        // A held certificate, whose renewal time is asked of the CA, and a
+        // name without one, which is issued.
+        let state = dir.path().join("state");
+        let (chain, key) = store::tests::self_signed("plex.int.test", 36_500);
+        Store::open(&state).unwrap().save(&directory, "plex.int.test", &chain, &key).unwrap();
+        let other = TlsService { vip: Ipv4Addr::new(100, 64, 0, 10), ..service("jelly") };
+        let config = TlsConfig {
+            acme: Some(wireserve_types::AcmeSettings { directory, email: None, propagation_secs: 0 }),
+            services: vec![service("plex"), other],
+            ..TlsConfig::default()
+        };
+        let socket = dir.path().join("tls.sock");
+        let mut check_ins = fake_agent(&socket, config);
+
+        let terminator = tokio::spawn(run(Options {
+            socket,
+            state_dir: state,
+            ca_file: None,
+            check_in_every: Duration::from_millis(20),
+            port: 0,
+        }));
+        let mut serving = Vec::new();
+        for n in 0..10 {
+            serving = tokio::time::timeout(Duration::from_secs(5), check_ins.recv())
+                .await
+                .unwrap_or_else(|_| panic!("check-in {n} never came: the loop waits on the CA"))
+                .unwrap();
+        }
+        assert_eq!(serving, vec!["plex".to_string()], "the held certificate is served meanwhile");
+        terminator.abort();
+        drop(ca);
     }
 }
