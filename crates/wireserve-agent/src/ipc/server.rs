@@ -160,9 +160,14 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
 }
 
 /// Whether this node publishes `name` on TCP 80 and its terminator did not
-/// answer that on the last cycle (PLAN.md #328).
+/// answer that on the last cycle (PLAN.md #328). Never one for people only
+/// (PLAN.md #326): its 80 is closed then, not passed on (`service_rules`).
 fn unguarded(state: &AgentState, name: &str) -> bool {
-    state.declared_services.iter().any(|d| d.name == name && d.ports.iter().any(wireserve_types::is_http_map))
+    let for_people = state.own_access.iter().any(|a| a.name == name && a.always_sign_in);
+    state
+        .declared_services
+        .iter()
+        .any(|d| d.name == name && !d.always_sign_in && !for_people && d.ports.iter().any(wireserve_types::is_http_map))
         && !state.http_answered.contains(name)
 }
 
@@ -703,6 +708,35 @@ mod tests {
         let (resp, _) = dispatch(&ctx, serve(&["443:3000"], false)).await;
         assert!(matches!(resp, IpcResponse::Ok));
         assert!(!ctx.state.lock().await.declared_services[0].always_sign_in);
+    }
+
+    #[tokio::test]
+    async fn port_80_of_a_service_for_people_is_never_called_unguarded() {
+        // Without a terminator answering it, it is closed, not passed on.
+        let (ctx, _dir, _rx) = test_ctx();
+        let serve = |always_sign_in: bool| IpcRequest::Serve {
+            name: "grafana".into(),
+            ports: vec!["443:3000".parse().unwrap(), "80:3000".parse().unwrap()],
+            group: None,
+            always_sign_in,
+        };
+        let (resp, _) = dispatch(&ctx, serve(false)).await;
+        assert!(matches!(resp, IpcResponse::Ok));
+        assert!(build_list_view(&ctx, &*ctx.state.lock().await).services[0].http_unguarded);
+
+        // The coordinator's word is enough, as it is for the firewall.
+        ctx.state.lock().await.own_access.push(wireserve_types::ServiceAccess {
+            name: "grafana".into(),
+            open: true,
+            always_sign_in: true,
+            ..Default::default()
+        });
+        assert!(!build_list_view(&ctx, &*ctx.state.lock().await).services[0].http_unguarded);
+        ctx.state.lock().await.own_access.clear();
+
+        let (resp, _) = dispatch(&ctx, serve(true)).await;
+        assert!(matches!(resp, IpcResponse::Ok));
+        assert!(!build_list_view(&ctx, &*ctx.state.lock().await).services[0].http_unguarded);
     }
 
     #[tokio::test]
