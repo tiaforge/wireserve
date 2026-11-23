@@ -290,7 +290,8 @@ Worth knowing:
   asks for through the tunnel — no cookie, so no SameSite rule holds it
   back. The terminator answers a service's 443 and, where it runs, its 80:
   a request must name the service or its address (another name is 421, so a
-  rebound DNS name reads nothing), and a POST, PUT or DELETE, or a
+  rebound DNS name reads nothing; a second `Host`, or a name with `user@`
+  before it, is 400; the backend is told only the name checked), and a POST, PUT or DELETE, or a
   WebSocket, that a page on another site started is refused with 403; another service under the same
   domain counts as another site, since a node's own 443 service is one of
   them. Following a link, reads (which the browser keeps from the other page)
