@@ -17,6 +17,7 @@ $dirs = cargo test -p wireserve-agent --locked --no-run --message-format=json |
 if ($LASTEXITCODE -ne 0) { throw "building the agent's tests failed" }
 if (-not $dirs) { throw "cargo named no test binary" }
 foreach ($dir in $dirs) {
-    Copy-Item $Dll $dir -ErrorAction Stop
+    # -Force: over a copy already there, read-only as the release's is.
+    Copy-Item $Dll $dir -Force -ErrorAction Stop
     Write-Host "wireguard.dll -> $dir"
 }
