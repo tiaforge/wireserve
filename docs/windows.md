@@ -25,6 +25,9 @@ What works on Linux and not, or differently, on Windows:
 - **Where the service listens**: on every address (`0.0.0.0`) or on the
   service's own address. On the node's mesh address alone it is not
   reached, as it would be on Linux.
+- **Who answers a published port**: but for 443 and 80, whichever program
+  listens on it, of any local user; Linux keeps ports below 1024 for root
+  (see [Serving](#serving)).
 - **Carrying traffic for others**: no `transit`, no relaying for other
   nodes, no `exit`. The commands are refused.
 - **`wireserve-admin` and the coordinator** do not run on Windows: manage
@@ -136,6 +139,13 @@ What differs:
   its grants admit even when the host firewall has a rule blocking that
   port, on any network profile. To keep a port closed to the mesh, don't
   publish it, or narrow who may reach it with grants.
+- **A plain port is open to whichever program listens on it.** Windows
+  reserves no ports for administrators, so while the service's own
+  program is not running, any program of any local user can listen on a
+  published port and answer the nodes the service admits. Only 443 and 80
+  are tied to one account, the terminator's. On a computer other people
+  have accounts on, keep the program behind a published port running, or
+  publish it on 443 or 80, through the terminator.
 - **No terminator, no remapped 80.** While the terminator does not answer
   a service's port 80 (just installed, or stopped), an `80:3000` service is
   closed on 80, where Linux sends it straight to the service. An `80` (on
