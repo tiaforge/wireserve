@@ -244,7 +244,7 @@ mod tests {
         use std::net::UdpSocket;
         use wireserve_types::{FirewallBackend, Forwarding, ReflexiveRules};
 
-        if !crate::firewall::netns::reexec(
+        if !crate::platform::linux::netns::reexec(
             "reflexive_responder::tests::kernel_a_probe_on_the_wireguard_port_is_answered_and_wireguard_keeps_the_rest",
         ) {
             return;
@@ -263,7 +263,7 @@ mod tests {
 
         let wireguard = UdpSocket::bind("0.0.0.0:51820").unwrap();
         wireguard.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
-        let mut fw = crate::firewall::nftables::NftablesBackend::new("wg0").unwrap();
+        let mut fw = crate::platform::linux::nftables::NftablesBackend::new("wg0").unwrap();
         fw.apply(&[], &Forwarding { reflexive: Some(ReflexiveRules { listen_port: 51820, divert_port: 42002 }), ..Forwarding::default() })
             .unwrap();
         let responder = Responder::default();

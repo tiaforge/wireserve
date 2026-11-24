@@ -171,7 +171,7 @@ enum Command {
         // The port to listen on when not started by `wireserve-tls.socket`,
         // which otherwise decides it. Service addresses' 443 is rewritten to
         // whichever it is. Not on Windows, which listens on each service
-        // address's 443 and 80 (PLAN.md M51).
+        // address's 443 and 80 (PLAN.md M52).
         #[arg(long, env = "WIRESERVE_TLS_PORT", default_value_t = wireserve_types::TLS_LISTEN_PORT, hide = true)]
         port: u16,
         /// Run under the service manager: the Service Control Manager on Windows (`install` sets this up)
@@ -998,7 +998,7 @@ async fn cmd_daemon(
     Ok(())
 }
 
-/// Removes the service addresses (PLAN.md M33, M51) a previous run left
+/// Removes the service addresses (PLAN.md M33, M52) a previous run left
 /// the host holding (see `platform::host_addresses::left_behind`).
 fn sweep_local_routes(state: &mut AgentState, state_path: &std::path::Path) {
     let range = state.mesh.as_ref().and_then(wireserve_types::MeshRanges::parse);
@@ -1026,11 +1026,16 @@ fn remove_leftover_interfaces(chosen: &str, previous: Option<&str>, private_key:
             continue;
         };
         tracing::info!(ifname = %name, "removing this node's own interface left behind under another name");
-        platform::firewall::remove_leftover(&name);
-        match WgInterface::new(&name).map(|mut wg| wg.teardown()) {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) | Err(e) => tracing::warn!(ifname = %name, error = %e, "could not remove it"),
-        }
+        // In the order a stop uses (`firewall::guarded_tear_down`): the
+        // interface, still up with its peers, goes before its table does,
+        // and keeps the table if it can't be removed.
+        platform::firewall::remove_leftover(&name, || match WgInterface::new(&name).map(|mut wg| wg.teardown()) {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) | Err(e) => {
+                tracing::warn!(ifname = %name, error = %e, "could not remove it; keeping its firewall table");
+                false
+            }
+        });
         platform::firewall::remove_leftover_carry(&name, private_key);
         drop(claim);
     }
@@ -1074,16 +1079,27 @@ async fn teardown_everything<F: FirewallBackend>(
             }
         }
     }
-    // The host firewall closes back first, then our own table goes: the
-    // interface is never left open to the host firewalls' view while
-    // nothing of ours default-denies it.
-    interop.stop();
-    if let Err(e) = fw.teardown() {
-        tracing::warn!(error = %e, "failed to tear down firewall rules during teardown");
-    }
-    // The service addresses stop being this host's own (PLAN.md M33, M51)
-    // — after the firewall, which marked traffic for them.
-    {
+    // The host firewall closes back first, then the interfaces go, and only
+    // then our own table: neither interface is ever up, with its peers,
+    // while nothing of ours default-denies it (see
+    // `firewall::guarded_tear_down`). If the interfaces can't be removed,
+    // the table stays.
+    let interfaces_gone = match firewall::guarded_tear_down(fw, interop, || wg.teardown()) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "failed to remove the WireGuard interface during teardown — keeping its firewall \
+                 table and local routes, so it stays default-denied"
+            );
+            false
+        }
+    };
+    // The service addresses stop being this host's own (PLAN.md M33, M52)
+    // — after the firewall, which marked traffic for them, and so kept
+    // with it while an interface may still be up. The next start sweeps
+    // them.
+    if interfaces_gone {
         let mut state = state.lock().await;
         if !state.local_routes.is_empty() {
             platform::host_addresses::remove(&state.local_routes);
@@ -1093,8 +1109,6 @@ async fn teardown_everything<F: FirewallBackend>(
             }
         }
     }
-    #[cfg(not(target_os = "linux"))]
-    let _ = interfaces_gone;
     if socket_path.exists() {
         if let Err(e) = std::fs::remove_file(socket_path) {
             tracing::warn!(error = %e, "failed to remove IPC socket during teardown");

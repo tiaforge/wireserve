@@ -1,4 +1,4 @@
-//! The terminator on Windows (see [`super`]; PLAN.md M51): the agent's
+//! The terminator on Windows (see [`super`]; PLAN.md M52): the agent's
 //! named pipe, each service address's own socket on 443 and 80, and files
 //! protected by their directory's ACL.
 
@@ -163,5 +163,12 @@ pub(crate) fn owner_only(_options: &mut std::fs::OpenOptions) {}
 /// See [`owner_only`]: the directory's ACL is `install`'s.
 #[allow(clippy::unnecessary_wraps)]
 pub(crate) fn set_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Nothing: a directory does not open as a file on Windows, and NTFS
+/// journals a rename itself.
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }

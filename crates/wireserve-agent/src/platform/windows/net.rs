@@ -1,6 +1,6 @@
 //! The Windows IP Helper calls the agent's Windows code shares: finding an
 //! interface by name, listing the host's addresses, and assigning an
-//! adapter its addresses (its services' too, PLAN.md M51) and MTU. What `getifaddrs`, `if_nametoindex` and
+//! adapter its addresses (its services' too, PLAN.md M52) and MTU. What `getifaddrs`, `if_nametoindex` and
 //! netlink do on Linux.
 //!
 //! Interfaces are named by their *alias* — what `Get-NetAdapter` shows
@@ -222,7 +222,7 @@ fn ip_interface(luid: NET_LUID_LH, family: ADDRESS_FAMILY) -> Option<MIB_IPINTER
 
 /// Sets the interface's MTU (when given) for every family enabled on it,
 /// and turns forwarding off on it for each: a Windows node carries nobody's
-/// traffic (PLAN.md M50), so nothing arriving over the mesh is routed on —
+/// traffic (PLAN.md M51), so nothing arriving over the mesh is routed on —
 /// said here rather than left to whatever the host's routing settings
 /// (ICS, a `netsh ... forwarding=enabled`) gave a new interface. The
 /// firewall blocks forwarding from the mesh as well (`super::wfp`); this
@@ -296,7 +296,7 @@ pub fn set_addresses(luid: NET_LUID_LH, addrs: &[(IpAddr, u8)]) -> io::Result<()
     first_err.map_or(Ok(()), Err)
 }
 
-/// Moves the interface's service addresses (PLAN.md M51) from `old` to
+/// Moves the interface's service addresses (PLAN.md M52) from `old` to
 /// `new`: each a /32 beside the interface's own addresses, so the host
 /// receives a service's traffic itself, as nothing rewrites it here, and
 /// never the source of the host's own connections (`SkipAsSource`), which

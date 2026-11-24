@@ -37,7 +37,7 @@ pub fn group(name: &str) -> Option<Principal> {
 }
 
 /// Who the TLS terminator's pipe is shared with: its service's own
-/// account (PLAN.md M51), once `install` made the service.
+/// account (PLAN.md M52), once `install` made the service.
 #[must_use]
 pub fn terminator(instance: &crate::paths::Instance) -> Option<Principal> {
     let name = super::service::tls_service_name(instance);
@@ -140,8 +140,8 @@ pub async fn connect(socket_path: &Path) -> std::io::Result<tokio::net::windows:
 /// member of the `wireserve` group is given, and would be refused. Still
 /// identification only, as tokio's is: the server may learn who connects,
 /// never act as them. And only a pipe the daemon could have made
-/// ([`super::security::check_pipe_owner`], PLAN.md #362), as the TLS
-/// terminator checks its own (#359).
+/// ([`super::security::check_pipe_owner`], PLAN.md #391), as the TLS
+/// terminator checks its own (#388).
 fn open_pipe(socket_path: &Path) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
     use std::os::windows::ffi::OsStrExt;
     use tokio::net::windows::named_pipe::NamedPipeClient;

@@ -10,7 +10,7 @@
 //! One service per instance: `wireserve-agent`, or `wireserve-agent-<name>`
 //! for a named one, each running `wireserve.exe daemon --service` as
 //! LocalSystem, started at boot and restarted after a failure. Beside each,
-//! its TLS terminator (PLAN.md M51): `wireserve-tls[-<name>]`, running
+//! its TLS terminator (PLAN.md M52): `wireserve-tls[-<name>]`, running
 //! `wireserve.exe tls-daemon --service` as a virtual account of its own,
 //! `NT SERVICE\wireserve-tls[-<name>]` — what the terminator's own user is
 //! on Linux.
@@ -50,7 +50,7 @@ pub fn service_name(instance: &Instance) -> String {
     }
 }
 
-/// The TLS terminator's service for `instance` (PLAN.md M51), and the
+/// The TLS terminator's service for `instance` (PLAN.md M52), and the
 /// name of the account it runs as, `NT SERVICE\<it>`.
 #[must_use]
 pub fn tls_service_name(instance: &Instance) -> String {
@@ -227,7 +227,7 @@ pub fn install(name: &str, instance: &Instance, exe: &Path) -> io::Result<()> {
     )
 }
 
-/// The TLS terminator's service `name` for `instance` (PLAN.md M51): `exe
+/// The TLS terminator's service `name` for `instance` (PLAN.md M52): `exe
 /// tls-daemon --service`, as `NT SERVICE\<name>`, which holds nothing of
 /// the agent's — it parses TLS and HTTP from the whole mesh.
 pub fn install_tls(name: &str, instance: &Instance, exe: &Path) -> io::Result<()> {
@@ -345,7 +345,7 @@ fn install_spec(spec: &Spec<'_>, instance: &Instance, exe: &Path) -> io::Result<
         if unsafe { ChangeServiceConfig2W(service.0, SERVICE_CONFIG_SERVICE_SID_INFO, std::ptr::from_ref(&sid).cast()) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        // Only the privileges it needs in its token (PLAN.md #362). A
+        // Only the privileges it needs in its token (PLAN.md #391). A
         // service account is given `SeImpersonatePrivilege` and others by
         // default, and with it code that took over the process parsing TLS
         // and HTTP from the whole mesh could make a SYSTEM token Windows

@@ -18,7 +18,7 @@
 //! the coordinator, which only then points the name at the service's own
 //! address.
 //!
-//! On Windows (PLAN.md M51) it runs as its own service, under a virtual
+//! On Windows (PLAN.md M52) it runs as its own service, under a virtual
 //! account of its own, and listens on each service address's 443 and 80
 //! itself: nothing there rewrites them onto one port.
 
@@ -590,6 +590,8 @@ mod tests {
 
     /// An agent on `socket` that answers every check-in with `config` and
     /// sends what the terminator said it serves to the returned channel.
+    /// Unix only, as `serve`'s tests are: the stand-in agent is a Unix socket.
+    #[cfg(unix)]
     fn fake_agent(socket: &std::path::Path, config: TlsConfig) -> tokio::sync::mpsc::UnboundedReceiver<Vec<String>> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use wireserve_types::tls::{TlsRequest, TlsResponse};
@@ -616,6 +618,7 @@ mod tests {
         rx
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn check_ins_go_on_while_the_ca_takes_connections_and_never_answers() {
         let dir = tempfile::tempdir().unwrap();

@@ -60,7 +60,7 @@ pass() { echo "PASS: $*"; PASSES=$((PASSES + 1)); }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 nsx() { local ns=$1; shift; nsenter --net=/run/netns/"$ns" "$@"; }
 
-MARK=0x01000000   # SERVICE_MARK in firewall/nftables.rs
+MARK=0x01000000   # SERVICE_MARK in platform/linux/nftables.rs
 CLIENT=10.99.0.1 NODE=10.99.0.2 VIP1=10.99.0.50 VIP2=10.99.0.51 APP=172.30.0.2
 
 # ---- topology ----

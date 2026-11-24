@@ -131,7 +131,7 @@ impl Instance {
         }
     }
 
-    /// The terminator's log on Windows (PLAN.md M51), in its own state
+    /// The terminator's log on Windows (PLAN.md M52), in its own state
     /// directory: the agent's is not its to write.
     #[must_use]
     pub fn tls_log_path(&self) -> PathBuf {

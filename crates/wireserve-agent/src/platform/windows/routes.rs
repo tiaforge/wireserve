@@ -13,7 +13,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    CreateIpForwardEntry2, DeleteIpForwardEntry2, InitializeIpForwardEntry, MIB_IPFORWARD_ROW2,
+    CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable, GetIpForwardTable2, InitializeIpForwardEntry,
+    MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
 };
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows_sys::Win32::Networking::WinSock::MIB_IPPROTO_NETMGMT;
@@ -106,6 +107,53 @@ fn request(luid: NET_LUID_LH, addr: IpAddr, add: bool) -> io::Result<()> {
     }
 }
 
+/// The adapter's interface index, which stays its own for as long as the
+/// adapter lives; `ENODEV`, as on Linux, when no adapter has the name —
+/// what `WgInterface::check` takes for "gone".
+pub fn interface_index(ifname: &str) -> io::Result<u32> {
+    match winnet::luid_by_alias(ifname)? {
+        Some(luid) => winnet::index_of(luid),
+        None => Err(io::Error::from_raw_os_error(libc::ENODEV)),
+    }
+}
+
+/// Every address the host has a host route to, through any interface (see
+/// the Linux version): what [`sync`] would find already there. Windows
+/// removes an adapter's routes when it is disabled.
+pub fn host_routes() -> io::Result<BTreeSet<IpAddr>> {
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    // SAFETY: the table is allocated by the call and freed below.
+    winnet::check(unsafe { GetIpForwardTable2(windows_sys::Win32::Networking::WinSock::AF_UNSPEC, &mut table) })?;
+    // SAFETY: `NumEntries` rows follow the count, alive until the table is freed.
+    let rows = unsafe { std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize) };
+    let out = rows
+        .iter()
+        .filter_map(|row| {
+            let addr = winnet::from_sockaddr_inet(&row.DestinationPrefix.Prefix)?.ip();
+            let full = if addr.is_ipv4() { 32 } else { 128 };
+            (row.DestinationPrefix.PrefixLength == full).then_some(addr)
+        })
+        .collect();
+    // SAFETY: the table the call above allocated, freed once.
+    unsafe { FreeMibTable(table.cast()) };
+    Ok(out)
+}
+
+/// Always: an adapter is up from `configure_interface` on for as long as
+/// its handle is held, and nothing like `ip link set down` takes it down
+/// without removing it. One disabled by hand loses its routes, which
+/// `WgInterface::check` puts back when it is enabled again.
+#[allow(clippy::unnecessary_wraps)]
+pub fn link_is_up(_index: u32) -> io::Result<bool> {
+    Ok(true)
+}
+
+/// Nothing: see [`link_is_up`].
+#[allow(clippy::unnecessary_wraps)]
+pub fn set_link_up(_index: u32) -> io::Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +165,13 @@ mod tests {
         let (add, remove) = plan(&[a, b].into(), &[b].into());
         assert_eq!(add, vec![b]);
         assert_eq!(remove, vec![a]);
+    }
+
+    #[test]
+    fn an_adapter_that_does_not_exist_has_no_index_and_loopback_is_routed() {
+        let err = interface_index("wireserve-no-such-adapter").unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENODEV));
+        // Windows keeps a host route to 127.0.0.1.
+        assert!(host_routes().unwrap().contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
     }
 }

@@ -113,6 +113,9 @@ impl Store {
         crate::platform::set_mode(&dir, 0o700)?;
         if let Some(ca) = dir.parent() {
             crate::platform::set_mode(ca, 0o700)?;
+            // The directories just made, if they were, survive a crash too.
+            sync_dir(ca)?;
+            sync_dir(&self.root.join("certs"))?;
         }
         let written = write_private(&dir.join("key.tmp"), key_pem.as_bytes())
             .and_then(|()| write_private(&dir.join("cert.tmp"), chain_pem.as_bytes()));
@@ -213,13 +216,15 @@ pub fn parse(chain_pem: &[u8], key_pem: &[u8]) -> io::Result<Stored> {
 /// Writes `path`, readable by this user alone, and flushes it to disk.
 fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = create_private(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
+    let mut f = create_private(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
+/// Flushes `dir`'s entries to disk, so a rename into it outlives a crash
+/// (see `platform::sync_dir`).
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    crate::platform::sync_dir(dir)
 }
 
 /// Creates (or truncates) `path` readable by its owner alone: `0600` on

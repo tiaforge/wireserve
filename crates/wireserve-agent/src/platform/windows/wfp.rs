@@ -1,14 +1,14 @@
 //! The Windows firewall backend: the Windows Filtering Platform, directly.
 //!
 //! A Windows node is a mesh member whose ruleset is the default-deny with
-//! holes for its services (PLAN.md M51) and nothing else: no transit, no
+//! holes for its services (PLAN.md M52) and nothing else: no transit, no
 //! exit. Every new inbound connection over the mesh is refused but those,
 //! and replies to the node's own connections come back as they belong to
 //! flows it opened — WFP's ALE layers only ever see the first packet of a
 //! flow, which is what nftables' `ct state established` amounts to on
 //! Linux.
 //!
-//! Why WFP and not Windows Defender Firewall rules (PLAN.md #349): the blocks
+//! Why WFP and not Windows Defender Firewall rules (PLAN.md #378): the blocks
 //! sit in a sublayer of our own at the highest weight and clear the
 //! action right, so no other firewall on the host — Defender, or whatever
 //! replaced it, all of them WFP clients — can permit what they refuse;
@@ -16,7 +16,7 @@
 //! Windows gave the adapter; and a ruleset is replaced in one transaction,
 //! like `nft -f`.
 //!
-//! Two lifetimes (PLAN.md #362):
+//! Two lifetimes (PLAN.md #391):
 //! - **Lasting blocks**, persistent WFP objects, for as long as the node is
 //!   joined — past a stop, a crash, a reboot: inbound to the node's **mesh
 //!   addresses** and to the **mesh's range** (the service addresses), at
@@ -34,7 +34,7 @@
 //!
 //! Every instance's filters, lasting or not, are in one persistent sublayer.
 //! A dynamic session's sublayer can be used by that session only
-//! (`FWP_E_WRONG_SESSION`, #349), a persistent one by every session, and
+//! (`FWP_E_WRONG_SESSION`, #378), a persistent one by every session, and
 //! within one sublayer the weights decide: an instance's permits outweigh
 //! every instance's blocks, which matters to two instances in one mesh,
 //! whose range blocks cover each other's service addresses.
@@ -112,7 +112,7 @@ fn lasting_key(instance: &str, slot: &str) -> GUID {
     crate::platform::windows::nt::name_guid(&format!("wireserve-wfp-block:{instance}:{slot}"))
 }
 
-/// One service's hole in the default-deny (PLAN.md M51): new connections
+/// One service's hole in the default-deny (PLAN.md M52): new connections
 /// to `vip:port` over `proto` on the mesh adapter, from `sources` (anyone
 /// when `None`), and with `terminator` only those its account accepts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -704,7 +704,7 @@ impl FirewallBackend for WfpBackend {
     type Error = io::Error;
 
     /// The default-deny and the services' holes. `forwarding` is always
-    /// empty here: a Windows node carries nobody's traffic (PLAN.md M50).
+    /// empty here: a Windows node carries nobody's traffic (PLAN.md M51).
     fn apply(&mut self, rules: &[ServiceRule], forwarding: &Forwarding) -> Result<(), Self::Error> {
         // What the agent always fills in (its own address and ports, the
         // mesh's range) asks for nothing to be forwarded; these would.

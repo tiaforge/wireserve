@@ -13,14 +13,14 @@
 //! replace what is in it. So the ACL is only applied to a directory whose
 //! owner is SYSTEM, Administrators, or the account the agent runs as, and
 //! every directory from the state root down to it must be owned so too
-//! and be no junction or symbolic link (PLAN.md #362): one some other user
+//! and be no junction or symbolic link (PLAN.md #391): one some other user
 //! created first is refused rather than adopted.
 //!
 //! The daemon's pipe may also be shared with a local group, as its socket
 //! is with the `wireserve` group on Linux; [`local_group_sid`] is the
 //! lookup and [`ensure_local_group`] the `groupadd`.
 //!
-//! The TLS terminator (PLAN.md M51) runs as a virtual account of its own,
+//! The TLS terminator (PLAN.md M52) runs as a virtual account of its own,
 //! `NT SERVICE\<its service>` ([`service_sid`]): its state directory
 //! ([`ensure_private_dir_for`]), its pipe and its firewall permits name it.
 

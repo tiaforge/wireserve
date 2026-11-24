@@ -16,7 +16,7 @@ pub type Interop = NoopInterop;
 
 /// The filters for the mesh adapter `ifname`, this node's own addresses
 /// `own` and the mesh's range `mesh` (both blocked for as long as the node
-/// is joined, see [`super::wfp`]). The terminator's holes (PLAN.md M51)
+/// is joined, see [`super::wfp`]). The terminator's holes (PLAN.md M52)
 /// are for its service's own account, which exists once `install` made
 /// the service. No carry interface's: the adapter blocks cover it.
 pub fn backend(
@@ -66,10 +66,12 @@ pub fn after_leave(fw: &mut Backend) {
     }
 }
 
-/// Nothing: the session's filters went with the run that made them, and
-/// the lasting blocks belong to the instance, not to an interface name —
-/// this start has just replaced them.
-pub fn remove_leftover(_name: &str) {}
+/// Only the interface, through `remove_interface`: the session's filters
+/// went with the run that made them, and the lasting blocks belong to the
+/// instance, not to an interface name — this start has just replaced them.
+pub fn remove_leftover(_name: &str, remove_interface: impl FnOnce() -> bool) {
+    remove_interface();
+}
 
 /// Nothing: a carry adapter goes with the process that made it.
 pub fn remove_leftover_carry(_main: &str, _private_key: &str) {}

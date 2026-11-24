@@ -74,8 +74,8 @@ jobs:
           bin=$(cargo test -p wireserve-agent --lib --locked --no-run --message-format=json \
             | jq -r 'select(.profile.test == true and .executable != null) | .executable')
           sudo WIRESERVE_TEST_STRICT=1 "$bin" --exact \
-            firewall::nftables::tests::kernel_a_mapped_service_is_reached_through_the_carry_interface_too \
-            firewall::nftables::tests::kernel_a_flow_whose_grant_was_taken_away_is_cut_however_the_client_addresses_it \
+            platform::linux::nftables::tests::kernel_a_mapped_service_is_reached_through_the_carry_interface_too \
+            platform::linux::nftables::tests::kernel_a_flow_whose_grant_was_taken_away_is_cut_however_the_client_addresses_it \
             --nocapture
 
   # Known advisories against Cargo.lock. .cargo/audit.toml lists the ones

@@ -117,7 +117,9 @@ pub mod firewall {
         Ok(())
     }
 
-    pub fn remove_leftover(_name: &str) {}
+    pub fn remove_leftover(_name: &str, remove_interface: impl FnOnce() -> bool) {
+        remove_interface();
+    }
 
     pub fn remove_leftover_carry(_main: &str, _private_key: &str) {}
 }

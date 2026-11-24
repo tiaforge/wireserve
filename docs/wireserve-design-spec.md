@@ -391,7 +391,7 @@ struct ServiceRule {
   implementing the same trait — backend swap only, no change to the sync
   logic that calls `apply()`. A Windows node carries nobody's traffic, so
   its ruleset is the default-deny and its services' permits; nothing on it
-  rewrites a port (PLAN.md M50, M51).
+  rewrites a port (PLAN.md M51, M52).
 - **Startup ordering**: `teardown()`-then-deny-all must run *before* the
   first successful `apply()` — the interface should never come up
   permissive-by-default while waiting on the first poll response.
@@ -756,8 +756,8 @@ What it does, end to end:
 
 ## Open items intentionally deferred (not v1)
 
-- BSD firewall backend (trait exists; Windows has one since PLAN.md M50,
-  serving since M51)
+- BSD firewall backend (trait exists; Windows has one since PLAN.md M51,
+  serving since M52)
 - Multi-tenant coordinator, web UI
 - OIDC-backed admin auth with per-admin attribution (through the
   coordinator's own identity provider client, revisited later) — v1 uses a

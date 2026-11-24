@@ -5791,7 +5791,8 @@ user is marked so. What was found and left is #373.
     secrets. The Quadlet unit names its container `wireserve-coordinator`, as
     the docs' command has it. `run-e2e-test.sh` no longer passes a token in,
     so the main suite's every admin command goes this way.
-## M50 — Windows nodes
+
+## M51 — Windows nodes
 
 A Windows 10/11 computer joins as a node that uses the mesh and serves
 nothing: peers, `<service>.wg` names, routes to peers and service addresses,
@@ -5804,7 +5805,7 @@ against a real coordinator: joined, reached a Linux node's services by
 name, a Linux peer's connection to the Windows node timed out, restart and
 `leave` clean.
 
-347. **Our own wireguard-nt binding** (`wg/nt.rs`). defguard's Windows
+376. **Our own wireguard-nt binding** (`wg/nt.rs`). defguard's Windows
     backend makes `configure_peer` and `remove_peer` no-ops, loads
     `wireguard.dll` from a path relative to the working directory (a
     service's is `System32`; a planted DLL would be loaded), panics without
@@ -5824,7 +5825,7 @@ name, a Linux peer's connection to the Windows node timed out, restart and
     than adopt it (a handle opened on it went dead under the next run), and
     `remove_interface` waits until it is gone.
 
-348. **The driver is shared, so its ABI is the newest one installed.**
+377. **The driver is shared, so its ABI is the newest one installed.**
     Driver runs dropped allowed IPs at random. Two things together:
     `ConfigBuf` copied the FFI structs out as whole words, implicit padding
     and all (uninitialized memory), and the host's driver was 1.1 —
@@ -5837,7 +5838,7 @@ name, a Linux peer's connection to the Windows node timed out, restart and
     signature checked, used by CI and the release alike). Moving to a newer
     wireguard-nt starts with diffing its header against `nt.rs`.
 
-349. **WFP, not Windows Defender Firewall rules** (`firewall/wfp.rs`).
+378. **WFP, not Windows Defender Firewall rules** (`firewall/wfp.rs`).
     Hard blocks (`FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT`) at
     `ALE_AUTH_RECV_ACCEPT_V4/V6`, in a sublayer of ours at the highest
     weight: no other WFP client — Defender, or the antivirus that replaced
@@ -5850,7 +5851,7 @@ name, a Linux peer's connection to the Windows node timed out, restart and
     it is up; loopback is exempt, as the Linux table matches on the
     interface name. Replies need no rule: ALE only classifies a flow's
     first packet. The session is dynamic, so the filters go with the
-    process — as the adapter does (#347), leaving nothing to guard. A
+    process — as the adapter does (#376), leaving nothing to guard. A
     shared sublayer was wrong: what a dynamic session adds only it may use
     (`FWP_E_WRONG_SESSION`), so a second instance could not use the first's.
     The sublayer is now per interface name. What the tests can't show on
@@ -5858,7 +5859,7 @@ name, a Linux peer's connection to the Windows node timed out, restart and
     through loopback — the real-mesh test did: a Linux peer's connection
     timed out.
 
-350. **Access control where Linux has modes and sockets.** The state
+379. **Access control where Linux has modes and sockets.** The state
     directory gets a protected ACL (SYSTEM, Administrators, owner) and is
     refused when owned by anyone else: any user can create a folder in
     ProgramData, and its owner can always rewrite its ACL, so a
@@ -5873,7 +5874,7 @@ name, a Linux peer's connection to the Windows node timed out, restart and
     `drivers\etc`, where only administrators create files; it stays
     behind.
 
-351. **The service through `windows-sys`, not a crate.** About 300 lines
+380. **The service through `windows-sys`, not a crate.** About 300 lines
     of Service Control Manager calls (`winservice.rs`), against a new
     dependency. `main` builds its runtime itself so `daemon --service` can
     hand the process to the SCM first; a stop or shutdown wakes the same
@@ -5883,19 +5884,19 @@ name, a Linux peer's connection to the Windows node timed out, restart and
     with no identity it would only fail. The log is a file in the private
     state directory, rolled at 10 MiB.
 
-352. **Refused at the connection, not the command.** A Windows daemon
+381. **Refused at the connection, not the command.** A Windows daemon
     refuses service declarations, transit and exit on its IPC connections
     (`refused_here`), so nothing reaches its state however it is asked;
     turning them off is still accepted. Tests call `dispatch` directly and
     keep running on Windows.
 
-353. **Left for later:** Authenticode-signing `wireserve.exe` (no
+382. **Left for later:** Authenticode-signing `wireserve.exe` (no
     certificate yet; SmartScreen warns on an unsigned download); an
-    aarch64 build (wireguard-nt ships an arm64 DLL). Serving came in M51,
+    aarch64 build (wireguard-nt ships an arm64 DLL). Serving came in M52,
     but for the address rewrites nftables does, which WFP has no plain
     counterpart for.
 
-354. **`Path` and the `wireserve` group** (2026-10-18). `install` appends
+383. **`Path` and the `wireserve` group** (2026-10-18). `install` appends
     `%ProgramFiles%\wireserve` to the system `Path` in the registry
     (`winpath.rs`), kept unexpanded and of its stored type, last so it
     shadows nothing, and broadcasts the change; `leave` leaves it, as it
@@ -5914,7 +5915,7 @@ name, a Linux peer's connection to the Windows node timed out, restart and
     exactly those rights (`CreateFileW` itself; tokio's `ClientOptions`
     asks for `GENERIC_WRITE`), still at identification level.
 
-## M51 — Windows nodes serve
+## M52 — Windows nodes serve
 
 A Windows node publishes services, with the TLS terminator, as a Linux one
 does, for everything that needs no rewrite: a port published as itself, and
@@ -5931,7 +5932,7 @@ Let's Encrypt certificate it got over DNS-01 as its own account; a second
 process could not bind a held 443, and one that took 443 while the
 terminator was stopped, its permit still in place, was not reached.
 
-355. **No rewrite, so the service address is the host's.** nftables
+384. **No rewrite, so the service address is the host's.** nftables
     rewrites `vip:PUBLIC` to `node:TARGET` before conntrack; WFP rewrites
     nothing without a kernel driver of our own (its redirect layers are
     callout-only). So each own service's address is added to the mesh
@@ -5944,7 +5945,7 @@ terminator was stopped, its permit still in place, was not reached.
     nothing is swept at start. `serve` refuses what would need a rewrite
     (`unsupported_on_windows`), and the firewall backend skips it again.
 
-356. **Permits in our sublayer, above our blocks.** One hard permit per
+385. **Permits in our sublayer, above our blocks.** One hard permit per
     service port at `ALE_AUTH_RECV_ACCEPT_V4`: the adapter's LUID, the
     service address, the port, the protocol, and the grants' sources as
     OR'ed remote-address conditions (an empty list: no permit). Weight
@@ -5954,7 +5955,7 @@ terminator was stopped, its permit still in place, was not reached.
     blocks do not veto: a backend Defender had an explicit block rule for,
     on a Public network, was reached — so `install` adds no Defender rule.
 
-357. **The terminator answers its ports itself, and only it.** Linux
+386. **The terminator answers its ports itself, and only it.** Linux
     rewrites 443 and 80 onto the terminator's one socket on every address,
     held by systemd. Here the terminator binds each service address's 443
     and 80 itself (`serve::Addresses`, fed into one accept loop through
@@ -5966,7 +5967,7 @@ terminator was stopped, its permit still in place, was not reached.
     got there first, or after a crash, is not let in. The check-in reports
     port 443 and 80, so the agent's `Terminated` rules need no change.
 
-358. **The terminator as a virtual account.** `wireserve-tls[-<name>]`, a
+387. **The terminator as a virtual account.** `wireserve-tls[-<name>]`, a
     second service running `tls-daemon --service` as `NT SERVICE\<it>`,
     unrestricted service SID: the separate user it is on Linux, with no
     password and nothing of the agent's. Its state directory,
@@ -5975,12 +5976,12 @@ terminator was stopped, its permit still in place, was not reached.
     (`winsec::ensure_private_dir_for`); the TLS crate's `0600` and `0700`
     are Unix-only, the ACL doing their work. Its log is in that directory,
     as the agent's is in its own. Its pipe is shared with that account,
-    reading and writing only, as the `wireserve` group's is (#354).
+    reading and writing only, as the `wireserve` group's is (#383).
     `install` makes it before the agent starts — the agent looks the
     account up once — and `leave` deletes it with the agent's; an upgrade
     stops terminators before agents and starts them after.
 
-359. **The terminator checks who made its pipe.** Any user may create a
+388. **The terminator checks who made its pipe.** Any user may create a
     pipe of a free name, and one made before the agent (at boot) would be
     handed every sign-in ticket and session the terminator passes on. So
     the link reads the pipe's owner and refuses any but SYSTEM or
@@ -5988,7 +5989,7 @@ terminator was stopped, its permit still in place, was not reached.
     The TLS crate's tests stay Unix-only: their stand-in agent is a Unix
     socket, and one on Windows would have to be made by an administrator.
 
-360. **A failed upgrade starts again what it stopped.** The first upgrade on
+389. **A failed upgrade starts again what it stopped.** The first upgrade on
     the test machine stopped every service, replaced `wireserve.exe`, then
     failed to replace `wireguard.dll` (a stopped service's process still
     held it) and returned with nothing running: the node was offline until
@@ -5997,10 +5998,10 @@ terminator was stopped, its permit still in place, was not reached.
     not replaced at all, and a replace is retried for ten seconds.
     Seen there too and left for later: every restart flips the adapter's
     name between `wireserve0` and `wireserve1` (the old one is still being
-    removed, #347), and a 443 that gives way to a plain mapping warns on
+    removed, #376), and a 443 that gives way to a plain mapping warns on
     every poll, as on Linux.
 
-361. **Platform code in one place** (2026-10-18). Everything that differs
+390. **Platform code in one place** (2026-10-18). Everything that differs
     between operating systems lives under `platform/` in the agent
     (`platform::unix`, `platform::linux`, `platform::windows`, and
     `fallback` for what a platform has nothing to do about), and under
@@ -6024,11 +6025,11 @@ terminator was stopped, its permit still in place, was not reached.
     claimed to work.
 
 
-362. **Security review of the Windows branch** (2026-11-24). Five
+391. **Security review of the Windows branch** (2026-11-24). Five
     findings, each closed here:
-    - *The default-deny went before the adapter.* #349's reasoning, that
+    - *The default-deny went before the adapter.* #378's reasoning, that
       the dynamic session's filters go with the process as the adapter
-      does, missed that the adapter goes seconds later (#347), service
+      does, missed that the adapter goes seconds later (#376), service
       addresses and all, and that a clean stop removes the firewall
       first and then waits up to 5 s for it. The blocks that need no
       adapter are now persistent WFP objects, kept for as long as the
@@ -6042,7 +6043,7 @@ terminator was stopped, its permit still in place, was not reached.
       interface but loopback and our own adapters, is left out with a
       warning: a lasting block on it would cut that network off — another
       VPN's too (the default range is in `100.64.0.0/10`, Tailscale's). One persistent
-      sublayer for every instance replaces #349's per-interface dynamic
+      sublayer for every instance replaces #378's per-interface dynamic
       one: any session may add to a persistent sublayer, and within one
       sublayer the weights decide, so an instance's dynamic permits
       outweigh every instance's blocks — two instances in one mesh have
@@ -6076,10 +6077,10 @@ terminator was stopped, its permit still in place, was not reached.
       and fails if it cannot.
     - *The CLI did not check who made the daemon's pipe.* It now refuses
       one not owned by SYSTEM, Administrators or its own user, as the
-      terminator does its link (#359); the own user is what an
+      terminator does its link (#388); the own user is what an
       unelevated test's daemon is, and could only deceive itself.
     Also: publishing a port opens it past the host firewall's own block
-    rules for that port (#356), which `docs/windows.md` now says where
+    rules for that port (#385), which `docs/windows.md` now says where
     serving is described. Not tested on Windows yet: the WFP layer and
     condition choices (forwarding layers, persistent objects from a
     non-dynamic session beside the dynamic one, a dynamic filter in a
@@ -6087,17 +6088,17 @@ terminator was stopped, its permit still in place, was not reached.
     type-checked, and the elevated kernel test covers them on the next
     Windows run.
 
-363. **Remapping a port on Windows is declined, not postponed**
-    (2026-11-24, with the user). M51 left "how to rewrite a port" for
+392. **Remapping a port on Windows is declined, not postponed**
+    (2026-11-24, with the user). M52 left "how to rewrite a port" for
     later; later is now never, as things stand. Every service has an
     address of its own, so a remap resolves no collision on Windows: it
     saves changing the port a backend binds, and 80 and 443 onto any port
     already work through the terminator. Each way to do it costs more
     than that. On the node: a userspace WireGuard (GotaTun or boringtun,
     with Wintun) rewrites in the agent and gives up the kernel path and
-    #347's binding; a WFP callout driver of our own needs a signing
+    #376's binding; a WFP callout driver of our own needs a signing
     certificate and kernel code; WinDivert, WinpkFilter and eBPF were
-    refused in M51, a proxy loses the client's address, and so does
+    refused in M52, a proxy loses the client's address, and so does
     `netsh portproxy`; WinNAT needs Hyper-V's networking and fights
     Docker and WSL. At the sender: nftables on Linux peers and phone
     relays, a loopback shim on Windows senders — the client's address
@@ -6108,7 +6109,7 @@ terminator was stopped, its permit still in place, was not reached.
     exit or a target on another address on Windows, which need a
     datapath on the node anyway — the remap would come with it.
 
-364. **What the pass on a real machine found** (2026-11-24). #362's
+393. **What the pass on a real machine found** (2026-11-24). #391's
     fixes ran on Windows 11 against the real mesh: the elevated tests
     under `WIRESERVE_TEST_STRICT`, an upgrade of a joined node, and its
     agent killed (`taskkill /F`) — the lasting blocks stayed through the
@@ -6127,5 +6128,26 @@ terminator was stopped, its permit still in place, was not reached.
     Left as it is, with the user (2026-11-24), and said in
     `docs/windows.md`: a plain port's permit matches whichever program
     listens on it, where 443 and 80 match the terminator's account
-    (#357). An option naming the account a port is for would close it; a
+    (#386). An option naming the account a port is for would close it; a
     preview does not need it.
+
+394. **Onto the release review** (2026-11-24). Main had moved on by M50
+    (the reflexive probe) and the release review (#357–#375) while this
+    was written, so these two milestones are M51 and M52 and their
+    items #376–#393, here and wherever the code names them. What the
+    review added meets the platform layer where the two touched:
+    `firewall::guarded_tear_down` (the release review's order, the interface before its
+    table) is what a Windows stop runs too — the adapter goes, then the
+    permits, the blocks staying as #391 has it — and
+    `platform::firewall::remove_leftover` takes the removal of the
+    interface as a closure so each platform keeps that order.
+    `WgInterface::check` asks `platform::routes` for the interface's
+    index, its routes and whether it is up; on Windows an adapter is up
+    for as long as its handle is held, and its routes are read with
+    `GetIpForwardTable2`. The certificate store's `sync_dir` is the
+    platform's: a directory does not open as a file on Windows. A node
+    that narrows what it offers while the coordinator is away keeps, on
+    Windows, the address of every service it still offers, not only the
+    terminated ones. CI's root-only tests are named by their new path,
+    `platform::linux::nftables::tests::…`: under `--exact` the old one
+    matched nothing, and had since #390.
