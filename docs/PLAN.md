@@ -6124,3 +6124,8 @@ terminator was stopped, its permit still in place, was not reached.
     one left in the program folder. Cargo 1.100 builds test binaries
     outside `target\debug\deps`, where CI put `wireguard.dll`:
     `deploy/windows/beside-tests.ps1` asks cargo where they are.
+    Left as it is, with the user (2026-11-24), and said in
+    `docs/windows.md`: a plain port's permit matches whichever program
+    listens on it, where 443 and 80 match the terminator's account
+    (#357). An option naming the account a port is for would close it; a
+    preview does not need it.
