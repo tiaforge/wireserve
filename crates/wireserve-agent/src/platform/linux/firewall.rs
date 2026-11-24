@@ -50,17 +50,19 @@ pub fn after_bring_up(_fw: &mut Backend) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The firewall state an interface left behind under another name (see
-/// `remove_leftover_interfaces`): its interop openings and its table.
-pub fn remove_leftover(name: &str) {
+/// Removes an interface left behind under another name (see
+/// `remove_leftover_interfaces`) with its firewall state, in the order a
+/// stop uses (`firewall::guarded_tear_down`): its interop openings close,
+/// `remove_interface` takes the interface away — still up with its peers
+/// until then — and only then its table goes. An interface that could not
+/// be removed (`false`) keeps its table.
+pub fn remove_leftover(name: &str, remove_interface: impl FnOnce() -> bool) {
     host_interop::remove_for(name);
-    match NftablesBackend::new(name.to_string()) {
-        Ok(mut fw) => {
-            if let Err(e) = fw.teardown() {
-                tracing::warn!(ifname = %name, error = %e, "could not remove its firewall table");
-            }
-        }
-        Err(e) => tracing::warn!(ifname = %name, error = %e, "could not remove its firewall table"),
+    if !remove_interface() {
+        return;
+    }
+    if let Err(e) = NftablesBackend::new(name.to_string()).and_then(|mut fw| fw.teardown()) {
+        tracing::warn!(ifname = %name, error = %e, "could not remove its firewall table");
     }
 }
 
@@ -74,16 +76,15 @@ pub fn remove_leftover_carry(main: &str, private_key: &str) {
     if carry.classify(private_key) != Slot::Ours {
         return;
     }
+    // The interface before its table, as for the mesh interface's.
     host_interop::remove_for(&name);
-    // The mesh interface's table is gone already; removing it again is
-    // a no-op, and this is the one call that knows both.
-    if let Ok(fw) = NftablesBackend::new(main.to_string()) {
-        let mut fw = fw.with_carry(Some(name.clone()));
-        if let Err(e) = fw.teardown() {
-            tracing::warn!(ifname = %name, error = %e, "could not remove its firewall table");
-        }
-    }
     if let Err(e) = super::routes::delete_link(&name) {
-        tracing::warn!(ifname = %name, error = %e, "could not remove a leftover carry interface");
+        tracing::warn!(ifname = %name, error = %e, "could not remove a leftover carry interface; keeping its firewall table");
+        return;
+    }
+    // Only the carry's own table: the mesh interface's is gone already, or
+    // was kept because the mesh interface could not be removed.
+    if let Err(e) = NftablesBackend::new(name.clone()).and_then(|mut fw| fw.teardown()) {
+        tracing::warn!(ifname = %name, error = %e, "could not remove its firewall table");
     }
 }

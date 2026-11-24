@@ -1,4 +1,4 @@
-//! `install` on Windows (PLAN.md M50, M51): the files, the services, the
+//! `install` on Windows (PLAN.md M51, M52): the files, the services, the
 //! group and the `Path`.
 
 use std::time::Duration;
@@ -130,7 +130,7 @@ where
     };
     let name = winservice::service_name(instance);
     winservice::install(&name, instance, &exe)?;
-    // The TLS terminator (PLAN.md M51), under an account of its own whose
+    // The TLS terminator (PLAN.md M52), under an account of its own whose
     // state directory only it and administrators may read. Before the
     // agent starts: the agent looks its account up once, at start.
     let tls_name = winservice::tls_service_name(instance);
@@ -138,7 +138,7 @@ where
     let tls_account = super::security::service_sid(&tls_name)?
         .ok_or_else(|| format!("the {tls_name} service was created, but Windows knows no account NT SERVICE\\{tls_name}"))?;
     // A named instance's folder is inside the default instance's: the
-    // default terminator keeps its access to that one (PLAN.md #362).
+    // default terminator keeps its access to that one (PLAN.md #391).
     let default_tls_account = if instance.is_default() {
         None
     } else {
@@ -208,7 +208,7 @@ fn install_files() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     for (from, file) in [(&current, "wireserve.exe"), (&dll, "wireguard.dll")] {
         let to = dir.join(file);
         // What an `install` that was interrupted, or one from before
-        // replaces were retried (PLAN.md #360), left beside it.
+        // replaces were retried (PLAN.md #389), left beside it.
         let tmp = dir.join(format!(".{file}.tmp"));
         let _ = std::fs::remove_file(&tmp);
         if to.canonicalize().is_ok_and(|t| t == *from) {

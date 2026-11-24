@@ -1,4 +1,4 @@
-//! Windows (see [`crate::platform`]; PLAN.md M50, M51).
+//! Windows (see [`crate::platform`]; PLAN.md M51, M52).
 
 pub mod capabilities;
 pub mod claim;

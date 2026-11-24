@@ -185,6 +185,7 @@ fn phone_relay_ports(base: u16) -> Option<(u16, u16)> {
 
 /// The reflexive responder's transparent socket (PLAN.md M50): the port
 /// after the phone relay's two.
+#[cfg(target_os = "linux")]
 fn reflexive_divert_port(base: u16) -> Option<u16> {
     base.checked_add(wireserve_types::RELAY_SLOTS)?.checked_add(2)
 }
@@ -761,7 +762,7 @@ pub struct PollContext<'a, F: FirewallBackend> {
 /// The service addresses the host must receive on itself (PLAN.md M33): on
 /// Linux those its terminator answers, which a rewrite sends to the host's
 /// own sockets; everything else is rewritten onto the node's address. On
-/// Windows (PLAN.md M51) every one of its services' addresses: nothing
+/// Windows (PLAN.md M52) every one of its services' addresses: nothing
 /// rewrites them, so whatever answers one receives it unchanged — and the
 /// terminator binds an address before it says it serves it.
 fn host_addresses_wanted(
@@ -942,7 +943,8 @@ where
                 .iter()
                 .filter_map(|(_, r)| match r {
                     ServiceRule::Terminated { vip, .. } => Some(*vip),
-                    ServiceRule::Mapped { .. } => None,
+                    // Where every service's address is the host's own.
+                    ServiceRule::Mapped { vip, .. } => crate::platform::host_addresses::EVERY_SERVICE.then_some(*vip),
                 })
                 .collect();
             if now.forwarding.relay.is_empty() && !forwards_services && now.forwarding.exit.is_empty() {
@@ -951,7 +953,7 @@ where
             if let (Some(carry), false) = (&carry_name, forwards_services) {
                 crate::firewall::ip_forward::set_enabled(carry, false);
             }
-            sync_local_routes(&routes_before, &routes_before.intersection(&wanted).copied().collect(), node_ip)
+            crate::platform::host_addresses::sync(&routes_before, &routes_before.intersection(&wanted).copied().collect(), node_ip, &ifname)
         } else {
             routes_before.clone()
         };
@@ -1204,7 +1206,7 @@ where
     let term = Terminator { tls: terminating_here(node_ip, &directory, &serving), tls_port, http, http_port };
     state.lock().await.http_answered.clone_from(&term.http);
     let rules = service_rules(&declared, node_ip, &directory, &directory.access, mesh_ranges.as_ref(), &term);
-    // The addresses the host must receive on (PLAN.md M33, M51): routed to
+    // The addresses the host must receive on (PLAN.md M33, M52): routed to
     // it, or on Windows given to the mesh adapter, so they arrive at its
     // sockets rather than looping back into the mesh interface.
     let local_routes_wanted = host_addresses_wanted(&rules, &declared, node_ip, &directory);
@@ -1705,7 +1707,7 @@ mod tests {
 
     /// Which service addresses the host receives on itself: on Linux the
     /// terminated ones, the rest being rewritten onto the node's address;
-    /// on Windows (PLAN.md M51) every one, nothing rewriting them.
+    /// on Windows (PLAN.md M52) every one, nothing rewriting them.
     #[test]
     fn the_host_receives_on_the_terminated_addresses_or_on_windows_on_all() {
         let other = Ipv4Addr::new(10, 9, 0, 51);

@@ -62,7 +62,7 @@ libc = "0.2"
 # version defguard_boringtun (through defguard_wireguard_rs) already uses.
 blake2 = { version = "0.11", default-features = false }
 # The versions defguard_wireguard_rs uses, for our own route handling (see
-# wireserve-agent/src/routes.rs); keep in step with it.
+# wireserve-agent/src/platform/linux/routes.rs); keep in step with it.
 netlink-packet-core = "0.9"
 netlink-packet-route = "0.33"
 netlink-sys = "0.9"

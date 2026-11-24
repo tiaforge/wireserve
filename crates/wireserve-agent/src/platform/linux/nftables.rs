@@ -2022,10 +2022,10 @@ mod tests {
                          nft add chain inet wireserve.wg0 stale\n\
                          nft add set inet wireserve.wg0c stale '{ type ipv4_addr; }'\n";
         let replaced = nft_script(&[previous]) + leftovers + &nft_script(std::slice::from_ref(&startup)) + "nft list ruleset";
-        let Some(replaced) = crate::firewall::netns::run(&replaced) else {
+        let Some(replaced) = crate::platform::linux::netns::run(&replaced) else {
             return;
         };
-        let Some(fresh) = crate::firewall::netns::run(&(nft_script(&[startup]) + "nft list ruleset")) else {
+        let Some(fresh) = crate::platform::linux::netns::run(&(nft_script(&[startup]) + "nft list ruleset")) else {
             return;
         };
         assert!(fresh.contains("table inet wireserve.wg0c"), "{fresh}");
@@ -2069,7 +2069,7 @@ mod tests {
         let forwarding =
             Forwarding { reflexive: Some(ReflexiveRules { listen_port: 51820, divert_port: 42002 }), ..Forwarding::default() };
         let script = nft_script(&[apply_batch("wg0", &[], &forwarding)]) + "nft list table inet wireserve.wg0";
-        let Some(listing) = crate::firewall::netns::run(&script) else {
+        let Some(listing) = crate::platform::linux::netns::run(&script) else {
             return;
         };
         let lines = normalised_lines(&listing);
@@ -2579,8 +2579,8 @@ d, a = s.recvfrom(4); s.sendto(d, a)"
     /// Needs real root, like the carry interface's test above.
     #[test]
     fn kernel_a_flow_whose_grant_was_taken_away_is_cut_however_the_client_addresses_it() {
-        if !crate::firewall::netns::reexec(
-            "firewall::nftables::tests::kernel_a_flow_whose_grant_was_taken_away_is_cut_however_the_client_addresses_it",
+        if !crate::platform::linux::netns::reexec(
+            "platform::linux::nftables::tests::kernel_a_flow_whose_grant_was_taken_away_is_cut_however_the_client_addresses_it",
         ) {
             return;
         }
@@ -2625,7 +2625,7 @@ d, a = s.recvfrom(4); s.sendto(d, a)"
             }
         };
         let out = sh(&nft_script(&[apply_batch("wg0", &rules(&["100.90.0.7"]), &forwarding)]));
-        if !crate::firewall::netns::real_root() && String::from_utf8_lossy(&out.stderr).contains("Operation not permitted") {
+        if !crate::platform::linux::netns::real_root() && String::from_utf8_lossy(&out.stderr).contains("Operation not permitted") {
             eprintln!("SKIPPED: the address rewrites need real root (run the test binary under sudo)");
             stop(hosts);
             return;
@@ -2736,7 +2736,7 @@ d, a = s.recvfrom(4); s.sendto(d, a)"
     /// namespace with two mesh addresses, each connection bound to one.
     #[test]
     fn kernel_an_exit_cuts_a_flow_once_the_device_is_no_longer_its_client() {
-        if !crate::firewall::netns::reexec("firewall::nftables::tests::kernel_an_exit_cuts_a_flow_once_the_device_is_no_longer_its_client") {
+        if !crate::platform::linux::netns::reexec("platform::linux::nftables::tests::kernel_an_exit_cuts_a_flow_once_the_device_is_no_longer_its_client") {
             return;
         }
         let mut hosts = Vec::new();

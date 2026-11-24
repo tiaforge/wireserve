@@ -1536,7 +1536,7 @@ impl WgInterface {
         // What `check` compares against from now on: the kernel's own
         // account, whose key comes back clamped (see `clamp_private_key`).
         let host = self.api.read_interface_data()?;
-        self.created = match (crate::routes::interface_index(&self.ifname), host.private_key) {
+        self.created = match (crate::platform::routes::interface_index(&self.ifname), host.private_key) {
             (Ok(index), Some(private_key)) => Some(Created { index, private_key, listen_port: host.listen_port }),
             (found, _) => {
                 tracing::warn!(ifname = %self.ifname, error = ?found.err(), "could not record the interface just brought up; it will not be checked");
@@ -1569,7 +1569,7 @@ impl WgInterface {
             return Ok(());
         };
         let lost = |reason| InterfaceLost { ifname: self.ifname.clone(), reason };
-        match index_verdict(crate::routes::interface_index(&self.ifname), created.index) {
+        match index_verdict(crate::platform::routes::interface_index(&self.ifname), created.index) {
             Verdict::Same => {}
             Verdict::Lost(reason) => return Err(lost(reason)),
             Verdict::Unknown(e) => {
@@ -1586,11 +1586,11 @@ impl WgInterface {
                 return Ok(());
             }
         }
-        match crate::routes::link_is_up(created.index) {
+        match crate::platform::routes::link_is_up(created.index) {
             Ok(true) => {}
             Ok(false) => {
                 tracing::warn!(ifname = %self.ifname, "the WireGuard interface was set down; setting it up again");
-                if let Err(e) = crate::routes::set_link_up(created.index) {
+                if let Err(e) = crate::platform::routes::set_link_up(created.index) {
                     tracing::warn!(ifname = %self.ifname, error = %e, "could not set the WireGuard interface up");
                 }
             }
@@ -1607,7 +1607,7 @@ impl WgInterface {
         if self.routed.is_empty() && self.carry.as_ref().is_none_or(|c| c.routed.is_empty()) {
             return;
         }
-        let present = match crate::routes::host_routes() {
+        let present = match crate::platform::routes::host_routes() {
             Ok(present) => present,
             Err(e) => {
                 tracing::debug!(ifname = %self.ifname, error = %e, "could not list the host's routes");
@@ -1622,12 +1622,12 @@ impl WgInterface {
         tracing::warn!(ifname = %self.ifname, "peer routes went missing from the kernel; adding them back");
         let mut sets = Vec::new();
         if main {
-            sets.push(crate::routes::RouteSet { ifname: &self.ifname, old: &self.routed, new: &self.routed, prefsrc: None });
+            sets.push(crate::platform::routes::RouteSet { ifname: &self.ifname, old: &self.routed, new: &self.routed, prefsrc: None });
         }
         if let Some(c) = carry {
-            sets.push(crate::routes::RouteSet { ifname: &c.ifname, old: &c.routed, new: &c.routed, prefsrc: Some(c.src) });
+            sets.push(crate::platform::routes::RouteSet { ifname: &c.ifname, old: &c.routed, new: &c.routed, prefsrc: Some(c.src) });
         }
-        if let Err(e) = crate::routes::sync_all(&sets) {
+        if let Err(e) = crate::platform::routes::sync_all(&sets) {
             tracing::warn!(ifname = %self.ifname, error = %e, "peer routes are incomplete");
         }
     }
@@ -1760,7 +1760,17 @@ impl WgInterface {
         // The carry interface first, and whatever happens to it the mesh
         // interface still goes.
         let carry = self.carry.take().map(|c| crate::platform::wg::release_carry(c.api, &c.ifname));
-        crate::platform::wg::remove_interface(&mut self.api, &self.ifname)?;
+        // Never an interface this daemon did not make: once its own is gone
+        // (see `check`), the name may already belong to someone else's.
+        let replaced = self
+            .created
+            .take()
+            .is_some_and(|c| crate::platform::routes::interface_index(&self.ifname).is_ok_and(|index| index != c.index));
+        if replaced {
+            tracing::warn!(ifname = %self.ifname, "not removing the interface now under this name: it is not the one this agent made");
+        } else {
+            crate::platform::wg::remove_interface(&mut self.api, &self.ifname)?;
+        }
         self.applied.clear();
         self.routed.clear();
         carry.transpose()?;
@@ -3186,7 +3196,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn kernel_check_restores_a_downed_interface_and_finds_a_deleted_or_replaced_one_lost() {
-        if !crate::firewall::netns::reexec(
+        if !crate::platform::linux::netns::reexec(
             "wg::tests::kernel_check_restores_a_downed_interface_and_finds_a_deleted_or_replaced_one_lost",
         ) {
             return;

@@ -699,7 +699,7 @@ mod tests {
 
         let (phone, minipc, carrier) = (End::new(1), End::new(2), End::new(4));
         let mut fw = crate::platform::linux::nftables::NftablesBackend::new("wg0").unwrap();
-        let rules = PhoneRelayRules { listen_port: 51820, divert_port: 42000, mesh_port: 42001, indexes: Vec::new() };
+        let rules = PhoneRelayRules { listen_port: 51820, divert_port: 42000, mesh_port: 42001, pool: Some(42003..=42066), indexes: Vec::new() };
         let forwarding = Forwarding {
             relay_self: Some("100.90.0.2".parse().unwrap()),
             relay_ends: vec![51820],

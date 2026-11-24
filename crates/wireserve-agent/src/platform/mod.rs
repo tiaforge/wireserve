@@ -8,7 +8,7 @@
 //! - [`linux`]: what only Linux has — nftables and the host-firewall
 //!   interop, netlink routes, per-interface forwarding;
 //! - [`windows`]: the Windows Filtering Platform, wireguard-nt, the Service
-//!   Control Manager, named pipes and ACLs (PLAN.md M50, M51);
+//!   Control Manager, named pipes and ACLs (PLAN.md M51, M52);
 //! - `fallback`: stand-ins where a platform has nothing to do.
 //!
 //! This is the one module that chooses between them; below, each name is

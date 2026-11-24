@@ -163,12 +163,16 @@ fn build_list_view(ctx: &AgentContext, state: &AgentState) -> ListView {
 /// answer that on the last cycle (PLAN.md #328). Never one for people only
 /// (PLAN.md #326): its 80 is closed then, not passed on (`service_rules`).
 fn unguarded(state: &AgentState, name: &str) -> bool {
+    let for_people = state.own_access.iter().any(|a| a.name == name && a.always_sign_in);
     // Where nothing rewrites ports (Windows), a remapped 80 the terminator
-    // does not answer is closed, not unguarded (PLAN.md M51).
+    // does not answer is closed, not unguarded (PLAN.md M52).
     let reaches_backend = |m: &wireserve_types::PortMap| {
         wireserve_types::is_http_map(m) && (crate::platform::capabilities::REWRITES_PORTS || m.public == m.target)
     };
-    state.declared_services.iter().any(|d| d.name == name && d.ports.iter().any(reaches_backend))
+    state
+        .declared_services
+        .iter()
+        .any(|d| d.name == name && !d.always_sign_in && !for_people && d.ports.iter().any(reaches_backend))
         && !state.http_answered.contains(name)
 }
 
@@ -384,10 +388,10 @@ where
 
 /// Why this platform's daemon refuses `req`, if it does (see
 /// `platform::capabilities`). Where nodes carry nobody's traffic (Windows,
-/// PLAN.md M50, #352): no transit or exit — what turns either off is still
+/// PLAN.md M51, #381): no transit or exit — what turns either off is still
 /// accepted, so a state file copied from elsewhere can be undone. Where
 /// nothing rewrites one port to another or forwards elsewhere (Windows,
-/// PLAN.md M51), what would need it (see [`unsupported_on_windows`]).
+/// PLAN.md M52), what would need it (see [`unsupported_on_windows`]).
 fn refused_here(req: &IpcRequest) -> Option<String> {
     use crate::platform::capabilities::{CARRIES_TRAFFIC, REWRITES_PORTS};
     match req {
