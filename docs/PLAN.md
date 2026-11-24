@@ -6086,3 +6086,24 @@ terminator was stopped, its permit still in place, was not reached.
     persistent sublayer) are written to the documentation and
     type-checked, and the elevated kernel test covers them on the next
     Windows run.
+
+363. **Remapping a port on Windows is declined, not postponed**
+    (2026-11-24, with the user). M51 left "how to rewrite a port" for
+    later; later is now never, as things stand. Every service has an
+    address of its own, so a remap resolves no collision on Windows: it
+    saves changing the port a backend binds, and 80 and 443 onto any port
+    already work through the terminator. Each way to do it costs more
+    than that. On the node: a userspace WireGuard (GotaTun or boringtun,
+    with Wintun) rewrites in the agent and gives up the kernel path and
+    #347's binding; a WFP callout driver of our own needs a signing
+    certificate and kernel code; WinDivert, WinpkFilter and eBPF were
+    refused in M51, a proxy loses the client's address, and so does
+    `netsh portproxy`; WinNAT needs Hyper-V's networking and fights
+    Docker and WSL. At the sender: nftables on Linux peers and phone
+    relays, a loopback shim on Windows senders — the client's address
+    kept, no driver, but a Windows quirk in the directory, the protocol
+    and three implementations, and old agents failing silently. So
+    `serve` keeps refusing, and says which port to publish
+    (`unsupported_on_windows`). What would reopen it: wanting transit,
+    exit or a target on another address on Windows, which need a
+    datapath on the node anyway — the remap would come with it.
