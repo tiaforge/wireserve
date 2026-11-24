@@ -33,7 +33,6 @@ cd "$(dirname "$0")/../.."   # repo root
 . deploy/e2e/lib.sh
 
 NET=wireserve-e2e-test
-ADMIN_TOKEN=e2e-test-admin-token
 COORD=wireserve-coord-e2e-test
 AGENT1=wireserve-agent1-e2e-test
 AGENT2=wireserve-agent2-e2e-test
@@ -71,8 +70,10 @@ log "building images"
 
 log "starting coordinator"
 podman network create "$NET" >/dev/null 2>&1 || true
+# No admin token passed in, as docs/coordinator.md runs it: the coordinator
+# generates one into its volume, and every `podman exec ... wireserve-admin`
+# below has to find it there.
 podman run -d --name "$COORD" --network "$NET" \
-    -e WIRESERVE_ADMIN_TOKEN="$ADMIN_TOKEN" \
     -e WIRESERVE_NET_V4_CIDR="$MESH_V4" \
     wireserve-coordinator:e2e >/dev/null
 sleep 1

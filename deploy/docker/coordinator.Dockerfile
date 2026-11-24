@@ -105,6 +105,9 @@ ENV WIRESERVE_ADMIN_LISTEN_ADDR=127.0.0.1:47821
 # a `docker exec` shell without extra flags. Two different URLs, matching
 # the two separately-bound listeners: WIRESERVE_COORDINATOR_URL for
 # /admin/*, WIRESERVE_REGISTER_URL for device create's /register call.
+# The admin token needs nothing here: with none passed in, wireserve-admin
+# reads the generated one from coordinator-secrets.env beside
+# WIRESERVE_DB_PATH, set above.
 ENV WIRESERVE_COORDINATOR_URL=http://127.0.0.1:47821
 ENV WIRESERVE_REGISTER_URL=http://127.0.0.1:47820
 VOLUME ["/var/lib/wireserve"]

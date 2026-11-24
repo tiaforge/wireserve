@@ -319,6 +319,7 @@ fn first_run_banner(generated: &[&str], config: &Config, secrets_path: &std::pat
     }
     if generated.contains(&"WIRESERVE_ADMIN_TOKEN") {
         let _ = writeln!(out, "Read the admin token with:  sudo grep WIRESERVE_ADMIN_TOKEN {path}");
+        let _ = writeln!(out, "In a container nothing needs it: `wireserve-admin` run inside finds it there.");
     }
     let _ = writeln!(
         out,

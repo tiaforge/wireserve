@@ -16,6 +16,9 @@ Wants=network-online.target
 
 [Container]
 Image=localhost/wireserve-coordinator:latest
+# The name the docs' `podman exec wireserve-coordinator wireserve-admin ...`
+# uses; Quadlet's own default would be systemd-wireserve-coordinator.
+ContainerName=wireserve-coordinator
 # Entirely optional — see deploy/env/coordinator.env.example. The admin
 # token and both mesh ranges are auto-generated and persisted into the
 # volume below on first start if you don't set them here.
