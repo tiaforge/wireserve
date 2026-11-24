@@ -363,8 +363,11 @@ log "5b/11: declared --always-sign-in, alice is named and the gate signs in too"
 podman exec "$HOME_AGENT" wireserve jellyfin 443:8096 8920:8920 --always-sign-in
 admin service list --json | jq -e '.services[] | select(.name == "jellyfin")' >/dev/null || fail "jellyfin is gone"
 wait_until "the gate to be asked to sign in" 60 eval 'fetch_from "$GATE" jellyfin | has "^STATUS 302 $PUBLIC/sign-in"'
-admin service list --json | jq -e '.services[] | select(.name == "jellyfin") | .always_sign_in' >/dev/null \
-    || fail "service list does not show jellyfin for people only"
+# Waited for, not read at once: the node holds its own declaration to itself
+# from the moment it is made (PLAN.md #358), so the gate is turned away before
+# the node's next poll has told the coordinator.
+wait_until "service list to show jellyfin for people only" 30 eval \
+    'admin service list --json | jq -e ".services[] | select(.name == \"jellyfin\") | .always_sign_in"'
 OUT=$(browser alice -D - -H 'X-Auth-User: mallory' "https://jellyfin.$DOMAIN/") || true
 echo "$OUT" | sed 's/^/  /'
 echo "$OUT" | has -i '^x-auth-user: alice' || fail "the backend did not get the identity header"
