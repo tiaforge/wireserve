@@ -8,7 +8,7 @@ this checklist lives in the session that created it — this file is the
 source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
-**Currently working on:** the release review of 2026-11-23 (items 357–373,
+**Currently working on:** the release review of 2026-11-23 (items 357–374,
 at the end of this file): what a review of the whole tree found in the way
 of 1.0, fixed on a branch of its own. Its unit tests and the kernel tests
 that need no WireGuard module ran where it was made; CI runs the rest, and
@@ -5652,10 +5652,10 @@ user is marked so. What was found and left is #373.
     check proves nothing, but moves nothing. The cost: a phone that roams
     is answered at its new address after its next handshake — about 15 s
     while it sends data, up to about 145 s or 205 s (who began the keypair)
-    when it only sends keepalives. And `phone-relay` (#343) is now said
-    only while the relay can open its sockets, as `reflexive_answering` is:
-    a carrier without `CAP_NET_RAW`, or whose ports are taken, is no longer
-    given phones it would drop.
+    when it only sends keepalives (#374 takes that wait away). And
+    `phone-relay` (#343) is now said only while the relay can open its
+    sockets, as `reflexive_answering` is: a carrier without `CAP_NET_RAW`,
+    or whose ports are taken, is no longer given phones it would drop.
 
 371. **Sign-in and DNS, the slower failures.** `/oidc/callback` answers a
     flow once and each address only so often (a kept cookie made the
@@ -5725,3 +5725,54 @@ user is marked so. What was found and left is #373.
       never-joined nodes.
     - *Not tried:* the oldest distributions the README names (Ubuntu 22.04's
       nft 1.0.2, RHEL 9); a renewal against a real CA.
+
+374. **Where a relayed phone is, the node says** (decided with the user;
+    replaces the pace of #370 and the rest of #341's roaming). #370 let only
+    the node settle where a session goes, but the one thing of the node's
+    the carrier could see was a handshake answered, so a phone that changed
+    network waited for its next one: 15 s in use, minutes when idle. The
+    node's WireGuard already decides this for itself — it sends to the
+    source of the last packet it authenticated — and could not show it only
+    because the carrier forwarded every phone from one port. So the carrier
+    is now a NAT by phone address: beside its main socket, a pool of 64
+    ports on its mesh address (`base + RELAY_SLOTS + 3` on, left out where
+    it would not fit), each mapped for one node to one phone address and
+    the address that phone dialled. What a phone sends goes to its node
+    from that address's port; what the node sends to a port goes to the
+    address mapped there, and is recorded as the session's and the
+    device's. A phone's first authenticated packet from a new address moves
+    the node's endpoint, and the node's next packet comes back through the
+    new port: roaming as without a carrier. Only carriers change: a relayed
+    node's input rule takes the mesh at its WireGuard port from any source
+    port, and its agent sets no endpoint for a device.
+    - *A port is never another address's while the node may send to it.* A
+      mapping is immutable, is never pushed out to make room, and is
+      forgotten only after 240 s quiet in both directions: a node sends data
+      only under a keypair younger than 180 s, made by a handshake the phone
+      took part in through the port its endpoint then pointed at, so a port
+      it can still address was used within 180 s. A node's own initiation
+      can come at any time later, so it goes to a port's address only where
+      the port carried the device its `mac1` names, and else to the device's
+      last vouched address.
+    - *The main socket is #370 as it was*: for an address its node's pool
+      has no port left for, for a carrier whose pool could not open, and
+      for anything a node sends there. Pending handshakes, the index checks
+      and "nothing a phone sends moves a session" all stand.
+    - *What is left to someone with a node's public key or a live index:*
+      filling that node's pool, so its phones' new addresses fall back to
+      the main socket's pace until the ports go quiet; phones already
+      mapped keep theirs. Nothing can be redirected or dropped. And
+      WireGuard's own limit, with or without a carrier: whoever is on the
+      path and gets a copy of a fresh packet to the node first, from
+      another address, has the endpoint until the phone's next packet.
+    - *After a carrier restart* the mappings start empty while a node's
+      endpoint may still name an old port for up to 180 s; what arrives
+      there is dropped unless a new session happens to have the same index,
+      as on the main socket before. Not closed with a warm-up: it would cost
+      every restart four minutes of the slow pace.
+    - Found by the kernel test: the node's index is now diverted before its
+      response goes on to the phone. The phone's first packet could beat the
+      rule to the carrier's own WireGuard and be dropped there.
+    The kernel test moves the phone mid-session in userspace WireGuard and
+    has a third address replay and forge with the live index; with kernel
+    WireGuard it is `run-phone-relay-test.sh`'s step 7.
