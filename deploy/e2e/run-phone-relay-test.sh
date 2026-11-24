@@ -22,8 +22,10 @@
 #      never saw inside;
 #   6. the phone reaches a service on the carrier itself too, over the same
 #      port, its session there the kernel's own;
-#   7. the phone roams (a new source port) and reaches the node again,
-#      once its next handshake from there has gone through;
+#   7. the phone roams (a new source port) and reaches the node again
+#      within seconds, with no new handshake: the node's WireGuard takes
+#      the phone's first packet from there, and the carrier sends the
+#      node's answers where the node now does;
 #   8. default-deny still holds through the relay;
 #   9. a refresh keeps the phone's address and its carrier.
 #
@@ -330,15 +332,24 @@ podman exec "$PHONE" timeout 30 bash -c "until exec 3<>/dev/tcp/$SVC_HOME/12345;
     || fail "after the refresh the phone no longer reaches svc-home"
 pass "the carrier's own service and homeserver's, both through UDP $WG_PORT"
 
-log "7/9: the phone roams and gets back"
+log "7/9: the phone roams and gets back at once"
+HANDSHAKES=$(podman exec "$PHONE" wg show wg0 latest-handshakes)
 podman exec "$PHONE" wg set wg0 listen-port 51999
-# The carrier answers the phone at its new address only once the node has
-# answered a handshake from there (PLAN.md M49): the phone starts one 15 s
-# after what it sends goes unanswered. Short attempts, so the one after
-# that handshake is not left waiting on a SYN retransmit of an older one.
-podman exec "$PHONE" timeout 60 bash -c "until timeout 5 bash -c 'exec 3<>/dev/tcp/$SVC_HOME/12345'; do sleep 1; done" 2>/dev/null \
-    || fail "after a new source port the phone never reached svc-home again"
-pass "reached again from a new source port, after its next handshake"
+# The carrier sends what the phone sends from its new address to the node
+# from a port of its own, and the node's WireGuard answers there from the
+# first packet it takes, as with no carrier in between (PLAN.md M49): the
+# first connection gets through, at worst after one SYN retransmit. 8 s
+# leaves no room for the old wait for the phone's next handshake, which
+# WireGuard starts only after 15 s of no answer.
+podman exec "$PHONE" timeout 8 bash -c "until timeout 3 bash -c 'exec 3<>/dev/tcp/$SVC_HOME/12345'; do sleep 0.5; done" 2>/dev/null \
+    || {
+        podman exec "$PHONE" wg show wg0
+        podman exec "$CARRIER" grep -iE 'phone|relay' /tmp/daemon.log || true
+        fail "after a new source port the phone did not reach svc-home again within 8 s"
+    }
+[ "$(podman exec "$PHONE" wg show wg0 latest-handshakes)" = "$HANDSHAKES" ] \
+    || note "the phone made a handshake meanwhile (a rekey due anyway, or the old wait)"
+pass "reached again from a new source port within seconds"
 
 log "8/9: default-deny holds through the relay"
 in_netns_bg "$HOME_AGENT" nc -l -k -p 12346
