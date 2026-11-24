@@ -138,8 +138,8 @@ jobs:
       - name: wireguard-nt
         shell: pwsh
         run: |
-          deploy/windows/fetch-wireguard-nt.ps1 target/debug/deps
           deploy/windows/fetch-wireguard-nt.ps1 out
+          deploy/windows/beside-tests.ps1 out/wireguard.dll
       - name: cargo test
         run: cargo test -p wireserve-agent --locked
       - name: cargo build --release

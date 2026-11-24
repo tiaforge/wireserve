@@ -109,7 +109,8 @@ skips otherwise; CI runs it with sudo.
 
 On Windows, `cargo test -p wireserve-agent` runs the agent's tests; the
 ones against the wireguard-nt driver and the filtering engine need an
-elevated terminal and `wireguard.dll` in `target\debug\deps`. Built with
+elevated terminal and `wireguard.dll` beside the test binaries
+(`deploy\windows\beside-tests.ps1 <the DLL>` puts it there). Built with
 cargo-xwin under WSL, the test binary runs from WSL as it is (WSL starts
 Windows executables), but elevated only if WSL itself was started from an
 elevated terminal.
