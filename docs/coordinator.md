@@ -148,7 +148,8 @@ generated into the named volume on first start unless you pass
 also a Quadlet unit in `deploy/` for Podman-under-systemd.
 
 The admin port never leaves the host by design, so admin commands run
-inside the container:
+inside the container, where `wireserve-admin` finds the generated admin
+token in the volume by itself:
 
 ```sh
 podman exec wireserve-coordinator wireserve-admin node list

@@ -8,7 +8,7 @@ this checklist lives in the session that created it — this file is the
 source of truth for *current status*, the spec is the source of truth for
 *requirements*.
 
-**Currently working on:** the release review of 2026-11-23 (items 357–374,
+**Currently working on:** the release review of 2026-11-23 (items 357–375,
 at the end of this file): what a review of the whole tree found in the way
 of 1.0, fixed on a branch of its own. Its unit tests and the kernel tests
 that need no WireGuard module ran where it was made; CI runs the rest, and
@@ -5713,9 +5713,8 @@ user is marked so. What was found and left is #373.
       plain-HTTP sockets; a beta.1/2 agent loses relayed peers under a
       coordinator from beta.3 on. Migrations from every beta's schema apply
       cleanly.
-    - *The container's first admin command* (`podman exec … wireserve-admin
-      node list`, docs/coordinator.md) finds no admin token unless one was
-      passed in: nothing reads `coordinator-secrets.env` for it.
+    - *The container's first admin command* found no admin token unless one
+      was passed in. Since fixed: #375.
     - *Terminator:* an HTTP/1.1 response quiet for 300 s is cut as idle;
       nothing drains on SIGTERM, so a restart drops what is in flight.
     - *Phone relay:* every initiation shares one nft limit (200/s) ahead of
@@ -5776,3 +5775,19 @@ user is marked so. What was found and left is #373.
     The kernel test moves the phone mid-session in userspace WireGuard and
     has a third address replay and forge with the live index; with kernel
     WireGuard it is `run-phone-relay-test.sh`'s step 7.
+
+375. **`wireserve-admin` beside a coordinator finds the token it generated.**
+    docs/coordinator.md runs the image with nothing passed in and then
+    `podman exec wireserve-coordinator wireserve-admin node list`, which
+    answered "no admin token found": the token exists only in
+    `coordinator-secrets.env` in the volume, the image's user has no home for
+    a token file, and every e2e suite passed `WIRESERVE_ADMIN_TOKEN` in. The
+    CLI now looks last, after the flag, the variable and the token file, in
+    `coordinator-secrets.env` beside the database `WIRESERVE_DB_PATH` names
+    — the coordinator's own rule for where that file is, and a variable only
+    a coordinator's environment has (the image sets it). Not by pointing
+    `WIRESERVE_ADMIN_TOKEN_FILE` at that file: a prompt's "save it for next
+    time" writes the token file, and would have replaced the mesh's other
+    secrets. The Quadlet unit names its container `wireserve-coordinator`, as
+    the docs' command has it. `run-e2e-test.sh` no longer passes a token in,
+    so the main suite's every admin command goes this way.
