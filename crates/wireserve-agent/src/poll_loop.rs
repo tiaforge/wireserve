@@ -188,6 +188,17 @@ fn reflexive_divert_port(base: u16) -> Option<u16> {
     base.checked_add(wireserve_types::RELAY_SLOTS)?.checked_add(2)
 }
 
+/// The phone relay's pool of ports on the mesh address, one for each
+/// address a phone sends from (`phone_relay::sorter`): right after the
+/// reflexive responder's. `None` where they would not all fit below 65536;
+/// the relay then works from its main mesh socket alone.
+#[cfg(target_os = "linux")]
+fn phone_relay_pool(base: u16) -> Option<std::ops::RangeInclusive<u16>> {
+    let first = reflexive_divert_port(base)?.checked_add(1)?;
+    let last = first.checked_add(crate::phone_relay::sorter::POOL_SIZE.checked_sub(1)?)?;
+    Some(first..=last)
+}
+
 /// What the phone relay is told this cycle (PLAN.md M49), from
 /// `relay_public` and `relay_devices`: each node by its mesh address and
 /// WireGuard port, from the directory, and its key. A node or device whose
@@ -213,11 +224,13 @@ fn phone_relay_config(
     if nodes.is_empty() {
         return None;
     }
-    let (divert_port, mesh_port) = phone_relay_ports(directory.relay_port_base?)?;
+    let base = directory.relay_port_base?;
+    let (divert_port, mesh_port) = phone_relay_ports(base)?;
     Some(crate::phone_relay::io::Config {
         listen_port,
         divert_port,
         mesh: std::net::SocketAddrV4::new(node_ip?, mesh_port),
+        pool: phone_relay_pool(base),
         nodes,
         devices: directory.relay_devices.iter().filter_map(|pk| key(pk)).collect(),
     })
@@ -284,6 +297,21 @@ fn note_reflexive_applied(handle: Option<&PhoneRelayHandle>, applied: bool) {
 
 #[cfg(not(target_os = "linux"))]
 fn note_reflexive_applied(_handle: Option<&PhoneRelayHandle>, _applied: bool) {}
+
+/// Once a ruleset that lets the relayed nodes answer at the phone relay's
+/// pool is in place, the relay sends from it (`PhoneRelay::pool_allowed`).
+/// Never taken back: a node may go on sending to a port it was given.
+#[cfg(target_os = "linux")]
+fn note_phone_relay_applied(handle: Option<&PhoneRelayHandle>, rules: Option<&wireserve_types::PhoneRelayRules>) {
+    if let Some(h) = handle {
+        if rules.is_some_and(|r| r.pool.is_some()) {
+            h.relay.pool_allowed();
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn note_phone_relay_applied(_handle: Option<&PhoneRelayHandle>, _rules: Option<&wireserve_types::PhoneRelayRules>) {}
 
 /// Builds the request body from currently-declared services — this is the
 /// node's own view of what it's serving, independent of anything the
@@ -1271,6 +1299,7 @@ where
             listen_port: c.listen_port,
             divert_port: c.divert_port,
             mesh_port: c.mesh.port(),
+            pool: ctx.phone_relay.and_then(|h| h.relay.pool()),
             indexes: Vec::new(),
         }
     });
@@ -1418,6 +1447,7 @@ where
             Ok(()) => {
                 crate::firewall::ip_forward::take_egress(&plan.take);
                 note_reflexive_applied(ctx.phone_relay, forwarding.reflexive.is_some());
+                note_phone_relay_applied(ctx.phone_relay, forwarding.phone_relay.as_ref());
                 *ctx.applied = Some(LastApplied { rules: named_rules, forwarding: forwarding.clone() });
                 plan.guard
             }
@@ -1508,6 +1538,22 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(exit_client_addrs(&directory), vec![Ipv4Addr::new(100, 90, 0, 9)]);
+    }
+
+    /// The phone relay's ports follow one another after the relay ports:
+    /// the divert socket, the main mesh socket, the reflexive responder's,
+    /// then the pool, which is left out where it would not fit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_phone_relays_ports_follow_the_relay_ports_and_the_pool_only_where_it_fits() {
+        let base = wireserve_types::DEFAULT_RELAY_PORT_BASE;
+        assert_eq!(phone_relay_ports(base), Some((42000, 42001)));
+        assert_eq!(reflexive_divert_port(base), Some(42002));
+        assert_eq!(phone_relay_pool(base), Some(42003..=42066));
+        let top = 65535 - wireserve_types::RELAY_SLOTS - 3 - (crate::phone_relay::sorter::POOL_SIZE - 1);
+        assert_eq!(phone_relay_pool(top), Some(65535 - 63..=65535));
+        assert_eq!(phone_relay_pool(top + 1), None);
+        assert!(phone_relay_ports(top + 1).is_some(), "the rest of the relay still fits");
     }
     use super::*;
     use wireserve_types::{MeshInfo, PortMap, Proto, ServiceInfo};
@@ -2231,7 +2277,7 @@ mod tests {
                 relay: vec![wireserve_types::RelayForward { a: end(3, 41000), c: end(4, 41002) }],
                 relay_self: Some(NODE),
                 relay_ends: vec![51820],
-                phone_relay: Some(wireserve_types::PhoneRelayRules { listen_port: 51820, divert_port: 41064, mesh_port: 41065, indexes: vec![] }),
+                phone_relay: Some(wireserve_types::PhoneRelayRules { listen_port: 51820, divert_port: 41064, mesh_port: 41065, pool: Some(41067..=41130), indexes: vec![] }),
                 reflexive: None,
                 guarded: vec!["eth0".into()],
                 exit: vec![EXIT_CLIENT],
