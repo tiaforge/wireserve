@@ -390,10 +390,10 @@ async fn cmd_join(instance: &Instance, args: JoinArgs) -> Result<(), Box<dyn std
     // Held across the whole join: a daemon running on this instance would
     // otherwise keep using (and saving) the identity this is replacing.
     let _lock = lock::lock_instance(instance)?;
-    let coordinator_url = resolve_coordinator_url(coordinator_url)?;
+    let coordinator_url = resolve_coordinator_url(coordinator_url, is_interactive())?;
     // Before asking for the token, so a refused URL costs no typing.
     register::check_coordinator_transport(&coordinator_url, allow_plaintext_http)?;
-    let join_token = resolve_join_token(join_token, join_token_file)?;
+    let join_token = resolve_join_token(join_token, join_token_file, is_interactive())?;
     let state_path = instance.state_path();
     // A re-join keeps the interface and port this instance already uses.
     let previous = AgentState::load(&state_path).unwrap_or_default();
@@ -453,16 +453,19 @@ fn is_interactive() -> bool {
 }
 
 /// Resolves the coordinator URL: the positional argument if given,
-/// otherwise a prompt when running interactively, otherwise a clear error.
+/// otherwise a prompt when running interactively (`interactive`, which the
+/// caller asks [`is_interactive`] for: a test must never prompt, whatever
+/// console it runs in), otherwise a clear error.
 fn resolve_coordinator_url(
     positional: Option<String>,
+    interactive: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(url) = positional {
         if !url.is_empty() {
             return Ok(url);
         }
     }
-    if is_interactive() {
+    if interactive {
         eprint!("Coordinator URL (e.g. https://wireserve.example.com): ");
         let mut line = String::new();
         std::io::stdin().read_line(&mut line)?;
@@ -477,10 +480,12 @@ fn resolve_coordinator_url(
 /// Resolves the join token from (in order): `--join-token-file`, the
 /// positional argument being literally `-` (read one line from stdin), the
 /// positional argument itself, or — running interactively, with neither of
-/// those given — a masked prompt. Security review S7.
+/// those given (`interactive`, as for the URL) — a masked prompt. Security
+/// review S7.
 fn resolve_join_token(
     positional: Option<String>,
     file: Option<std::path::PathBuf>,
+    interactive: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(path) = file {
         let contents = std::fs::read_to_string(&path)
@@ -495,7 +500,7 @@ fn resolve_join_token(
         }
         Some(token) => Ok(token.to_string()),
         None => {
-            if is_interactive() {
+            if interactive {
                 let token = rpassword::prompt_password(
                     "Join token (from 'wireserve-admin node create'): ",
                 )?;
@@ -1398,38 +1403,39 @@ mod tests {
         let path = dir.path().join("token");
         std::fs::write(&path, "jtk_from_file\n").unwrap();
 
-        let token = resolve_join_token(Some("jtk_positional".into()), Some(path)).unwrap();
+        let token = resolve_join_token(Some("jtk_positional".into()), Some(path), false).unwrap();
         assert_eq!(token, "jtk_from_file");
     }
 
     #[test]
     fn resolve_join_token_uses_positional_when_no_file() {
-        let token = resolve_join_token(Some("jtk_abc".into()), None).unwrap();
+        let token = resolve_join_token(Some("jtk_abc".into()), None, false).unwrap();
         assert_eq!(token, "jtk_abc");
     }
 
     #[test]
     fn resolve_join_token_errors_when_nothing_given() {
-        assert!(resolve_join_token(None, None).is_err());
+        assert!(resolve_join_token(None, None, false).is_err());
     }
 
     #[test]
     fn resolve_join_token_errors_on_unreadable_file() {
         let path = std::path::PathBuf::from("/nonexistent/path/for/test/token");
-        assert!(resolve_join_token(None, Some(path)).is_err());
+        assert!(resolve_join_token(None, Some(path), false).is_err());
     }
 
     // ---- resolve_coordinator_url ----
 
     #[test]
     fn resolve_coordinator_url_uses_positional_when_given() {
-        let url = resolve_coordinator_url(Some("https://wireserve.example.com".into())).unwrap();
+        let url = resolve_coordinator_url(Some("https://wireserve.example.com".into()), false).unwrap();
         assert_eq!(url, "https://wireserve.example.com");
     }
 
     #[test]
     fn resolve_coordinator_url_errors_when_nothing_given_and_not_interactive() {
-        assert!(!is_interactive(), "cargo test's stdin should never be a tty");
-        assert!(resolve_coordinator_url(None).is_err());
+        // Not `is_interactive()`: an elevated Windows test run has a console
+        // of its own, and prompted there.
+        assert!(resolve_coordinator_url(None, false).is_err());
     }
 }

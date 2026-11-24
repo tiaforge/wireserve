@@ -150,6 +150,7 @@ where
     }
     winservice::start(&name, &instance.log_path())?;
     winservice::start(&tls_name, &instance.tls_log_path())?;
+    wait_until_answering(&name, instance).await?;
     for other in running.iter().filter(|i| *i != instance) {
         winservice::start(&winservice::service_name(other), &other.log_path())?;
     }
@@ -157,6 +158,35 @@ where
         winservice::start(&winservice::tls_service_name(other), &other.tls_log_path())?;
     }
     Ok((exe, name, tls_name, group, on_path))
+}
+
+/// Waits until the agent's service `name` answers on its pipe. The service
+/// reports itself running as soon as its process is up, some seconds
+/// before the daemon in it has its interface and its pipe: a `status`
+/// straight after an `install` that returned then found no daemon. One that
+/// stops in that time failed at startup, which `start` returned too early
+/// to see. One still starting after 30 s — a coordinator slow to answer —
+/// is left to it, with a note.
+async fn wait_until_answering(name: &str, instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        // Anything but "no such pipe" is the daemon's pipe being there.
+        match super::ipc::connect(&instance.socket_path()).await {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Ok(()),
+        }
+        if !super::service::is_running(name)? {
+            return Err(format!("the {name} service stopped right after starting; see {}", instance.log_path().display()).into());
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "note: {name} is running but does not answer yet; `wireserve status` will once it does (its log: {})",
+                instance.log_path().display()
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// Copies this executable and the `wireguard.dll` beside it into
@@ -177,6 +207,10 @@ fn install_files() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&dir)?;
     for (from, file) in [(&current, "wireserve.exe"), (&dll, "wireguard.dll")] {
         let to = dir.join(file);
+        // What an `install` that was interrupted, or one from before
+        // replaces were retried (PLAN.md #360), left beside it.
+        let tmp = dir.join(format!(".{file}.tmp"));
+        let _ = std::fs::remove_file(&tmp);
         if to.canonicalize().is_ok_and(|t| t == *from) {
             continue;
         }
@@ -187,7 +221,6 @@ fn install_files() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
         }
         // Copied beside, then renamed over: never a half-written file where
         // the service looks for it.
-        let tmp = dir.join(format!(".{file}.tmp"));
         std::fs::copy(from, &tmp).map_err(|e| format!("could not copy {} to {}: {e}", from.display(), dir.display()))?;
         // A stopped service's process may still be exiting, and holding the
         // file, for a moment after the service reports stopped.

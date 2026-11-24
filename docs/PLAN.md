@@ -6107,3 +6107,20 @@ terminator was stopped, its permit still in place, was not reached.
     (`unsupported_on_windows`). What would reopen it: wanting transit,
     exit or a target on another address on Windows, which need a
     datapath on the node anyway — the remap would come with it.
+
+364. **What the pass on a real machine found** (2026-11-24). #362's
+    fixes ran on Windows 11 against the real mesh: the elevated tests
+    under `WIRESERVE_TEST_STRICT`, an upgrade of a joined node, and its
+    agent killed (`taskkill /F`) — the lasting blocks stayed through the
+    adapter's removal, the service came back in ten seconds. Not done:
+    a peer connecting in during that removal. Three things it turned up:
+    `install` returned while the daemon was still some seconds from its
+    pipe, so a `status` straight after found none — it now waits until
+    the pipe answers (and says so when the service stops instead, which
+    `start` returned too early to see). `resolve_coordinator_url` and
+    `resolve_join_token` asked the console themselves, and an elevated
+    test run has one: a test prompted for a join token and waited. They
+    are told whether to prompt. And `install` removes a `.tmp` an earlier
+    one left in the program folder. Cargo 1.100 builds test binaries
+    outside `target\debug\deps`, where CI put `wireguard.dll`:
+    `deploy/windows/beside-tests.ps1` asks cargo where they are.
