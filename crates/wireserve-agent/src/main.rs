@@ -628,7 +628,10 @@ async fn cmd_daemon(
         }
     };
 
-    let mut fw = platform::firewall::backend(&ifname, carry.clone(), &[ip4.into(), ip6.into()], instance)?;
+    // The ranges pinned at join: Windows blocks them as a whole for as long
+    // as the node is joined, past this process (`platform::windows::wfp`).
+    let mesh = state.mesh.as_ref().and_then(wireserve_types::MeshRanges::parse);
+    let mut fw = platform::firewall::backend(&ifname, carry.clone(), &[ip4.into(), ip6.into()], mesh.as_ref(), instance)?;
 
     // Spec §5: teardown-then-deny-all must run before the first successful
     // apply() from a poll response — the interface must never come up
@@ -978,6 +981,10 @@ async fn cmd_daemon(
             _ = shutdown_rx.recv() => {
                 tracing::info!("leave requested, tearing down");
                 teardown_everything(&mut fw, &mut interop, &mut wg, &hosts_path, instance.hosts_label(), &socket_path, &shared_state, &state_path, true).await;
+                // What the platform keeps past a stop for a joined node —
+                // Windows' blocks — goes once it is not, and only after the
+                // interface it guarded.
+                platform::firewall::after_leave(&mut fw);
                 break;
             }
         }

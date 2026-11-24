@@ -9,10 +9,12 @@
 //! everything created inside.
 //!
 //! Any local user may create a directory in `%ProgramData%`, though, and
-//! the owner of a directory can always rewrite its ACL. So the ACL is only
-//! applied to a directory whose owner is SYSTEM, Administrators, or the
-//! account the agent runs as; one some other user created first is
-//! refused rather than adopted.
+//! the owner of a directory can always rewrite its ACL, and rename or
+//! replace what is in it. So the ACL is only applied to a directory whose
+//! owner is SYSTEM, Administrators, or the account the agent runs as, and
+//! every directory from the state root down to it must be owned so too
+//! and be no junction or symbolic link (PLAN.md #362): one some other user
+//! created first is refused rather than adopted.
 //!
 //! The daemon's pipe may also be shared with a local group, as its socket
 //! is with the `wireserve` group on Linux; [`local_group_sid`] is the
@@ -23,20 +25,27 @@
 //! ([`ensure_private_dir_for`]), its pipe and its firewall permits name it.
 
 use std::io;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use windows_sys::core::PWSTR;
-use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_ALIAS_EXISTS, ERROR_NONE_MAPPED, ERROR_SUCCESS, HANDLE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, LocalFree, ERROR_ALIAS_EXISTS, ERROR_NONE_MAPPED, ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::NetworkManagement::NetManagement::{NetLocalGroupAdd, LOCALGROUP_INFO_1};
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
-    SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SetSecurityInfo,
+    SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_OBJECT_TYPE,
 };
 use windows_sys::Win32::Security::{
     CreateWellKnownSid, EqualSid, GetSecurityDescriptorDacl, GetSecurityDescriptorLength, GetTokenInformation,
     LookupAccountNameW, SidTypeAlias, TokenElevation, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid, ACL, DACL_SECURITY_INFORMATION,
     OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
     SECURITY_MAX_SID_SIZE, SID_NAME_USE, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, WELL_KNOWN_SID_TYPE,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
 };
 use windows_sys::Win32::System::SystemInformation::{ComputerNameNetBIOS, GetComputerNameExW};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -48,7 +57,7 @@ use crate::platform::windows::net::wide;
 pub const ADMINS_ONLY: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 
 /// [`ADMINS_ONLY`] plus the owner (`OW`, Owner Rights) — for a directory
-/// whose owner [`restrict_to_admins`] has checked is one of those two or
+/// whose owner [`ensure_private_dir`] has checked is one of those two or
 /// the agent's own account, which an unelevated test run is.
 const ADMINS_AND_OWNER: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)";
 
@@ -110,78 +119,203 @@ impl Drop for SecurityDescriptor {
     }
 }
 
-/// Replaces `path`'s ACL with SYSTEM, Administrators and its owner only,
-/// applied to what is already inside it as well — after checking the
-/// owner is one of the first two or the account this process runs as.
-pub fn restrict_to_admins(path: &Path) -> io::Result<()> {
-    let name = wide(&path.to_string_lossy());
-    check_owner(path, &name)?;
-    let sd = SecurityDescriptor::from_sddl(ADMINS_AND_OWNER)?;
-    let dacl = sd.dacl()?;
-    // SAFETY: a NUL-terminated path and a DACL inside `sd`, both live for the call.
-    let code = unsafe {
-        SetNamedSecurityInfoW(
-            name.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            dacl,
-            std::ptr::null(),
-        )
+/// The directories from `root` down to `dir`, `root` first and `dir`
+/// last: every one of them is checked, since whoever owns a directory can
+/// rename or replace what is in it. `dir` alone when it is not under
+/// `root` (a test's own directory), or reached from it by anything but
+/// plain names.
+fn chain(root: &Path, dir: &Path) -> Vec<PathBuf> {
+    let Ok(rest) = dir.strip_prefix(root) else {
+        return vec![dir.to_path_buf()];
     };
-    if code != ERROR_SUCCESS {
-        return Err(io::Error::from_raw_os_error(code as i32));
+    if !rest.components().all(|c| matches!(c, Component::Normal(_))) {
+        return vec![dir.to_path_buf()];
+    }
+    let mut out = vec![root.to_path_buf()];
+    let mut at = root.to_path_buf();
+    for c in rest.components() {
+        at.push(c);
+        out.push(at.clone());
+    }
+    out
+}
+
+/// One directory, open as itself, never through a junction or symbolic
+/// link, and kept open without delete sharing, so it is neither renamed
+/// nor replaced while it is checked and given its ACL. Closed on drop.
+struct Dir(HANDLE);
+
+impl Drop for Dir {
+    fn drop(&mut self) {
+        // SAFETY: a handle we opened, closed once.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+impl Dir {
+    /// Opens `path`, refusing anything but a plain directory: a reparse
+    /// point (a junction, a symbolic link) would send every later use of
+    /// the path wherever its owner pointed it. `write_dac` to give it an
+    /// ACL after.
+    fn open(path: &Path, write_dac: bool) -> io::Result<Self> {
+        let name = wide(&path.to_string_lossy());
+        let access = READ_CONTROL | FILE_READ_ATTRIBUTES | if write_dac { WRITE_DAC } else { 0 };
+        // SAFETY: a NUL-terminated path; the handle is owned by `Dir` from here.
+        let h = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                // A directory takes backup semantics to be opened at all.
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if h == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let dir = Self(h);
+        // SAFETY: all-zero is a valid BY_HANDLE_FILE_INFORMATION to be written.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: an open handle with FILE_READ_ATTRIBUTES.
+        if unsafe { GetFileInformationByHandle(dir.0, &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is a link (a junction or symbolic link), not a folder; remove it and start again", path.display()),
+            ));
+        }
+        if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(io::Error::other(format!("{} is not a folder", path.display())));
+        }
+        Ok(dir)
+    }
+
+    /// Refuses a directory owned by anyone but SYSTEM, Administrators or
+    /// this process's own user.
+    fn check_owner(&self, path: &Path) -> io::Result<()> {
+        if owner_trusted(self.0, SE_FILE_OBJECT)? {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is owned by another user, who could read the keys kept under it; \
+                     remove it and start again",
+                    path.display()
+                ),
+            ))
+        }
+    }
+
+    /// Replaces the directory's ACL with `sddl`'s, protected (nothing
+    /// inherited from above) and passed on to what is already inside it.
+    fn set_acl(&self, sddl: &str) -> io::Result<()> {
+        let sd = SecurityDescriptor::from_sddl(sddl)?;
+        let dacl = sd.dacl()?;
+        // SAFETY: a handle opened with WRITE_DAC and a DACL inside `sd`, both
+        // live for the call.
+        let code = unsafe {
+            SetSecurityInfo(
+                self.0,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null(),
+            )
+        };
+        if code != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(code as i32));
+        }
+        Ok(())
+    }
+}
+
+/// Creates what is missing from `root` down to `dir`, and makes sure no
+/// one but SYSTEM, Administrators or this process's own user owns any of
+/// it, and none of it is a link: an unprivileged user may create folders
+/// in `%ProgramData%`, so with no default instance installed one could
+/// otherwise own `wireserve\instances` and swap a named instance's folder
+/// under the agent. `root` gets `root_sddl` and `dir` `leaf_sddl` (only
+/// that, when they are one), each protected; what lies between inherits
+/// the root's. Every directory stays open until the end, so none is
+/// replaced in between.
+fn ensure_private_tree(root: &Path, dir: &Path, root_sddl: &str, leaf_sddl: &str) -> io::Result<()> {
+    let chain = chain(root, dir);
+    // Above the root: `%ProgramData%`, or a test's own directory.
+    if let Some(parent) = chain[0].parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let last = chain.len() - 1;
+    let mut held = Vec::with_capacity(chain.len());
+    for (i, path) in chain.iter().enumerate() {
+        match std::fs::create_dir(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        let sddl = if i == last {
+            Some(leaf_sddl)
+        } else if i == 0 {
+            Some(root_sddl)
+        } else {
+            None
+        };
+        let d = Dir::open(path, sddl.is_some())?;
+        d.check_owner(path)?;
+        if let Some(sddl) = sddl {
+            d.set_acl(sddl)?;
+        }
+        held.push(d);
     }
     Ok(())
 }
 
-/// Creates `dir` if need be and makes it private (see
-/// [`restrict_to_admins`]) — every time, not only when it is new: one that
-/// was already there may have been put there by another user.
+/// Creates `dir` if need be and makes it private: SYSTEM, Administrators
+/// and its owner only, after checking every folder from the state root
+/// down to it (see [`ensure_private_tree`]) — every time, not only when it
+/// is new: one that was already there may have been put there by another
+/// user. The state root, `%ProgramData%\wireserve`, gets the same ACL.
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    restrict_to_admins(dir)
+    ensure_private_tree(&super::paths::state_root(), dir, ADMINS_AND_OWNER, ADMINS_AND_OWNER)
 }
 
 /// [`ensure_private_dir`] for a directory another account works in — the
 /// TLS terminator's: SYSTEM, Administrators and that account (`sid`), and
-/// nobody else, after the same check of who owns it.
-pub fn ensure_private_dir_for(dir: &Path, sid: &str) -> io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let name = wide(&dir.to_string_lossy());
-    check_owner(dir, &name)?;
-    let sd = SecurityDescriptor::from_sddl(&format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{sid})"))?;
-    let dacl = sd.dacl()?;
-    // SAFETY: a NUL-terminated path and a DACL inside `sd`, both live for the call.
-    let code = unsafe {
-        SetNamedSecurityInfoW(
-            name.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            dacl,
-            std::ptr::null(),
-        )
+/// nobody else, after the same checks from the terminators' root,
+/// `%ProgramData%\wireserve-tls`, down. The root is the default
+/// instance's own directory: when `dir` is a named instance's below it,
+/// the root gets SYSTEM, Administrators and `root_sid`, the default
+/// instance's terminator when it has one. A named instance's terminator
+/// needs no right on the root to reach its own folder: its token's
+/// `SeChangeNotifyPrivilege` (bypassing traverse checks) takes it there.
+pub fn ensure_private_dir_for(dir: &Path, sid: &str, root_sid: Option<&str>) -> io::Result<()> {
+    let leaf = format!("{ADMINS_ONLY}(A;OICI;FA;;;{sid})");
+    let root = match root_sid {
+        Some(root_sid) => format!("{ADMINS_ONLY}(A;OICI;FA;;;{root_sid})"),
+        None => ADMINS_ONLY.to_string(),
     };
-    if code != ERROR_SUCCESS {
-        return Err(io::Error::from_raw_os_error(code as i32));
-    }
-    Ok(())
+    ensure_private_tree(&super::paths::tls_state_root(), dir, &root, &leaf)
 }
 
-/// Refuses a `path` owned by anyone but SYSTEM, Administrators or this
-/// process's own user.
-fn check_owner(path: &Path, name: &[u16]) -> io::Result<()> {
+/// Whether the owner of the object `h` (of the kind `kind`) is SYSTEM,
+/// Administrators or this process's own user. Read from the open handle,
+/// not by name, so it is the owner of exactly what was opened.
+fn owner_trusted(h: HANDLE, kind: SE_OBJECT_TYPE) -> io::Result<bool> {
     let mut owner: PSID = std::ptr::null_mut();
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    // SAFETY: a NUL-terminated path; `owner` points into `sd`, which the call
-    // allocates and the guard below frees.
+    // SAFETY: an open handle with READ_CONTROL; `owner` points into `sd`,
+    // which the call allocates and the guard below frees.
     let code = unsafe {
-        GetNamedSecurityInfoW(
-            name.as_ptr(),
-            SE_FILE_OBJECT,
+        GetSecurityInfo(
+            h,
+            kind,
             OWNER_SECURITY_INFORMATION,
             &mut owner,
             std::ptr::null_mut(),
@@ -201,21 +335,29 @@ fn check_owner(path: &Path, name: &[u16]) -> io::Result<()> {
     // whose SID points further into `me`.
     let my_sid = unsafe { (*me.as_ptr().cast::<TOKEN_USER>()).User.Sid };
     // SAFETY: valid SIDs, all alive for the comparison.
-    let trusted = unsafe {
+    Ok(unsafe {
         EqualSid(owner, system.as_ptr().cast_mut().cast()) != 0
             || EqualSid(owner, admins.as_ptr().cast_mut().cast()) != 0
             || EqualSid(owner, my_sid) != 0
-    };
-    if trusted {
+    })
+}
+
+/// Refuses the named pipe `h` (at `path`) unless SYSTEM, Administrators or
+/// this process's own user created it, and so owns it: anyone may create a
+/// pipe of a free name, and a client that took another user's for the
+/// daemon's would tell it what it asks and believe what it answers. The
+/// daemon runs as LocalSystem, whose objects are owned by SYSTEM or, as its
+/// token's default owner, Administrators — which no other user can make
+/// the owner of anything. This process's own user is trusted too, as for
+/// directories: an unelevated test's daemon is that, and it could only
+/// deceive itself. `h` needs READ_CONTROL.
+pub fn check_pipe_owner(h: HANDLE, path: &Path) -> io::Result<()> {
+    if owner_trusted(h, SE_KERNEL_OBJECT)? {
         Ok(())
     } else {
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!(
-                "{} is owned by another user, who could read the keys kept in it; \
-                 remove it and start again",
-                path.display()
-            ),
+            format!("{} was not created by the wireserve daemon; refusing to talk to it", path.display()),
         ))
     }
 }
@@ -280,19 +422,31 @@ fn lookup(account: &str) -> io::Result<Option<(String, SID_NAME_USE, String)>> {
         return if err.raw_os_error() == Some(ERROR_NONE_MAPPED as i32) { Ok(None) } else { Err(err) };
     }
     let domain = String::from_utf16_lossy(&domain[..domain_len as usize]);
+    Ok(Some((sid_string(sid.as_mut_ptr().cast())?, kind, domain)))
+}
+
+/// `sid` as SDDL writes it (`S-1-5-...`).
+fn sid_string(sid: PSID) -> io::Result<String> {
     let mut text: PWSTR = std::ptr::null_mut();
     // SAFETY: a valid SID; `text` is allocated by the call and freed below.
-    if unsafe { ConvertSidToStringSidW(sid.as_mut_ptr().cast(), &mut text) } == 0 {
+    if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: a NUL-terminated string from the call above, freed once.
-    let out = unsafe {
+    Ok(unsafe {
         let len = (0..).take_while(|&i| *text.add(i) != 0).count();
         let out = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
         LocalFree(text.cast());
         out
-    };
-    Ok(Some((out, kind, domain)))
+    })
+}
+
+/// The SID of the user this process runs as, as SDDL writes it.
+pub fn process_user_sid() -> io::Result<String> {
+    let me = process_user()?;
+    // SAFETY: `me` starts with a TOKEN_USER (8-aligned, as a `Vec<u64>`)
+    // whose SID points further into `me`, which outlives the conversion.
+    sid_string(unsafe { (*me.as_ptr().cast::<TOKEN_USER>()).User.Sid })
 }
 
 /// Creates the local group `name` unless one exists already: the Windows
@@ -390,9 +544,62 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sub = dir.path().join("nested");
         std::fs::create_dir_all(&sub).unwrap();
-        restrict_to_admins(&sub).unwrap();
+        ensure_private_dir(&sub).unwrap();
         std::fs::write(sub.join("f"), b"x").unwrap();
         assert_eq!(std::fs::read(sub.join("f")).unwrap(), b"x");
+    }
+
+    #[test]
+    fn every_directory_from_the_root_down_is_checked() {
+        let root = Path::new(r"C:\ProgramData\wireserve");
+        let dir = root.join("instances").join("work");
+        assert_eq!(chain(root, &dir), vec![root.to_path_buf(), root.join("instances"), dir.clone()]);
+        // The default instance's directory is the root itself.
+        assert_eq!(chain(root, root), vec![root.to_path_buf()]);
+        // Anything not under the root is itself alone.
+        let elsewhere = Path::new(r"C:\Users\me\AppData\Local\Temp\x");
+        assert_eq!(chain(root, elsewhere), vec![elsewhere.to_path_buf()]);
+        assert_eq!(chain(root, &root.join("..").join("other")), vec![root.join("..").join("other")]);
+    }
+
+    /// A named instance's directories, from a root of the test's own, are
+    /// created, checked and kept usable; a junction anywhere on the way is
+    /// refused, the leaf's or a parent's.
+    #[test]
+    fn a_tree_is_created_and_a_junction_in_it_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("wireserve");
+        let leaf = root.join("instances").join("work");
+        ensure_private_tree(&root, &leaf, ADMINS_AND_OWNER, ADMINS_AND_OWNER).unwrap();
+        std::fs::write(leaf.join("f"), b"x").unwrap();
+        assert_eq!(std::fs::read(leaf.join("f")).unwrap(), b"x");
+        // Again: nothing changes, nothing fails.
+        ensure_private_tree(&root, &leaf, ADMINS_AND_OWNER, ADMINS_AND_OWNER).unwrap();
+
+        // A junction for a parent, pointing at a directory of the user's.
+        let target = base.path().join("target");
+        std::fs::create_dir_all(target.join("work")).unwrap();
+        let planted = base.path().join("planted");
+        std::fs::create_dir_all(&planted).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(planted.join("instances"))
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J needs no privilege");
+        let err = ensure_private_tree(&planted, &planted.join("instances").join("work"), ADMINS_AND_OWNER, ADMINS_AND_OWNER)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        // And for the leaf itself.
+        let err = ensure_private_tree(&planted, &planted.join("instances"), ADMINS_AND_OWNER, ADMINS_AND_OWNER).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    #[test]
+    fn this_process_has_a_user_sid() {
+        let sid = process_user_sid().unwrap();
+        assert!(sid.starts_with("S-1-5-"), "{sid}");
     }
 
     #[test]

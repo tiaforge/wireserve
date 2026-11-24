@@ -6023,3 +6023,66 @@ terminator was stopped, its permit still in place, was not reached.
     and Windows only, as it did: the other-Unix stand-ins are kept, not
     claimed to work.
 
+
+362. **Security review of the Windows branch** (2026-11-24). Five
+    findings, each closed here:
+    - *The default-deny went before the adapter.* #349's reasoning, that
+      the dynamic session's filters go with the process as the adapter
+      does, missed that the adapter goes seconds later (#347), service
+      addresses and all, and that a clean stop removes the firewall
+      first and then waits up to 5 s for it. The blocks that need no
+      adapter are now persistent WFP objects, kept for as long as the
+      node is joined: inbound to the node's mesh addresses and to the
+      mesh's pinned range (the service addresses), at
+      `ALE_AUTH_RECV_ACCEPT_V4/V6`, and forwarding from that range at
+      `IPFORWARD_V4/V6`. Their keys come from the instance and what they
+      block, so a start deletes and re-adds them in one transaction
+      (nothing to fail on, nothing piling up, no stale address left).
+      A range wider than /8, or one the host has an address in on any
+      interface but loopback and our own adapters, is left out with a
+      warning: a lasting block on it would cut that network off — another
+      VPN's too (the default range is in `100.64.0.0/10`, Tailscale's). One persistent
+      sublayer for every instance replaces #349's per-interface dynamic
+      one: any session may add to a persistent sublayer, and within one
+      sublayer the weights decide, so an instance's dynamic permits
+      outweigh every instance's blocks — two instances in one mesh have
+      range blocks covering each other's service addresses. `teardown`
+      on Windows closes the holes and keeps the blocks: the adapter's own
+      (by LUID, and now by index at the forwarding layers) go with the
+      session at process exit, the lasting ones at `leave`, in the daemon
+      after the adapter and again from the CLI's `after_leave` once the
+      service has stopped. The Linux order is unchanged.
+    - *Forwarded traffic was unfiltered.* ALE never sees a routed packet.
+      Blocks at `IPFORWARD_V4/V6` match `SOURCE_INTERFACE_INDEX` (those
+      layers have no `IP_LOCAL_INTERFACE`) and, lasting, the mesh's range
+      as `IP_SOURCE_ADDRESS`; and `ForwardingEnabled` is turned off on the
+      adapter's IP interface for both families, where its MTU is set.
+    - *Only the leaf directory's owner was checked.* With no default
+      instance, any user could create `%ProgramData%\wireserve` and
+      `instances`, then rename or replace a named instance's folder, or
+      plant a junction (the owner lookup followed it). Now every folder
+      from the root (`wireserve`, `wireserve-tls`) down is opened as
+      itself (`FILE_FLAG_OPEN_REPARSE_POINT`), refused if it is a
+      reparse point or owned by anyone but SYSTEM, Administrators or
+      the process's own user, and held open without delete sharing until
+      its ACL is set; the root gets the protected ACL too. The
+      terminators' root names the default instance's terminator, whose
+      folder it is; a named one reaches its own through the traverse
+      bypass it keeps.
+    - *The terminator kept `SeImpersonatePrivilege`.* A service account
+      has it by default, which makes code running as it as good as
+      LocalSystem. `install` now sets the terminator's required
+      privileges to `SeChangeNotifyPrivilege` alone, on an upgrade too,
+      and fails if it cannot.
+    - *The CLI did not check who made the daemon's pipe.* It now refuses
+      one not owned by SYSTEM, Administrators or its own user, as the
+      terminator does its link (#359); the own user is what an
+      unelevated test's daemon is, and could only deceive itself.
+    Also: publishing a port opens it past the host firewall's own block
+    rules for that port (#356), which `docs/windows.md` now says where
+    serving is described. Not tested on Windows yet: the WFP layer and
+    condition choices (forwarding layers, persistent objects from a
+    non-dynamic session beside the dynamic one, a dynamic filter in a
+    persistent sublayer) are written to the documentation and
+    type-checked, and the elevated kernel test covers them on the next
+    Windows run.

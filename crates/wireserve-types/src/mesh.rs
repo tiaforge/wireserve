@@ -68,6 +68,13 @@ impl MeshRanges {
         (Ipv4Addr::from(self.v4.0), self.v4.1 as u8)
     }
 
+    /// The v6 range as network address and prefix length.
+    #[must_use]
+    pub fn v6(&self) -> (Ipv6Addr, u8) {
+        // `parse` refuses a length over 128, so this cannot truncate.
+        (Ipv6Addr::from(self.v6.0), self.v6.1 as u8)
+    }
+
     #[must_use]
     pub fn contains4(&self, addr: Ipv4Addr) -> bool {
         u32::from(addr) & mask32(self.v4.1) == self.v4.0
@@ -119,6 +126,8 @@ mod tests {
         let r = ranges("10.90.0.77/24", "fdb4:d481:7c21::9/64").unwrap();
         assert_eq!(r.v4_cidr(), "10.90.0.0/24");
         assert_eq!(r.v6_prefix(), "fdb4:d481:7c21::/64");
+        assert_eq!(r.v4(), ("10.90.0.0".parse().unwrap(), 24));
+        assert_eq!(r.v6(), ("fdb4:d481:7c21::".parse().unwrap(), 64));
     }
 
     #[test]

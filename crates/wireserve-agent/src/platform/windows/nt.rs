@@ -45,7 +45,7 @@ use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, 
 use crate::platform::windows::net as winnet;
 
 /// What the adapters are listed as in Windows ("WireServe Tunnel").
-const TUNNEL_TYPE: &str = "WireServe";
+pub(crate) const TUNNEL_TYPE: &str = "WireServe";
 
 /// How long a closed adapter may take to disappear.
 pub(crate) const REMOVAL_WAIT: Duration = Duration::from_secs(5);
@@ -553,9 +553,8 @@ impl NtApi {
         let luid = adapter.luid().map_err(wg_err)?;
         let addrs: Vec<(IpAddr, u8)> = config.addresses.iter().map(|a| (a.address, a.cidr)).collect();
         winnet::set_addresses(luid, &addrs).map_err(wg_err)?;
-        if let Some(mtu) = config.mtu {
-            winnet::set_mtu(luid, mtu).map_err(wg_err)?;
-        }
+        // Forwarding off whether or not there is an MTU to set.
+        winnet::configure_ip_interface(luid, config.mtu).map_err(wg_err)?;
         adapter.set_up().map_err(wg_err)
     }
 

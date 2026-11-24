@@ -139,18 +139,20 @@ pub async fn connect(socket_path: &Path) -> std::io::Result<tokio::net::windows:
 /// ([`GROUP_PIPE_ACCESS`]): its `GENERIC_WRITE` asks for more than a
 /// member of the `wireserve` group is given, and would be refused. Still
 /// identification only, as tokio's is: the server may learn who connects,
-/// never act as them.
+/// never act as them. And only a pipe the daemon could have made
+/// ([`super::security::check_pipe_owner`], PLAN.md #362), as the TLS
+/// terminator checks its own (#359).
 fn open_pipe(socket_path: &Path) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
     use std::os::windows::ffi::OsStrExt;
     use tokio::net::windows::named_pipe::NamedPipeClient;
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
     };
 
     let name: Vec<u16> = socket_path.as_os_str().encode_wide().chain(Some(0)).collect();
-    // SAFETY: a NUL-terminated name; the handle is handed to tokio, which
-    // owns and closes it from then on.
+    // SAFETY: a NUL-terminated name. The handle is closed here on a
+    // refusal, and handed to tokio, which owns and closes it, otherwise.
     unsafe {
         let h = CreateFileW(
             name.as_ptr(),
@@ -163,6 +165,11 @@ fn open_pipe(socket_path: &Path) -> std::io::Result<tokio::net::windows::named_p
         );
         if h == INVALID_HANDLE_VALUE {
             return Err(std::io::Error::last_os_error());
+        }
+        // FILE_GENERIC_READ, in GROUP_PIPE_ACCESS, includes READ_CONTROL.
+        if let Err(e) = super::security::check_pipe_owner(h, socket_path) {
+            CloseHandle(h);
+            return Err(e);
         }
         NamedPipeClient::from_raw_handle(h)
     }
@@ -181,5 +188,17 @@ mod tests {
         assert_eq!(shared, "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12008b;;;S-1-5-32-545)");
         assert_eq!(GROUP_PIPE_ACCESS & FILE_CREATE_PIPE_INSTANCE, 0);
         SecurityDescriptor::from_sddl(&shared).unwrap();
+    }
+
+    /// The client talks to a pipe this process made: owned by its user, or
+    /// by Administrators when elevated, both of which the owner check
+    /// trusts. Shared with this process's own user, so an unelevated run
+    /// may open it at all.
+    #[tokio::test]
+    async fn the_client_opens_a_pipe_made_by_a_trusted_owner() {
+        let path = PathBuf::from(format!(r"\\.\pipe\wireserve-test-{}", std::process::id()));
+        let me = super::super::security::process_user_sid().unwrap();
+        let _listener = Listener::bind(&path, Some(&me)).unwrap();
+        connect(&path).await.unwrap();
     }
 }

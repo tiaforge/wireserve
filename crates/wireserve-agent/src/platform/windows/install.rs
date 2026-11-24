@@ -137,7 +137,14 @@ where
     winservice::install_tls(&tls_name, instance, &exe)?;
     let tls_account = super::security::service_sid(&tls_name)?
         .ok_or_else(|| format!("the {tls_name} service was created, but Windows knows no account NT SERVICE\\{tls_name}"))?;
-    super::security::ensure_private_dir_for(&instance.tls_state_dir(), &tls_account)?;
+    // A named instance's folder is inside the default instance's: the
+    // default terminator keeps its access to that one (PLAN.md #362).
+    let default_tls_account = if instance.is_default() {
+        None
+    } else {
+        super::security::service_sid(&winservice::tls_service_name(&Instance::default()))?
+    };
+    super::security::ensure_private_dir_for(&instance.tls_state_dir(), &tls_account, default_tls_account.as_deref())?;
     if !upgrade {
         join().await?;
     }

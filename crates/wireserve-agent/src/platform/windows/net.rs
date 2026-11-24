@@ -15,7 +15,7 @@ use windows_sys::Win32::Foundation::{
     ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    ConvertInterfaceAliasToLuid, CreateUnicastIpAddressEntry, DeleteUnicastIpAddressEntry, FreeMibTable,
+    ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToIndex, CreateUnicastIpAddressEntry, DeleteUnicastIpAddressEntry, FreeMibTable,
     GetAdaptersAddresses, GetIpInterfaceEntry, GetUnicastIpAddressTable, InitializeIpInterfaceEntry,
     InitializeUnicastIpAddressEntry, SetIpInterfaceEntry, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
     GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH, MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_ROW,
@@ -131,6 +131,15 @@ pub fn luid_by_alias(name: &str) -> io::Result<Option<NET_LUID_LH>> {
     }
 }
 
+/// The interface index of `luid`: what WFP's forwarding layers match the
+/// arrival interface by (`super::wfp`).
+pub fn index_of(luid: NET_LUID_LH) -> io::Result<u32> {
+    let mut index = 0u32;
+    // SAFETY: a LUID and an index the call writes, both live for it.
+    check(unsafe { ConvertInterfaceLuidToIndex(&luid, &mut index) })?;
+    Ok(index)
+}
+
 /// One address of one interface on this host.
 #[derive(Debug, Clone)]
 pub struct HostAddress {
@@ -211,13 +220,22 @@ fn ip_interface(luid: NET_LUID_LH, family: ADDRESS_FAMILY) -> Option<MIB_IPINTER
     (unsafe { GetIpInterfaceEntry(&mut row) } == NO_ERROR).then_some(row)
 }
 
-/// Sets the interface's MTU for every family enabled on it.
-pub fn set_mtu(luid: NET_LUID_LH, mtu: u32) -> io::Result<()> {
+/// Sets the interface's MTU (when given) for every family enabled on it,
+/// and turns forwarding off on it for each: a Windows node carries nobody's
+/// traffic (PLAN.md M50), so nothing arriving over the mesh is routed on —
+/// said here rather than left to whatever the host's routing settings
+/// (ICS, a `netsh ... forwarding=enabled`) gave a new interface. The
+/// firewall blocks forwarding from the mesh as well (`super::wfp`); this
+/// is the layer below it.
+pub fn configure_ip_interface(luid: NET_LUID_LH, mtu: Option<u32>) -> io::Result<()> {
     for family in [AF_INET, AF_INET6] {
         let Some(mut row) = ip_interface(luid, family) else {
             continue;
         };
-        row.NlMtu = mtu;
+        if let Some(mtu) = mtu {
+            row.NlMtu = mtu;
+        }
+        row.ForwardingEnabled = false;
         // SetIpInterfaceEntry refuses an IPv4 row with the site prefix
         // length GetIpInterfaceEntry itself returned.
         if family == AF_INET {
@@ -377,17 +395,35 @@ pub fn local_lan_ifaces(except: &str) -> std::io::Result<Vec<crate::wg::LocalLan
         .collect())
 }
 
+const IF_TYPE_PROP_VIRTUAL: u32 = 53;
+const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
+const IF_TYPE_TUNNEL: u32 = 131;
+
 /// Loopback, tunnels (wireguard-nt and Wintun adapters, Tailscale's
 /// among them), and the virtual switches of Hyper-V, WSL and the desktop
 /// hypervisors.
 fn looks_virtual_windows(a: &HostAddress) -> bool {
-    const IF_TYPE_PROP_VIRTUAL: u32 = 53;
-    const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
-    const IF_TYPE_TUNNEL: u32 = 131;
     const VIRTUAL_DESCRIPTIONS: &[&str] = &["Hyper-V", "VMware", "VirtualBox", "Virtual Ethernet", "TAP-Windows"];
-    matches!(a.if_type, IF_TYPE_PROP_VIRTUAL | IF_TYPE_SOFTWARE_LOOPBACK | IF_TYPE_TUNNEL)
+    is_tunnel_or_loopback(a)
         || a.ifname.starts_with("vEthernet")
         || VIRTUAL_DESCRIPTIONS.iter().any(|d| a.description.contains(d))
+}
+
+/// Loopback and tunnels — our own mesh adapters ("WireServe Tunnel") among
+/// them, whatever type wireguard-nt reports them as: not one of the host's
+/// own networks.
+#[must_use]
+pub fn is_tunnel_or_loopback(a: &HostAddress) -> bool {
+    matches!(a.if_type, IF_TYPE_PROP_VIRTUAL | IF_TYPE_SOFTWARE_LOOPBACK | IF_TYPE_TUNNEL)
+        || a.description.contains(super::nt::TUNNEL_TYPE)
+}
+
+/// Loopback and our own mesh adapters ("WireServe Tunnel"): the addresses
+/// that are no network of the host's nor anyone else's. Another VPN's
+/// tunnel is not among them: its addresses are that VPN's to receive on.
+#[must_use]
+pub fn is_ours_or_loopback(a: &HostAddress) -> bool {
+    a.if_type == IF_TYPE_SOFTWARE_LOOPBACK || a.description.contains(super::nt::TUNNEL_TYPE)
 }
 
 /// Whether `ifname` is taken (see the Unix version): Windows looks an

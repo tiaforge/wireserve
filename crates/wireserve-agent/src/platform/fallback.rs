@@ -92,9 +92,17 @@ pub mod firewall {
     pub type Interop = NoopInterop;
 
     #[allow(clippy::unnecessary_wraps)]
-    pub fn backend(_ifname: &str, _carry: Option<String>, _own: &[IpAddr], _instance: &Instance) -> Result<Backend, Box<dyn std::error::Error>> {
+    pub fn backend(
+        _ifname: &str,
+        _carry: Option<String>,
+        _own: &[IpAddr],
+        _mesh: Option<&wireserve_types::MeshRanges>,
+        _instance: &Instance,
+    ) -> Result<Backend, Box<dyn std::error::Error>> {
         Ok(Backend)
     }
+
+    pub fn after_leave(_fw: &mut Backend) {}
 
     pub fn own_table(_fw: &Backend) -> OwnTable {
     OwnTable

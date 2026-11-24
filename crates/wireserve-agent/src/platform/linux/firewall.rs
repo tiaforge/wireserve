@@ -19,10 +19,21 @@ pub type OwnTable = SharedRuleset;
 pub type Interop = HostInterop;
 
 /// The table for the mesh interface `ifname`, its carry interface's
-/// (PLAN.md M39), and this node's own addresses `own`.
-pub fn backend(ifname: &str, carry: Option<String>, own: &[IpAddr], _instance: &Instance) -> Result<Backend, Box<dyn std::error::Error>> {
+/// (PLAN.md M39), and this node's own addresses `own`. The mesh's range is
+/// not needed: the table matches the interface by name.
+pub fn backend(
+    ifname: &str,
+    carry: Option<String>,
+    own: &[IpAddr],
+    _mesh: Option<&wireserve_types::MeshRanges>,
+    _instance: &Instance,
+) -> Result<Backend, Box<dyn std::error::Error>> {
     Ok(NftablesBackend::new(ifname.to_string())?.with_carry(carry).with_own(own))
 }
+
+/// Nothing: the table went with `teardown`, and nothing of it outlives the
+/// interface.
+pub fn after_leave(_fw: &mut Backend) {}
 
 #[must_use]
 pub fn own_table(fw: &Backend) -> OwnTable {

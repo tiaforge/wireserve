@@ -8,7 +8,7 @@
 #
 # To move to a newer wireguard-nt: change the version and checksum below,
 # and compare its include/wireguard.h with the layouts in
-# crates/wireserve-agent/src/wg/nt.rs before anything else.
+# crates/wireserve-agent/src/platform/windows/nt.rs before anything else.
 param(
     [Parameter(Mandatory)] [string] $Destination,
     [ValidateSet("amd64", "arm64")] [string] $Arch = "amd64"
