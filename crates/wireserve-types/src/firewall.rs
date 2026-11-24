@@ -58,6 +58,10 @@ pub struct PhoneRelayRules {
     /// The sorter's socket on this node's mesh address, which relayed
     /// nodes answer.
     pub mesh_port: u16,
+    /// The sorter's pool of ports on the same address, which relayed nodes
+    /// answer too: one for each address a phone sends from. `None` while
+    /// it is not open.
+    pub pool: Option<std::ops::RangeInclusive<u16>>,
     /// The receiver indexes relayed nodes chose for live sessions: a type
     /// 2, 3 or 4 packet carrying one of them is a relayed node's, not this
     /// node's own.

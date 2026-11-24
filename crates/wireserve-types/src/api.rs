@@ -357,8 +357,9 @@ pub const CAP_REFLEXIVE: &str = "reflexive";
 /// How many relay slots a mesh has (PLAN.md M39): a node's relay port is
 /// the coordinator's base plus its slot, so the ports run from the base to
 /// the base plus this, less one. A carrier's sorter for phones listens on
-/// the two ports right after them (PLAN.md M49), and the reflexive
-/// responder on the one after those (PLAN.md M50).
+/// the two ports right after them (PLAN.md M49), the reflexive responder
+/// on the one after those (PLAN.md M50), and the sorter's pool of mesh
+/// ports on the 64 after that.
 pub const RELAY_SLOTS: u16 = 1000;
 
 /// The default first relay port (`WIRESERVE_RELAY_PORT_BASE`).
@@ -707,7 +708,7 @@ pub struct PollResponse {
     pub answer_reflexive: bool,
     /// The first relay port (`WIRESERVE_RELAY_PORT_BASE`): relay ports run
     /// from it for [`RELAY_SLOTS`], and a carrier's sorter for phones
-    /// listens on the two ports after those (PLAN.md M49).
+    /// listens on the ports after those (PLAN.md M49; see [`RELAY_SLOTS`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_port_base: Option<u16>,
     /// THIS node asked to carry transit (`transit_capable`) but no admin

@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use nftables::expr::{
     BinaryOperation, CTDir, Expression, Fib, FibFlag, FibResult, Meta, MetaKey, NamedExpression, Payload, PayloadBase, PayloadField,
-    PayloadRaw, Prefix, SetItem, CT,
+    PayloadRaw, Prefix, Range, SetItem, CT,
 };
 use nftables::schema::{Chain, NfCmd, NfListObject, NfObject, Nftables, Rule, Table};
 use nftables::stmt::{Accept, Drop, JumpTarget, Limit, Mangle, Match, NATFamily, Operator, Reject, RejectType, Statement, TProxy, NAT};
@@ -984,11 +984,19 @@ pub(crate) fn apply_batch_with(
         ]));
     }
     // The relayed nodes' answers to the phones this node relays (PLAN.md
-    // M49), at the sorter's socket on this node's mesh address. The sorter
-    // takes a packet only from a relayed node's own address and port.
+    // M49), at the sorter's sockets on this node's mesh address: the main
+    // one, and its pool of ports, one for each address a phone sends from.
+    // The sorter takes a packet only from a relayed node's own address and
+    // port.
     let phone_relay = forwarding.phone_relay.as_ref().filter(|_| forwarding.relay_self.is_some());
     if let Some(phones) = phone_relay {
         objects.push(rule(t, CHAIN_NAME, vec![iifname_is(ifname), dport_is(Proto::Udp, phones.mesh_port), accept()]));
+        if let Some(pool) = &phones.pool {
+            let range = Expression::Range(Box::new(Range {
+                range: [Expression::Number(u32::from(*pool.start())), Expression::Number(u32::from(*pool.end()))],
+            }));
+            objects.push(rule(t, CHAIN_NAME, vec![iifname_is(ifname), is(payload("udp", "dport"), range), accept()]));
+        }
     }
     // Default-deny, but ONLY for the WireGuard interface — everything else
     // stays governed by the chain's own accept policy above. TCP is refused
@@ -1990,7 +1998,7 @@ mod tests {
 
 
     fn phones(indexes: Vec<u32>) -> PhoneRelayRules {
-        PhoneRelayRules { listen_port: 51820, divert_port: 42000, mesh_port: 42001, indexes }
+        PhoneRelayRules { listen_port: 51820, divert_port: 42000, mesh_port: 42001, pool: Some(42003..=42066), indexes }
     }
 
     /// What startup's single replace (`firewall::startup_sequence`) leaves
@@ -2045,6 +2053,7 @@ mod tests {
             "meta l4proto udp @th,64,32 { 0x3000000, 0x4000000 } @th,96,32 0x4030201 tproxy ip to :42000 accept".to_string(),
             "meta l4proto udp @th,64,32 0x2000000 @th,128,32 0x4030201 tproxy ip to :42000 accept".to_string(),
             "iifname \"wg0\" udp dport 42001 accept".to_string(),
+            "iifname \"wg0\" udp dport 42003-42066 accept".to_string(),
         ] {
             assert!(lines.contains(&want), "missing `{want}` in:\n{listing}");
         }
@@ -2096,6 +2105,33 @@ mod tests {
         let some = Forwarding { relay_self: Some("100.90.0.2".parse().unwrap()), phone_relay: Some(phones(vec![])), ..Forwarding::default() };
         let batch = serde_json::to_value(apply_batch("wg0", &[], &some)).unwrap().to_string();
         assert!(batch.contains("tproxy") && batch.contains("\"jump\""), "{batch}");
+    }
+
+    /// The relayed nodes' answers are let in at the sorter's main socket and
+    /// at its pool's ports, as one range, while the pool is open; at the
+    /// main socket alone while it is not.
+    #[test]
+    fn the_nodes_answers_are_let_in_at_the_main_socket_and_the_pool() {
+        let accepted = |forwarding: &Forwarding| -> Vec<serde_json::Value> {
+            let batch = serde_json::to_value(apply_batch("wg0", &[], forwarding)).unwrap();
+            batch["nftables"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item.pointer("/add/rule"))
+                .filter(|r| r["chain"] == CHAIN_NAME && r["expr"].to_string().contains("\"dport\"") && r["expr"].to_string().contains("\"wg0\""))
+                .map(|r| r["expr"][1]["match"]["right"].clone())
+                .collect()
+        };
+        let with = Forwarding { relay_self: Some("100.90.0.2".parse().unwrap()), phone_relay: Some(phones(vec![])), ..Forwarding::default() };
+        let rights = accepted(&with);
+        assert!(rights.contains(&serde_json::json!(42001)), "{rights:?}");
+        assert!(rights.contains(&serde_json::json!({"range": [42003, 42066]})), "{rights:?}");
+        let mut without = with.clone();
+        without.phone_relay.as_mut().unwrap().pool = None;
+        let rights = accepted(&without);
+        assert!(rights.contains(&serde_json::json!(42001)), "{rights:?}");
+        assert!(!rights.iter().any(|r| r.get("range").is_some()), "{rights:?}");
     }
 
     #[test]
