@@ -130,6 +130,12 @@ What differs:
   service's own address: a service's traffic arrives at that address,
   unrewritten. One bound to the node's mesh address alone, or to
   `127.0.0.1`, is not reached.
+- **Publishing a port opens it past the host's own firewall.** The
+  agent's permits sit above Windows Defender Firewall (or whatever
+  replaced it), so a published port is reached from the nodes and devices
+  its grants admit even when the host firewall has a rule blocking that
+  port, on any network profile. To keep a port closed to the mesh, don't
+  publish it, or narrow who may reach it with grants.
 - **No terminator, no remapped 80.** While the terminator does not answer
   a service's port 80 (just installed, or stopped), an `80:3000` service is
   closed on 80, where Linux sends it straight to the service. An `80` (on
@@ -137,7 +143,9 @@ What differs:
   `(80 unguarded)`.
 - **The terminator is a service of its own**, `wireserve-tls`, running as
   the account `NT SERVICE\wireserve-tls`, which holds nothing of the
-  agent's: no WireGuard key, no firewall. It listens on each service
+  agent's: no WireGuard key, no firewall, and no privilege but bypassing
+  folder traverse checks (no `SeImpersonatePrivilege`, which service
+  accounts have by default). It listens on each service
   address's 443 and 80 itself, and the firewall lets in only what that
   account accepts there, so no other program can answer those ports in
   its place. Its certificates are in `C:\ProgramData\wireserve-tls\`,
@@ -157,7 +165,8 @@ beside it), and every other command takes the same flag.
   `wireserve0` … `wireserve15`), of type *WireServe Tunnel*. It exists only
   while the agent runs: stopping the service, or the agent crashing,
   removes it. Windows lists it as an unidentified, public network; that
-  does not matter to the firewall below.
+  does not matter to the firewall below. Forwarding is off on it: nothing
+  arriving over the mesh is routed on.
 - **The system `Path`**: `C:\Program Files\wireserve` added at its end,
   once. `leave` keeps it, as it keeps the files there.
 - **A local group**, `wireserve`, empty until you add someone.
@@ -165,14 +174,25 @@ beside it), and every other command takes the same flag.
   mesh adapter while the service is published. Windows never uses them
   as the source of the computer's own connections.
 - **Firewall rules** in the Windows Filtering Platform: every new inbound
-  connection over the mesh is blocked, on the mesh adapter and to the
-  node's mesh addresses, but for each service's published ports, from the
-  nodes and devices its grants admit; replies to the computer's own
-  connections come back as usual. The rules sit above Windows Defender
-  Firewall (or whatever firewall replaced it), so another firewall cannot
-  open them, and they go when the agent stops. `netsh wfp show filters`
-  lists them, named `wireserve: block inbound on wireserve0` and
-  `wireserve: permit <address>:<port>/<protocol> on wireserve0`.
+  connection over the mesh is blocked, on the mesh adapter, to the node's
+  mesh addresses and to the mesh's address range, but for each service's
+  published ports, from the nodes and devices its grants admit; replies to
+  the computer's own connections come back as usual. Nothing from the
+  mesh is forwarded. The rules sit above Windows Defender Firewall (or
+  whatever firewall replaced it), so another firewall cannot open them.
+  The permits and the adapter's own blocks go when the agent stops; the
+  blocks on the mesh's addresses and range stay, across stops and
+  reboots, until `leave`, so the adapter is never left unguarded while
+  Windows removes it. They only ever match the mesh's own addresses. The
+  range is left out, with a warning in the log, when one of the
+  computer's own networks is inside it. `netsh wfp show filters` lists
+  them all, in the sublayer `wireserve`: `wireserve (<instance>): block
+  inbound to <address or range>`, `wireserve (<instance>): block
+  forwarding from <range>`, `wireserve: block inbound on wireserve0`,
+  `wireserve: block forwarding from wireserve0` and `wireserve: permit
+  <address>:<port>/<protocol> on wireserve0`. A computer whose services
+  were removed without `leave` keeps the first two kinds; `install` and
+  `leave` again remove them.
 - **The `wireserve-tls` service** and its folder,
   `C:\ProgramData\wireserve-tls\` (see [Serving](#serving)).
 - **The hosts file**, `C:\Windows\System32\drivers\etc\hosts`: a block
@@ -183,7 +203,10 @@ beside it), and every other command takes the same flag.
   through the mesh adapter only. Nothing else is routed through the mesh.
 - **Its state** in `C:\ProgramData\wireserve\`: keys, token and the last
   known mesh, readable by SYSTEM and Administrators only. The agent refuses
-  a `wireserve` folder there that some other user created.
+  a `wireserve` folder there, or any folder below it on the way to its
+  own (`instances`, `instances\<name>`), that some other user created, or
+  that is a junction or symbolic link. The same holds for
+  `C:\ProgramData\wireserve-tls\` and the instances' folders in it.
 - **Its log**, `C:\ProgramData\wireserve\agent.log` (an instance's in its
   own folder under `instances\`), kept to about 10 MiB, and the
   terminator's, `C:\ProgramData\wireserve-tls\tls.log`. `ProgramData` is
@@ -200,6 +223,14 @@ beside it), and every other command takes the same flag.
   the log; the reason is at its end.
 - **`wireguard.dll must be next to wireserve.exe`**: unpack the whole zip
   and run `install` from that folder.
+- **`... is owned by another user`** or **`... is a link`** in the log
+  or from `install`: a folder under `C:\ProgramData\wireserve` or
+  `wireserve-tls` was not made by wireserve. Remove it from an elevated
+  terminal and start the service again.
+- **`was not created by the wireserve daemon`**: the pipe a command
+  talks to was made by another program, under another user, before the
+  service could make it; the service then cannot start either. Find and
+  stop that program; the service makes the pipe when it starts, at boot.
 - **`not permitted to use the wireserve daemon`**: the command was run
   from an unelevated terminal by someone not in the `wireserve` group, or
   who joined it without signing out and in again.

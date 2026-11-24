@@ -30,9 +30,9 @@ use windows_sys::Win32::System::Services::{
     StartServiceCtrlDispatcherW, StartServiceW, SC_ACTION, SC_ACTION_RESTART, SC_HANDLE, SC_MANAGER_ALL_ACCESS,
     SC_MANAGER_CONNECT, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
     SERVICE_CONFIG_DESCRIPTION, SERVICE_CONFIG_FAILURE_ACTIONS, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
-    SERVICE_CONFIG_SERVICE_SID_INFO, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_DESCRIPTIONW,
-    SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONSW, SERVICE_FAILURE_ACTIONS_FLAG,
-    SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_SID_INFO, SERVICE_SID_TYPE_UNRESTRICTED, SERVICE_START,
+    SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO, SERVICE_CONFIG_SERVICE_SID_INFO, SERVICE_CONTROL_INTERROGATE,
+    SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONSW,
+    SERVICE_FAILURE_ACTIONS_FLAG, SERVICE_QUERY_STATUS, SERVICE_REQUIRED_PRIVILEGES_INFOW, SERVICE_RUNNING, SERVICE_SID_INFO, SERVICE_SID_TYPE_UNRESTRICTED, SERVICE_START,
     SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOP, SERVICE_STOPPED, SERVICE_STOP_PENDING,
     SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
 };
@@ -244,6 +244,17 @@ pub fn install_tls(name: &str, instance: &Instance, exe: &Path) -> io::Result<()
     )
 }
 
+/// The one privilege the terminator's token keeps (see [`install_spec`]).
+const TERMINATOR_PRIVILEGE: &str = "SeChangeNotifyPrivilege";
+
+/// `names` as the Service Control Manager takes a list: each NUL-terminated,
+/// and one more NUL after the last.
+fn required_privileges(names: &[&str]) -> Vec<u16> {
+    let mut out: Vec<u16> = names.iter().flat_map(|n| n.encode_utf16().chain(Some(0))).collect();
+    out.push(0);
+    out
+}
+
 fn display_name(what: &str, instance: &Instance) -> String {
     if instance.is_default() {
         what.to_string()
@@ -333,6 +344,28 @@ fn install_spec(spec: &Spec<'_>, instance: &Instance, exe: &Path) -> io::Result<
         // SAFETY: a structure that outlives the call.
         if unsafe { ChangeServiceConfig2W(service.0, SERVICE_CONFIG_SERVICE_SID_INFO, std::ptr::from_ref(&sid).cast()) } == 0 {
             return Err(io::Error::last_os_error());
+        }
+        // Only the privileges it needs in its token (PLAN.md #362). A
+        // service account is given `SeImpersonatePrivilege` and others by
+        // default, and with it code that took over the process parsing TLS
+        // and HTTP from the whole mesh could make a SYSTEM token Windows
+        // can be coaxed into handing it (the "potato" attacks) its own:
+        // the terminator's account would be as good as LocalSystem. It
+        // needs none of them: it binds ports, which
+        // Windows does not reserve, and reads its own folder, which
+        // `SeChangeNotifyPrivilege` (bypassing traverse checks) lets it
+        // reach. Set on every install, so an upgrade drops them from a
+        // terminator made before.
+        let mut privileges = required_privileges(&[TERMINATOR_PRIVILEGE]);
+        let info = SERVICE_REQUIRED_PRIVILEGES_INFOW { pmszRequiredPrivileges: privileges.as_mut_ptr() };
+        // SAFETY: a double-NUL-terminated list that outlives the call.
+        if unsafe { ChangeServiceConfig2W(service.0, SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO, std::ptr::from_ref(&info).cast()) }
+            == 0
+        {
+            return Err(io::Error::other(format!(
+                "could not limit the {name} service's privileges: {}",
+                io::Error::last_os_error()
+            )));
         }
     }
 
@@ -512,12 +545,15 @@ impl Shutdown {
 }
 
 /// After `leave`: the services go too. Started at boot with no identity to
-/// run on, the agent would only fail and be restarted over and over.
+/// run on, the agent would only fail and be restarted over and over. Then,
+/// once the agent has stopped, the firewall blocks that outlive it
+/// (`super::wfp`): the agent removed them itself on its way out, so this
+/// only finds what it could not.
 pub fn after_leave(instance: &Instance) -> Result<(), String> {
     for name in [tls_service_name(instance), service_name(instance)] {
         delete(&name).map_err(|e| format!("left the mesh, but could not remove the {name} service: {e}"))?;
     }
-    Ok(())
+    super::wfp::remove_lasting(instance.name()).map_err(|e| format!("left the mesh, but could not remove its firewall blocks: {e}"))
 }
 
 #[cfg(test)]
@@ -530,6 +566,15 @@ mod tests {
         assert_eq!(service_name(&Instance::new("work").unwrap()), "wireserve-agent-work");
         assert_eq!(tls_service_name(&Instance::default()), "wireserve-tls");
         assert_eq!(tls_service_name(&Instance::new("work").unwrap()), "wireserve-tls-work");
+    }
+
+    #[test]
+    fn required_privileges_are_a_double_nul_terminated_list() {
+        let list = required_privileges(&[TERMINATOR_PRIVILEGE]);
+        let expected: Vec<u16> = "SeChangeNotifyPrivilege\0\0".encode_utf16().collect();
+        assert_eq!(list, expected);
+        let two = required_privileges(&["A", "B"]);
+        assert_eq!(two, "A\0B\0\0".encode_utf16().collect::<Vec<u16>>());
     }
 
     #[test]

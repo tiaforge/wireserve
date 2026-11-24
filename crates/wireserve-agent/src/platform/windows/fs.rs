@@ -19,9 +19,11 @@ pub const RENAME_FALLBACK_ERRORS: [i32; 4] = [
 /// Nothing: the new file takes its directory's ACL.
 pub fn create_with_mode(_options: &mut OpenOptions, _mode: u32) {}
 
-/// The Windows counterpart of `0700`: SYSTEM and Administrators only.
+/// The Windows counterpart of `0700`: SYSTEM and Administrators only, and
+/// every folder from the state root down to it checked (see
+/// [`super::security::ensure_private_dir`]).
 pub fn make_private_dir(path: &Path) -> std::io::Result<()> {
-    super::security::restrict_to_admins(path)
+    super::security::ensure_private_dir(path)
 }
 
 /// Runs a read-modify-write of `path` under an exclusive lock (see the
