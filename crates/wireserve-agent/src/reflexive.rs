@@ -215,7 +215,7 @@ async fn try_learn(coordinator_url: &str, listen_port: u16, timeout: Duration) -
         for target in &targets {
             socket.send_to(&request, target).await.map_err(ReflexiveProbeError::Io)?;
         }
-        let Ok(recv) = tokio::time::timeout(per_attempt_timeout, socket.recv_from(&mut buf)).await else {
+        let Ok(recv) = tokio::time::timeout(per_attempt_timeout, recv_answer(&socket, &mut buf)).await else {
             continue; // this attempt timed out — retry
         };
         let (n, src) = recv.map_err(ReflexiveProbeError::Io)?;
@@ -237,7 +237,7 @@ async fn try_learn(coordinator_url: &str, listen_port: u16, timeout: Duration) -
             all_probed && second
         };
         while !done(&answers) {
-            let Ok(Ok((n, src))) = tokio::time::timeout_at(deadline, socket.recv_from(&mut buf)).await else {
+            let Ok(Ok((n, src))) = tokio::time::timeout_at(deadline, recv_answer(&socket, &mut buf)).await else {
                 break;
             };
             if let Some(answer) = parse_response(&buf[..n])
@@ -252,6 +252,20 @@ async fn try_learn(coordinator_url: &str, listen_port: u16, timeout: Duration) -
         return Ok(conclude(&answers, answers_twice, own));
     }
     Err(ReflexiveProbeError::NoResponse)
+}
+
+/// The next datagram on `socket`. Windows reports a port that refused an
+/// earlier send (an ICMP port-unreachable) as an error of the next receive,
+/// "connection reset": one of the coordinator's listed ports being closed
+/// is no reason to stop listening for the other's answer. Bounded by the
+/// caller's timeout.
+async fn recv_answer(socket: &tokio::net::UdpSocket, buf: &mut [u8]) -> std::io::Result<(usize, std::net::SocketAddr)> {
+    loop {
+        match socket.recv_from(buf).await {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => return other,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -640,10 +640,12 @@ mod tests {
     #[tokio::test]
     async fn port_80_of_a_service_for_people_is_never_called_unguarded() {
         // Without a terminator answering it, it is closed, not passed on.
+        // Port 80 as itself: what reaches the backend on every platform
+        // (a remapped 80 is closed on Windows whoever the service is for).
         let (ctx, _dir, _rx) = test_ctx();
         let serve = |always_sign_in: bool| IpcRequest::Serve {
             name: "grafana".into(),
-            ports: vec!["443:3000".parse().unwrap(), "80:3000".parse().unwrap()],
+            ports: vec!["443:3000".parse().unwrap(), "80".parse().unwrap()],
             group: None,
             always_sign_in,
         };
