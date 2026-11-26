@@ -32,3 +32,9 @@ exists.
 - [Command reference](commands.md)
 - [Building from source](building.md)
 - [Releasing](releasing.md)
+
+## Proposals
+
+Ideas worked out but not scheduled in [PLAN.md](PLAN.md):
+
+- [Nodes that join by signing in](proposals/self-enrolment.md)
